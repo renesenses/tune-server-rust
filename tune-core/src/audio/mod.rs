@@ -10,6 +10,9 @@ pub mod canaux_reseau_4573;
 
 pub mod bitperfect_strict;
 pub mod channels;
+/// #5071 — la compensation de niveau cuite dans le flux réseau, bornée à la
+/// crête (jamais d'écrêtage).
+pub mod compensation_reseau;
 pub mod convolver;
 pub mod crossfeed;
 pub mod dash_growth;

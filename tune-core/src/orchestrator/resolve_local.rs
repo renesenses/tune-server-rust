@@ -2348,6 +2348,18 @@ impl PlaybackOrchestrator {
             // cache : `crossfeed_bibliotheque_reseau`, cas 1.
             let crossfeed =
                 self.crossfeed_du_fichier(req.zone_id, out_sr, is_network_output, is_local_output);
+            // #5071 — la compensation de niveau, cuite APRÈS eux et bornée à
+            // la crête de la piste. Fermée à une sortie `local:` (qui compense
+            // par son volume) par `compensation_du_flux_reseau` elle-même.
+            let compensation = cuire
+                .then(|| {
+                    self.compensation_du_flux_reseau(
+                        req.zone_id,
+                        eq_profile.as_ref(),
+                        crossfeed.as_ref().map(|(p, _)| p).filter(|_| channels == 2),
+                    )
+                })
+                .flatten();
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
@@ -2400,6 +2412,13 @@ impl PlaybackOrchestrator {
             let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_crossfeed(
                 empreinte_dsp,
                 crossfeed.as_ref().map(|(_, reglage)| *reglage),
+            );
+            // #5071 — la compensation change les octets : elle entre dans la
+            // clé, sinon une rendition non compensée serait servie à une zone
+            // qui l'a demandée (et inversement). `None` : la clé d'avant.
+            let empreinte_dsp = crate::audio::compensation_reseau::empreinte_avec_compensation(
+                empreinte_dsp,
+                compensation.as_ref().map(|c| c.cible_db()),
             );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
@@ -2645,6 +2664,7 @@ impl PlaybackOrchestrator {
                             duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
+                        compensation,
                     ),
                     progres,
                     politique,

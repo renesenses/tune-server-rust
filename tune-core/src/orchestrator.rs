@@ -1202,6 +1202,12 @@ struct StreamingDsp {
     /// bâti sans dire combien de canaux il traite ne doit pas mélanger des
     /// canaux au hasard.
     channels: u16,
+    /// #5071 — la compensation de niveau (#4685), cinquième et DERNIER étage :
+    /// elle rend ce que l'égaliseur et le crossfeed retirent au niveau moyen,
+    /// bornée à la crête pour ne jamais écrêter. `None` sur une sortie
+    /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
+    /// sans égaliseur ni crossfeed.
+    compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
 }
 
 impl StreamingDsp {
@@ -1212,6 +1218,7 @@ impl StreamingDsp {
             || self.eq.is_some()
             || self.convolver.is_some()
             || self.crossfeed.is_some()
+            || self.compensation.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -1248,6 +1255,11 @@ impl StreamingDsp {
         // l'image d'un signal déjà corrigé, il ne corrige pas.
         if let Some(cf) = self.crossfeed.as_mut() {
             cf.process_pcm(pcm, bit_depth, self.channels);
+        }
+        // #5071 — la compensation APRÈS tous les étages : elle rend le niveau
+        // moyen qu'ils ont retiré, et sa borne lit la crête qu'ils ont laissée.
+        if let Some(comp) = self.compensation.as_mut() {
+            comp.process_pcm(pcm, bit_depth);
         }
     }
 }
@@ -1402,6 +1414,9 @@ mod resolve_local;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
+// #5071 — témoins de bout en bout de la compensation de niveau réseau.
+#[cfg(test)]
+mod compensation_reseau_5071_tests;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;

@@ -100,7 +100,31 @@ async fn la_route_publie_la_compensation_active_par_defaut_et_chiffree() {
     assert!((eq - (-9.36)).abs() < 0.05, "égaliseur {eq}");
     assert!((cf - (-1.02)).abs() < 0.05, "crossfeed {cf}");
     assert!((comp - -(eq + cf)).abs() < 0.011, "compensation {comp}");
-    assert_eq!(lc["local_output_only"], true);
+    // #5071 — la compensation n'est plus réservée à la sortie locale ; sur
+    // celle-ci, elle passe toujours par le volume.
+    assert_eq!(lc["local_output_only"], false);
+    assert_eq!(lc["applied_by"], "output_volume");
+}
+
+/// #5071 — une zone RÉSEAU reçoit la compensation dans son flux : la route le
+/// dit, au lieu de publier un interrupteur que rien n'appliquait.
+#[tokio::test]
+async fn une_zone_reseau_recoit_la_compensation_par_le_flux() {
+    let (app, _zone, state) = app().await;
+    let dlna = ZoneRepo::with_backend(state.backend.clone())
+        .create("Marantz ND8006", Some("dlna"), Some("dlna:uuid:marantz"))
+        .unwrap();
+    let s = SettingsRepo::with_backend(state.backend.clone());
+    s.set(
+        &format!("zone_{dlna}_eq_profile"),
+        &profil_rock().to_string(),
+    )
+    .unwrap();
+    let lc = lire(&app, dlna).await;
+    assert_eq!(lc["enabled"], true, "{lc}");
+    assert_eq!(lc["applied_by"], "stream_gain", "{lc}");
+    assert_eq!(lc["local_output_only"], false, "{lc}");
+    assert!(lc["compensation_db"].as_f64().unwrap() > 9.0, "{lc}");
 }
 
 #[tokio::test]
