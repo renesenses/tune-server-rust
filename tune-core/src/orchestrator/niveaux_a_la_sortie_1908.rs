@@ -186,3 +186,114 @@ async fn une_horloge_incoherente_est_lachee_sans_bloquer_les_niveaux() {
          lâcher et publier au rythme mural ; vu {vues:?}"
     );
 }
+
+/// 🔴 Fil 1954 (Didier, 25/09/2026, Windows 11, SMSL SU-8, album LOCAL
+/// rééchantillonné 44,1 → 96 kHz) : « La fenêtre Lecture en cours n'affiche
+/// plus les analyseurs de spectre lors de la lecture d'un album en local. »
+///
+/// Au démarrage d'une piste, la sortie locale rapporte encore la FIN de la
+/// précédente (vidage terminé : 180 s, anneau vide) jusqu'à ce qu'elle ouvre
+/// la nouvelle. Une piste pré-transcodée ou servie du cache de transcodage
+/// livre ses fenêtres d'un bloc, pendant ce temps-là : la branche d'horloge
+/// de #4883 les jugeait toutes « déjà entendues » (`0 + 2 s < 180 s`) et les
+/// jetait — plus un niveau pour la piste entière, spectre et crête-mètre à
+/// plat. Contre-épreuve : sans la garde, aucune fenêtre ne sort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l_horloge_de_la_piste_precedente_ne_fait_pas_jeter_la_suivante() {
+    let zone_id = 987_954;
+    let playback = Arc::new(PlaybackManager::new());
+    // Fin naturelle de la piste précédente : la sortie a tout vidé et
+    // rapporte sa position JOUÉE, 180 s.
+    let anneau = Arc::new(RingStarvation::new());
+    anneau.begin_stream(48_000, 2);
+    anneau.marquer_le_vidage();
+    let alimentee = Arc::new(AtomicU64::new(180_000));
+    playback.brancher_l_horloge_de_sortie(
+        zone_id,
+        HorlogeDeSortie {
+            position_alimentee_ms: alimentee.clone(),
+            anneau: anneau.clone(),
+        },
+    );
+    assert_eq!(playback.position_audible_ms(zone_id), Some(180_000));
+    // Le sondeur lance la piste suivante.
+    playback.play(zone_id, NowPlaying::default()).await;
+    let bus = Arc::new(super::EventBus::new());
+    let mut rx = bus.subscribe();
+    let play_seq = playback.current_play_seq(zone_id).await;
+    let levels_tx =
+        super::spawn_paced_levels_forwarder(bus.clone(), playback.clone(), zone_id, play_seq, 0);
+    // Piste pré-transcodée : toutes ses fenêtres arrivent d'un coup, AVANT
+    // que la sortie ne l'ouvre.
+    assert!(crate::audio::tap::send_windowed_pcm(
+        &levels_tx,
+        &une_seconde_de_sinus(),
+        16,
+        2,
+        48_000
+    ));
+    let vues = positions_publiees(&mut rx, std::time::Duration::from_millis(300)).await;
+    assert!(
+        vues.is_empty(),
+        "la sortie n'a pas encore ouvert la piste : rien ne doit sortir ; vu {vues:?}"
+    );
+    // La sortie ouvre la piste : position 0, anneau plein de deux secondes —
+    // on entend encore 0.
+    anneau.begin_stream(48_000, 2);
+    anneau.noter_alimentation(48_000 * 2 * 2);
+    alimentee.store(2_000, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(playback.position_audible_ms(zone_id), Some(0));
+    let vues = positions_publiees(&mut rx, std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        vues,
+        vec![0],
+        "la sortie joue 0 ms : la première fenêtre doit sortir, et elle seule — \
+         jetées sur la foi de l'horloge de la piste précédente, il n'en sort \
+         aucune (fil 1954) ; vu {vues:?}"
+    );
+    // Le pilote tire 400 ms : les fenêtres suivantes sortent avec le son.
+    anneau.noter_en_attente(48_000 * 2 * 16 / 10);
+    let vues = positions_publiees(&mut rx, std::time::Duration::from_millis(600)).await;
+    assert_eq!(vues, (1..=10).map(|k| k * 40).collect::<Vec<i64>>());
+}
+
+/// Non-régression de la garde du fil 1954 : une fois l'horloge vue sur CETTE
+/// piste, une fenêtre réellement dépassée (le son est loin devant) reste
+/// jetée, comme avant — sans quoi un décodage en retard déverserait ses
+/// fenêtres périmées sur le bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_fenetre_vraiment_depassee_reste_jetee() {
+    let zone_id = 987_955;
+    let playback = Arc::new(PlaybackManager::new());
+    let anneau = Arc::new(RingStarvation::new());
+    anneau.begin_stream(48_000, 2);
+    anneau.noter_alimentation(48_000 * 2 * 2);
+    let alimentee = Arc::new(AtomicU64::new(2_000));
+    playback.brancher_l_horloge_de_sortie(
+        zone_id,
+        HorlogeDeSortie {
+            position_alimentee_ms: alimentee.clone(),
+            anneau: anneau.clone(),
+        },
+    );
+    playback.play(zone_id, NowPlaying::default()).await;
+    let bus = Arc::new(super::EventBus::new());
+    let mut rx = bus.subscribe();
+    let play_seq = playback.current_play_seq(zone_id).await;
+    let levels_tx =
+        super::spawn_paced_levels_forwarder(bus.clone(), playback.clone(), zone_id, play_seq, 0);
+    crate::audio::tap::send_windowed_pcm(&levels_tx, &une_seconde_de_sinus(), 16, 2, 48_000);
+    let vues = positions_publiees(&mut rx, std::time::Duration::from_millis(300)).await;
+    assert_eq!(vues, vec![0], "horloge vue sur la piste, à 0 ms");
+    // Le son saute à 10 s : toute la seconde restante est dépassée.
+    alimentee.store(12_000, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(playback.position_audible_ms(zone_id), Some(10_000));
+    let vues = positions_publiees(&mut rx, std::time::Duration::from_millis(300)).await;
+    // La fenêtre de 40 ms attendait déjà le son : elle sort quand il la
+    // dépasse. Les suivantes, elles, sont jetées.
+    assert!(
+        vues.iter().all(|&p| p <= 40),
+        "fenêtres de 80 à 960 ms, son à 10 s : elles sont dépassées et ne \
+         doivent pas sortir ; vu {vues:?}"
+    );
+}
