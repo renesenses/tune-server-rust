@@ -2348,6 +2348,9 @@ impl PlaybackOrchestrator {
             // cache : `crossfeed_bibliotheque_reseau`, cas 1.
             let crossfeed =
                 self.crossfeed_du_fichier(req.zone_id, out_sr, is_network_output, is_local_output);
+            // #5114 — ce que le fichier servi porte, dit par son `StreamInfo`.
+            // Le crossfeed n'agit qu'en stéréo (`CrossfeedProcessor::process_pcm`).
+            let crossfeed_cuit = crossfeed.is_some() && channels == 2;
             // #5071 — la compensation de niveau, cuite APRÈS eux et bornée à
             // la crête de la piste. Fermée à une sortie `local:` (qui compense
             // par son volume) par `compensation_du_flux_reseau` elle-même.
@@ -2484,6 +2487,7 @@ impl PlaybackOrchestrator {
                     channels,
                     file_size: Some(file_size),
                     duration_ms: Some(track_duration_ms as u64),
+                    crossfeed: crossfeed_cuit,
                     ..Default::default()
                 };
                 let session_id = self
@@ -2745,6 +2749,7 @@ impl PlaybackOrchestrator {
                             channels,
                             file_size: Some(file_size),
                             duration_ms: Some(track_duration_ms as u64),
+                            crossfeed: crossfeed_cuit,
                             ..Default::default()
                         };
                         let session_id = self
@@ -2897,6 +2902,13 @@ impl PlaybackOrchestrator {
             // attribute so DLNA renderers know the correct stream size.
             let transcode_file_size = info.wav_content_length();
 
+            // Chargé AVANT la session (#5114) : le flux doit dire, dans son
+            // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
+            // réellement posé sur le canal le sait.
+            let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
+            let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
+            let mut info = info;
+            info.crossfeed = relais && dsp.crossfeed_executable();
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
 
             // LAT-F1 (phase 0) : la chaîne DSP de la zone AU FIL DE L'EAU.
@@ -2917,8 +2929,7 @@ impl PlaybackOrchestrator {
             // propre boucle de lecture. Les cumuler doublait la courbe de
             // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
             // voir `relais_dsp_progressif`.
-            let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
-            let tx = if relais_dsp_progressif(dsp.is_active(), is_local_output) {
+            let tx = if relais {
                 tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {

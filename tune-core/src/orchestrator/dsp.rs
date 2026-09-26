@@ -1709,19 +1709,27 @@ impl PlaybackOrchestrator {
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        if self
-            .license
-            .as_ref()
-            .is_some_and(|license| !license.premium_snapshot())
-        {
-            return None;
-        }
-        Self::crossfeed_configure_with(&self.db, zone_id)
+        Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)
     }
 
-    /// [`Self::crossfeed_configure`] sans orchestrateur, donc SANS la garde
-    /// de licence (seul l'orchestrateur la porte) — c'est par là que le chemin
-    /// du signal compose la compensation réseau (#5071).
+    /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
+    /// garde de licence : la même, écrite une fois, sur le même
+    /// `LicenseManager`. C'est par là que le miroir de la compensation réseau
+    /// lit le crossfeed. `None` : aucune garde, comme un orchestrateur sans
+    /// licence (les tests).
+    fn crossfeed_configure_sous_licence(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        license: Option<&crate::license::LicenseManager>,
+        zone_id: i64,
+    ) -> Option<(f32, f32)> {
+        if license.is_some_and(|license| !license.premium_snapshot()) {
+            return None;
+        }
+        Self::crossfeed_configure_with(db, zone_id)
+    }
+
+    /// La lecture du réglage, SANS la garde de licence : seul
+    /// [`Self::crossfeed_configure_sous_licence`] l'appelle.
     fn crossfeed_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
@@ -1821,11 +1829,15 @@ impl PlaybackOrchestrator {
     /// chargeurs de la lecture : PURE, interrupteur coupé, sortie `local:`
     /// (qui compense par son volume) ou ni égaliseur ni crossfeed ⇒ `None`.
     /// Sondé à 44,1 kHz stéréo, comme [`Self::gain_moyen_du_dsp_de_zone`].
-    /// Seule différence assumée : la garde de licence du crossfeed vit dans
-    /// l'orchestrateur ; une licence échue que le chemin du signal ne voit
-    /// pas surestimerait la cible du crossfeed (~1 dB), jamais le contraire.
+    ///
+    /// #5114 — `license` porte la garde de licence du crossfeed, la MÊME que
+    /// [`Self::crossfeed_configure`] (et par la même fonction) : sans elle,
+    /// une licence échue faisait compter au miroir un crossfeed que le flux
+    /// ne porte pas, et la cible était surestimée de son gain moyen. `None` :
+    /// aucune garde, comme un orchestrateur sans licence.
     pub fn compensation_reseau_prevue_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        license: Option<&crate::license::LicenseManager>,
         zone_id: i64,
     ) -> Option<f64> {
         if crate::audio::audiophile::zone_enabled(db, zone_id)
@@ -1846,10 +1858,12 @@ impl PlaybackOrchestrator {
             .map(|p| crate::audio::eq::EqProcessor::new(&p, 44_100, 2))
             .filter(|p| p.is_enabled())
             .map(|p| p.gain_moyen_db());
-        let cf = Self::crossfeed_configure_with(db, zone_id).map(|(amount, delay_ms)| {
-            crate::audio::crossfeed::CrossfeedProcessor::new(44_100, amount, delay_ms)
-                .gain_moyen_db()
-        });
+        let cf = Self::crossfeed_configure_sous_licence(db, license, zone_id).map(
+            |(amount, delay_ms)| {
+                crate::audio::crossfeed::CrossfeedProcessor::new(44_100, amount, delay_ms)
+                    .gain_moyen_db()
+            },
+        );
         if eq.is_none() && cf.is_none() {
             return None;
         }

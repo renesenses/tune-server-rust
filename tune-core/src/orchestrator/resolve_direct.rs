@@ -1323,8 +1323,13 @@ impl PlaybackOrchestrator {
             duration_ms: req.duration_ms.map(|d| d as u64),
             ..Default::default()
         };
-        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        // #5114 — le porteur d'abord : le flux dit s'il cuit le crossfeed.
         let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let info = StreamInfo {
+            crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
+            ..info
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
         let tx = if dsp.is_active() {
             info!(
                 zone_id = req.zone_id,
