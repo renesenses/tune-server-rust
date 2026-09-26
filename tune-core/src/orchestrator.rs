@@ -1580,6 +1580,11 @@ mod dsd_passthrough_tests;
 #[cfg(test)]
 mod dsd_upnp_politique_de_zone_tests;
 
+/// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
+/// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
+#[cfg(test)]
+mod double_dsp_dsf_aac_sortie_locale_tests;
+
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]
