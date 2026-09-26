@@ -651,6 +651,38 @@ pub(super) fn streaming_pretranscode_format(renderer_supports_mime: bool) -> &'s
     }
 }
 
+/// #5080 — un flux de SERVICE (Qobuz, Tidal) à traitement actif vers une zone
+/// réseau doit-il partir en WAV PROGRESSIF, au lieu du pré-transcodage par le
+/// fichier entier ?
+///
+/// Le pré-transcodage télécharge la piste ENTIÈRE, la décode ENTIÈRE en
+/// mémoire, la traite, la ré-encode, et seulement alors rend une adresse au
+/// renderer : 92,6 s de silence mesurés pour un 24/96 de 18 min (fil 1949,
+/// `resolve_ms=92559`, 7,9 Gio de RSS). La bibliothèque locale a quitté ce
+/// chemin avec LAT-F1 (#3357) ; le bras des services, jamais.
+///
+/// Mêmes conditions que la bibliothèque ([`cible_wav_pour_traitement`] :
+/// traitement actif, sortie réseau, consentement au WAV, renderer qui annonce
+/// le LPCM à la profondeur servie), plus une : le flux doit se décoder au fil
+/// de l'eau ([`super::resolve_stream::decodage_progressif_par_range`]). Hors
+/// de ces cas, le fichier reste la voie — rien ne bouge.
+pub(super) fn service_en_wav_progressif(
+    traitement_actif: bool,
+    sortie_reseau: bool,
+    consenti: bool,
+    decodable_au_fil_de_l_eau: bool,
+    renderer_accepte_lpcm: bool,
+) -> bool {
+    decodable_au_fil_de_l_eau
+        && cible_wav_pour_traitement(
+            traitement_actif,
+            sortie_reseau,
+            false,
+            consenti,
+            renderer_accepte_lpcm,
+        )
+}
+
 /// Les types de sortie qui poussent l'audio vers un appareil PAR LE RÉSEAU.
 ///
 /// **L'unique exemplaire de cette liste.** Elle était recopiée à l'identique en

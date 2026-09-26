@@ -1403,6 +1403,10 @@ mod resolve_local;
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
 
+// #5080 — un flux de service à traitement actif part en WAV progressif.
+#[cfg(test)]
+mod service_wav_progressif_5080;
+
 mod dsp;
 pub use dsp::PorteeDuReglage;
 
