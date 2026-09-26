@@ -83,6 +83,26 @@ impl SettingsRepo {
         }
     }
 
+    /// Lit un réglage par le POOL DE LECTURE, sans passer par l'écrivain.
+    ///
+    /// [`get`](Self::get) lit par la connexion d'écriture, pour voir une
+    /// valeur posée l'instant d'avant. Le prix : il attend tout écrivain qui
+    /// tient cette connexion, aussi longtemps qu'il la tient. Pour une sonde
+    /// de santé, c'est un faux négatif garanti — c'est #5086, où les quatre
+    /// sondes de Support › Diagnostic tombaient ENSEMBLE derrière l'écrivain
+    /// et annonçaient « Serveur : injoignable ».
+    ///
+    /// À réserver aux lectures qui se contentent de la dernière valeur
+    /// COMMITÉE : nom du serveur, statut de scan, et autres états publiés.
+    pub fn get_sans_ecrivain(&self, key: &str) -> Result<Option<String>, String> {
+        let sql = self.dialect_sql(sql::get_by_key, sql::get_by_key);
+        let params: [&dyn ToSqlValue; 1] = [&key];
+        match self.db.query_one(&sql, &params)? {
+            None => Ok(None),
+            Some(row) => Ok(row.first().and_then(|v| v.as_string())),
+        }
+    }
+
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let sql = self.dialect_sql(sql::upsert, sql::upsert);

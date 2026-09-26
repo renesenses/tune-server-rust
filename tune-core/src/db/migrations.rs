@@ -3709,22 +3709,37 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 }
 
 pub fn current_version(db: &SqliteDb) -> Result<i32, String> {
-    let has_table = {
-        let conn = db.connection().lock().unwrap();
-        conn.query_row(
+    let conn = db.connection().lock().unwrap();
+    version_sur(&conn)
+}
+
+/// [`current_version`], lue par le POOL DE LECTURE (#5086).
+///
+/// `current_version` prend la connexion d'écriture : c'est ce qu'il faut
+/// pendant les migrations, qui l'appellent entre deux écritures. Mais
+/// `/system/database/status`, le rapport de bogue et les diagnostics ne font
+/// que PUBLIER cette version ; passer par l'écrivain les faisait attendre tout
+/// écrivain en cours, et Support › Diagnostic annonçait alors « Base de
+/// données : injoignable » sur une base qui servait.
+pub fn current_version_sans_ecrivain(db: &SqliteDb) -> Result<i32, String> {
+    let conn = db.read_connection();
+    version_sur(&conn)
+}
+
+fn version_sur(conn: &rusqlite::Connection) -> Result<i32, String> {
+    let has_table = conn
+        .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_migrations'",
             [],
             |row| row.get::<_, i32>(0),
         )
         .map_err(|e| e.to_string())?
-            > 0
-    };
+        > 0;
 
     if !has_table {
         return Ok(0);
     }
 
-    let conn = db.connection().lock().unwrap();
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM _migrations",
         [],
