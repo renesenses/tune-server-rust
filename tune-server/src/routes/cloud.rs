@@ -788,7 +788,7 @@ async fn sync_community_covers(
         state
             .backend
             .execute(
-                "UPDATE albums SET cover_path = ? WHERE mbid = ? AND (cover_path IS NULL OR cover_path = '')",
+                "UPDATE albums SET cover_path = ?, cover_source = 'provider', cover_source_path = NULL, cover_source_stamp = NULL WHERE mbid = ? AND (cover_path IS NULL OR cover_path = '')",
                 &[&dest_str as &dyn ToSqlValue, &mbid as &dyn ToSqlValue],
             )
             .ok();

@@ -150,6 +150,66 @@ impl Drop for ScanLease<'_> {
 
 static SCAN_GATE: ScanGate = ScanGate::new();
 
+/// Épreuves seulement — le verrou des tests qui dépendent de l'ÉTAT GLOBAL du
+/// scan : le droit de scanner (`SCAN_GATE`) et le compteur de scans en cours
+/// que lit le balayage acoustique sont des globales de PROCESSUS.
+///
+/// Un test qui lance un vrai scan le prend pendant tout le scan ; un test qui
+/// constate « aucun scan ne tourne » ou « mon scan de démarrage a pris le
+/// droit » le prend aussi. Sans lui, ces constats deviennent intermittents dès
+/// que des épreuves de scan réel tournent en parallèle (#5034 en ajoute une
+/// vingtaine : `le_jeton_de_scan_efface_le_balayage_acoustique` et
+/// `le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable` ont rougi
+/// sur Shrek, sans rapport avec leur code).
+#[cfg(test)]
+static VERROU_DES_SCANS_DE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn serialiser_les_scans_de_test() -> std::sync::MutexGuard<'static, ()> {
+    VERROU_DES_SCANS_DE_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Le même verrou, attendu SANS bloquer le fil : pour une épreuve qui a déjà
+/// lancé un scan sur son propre exécuteur. Bloquer le fil figerait ce scan,
+/// qui tient le droit de scanner que le détenteur du verrou attend : les deux
+/// s'attendraient pour toujours (vu sur Shrek, les aides de
+/// `scan_realigne_tests_4896`, qui scannent deux fois par épreuve).
+#[cfg(test)]
+pub(crate) async fn serialiser_les_scans_de_test_sans_bloquer() -> std::sync::MutexGuard<'static, ()>
+{
+    loop {
+        match VERROU_DES_SCANS_DE_TEST.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Épreuves seulement — attend que le droit de scanner soit LIBRE : le scan
+/// annonce sa fin (`ScanComplete`) avant d'avoir rendu son droit et baissé le
+/// compteur de scans en cours. Une épreuve qui rend le verrou commun dès
+/// l'annonce laisserait la suivante trouver un scan « en cours ».
+#[cfg(test)]
+pub(crate) async fn attendre_que_le_droit_de_scanner_soit_libre() {
+    let debut = std::time::Instant::now();
+    loop {
+        if let Some(jeton) = try_begin_scan() {
+            drop(jeton);
+            return;
+        }
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(300),
+            "le droit de scanner n'est jamais revenu"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 pub(crate) fn try_begin_scan() -> Option<ScanLease<'static>> {
     SCAN_GATE.try_acquire()
 }
@@ -217,10 +277,12 @@ mod scan_gate_tests {
     /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
     /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
     /// verrou.
-    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    ///
+    /// C'est le verrou COMMUN aux épreuves de scan réel
+    /// ([`super::serialiser_les_scans_de_test`]) : un vrai scan lève le même
+    /// compteur.
     fn serialiser() -> std::sync::MutexGuard<'static, ()> {
-        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+        super::serialiser_les_scans_de_test()
     }
 
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
@@ -263,6 +325,13 @@ mod scan_gate_tests {
         use tune_core::scanner::activite::scan_bibliotheque_en_cours;
 
         let _serialise = serialiser();
+        // Le compteur est de PROCESSUS : un vrai scan lancé par une autre
+        // épreuve peut finir de tourner. On attend qu'il ait fini (#5034).
+        let debut = std::time::Instant::now();
+        while scan_bibliotheque_en_cours() && debut.elapsed() < std::time::Duration::from_secs(120)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let gate = ScanGate::new();
         assert!(
             !scan_bibliotheque_en_cours(),
@@ -2303,6 +2372,19 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // #4896 — APRÈS la purge et son COMMIT : la ligne album d'un dossier
         // retouché suit ses balises, par la même règle que le surveillant.
         balises_vues.realigner(&db);
+
+        // #5034 — APRÈS la purge : chaque pochette tirée d'un fichier du
+        // disque est confrontée à ce fichier, d'un `stat`. Le scan rapide ne
+        // relit que les pistes modifiées : un `cover.jpg` supprimé dans un
+        // album dont aucune piste n'a bougé n'était vu par personne.
+        // « Répertoires » ne regarde que son dossier.
+        let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+            &db,
+            &cache_dir,
+            &portee_pochettes,
+            force,
+        );
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —

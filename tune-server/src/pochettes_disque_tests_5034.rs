@@ -1,0 +1,1018 @@
+//! #5034 (Didier, fil 1904, Windows 11) — la pochette d'album face au DISQUE,
+//! jouée sur de VRAIS FLAC et par les VRAIES passes :
+//!
+//! - « Analyse rapide » et « Répertoires » : `spawn_library_scan` (non forcé,
+//!   entier ou ciblé sur le dossier de l'album) ;
+//! - « Analyse complète » : `spawn_library_scan` forcé ;
+//! - le scan de démarrage : `spawn_auto_scan` ;
+//! - le surveillant : `traiter_le_lot_du_surveillant`, nourri des événements
+//!   que `notify` fabrique sous Windows, traduits par le gestionnaire de
+//!   production (`rejouer_evenements_notify`) et passés par l'attente
+//!   d'écriture stable (`settle_partition`).
+//!
+//! Chaque cas part d'un album de deux pistes indexé par un premier scan, fait
+//! le geste de Didier sur le disque (Mp3tag sur les DEUX pistes, ou
+//! l'explorateur sur `cover.jpg`), rejoue la passe, et lit `albums.cover_path`.
+//! Le tableau reprend celui de la sonde de l'enquête
+//! (`~/DEV/banc5034/sonde_pochettes_5034_5035.rs`).
+use super::{ReglagesDuSurveillant, settle_partition, traiter_le_lot_du_surveillant};
+use crate::state::AppState;
+use lofty::config::{ParseOptions, WriteOptions};
+use lofty::file::AudioFile;
+use lofty::flac::FlacFile;
+use lofty::ogg::{OggPictureStorage, VorbisComments};
+use lofty::picture::{MimeType, Picture, PictureInformation, PictureType};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, SystemTime};
+use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::backend::DbBackend;
+use tune_core::db::models::SourcePochette;
+use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::track_repo::TrackRepo;
+use tune_core::library::artwork::{artwork_hash, content_hash};
+use tune_core::scanner::watcher::notify::event::{CreateKind, ModifyKind, RemoveKind};
+use tune_core::scanner::watcher::notify::{Event, EventKind};
+use tune_core::scanner::watcher::{ChangeType, FileChange};
+
+pub(super) const JAQUETTE: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-FLAC-5034";
+pub(super) const JAQUETTE_2: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-FLAC-CHANGEE-5034";
+pub(super) const COVER: &[u8] = b"\xFF\xD8\xFF\xE0COVER-JPG-DU-DOSSIER-5034";
+pub(super) const COVER_2: &[u8] = b"\xFF\xD8\xFF\xE0COVER-JPG-CHANGE-DANS-L-EXPLORATEUR-5034";
+const TELEVERSEE: &[u8] = b"\xFF\xD8\xFF\xE0TELEVERSEE-A-LA-MAIN-5034";
+const FOURNISSEUR: &[u8] = b"\xFF\xD8\xFF\xE0COVER-ART-ARCHIVE-5034";
+
+fn gabarit() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tune-core/tests/fixtures/test.flac")
+}
+
+fn hier() -> SystemTime {
+    SystemTime::now() - Duration::from_secs(86_400)
+}
+
+fn dater(fichier: &Path, quand: SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(fichier)
+        .and_then(|f| f.set_modified(quand))
+        .expect("date de modification");
+}
+
+/// Pose (ou retire, `None`) la jaquette intégrée, comme Mp3tag.
+pub(super) fn poser_jaquette(piste: &Path, jaquette: Option<&[u8]>) {
+    let mut f = std::fs::File::open(piste).unwrap();
+    let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+    drop(f);
+    while !flac.pictures().is_empty() {
+        flac.remove_picture(0);
+    }
+    if let Some(octets) = jaquette {
+        let pic = Picture::unchecked(octets.to_vec())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .build();
+        flac.insert_picture(pic, Some(PictureInformation::default()))
+            .unwrap();
+    }
+    flac.save_to_path(piste, WriteOptions::default()).unwrap();
+}
+
+/// Pose, remplace ou retire `cover.jpg`, comme l'explorateur.
+pub(super) fn poser_cover(dossier: &Path, cover: Option<&[u8]>) {
+    let chemin = dossier.join("cover.jpg");
+    match cover {
+        Some(o) => std::fs::write(&chemin, o).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(&chemin);
+        }
+    }
+}
+
+/// Un album de deux pistes, `<racine>/Didier/<nom>/`, tagué `ALBUM = nom`,
+/// daté d'hier.
+pub(super) fn album_dans(
+    racine: &Path,
+    nom: &str,
+    jaquette: Option<&[u8]>,
+    cover: Option<&[u8]>,
+) -> (PathBuf, Vec<PathBuf>) {
+    let dossier = racine.join("Didier").join(nom);
+    std::fs::create_dir_all(&dossier).unwrap();
+    let mut pistes = Vec::new();
+    for (i, titre) in ["Un", "Deux"].iter().enumerate() {
+        let piste = dossier.join(format!("0{} - {titre}.flac", i + 1));
+        std::fs::copy(gabarit(), &piste).unwrap();
+        let mut f = std::fs::File::open(&piste).unwrap();
+        let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut vc = VorbisComments::default();
+        let n = (i + 1).to_string();
+        for (k, v) in [
+            ("TITLE", *titre),
+            ("ARTIST", "Didier"),
+            ("ALBUMARTIST", "Didier"),
+            ("ALBUM", nom),
+            ("TRACKNUMBER", n.as_str()),
+        ] {
+            vc.insert(k.to_string(), v.to_string());
+        }
+        flac.set_vorbis_comments(vc);
+        flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+        poser_jaquette(&piste, jaquette);
+        dater(&piste, hier());
+        pistes.push(piste);
+    }
+    poser_cover(&dossier, cover);
+    if cover.is_some() {
+        dater(&dossier.join("cover.jpg"), hier());
+    }
+    (dossier, pistes)
+}
+
+/// Une racine de musique neuve, sous le dossier courant et NON sous le
+/// dossier temporaire du système : `is_tune_temp_file` écarte tout ce qui vit
+/// sous ce dernier.
+pub(super) fn racine(epreuve: &str) -> tune_core::test_scratch::ScratchDir {
+    tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        &format!("pochettes-5034-{epreuve}"),
+    )
+}
+
+/// Un album de deux pistes seul sous une racine de musique neuve.
+pub(super) fn album_sur_disque(
+    epreuve: &str,
+    jaquette: Option<&[u8]>,
+    cover: Option<&[u8]>,
+) -> (tune_core::test_scratch::ScratchDir, PathBuf, Vec<PathBuf>) {
+    let r = racine(epreuve);
+    let (dossier, pistes) = album_dans(&r, "Album de Didier", jaquette, cover);
+    (r, dossier, pistes)
+}
+
+pub(super) fn etat_sur(racine: &Path) -> AppState {
+    let etat = AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire");
+    SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            "music_dirs",
+            &serde_json::to_string(&[racine.to_string_lossy()]).unwrap(),
+        )
+        .unwrap();
+    etat
+}
+
+/// Le scan MANUEL (`force` = « Analyse complète », `cible` = « Répertoires »),
+/// jusqu'à sa fin annoncée. Le droit de scanner est global au processus : un
+/// autre essai peut le tenir, on attend qu'il revienne.
+pub(super) async fn scan_manuel(etat: &AppState, force: bool, cible: Option<&Path>) {
+    let mut rx = etat.event_bus.subscribe();
+    let debut = Instant::now();
+    let cible = cible.map(|c| c.to_string_lossy().into_owned());
+    while !crate::routes::system::scan::spawn_library_scan(etat.clone(), force, cible.clone()).await
+    {
+        assert!(
+            debut.elapsed() < Duration::from_secs(300),
+            "le droit de scanner n'est jamais revenu"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let fin = tune_core::event_types::EventType::ScanComplete.as_str();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(120), rx.recv())
+            .await
+            .expect("le scan manuel n'a pas annoncé sa fin")
+        {
+            Ok(ev) if ev.event_type == fin => {
+                crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+                return;
+            }
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(e) => panic!("bus d'événements fermé : {e}"),
+        }
+    }
+}
+
+/// Le scan de DÉMARRAGE. Il se retire en silence quand un autre scan tient le
+/// droit : `scan_started_at`, qu'il ne pose qu'une fois le droit acquis, dit
+/// s'il a vraiment tourné.
+pub(super) async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) {
+    let reglages = SettingsRepo::with_backend(db.clone());
+    let debut = Instant::now();
+    loop {
+        reglages.set("scan_started_at", "0").unwrap();
+        let fini = crate::auto_scan::spawn_auto_scan(
+            db.clone(),
+            Arc::new(tune_core::event_bus::EventBus::new()),
+        );
+        while !fini.load(Ordering::Acquire) {
+            assert!(
+                debut.elapsed() < Duration::from_secs(300),
+                "scan de démarrage sans fin"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if reglages.get("scan_started_at").unwrap().as_deref() != Some("0") {
+            crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+            return;
+        }
+        assert!(
+            debut.elapsed() < Duration::from_secs(300),
+            "le droit de scanner n'est jamais revenu"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Un lot du surveillant : les événements Windows de `notify` 7.0.0
+/// (`src/windows.rs`) pour ce qui a bougé, traduits par le gestionnaire de
+/// production, passés par l'attente d'écriture stable, puis traités.
+pub(super) fn lot_du_surveillant(
+    db: &Arc<dyn DbBackend>,
+    racine: &Path,
+    pistes_touchees: &[PathBuf],
+    covers: &[(PathBuf, bool)],
+) {
+    let mut evenements: Vec<Event> = pistes_touchees
+        .iter()
+        .map(|p| Event::new(EventKind::Modify(ModifyKind::Any)).add_path(p.clone()))
+        .collect();
+    for (chemin, existe) in covers {
+        let existe = *existe;
+        // Windows : `FILE_ACTION_REMOVED` → `Remove(Any)` ; une écriture en
+        // place → `Modify(Any)` ; une création → `Create(Any)`.
+        let genre = if !existe {
+            EventKind::Remove(RemoveKind::Any)
+        } else if chemin.exists() {
+            EventKind::Modify(ModifyKind::Any)
+        } else {
+            EventKind::Create(CreateKind::Any)
+        };
+        evenements.push(Event::new(genre).add_path(chemin.clone()));
+    }
+    let changes = tune_core::scanner::watcher::rejouer_evenements_notify(evenements);
+    let (prets, en_attente) = settle_partition(changes, &[]);
+    assert!(
+        en_attente.is_empty(),
+        "montage : rien ne s'écrit encore ({en_attente:?})"
+    );
+    let racines = [racine.to_string_lossy().into_owned()];
+    let mut attente = Vec::new();
+    traiter_le_lot_du_surveillant(
+        db,
+        prets,
+        &ReglagesDuSurveillant {
+            exclusions: &[],
+            racines: &racines,
+            quality_split: true,
+        },
+        &mut attente,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Passe {
+    Rapide,
+    Repertoires,
+    Complete,
+    Demarrage,
+    Surveillant,
+}
+
+/// Ce qu'on fait à la pochette déjà en place avant le geste.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Avant {
+    /// Telle que le premier scan l'a posée.
+    DuScan,
+    /// Téléversée à la main (`POST /albums/{id}/artwork`).
+    Televersee,
+    /// Récupérée chez un fournisseur (Cover Art Archive).
+    Fournisseur,
+    /// Ligne d'avant la migration 111 : source inconnue.
+    SourceInconnue,
+    /// Ligne d'avant #1444 : adresse dérivée du CHEMIN de la première piste,
+    /// source inconnue.
+    AdresseHeritee,
+}
+
+pub(super) struct Cas {
+    pub nom: &'static str,
+    pub avant: (Option<&'static [u8]>, Option<&'static [u8]>),
+    pub pochette: Avant,
+    pub apres: (Option<&'static [u8]>, Option<&'static [u8]>),
+    /// `None` : l'album ne doit plus avoir de pochette.
+    pub attendu: Option<&'static [u8]>,
+    /// Ce qu'attend l'« Analyse complète » quand elle diffère des passes
+    /// automatiques (elle seule remplace une pochette de fournisseur ou de
+    /// source inconnue).
+    pub complet: Option<Option<&'static [u8]>>,
+}
+
+fn nommer(h: Option<&str>) -> String {
+    let noms: [(&[u8], &str); 6] = [
+        (JAQUETTE, "jaquette du FLAC"),
+        (JAQUETTE_2, "jaquette du FLAC changée"),
+        (COVER, "cover.jpg"),
+        (COVER_2, "cover.jpg changé"),
+        (TELEVERSEE, "pochette téléversée"),
+        (FOURNISSEUR, "pochette du fournisseur"),
+    ];
+    match h {
+        None => "aucune".into(),
+        Some(h) => noms
+            .iter()
+            .find(|(o, _)| content_hash(o) == h)
+            .map(|(_, n)| (*n).to_string())
+            .unwrap_or_else(|| format!("autre ({h})")),
+    }
+}
+
+fn album_de(db: &Arc<dyn DbBackend>, piste: &Path) -> i64 {
+    TrackRepo::with_backend(db.clone())
+        .get_by_path(&piste.to_string_lossy())
+        .unwrap()
+        .expect("piste indexée")
+        .album_id
+        .expect("album")
+}
+
+/// Joue le tableau par UNE passe : tous les cas vivent sous la MÊME racine de
+/// musique, un album par cas, indexés par un seul scan, et la passe est jouée
+/// UNE fois — deux scans par passe, pas deux par cas. (Le droit de scanner est
+/// global au processus : cent scans d'affilée affamaient les épreuves voisines
+/// qui en lancent un et le veulent tout de suite.)
+///
+/// Rend TOUS les écarts d'un coup : un rouge dit chaque cas faux, pas
+/// seulement le premier.
+pub(super) async fn jouer_le_tableau(table: &str, cas: &[Cas], passe: Passe) {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    let r = racine(&format!("{table}-{passe:?}"));
+    let albums: Vec<(PathBuf, Vec<PathBuf>)> = cas
+        .iter()
+        .enumerate()
+        .map(|(i, c)| album_dans(&r, &format!("Album {i:02}"), c.avant.0, c.avant.1))
+        .collect();
+    let etat = etat_sur(&r);
+    let db = etat.backend.clone();
+    scan_manuel(&etat, false, None).await;
+    let repo = AlbumRepo::with_backend(db.clone());
+    let mut avant = Vec::new();
+    for (c, (_, pistes)) in cas.iter().zip(&albums) {
+        let aid = album_de(&db, &pistes[0]);
+        match c.pochette {
+            Avant::DuScan => {}
+            Avant::Televersee => repo
+                .force_update_cover_path(aid, &content_hash(TELEVERSEE), SourcePochette::Televersee)
+                .unwrap(),
+            Avant::Fournisseur => repo
+                .force_update_cover_path(
+                    aid,
+                    &content_hash(FOURNISSEUR),
+                    SourcePochette::Fournisseur,
+                )
+                .unwrap(),
+            Avant::SourceInconnue => {
+                db.execute(
+                    "UPDATE albums SET cover_source = NULL, cover_source_path = NULL, \
+                     cover_source_stamp = NULL WHERE id = ?",
+                    &[&aid],
+                )
+                .unwrap();
+            }
+            Avant::AdresseHeritee => {
+                let heritee = artwork_hash(&pistes[0].to_string_lossy());
+                db.execute(
+                    "UPDATE albums SET cover_path = ?, cover_source = NULL, \
+                     cover_source_path = NULL, cover_source_stamp = NULL WHERE id = ?",
+                    &[&heritee as &dyn tune_core::db::backend::ToSqlValue, &aid],
+                )
+                .unwrap();
+            }
+        }
+        avant.push(nommer(
+            repo.get(aid).unwrap().unwrap().cover_path.as_deref(),
+        ));
+    }
+
+    // Les gestes, sur le disque.
+    let mut touchees = Vec::new();
+    let mut covers = Vec::new();
+    for (c, (dossier, pistes)) in cas.iter().zip(&albums) {
+        if c.apres.0 != c.avant.0 {
+            for p in pistes {
+                poser_jaquette(p, c.apres.0);
+                touchees.push(p.clone());
+            }
+        }
+        if c.apres.1 != c.avant.1 {
+            poser_cover(dossier, c.apres.1);
+            covers.push((dossier.join("cover.jpg"), c.apres.1.is_some()));
+        }
+    }
+
+    match passe {
+        Passe::Rapide => scan_manuel(&etat, false, None).await,
+        Passe::Repertoires => scan_manuel(&etat, false, Some(&r.join("Didier"))).await,
+        Passe::Complete => scan_manuel(&etat, true, None).await,
+        Passe::Demarrage => scan_de_demarrage(&db).await,
+        Passe::Surveillant => lot_du_surveillant(&db, &r, &touchees, &covers),
+    }
+
+    let mut ecarts = Vec::new();
+    for ((c, (_, pistes)), avant) in cas.iter().zip(&albums).zip(avant) {
+        let aid = album_de(&db, &pistes[0]);
+        let apres = nommer(repo.get(aid).unwrap().unwrap().cover_path.as_deref());
+        let attendu = match (passe, c.complet) {
+            (Passe::Complete, Some(a)) => a,
+            _ => c.attendu,
+        };
+        let attendu = nommer(attendu.map(content_hash).as_deref());
+        if apres != attendu {
+            ecarts.push(format!(
+                "{passe:?} / {} : avant « {avant} », après « {apres} », attendu « {attendu} »",
+                c.nom
+            ));
+        }
+    }
+    assert!(ecarts.is_empty(), "#5034 —\n{}", ecarts.join("\n"));
+}
+
+/// Les gestes de RETRAIT (points 6 et 8 de Didier) et leurs contre-témoins.
+pub(super) const RETRAITS: &[Cas] = &[
+    Cas {
+        nom: "6 jaquette retiree sans cover.jpg",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::DuScan,
+        apres: (None, None),
+        attendu: None,
+        complet: None,
+    },
+    Cas {
+        nom: "6b jaquette retiree, cover.jpg present",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (None, Some(COVER)),
+        attendu: Some(COVER),
+        complet: None,
+    },
+    Cas {
+        nom: "8 cover.jpg retire sans jaquette",
+        avant: (None, Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (None, None),
+        attendu: None,
+        complet: None,
+    },
+    Cas {
+        nom: "8b cover.jpg retire, jaquette presente",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE), None),
+        attendu: Some(JAQUETTE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis jaquette retiree",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::Televersee,
+        apres: (None, None),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis cover.jpg retire",
+        avant: (None, Some(COVER)),
+        pochette: Avant::Televersee,
+        apres: (None, None),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "fournisseur puis cover.jpg retire",
+        avant: (None, Some(COVER)),
+        pochette: Avant::Fournisseur,
+        apres: (None, None),
+        attendu: Some(FOURNISSEUR),
+        complet: None,
+    },
+    Cas {
+        nom: "source inconnue (avant migration) puis cover.jpg retire",
+        avant: (None, Some(COVER)),
+        pochette: Avant::SourceInconnue,
+        apres: (None, None),
+        attendu: Some(COVER),
+        complet: None,
+    },
+    Cas {
+        nom: "source inconnue (avant migration) puis jaquette retiree",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::SourceInconnue,
+        apres: (None, None),
+        attendu: Some(JAQUETTE),
+        complet: None,
+    },
+];
+
+/// Le retrait PROUVÉ d'une ligne d'avant la migration : son adresse est celle
+/// que l'ancien schéma dérivait du chemin de la piste — un téléversement ne la
+/// fabrique jamais. La jaquette retirée, elle part.
+///
+/// Ne vaut que pour les passes qui RELISENT la piste : le surveillant (piste
+/// modifiée), les scans (piste plus récente que la ligne) — toutes.
+const RETRAIT_PROUVE: &[Cas] = &[Cas {
+    nom: "adresse heritee puis jaquette retiree",
+    avant: (Some(JAQUETTE), None),
+    pochette: Avant::AdresseHeritee,
+    apres: (None, None),
+    attendu: None,
+    complet: None,
+}];
+
+/// Les gestes de CHANGEMENT (points 7 et 9 de Didier) et leurs contre-témoins.
+/// Décision de Bertrand du 25/09/2026 : les passes automatiques suivent une
+/// pochette du disque changée ; une pochette téléversée n'est jamais écrasée.
+pub(super) const CHANGEMENTS: &[Cas] = &[
+    Cas {
+        nom: "7 jaquette changee sans cover.jpg",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+    Cas {
+        nom: "7b jaquette changee, cover.jpg present",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE_2), Some(COVER)),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+    Cas {
+        nom: "9 cover.jpg change sans jaquette",
+        avant: (None, Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (None, Some(COVER_2)),
+        attendu: Some(COVER_2),
+        complet: None,
+    },
+    Cas {
+        // La jaquette intégrée passe avant le cover.jpg (#5035) : changer ce
+        // dernier ne change rien à l'écran.
+        nom: "9b cover.jpg change, jaquette presente",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE), Some(COVER_2)),
+        attendu: Some(JAQUETTE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::Televersee,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis cover.jpg change",
+        avant: (None, Some(COVER)),
+        pochette: Avant::Televersee,
+        apres: (None, Some(COVER_2)),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "fournisseur puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::Fournisseur,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(FOURNISSEUR),
+        // L'Analyse complète reconstruit depuis les fichiers — comme avant.
+        complet: Some(Some(JAQUETTE_2)),
+    },
+    Cas {
+        // Rien ne prouve que l'image en place venait du disque : une passe
+        // automatique la garde ; l'Analyse complète reconstruit, comme avant.
+        nom: "source inconnue (avant migration) puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::SourceInconnue,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE),
+        complet: Some(Some(JAQUETTE_2)),
+    },
+    Cas {
+        nom: "adresse heritee puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::AdresseHeritee,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+];
+
+#[tokio::test]
+async fn changements_par_l_analyse_rapide_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Rapide).await;
+}
+
+#[tokio::test]
+async fn changements_par_repertoires_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Repertoires).await;
+}
+
+#[tokio::test]
+async fn changements_par_l_analyse_complete_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Complete).await;
+}
+
+#[tokio::test]
+async fn changements_par_le_scan_de_demarrage_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Demarrage).await;
+}
+
+#[tokio::test]
+async fn changements_par_le_surveillant_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Surveillant).await;
+}
+
+/// #4650 — le single à la jaquette PROPRE, rangé dans l'album, ne devient
+/// pas la pochette de l'album quand on retouche SA jaquette, ni quand on
+/// retouche l'album entier et qu'il est relu le premier.
+#[tokio::test]
+async fn un_single_retouche_ne_prend_pas_la_pochette_de_l_album_5034() {
+    const SINGLE: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-SINGLE-5034";
+    const SINGLE_2: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-SINGLE-RETOUCHEE-5034";
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Surveillant] {
+        let (racine, _dossier, pistes) =
+            album_sur_disque(&format!("single-{passe:?}"), Some(JAQUETTE), None);
+        poser_jaquette(&pistes[1], Some(SINGLE));
+        dater(&pistes[1], hier());
+        let etat = etat_sur(&racine);
+        let db = etat.backend.clone();
+        scan_manuel(&etat, false, None).await;
+        let aid = album_de(&db, &pistes[0]);
+        let pochette = || {
+            AlbumRepo::with_backend(db.clone())
+                .get(aid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+        };
+        assert_eq!(
+            pochette(),
+            Some(content_hash(JAQUETTE)),
+            "{passe:?} : montage"
+        );
+        // Le single seul, puis l'album entier en commençant par le single.
+        for touchees in [vec![1usize], vec![1, 0]] {
+            for &i in &touchees {
+                let j = if i == 1 { SINGLE_2 } else { JAQUETTE };
+                poser_jaquette(&pistes[i], Some(j));
+            }
+            match passe {
+                Passe::Surveillant => {
+                    for &i in &touchees {
+                        lot_du_surveillant(&db, &racine, &[pistes[i].clone()], &[]);
+                    }
+                }
+                Passe::Demarrage => scan_de_demarrage(&db).await,
+                _ => scan_manuel(&etat, false, None).await,
+            }
+            assert_eq!(
+                pochette(),
+                Some(content_hash(JAQUETTE)),
+                "{passe:?} / pistes retouchées {touchees:?} : le single a pris la pochette de l'album"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retraits_par_l_analyse_rapide_5034() {
+    jouer_le_tableau("retraits", RETRAITS, Passe::Rapide).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Rapide).await;
+}
+
+#[tokio::test]
+async fn retraits_par_repertoires_5034() {
+    jouer_le_tableau("retraits", RETRAITS, Passe::Repertoires).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Repertoires).await;
+}
+
+#[tokio::test]
+async fn retraits_par_l_analyse_complete_5034() {
+    jouer_le_tableau("retraits", RETRAITS, Passe::Complete).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Complete).await;
+}
+
+#[tokio::test]
+async fn retraits_par_le_scan_de_demarrage_5034() {
+    jouer_le_tableau("retraits", RETRAITS, Passe::Demarrage).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Demarrage).await;
+}
+
+#[tokio::test]
+async fn retraits_par_le_surveillant_5034() {
+    jouer_le_tableau("retraits", RETRAITS, Passe::Surveillant).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Surveillant).await;
+}
+
+/// Le surveillant relaie désormais les images de pochette — et SEULEMENT
+/// elles parmi les fichiers non audio. Une suppression de `cover.jpg` sous
+/// Windows (`Remove(Any)`) ne passe plus pour un dossier disparu, et elle
+/// franchit l'attente d'écriture stable, qui jetait tout chemin absent.
+#[test]
+fn le_surveillant_relaie_les_images_de_pochette_5034() {
+    let racine = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "pochettes-5034-relais",
+    );
+    let dossier = racine.join("Album");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let absente = dossier.join("Cover.JPG");
+    let changes = tune_core::scanner::watcher::rejouer_evenements_notify(vec![
+        Event::new(EventKind::Remove(RemoveKind::Any)).add_path(absente.clone()),
+        Event::new(EventKind::Remove(RemoveKind::Any)).add_path(dossier.join("notes.txt")),
+    ]);
+    assert_eq!(
+        changes
+            .iter()
+            .map(|c| (c.change_type.clone(), c.path.clone()))
+            .filter(|(_, p)| p.ends_with("Cover.JPG"))
+            .collect::<Vec<_>>(),
+        vec![(
+            ChangeType::ImageDePochette,
+            absente.to_string_lossy().into_owned()
+        )],
+        "la suppression de Cover.JPG doit être relayée comme image de pochette : {changes:?}"
+    );
+    let (prets, _) = settle_partition(
+        vec![FileChange {
+            change_type: ChangeType::ImageDePochette,
+            path: absente.to_string_lossy().into_owned(),
+        }],
+        &[],
+    );
+    assert_eq!(prets.len(), 1, "une image supprimée n'a rien à attendre");
+}
+
+// ---------------------------------------------------------------------------
+// Décision 3 (25/09/2026) — la jaquette PAR PISTE, lue pour de vrai.
+//
+// `read_metadata` lit avec `.read_cover_art(false)` : `meta.cover_art` est
+// TOUJOURS vide en production, et la pochette propre d'une piste (#4650,
+// #1284) ne se déclenchait jamais. Les épreuves d'origine l'injectaient à la
+// main ; celles-ci passent par la vraie lecture des balises.
+// ---------------------------------------------------------------------------
+
+/// La pochette qu'affiche une piste : `COALESCE(t.cover_path, al.cover_path)`.
+fn pochette_de_piste(db: &Arc<dyn DbBackend>, piste: &Path) -> String {
+    nommer(
+        TrackRepo::with_backend(db.clone())
+            .get_by_path(&piste.to_string_lossy())
+            .unwrap()
+            .expect("piste indexée")
+            .cover_path
+            .as_deref(),
+    )
+}
+
+const SINGLE_PROPRE: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-PROPRE-DU-SINGLE-5034";
+
+/// #4650 — « Angry » rangé dans *Hackney Diamonds* avec sa propre jaquette :
+/// la piste garde la sienne, l'album garde la sienne. Par le scan manuel, le
+/// scan de démarrage et l'Analyse complète, sur un premier index.
+#[tokio::test]
+async fn un_single_garde_sa_jaquette_dans_son_album_4650_5034() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Complete] {
+        let (r, _dossier, pistes) =
+            album_sur_disque(&format!("single-propre-{passe:?}"), Some(JAQUETTE), None);
+        poser_jaquette(&pistes[1], Some(SINGLE_PROPRE));
+        dater(&pistes[1], hier());
+        let etat = etat_sur(&r);
+        let db = etat.backend.clone();
+        match passe {
+            Passe::Demarrage => scan_de_demarrage(&db).await,
+            _ => scan_manuel(&etat, passe == Passe::Complete, None).await,
+        }
+        let aid = album_de(&db, &pistes[0]);
+        let album = nommer(
+            AlbumRepo::with_backend(db.clone())
+                .get(aid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+                .as_deref(),
+        );
+        assert_eq!(
+            (
+                album.as_str(),
+                pochette_de_piste(&db, &pistes[0]),
+                pochette_de_piste(&db, &pistes[1])
+            ),
+            (
+                "jaquette du FLAC",
+                "jaquette du FLAC".to_string(),
+                format!("autre ({})", content_hash(SINGLE_PROPRE))
+            ),
+            "{passe:?} — album, piste 1, single (#4650)"
+        );
+    }
+}
+
+/// #1284 — un dossier fourre-tout (artistes ET albums sans rapport) : chaque
+/// piste montre SA jaquette, pas celle du premier fichier lu.
+#[tokio::test]
+async fn un_dossier_fourre_tout_montre_la_jaquette_de_chaque_piste_1284_5034() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    let r = racine("fourre-tout");
+    let dossier = r.join("Divers");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let mut pistes = Vec::new();
+    for (i, (artiste, album, jaquette)) in [
+        ("Brel", "Ces gens-là", JAQUETTE),
+        ("Ferré", "Avec le temps", JAQUETTE_2),
+        ("Barbara", "L'Aigle noir", SINGLE_PROPRE),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let piste = dossier.join(format!("0{} - {artiste}.flac", i + 1));
+        std::fs::copy(gabarit(), &piste).unwrap();
+        let mut f = std::fs::File::open(&piste).unwrap();
+        let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut vc = VorbisComments::default();
+        for (k, v) in [("TITLE", *artiste), ("ARTIST", *artiste), ("ALBUM", *album)] {
+            vc.insert(k.to_string(), v.to_string());
+        }
+        flac.set_vorbis_comments(vc);
+        flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+        poser_jaquette(&piste, Some(jaquette));
+        pistes.push(piste);
+    }
+    let etat = etat_sur(&r);
+    let db = etat.backend.clone();
+    scan_manuel(&etat, false, None).await;
+    let vues: Vec<String> = pistes.iter().map(|p| pochette_de_piste(&db, p)).collect();
+    assert_eq!(
+        vues,
+        vec![
+            "jaquette du FLAC".to_string(),
+            "jaquette du FLAC changée".to_string(),
+            format!("autre ({})", content_hash(SINGLE_PROPRE)),
+        ],
+        "#1284 — chaque piste du dossier fourre-tout garde sa jaquette"
+    );
+}
+
+/// #5035 — l'hypothèse de l'enquête, AVÉRÉE : la PREMIÈRE piste lue n'a pas
+/// de jaquette, les autres en ont une, et le dossier porte un `cover.jpg`.
+/// Le `cover.jpg` gagnait — `albums_with_cover` le figeait pour tout le scan.
+/// La règle est « jaquette intégrée d'abord » : elle doit gagner.
+#[tokio::test]
+async fn la_jaquette_passe_avant_le_cover_jpg_meme_si_la_premiere_piste_n_en_a_pas_5035() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Complete] {
+        let (r, _dossier, pistes) = album_sur_disque(
+            &format!("premiere-sans-jaquette-{passe:?}"),
+            Some(JAQUETTE),
+            Some(COVER),
+        );
+        poser_jaquette(&pistes[0], None);
+        dater(&pistes[0], hier());
+        let etat = etat_sur(&r);
+        let db = etat.backend.clone();
+        match passe {
+            Passe::Demarrage => scan_de_demarrage(&db).await,
+            _ => scan_manuel(&etat, passe == Passe::Complete, None).await,
+        }
+        let aid = album_de(&db, &pistes[0]);
+        assert_eq!(
+            nommer(
+                AlbumRepo::with_backend(db.clone())
+                    .get(aid)
+                    .unwrap()
+                    .unwrap()
+                    .cover_path
+                    .as_deref()
+            ),
+            "jaquette du FLAC",
+            "{passe:?} — #5035 : la jaquette de la piste 2 passe avant le cover.jpg"
+        );
+    }
+}
+
+/// MESURE (décision 3) — le coût de la lecture des jaquettes sur un vrai scan.
+///
+/// Banc, pas témoin : `#[ignore]`, joué à la main de part et d'autre du
+/// correctif (`cargo test --release -p tune-server … -- --ignored
+/// banc_cout_de_la_jaquette_par_piste_5034 --nocapture`). La bibliothèque est
+/// fabriquée une fois sous `banc-5034-pochettes/`, dans le dossier courant
+/// (pas le dossier temporaire du système, que le scan écarte). Trois scans sur
+/// base neuve, puis le travail AJOUTÉ par le correctif, mesuré seul.
+#[tokio::test]
+#[ignore = "banc de mesure, 800 Mo de FLAC : à jouer à la main"]
+async fn banc_cout_de_la_jaquette_par_piste_5034() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("banc-5034-pochettes")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&dir).unwrap();
+    // La bibliothèque, fabriquée une fois : 300 albums de 10 pistes, une
+    // jaquette de 256 Kio par album (octets pseudo-aléatoires : le scan ne
+    // décode pas l'image), un `cover.jpg` un album sur trois, un single à la
+    // jaquette propre un album sur cinq.
+    let marque = Path::new(&dir).join(".banc5034");
+    if !marque.exists() {
+        let albums: usize = 300;
+        let mut graine: u64 = 0x5034;
+        let mut octets = |n: usize| -> Vec<u8> {
+            let mut v = b"\xFF\xD8\xFF\xE0".to_vec();
+            while v.len() < n {
+                graine ^= graine << 13;
+                graine ^= graine >> 7;
+                graine ^= graine << 17;
+                v.extend_from_slice(&graine.to_le_bytes());
+            }
+            v
+        };
+        for a in 0..albums {
+            let jaquette = octets(256 * 1024);
+            let single = octets(200 * 1024);
+            let dossier = Path::new(&dir)
+                .join(format!("Artiste {:03}", a / 10))
+                .join(format!("Album {a:03}"));
+            std::fs::create_dir_all(&dossier).unwrap();
+            for t in 0..10 {
+                let piste = dossier.join(format!("{:02} - Titre.flac", t + 1));
+                std::fs::copy(gabarit(), &piste).unwrap();
+                let mut f = std::fs::File::open(&piste).unwrap();
+                let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+                drop(f);
+                let mut vc = VorbisComments::default();
+                let n = (t + 1).to_string();
+                let album = format!("Album {a:03}");
+                let artiste = format!("Artiste {:03}", a / 10);
+                for (k, v) in [
+                    ("TITLE", format!("Titre {n}")),
+                    ("ARTIST", artiste.clone()),
+                    ("ALBUMARTIST", artiste),
+                    ("ALBUM", album),
+                    ("TRACKNUMBER", n),
+                ] {
+                    vc.insert(k.to_string(), v);
+                }
+                flac.set_vorbis_comments(vc);
+                flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+                let j = if a % 5 == 0 && t == 3 {
+                    &single
+                } else {
+                    &jaquette
+                };
+                poser_jaquette(&piste, Some(j));
+            }
+            if a % 3 == 0 {
+                std::fs::write(dossier.join("cover.jpg"), octets(300 * 1024)).unwrap();
+            }
+        }
+        std::fs::write(&marque, b"").unwrap();
+    }
+    for tour in 0..3 {
+        let etat = etat_sur(Path::new(&dir));
+        let debut = Instant::now();
+        scan_manuel(&etat, false, None).await;
+        let duree = debut.elapsed();
+        let n = TrackRepo::with_backend(etat.backend.clone())
+            .get_all_file_info_by_path()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        eprintln!(
+            "BANC5034 tour={tour} pistes={n} premier_scan_ms={}",
+            duree.as_millis()
+        );
+    }
+    // Le travail que le correctif AJOUTE, isolé du reste du scan : relire la
+    // jaquette de chaque piste (une à la fois, cache disque chaud) et en
+    // prendre le condensat.
+    let pistes = tune_core::scanner::walker::list_audio_files(std::slice::from_ref(&dir)).files;
+    for tour in 0..3 {
+        let debut = Instant::now();
+        let mut octets = 0usize;
+        for p in &pistes {
+            if let Some((data, _)) = tune_core::library::artwork::extract_cover_art(p) {
+                octets += data.len();
+                std::hint::black_box(content_hash(&data));
+            }
+        }
+        eprintln!(
+            "BANC5034 jaquettes tour={tour} pistes={} octets={octets} ms={}",
+            pistes.len(),
+            debut.elapsed().as_millis()
+        );
+    }
+}

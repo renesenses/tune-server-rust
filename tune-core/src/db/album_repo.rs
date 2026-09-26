@@ -3,9 +3,23 @@ use std::sync::Arc;
 use super::absorption::{self, table_absente};
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
-use super::models::Album;
+use super::models::{Album, SourcePochette};
 use super::sqlite::SqliteDb;
 use crate::TuneError;
+
+/// #5034 — la pochette d'un album et ce que la base sait de sa source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EtatPochette {
+    pub cover_path: Option<String>,
+    /// `None` : inconnue (ligne d'avant la migration 111, ou valeur d'une
+    /// version plus récente).
+    pub source: Option<SourcePochette>,
+    /// Le fichier d'où la pochette a été tirée : la piste pour une jaquette
+    /// intégrée, l'image pour une pochette de dossier.
+    pub fichier: Option<String>,
+    /// « mtime:taille » de ce fichier au moment de la lecture.
+    pub empreinte: Option<String>,
+}
 
 /// Engine-agnostic SQL builders for album_repo.
 pub mod sql {
@@ -322,11 +336,70 @@ pub mod sql {
         )
     }
 
+    /// Pose une pochette sur un album qui n'en a PAS — l'ancien `COALESCE`,
+    /// écrit en `WHERE cover_path IS NULL` pour que la SOURCE (#5034) ne
+    /// s'écrive qu'avec la pochette qu'elle décrit.
     pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET cover_path = COALESCE(cover_path, {}) WHERE id = {}",
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {} AND cover_path IS NULL",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    /// #5034 — pochette tirée du DISQUE, avec le fichier d'où elle sort et
+    /// son empreinte (« mtime:taille ») : c'est ce qui permet au scan suivant
+    /// de voir, d'un seul `stat`, que ce fichier a changé ou disparu.
+    pub fn poser_pochette_du_disque<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = {}, cover_source_stamp = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
+
+    /// #5034 — la pochette ET sa source partent ensemble.
+    pub fn retirer_pochette<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = NULL, cover_source = NULL, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn etat_pochette<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT cover_path, cover_source, cover_source_path, cover_source_stamp FROM albums WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// #5034 — les albums LOCAUX dont la pochette sort d'un fichier connu.
+    pub fn pochettes_tirees_du_disque() -> &'static str {
+        "SELECT id, cover_source_path, cover_source_stamp FROM albums \
+         WHERE cover_source IN ('embedded', 'folder') AND cover_source_path IS NOT NULL \
+         AND source = 'local' ORDER BY id"
+    }
+
+    /// #5034 — l'absorption d'un doublon reprend sa pochette quand la cible
+    /// n'en a pas : la SOURCE doit venir avec elle, jamais seule. Joué AVANT
+    /// la reprise générique des champs vides, tant que la cible est vide.
+    pub fn reprendre_la_source_de_pochette<D: SqlDialect>(d: &D) -> String {
+        // Cinq marqueurs distincts : `?` de SQLite est positionnel, un
+        // marqueur répété y compterait deux paramètres.
+        let p: Vec<String> = (1..=5).map(|i| d.placeholder(i)).collect();
+        format!(
+            "UPDATE albums SET \
+               cover_source = (SELECT d.cover_source FROM albums d WHERE d.id = {}), \
+               cover_source_path = (SELECT d.cover_source_path FROM albums d WHERE d.id = {}), \
+               cover_source_stamp = (SELECT d.cover_source_stamp FROM albums d WHERE d.id = {}) \
+             WHERE id = {} AND (cover_path IS NULL OR cover_path = '') \
+               AND EXISTS (SELECT 1 FROM albums d WHERE d.id = {} \
+                           AND d.cover_path IS NOT NULL AND d.cover_path <> '')",
+            p[0], p[1], p[2], p[3], p[4]
         )
     }
 
@@ -340,9 +413,10 @@ pub mod sql {
 
     pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET cover_path = {} WHERE id = {}",
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -968,6 +1042,18 @@ impl AlbumRepo {
     /// Les champs de la cible restés vides prennent la valeur du doublon —
     /// jamais l'inverse : un champ renseigné sur la cible ne cède pas.
     fn reprendre_les_champs_vides(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
+        // #5034 — la source de la pochette voyage AVEC elle, avant que la
+        // reprise générique ne remplisse `cover_path`.
+        let sql = self.dialect_sql(
+            sql::reprendre_la_source_de_pochette,
+            sql::reprendre_la_source_de_pochette,
+        );
+        let params: [&dyn ToSqlValue; 5] = [&doublon, &doublon, &doublon, &cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => {}
+            Err(e) if table_absente(&e) => {}
+            Err(e) => return Err(TuneError::from(e)),
+        }
         const CHAMPS: [&str; 8] = [
             "cover_path",
             "year",
@@ -2050,11 +2136,86 @@ impl AlbumRepo {
         Ok(())
     }
 
-    pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), TuneError> {
+    /// Pose une pochette sur un album qui n'en a pas encore ; ne remplace
+    /// jamais une valeur en place. `source` dit d'où elle vient (#5034) : c'est
+    /// elle qui décide, plus tard, si un scan peut la retirer.
+    pub fn update_cover_path(
+        &self,
+        album_id: i64,
+        cover_path: &str,
+        source: SourcePochette,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
-        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 3] = [&cover_path, &source, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// #5034 — pochette tirée du disque : jaquette d'une piste ou image du
+    /// dossier, avec le fichier qui l'a donnée et son empreinte.
+    pub fn poser_pochette_du_disque(
+        &self,
+        album_id: i64,
+        cover_path: &str,
+        source: SourcePochette,
+        fichier: &str,
+        empreinte: Option<&str>,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::poser_pochette_du_disque, sql::poser_pochette_du_disque);
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 5] = [&cover_path, &source, &fichier, &empreinte, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// #5034 — retire la pochette d'un album, et sa source avec elle.
+    pub fn retirer_pochette(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::retirer_pochette, sql::retirer_pochette);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// #5034 — la pochette d'un album et ce que la base sait de sa source.
+    ///
+    /// Lue sur la connexion d'ÉCRITURE (`query_one_strong`) : le scan
+    /// l'interroge au milieu du lot qui vient de créer la ligne album, que
+    /// les connexions de lecture ne voient pas encore.
+    pub fn etat_pochette(&self, album_id: i64) -> Result<Option<EtatPochette>, TuneError> {
+        let sql = self.dialect_sql(sql::etat_pochette, sql::etat_pochette);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        Ok(self.db.query_one_strong(&sql, &params)?.map(|cols| {
+            let texte = |i: usize| {
+                cols.get(i)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+            };
+            EtatPochette {
+                cover_path: texte(0),
+                source: texte(1).as_deref().and_then(SourcePochette::depuis_colonne),
+                fichier: texte(2),
+                empreinte: texte(3),
+            }
+        }))
+    }
+
+    /// #5034 — `(album, fichier source, empreinte)` de chaque album local dont
+    /// la pochette sort d'un fichier du disque.
+    pub fn pochettes_tirees_du_disque(
+        &self,
+    ) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
+        let rows = self.db.query_many(sql::pochettes_tirees_du_disque(), &[])?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first().and_then(|v| v.as_i64())?,
+                    cols.get(1).and_then(|v| v.as_string())?,
+                    cols.get(2).and_then(|v| v.as_string()),
+                ))
+            })
+            .collect())
     }
 
     /// Like `update_cover_path` but always overwrites the existing value.
@@ -2084,13 +2245,18 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Écrase la pochette en place. `source` dit d'où vient la nouvelle
+    /// (#5034) ; le fichier d'origine est oublié — ce n'est pas une pochette
+    /// du disque, ou son fichier n'est pas suivi.
     pub fn force_update_cover_path(
         &self,
         album_id: i64,
         cover_path: &str,
+        source: SourcePochette,
     ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_cover_path, sql::force_update_cover_path);
-        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 3] = [&cover_path, &source, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -4435,13 +4601,15 @@ mod tests {
         let repo = AlbumRepo::new(db);
 
         let id = repo.create(&Album::new("Test Album".into())).unwrap();
-        repo.update_cover_path(id, "abc123").unwrap();
+        repo.update_cover_path(id, "abc123", SourcePochette::Dossier)
+            .unwrap();
 
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
         // COALESCE: does NOT overwrite existing cover_path
-        repo.update_cover_path(id, "new_hash").unwrap();
+        repo.update_cover_path(id, "new_hash", SourcePochette::Dossier)
+            .unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("abc123"));
     }
@@ -4452,13 +4620,15 @@ mod tests {
         let repo = AlbumRepo::new(db);
 
         let id = repo.create(&Album::new("Test Album".into())).unwrap();
-        repo.update_cover_path(id, "abc123").unwrap();
+        repo.update_cover_path(id, "abc123", SourcePochette::Dossier)
+            .unwrap();
 
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
         // force: DOES overwrite existing cover_path (used by rescan endpoints)
-        repo.force_update_cover_path(id, "new_hash").unwrap();
+        repo.force_update_cover_path(id, "new_hash", SourcePochette::Televersee)
+            .unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("new_hash"));
     }

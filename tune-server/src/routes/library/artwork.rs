@@ -280,7 +280,11 @@ pub(super) async fn upload_album_artwork(
             .into_response();
     }
 
-    album_repo.force_update_cover_path(id, &hash).ok();
+    // #5034 — TÉLÉVERSÉE : aucune passe de scan ne la remplacera ni ne la
+    // retirera.
+    album_repo
+        .force_update_cover_path(id, &hash, tune_core::db::models::SourcePochette::Televersee)
+        .ok();
 
     // Return the updated album
     match album_repo.get(id) {
@@ -505,7 +509,12 @@ pub(super) async fn enrich_album_artwork(
             if let Some(hash) =
                 tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
-                repo.update_cover_path(id, &hash).ok();
+                repo.update_cover_path(
+                    id,
+                    &hash,
+                    tune_core::db::models::SourcePochette::Fournisseur,
+                )
+                .ok();
                 Json(json!({"enriched": true, "hash": hash, "size": data.len(), "mbid": mbid_val}))
                     .into_response()
             } else {
@@ -2004,7 +2013,6 @@ pub(super) async fn rescan_album_artwork(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
     if tracks.is_empty() {
         return (
@@ -2014,28 +2022,21 @@ pub(super) async fn rescan_album_artwork(
             .into_response();
     }
     let cache_dir = artwork_cache_dir();
-    let mut found_hash: Option<String> = None;
-    for track in &tracks {
-        if let Some(ref file_path) = track.file_path {
-            // `refresh_cover_hash` et non `get_or_extract` : cette route EST le
-            // rattrapage manuel. `get_or_extract` sonde d'abord l'entrée
-            // héritée, adressée par le CHEMIN de la piste — remplacer
-            // `cover.jpg` ne déplace pas ce chemin, donc la sonde rendait
-            // l'ancienne image et le `force_update_cover_path` ci-dessous
-            // réécrivait la base avec le condensat qu'elle portait déjà. Le
-            // bouton ne pouvait rien changer (#3028).
-            if let Some(hash) = tune_core::library::artwork::refresh_cover_hash(
-                std::path::Path::new(file_path),
-                &cache_dir,
-            ) {
-                found_hash = Some(hash);
-                break;
-            }
-        }
-    }
-    if let Some(ref hash) = found_hash {
-        album_repo.force_update_cover_path(id, hash).ok();
-    }
+    // Relecture du DISQUE, sans sonde héritée : c'est le rattrapage manuel
+    // (#3028). Même règle que le scan complet (#5034) — la jaquette intégrée
+    // d'abord, puis l'image du dossier ; source et fichier écrits avec la
+    // pochette ; une pochette TÉLÉVERSÉE n'est jamais écrasée ; une pochette
+    // du disque dont le fichier a disparu est retirée.
+    let found_hash = match tune_core::library::pochette_disque::reevaluer_l_album(
+        &state.backend,
+        id,
+        &cache_dir,
+        true,
+        None,
+    ) {
+        tune_core::library::pochette_disque::Geste::Poser(l) => Some(l.condensat),
+        _ => None,
+    };
     Json(json!({
         "album_id": id,
         "rescanned_tracks": tracks.len(),
@@ -2109,8 +2110,6 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
             .filter_map(|row| row.first().and_then(|v| v.as_i64()))
             .collect();
 
-        let track_repo = TrackRepo::with_backend(backend.clone());
-        let album_repo = AlbumRepo::with_backend(backend);
         let mut fin = FinDeReprise {
             bus: event_bus.clone(),
             avancement: AvancementPochettes {
@@ -2131,21 +2130,14 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
             );
         }
         for album_id in &albums {
-            let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
-            for track in &tracks {
-                if let Some(ref file_path) = track.file_path {
-                    // Même raison qu'au rattrapage par album : sans sauter la
-                    // sonde héritée, cette passe réécrit la base avec le
-                    // condensat qu'elle portait déjà (#3028).
-                    if let Some(hash) = tune_core::library::artwork::refresh_cover_hash(
-                        std::path::Path::new(file_path),
-                        &cache_dir,
-                    ) {
-                        album_repo.force_update_cover_path(*album_id, &hash).ok();
-                        fin.avancement.trouvees += 1;
-                        break;
-                    }
-                }
+            // Même règle que le rattrapage par album (#3028, #5034).
+            if matches!(
+                tune_core::library::pochette_disque::reevaluer_l_album(
+                    &backend, *album_id, &cache_dir, true, None,
+                ),
+                tune_core::library::pochette_disque::Geste::Poser(_)
+            ) {
+                fin.avancement.trouvees += 1;
             }
             fin.avancement.traites += 1;
             if cadence.autorise() {

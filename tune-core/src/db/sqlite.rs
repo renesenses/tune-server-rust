@@ -528,7 +528,16 @@ CREATE TABLE IF NOT EXISTS albums (
     -- Dernier passage de la passe des credits MusicBrainz sur ce disque
     -- (migration 107, #4767). NUL = jamais interroge : c'est le curseur de
     -- reprise de `POST /system/enrich-credits`.
-    credits_mb_at TEXT
+    credits_mb_at TEXT,
+    -- D'ou vient la pochette (migration 111, #5034) : `embedded`, `folder`,
+    -- `upload`, `provider`, `import` — voir `models::SourcePochette`. NUL =
+    -- INCONNUE, l'etat de toute ligne d'avant la migration : jamais retiree
+    -- sans preuve. `cover_source_path` / `cover_source_stamp` : le fichier
+    -- d'ou l'image a ete tiree et sa date/taille a ce moment-la (« mtime:taille »),
+    -- pour qu'un scan sache, d'un seul stat, que la source a change ou disparu.
+    cover_source TEXT,
+    cover_source_path TEXT,
+    cover_source_stamp TEXT
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,

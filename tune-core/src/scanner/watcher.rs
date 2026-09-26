@@ -32,6 +32,13 @@ pub enum ChangeType {
     /// — il n'existe plus — : `auto_scan` le décide d'après les pistes qu'il
     /// contenait, et un chemin sans piste n'y touche à rien.
     DossierDisparu,
+    /// #5034 — une IMAGE DE POCHETTE de dossier (`cover.jpg`, `folder.png`…)
+    /// a été créée, modifiée, renommée ou supprimée. Le surveillant ne
+    /// relayait que l'audio : remplacer ou retirer le `cover.jpg` d'un album
+    /// n'était vu par personne jusqu'au scan suivant — et même lui ne le
+    /// voyait pas, les pistes n'ayant pas changé. Le geste exact importe peu :
+    /// `auto_scan` relit l'album du dossier et laisse la règle trancher.
+    ImageDePochette,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +107,16 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
             }
             for path in &event.paths {
                 if is_audio_file(path) || super::is_tune_temp_file(path) {
+                    continue;
+                }
+                // #5034 — une image de pochette n'est pas un dossier : sous
+                // Windows, sa suppression (`Remove(Any)`) passerait sinon pour
+                // un dossier disparu.
+                if crate::library::pochette_disque::est_une_image_de_pochette(path) {
+                    let _ = event_tx.send(FileChange {
+                        change_type: ChangeType::ImageDePochette,
+                        path: path.to_string_lossy().to_string(),
+                    });
                     continue;
                 }
                 if let Some(genre) = evenement_de_dossier(&event.kind, path) {
@@ -710,9 +727,12 @@ mod tests {
             ),
             evp(EventKind::Create(CreateKind::Any), &pochette),
         ]));
-        assert!(
-            vus.is_empty(),
-            "une pochette présente ne dit rien : {vus:?}"
+        // #5034 — elle est désormais RELAYÉE, mais comme image de pochette :
+        // jamais comme un dossier.
+        assert_eq!(
+            vus.values().collect::<Vec<_>>(),
+            vec![&ChangeType::ImageDePochette],
+            "une pochette n'est jamais un dossier : {vus:?}"
         );
         // Le moteur a dit « fichier » : pas de dossier, même disparu.
         let vus = genres(&rejouer_evenements_notify(vec![evp(

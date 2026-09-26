@@ -1711,6 +1711,31 @@ impl TrackRepo {
             .collect())
     }
 
+    /// #5034 — `(fichier, album)` des pistes rangées sous `dossier` (découpage
+    /// exact, comme [`Self::fichiers_sous_dossier`]) : ce qu'une image de
+    /// pochette de ce dossier peut illustrer.
+    pub fn albums_sous_dossier(&self, dossier: &str) -> Result<Vec<(String, i64)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT DISTINCT {c}, album_id FROM tracks WHERE {c} LIKE {p1}{esc} \
+             AND substr({c}, 1, {n}) = {p2} AND album_id IS NOT NULL",
+            c = CHEMIN_DE_LA_PISTE,
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let chemin = ligne.first()?.as_string()?;
+                Some((chemin, ligne.get(1)?.as_i64()?))
+            })
+            .collect())
+    }
+
     /// #4896 — un dossier renommé ou déplacé : chaque fichier `(ancien,
     /// nouveau)` change de chemin en GARDANT sa ligne, donc son identifiant et
     /// tout ce qui s'y rattache (favoris, écoutes, étiquettes, files
@@ -3934,7 +3959,11 @@ mod tests {
             .id
             .unwrap();
         albums
-            .update_cover_path(album_id, "album-sleeve-hash")
+            .update_cover_path(
+                album_id,
+                "album-sleeve-hash",
+                crate::db::models::SourcePochette::Dossier,
+            )
             .unwrap();
 
         let repo = TrackRepo::new(db.clone());
@@ -4988,7 +5017,13 @@ mod tests {
         let album = albums
             .create(&Album::new("Hackney Diamonds".into()))
             .unwrap();
-        albums.update_cover_path(album, "condensat-album").unwrap();
+        albums
+            .update_cover_path(
+                album,
+                "condensat-album",
+                crate::db::models::SourcePochette::Integree,
+            )
+            .unwrap();
 
         // La piste telle qu'un scan d'avant le correctif l'a posée : aucune
         // pochette propre.

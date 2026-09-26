@@ -60,4 +60,6 @@ pub mod zone_repo;
 mod album_dr_provenance_tests;
 #[cfg(test)]
 mod lenteur_albums_4800_tests;
+#[cfg(test)]
+mod pochette_source_pg_tests_5034;
 pub mod upnp_revision;
