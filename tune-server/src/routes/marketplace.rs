@@ -286,12 +286,11 @@ async fn install_plugin(
     };
 
     // Gate: paid plugins require Premium.
-    if !is_free_plugin(&plugin) {
-        if let Err(resp) =
+    if !is_free_plugin(&plugin)
+        && let Err(resp) =
             crate::premium_guard::require_premium(&state.license, Feature::PluginMarketplace).await
-        {
-            return resp;
-        }
+    {
+        return resp;
     }
 
     // Download the plugin archive. The Laravel store keys the download route
@@ -601,12 +600,11 @@ async fn update_plugin(
     }
 
     // Gate: paid plugins require Premium.
-    if !is_free_plugin(&plugin) {
-        if let Err(resp) =
+    if !is_free_plugin(&plugin)
+        && let Err(resp) =
             crate::premium_guard::require_premium(&state.license, Feature::PluginMarketplace).await
-        {
-            return resp;
-        }
+    {
+        return resp;
     }
 
     // Download new version. Keyed on the package name, like install.

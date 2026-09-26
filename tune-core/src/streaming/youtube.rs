@@ -301,13 +301,9 @@ impl UrlCache {
     }
 
     fn get(&self, key: &str) -> Option<&CachedUrl> {
-        self.entries.get(key).and_then(|entry| {
-            if entry.created.elapsed() < self.ttl {
-                Some(entry)
-            } else {
-                None
-            }
-        })
+        self.entries
+            .get(key)
+            .filter(|&entry| entry.created.elapsed() < self.ttl)
     }
 
     fn set(&mut self, key: String, entry: CachedUrl) {
@@ -1107,10 +1103,10 @@ impl YouTubeService {
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await;
-        if let Ok(resp) = resp {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                self.email = data["email"].as_str().map(String::from);
-            }
+        if let Ok(resp) = resp
+            && let Ok(data) = resp.json::<serde_json::Value>().await
+        {
+            self.email = data["email"].as_str().map(String::from);
         }
     }
 
@@ -1902,11 +1898,10 @@ impl YouTubeService {
                         &[("part", "snippet,contentDetails"), ("id", &ids)],
                     )
                     .await
+                    && let Some(items) = data["items"].as_array()
                 {
-                    if let Some(items) = data["items"].as_array() {
-                        for item in items {
-                            tracks.push(Self::map_video(item));
-                        }
+                    for item in items {
+                        tracks.push(Self::map_video(item));
                     }
                 }
             }
@@ -2105,7 +2100,7 @@ impl YouTubeService {
                 r["text"]
                     .as_str()
                     .and_then(|t| t.parse::<u32>().ok())
-                    .filter(|&y| y >= 1900 && y <= 2100)
+                    .filter(|&y| (1900..=2100).contains(&y))
             })
         });
 
@@ -2212,7 +2207,7 @@ impl YouTubeService {
                                 r["text"]
                                     .as_str()
                                     .and_then(|t| t.parse::<u32>().ok())
-                                    .filter(|&y| y >= 1900 && y <= 2100)
+                                    .filter(|&y| (1900..=2100).contains(&y))
                             })
                         });
 
@@ -2710,18 +2705,16 @@ impl StreamingService for YouTubeService {
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
         // Try Data API v3 first for full metadata
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get(
                     "videos",
                     &[("part", "snippet,contentDetails"), ("id", track_id)],
                 )
                 .await
-            {
-                if let Some(item) = data["items"].as_array().and_then(|a| a.first()) {
-                    return Ok(Self::map_video(item));
-                }
-            }
+            && let Some(item) = data["items"].as_array().and_then(|a| a.first())
+        {
+            return Ok(Self::map_video(item));
         }
 
         // Fallback: return a basic track with thumbnail
@@ -2786,7 +2779,7 @@ impl StreamingService for YouTubeService {
         let FluxYoutube { url, headers } = self
             .extract_audio_url(track_id)
             .await
-            .map_err(|e| TuneError::Streaming(e))?;
+            .map_err(TuneError::Streaming)?;
 
         // Determine MIME type + codec from the resolved URL. The codec label
         // drives the temp-file extension used by the decoder: m4a/AAC routes to
@@ -2836,30 +2829,27 @@ impl StreamingService for YouTubeService {
 
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
         // If it starts with "MPREb_" or similar, it's a YTM album browseId
-        if album_id.starts_with("MPRE") || album_id.starts_with("OLAK") {
-            if let Ok(data) = self.ytm_browse(album_id).await {
-                if let Some(mut album) = Self::parse_album_header(&data) {
-                    album.id = album_id.into();
-                    let tracks = Self::parse_browse_tracks(&data);
-                    album.track_count = tracks.len() as u32;
-                    return Ok(album);
-                }
-            }
+        if (album_id.starts_with("MPRE") || album_id.starts_with("OLAK"))
+            && let Ok(data) = self.ytm_browse(album_id).await
+            && let Some(mut album) = Self::parse_album_header(&data)
+        {
+            album.id = album_id.into();
+            let tracks = Self::parse_browse_tracks(&data);
+            album.track_count = tracks.len() as u32;
+            return Ok(album);
         }
 
         // Try YouTube Data API v3 (playlist)
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get(
                     "playlists",
                     &[("part", "snippet,contentDetails"), ("id", album_id)],
                 )
                 .await
-            {
-                if let Some(item) = data["items"].as_array().and_then(|a| a.first()) {
-                    return Ok(Self::map_playlist_as_album(item));
-                }
-            }
+            && let Some(item) = data["items"].as_array().and_then(|a| a.first())
+        {
+            return Ok(Self::map_playlist_as_album(item));
         }
 
         // Fallback: try YTM browse for any ID
@@ -2936,23 +2926,21 @@ impl StreamingService for YouTubeService {
 
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         // Try YTM browse first (richer artist data)
-        if let Ok(data) = self.ytm_browse(artist_id).await {
-            if let Some(mut artist) = Self::parse_artist_header(&data) {
-                artist.id = artist_id.into();
-                return Ok(artist);
-            }
+        if let Ok(data) = self.ytm_browse(artist_id).await
+            && let Some(mut artist) = Self::parse_artist_header(&data)
+        {
+            artist.id = artist_id.into();
+            return Ok(artist);
         }
 
         // Try Data API v3
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get("channels", &[("part", "snippet"), ("id", artist_id)])
                 .await
-            {
-                if let Some(item) = data["items"].as_array().and_then(|a| a.first()) {
-                    return Ok(Self::map_channel(item));
-                }
-            }
+            && let Some(item) = data["items"].as_array().and_then(|a| a.first())
+        {
+            return Ok(Self::map_channel(item));
         }
 
         Err(TuneError::NotFound(format!(
@@ -2970,8 +2958,8 @@ impl StreamingService for YouTubeService {
         }
 
         // Try Data API v3 (channel playlists)
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get(
                     "playlists",
                     &[
@@ -2981,13 +2969,12 @@ impl StreamingService for YouTubeService {
                     ],
                 )
                 .await
-            {
-                let albums = data["items"]
-                    .as_array()
-                    .map(|items| items.iter().map(Self::map_playlist_as_album).collect())
-                    .unwrap_or_default();
-                return Ok(albums);
-            }
+        {
+            let albums = data["items"]
+                .as_array()
+                .map(|items| items.iter().map(Self::map_playlist_as_album).collect())
+                .unwrap_or_default();
+            return Ok(albums);
         }
 
         Ok(vec![])
@@ -3003,8 +2990,8 @@ impl StreamingService for YouTubeService {
         }
 
         // Try Data API v3 (channel's recent videos)
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get(
                     "search",
                     &[
@@ -3016,15 +3003,14 @@ impl StreamingService for YouTubeService {
                     ],
                 )
                 .await
-            {
-                let video_ids: Vec<String> = data["items"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter_map(|item| item["id"]["videoId"].as_str().map(String::from))
-                    .collect();
-                return Ok(self.fetch_videos_batch(&video_ids).await);
-            }
+        {
+            let video_ids: Vec<String> = data["items"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|item| item["id"]["videoId"].as_str().map(String::from))
+                .collect();
+            return Ok(self.fetch_videos_batch(&video_ids).await);
         }
 
         Ok(vec![])
@@ -3082,31 +3068,29 @@ impl StreamingService for YouTubeService {
         }
 
         // Try Data API v3
-        if self.api_key.is_some() {
-            if let Ok(data) = self
+        if self.api_key.is_some()
+            && let Ok(data) = self
                 .yt_api_get(
                     "playlists",
                     &[("part", "snippet,contentDetails"), ("id", playlist_id)],
                 )
                 .await
-            {
-                if let Some(item) = data["items"].as_array().and_then(|a| a.first()) {
-                    let snippet = &item["snippet"];
-                    let content = &item["contentDetails"];
-                    return Ok(StreamPlaylist {
-                        id: playlist_id.into(),
-                        name: snippet["title"].as_str().unwrap_or("").into(),
-                        description: snippet["description"]
-                            .as_str()
-                            .filter(|d| !d.is_empty())
-                            .map(Into::into),
-                        cover_path: Self::best_thumbnail(&snippet["thumbnails"]),
-                        track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
-                        owner: snippet["channelTitle"].as_str().map(Into::into),
-                        covers: Vec::new(),
-                    });
-                }
-            }
+            && let Some(item) = data["items"].as_array().and_then(|a| a.first())
+        {
+            let snippet = &item["snippet"];
+            let content = &item["contentDetails"];
+            return Ok(StreamPlaylist {
+                id: playlist_id.into(),
+                name: snippet["title"].as_str().unwrap_or("").into(),
+                description: snippet["description"]
+                    .as_str()
+                    .filter(|d| !d.is_empty())
+                    .map(Into::into),
+                cover_path: Self::best_thumbnail(&snippet["thumbnails"]),
+                track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
+                owner: snippet["channelTitle"].as_str().map(Into::into),
+                covers: Vec::new(),
+            });
         }
 
         Err(TuneError::NotFound(format!(
@@ -3150,10 +3134,10 @@ impl StreamingService for YouTubeService {
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         // Check cache
-        if let Some(cached) = self.browse_cache_get("home_sections").await {
-            if let Ok(sections) = serde_json::from_value::<Vec<FeaturedSection>>(cached) {
-                return Ok(sections);
-            }
+        if let Some(cached) = self.browse_cache_get("home_sections").await
+            && let Ok(sections) = serde_json::from_value::<Vec<FeaturedSection>>(cached)
+        {
+            return Ok(sections);
         }
 
         // Fetch home page
@@ -3186,20 +3170,20 @@ impl StreamingService for YouTubeService {
         let cache_key = format!("home_section_{section_id}");
 
         // Check cache
-        if let Some(cached) = self.browse_cache_get(&cache_key).await {
-            if let Ok(albums) = serde_json::from_value::<Vec<StreamAlbum>>(cached) {
-                return Ok(albums);
-            }
+        if let Some(cached) = self.browse_cache_get(&cache_key).await
+            && let Ok(albums) = serde_json::from_value::<Vec<StreamAlbum>>(cached)
+        {
+            return Ok(albums);
         }
 
         // Cache miss — refresh home sections
         let _ = self.get_featured_sections().await?;
 
         // Try cache again
-        if let Some(cached) = self.browse_cache_get(&cache_key).await {
-            if let Ok(albums) = serde_json::from_value::<Vec<StreamAlbum>>(cached) {
-                return Ok(albums);
-            }
+        if let Some(cached) = self.browse_cache_get(&cache_key).await
+            && let Ok(albums) = serde_json::from_value::<Vec<StreamAlbum>>(cached)
+        {
+            return Ok(albums);
         }
 
         Ok(vec![])
@@ -3225,15 +3209,15 @@ impl StreamingService for YouTubeService {
         }
 
         // Persist pending device code so a server restart doesn't lose the flow
-        if let Some(ref pending) = self.pending_device_auth {
-            if let Some(ref started) = self.device_auth_started {
-                let elapsed = started.elapsed().as_secs();
-                obj["pending_device_code"] = json!(pending.device_code);
-                obj["pending_user_code"] = json!(pending.user_code);
-                obj["pending_verification_url"] = json!(pending.verification_url);
-                obj["pending_interval"] = json!(pending.interval);
-                obj["pending_elapsed_secs"] = json!(elapsed);
-            }
+        if let Some(ref pending) = self.pending_device_auth
+            && let Some(ref started) = self.device_auth_started
+        {
+            let elapsed = started.elapsed().as_secs();
+            obj["pending_device_code"] = json!(pending.device_code);
+            obj["pending_user_code"] = json!(pending.user_code);
+            obj["pending_verification_url"] = json!(pending.verification_url);
+            obj["pending_interval"] = json!(pending.interval);
+            obj["pending_elapsed_secs"] = json!(elapsed);
         }
 
         Some(obj)

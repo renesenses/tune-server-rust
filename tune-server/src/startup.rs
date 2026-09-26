@@ -251,6 +251,12 @@ fn spawn_asio_warm_scan() {
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    // Les fichiers de transcodage laissés par un plantage précédent. Une fois
+    // par DÉMARRAGE, et non à chaque `AppState::new` (#5142) : ce constructeur
+    // sert aussi aux épreuves, qui effaçaient les transcodages en cours d'un
+    // autre processus du même compte. Aucune lecture n'a encore pu commencer
+    // ici, comme avant.
+    tune_core::http::streamer::cleanup_leftover_transcode_files();
     // Turn any update markers left by a just-applied update into a persisted
     // last_update_result the UI can show. Catches a silent Windows bat-swap
     // failure (came back on the old binary) instead of it looking like a no-op.
@@ -291,8 +297,19 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // comme le dedoublonnage juste au-dessus, AVANT que la moindre tache de
     // decouverte ne demarre.
     masquer_les_zones_reflet(state);
+    // #5077 — la réparation sûre des masquages : une zone masquée par la
+    // cascade d'« Ignorer » dont l'appareil n'est plus ignoré revient. Rien
+    // d'autre : un motif inconnu (masquage d'avant la migration 112) ou une
+    // suppression par l'utilisateur n'est jamais touché.
+    reparer_les_masquages_de_zones(state);
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
+    recalculer_les_compilations(state);
+    // Coffrets automatiques (GO du 25/09/2026) : la passe sur la base
+    // EXISTANTE, sans relire un fichier. Après la réconciliation des paires
+    // « distinctes », que la passe consulte. Idempotente : sur une base déjà
+    // passée, trois lectures et rien d'écrit.
+    tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -619,7 +636,8 @@ fn nos_facades_par_zone(db: &Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<
 ///
 /// ## Masquer, et non supprimer
 ///
-/// [`tune_core::db::zone_repo::ZoneRepo::delete`] pose `is_hidden = 1`. C'est
+/// [`tune_core::db::zone_repo::ZoneRepo::masquer`] pose `is_hidden = 1`, au
+/// motif `zone_reflet` (#5077), que la réparation sûre ne défait jamais. C'est
 /// ce qu'il faut : la ligne garde son `output_device_id`, donc
 /// `is_device_hidden` reconnaît l'UDN au tour de découverte suivant et
 /// `get_or_create` rend la zone masquée **telle quelle** au lieu d'en créer une
@@ -681,8 +699,8 @@ fn masquer_les_zones_reflet(state: &AppState) -> usize {
             );
             continue;
         }
-        match zone_repo.delete(zid) {
-            Ok(()) => {
+        match zone_repo.masquer(zid, tune_core::db::zone_repo::MotifMasquage::ZoneReflet) {
+            Ok(_) => {
                 masquees += 1;
                 info!(
                     zone_id = zid,
@@ -696,6 +714,23 @@ fn masquer_les_zones_reflet(state: &AppState) -> usize {
         }
     }
     masquees
+}
+
+/// Recalcule le drapeau « compilation » des albums deja marques, selon LA
+/// regle du 25/09/2026 (`tune_core::library::regle_compilation`), SANS relire
+/// un fichier ni attendre un scan : la base a deja les artistes d'album et de
+/// piste. Ne fait que baisser, respecte les editions manuelles, idempotente
+/// (voir `AlbumRepo::recalculer_les_compilations`).
+fn recalculer_les_compilations(state: &AppState) {
+    match tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+        .recalculer_les_compilations()
+    {
+        Ok(bilan) if bilan.baisses > 0 => {
+            info!(?bilan, "compilations_recalculees_au_demarrage");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "compilations_recalcul_impossible"),
+    }
 }
 
 /// Re-rattache les favoris orphelins aux items vivants retrouvés par identité
@@ -779,6 +814,21 @@ fn cleanup_orphan_queues(state: &AppState) {
     }
 }
 
+/// #5077 — voir [`tune_core::db::zone_motif_masquage::reparer_les_masquages_surs`].
+/// Un échec (base d'avant la migration 112, liste d'ignorés illisible) ne
+/// démasque rien et ne bloque pas le démarrage.
+fn reparer_les_masquages_de_zones(state: &AppState) {
+    match tune_core::db::zone_motif_masquage::reparer_les_masquages_surs(state.backend.clone()) {
+        Ok(rapport) if !rapport.demasquees.is_empty() => info!(
+            demasquees = ?rapport.demasquees,
+            gardees = ?rapport.gardees,
+            "zones_masquees_reparees"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "zones_masquees_reparation_sautee"),
+    }
+}
+
 fn ensure_zones_is_hidden(state: &AppState) {
     match state.backend.engine() {
         tune_core::db::engine::Engine::Postgres => {
@@ -800,19 +850,16 @@ fn ensure_zones_is_hidden(state: &AppState) {
 
     // Ensure last_play_state column exists (migration v39 for SQLite,
     // idempotent ALTER for Postgres).
-    match state.backend.engine() {
-        tune_core::db::engine::Engine::Postgres => {
-            let result = state.backend.execute(
-                "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped'",
-                &[],
-            );
-            match result {
-                Ok(_) => info!("zones_last_play_state_column_added"),
-                Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
-                Err(e) => tracing::warn!(error = %e, "zones_last_play_state_add_failed"),
-            }
+    if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        let result = state.backend.execute(
+            "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped'",
+            &[],
+        );
+        match result {
+            Ok(_) => info!("zones_last_play_state_column_added"),
+            Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
+            Err(e) => tracing::warn!(error = %e, "zones_last_play_state_add_failed"),
         }
-        _ => {}
     }
 
     // Aucune zone ne peut être en lecture au démarrage : c'est ce processus qui
@@ -1047,9 +1094,8 @@ async fn restore_playback_positions(state: &AppState) {
                 } else {
                     continue;
                 }
-            } else if zone.last_track_source.as_deref() == Some("radio") {
-                continue;
             } else {
+                // Radio comprise : sans piste en base, rien à restaurer ici.
                 continue;
             };
             let clamped_pos = if np.duration_ms > 0 {
@@ -1088,7 +1134,9 @@ async fn restore_oaat_groups(state: &AppState) {
     let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
-    let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();
+    // (identifiant du groupe, nom, points d'accès hôte:port à sonder)
+    type GroupeASonder = (String, String, Vec<(String, u16)>);
+    let mut to_probe: Vec<GroupeASonder> = Vec::new();
     for group in &groups {
         let id = match group["id"].as_str() {
             Some(id) => id.to_string(),
@@ -2107,8 +2155,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         // Rien ne doit etre ecrit — et surtout pas « [] », qui vaudrait
         // « l'utilisateur a tout retire » pour tous les demarrages suivants.
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![vide.clone()];
+        let config = TuneConfig {
+            music_dirs: vec![vide.clone()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -2123,8 +2173,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         // Sans elle, un `dossier_semable` qui refuserait tout serait vert
         // ci-dessus tout en empechant TOUTE installation Docker de demarrer.
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![vide, plein.clone()];
+        let config = TuneConfig {
+            music_dirs: vec![vide, plein.clone()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -2154,8 +2206,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         settings.set("music_dirs", "[]").unwrap();
 
         let t = arbre();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![t.path().join("plein").to_string_lossy().to_string()];
+        let config = TuneConfig {
+            music_dirs: vec![t.path().join("plein").to_string_lossy().to_string()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
 
         assert_eq!(

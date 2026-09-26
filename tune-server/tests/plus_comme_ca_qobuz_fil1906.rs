@@ -212,6 +212,68 @@ async fn un_titre_qobuz_rend_ses_voisins_sans_lui_meme() {
     assert_eq!(pistes[0]["title"], "Titre a2");
 }
 
+/// #4806 suite — un titre de ce service BANNI par le profil actif ne revient
+/// jamais par « Plus comme ça » (ni par la radio de fin de file, qui partage
+/// `hidden_repo::exclure_les_titres_de_service_bannis`). Témoin : sans
+/// bannissement, `a2` est proposé.
+#[tokio::test]
+async fn un_titre_de_service_banni_n_est_jamais_propose() {
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("artist_enrichment_api", "http://127.0.0.1:9")
+        .unwrap();
+    state
+        .services
+        .lock()
+        .await
+        .register(Box::new(ServiceSimule {
+            nom: "qobuz-simule".into(),
+            similarite: true,
+        }));
+    let app = tune_server::routes::router(state.clone());
+    let ids = |corps: &[u8]| -> Vec<String> {
+        let pistes: Vec<Value> = serde_json::from_slice(corps).unwrap();
+        pistes
+            .iter()
+            .map(|p| p["source_id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    let (status, corps) = get(&app, "/api/v1/streaming/qobuz-simule/tracks/source/similar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&corps), vec!["a2", "b1"], "témoin");
+
+    let bans = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    assert!(
+        bans.ban_streaming_track(
+            1,
+            &tune_core::db::hidden_repo::TitreDeService {
+                source: "Qobuz-Simule".into(),
+                source_id: "a2".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    );
+    let (status, corps) = get(&app, "/api/v1/streaming/qobuz-simule/tracks/source/similar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&corps), vec!["b1"], "le titre banni n'est plus proposé");
+
+    // Un AUTRE profil que celui des sélections automatiques ne compte pas.
+    bans.unban_streaming_track(1, "qobuz-simule", "a2").unwrap();
+    bans.ban_streaming_track(
+        2,
+        &tune_core::db::hidden_repo::TitreDeService {
+            source: "qobuz-simule".into(),
+            source_id: "a2".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_, corps) = get(&app, "/api/v1/streaming/qobuz-simule/tracks/source/similar").await;
+    assert_eq!(ids(&corps), vec!["a2", "b1"], "banni chez 2, pas chez 1");
+}
+
 #[tokio::test]
 async fn la_borne_limit_est_tenue() {
     let app = app().await;

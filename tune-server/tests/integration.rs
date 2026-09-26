@@ -665,7 +665,7 @@ async fn zone_delete_updates_all_counts() {
     let resp = app
         .clone()
         .oneshot(
-            axum::http::Request::delete(&format!("/api/v1/zones/{zone_id}"))
+            axum::http::Request::delete(format!("/api/v1/zones/{zone_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2699,13 +2699,27 @@ async fn favoris_radio_vers_streaming_rend_les_trois_compteurs_de_l_ecran() {
         .as_array()
         .unwrap_or_else(|| panic!("témoin : `details[]` doit rester rendu : {body}"));
     assert_eq!(details.len(), 3, "témoin : {body}");
-    let statuts: Vec<&str> = details
+    // Statut lu PAR TITRE : la route parcourt les favoris `ORDER BY saved_at
+    // DESC`, à la seconde près. Les trois favoris tombent le plus souvent dans
+    // la même seconde (ordre d'insertion), mais pas toujours : l'ordre de
+    // `details[]` n'est pas le contrat.
+    let mut statuts: Vec<(&str, &str)> = details
         .iter()
-        .map(|d| d["status"].as_str().unwrap_or(""))
+        .map(|d| {
+            (
+                d["title"].as_str().unwrap_or(""),
+                d["status"].as_str().unwrap_or(""),
+            )
+        })
         .collect();
+    statuts.sort();
     assert_eq!(
         statuts,
-        vec!["matched", "approximate", "not_found"],
+        vec![
+            ("Nightswimming", "approximate"),
+            ("Un titre que ce service n a jamais eu", "not_found"),
+            ("Under the Strikes", "matched"),
+        ],
         "{body}"
     );
 }

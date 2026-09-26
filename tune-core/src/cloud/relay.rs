@@ -404,12 +404,9 @@ mod emission_vers_le_relais_tests {
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc};
 
-    fn canal(
-        capacite: usize,
-    ) -> (
-        Arc<Mutex<Option<mpsc::Sender<String>>>>,
-        mpsc::Receiver<String>,
-    ) {
+    type Emetteur = Arc<Mutex<Option<mpsc::Sender<String>>>>;
+
+    fn canal(capacite: usize) -> (Emetteur, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(capacite);
         (Arc::new(Mutex::new(Some(tx))), rx)
     }
@@ -574,7 +571,7 @@ mod entetes_de_flux_tests {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

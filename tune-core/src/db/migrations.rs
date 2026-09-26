@@ -2073,6 +2073,116 @@ CREATE INDEX IF NOT EXISTS idx_collection_folder_items_folder ON collection_fold
         name: "playlist_tracks_titres_de_service",
         up: "",
     },
+    // #4907 — la meme musique dans plusieurs repertoires : les EXEMPLAIRES
+    // d'une piste, et le repertoire prefere d'un album.
+    //
+    // Numerotee 110, a la suite des 107 (credits MusicBrainz), 108 (dossiers
+    // de collections) et 109 (titres de service en playlist) livrees par la
+    // v0.9.165. Un numero deja applique sur une base ne se reprend jamais.
+    //
+    // `track_copies` : un fichier octet pour octet identique a celui d'une
+    // piste, range dans le meme album. Le scan l'ecartait
+    // (`skip_duplicate_audio_hash`) ; il le rattache desormais a la piste.
+    // AUCUNE ligne `tracks` n'est creee, modifiee ni renumerotee : les
+    // identifiants que visent playlists, favoris, historique, notes et files
+    // d'attente ne bougent pas. La table part VIDE ; le prochain scan la
+    // remplit. `ON DELETE CASCADE` : une piste retiree emporte ses copies.
+    //
+    // `album_preferred_roots` : le dossier de musique depuis lequel
+    // l'utilisateur veut lire un album. Absente = regle par defaut (meilleure
+    // qualite, puis ordre des repertoires).
+    Migration {
+        version: 110,
+        name: "exemplaires_par_repertoire",
+        up: "
+CREATE TABLE IF NOT EXISTS track_copies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL UNIQUE,
+    format TEXT,
+    sample_rate INTEGER,
+    bit_depth INTEGER,
+    file_size INTEGER,
+    file_mtime REAL,
+    audio_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_track_copies_track ON track_copies(track_id);
+CREATE TABLE IF NOT EXISTS album_preferred_roots (
+    album_id INTEGER PRIMARY KEY REFERENCES albums(id) ON DELETE CASCADE,
+    root TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+",
+    },
+    // #5034 (Didier, fil 1904) — D'OU VIENT la pochette d'un album :
+    // `albums.cover_source`, et le fichier dont elle a ete tiree
+    // (`cover_source_path`, `cover_source_stamp` = « mtime:taille » au moment
+    // de la lecture).
+    //
+    // Sans elles, aucun scan ne pouvait retirer une pochette dont le fichier a
+    // disparu (jaquette otee dans Mp3tag, `cover.jpg` supprime) : rien ne
+    // distinguait une image tiree du disque d'une image TELEVERSEE a la main
+    // ou venue d'un fournisseur, et effacer celles-la serait une perte. Les
+    // valeurs — `embedded`, `folder`, `upload`, `provider`, `import` — sont
+    // celles des ecrivains de `cover_path`, un par un : voir
+    // `models::SourcePochette`.
+    //
+    // 🔴 Valeur par defaut PRUDENTE : NUL = INCONNUE, pour TOUTES les lignes
+    // existantes. Les deux sortes sont adressees par le condensat de leur
+    // CONTENU (#1444) : rien dans cette base ne prouve qu'une pochette deja
+    // posee venait d'un fichier. Une source inconnue n'est jamais retiree ; le
+    // scan la classe quand il le PROUVE (meme image relue sur le disque, ou
+    // ancienne adresse derivee du chemin d'un fichier), et « Analyse
+    // complete » reclasse tout ce qu'elle relit.
+    //
+    // Numerotee 111, PAS 110 : la 110 (et la PG 073) est prise par #4925
+    // (exemplaires par repertoire), PR ouverte en meme temps que celle-ci.
+    // Le lanceur ne joue que `version > MAX` : une 111 appliquee AVANT la 110
+    // ferait sauter la 110 en silence sur toute base deja montee. Cette
+    // migration EXIGE donc que la 110 soit fusionnee avant elle — sinon, elle
+    // se renumerote a la promotion. La garde de contiguite de cette liste le
+    // signale tant que la 110 manque.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'a la 106. Jumelle PG : 074.
+    Migration {
+        version: 111,
+        name: "albums_source_de_pochette",
+        up: "",
+    },
+    // #5077 (Villerio, fil 1926) — POURQUOI une zone est masquee :
+    // `zones.motif_masquage` et `zones.masquee_le`.
+    //
+    // Le masquage etait un seul bit (`is_hidden = 1`), sans motif ni date.
+    // Plusieurs chemins le posent — suppression par l'utilisateur, « supprimer
+    // toutes les zones », jumelle locale generique, cascade d'« Ignorer cet
+    // appareil », reflet de notre propre facade, fusion — et rien ne
+    // permettait ensuite de distinguer une zone que l'utilisateur a voulu
+    // retirer d'une zone emportee par erreur (l'ancien defaut #4957 : ignorer
+    // l'entree AirPlay d'un boitier masquait sa zone DLNA). Les valeurs sont
+    // celles de `zone_motif_masquage::MotifMasquage`.
+    //
+    // 🔴 NUL = INCONNU, pour TOUT masquage existant : on ne devine rien. Seul
+    // un motif CONNU et explicitement reparable (`appareil_ignore` dont
+    // l'appareil n'est plus ignore) peut etre demasque automatiquement ; un
+    // NUL ou une `suppression_utilisateur` ne l'est jamais.
+    //
+    // Numerotee 112, PAS 110 : la 110 (PG 073) est prise par #4925, la 111
+    // (PG 074) par #5034, toutes deux en PR en meme temps que celle-ci. Le
+    // lanceur ne joue que `version > MAX` : une 112 appliquee AVANT la 110 et
+    // la 111 les ferait sauter en silence sur toute base deja montee. Cette
+    // migration EXIGE donc les deux avant elle — sinon, elle se renumerote a
+    // la promotion. La garde de contiguite de cette liste le signale tant
+    // qu'elles manquent.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'a la 106. Jumelle PG : 075.
+    Migration {
+        version: 112,
+        name: "zones_motif_masquage",
+        up: "",
+    },
 ];
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
@@ -2838,6 +2948,34 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
 pub(crate) const TRACKS_SOURCE_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_source_source_id ON tracks(source, source_id)";
 
+/// #4836 (suite) — le label des pistes remonte sur leur album à CHAQUE
+/// démarrage, hors migration numérotée.
+///
+/// v0.9.164 ne jouait cette remontée qu'en fin de scan manuel : ni la mise à
+/// jour, ni le démarrage, ni le surveillant ne la déclenchaient, et une base
+/// déjà scannée gardait 0 album étiqueté alors que ses pistes l'étaient (le
+/// .18 : 2 641 pistes étiquetées, 257 albums à combler, 0 album avec un
+/// label). Comblement seul : un label d'album déjà posé n'est jamais écrasé ;
+/// un second passage ne touche aucune ligne.
+///
+/// Pas de numéro : le lanceur ne joue que `version > MAX` et le registre est
+/// réservé ailleurs ; une passe idempotente n'a de toute façon pas besoin
+/// d'être mémorisée. Un échec est journalisé, jamais bloquant.
+fn combler_les_labels_d_album_sqlite(db: &SqliteDb) {
+    let debut = std::time::Instant::now();
+    match db.execute(
+        &crate::db::album_repo::sql_combler_les_labels_d_album(),
+        &[],
+    ) {
+        Ok(albums) => info!(
+            albums,
+            ms = debut.elapsed().as_millis() as u64,
+            "albums_labels_repris_des_pistes"
+        ),
+        Err(e) => warn!(error = %e, "albums_labels_repris_des_pistes_failed"),
+    }
+}
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -2989,6 +3127,21 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ) {
                 warn!(erreur = %e, "migration_107_index_artist_mbid");
             }
+        }
+        if migration.version == 111 {
+            // Source de la pochette d'album (#5034). Sans defaut : NUL =
+            // INCONNUE, et c'est ce que recoit toute ligne existante — rien
+            // dans cette base ne prouve d'ou venait une pochette deja posee.
+            add_column_if_missing(db, "albums", "cover_source", "TEXT");
+            add_column_if_missing(db, "albums", "cover_source_path", "TEXT");
+            add_column_if_missing(db, "albums", "cover_source_stamp", "TEXT");
+        }
+        if migration.version == 112 {
+            // Motif et date du masquage d'une zone (#5077). Sans defaut : NUL =
+            // INCONNU, et c'est ce que recoit tout masquage existant — rien
+            // dans cette base ne dit pourquoi une zone deja masquee l'a ete.
+            add_column_if_missing(db, "zones", "motif_masquage", "TEXT");
+            add_column_if_missing(db, "zones", "masquee_le", "TEXT");
         }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
@@ -3283,6 +3436,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
     // l'existant. Voir la migration 99 et `outputs::identite_de_sortie`.
     add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
+    // #5077 : motif et date du masquage (migration 112). Chaque masquage et
+    // chaque demasquage les NOMMENT ; NUL = inconnu pour l'existant.
+    add_column_if_missing(db, "zones", "motif_masquage", "TEXT");
+    add_column_if_missing(db, "zones", "masquee_le", "TEXT");
     // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
     add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
@@ -3339,6 +3496,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // arriverait ici sans elles ferait echouer ces deux lectures.
     add_column_if_missing(db, "track_credits", "artist_mbid", "TEXT");
     add_column_if_missing(db, "albums", "credits_mb_at", "TEXT");
+
+    // Source de la pochette d'album (migration v111, #5034). Le scan et le
+    // surveillant NOMMENT ces trois colonnes a chaque album relu : une base
+    // qui arriverait ici sans elles ne suivrait plus aucune pochette.
+    add_column_if_missing(db, "albums", "cover_source", "TEXT");
+    add_column_if_missing(db, "albums", "cover_source_path", "TEXT");
+    add_column_if_missing(db, "albums", "cover_source_stamp", "TEXT");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -3443,6 +3607,32 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         );",
     )
     .ok();
+    // Titres de SERVICE bannis (#4806) — la jumelle de `hidden_items` pour
+    // l'espace d'identifiants du streaming, sur le modele de
+    // `streaming_item_tags` juste au-dessus. SANS migration numerotee, et
+    // c'est voulu : ce rattrapage tourne a CHAQUE demarrage, sur toute base
+    // SQLite existante ou neuve (le CORE_SCHEMA de `sqlite.rs` la porte
+    // aussi), exactement comme `streaming_favorites`. Un numero reserve pour
+    // un lot qui n'est pas encore fusionne casserait la contiguite
+    // (`migration_count_matches`) ; une table neuve n'en a pas besoin.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_hidden_items (\
+            profile_id INTEGER NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            album_source_id TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\
+            PRIMARY KEY (profile_id, item_type, source, source_id)\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item \
+            ON streaming_hidden_items(item_type, source, source_id);",
+    )
+    .ok();
     // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
@@ -3503,6 +3693,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // on DBs that skipped the numbered unified-queue migration.
     migrate_to_unified_queue(db);
 
+    combler_les_labels_d_album_sqlite(db);
+
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
 
@@ -3517,22 +3709,37 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 }
 
 pub fn current_version(db: &SqliteDb) -> Result<i32, String> {
-    let has_table = {
-        let conn = db.connection().lock().unwrap();
-        conn.query_row(
+    let conn = db.connection().lock().unwrap();
+    version_sur(&conn)
+}
+
+/// [`current_version`], lue par le POOL DE LECTURE (#5086).
+///
+/// `current_version` prend la connexion d'écriture : c'est ce qu'il faut
+/// pendant les migrations, qui l'appellent entre deux écritures. Mais
+/// `/system/database/status`, le rapport de bogue et les diagnostics ne font
+/// que PUBLIER cette version ; passer par l'écrivain les faisait attendre tout
+/// écrivain en cours, et Support › Diagnostic annonçait alors « Base de
+/// données : injoignable » sur une base qui servait.
+pub fn current_version_sans_ecrivain(db: &SqliteDb) -> Result<i32, String> {
+    let conn = db.read_connection();
+    version_sur(&conn)
+}
+
+fn version_sur(conn: &rusqlite::Connection) -> Result<i32, String> {
+    let has_table = conn
+        .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_migrations'",
             [],
             |row| row.get::<_, i32>(0),
         )
         .map_err(|e| e.to_string())?
-            > 0
-    };
+        > 0;
 
     if !has_table {
         return Ok(0);
     }
 
-    let conn = db.connection().lock().unwrap();
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM _migrations",
         [],
@@ -4100,6 +4307,32 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "playlist_tracks_titres_de_service",
         include_str!("../../migrations/postgres/072_playlist_tracks_titres_de_service.sql"),
     ),
+    // #4907 — exemplaires d'une piste et repertoire prefere d'un album.
+    // Jumelle de la migration SQLite 110. Numerotee 73, a la suite des 70, 71
+    // et 72 (#4767, #4853, #4889) livrees par la v0.9.165.
+    (
+        73,
+        "exemplaires_par_repertoire",
+        include_str!("../../migrations/postgres/073_exemplaires_par_repertoire.sql"),
+    ),
+    // Jumelle de la SQLite 111 (#5034) : source de la pochette d'album.
+    // Numerotee 74 : la 73 est prise par #4925 (exemplaires par repertoire),
+    // PR ouverte en meme temps. Elle EXIGE la 73 avant elle, sinon elle se
+    // renumerote a la promotion — la garde de contiguite le signale.
+    (
+        74,
+        "albums_source_de_pochette",
+        include_str!("../../migrations/postgres/074_albums_source_de_pochette.sql"),
+    ),
+    // Jumelle de la SQLite 112 (#5077) : motif et date du masquage d'une
+    // zone. Numerotee 75 : la 73 est prise par #4925, la 74 par #5034, PR
+    // ouvertes en meme temps. Elle EXIGE la 73 et la 74 avant elle, sinon
+    // elle se renumerote a la promotion — la garde de contiguite le signale.
+    (
+        75,
+        "zones_motif_masquage",
+        include_str!("../../migrations/postgres/075_zones_motif_masquage.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4134,7 +4367,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // in-place cast is safe; no-op once the column is integer.
     let version_type: Option<String> = sqlx::query_scalar(
         "SELECT data_type FROM information_schema.columns \
-         WHERE table_name = 'schema_version' AND column_name = 'version'",
+         WHERE table_schema = current_schema() AND table_name = 'schema_version' AND column_name = 'version'",
     )
     .fetch_optional(pool)
     .await
@@ -4262,6 +4495,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // pas encore quand `ensure_schema` tourne a la connexion.
     if let Err(e) = sqlx::raw_sql(TRACKS_SOURCE_ID_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_source_id_index_failed");
+    }
+
+    // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
+    // rejouée à chaque démarrage, sans numéro de migration.
+    let debut_labels = std::time::Instant::now();
+    match sqlx::query(sqlx::AssertSqlSafe(
+        // Fragments constants seulement : aucune donnée n'entre dans ce texte.
+        crate::db::album_repo::sql_combler_les_labels_d_album(),
+    ))
+    .execute(pool)
+    .await
+    {
+        Ok(r) => info!(
+            albums = r.rows_affected(),
+            ms = debut_labels.elapsed().as_millis() as u64,
+            "pg_albums_labels_repris_des_pistes"
+        ),
+        Err(e) => warn!(error = %e, "pg_albums_labels_repris_des_pistes_failed"),
     }
 
     // Run ANALYZE on key tables for the query planner.
@@ -5946,6 +6197,117 @@ mod tests {
         );
     }
 
+    /// #5034 — la migration 111 pose la SOURCE de la pochette d'album, sur
+    /// une base NEUVE comme sur une base ANCIENNE ; une ligne existante naît
+    /// de source INCONNUE (la valeur par défaut prudente : rien n'est classé
+    /// « fichier » sans preuve, donc rien n'est retiré au premier scan) ; et
+    /// la jumelle PG 074 existe, est enregistrée et marque le bon numéro.
+    #[test]
+    fn la_migration_111_pose_la_source_de_pochette_sans_rien_classer_5034() {
+        let colonnes = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(albums)").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        let attendues = ["cover_source", "cover_source_path", "cover_source_stamp"];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        let c = colonnes(&neuve);
+        for a in attendues {
+            assert!(
+                c.iter().any(|x| x == a),
+                "base neuve : `albums.{a}` manque ({c:?})"
+            );
+        }
+
+        // Base ANCIENNE : `albums` d'avant la 111, avec une pochette déjà
+        // posée — téléversée ou tirée d'un fichier, la base ne le sait pas.
+        let ancienne = SqliteDb::open_in_memory().unwrap();
+        ancienne
+            .execute_batch(
+                "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist_id INTEGER,
+                    year INTEGER,
+                    cover_path TEXT,
+                    folder_path TEXT
+                );
+                INSERT INTO albums (title, cover_path) VALUES ('Album de Didier', 'abc');",
+            )
+            .unwrap();
+        ancienne.init_schema().unwrap();
+        run_migrations(&ancienne).unwrap();
+        let c = colonnes(&ancienne);
+        for a in attendues {
+            assert!(
+                c.iter().any(|x| x == a),
+                "base ancienne : `albums.{a}` manque ({c:?})"
+            );
+        }
+        {
+            let conn = ancienne.connection().lock().unwrap();
+            let (pochette, source, fichier): (Option<String>, Option<String>, Option<String>) =
+                conn.query_row(
+                    "SELECT cover_path, cover_source, cover_source_path FROM albums",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                pochette.as_deref(),
+                Some("abc"),
+                "la pochette en place survit"
+            );
+            assert_eq!(
+                (source, fichier),
+                (None, None),
+                "une pochette d'avant la 111 doit naître de source INCONNUE"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "074_albums_source_de_pochette.sql";
+        assert!(
+            racine.join("migrations/postgres").join(fichier).exists(),
+            "la jumelle PG {fichier} n'existe pas"
+        );
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains(fichier),
+            "{fichier} n'est pas enregistrée"
+        );
+        assert!(
+            ce_fichier.contains("(\n        74,"),
+            "le rang PG attendu a bougé"
+        );
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (74, 'albums_source_de_pochette')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        for a in attendues {
+            assert!(
+                sql_pg.contains(&format!("ADD COLUMN IF NOT EXISTS {a} TEXT")),
+                "la jumelle PG ne pose pas `{a}`"
+            );
+        }
+        // Le schéma de bascule SQLite -> PG et sa passe de rattrapage : lus
+        // dans la SOURCE, `pg_migrate` n'étant compilé qu'avec `postgres`.
+        let pg_migrate = include_str!("pg_migrate.rs");
+        for a in attendues {
+            assert!(
+                pg_migrate.contains(&format!("    {a} TEXT"))
+                    && pg_migrate.contains(&format!("ADD COLUMN IF NOT EXISTS {a} TEXT")),
+                "pg_migrate.rs ne porte pas `{a}` (schéma de bascule et rattrapage)"
+            );
+        }
+    }
+
     /// #4767 — la migration 107 pose `track_credits.artist_mbid` et
     /// `albums.credits_mb_at`, sur une base NEUVE comme sur une base ANCIENNE
     /// dont `track_credits` date de la migration 9 ; et sa jumelle PG 070
@@ -6511,7 +6873,15 @@ mod tests {
         // 72 : `playlist_tracks_titres_de_service` (#4889), jumelle de la
         // SQLite 109. Relache `track_id`, pose `source` / `source_id` et les
         // colonnes d'affichage, et le CHECK « l'un ou l'autre ».
-        assert_eq!(pg_latest_version(), 72, "latest PG migration must be 72");
+        // 73 : `exemplaires_par_repertoire` (#4907), jumelle de la SQLite 110.
+        // Pose `track_copies` et `album_preferred_roots`.
+        // 74 : `albums_source_de_pochette` (#5034), jumelle de la SQLite 111.
+        // Pose `albums.cover_source`, `cover_source_path`,
+        // `cover_source_stamp`, que le scan et le surveillant NOMMENT.
+        // 75 : `zones_motif_masquage` (#5077), jumelle de la SQLite 112. Pose
+        // `zones.motif_masquage` et `zones.masquee_le`, que chaque masquage
+        // et chaque demasquage NOMMENT.
+        assert_eq!(pg_latest_version(), 75, "latest PG migration must be 75");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -7138,6 +7508,52 @@ mod tests {
              PostgreSQL deja converties (schema_version 99) resteraient sans \
              la table pour toujours"
         );
+    }
+
+    /// `streaming_hidden_items` (#4806 suite, titres de SERVICE bannis) doit
+    /// exister partout ou une base arrive a la vie — SANS migration numerotee,
+    /// comme `streaming_favorites` : le rattrapage de `run_migrations` (toute
+    /// base SQLite), le CORE_SCHEMA, `PG_FULL_SCHEMA` avec sa copie et sa
+    /// clause de conflit (bascule SQLite -> PG), et `ENSURE_TABLES` (toute
+    /// base PostgreSQL, a chaque demarrage).
+    #[test]
+    fn les_titres_de_service_bannis_existent_sur_tous_les_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // 1. Une base SQLite qui ne passe QUE par `run_migrations` (sans
+        //    CORE_SCHEMA prealable) a la table : c'est le rattrapage.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch("DROP TABLE streaming_hidden_items;")
+            .unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'streaming_hidden_items'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 1, "le rattrapage de run_migrations ne pose pas la table");
+        // 2. CORE_SCHEMA.
+        let sqlite = fs::read_to_string(racine.join("src/db/sqlite.rs")).unwrap();
+        assert!(sqlite.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
+        // 3. Bascule SQLite -> PG : schema, copie, clause de conflit.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(pg_neuf.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
+        assert!(
+            pg_neuf.contains("\"streaming_hidden_items\","),
+            "`streaming_hidden_items` n'est pas dans MIGRATION_TABLES : les \
+             titres de service bannis seraient perdus a la bascule"
+        );
+        assert!(
+            pg_neuf.contains("ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"),
+            "pas de colonne `id` : la clause par defaut echouerait"
+        );
+        // 4. ENSURE_TABLES — le seul chemin PostgreSQL, a chaque demarrage.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(ensure.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
     }
 
     /// `media_servers` (#2219, phase 1) doit exister sur les QUATRE chemins,

@@ -421,10 +421,10 @@ fn extract_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String>
     if let Some(cookie_header) = headers.get("Cookie").and_then(|v| v.to_str().ok()) {
         for part in cookie_header.split(';') {
             let part = part.trim();
-            if let Some(value) = part.strip_prefix("tune_session=") {
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+            if let Some(value) = part.strip_prefix("tune_session=")
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
             }
         }
     }
@@ -475,18 +475,19 @@ pub fn ws_authorized(
             if !stored.is_empty() && key == stored {
                 return true;
             }
-        } else if let Some(secret) = &jwt_secret {
-            if verify_jwt(&tok, secret).is_ok() {
-                return true;
-            }
+        } else if let Some(secret) = &jwt_secret
+            && verify_jwt(&tok, secret).is_ok()
+        {
+            return true;
         }
     }
 
     // Query-param JWT (browser WebSocket can't set an Authorization header).
-    if let (Some(tok), Some(secret)) = (query_token, &jwt_secret) {
-        if !tok.is_empty() && verify_jwt(tok, secret).is_ok() {
-            return true;
-        }
+    if let (Some(tok), Some(secret)) = (query_token, &jwt_secret)
+        && !tok.is_empty()
+        && verify_jwt(tok, secret).is_ok()
+    {
+        return true;
     }
 
     false
@@ -850,7 +851,7 @@ async fn login(
         .flatten()
         .map(|r| {
             (
-                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 r.get(1).and_then(|v| v.as_string()),
                 r.get(2).and_then(|v| v.as_string()),
                 r.get(3).and_then(|v| v.as_bool()).unwrap_or(false),
@@ -921,16 +922,17 @@ async fn login(
     clear_login_failures(peer.ip());
 
     // If logged in with old SHA-256 hash, upgrade to argon2
-    if !valid_v2 && valid {
-        if let Ok(upgraded) = hash_password(&body.password) {
-            state
-                .backend
-                .execute(
-                    "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
-                    &[&upgraded as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
-                )
-                .ok();
-        }
+    if !valid_v2
+        && valid
+        && let Ok(upgraded) = hash_password(&body.password)
+    {
+        state
+            .backend
+            .execute(
+                "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
+                &[&upgraded as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
 
     let role = if is_admin { "admin" } else { "user" };
@@ -995,7 +997,7 @@ async fn me(State(state): State<AppState>, auth: AuthUser) -> impl IntoResponse 
 
     match row {
         Some(r) => Json(json!({
-            "id": r.get(0).and_then(|v| v.as_i64()),
+            "id": r.first().and_then(|v| v.as_i64()),
             "username": r.get(1).and_then(|v| v.as_string()),
             "display_name": r.get(2).and_then(|v| v.as_string()),
             "avatar_path": r.get(3).and_then(|v| v.as_string()),
@@ -1131,10 +1133,10 @@ async fn set_auth_config(
             get_or_create_jwt_secret(&settings);
         }
     }
-    if let Some(ref secret) = body.jwt_secret {
-        if !secret.is_empty() {
-            settings.set("jwt_secret", secret).ok();
-        }
+    if let Some(ref secret) = body.jwt_secret
+        && !secret.is_empty()
+    {
+        settings.set("jwt_secret", secret).ok();
     }
 
     let enabled = settings

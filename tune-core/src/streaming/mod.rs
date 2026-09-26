@@ -7,6 +7,7 @@ pub mod favorites_import;
 pub mod matching;
 pub mod podcasts;
 pub mod qobuz;
+pub mod qobuz_credits;
 pub mod quality;
 pub mod radiofrance;
 pub mod registry;

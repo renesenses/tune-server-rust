@@ -34,7 +34,7 @@ impl TunePlugin for PremiumAudio {
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
-            "crossfeed" => "Crossfeed casque : intensité et retard, état conservé à chaud",
+            "crossfeed" => "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
             "converter" => "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
             _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
@@ -169,7 +169,12 @@ pub async fn register(loader: &PluginLoader, state: &AppState) {
 pub fn require_installed(state: &AppState, id: &str) -> Result<(), axum::response::Response> {
     use axum::response::IntoResponse;
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if tune_core::audio::premium_plugins::enabled(&settings, id) {
+    let actif = if tune_core::audio::premium_plugins::contains(id) {
+        tune_core::audio::premium_plugins::enabled(&settings, id)
+    } else {
+        tune_core::audio::natifs_tiers::actif(&settings, id)
+    };
+    if actif {
         Ok(())
     } else {
         Err((axum::http::StatusCode::CONFLICT,axum::Json(json!({"error":"plugin_unavailable","plugin":id,"message":"Ce plugin doit être installé et activé."}))).into_response())
@@ -180,7 +185,12 @@ pub async fn require_entitlement(
     state: &AppState,
     id: &str,
 ) -> Result<(), axum::response::Response> {
-    if tune_core::audio::premium_plugins::contains(id) {
+    // Les quatre emplacements, et tout greffon natif tiers présent ou chargé :
+    // ce dernier exige toujours le Premium (`native_audio::feature`).
+    if tune_core::audio::premium_plugins::contains(id)
+        || crate::native_audio::is_third_party(id)
+        || tune_plugin_native::provider(id).is_some()
+    {
         crate::premium_guard::require_premium(&state.license, crate::native_audio::feature(id))
             .await
     } else {
@@ -600,5 +610,171 @@ mod tests {
             assert!(premium_plugins::enabled(&settings, id), "{id} inactif");
         }
         assert_eq!(proposes(&app).await, json!([]));
+    }
+
+    /// Greffon natif tiers : le droit qui l'ouvre est un droit Premium, jamais
+    /// le droit gratuit de l'égaliseur, quel que soit son identifiant.
+    #[tokio::test]
+    async fn greffon_natif_tiers_le_droit_est_premium() {
+        let droit = crate::native_audio::feature("greffon-tiers");
+        assert_ne!(droit, tune_core::license::Feature::DspEq);
+        assert!(
+            tune_core::license::Feature::all_premium().contains(&droit),
+            "{droit:?} hors des droits Premium"
+        );
+        assert_eq!(
+            crate::native_audio::feature("equalizer"),
+            tune_core::license::Feature::DspEq
+        );
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(!state.license.check_feature(droit).await, "accordé en Free");
+    }
+
+    /// Greffon natif tiers, par les routes réelles : l'installation, le
+    /// catalogue, les réglages de zone et les profils exigent le Premium ; un
+    /// identifiant déjà porté par un greffon compilé est refusé ; en Premium,
+    /// l'installation n'est plus arrêtée que par la signature.
+    #[tokio::test]
+    async fn greffon_natif_tiers_routes_gardees_par_le_premium() {
+        dossier_de_donnees_jetable();
+        let tiers = "greffon-tiers-routes";
+        let dossier = crate::native_audio::root().join(tiers).join("versions");
+        std::fs::create_dir_all(&dossier).unwrap();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        assert!(!state.license.is_premium().await);
+
+        let (status, reponse) = appel(
+            &app,
+            "POST",
+            &format!("/api/v1/audio-plugins/{tiers}/install"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "install Free : {reponse}"
+        );
+        let (status, reponse) =
+            appel(&app, "POST", &format!("/api/v1/plugins/{tiers}/enable")).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "enable Free : {reponse}"
+        );
+        assert!(
+            settings
+                .get(&format!("plugin_{tiers}_enabled"))
+                .unwrap()
+                .is_none(),
+            "drapeau écrit malgré le refus"
+        );
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "PUT",
+            &format!("/api/v1/audio-plugins/{tiers}/zones/1"),
+            json!({"enabled": true}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "zone Free : {reponse}"
+        );
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "POST",
+            &format!("/api/v1/audio-plugins/{tiers}/profiles"),
+            json!({"name": "Salon", "settings": {"enabled": true}}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "profil Free : {reponse}"
+        );
+        // Lire reste libre.
+        let (status, reponse) = appel(
+            &app,
+            "GET",
+            &format!("/api/v1/audio-plugins/{tiers}/profiles"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert_eq!(reponse["profiles"], json!([]));
+        // Un identifiant inconnu n'a ni réglage ni profil.
+        let (status, _) = appel(
+            &app,
+            "GET",
+            "/api/v1/audio-plugins/absent-du-disque/profiles",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        state
+            .license
+            .update_from_server(tune_core::license::Tier::Premium, None)
+            .await;
+        let (status, reponse) = appel(
+            &app,
+            "POST",
+            &format!("/api/v1/audio-plugins/{tiers}/install"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reponse}");
+        assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
+        // Premium mais greffon non chargé : pas de réglage de zone.
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "PUT",
+            &format!("/api/v1/audio-plugins/{tiers}/zones/1"),
+            json!({"enabled": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{reponse}");
+        let (status, reponse) = appel(&app, "GET", "/api/v1/audio-plugins").await;
+        assert_eq!(status, StatusCode::OK, "état : {status} {reponse}");
+        assert!(
+            reponse["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == tiers && p["third_party"] == true),
+            "greffon tiers absent de l'état : {reponse}"
+        );
+    }
+
+    /// Un greffon natif tiers ne peut pas prendre le nom d'un greffon compilé
+    /// dans ce serveur : ils partageraient les drapeaux `plugin_{id}_*`. Le jeu
+    /// registré est posé à la main, pour ne dépendre d'aucune feature.
+    #[tokio::test]
+    async fn greffon_natif_tiers_refuse_le_nom_d_un_greffon_compile() {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .plugin_names
+            .set(vec!["greffon-compile-essai".to_string()])
+            .unwrap();
+        state
+            .license
+            .update_from_server(tune_core::license::Tier::Premium, None)
+            .await;
+        let app = crate::routes::router_with_plugins(state.clone(), vec![]);
+        let (status, reponse) = appel(
+            &app,
+            "POST",
+            "/api/v1/audio-plugins/greffon-compile-essai/install",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reponse}");
+        assert_eq!(
+            reponse["detail"], "plugin id already used by another plugin",
+            "{reponse}"
+        );
+        // Un nom libre n'est arrêté que par la signature.
+        let (_, reponse) = appel(&app, "POST", "/api/v1/audio-plugins/greffon-libre/install").await;
+        assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
     }
 }

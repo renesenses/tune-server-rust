@@ -157,14 +157,14 @@ pub fn preconfigurer(
         if let Some(v) = dev.drapeau("upnp_silence") {
             pousser("upnp_silence", Valeur::Drapeau(v), Origine::TuneTested);
         }
-        if let Some(ms) = dev.nombre("dlna_play_delay_ms") {
-            if ms >= 0.0 {
-                pousser(
-                    "dlna_play_delay_ms",
-                    Valeur::Duree(ms as u64),
-                    Origine::TuneTested,
-                );
-            }
+        if let Some(ms) = dev.nombre("dlna_play_delay_ms")
+            && ms >= 0.0
+        {
+            pousser(
+                "dlna_play_delay_ms",
+                Valeur::Duree(ms as u64),
+                Origine::TuneTested,
+            );
         }
         // 🔴 `-3` arrive entier : `nombre` le lit, un `f64` strict l'aurait
         // rejeté. Même borne que le PATCH de zone (±12 dB).

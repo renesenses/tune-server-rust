@@ -127,6 +127,53 @@ pub(super) fn zone_eq_step_description(
     }
 }
 
+/// #5081 — l'ombre de la tête du crossfeed de la zone, quand la case du
+/// crossfeed ET l'interrupteur du filtre sont cochés (clé
+/// `zone_{id}_crossfeed`, bornes du greffon). `None` sinon — et pour tout
+/// réglage écrit avant #5081.
+pub(super) fn zone_crossfeed_ombre(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<tune_core::audio::crossfeed::OmbreDeTete> {
+    let reglage: Value = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get(&format!("zone_{zone_id}_crossfeed"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    if !reglage["enabled"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    tune_core::audio::crossfeed::ombre_du_reglage(&reglage)
+}
+
+/// #5081 — l'étape « Crossfeed » (`code: "crossfeed"`) montre l'ombre de la
+/// tête quand elle est allumée : la coupure et la pente, en champs et dans la
+/// description. N'ajoute AUCUNE étape : elle annote celle qui dit que le
+/// crossfeed est dans le flux, et rien quand il n'y en a pas.
+pub(super) fn annoter_l_ombre_du_crossfeed(
+    steps: &mut [Value],
+    ombre: Option<tune_core::audio::crossfeed::OmbreDeTete>,
+) {
+    let Some(ombre) = ombre else {
+        return;
+    };
+    for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
+        let suffixe = format!(
+            "ombre de la tête {} Hz, {} dB/octave",
+            ombre.cutoff_hz, ombre.slope_db_per_octave
+        );
+        let description = match etape["description"].as_str() {
+            Some(d) => format!("{d} · {suffixe}"),
+            None => suffixe,
+        };
+        etape["description"] = json!(description);
+        etape["head_shadow"] = json!({
+            "cutoff_hz": ombre.cutoff_hz,
+            "slope_db_per_octave": ombre.slope_db_per_octave,
+        });
+    }
+}
+
 /// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
 ///
 /// Miroir de `Orchestrator::zone_replaygain_changes_audio`, pour la même
@@ -397,13 +444,34 @@ pub(super) fn wire_carries_raw_dsd(wire: Option<&StreamInfo>) -> bool {
     })
 }
 
+/// 🔴 #4354 (défaut n° 3) — `dsd_decime_en_pcm` ferme un trou qui déclarait
+/// bit-perfect une conversion de DOMAINE.
+///
+/// Pour une source DSD, `bit_depth` vaut la profondeur de la SOURCE, soit 1
+/// (voir `decrire_la_source`, qui la force délibérément pour que l'écran
+/// affiche « 1 bit » et non la profondeur du fil). La clause `bit_depth <= 16`
+/// était donc **trivialement vraie** sur tout DSD, et `is_lossless` l'est aussi
+/// (le DSD est un format sans perte). Résultat : dès que le fil portait du WAV,
+/// cette fonction rendait `true` — y compris pour une décimation 1 bit → PCM
+/// multibit, qui n'a plus rien de bit-perfect.
+///
+/// La branche `"oaat"` de [`decrire_le_transport`] tenait déjà la bonne règle,
+/// en toutes lettres : « DSD → WAV is a domain conversion […] so it is NOT
+/// bit-perfect ». Elle manquait à la branche `"dlna" | "openhome"` — celle du
+/// signalement.
+///
+/// ⚠️ Le drapeau ne dit PAS « la source est du DSD » : le DoP emballe le DSD
+/// dans des trames PCM **sans toucher aux bits**, et reste bit-perfect. Il dit
+/// « le DSD est décimé en PCM », ce que seul [`tune_core::orchestrator::transport_dsd`]
+/// sait trancher, depuis le réglage `dsd_mode` de la zone.
 pub(super) fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
     dlna_wav24: bool,
     bit_depth: i32,
+    dsd_decime_en_pcm: bool,
 ) -> bool {
-    is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
+    !dsd_decime_en_pcm && is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
 }
 
 /// Le fil est-il intact, du point de vue du VERDICT affiché ?
@@ -500,7 +568,8 @@ pub(super) fn build_signal_path(
     // mesuré le publie, et `None` laisse chaque verdict à sa déduction.
     let transformations_reelles = ps.transformations_reelles.as_ref();
 
-    let traitements = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
+    let traitements =
+        relever_les_traitements(backend, zone, np, output_type, runtime_signal_path, wire);
     let forcages = decider_les_forcages(
         zone,
         backend,
@@ -509,6 +578,9 @@ pub(super) fn build_signal_path(
         &source,
         traitements.dsp_enabled,
     );
+    // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
+    // se rend en fin de fonction, une fois les étapes décrites.
+    let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
     let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
         output_type,
         audio_backend,
@@ -538,11 +610,17 @@ pub(super) fn build_signal_path(
         )
         .map(|d| d.channel_count()),
     };
-    let bit_perfect = analyse.verdicts.bit_perfect;
+    // #5051 — une entrée audio EN DIRECT : ce que la compensation de dérive
+    // fait au signal. Une reprise ou un rééchantillonnage retire le
+    // bit-perfect, et l'étape « Capture » le dit.
+    let capture = etape_de_capture_en_direct(np);
+    let bit_perfect =
+        analyse.verdicts.bit_perfect && capture.as_ref().is_none_or(|(_, intacte)| *intacte);
     let is_lossless = analyse.source.is_lossless;
+    let codec_connu = analyse.source.codec_connu;
     let zone_id_courant = zone.id.unwrap_or(0);
     let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
-    let etapes = assembler_les_etapes(
+    let mut etapes = assembler_les_etapes(
         ps,
         zone,
         renderer_label,
@@ -550,13 +628,28 @@ pub(super) fn build_signal_path(
         runtime_signal_path,
         analyse,
     );
+    // #5081 — la coupure et la pente de l'ombre de la tête, sur l'étape
+    // crossfeed quand elle existe.
+    annoter_l_ombre_du_crossfeed(
+        &mut etapes.steps,
+        zone_crossfeed_ombre(backend, zone_id_courant),
+    );
+    if let Some((etape, _)) = capture {
+        let apres_la_source = etapes.steps.len().min(1);
+        etapes.steps.insert(apres_la_source, etape);
+    }
     Some(json!({
         "bit_perfect": bit_perfect,
         // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
         // Distinct from bit_perfect: a lossless source transcoded to another
         // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
         // bit-perfect but is still lossless — the UI must not call it "lossy".
-        "lossless": is_lossless,
+        //
+        // #4346 — `null` quand le codec de la source est INCONNU (radio pas
+        // encore sondée, format non reconnu) : « je ne sais pas » n'est ni
+        // « sans perte » ni « avec perte ». Publier `false` faisait afficher
+        // « Avec perte » sur une radio FLAC pendant toute l'attente de la sonde.
+        "lossless": lossless_publie(codec_connu, is_lossless),
         "summary": etapes.summary,
         "steps": etapes.steps,
         "runtime_observed": runtime_signal_path.is_some(),
@@ -567,19 +660,119 @@ pub(super) fn build_signal_path(
         // lieu d'allumer le badge. `strict_bitperfect` : la zone refuserait
         // plutôt que convertir (la lecture n'aurait alors pas démarré).
         "pure": pure,
-        "pure_degraded": pure_degraded(pure, etapes.rate_conversion),
+        "pure_degraded": pure_degraded(pure, etapes.rate_conversion, dsd_decime_en_pcm),
         "strict_bitperfect": tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id_courant),
         "rate_conversion": etapes.rate_conversion.map(|(de, vers)| json!({
             "from_hz": de,
             "to_hz": vers,
         })),
     }))
+    .map(|mut v| {
+        // #4907 — l'EXEMPLAIRE réellement ouvert, quand la piste en a
+        // plusieurs (même musique dans plusieurs répertoires) : son chemin, sa
+        // racine, et s'il s'agit d'un repli. Clé ABSENTE sinon : le contrat
+        // des pistes à un seul fichier ne bouge pas.
+        if let Some(e) = np
+            .track_id
+            .and_then(tune_core::library::exemplaires::exemplaire_lu)
+        {
+            v["exemplaire"] = json!(e);
+        }
+        v
+    })
+}
+
+/// #4346 — la valeur publiée dans `signal_path.lossless` : le verdict de la
+/// source quand son codec est connu, `null` sinon. Un codec inconnu n'est
+/// jamais un aveu de perte.
+pub(super) fn lossless_publie(codec_connu: bool, is_lossless: bool) -> Value {
+    if codec_connu {
+        Value::Bool(is_lossless)
+    } else {
+        Value::Null
+    }
+}
+
+/// #4346 — le libellé NEUTRE d'un codec inconnu dans les descriptions
+/// d'étapes. Les descriptions sont du texte libre : y écrire le mot anglais
+/// « Unknown » le montrait tel quel, non traduit (« Unknown → Unknown
+/// 44kHz/16bit »). Le jeton est court et sans langue ; les étapes qui le
+/// portent sont marquées par [`CODE_CODEC_INCONNU`], que le client traduit.
+pub(crate) const CODEC_INCONNU: &str = "?";
+
+/// #4346 — code stable des étapes (`Source`, `Decoder`, `Transcoder`) dont la
+/// description nomme un codec inconnu par [`CODEC_INCONNU`].
+pub(crate) const CODE_CODEC_INCONNU: &str = "source_codec_unknown";
+
+/// #5051 — l'étape « Capture » d'une entrée audio en direct, et si le signal
+/// servi est encore, à l'octet près, celui capté. `None` hors entrée audio.
+pub(super) fn etape_de_capture_en_direct(
+    np: &tune_core::playback::NowPlaying,
+) -> Option<(Value, bool)> {
+    if np.source != "entree-audio" {
+        return None;
+    }
+    let compensation = np
+        .stream_id
+        .as_deref()
+        .and_then(tune_core::source_pcm::compensation_du_direct);
+    let Some(c) = compensation else {
+        return Some((
+            json!({
+                "name": "Capture",
+                "description": "Entrée audio en direct",
+                "bit_perfect": true,
+            }),
+            true,
+        ));
+    };
+    let derive = c
+        .derive_ppm
+        .map(|p| format!(", dérive {p:+.1} ppm"))
+        .unwrap_or_default();
+    let description = if c.reechantillonne {
+        format!("Entrée audio en direct — dérive compensée par rééchantillonnage adaptatif{derive}")
+    } else {
+        format!(
+            "Entrée audio en direct — tampon avec reprise, sans rééchantillonnage ; {} reprise(s){derive}",
+            c.reprises
+        )
+    };
+    let intacte = c.bit_perfect();
+    Some((
+        json!({
+            "name": "Capture",
+            "description": description,
+            "bit_perfect": intacte,
+        }),
+        intacte,
+    ))
 }
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
 /// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).
-pub(super) fn pure_degraded(pure: bool, rate_conversion: Option<(u32, u32)>) -> bool {
-    pure && rate_conversion.is_some_and(|(de, vers)| de != vers)
+///
+/// 🔴 #4354 (défaut n° 3) — `dsd_decime_en_pcm` ajoute la conversion de
+/// DOMAINE, que `rate_conversion` ne pouvait pas voir.
+///
+/// `rate_conversion` n'est renseigné que par l'étape « Resampler »
+/// (rééchantillonnage PCM → PCM mesuré, ou plafond `max_sample_rate`), et ce
+/// second cas **exclut explicitement le DSD** (`rendre_les_verdicts` :
+/// `!is_dsd && forcages.max_sample_rate.is_some_and(…)`). Une décimation
+/// DSD128 → PCM 352,8 kHz passe, elle, par l'étape « Transcoder ». Elle
+/// laissait donc `rate_conversion` à `None` et le badge PURE allumé, intact,
+/// pendant que le signal était reconstruit — le bandeau trompeur du
+/// signalement du 17/09 sur le .42.
+///
+/// PURE promet l'absence de traitement. Convertir du 1 bit en PCM multibit est
+/// le traitement le plus lourd de toute la chaîne : c'est au moins aussi
+/// dégradant qu'un changement de fréquence, qui, lui, était déjà dit.
+pub(super) fn pure_degraded(
+    pure: bool,
+    rate_conversion: Option<(u32, u32)>,
+    dsd_decime_en_pcm: bool,
+) -> bool {
+    pure && (dsd_decime_en_pcm || rate_conversion.is_some_and(|(de, vers)| de != vers))
 }
 
 /// Tout ce que `build_signal_path` a établi, prêt à être décrit en étapes
@@ -631,6 +824,7 @@ fn assembler_les_etapes(
         bit_depth,
         format_name,
         is_lossless,
+        codec_connu,
         flac_ffmpeg_vers_le_reseau,
         conteneur_flac_copie,
         canaux_source,
@@ -641,6 +835,8 @@ fn assembler_les_etapes(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        compensation_reseau_db,
+        crossfeed_du_flux,
         ui_volume,
         volume_full,
         ..
@@ -656,6 +852,9 @@ fn assembler_les_etapes(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
+        // sert qu'au verdict de transport et au badge PURE.
+        dsd_decime_en_pcm: _,
     } = analyse.forcages;
     let Verdicts {
         resampling_active,
@@ -687,16 +886,25 @@ fn assembler_les_etapes(
         "description": source_desc,
         "bit_perfect": true,
     })];
+    // #4346 — l'étape qui nomme un codec inconnu le DIT par un code stable.
+    let marquer_codec_inconnu = |etape: &mut Value| {
+        if !codec_connu {
+            etape["code"] = json!(CODE_CODEC_INCONNU);
+        }
+    };
+    marquer_codec_inconnu(&mut steps[0]);
 
     // Decoder step. Skipped for DSD: the Source already reads e.g.
     // "DSD64 2.8 MHz" and the DSD→PCM/FLAC conversion is shown by the Transcoder
     // step, so a bare "DSD64" decoder line was just a confusing duplicate.
     if !is_dsd {
-        steps.push(json!({
+        let mut decodeur = json!({
             "name": "Decoder",
             "description": format_name,
             "bit_perfect": is_lossless,
-        }));
+        });
+        marquer_codec_inconnu(&mut decodeur);
+        steps.push(decodeur);
     }
 
     // Transcoding step (only if transcoding occurs). Include the zone-forced
@@ -775,6 +983,7 @@ fn assembler_les_etapes(
             "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
         });
+        marquer_codec_inconnu(&mut etape);
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.
@@ -969,6 +1178,42 @@ fn assembler_les_etapes(
         }));
     }
 
+    // Étape « Crossfeed » (#5114) — le crossfeed que le flux RÉSEAU porte
+    // dans ses octets. Ce panneau ne le voyait pas : l'étape DSP ne lit que
+    // l'égaliseur et le préréglage, et une zone DLNA dont le flux croisait
+    // les voies se disait « bit-perfect ». Ce n'est pas une déduction des
+    // réglages : c'est le fait que la session publie (`StreamInfo::crossfeed`),
+    // posé là où le processeur réellement chargé — licence, greffon, PURE et
+    // case compris — entre dans le flux. Une piste servie telle quelle (cas 3
+    // de #2742) ne l'annonce donc pas, et n'affiche rien.
+    //
+    // Place : après l'égaliseur et le convolveur, avant la compensation —
+    // l'ordre de `StreamingDsp::process` et du ré-encodage par le fichier.
+    if crossfeed_du_flux {
+        steps.push(json!({
+            "name": "Crossfeed",
+            "code": "crossfeed",
+            "description": "Crossfeed casque dans le flux (voies gauche et droite croisées)",
+            "bit_perfect": false,
+        }));
+    }
+
+    // Étape « Compensation » (#5071) — APRÈS le DSP, là où elle a lieu : le
+    // dernier étage du flux réseau, après égaliseur, convolveur et crossfeed.
+    // `bit_perfect: false` : elle multiplie chaque échantillon, comme le
+    // ReplayGain. Absente sur un DSD servi brut, où rien n'est cuit.
+    if let Some(db) = compensation_reseau_db.filter(|_| !dsp_contourne_par_le_dsd) {
+        steps.push(json!({
+            "name": "Compensation",
+            "code": "level_compensation",
+            "description": format!(
+                "Compensation de niveau {db:+.1} dB dans le flux (bornée à la crête, sans écrêtage)"
+            ),
+            "bit_perfect": false,
+            "compensation_db": (db * 100.0).round() / 100.0,
+        }));
+    }
+
     // Étape « Mono » (#2362) — APRÈS le DSP et juste avant le transport, parce
     // que c'est exactement là qu'elle a lieu dans la chaîne : le repli tombe en
     // dernier dans `apply_local_dsp`, après l'égaliseur, le convolveur et le
@@ -1117,6 +1362,11 @@ fn rendre_les_verdicts(
     let dsp_applique = forcages.dsp_applique;
     let replaygain_step = traitements.replaygain_step.as_ref();
     let mono_downmix_step = traitements.mono_downmix_step.as_deref();
+    // #5071 — sauf sur un DSD servi brut : rien n'y est cuit.
+    let compensation_reseau =
+        traitements.compensation_reseau_db.is_some() && !forcages.dsp_contourne_par_le_dsd;
+    // #5114 — le crossfeed cuit dans le flux réécrit chaque échantillon.
+    let crossfeed_du_flux = traitements.crossfeed_du_flux;
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
     // already handles rate conversion; showing a separate resampler step
     // would be misleading since sample_rate here is the DSD MHz rate).
@@ -1171,7 +1421,9 @@ fn rendre_les_verdicts(
         && !resampling_active
         && !transformation_reelle_declaree
         && !replaygain_altere
-        && mono_downmix_step.is_none();
+        && mono_downmix_step.is_none()
+        && !compensation_reseau
+        && !crossfeed_du_flux;
 
     // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
     //
@@ -1255,6 +1507,7 @@ fn decrire_le_transport<'a>(
         dlna_cap_16bit,
         needs_transcode_for_output,
         oaat_transcodes,
+        dsd_decime_en_pcm,
         ..
     } = *forcages;
     match output_type {
@@ -1275,18 +1528,17 @@ fn decrire_le_transport<'a>(
                 // transcodes for DLNA), so it is bit-perfect at any depth
                 // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
                 // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
-                // Un DSD décimé en WAV est un changement de DOMAINE (1 bit
-                // sigma-delta → PCM multibit), jamais bit-perfect — le bras
-                // OAAT le dit déjà. Ici, `bit_depth` vaut 1 pour un DSD, et
-                // `1 <= 16` faisait passer la décimation pour du LPCM intact
-                // (Abacab, DMP-A8, .18 du 23/09/2026).
-                let wav_bit_perfect = !is_dsd
-                    && wav_wire_bit_perfect(
-                        is_lossless,
-                        matches!(source_format, Some(AudioFormat::Wav)),
-                        dlna_wav24,
-                        bit_depth,
-                    );
+                // #4354 — le cinquième argument est la conversion de DOMAINE.
+                // Sans lui, un DSD128 décimé en WAV 352,8 kHz/24 bits sortait
+                // d'ici `bit_perfect = true` : `bit_depth` vaut 1 pour du DSD,
+                // donc `bit_depth <= 16` était toujours vrai.
+                let wav_bit_perfect = wav_wire_bit_perfect(
+                    is_lossless,
+                    matches!(source_format, Some(AudioFormat::Wav)),
+                    dlna_wav24,
+                    bit_depth,
+                    dsd_decime_en_pcm,
+                );
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
@@ -1424,6 +1676,14 @@ struct Forcages {
     /// Plafond de fréquence EFFECTIF : réglage de zone et catalogue d'appareils
     /// combinés en `min`, comme `resolve_local_track` (#3183).
     max_sample_rate: Option<u32>,
+    /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
+    ///
+    /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
+    /// brut (`dsd_passthrough`), ni le DoP — qui emballe les mêmes bits dans
+    /// des trames PCM et reste, lui, bit-perfect. La distinction se lit dans
+    /// [`tune_core::orchestrator::transport_dsd`], la règle que l'orchestrateur
+    /// applique déjà ; ce miroir n'en écrit pas une sixième copie.
+    dsd_decime_en_pcm: bool,
 }
 
 /// Décide les forçages de sortie, en miroir des conditions de l'orchestrateur.
@@ -1617,6 +1877,26 @@ fn decider_les_forcages(
     // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
     // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
     let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    // #4354 (défaut n° 3) — la conversion de DOMAINE, celle que le panneau ne
+    // voyait pas.
+    //
+    // `is_local` se lit sur le PRÉFIXE `local:` de `output_device_id`, et non
+    // sur `output_type` : c'est la source dont se sert `resolve_local_track`,
+    // et `transport_dsd` documente en toutes lettres que le miroir d'affichage
+    // doit se servir de la même, faute de quoi le panneau et le chemin audio
+    // répondraient à deux questions différentes (#2189).
+    //
+    // `!dsd_passthrough` garde le cas du .dsf servi BRUT : là, rien n'est
+    // converti, et c'est constaté sur le fil, pas déduit.
+    let dsd_decime_en_pcm = is_dsd
+        && !dsd_passthrough
+        && tune_core::orchestrator::transport_dsd(
+            zone.output_device_id
+                .as_deref()
+                .is_some_and(|d| d.starts_with("local:")),
+            is_network_output,
+            &ZoneRepo::with_backend(backend.clone()).get_dsd_mode(zone_id),
+        ) == tune_core::orchestrator::TransportDsd::Pcm;
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -1628,6 +1908,7 @@ fn decider_les_forcages(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        dsd_decime_en_pcm,
     }
 }
 
@@ -1640,6 +1921,15 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
+    /// #5071 — la compensation de niveau cuite dans le flux RÉSEAU, en dB,
+    /// telle que la session la publie (`StreamInfo::compensation_db`, #5146).
+    /// `None` sans session, ou quand le flux n'en porte pas : sortie locale
+    /// (elle compense par son volume), PURE, interrupteur coupé, piste servie
+    /// telle quelle.
+    compensation_reseau_db: Option<f64>,
+    /// #5114 — le flux servi porte le crossfeed dans ses octets, tel que la
+    /// session le publie (`StreamInfo::crossfeed`). `false` sans session.
+    crossfeed_du_flux: bool,
     ui_volume: f64,
     volume_full: bool,
 }
@@ -1651,6 +1941,7 @@ fn relever_les_traitements(
     np: &tune_core::playback::NowPlaying,
     output_type: &str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
+    wire: Option<&StreamInfo>,
 ) -> Traitements {
     // Determine if DSP is active.
     //
@@ -1685,6 +1976,19 @@ fn relever_les_traitements(
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
 
+    // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
+    // échantillon du flux : une étape, et le verdict en tient compte.
+    //
+    // #5146 — LUE sur le fil (`StreamInfo::compensation_db`), comme le
+    // crossfeed juste en dessous, et non plus prévue depuis les réglages par
+    // `compensation_reseau_prevue_with`. Le miroir ne savait pas si le flux
+    // servi traversait un étage de compensation : sur une piste partie telle
+    // quelle (cas 3 de #2742, crossfeed seul vers un renderer sans LPCM), il
+    // comptait le crossfeed et affichait une compensation — et « non
+    // bit-perfect » — sur des octets intacts. Le flux, lui, sait ce qu'il cuit.
+    let compensation_reseau_db = wire.and_then(|w| w.compensation_db);
+    let crossfeed_du_flux = wire.is_some_and(|w| w.crossfeed);
+
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
     //
@@ -1706,6 +2010,8 @@ fn relever_les_traitements(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        compensation_reseau_db,
+        crossfeed_du_flux,
         ui_volume,
         volume_full,
     }
@@ -1727,6 +2033,10 @@ struct Source<'w> {
     bit_depth: i32,
     format_name: &'static str,
     is_lossless: bool,
+    /// #4346 — le codec de la source est-il CONNU ? Faux pour une radio pas
+    /// encore sondée ou un format non reconnu : `format_name` vaut alors
+    /// [`CODEC_INCONNU`] et `lossless` est publié `null`, jamais `false`.
+    codec_connu: bool,
     /// #4350 — FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5, vers une
     /// sortie réseau : l'orchestrateur le RÉ-ENCODE au lieu de le servir tel
     /// quel (le DMP-A8 cale sur ces en-têtes). Même fonction que la décision,
@@ -1799,8 +2109,9 @@ fn decrire_la_source<'w>(
             bit_depth: radio.bit_depth.unwrap_or(0) as i32,
             format_name: source_format
                 .as_ref()
-                .map_or("Unknown", AudioFormat::display_name),
+                .map_or(CODEC_INCONNU, AudioFormat::display_name),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
+            codec_connu: source_format.is_some(),
             flac_ffmpeg_vers_le_reseau: false,
             conteneur_flac_copie: false,
             // Une radio n'a pas de ligne `tracks` : rien à comparer.
@@ -1901,7 +2212,7 @@ fn decrire_la_source<'w>(
         } else if l.contains("opus") {
             "OPUS"
         } else {
-            "Unknown"
+            CODEC_INCONNU
         }
     };
     // For a media-server source (no from_extension AudioFormat) the lossless
@@ -1946,6 +2257,7 @@ fn decrire_la_source<'w>(
         bit_depth,
         format_name,
         is_lossless,
+        codec_connu: format_name != CODEC_INCONNU,
         flac_ffmpeg_vers_le_reseau,
         conteneur_flac_copie,
         // #4573 — un `0` en base veut dire « le scan ne l'a pas lu », pas

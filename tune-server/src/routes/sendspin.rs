@@ -73,7 +73,11 @@ use tune_core::sendspin::{
 /// La spécification abandonne une connexion provisoire restée sans
 /// `server/activate` au bout de 30 s. Nous nous tenons sous cette borne : une
 /// enceinte qui se tait ne doit pas immobiliser une tâche indéfiniment.
-const DELAI_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// Public pour les épreuves (#5142) : un lecteur de test attend le serveur
+/// avec la MÊME borne que celle que le serveur accorde à un lecteur, et non
+/// avec un délai à lui, plus serré, que rien dans le protocole ne fonde.
+pub const DELAI_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Le routeur du point d'accès.
 ///

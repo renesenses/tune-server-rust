@@ -300,7 +300,7 @@ impl RiceModel {
             if overflow != 0 {
                 // Read overflow value
                 let overflow_val = rc.decode_value(MODEL_ELEMENTS as u32 - 1);
-                let mut b = overflow_val as u32;
+                let mut b = overflow_val;
 
                 // If max overflow, read extra bits
                 if b >= MODEL_ELEMENTS as u32 - 1 {
@@ -523,8 +523,8 @@ impl ApePredictor {
             output
         } else {
             // Single-stage (compression 1000 - Fast)
-            let output = self.yadapt.apply(residual);
-            output
+
+            self.yadapt.apply(residual)
         }
     }
 
@@ -696,7 +696,7 @@ pub fn decode_ape_to_pcm(
             // Last frame: read to end of audio data
             reader
                 .seek(SeekFrom::End(0))
-                .map_err(|e| format!("ape: seek to end: {e}"))? as u64
+                .map_err(|e| format!("ape: seek to end: {e}"))?
         };
 
         let frame_size = (frame_end - frame_offset) as usize;
@@ -771,7 +771,7 @@ pub fn decode_ape_to_pcm(
 
     Ok(DecodedAudio {
         samples_i32: all_samples,
-        bit_depth: bits as u16,
+        bit_depth: bits,
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,

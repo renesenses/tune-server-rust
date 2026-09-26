@@ -817,6 +817,12 @@ pub struct SlimProtoServer {
     event_bus: Option<Arc<crate::event_bus::EventBus>>,
 }
 
+impl Default for SlimProtoServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlimProtoServer {
     /// Create a new server. The port defaults to 3483 but can be overridden
     /// via the `TUNE_SLIMPROTO_PORT` environment variable. No zone bridging
@@ -1147,7 +1153,7 @@ impl SlimProtoServer {
                 let mut w = writer_clone.lock().await;
                 // Reassemble a TcpStream is not possible with split halves,
                 // so we write directly to the write half.
-                if let Err(e) = write_message_to_writer(&mut *w, &msg).await {
+                if let Err(e) = write_message_to_writer(&mut w, &msg).await {
                     debug!(mac = %mac_for_writer, error = %e, "slimproto_write_failed");
                     break;
                 }
@@ -1161,7 +1167,7 @@ impl SlimProtoServer {
             loop {
                 let msg = {
                     let mut r = reader.lock().await;
-                    read_message_from_reader(&mut *r).await
+                    read_message_from_reader(&mut r).await
                 };
 
                 match msg {

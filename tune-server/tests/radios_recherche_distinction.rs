@@ -25,7 +25,7 @@
 //!    longueur de `items`) ;
 //! 2. une station ABSENTE rend « aucun résultat », avec le geste de secours à
 //!    l'écran — c'est la voie 3 de l'issue, « au minimum, le dire » ;
-//! 2 bis. et la requête du ticket, elle, TROUVE désormais : le catalogue livré
+//!    2 bis. et la requête du ticket, elle, TROUVE désormais : le catalogue livré
 //!    a cessé d'être français-seulement (migration 90, voie 1 de l'issue,
 //!    tranchée le 29/08 — peupler le semis depuis notre annuaire) ;
 //! 3. une recherche qui n'aboutit pas rend une PANNE, et non un catalogue

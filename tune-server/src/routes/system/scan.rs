@@ -4,7 +4,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::artist_repo::ArtistRepo;
@@ -29,12 +28,20 @@ const SCAN_FLAGS: u64 = SCAN_ACTIVE | SCAN_CANCELLED;
 /// de génération empêche cette fuite entre propriétaires successifs.
 struct ScanGate {
     state: AtomicU64,
+    /// Le compteur que le jeton lève pour le balayage acoustique. Celui du
+    /// PROCESSUS pour [`SCAN_GATE`] ; un compteur propre pour une porte
+    /// d'épreuve, qui ne voit donc pas les vrais scans des autres épreuves
+    /// (#5142).
+    activite: &'static tune_core::scanner::activite::CompteurDeScans,
 }
 
 impl ScanGate {
-    const fn new() -> Self {
+    const fn avec_activite(
+        activite: &'static tune_core::scanner::activite::CompteurDeScans,
+    ) -> Self {
         Self {
             state: AtomicU64::new(0),
+            activite,
         }
     }
 
@@ -68,7 +75,7 @@ impl ScanGate {
                         // ICI, dans la seule branche qui délivre un jeton, et
                         // baissée par le `Drop` du jeton : les deux gestes ne
                         // peuvent pas se désynchroniser.
-                        _marque_acoustique: tune_core::scanner::activite::MarqueDeScan::poser(),
+                        _marque_acoustique: self.activite.poser(),
                     });
                 }
                 Err(current) => observed = current,
@@ -148,7 +155,74 @@ impl Drop for ScanLease<'_> {
     }
 }
 
-static SCAN_GATE: ScanGate = ScanGate::new();
+static SCAN_GATE: ScanGate =
+    ScanGate::avec_activite(&tune_core::scanner::activite::SCANS_DU_PROCESSUS);
+
+/// Épreuves seulement — le verrou des tests qui dépendent de l'ÉTAT GLOBAL du
+/// scan : le droit de scanner (`SCAN_GATE`) et le compteur de scans en cours
+/// que lit le balayage acoustique sont des globales de PROCESSUS.
+///
+/// Un test qui lance un vrai scan le prend pendant tout le scan ; un test qui
+/// constate « aucun scan ne tourne » ou « mon scan de démarrage a pris le
+/// droit » le prend aussi. Sans lui, ces constats deviennent intermittents dès
+/// que des épreuves de scan réel tournent en parallèle (#5034 en ajoute une
+/// vingtaine : `le_jeton_de_scan_efface_le_balayage_acoustique` et
+/// `le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable` ont rougi
+/// sur Shrek, sans rapport avec leur code).
+///
+/// Recensement du 26/09/2026 (#5142) : chaque appel à `try_begin_scan` des
+/// épreuves de la caisse, sous les deux jeux de fonctionnalités de la CI, a
+/// été relevé avec l'état de ce verrou — tous le tenaient. Les épreuves de la
+/// porte elle-même n'en ont plus besoin : elles ont leur porte et leur
+/// compteur (`scan_gate_tests::porte_isolee`).
+#[cfg(test)]
+static VERROU_DES_SCANS_DE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn serialiser_les_scans_de_test() -> std::sync::MutexGuard<'static, ()> {
+    VERROU_DES_SCANS_DE_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Le même verrou, attendu SANS bloquer le fil : pour une épreuve qui a déjà
+/// lancé un scan sur son propre exécuteur. Bloquer le fil figerait ce scan,
+/// qui tient le droit de scanner que le détenteur du verrou attend : les deux
+/// s'attendraient pour toujours (vu sur Shrek, les aides de
+/// `scan_realigne_tests_4896`, qui scannent deux fois par épreuve).
+#[cfg(test)]
+pub(crate) async fn serialiser_les_scans_de_test_sans_bloquer() -> std::sync::MutexGuard<'static, ()>
+{
+    loop {
+        match VERROU_DES_SCANS_DE_TEST.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Épreuves seulement — attend que le droit de scanner soit LIBRE : le scan
+/// annonce sa fin (`ScanComplete`) avant d'avoir rendu son droit et baissé le
+/// compteur de scans en cours. Une épreuve qui rend le verrou commun dès
+/// l'annonce laisserait la suivante trouver un scan « en cours ».
+#[cfg(test)]
+pub(crate) async fn attendre_que_le_droit_de_scanner_soit_libre() {
+    let debut = std::time::Instant::now();
+    loop {
+        if let Some(jeton) = try_begin_scan() {
+            drop(jeton);
+            return;
+        }
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(300),
+            "le droit de scanner n'est jamais revenu"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
 pub(crate) fn try_begin_scan() -> Option<ScanLease<'static>> {
     SCAN_GATE.try_acquire()
@@ -163,12 +237,20 @@ pub(crate) fn scan_cancel_requested() -> bool {
 #[cfg(test)]
 mod scan_gate_tests {
     use super::ScanGate;
+    use tune_core::scanner::activite::CompteurDeScans;
+
+    /// Une porte d'épreuve avec SON compteur d'activité (#5142) : elle ne
+    /// partage rien avec les vrais scans que d'autres épreuves du processus
+    /// font tourner, et n'a donc pas à se sérialiser avec elles.
+    fn porte_isolee() -> (ScanGate, &'static CompteurDeScans) {
+        let activite: &'static CompteurDeScans = Box::leak(Box::new(CompteurDeScans::new()));
+        (ScanGate::avec_activite(activite), activite)
+    }
 
     /// Le bit que `trigger_scan` consulte se lit, et retombe avec le jeton.
     #[test]
     fn le_verrou_dit_s_il_est_tenu() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         assert!(!gate.is_active());
         let jeton = gate.try_acquire().expect("premier depart");
         assert!(gate.is_active(), "tenu : un nouveau depart serait refuse");
@@ -189,6 +271,9 @@ mod scan_gate_tests {
     /// dire « scanning » — sinon le client relance et reçoit 409
     /// `already_scanning` (pg_scan_converge_4602, 24/09/2026).
     #[tokio::test]
+    // `serialiser()` est tenu à travers les `.await` à dessein : c'est lui qui
+    // tient à l'écart les autres tests du droit de scan global (clippy 1.98).
+    #[allow(clippy::await_holding_lock)]
     async fn scan_status_ne_dit_pas_idle_tant_que_le_droit_est_tenu() {
         let _serialise = serialiser();
         let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -211,16 +296,12 @@ mod scan_gate_tests {
         drop(jeton);
     }
 
-    /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
-    /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
-    /// point 3). Deux tests qui tiennent un jeton en même temps se voient donc
-    /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
-    /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
-    /// verrou.
-    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Le verrou COMMUN aux épreuves de scan réel
+    /// ([`super::serialiser_les_scans_de_test`]). Seule l'épreuve qui touche à
+    /// la porte du PROCESSUS le prend : les autres ont leur porte et leur
+    /// compteur (`porte_isolee`).
     fn serialiser() -> std::sync::MutexGuard<'static, ()> {
-        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+        super::serialiser_les_scans_de_test()
     }
 
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde
@@ -228,8 +309,7 @@ mod scan_gate_tests {
     /// bit d'annulation de A à zéro.
     #[test]
     fn un_second_depart_refuse_ne_desarme_pas_stop() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
 
         assert!(gate.request_cancel());
@@ -258,27 +338,46 @@ mod scan_gate_tests {
     /// jamais et la garde ajoutée dans `embedding.rs` serait du code mort —
     /// exactement le défaut que #2469 a déjà rencontré une fois, quand
     /// `spawn_scan_scheduler` n'était appelé de nulle part.
+    ///
+    /// La porte d'épreuve a son propre compteur (#5142) : le constat ne dépend
+    /// plus d'aucun vrai scan lancé par une autre épreuve du processus, alors
+    /// qu'il attendait jusqu'à deux minutes qu'ils aient fini et rougissait
+    /// quand l'un d'eux démarrait entre l'attente et l'assertion. Le câblage
+    /// de production est cloué juste en dessous.
     #[test]
     fn le_jeton_de_scan_efface_le_balayage_acoustique() {
-        use tune_core::scanner::activite::scan_bibliotheque_en_cours;
-
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, activite) = porte_isolee();
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !activite.en_cours(),
             "aucun scan ne tourne avant d'avoir pris la porte"
         );
 
         let scan = gate.try_acquire().expect("le scan doit demarrer");
         assert!(
-            scan_bibliotheque_en_cours(),
+            activite.en_cours(),
             "un scan qui tourne doit etre visible du balayage acoustique"
         );
 
         drop(scan);
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !activite.en_cours(),
             "la fin du scan doit rendre la main au balayage acoustique"
+        );
+    }
+
+    /// Le câblage : la porte de PRODUCTION lève le compteur du processus,
+    /// celui-là même que lit `scan_bibliotheque_en_cours()` (et donc la garde
+    /// de `embedding.rs`). Une porte branchée sur un autre compteur laisserait
+    /// le balayage acoustique aveugle aux scans — le défaut que #2469 a déjà
+    /// rencontré une fois.
+    #[test]
+    fn la_porte_du_processus_leve_le_compteur_du_balayage_acoustique() {
+        assert!(
+            std::ptr::eq(
+                super::SCAN_GATE.activite,
+                &tune_core::scanner::activite::SCANS_DU_PROCESSUS
+            ),
+            "SCAN_GATE doit lever le compteur que lit le balayage acoustique"
         );
     }
 
@@ -286,8 +385,7 @@ mod scan_gate_tests {
     /// scan. C'est l'autre moitié de l'attachement à une génération précise.
     #[test]
     fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         assert!(!gate.request_cancel());
         let _scan = gate.try_acquire().expect("le scan doit demarrer");
         assert!(!gate.cancel_requested());
@@ -300,8 +398,7 @@ mod scan_gate_tests {
     fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
         use std::sync::{Arc, Barrier, mpsc};
 
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         let depart = Arc::new(Barrier::new(3));
         let maintien = Arc::new(Barrier::new(3));
         let (tx, rx) = mpsc::channel();
@@ -608,18 +705,18 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// received the NFC fix.
 pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
     let path_str: String = path.to_string_lossy().nfc().collect();
-    if let Some(info) = existing_tracks.get(path_str.as_str()) {
-        if let Ok(file_meta) = path.metadata() {
-            let mtime = file_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                && info.taille.is_some_and(|s| s == file_meta.len() as i64);
-            return !unchanged;
-        }
+    if let Some(info) = existing_tracks.get(path_str.as_str())
+        && let Ok(file_meta) = path.metadata()
+    {
+        let mtime = file_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+            && info.taille.is_some_and(|s| s == file_meta.len() as i64);
+        return !unchanged;
     }
     true
 }
@@ -745,7 +842,7 @@ pub(super) async fn trigger_scan(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| tune_core::scanner::walker::normalize_path(s));
+        .map(tune_core::scanner::walker::normalize_path);
     if spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await {
         (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
     } else {
@@ -880,6 +977,162 @@ pub(crate) fn supprimer_pistes_du_scan(
         }
     }
     bilan
+}
+
+/// #4907 — les copies À L'IDENTIQUE rencontrées par un lot de scan.
+///
+/// Une copie octet pour octet d'une piste du même album n'est plus écartée :
+/// elle devient un EXEMPLAIRE de cette piste (`track_copies`), sans ligne
+/// `tracks` de plus. Partagé par le scan manuel et le scan automatique, qui
+/// ne doivent pas diverger sur cette règle (même leçon que #2939).
+#[derive(Default)]
+pub(crate) struct ExemplairesDuLot {
+    a_rattacher: Vec<tune_core::library::exemplaires::NouvelExemplaire>,
+    /// Les pistes que ce lot va insérer, par (hachage, album) : une copie et
+    /// son original peuvent tomber dans le même lot, avant que l'index des
+    /// hachages connus ne les voie.
+    chemins_du_lot: std::collections::HashMap<(String, i64), Vec<String>>,
+}
+
+impl ExemplairesDuLot {
+    /// La piste que l'importateur vient de lire est-elle la copie exacte
+    /// d'une piste déjà connue (base ou lot) du même album ? Si oui, elle est
+    /// notée comme exemplaire et le chemin du propriétaire est rendu ; sinon
+    /// elle est notée comme insertion du lot, et l'appelant l'insère.
+    ///
+    /// Le hachage échantillonné ne fait que désigner des candidats : seule une
+    /// comparaison complète des octets fait d'un fichier un exemplaire (#2664).
+    pub(crate) fn exemplaire_identique(
+        &mut self,
+        track: &tune_core::db::models::Track,
+        connus: &std::collections::HashMap<(String, i64), Vec<String>>,
+    ) -> Option<String> {
+        let (Some(hash), Some(aid), Some(chemin)) =
+            (&track.audio_hash, track.album_id, &track.file_path)
+        else {
+            return None;
+        };
+        let key = (hash.clone(), aid);
+        let mut candidates = connus.get(&key).cloned().unwrap_or_default();
+        candidates.extend(self.chemins_du_lot.get(&key).cloned().unwrap_or_default());
+        if let Some(existant) = tune_core::scanner::hasher::find_byte_identical_path(
+            std::path::Path::new(chemin),
+            &candidates,
+        ) {
+            if let Some(n) =
+                tune_core::library::exemplaires::NouvelExemplaire::depuis_la_piste(&existant, track)
+            {
+                self.a_rattacher.push(n);
+            }
+            return Some(existant);
+        }
+        if !candidates.is_empty() {
+            tracing::warn!(
+                audio_hash = %hash,
+                album_id = aid,
+                path = %chemin,
+                candidates = candidates.len(),
+                "audio_hash_candidate_not_byte_identical"
+            );
+        }
+        self.chemins_du_lot
+            .entry(key)
+            .or_default()
+            .push(chemin.clone());
+        None
+    }
+
+    /// Après l'écriture du lot : rattache les copies à leur piste, et retire
+    /// des exemplaires un fichier qui ne l'est plus (il vient d'entrer comme
+    /// piste parce qu'il a changé).
+    pub(crate) fn ecrire(
+        self,
+        db: &dyn tune_core::db::backend::DbBackend,
+        copies_connues: &CarteDesChemins,
+        inseres: &[tune_core::db::models::Track],
+    ) -> usize {
+        let plus_copies: Vec<String> = inseres
+            .iter()
+            .filter_map(|t| t.file_path.clone())
+            .filter(|p| copies_connues.contains_key(p))
+            .collect();
+        if !plus_copies.is_empty() {
+            tune_core::library::exemplaires::retirer_des_exemplaires(db, &plus_copies);
+        }
+        tune_core::library::exemplaires::rattacher(db, &self.a_rattacher)
+    }
+}
+
+/// #4907 — une piste dont le fichier a disparu mais dont une copie a été VUE
+/// par ce scan ne part pas : la copie prend sa place et la piste garde son
+/// identifiant. Retire ces pistes des candidats à la suppression — AVANT le
+/// plafond volumétrique, qui ne doit compter que de vraies disparitions — et
+/// les rend.
+pub(crate) fn separer_les_promotions(
+    a_supprimer: &mut Vec<i64>,
+    copies: &CarteDesChemins,
+    discovered_paths: &std::collections::HashSet<String>,
+) -> Vec<i64> {
+    let vus: std::collections::HashSet<i64> = copies
+        .iter()
+        .filter(|(chemin, _)| discovered_paths.contains(chemin.as_str()))
+        .map(|(_, info)| info.id)
+        .collect();
+    let (promus, restent): (Vec<i64>, Vec<i64>) =
+        a_supprimer.drain(..).partition(|id| vus.contains(id));
+    *a_supprimer = restent;
+    promus
+}
+
+/// Applique les promotions décidées par [`separer_les_promotions`]. Rend le
+/// nombre de pistes sauvées ; une piste dont aucune copie ne répond plus au
+/// moment de promouvoir est retirée comme avant.
+pub(crate) fn promouvoir_les_exemplaires(
+    db: &dyn tune_core::db::backend::DbBackend,
+    track_repo: &tune_core::db::track_repo::TrackRepo,
+    promus: Vec<i64>,
+    scan: &'static str,
+) -> BilanSuppressionDuScan {
+    let mut perdues = Vec::new();
+    let mut sauvees = 0i64;
+    for id in promus {
+        match tune_core::library::exemplaires::promouvoir(db, id) {
+            Ok(Some(_)) => sauvees += 1,
+            Ok(None) => perdues.push(id),
+            Err(e) => {
+                tracing::warn!(scan, track_id = id, error = %e, "scan_promotion_exemplaire_echec")
+            }
+        }
+    }
+    if sauvees > 0 {
+        tracing::info!(scan, sauvees, "scan_pistes_sauvees_par_un_exemplaire");
+    }
+    supprimer_pistes_du_scan(track_repo, perdues, scan)
+}
+
+/// #4907 — retire les exemplaires dont le fichier a disparu, sous la MÊME
+/// règle que les pistes ([`verdict_purge`]) : une racine illisible ou vidée
+/// ne prouve rien. Le plafond volumétrique ne s'applique pas : retirer un
+/// exemplaire ne retire jamais une piste.
+pub(crate) fn purger_les_exemplaires_disparus(
+    db: &dyn tune_core::db::backend::DbBackend,
+    copies: &CarteDesChemins,
+    discovered_paths: &std::collections::HashSet<String>,
+    targeted: Option<&str>,
+    verdict: impl Fn(&str) -> VerdictPurge,
+) -> usize {
+    let partis: Vec<String> = copies
+        .keys()
+        .filter(|c| targeted.is_none_or(|t| sous_le_dossier(c, t)))
+        .filter(|c| !discovered_paths.contains(c.as_str()))
+        .filter(|c| verdict(c) == VerdictPurge::Supprimer)
+        .cloned()
+        .collect();
+    let n = tune_core::library::exemplaires::retirer_des_exemplaires(db, &partis);
+    if n > 0 {
+        tracing::info!(retires = n, "scan_exemplaires_disparus_retires");
+    }
+    n
 }
 
 /// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
@@ -1348,7 +1601,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // virtuelles, au même endroit et sans relire une feuille de plus. Le
         // rapport garde exactement les mêmes clés — c'est le même inventaire.
         let (inventaire_cue, bilan_cue, images_cue) =
-            tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
+            tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
                 // 🔴 `music_dirs`, PAS `scan_dirs` : un scan ciblé ne porte que
@@ -1357,6 +1610,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // racines DÉCLARÉES qui bornent la décision, jamais l'étendue
                 // du scan en cours.
                 &music_dirs,
+                // #5108 : la base est confrontée aux feuilles relues (retouchées ou
+                // supprimées), sous le plafond de la purge.
+                &tune_core::scanner::cue_bibliotheque::ConfrontationDuScan {
+                    fichiers_vus: &list_result.files,
+                    trop_massive: &crate::routes::system::scan::purge_trop_massive,
+                },
             );
         if inventaire_cue.dossiers > 0 {
             tracing::info!(
@@ -1470,6 +1729,51 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut known_hashes = track_repo
             .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
+        // #4907 — les copies à l'identique déjà rattachées à une piste. Une
+        // lecture en échec rend une carte vide : chaque copie repasse alors par
+        // l'importateur et se rattache de nouveau — rien ne se perd.
+        tune_core::library::exemplaires::nettoyer_les_orphelins(&*db);
+        let existing_copies: CarteDesChemins =
+            tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
+
+        // #5043 — le RATTRAPAGE des métadonnées étendues, et sa borne.
+        //
+        // Un scan complet (`?force=true` / `?full=true`, le bouton « Scan
+        // complet ») désactive le raccourci « inchangé » : TOUS les fichiers
+        // entrent dans son lot de travail, y compris ceux qui n'ont pas bougé.
+        // C'est ce qui permet au bloc de métadonnées étendues, plus bas, de
+        // rattraper une bibliothèque constituée avant son existence. Un scan
+        // incrémental, lui, ne voit jamais un fichier inchangé : il ne rouvre
+        // donc rien de plus, et n'a rien à lire ici.
+        //
+        // La contrepartie : sans borne, chaque scan complet rouvrirait une
+        // SECONDE fois (`read_extended_metadata` ouvre le fichier pour son
+        // compte, après la lecture des balises de base) les 32 333 pistes du
+        // .18 qui ont DÉJÀ leurs crédits. Le surcoût serait permanent au lieu
+        // d'être payé une fois. On lit donc en UNE requête l'ensemble des
+        // pistes qui ont DÉJÀ leurs métadonnées étendues, et aucun lot n'en
+        // rouvre une seule.
+        let deja_pourvues: std::collections::HashSet<i64> = if force {
+            match tune_core::db::rattrapage_metadonnees_5043::pistes_deja_pourvues(&db) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Un échec de lecture ne doit pas SAUTER le rattrapage :
+                    // l'ensemble vide fait relire tout le monde — le
+                    // comportement d'avant #5043, coûteux mais jamais faux.
+                    tracing::warn!(error = %e, "scan_rattrapage_metadonnees_lecture_echouee");
+                    std::collections::HashSet::new()
+                }
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+        if force {
+            tracing::info!(
+                deja_pourvues = deja_pourvues.len(),
+                "scan_rattrapage_metadonnees_etendues — un fichier inchangé n'est rouvert pour \
+                 ses métadonnées étendues que s'il n'en a AUCUNE (#5043)"
+            );
+        }
 
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
@@ -1494,7 +1798,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
                 // Shared with auto_scan so the manual and watcher scans can't
                 // diverge on the NFC key handling (the "scan interminable" bug).
-                file_needs_scan(path, &existing_tracks)
+                // Un exemplaire inchangé se saute comme une piste (#4907).
+                file_needs_scan(path, &existing_tracks) && file_needs_scan(path, &existing_copies)
             });
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
@@ -1618,6 +1923,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // Lignes de ce lot qui existaient sous une source d'importation
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
+                let mut exemplaires_du_lot = ExemplairesDuLot::default();
 
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
@@ -1684,6 +1990,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     // fichier qu'on va finalement écarter (#593). Le mode
                     // `force` désactive le raccourci « inchangé » pour que les
                     // album_id soient re-résolus.
+                    // Un exemplaire déjà rattaché et inchangé ne se relit pas (#4907).
+                    if verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_copies)
+                        == VerdictEcriture::Inchange
+                    {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
+                    }
                     let verdict =
                         verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_tracks);
                     if verdict == VerdictEcriture::Inchange {
@@ -1707,57 +2021,67 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_update.push(track);
                     } else {
-                        // The sampled hash only narrows the candidates. A track
-                        // is skipped solely when a complete byte comparison
-                        // confirms an exact copy in the same album.
-                        if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
-                            let key = (hash.clone(), aid);
-                            let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
-                            if let Some(existing_path) =
-                                tune_core::scanner::hasher::find_byte_identical_path(
-                                    std::path::Path::new(&sf.path),
-                                    &candidates,
-                                )
-                            {
-                                tracing::debug!(
-                                    audio_hash = %hash,
-                                    album_id = aid,
-                                    path = %sf.path,
-                                    existing_path = %existing_path,
-                                    "skip_duplicate_audio_hash"
-                                );
-                                skipped += 1;
-                                skipped_duplicate += 1;
-                                // Ce chemin n'était journalisé qu'en `debug!` :
-                                // invisible au niveau livré, donc introuvable
-                                // même en fouillant les journaux (#2050).
-                                tune_core::scanner::walker::pousser_chemin_ecarte(
-                                    &mut skipped_duplicate_paths,
-                                    format!("{} (identique à {})", sf.path, existing_path),
-                                );
-                                continue;
-                            }
-                            if !candidates.is_empty() {
-                                tracing::warn!(
-                                    audio_hash = %hash,
-                                    album_id = aid,
-                                    path = %sf.path,
-                                    candidates = candidates.len(),
-                                    "audio_hash_candidate_not_byte_identical"
-                                );
-                            }
+                        // #4907 — une copie octet pour octet d'une piste du même
+                        // album n'est plus écartée : elle devient un EXEMPLAIRE de
+                        // cette piste, sans ligne `tracks` de plus.
+                        if let Some(existing_path) =
+                            exemplaires_du_lot.exemplaire_identique(&track, &known_hashes)
+                        {
+                            tracing::debug!(
+                                path = %sf.path,
+                                existing_path = %existing_path,
+                                "scan_exemplaire_identique"
+                            );
+                            skipped += 1;
+                            skipped_duplicate += 1;
+                            tune_core::scanner::walker::pousser_chemin_ecarte(
+                                &mut skipped_duplicate_paths,
+                                format!("{} (exemplaire de {})", sf.path, existing_path),
+                            );
+                            continue;
                         }
                         balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_insert.push(track);
                     }
                 }
 
-                // Collect extended metadata for tracks in this batch
+                // Collect extended metadata for tracks in this batch.
+                //
+                // #5043 — un fichier NEUF ou MODIFIÉ se relit toujours : ses
+                // balises viennent de changer, ses crédits avec. Un fichier
+                // INCHANGÉ n'est dans ce lot que parce qu'un scan COMPLET a
+                // désactivé le raccourci ; on ne le rouvre alors que s'il n'a
+                // encore AUCUNE métadonnée étendue. Sans cette borne, chaque
+                // scan complet repaierait le second passage sur toute la
+                // bibliothèque, pour n'y rien changer.
+                //
+                // Le critère ne compte PAS les lignes de `track_metadata` : les
+                // clés `rg_*` / `dr_*` / `upnp_*` ont leurs propres écrivains,
+                // qui n'ouvrent jamais le fichier pour ses crédits. Les compter
+                // sauterait à vie les 15 151 pistes du .18 qui n'ont qu'elles
+                // (voir `rattrapage_metadonnees_5043`).
                 let mut extended_meta_paths: Vec<String> = Vec::new();
                 for sf in &batch {
-                    if sf.metadata.is_some() {
-                        extended_meta_paths.push(sf.path.clone());
+                    if sf.metadata.is_none() {
+                        continue;
                     }
+                    // `false` et non `force` : la question est « ce fichier
+                    // a-t-il bougé ? », pas « le scan est-il complet ? ».
+                    let inchange = verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_tracks,
+                    ) == VerdictEcriture::Inchange;
+                    if inchange
+                        && existing_tracks
+                            .get(sf.path.as_str())
+                            .is_some_and(|info| deja_pourvues.contains(&info.id))
+                    {
+                        continue;
+                    }
+                    extended_meta_paths.push(sf.path.clone());
                 }
 
                 // Batch insert + update using prepared statements. Per-row
@@ -1766,6 +2090,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                exemplaires_du_lot.ecrire(&*db, &existing_copies, &to_insert);
                 // La pochette PROPRE d'une piste se pose à part : `update_batch`
                 // n'écrit pas `cover_path`, faute de quoi une piste relue
                 // recopierait dans sa ligne la pochette de son ALBUM (la lecture
@@ -1824,16 +2149,33 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
                     let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
 
+                    // #5043 — les `tracks.id` du lot, par une lecture FORTE.
+                    //
+                    // Ce bloc tourne DANS la transaction du lot. `get_by_path`
+                    // passait par le pool de lecture — des connexions SÉPARÉES
+                    // sous SQLite, qui ne voient pas ce que cette transaction
+                    // vient d'écrire. Elle rendait `None`, le `if let
+                    // Ok(Some(..))` l'avalait, et aucune métadonnée étendue
+                    // n'entrait en base : sur le .18, un scan complet de
+                    // 46 965 fichiers n'a posé PAS UNE clé de crédit.
+                    //
+                    // Une requête par tranche, et non une par fichier.
+                    let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
+                        &db,
+                        &extended_meta_paths,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "scan_ids_des_metadonnees_etendues_echec");
+                        std::collections::HashMap::new()
+                    });
                     for path_str in &extended_meta_paths {
                         let path = std::path::Path::new(path_str);
-                        // Look up the track_id by file_path
-                        if let Ok(Some(track)) = track_repo.get_by_path(path_str) {
-                            if let Some(track_id) = track.id {
-                                let ext_meta = tune_core::metadata::read_extended_metadata(path);
-                                if !ext_meta.is_empty() {
-                                    meta_entries.push((track_id, ext_meta));
-                                }
-                            }
+                        let Some(track_id) = ids.get(path_str).copied() else {
+                            continue;
+                        };
+                        let ext_meta = tune_core::metadata::read_extended_metadata(path);
+                        if !ext_meta.is_empty() {
+                            meta_entries.push((track_id, ext_meta));
                         }
                     }
 
@@ -2010,10 +2352,21 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 .filter(|(_, info)| info.est_locale())
                 .map(|(chemin, info)| (chemin.as_str(), info.id))
                 .collect();
+            // #4907 — les exemplaires TELS QU'ILS SONT MAINTENANT : ce scan
+            // vient peut-être d'en rattacher, et ce sont eux qui sauvent une
+            // piste dont le fichier propre a disparu.
+            let copies_du_scan: CarteDesChemins =
+                tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
             // Racines devenues vides : un partage non monté est LISIBLE et
             // vide, donc invisible pour `missing_dirs`. Sans ce garde, le
             // nettoyage ci-dessous efface la bibliothèque entière (#1652).
-            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
+            // Les exemplaires comptent : une racine qui ne porte QUE des
+            // copies se vide aussi quand son montage tombe (#4907).
+            let existing_refs: Vec<&str> = pistes_locales
+                .keys()
+                .copied()
+                .chain(copies_du_scan.keys().map(String::as_str))
+                .collect();
             racines_videes = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
             let emptied_roots = &racines_videes;
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
@@ -2047,11 +2400,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // `discovered_paths` only holds files below that folder, so a
                 // track anywhere else would look "missing" and get wrongly
                 // deleted — pruning the whole library except the sub-folder.
-                if let Some(ref t) = targeted {
-                    if !sous_le_dossier(db_path, t) {
+                if let Some(ref t) = targeted
+                    && !sous_le_dossier(db_path, t) {
                         continue;
                     }
-                }
                 examinees += 1;
                 if !discovered_paths.contains(db_path) {
                     match verdict_purge(
@@ -2068,6 +2420,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
             }
+            let a_promouvoir =
+                separer_les_promotions(&mut a_supprimer, &copies_du_scan, &discovered_paths);
             if purge_refusee(a_supprimer.len(), examinees, purge_confirmee) {
                 // Le nombre exact est publié — log ET `scan_result` — parce
                 // que c'est lui qu'il faut renvoyer pour confirmer. Un refus
@@ -2098,8 +2452,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 );
             }
             let bilan = supprimer_pistes_du_scan(&track_repo, a_supprimer, "manual");
-            let pruned = bilan.removed;
-            db_delete_failed = bilan.db_delete_failed;
+            let bilan_promotions =
+                promouvoir_les_exemplaires(&*db, &track_repo, a_promouvoir, "manual");
+            purger_les_exemplaires_disparus(
+                &*db,
+                &copies_du_scan,
+                &discovered_paths,
+                targeted.as_deref(),
+                |chemin| {
+                    verdict_purge(
+                        chemin,
+                        &scan_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        sous_arbres,
+                    )
+                },
+            );
+            let pruned = bilan.removed + bilan_promotions.removed;
+            db_delete_failed = bilan.db_delete_failed + bilan_promotions.db_delete_failed;
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
             pistes_supprimees = pruned;
@@ -2203,8 +2575,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // came from two independent subqueries, which is how an album
                 // tagged "Alternatif & Indé" surfaced a stale "singer; Songwriter"
                 // genres value from an unrelated track — #1160).
+                //
+                // Un genre corrigé À LA MAIN (C3 ; écran « Modifier » de la
+                // fiche, 25/09/2026) n'est pas un genre « périmé » : le scan
+                // complet ne le réécrit pas.
                 if let Err(e) = db.execute(
-                    "UPDATE albums SET \
+                    &format!(
+                        "UPDATE albums SET \
                      genre = (SELECT t.genre FROM tracks t \
                               WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' \
                               GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
@@ -2213,70 +2590,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
                                   WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' \
                                   GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
                                  '\"', '\\\"') || '\"]' \
-                     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '')",
+                     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '') \
+                     AND NOT {}",
+                        tune_core::db::album_repo::sql_champ_tenu_a_la_main("genre")
+                    ),
                     &[],
                 ) {
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
-                }
-            }
-            // Merge duplicate local albums (same title, case-insensitive).
-            // After a rescan, tag changes can create a second album entry for
-            // tracks that already belonged to an existing album (e.g. when
-            // album_artist changed). Merging moves all tracks to the album
-            // with the most tracks, so the orphan cleanup below can delete the
-            // now-empty duplicate. This is the definitive fix for bug #593
-            // ("Doublons pochettes albums apres rescan").
-            {
-                let dupe_rows = db.query_many(
-                    "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
-                     WHERE source = 'local' \
-                     GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
-                    &[],
-                ).ou_defaut_journalise();
-                let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
-                    (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
-                }).collect();
-                let mut merged_albums = 0usize;
-                for (_title, ids_str) in &dupes {
-                    let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-                    if ids.len() < 2 {
-                        continue;
-                    }
-                    // Keep the album with the most tracks
-                    let mut best_id = ids[0];
-                    let mut best_count = 0i64;
-                    for &aid in &ids {
-                        let cnt = db.query_one(
-                            "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                            &[&aid],
-                        ).ok().flatten().and_then(|r| r[0].as_i64()).unwrap_or(0);
-                        if cnt > best_count {
-                            best_count = cnt;
-                            best_id = aid;
-                        }
-                    }
-                    for &aid in &ids {
-                        if aid != best_id {
-                            db.execute(
-                                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                                &[&best_id, &aid],
-                            ).ok();
-                            db.execute(
-                                "DELETE FROM albums WHERE id = ?",
-                                &[&aid],
-                            ).ok();
-                            merged_albums += 1;
-                        }
-                    }
-                }
-                if merged_albums > 0 {
-                    // Refresh track_count for albums that received tracks from merged duplicates
-                    db.execute_batch(&format!(
-                        "UPDATE albums SET track_count = {}",
-                        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
-                    ))
-                    .ok();
-                    tracing::info!(merged_albums, "post_scan_duplicate_albums_merged");
                 }
             }
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
@@ -2304,6 +2624,19 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // retouché suit ses balises, par la même règle que le surveillant.
         balises_vues.realigner(&db);
 
+        // #5034 — APRÈS la purge : chaque pochette tirée d'un fichier du
+        // disque est confrontée à ce fichier, d'un `stat`. Le scan rapide ne
+        // relit que les pistes modifiées : un `cover.jpg` supprimé dans un
+        // album dont aucune piste n'a bougé n'était vu par personne.
+        // « Répertoires » ne regarde que son dossier.
+        let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+            &db,
+            &cache_dir,
+            &portee_pochettes,
+            force,
+        );
+
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
         // can leave album rows behind that no track references. Without this
@@ -2316,6 +2649,22 @@ pub(crate) async fn spawn_library_scan_confirmee(
             .unwrap_or(0);
         if orphan_albums > 0 {
             tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
+        }
+
+        // LA règle « compilation » (25/09/2026) sur ce que la base garde : le
+        // scan ne sait que LEVER le drapeau, cette passe baisse celui des
+        // albums d'un seul artiste marqués sous l'ancienne règle. Lecture de
+        // la base seule, idempotente, éditions manuelles respectées.
+        if !scan_cancel_requested() {
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .recalculer_les_compilations()
+            {
+                Ok(bilan) if bilan.baisses > 0 => {
+                    tracing::info!(?bilan, "post_scan_compilations_recalculees")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
+            }
         }
 
         // Une réparation d'attribution ne se fonde que sur une vue complète et
@@ -2417,6 +2766,36 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     tracing::warn!(error = %e, "post_scan_album_distinct_pairs_reconcile_failed")
                 }
             }
+        }
+        // Coffrets automatiques (GO du 25/09/2026) : les disques d'un coffret
+        // rangé un dossier par disque (« Titre, Disc 2 ») sont réunis. APRÈS
+        // la réconciliation des paires distinctes, qu'elle consulte, et hors de
+        // la garde `full_scan_ok` : elle ne supprime rien qui ne soit absorbé.
+        tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan");
+
+        // Merge duplicate local albums (same title, case-insensitive, same
+        // artist). After a rescan, tag changes can create a second album entry
+        // for tracks that already belonged to an existing album — bug #593
+        // ("Doublons pochettes albums apres rescan").
+        //
+        // Reste de #5005 : la logique est celle de la fusion manuelle et du
+        // nettoyage (`FusionDesDoublons`). Écrite dans la transaction plus
+        // haut avec `GROUP_CONCAT` en dur, elle ne tournait jamais sur
+        // PostgreSQL (erreur avalée), et elle fusionnait des paires déclarées
+        // distinctes (#1276). Elle vient APRÈS la réconciliation des paires :
+        // un scan qui renouvelle les rowids laisse jusque-là les arbitrages
+        // pointer des albums morts, et la fusion ne les verrait pas.
+        match tune_core::db::album_doublons::FusionDesDoublons::with_backend(db.clone())
+            .fusionner(tune_core::db::album_doublons::Declencheur::FinDeScan)
+        {
+            Ok(bilan) if bilan.fusionnes > 0 => {
+                tracing::info!(
+                    merged_albums = bilan.fusionnes,
+                    "post_scan_duplicate_albums_merged"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "post_scan_duplicate_albums_merge_failed"),
         }
 
         // Backfill embedded cover art for local albums still missing a cover.
@@ -2654,9 +3033,12 @@ fn statut_publie(stocke: String, droit_tenu: bool) -> String {
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
+    // #5086 — lu par le pool, pas par l'écrivain : un statut PUBLIÉ n'a pas à
+    // attendre la fin d'une écriture, et c'est `SCAN_GATE`, plus bas, qui fait
+    // foi pendant un scan. Par l'écrivain, Support › Diagnostic rendait « — ».
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let status = settings
-        .get("scan_status")
+        .get_sans_ecrivain("scan_status")
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
@@ -2669,7 +3051,7 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings
-        .get("scan_result")
+        .get_sans_ecrivain("scan_result")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -3751,17 +4133,18 @@ mod tests {
             // Ces temoins parlent en « drapeau leve / pas de drapeau », ce qui
             // est exactement `Some(true)` / `None` depuis que le tag porte
             // trois etats (C1).
+            // Pas d'artiste de piste : l'artiste d'album en tient lieu.
             (
                 dir.to_string(),
                 *album,
                 *aa,
                 if *flag { Some(true) } else { None },
+                None,
             )
         }))
         .into_iter()
-        // La regle C1 ramenee au `bool` que ces temoins interrogent : le tag
-        // tranche s'il existe, la forme des dossiers seulement sinon.
-        .map(|(k, v)| (k, v.tag.unwrap_or(v.forme)))
+        // LA regle (25/09/2026) ramenee au `bool` que ces temoins interrogent.
+        .map(|(k, v)| (k, v.jugement.compilation))
         .collect()
     }
 
@@ -3820,13 +4203,22 @@ mod tests {
         assert!(is_comp(&m, "/m/comp/hits", "Now 100"));
     }
 
+    /// Bertrand, 25/09/2026 : la balise `COMPILATION=1` SEULE, sur un album
+    /// d'un seul artiste, ne suffit plus (« Here & Gone », David Sanborn).
+    /// Ce témoin disait l'inverse (« le drapeau l'emporte ») ; il est retourné.
     #[test]
-    fn compilation_flag_wins_even_with_consistent_artist() {
+    fn la_balise_seule_ne_suffit_plus_sur_un_seul_artiste() {
         let m = decide(&[
             ("/m/comp/ost", "OST", Some("Hans Zimmer"), true),
             ("/m/comp/ost", "OST", Some("Hans Zimmer"), false),
         ]);
-        assert!(is_comp(&m, "/m/comp/ost", "OST"));
+        assert!(!is_comp(&m, "/m/comp/ost", "OST"));
+        // Avec des artistes variés, la balise ne gêne rien : compilation.
+        let m = decide(&[
+            ("/m/comp/mix", "Mix", Some("Hans Zimmer"), true),
+            ("/m/comp/mix", "Mix", Some("John Williams"), true),
+        ]);
+        assert!(is_comp(&m, "/m/comp/mix", "Mix"));
     }
 
     #[test]

@@ -258,14 +258,14 @@ pub async fn save(
         for (key, value) in obj {
             let skey = format!("{}_{}", id, key);
             let sval = value.as_str().unwrap_or("");
-            if !sval.is_empty() {
-                if let Err(e) = settings.set(&skey, sval) {
-                    error!(key = %skey, error = %e, "service_token_save_failed");
-                    return Json(json!({
-                        "valid": false,
-                        "validation_message": format!("Erreur sauvegarde: {e}")
-                    }));
-                }
+            if !sval.is_empty()
+                && let Err(e) = settings.set(&skey, sval)
+            {
+                error!(key = %skey, error = %e, "service_token_save_failed");
+                return Json(json!({
+                    "valid": false,
+                    "validation_message": format!("Erreur sauvegarde: {e}")
+                }));
             }
         }
     }

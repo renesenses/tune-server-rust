@@ -170,15 +170,21 @@ fn vers_pcm(x: &[f64], bits: u16) -> Vec<u8> {
 fn depuis_pcm(pcm: &[u8], bits: u16) -> Vec<i64> {
     match bits {
         16 => pcm
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i64::from(i16::from_le_bytes([b[0], b[1]])))
             .collect(),
         24 => pcm
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| i64::from((i32::from_le_bytes([0, b[0], b[1], b[2]])) >> 8))
             .collect(),
         32 => pcm
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
             .collect(),
         _ => unreachable!("profondeur {bits}"),

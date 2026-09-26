@@ -1246,21 +1246,21 @@ fn alac_16_playing() -> ZoneState {
 
 #[test]
 fn wav_wire_native_wav_is_bit_perfect_any_depth() {
-    assert!(wav_wire_bit_perfect(true, true, false, 24)); // native WAV 24-bit, flag off
-    assert!(wav_wire_bit_perfect(true, true, false, 16));
+    assert!(wav_wire_bit_perfect(true, true, false, 24, false)); // native WAV 24-bit, flag off
+    assert!(wav_wire_bit_perfect(true, true, false, 16, false));
 }
 
 #[test]
 fn wav_wire_flac_fallback_capped_at_16_bit() {
     // FLAC/ALAC → WAV fallback (source not WAV): 24-bit needs the override.
-    assert!(!wav_wire_bit_perfect(true, false, false, 24));
-    assert!(wav_wire_bit_perfect(true, false, false, 16)); // fits plain 16-bit LPCM
-    assert!(wav_wire_bit_perfect(true, false, true, 24)); // dlna_wav24 preserves 24-bit
+    assert!(!wav_wire_bit_perfect(true, false, false, 24, false));
+    assert!(wav_wire_bit_perfect(true, false, false, 16, false)); // fits plain 16-bit LPCM
+    assert!(wav_wire_bit_perfect(true, false, true, 24, false)); // dlna_wav24 preserves 24-bit
 }
 
 #[test]
 fn wav_wire_lossy_source_never_bit_perfect() {
-    assert!(!wav_wire_bit_perfect(false, true, true, 16));
+    assert!(!wav_wire_bit_perfect(false, true, true, 16, false));
 }
 
 // ------------------------------------------------------------------
@@ -2873,16 +2873,17 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
         ..Default::default()
     };
     for (codec, rate, bits, expected, lossless) in [
-        (Some("mp3"), Some(44_100), None, "MP3 44kHz", false),
-        (Some("aac"), Some(22_050), None, "AAC 22kHz", false),
+        (Some("mp3"), Some(44_100), None, "MP3 44kHz", json!(false)),
+        (Some("aac"), Some(22_050), None, "AAC 22kHz", json!(false)),
         (
             Some("flac"),
             Some(48_000),
             Some(16),
             "FLAC 48kHz/16bit",
-            true,
+            json!(true),
         ),
-        (None, None, None, "Unknown", false),
+        // #4346 : codec inconnu ⇒ état inconnu (`null`), jamais `false`.
+        (None, None, None, CODEC_INCONNU, Value::Null),
     ] {
         let stream = StreamInfo {
             radio_source: Some(RadioSourceInfo {
@@ -2912,7 +2913,7 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
                 sp["lossless"], lossless,
                 "WAV decoding must not make a lossy radio lossless"
             );
-            if !lossless {
+            if lossless != json!(true) {
                 assert_eq!(
                     sp["bit_perfect"], false,
                     "lossy or unknown radio cannot claim bit-perfect"
@@ -2938,11 +2939,12 @@ fn radio_4346_without_probe_cannot_claim_lossless() {
     for stream in [None, Some(wire("wav", 44_100, 16))] {
         let sp = build_signal_path(&ps, &zone, &backend, None, "none", stream.as_ref()).unwrap();
         assert_eq!(
-            sp["lossless"], false,
-            "pending radio codec must not be inferred from WAV"
+            sp["lossless"],
+            Value::Null,
+            "pending radio codec must not be inferred from WAV — nor declared lossy (#4346)"
         );
         assert_eq!(sp["bit_perfect"], false);
-        assert_eq!(step_desc(&sp, "Source").as_deref(), Some("Unknown"));
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some(CODEC_INCONNU));
     }
 }
 
@@ -3007,6 +3009,150 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
             "{output}: 24-bit source truncated to 16-bit before output"
         );
     }
+}
+
+// ── #4346 — codec INCONNU : un état publié, pas un aveu de perte ──
+
+fn step_code(v: &Value, name: &str) -> Option<String> {
+    step_field(v, name, "code")
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+/// La capture de Jean Valjean (fil 1825, v0.9.155, Windows 11) : une radio
+/// lancée sur `local:Haut-parleurs`, codec pas encore sondé, fil WAV 44,1/16.
+/// L'écran disait « Avec perte », et « Unknown » trois fois.
+fn radio_non_sondee_en_local() -> (Arc<dyn DbBackend>, Zone, ZoneState, StreamInfo) {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("local".into());
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let stream = StreamInfo {
+        radio_source: Some(RadioSourceInfo::default()),
+        ..wire("wav", 44_100, 16)
+    };
+    (backend, zone, ps, stream)
+}
+
+#[test]
+fn codec_inconnu_4346_publie_lossless_null_jamais_false() {
+    let (backend, zone, ps, stream) = radio_non_sondee_en_local();
+    let sp = build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+    assert!(
+        sp.get("lossless").is_some(),
+        "la clé `lossless` doit rester publiée"
+    );
+    assert_eq!(
+        sp["lossless"],
+        Value::Null,
+        "codec inconnu : `lossless` doit valoir null (état inconnu), pas {} — \
+         `false` fait afficher « Avec perte » (#4346)",
+        sp["lossless"]
+    );
+    assert_eq!(sp["bit_perfect"], false, "l'inconnu ne prouve rien");
+}
+
+#[test]
+fn codec_inconnu_4346_aucune_description_n_ecrit_unknown() {
+    let (backend, zone, ps, stream) = radio_non_sondee_en_local();
+    let sp = build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+    let steps = sp["steps"].as_array().unwrap();
+    for step in steps {
+        let desc = step["description"].as_str().unwrap_or_default();
+        assert!(
+            !desc.contains("Unknown"),
+            "étape {} : « {desc} » écrit le mot anglais en dur (#4346)",
+            step["name"]
+        );
+    }
+    assert!(
+        !sp["summary"].as_str().unwrap().contains("Unknown"),
+        "résumé : {}",
+        sp["summary"]
+    );
+    for name in ["Source", "Decoder", "Transcoder"] {
+        assert_eq!(
+            step_code(&sp, name).as_deref(),
+            Some(CODE_CODEC_INCONNU),
+            "l'étape {name} nomme un codec inconnu : elle doit le dire par un code stable"
+        );
+        assert!(
+            step_desc(&sp, name).unwrap().contains(CODEC_INCONNU),
+            "l'étape {name} porte le jeton neutre que le client traduit"
+        );
+    }
+}
+
+/// Un format de piste non reconnu (ni extension, ni MIME connu) est le même
+/// inconnu que la radio pas encore sondée.
+#[test]
+fn codec_inconnu_4346_format_de_piste_non_reconnu_est_aussi_inconnu() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            format: Some("x-codec-exotique".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(sp["lossless"], Value::Null);
+    assert_eq!(
+        step_code(&sp, "Source").as_deref(),
+        Some(CODE_CODEC_INCONNU)
+    );
+    assert!(!step_desc(&sp, "Source").unwrap().contains("Unknown"));
+}
+
+/// Codec CONNU : rien ne change — booléen, et aucune étape marquée.
+#[test]
+fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone, ps, _) = radio_non_sondee_en_local();
+    for (codec, bits, attendu) in [
+        ("mp3", None, false),
+        ("aac", None, false),
+        ("flac", Some(16), true),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                format: Some(codec),
+                sample_rate: Some(44_100),
+                bit_depth: bits,
+            }),
+            ..wire("wav", 44_100, 16)
+        };
+        for output in ["local", "dlna", "oaat"] {
+            zone.output_type = Some(output.into());
+            let sp =
+                build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+            assert_eq!(sp["lossless"], json!(attendu), "{codec} vers {output}");
+            for step in sp["steps"].as_array().unwrap() {
+                assert_ne!(
+                    step["code"].as_str(),
+                    Some(CODE_CODEC_INCONNU),
+                    "{codec} vers {output} : étape {} marquée inconnue à tort",
+                    step["name"]
+                );
+            }
+        }
+    }
+    // Et une piste ALAC de la bibliothèque, le cas courant.
+    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(sp["lossless"], json!(true));
 }
 
 // ── #4172 — WASAPI sans contrat exclusif = mode partagé, nommé et non bit-perfect ──
@@ -3127,6 +3273,167 @@ fn pure_sans_conversion_n_est_pas_degrade_3973() {
     assert_eq!(sp["pure"], serde_json::json!(true));
     assert_eq!(sp["pure_degraded"], serde_json::json!(false), "{sp}");
     assert!(sp["rate_conversion"].is_null(), "{sp}");
+}
+
+// ── #4354 (défaut n° 3) — le bandeau PURE pendant une DÉCIMATION DSD → PCM ──
+//
+// Le .42, 17/09/2026 : zone 10 en `dsd_mode = pcm` vers un Eversolo DMP-A8 en
+// DLNA. Le journal dit `streaming_decode_wav_header_sent_dsd source_rate=352800
+// output_bd=24` — le 1 bit est décimé en PCM multibit — et l'interface affiche
+// PURE. PURE promet l'absence de traitement ; ici le signal est reconstruit.
+//
+// Deux trous indépendants, fermés ensemble :
+//
+//  1. `pure_degraded` ne regardait que `rate_conversion`, renseigné par la
+//     seule étape « Resampler ». La décimation DSD passe par « Transcoder », et
+//     le calcul du plafond exclut explicitement le DSD (`!is_dsd`). PURE
+//     restait donc intact.
+//  2. `wav_wire_bit_perfect` rendait `true` : pour du DSD, `bit_depth` vaut 1
+//     (la profondeur de la SOURCE, forcée par `decrire_la_source`), donc
+//     `bit_depth <= 16` était trivialement vrai, et le DSD est « lossless ».
+//     La branche `"oaat"` portait déjà la bonne règle — « DSD → WAV is a
+//     domain conversion […] so it is NOT bit-perfect » —, la branche
+//     `"dlna" | "openhome"` ne l'avait pas.
+//
+// La distinction qui compte, et que ces tests clouent : le DoP n'est PAS une
+// décimation. Il emballe les mêmes bits dans des trames PCM et doit rester
+// bit-perfect, PURE non dégradé.
+
+/// La fonction NUE : c'est `bit_depth = 1` du DSD qui rendait la clause
+/// `bit_depth <= 16` toujours vraie. Le dernier argument est le seul qui
+/// change le verdict, et son absence était le défaut.
+#[test]
+fn wav_wire_un_dsd_decime_n_est_jamais_bit_perfect_4354() {
+    // Ce que la fonction rendait AVANT, sur exactement ces entrées (source DSD
+    // sans perte, fil WAV, profondeur source de 1 bit) : `true`.
+    assert!(
+        wav_wire_bit_perfect(true, false, true, 1, false),
+        "sans le drapeau, le verdict historique est conservé — c'est le DoP"
+    );
+    // Et ce qu'elle doit rendre quand le DSD est DÉCIMÉ.
+    assert!(
+        !wav_wire_bit_perfect(true, false, true, 1, true),
+        "une décimation 1 bit -> PCM multibit n'est pas bit-perfect"
+    );
+}
+
+/// ⭐ Le cas du signalement : zone réseau, `dsd_mode = pcm`, fil WAV
+/// 352,8 kHz / 24 bits, PURE armé. Le badge doit dire DÉGRADÉ, et le transport
+/// ne doit plus se dire bit-perfect.
+#[test]
+fn pure_sur_un_dsd_decime_en_pcm_est_declare_degrade_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "pcm")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 352_800, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(true),
+        "PURE + décimation DSD -> PCM = PURE dégradé : {sp}"
+    );
+    let transport = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Transport")
+        .expect("l'étape Transport")
+        .clone();
+    assert_eq!(
+        transport["bit_perfect"],
+        serde_json::json!(false),
+        "le transport DLNA d'un DSD décimé n'est pas bit-perfect : {transport}"
+    );
+}
+
+/// ⭐ La contre-épreuve du correctif lui-même : le DoP n'est pas une
+/// décimation. Même source, même fil, même zone — seul `dsd_mode` change — et
+/// le verdict doit rester celui d'avant. Sans ce test, un correctif qui
+/// écrirait simplement « DSD => pas bit-perfect » passerait, en cassant le DoP.
+#[test]
+fn le_dop_reste_bit_perfect_et_pure_non_degrade_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "dop")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 352_800, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(false),
+        "le DoP emballe les mêmes bits : PURE n'est pas dégradé : {sp}"
+    );
+    let transport = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Transport")
+        .expect("l'étape Transport")
+        .clone();
+    assert_eq!(
+        transport["bit_perfect"],
+        serde_json::json!(true),
+        "le DoP reste bit-perfect : {transport}"
+    );
+}
+
+/// Et le DSD servi BRUT (mode natif accepté par le renderer) n'est pas touché
+/// non plus : rien n'est converti, le fil porte du `audio/dsf`.
+#[test]
+fn le_dsd_servi_brut_reste_bit_perfect_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "native")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("Yamaha R-N2000A"),
+        "none",
+        Some(&wire_mime("dsf", "audio/dsf", 5_644_800, 1)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(false),
+        "le .dsf part brut : rien n'est converti, PURE tient : {sp}"
+    );
 }
 
 // #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 part ré-encodé
@@ -3576,4 +3883,344 @@ fn un_dsd_de_serveur_media_decime_par_tune_annonce_le_wav_reellement_servi() {
     );
     assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
     assert_eq!(sp.get("lossless").and_then(Value::as_bool), Some(true));
+}
+
+/// Un FLAC 16 bits qui joue, avec sa session, pour les témoins de #5071.
+fn flac_16_en_lecture_5071() -> ZoneState {
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Radio Paradise".into(),
+            format: Some("flac".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            stream_id: Some("sid-5071".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
+/// #5146 — un fil qui porte la compensation de niveau, tel que la session le
+/// publie (`StreamInfo::compensation_db`).
+fn fil_compense(format: &str, compensation_db: f64) -> StreamInfo {
+    StreamInfo {
+        compensation_db: Some(compensation_db),
+        ..wire(format, 44_100, 16)
+    }
+}
+
+/// #5071 — sur une zone RÉSEAU, la compensation de niveau est cuite dans le
+/// flux : le chemin du signal la NOMME, avec son gain — celui que le flux
+/// publie (#5146) —, non bit-perfect, et placée après le DSP, là où elle a lieu.
+#[test]
+fn la_compensation_reseau_est_une_etape_du_chemin_5071() {
+    let (backend, zone) = dlna_zone();
+    armer_l_eq(&backend, zone.id.unwrap());
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil_compense("flac", 4.27)),
+    )
+    .unwrap();
+    let comp = etape(&sp, "Compensation").expect("étape Compensation absente");
+    eprintln!("compensation = {comp}");
+    assert_eq!(comp["bit_perfect"], false, "{comp}");
+    assert_eq!(comp["code"], "level_compensation");
+    assert_eq!(
+        comp["compensation_db"].as_f64(),
+        Some(4.27),
+        "le gain affiché est celui que le flux publie : {comp}"
+    );
+    assert_eq!(sp["bit_perfect"], false);
+    let noms: Vec<&str> = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let dsp = noms.iter().position(|n| *n == "DSP");
+    let cp = noms.iter().position(|n| *n == "Compensation");
+    assert!(
+        dsp.is_some() && cp.is_some() && dsp < cp,
+        "la compensation vient APRÈS le DSP : {noms:?}"
+    );
+}
+
+/// #5071 — interrupteur coupé : aucune étape, et le chemin redevient celui
+/// d'avant (l'égaliseur seul le rend non bit-perfect).
+#[test]
+fn compensation_coupee_aucune_etape_5071() {
+    let (backend, zone) = dlna_zone();
+    let zid = zone.id.unwrap();
+    armer_l_eq(&backend, zid);
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zid}_level_compensation"), "false")
+        .unwrap();
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Compensation").is_none(), "{sp}");
+}
+
+/// #5071 — sans égaliseur ni crossfeed, la compensation n'a rien à rendre :
+/// aucune étape, et le verdict bit-perfect du fil est CONSERVÉ.
+#[test]
+fn sans_dsp_la_compensation_ne_touche_pas_au_bit_perfect_5071() {
+    let (backend, zone) = dlna_zone();
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Compensation").is_none(), "{sp}");
+    assert_eq!(sp["bit_perfect"], true, "{sp}");
+}
+
+/// #5071 — en PURE, l'égaliseur n'est pas construit : ce qui le compense ne
+/// l'est pas non plus. Aucune étape.
+#[test]
+fn en_pure_aucune_compensation_reseau_5071() {
+    let (backend, zone) = dlna_zone();
+    let zid = zone.id.unwrap();
+    armer_l_eq(&backend, zid);
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zid}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Compensation").is_none(), "{sp}");
+}
+
+/// #5114 — un fil qui porte le crossfeed, tel que la session le publie.
+fn fil_avec_crossfeed(format: &str) -> StreamInfo {
+    StreamInfo {
+        crossfeed: true,
+        ..wire(format, 44_100, 16)
+    }
+}
+
+/// #5114 — la zone RÉSEAU a coché le crossfeed ; l'interrupteur de
+/// compensation est coupé, pour que le verdict ne tienne qu'au crossfeed.
+fn zone_reseau_crossfeed_5114(compensation: bool) -> (Arc<dyn DbBackend>, Zone) {
+    let (backend, zone) = dlna_zone();
+    let zid = zone.id.unwrap();
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(
+        &format!("zone_{zid}_crossfeed"),
+        r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+    )
+    .unwrap();
+    if !compensation {
+        s.set(&format!("zone_{zid}_level_compensation"), "false")
+            .unwrap();
+    }
+    (backend, zone)
+}
+
+/// #5114 — une zone DLNA dont le flux porte le crossfeed (WAV progressif,
+/// cas 2 de #2742) : l'étape est là, non bit-perfect, et le verdict global
+/// tombe. Avant, le panneau n'en disait rien et annonçait « bit-perfect » :
+/// un FLAC 16 bits servi en WAV 16 bits passe pour un transcodage sans perte.
+#[test]
+fn le_crossfeed_du_flux_reseau_est_une_etape_et_fait_tomber_le_verdict_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(false);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil_avec_crossfeed("wav")),
+    )
+    .unwrap();
+    let cf = etape(&sp, "Crossfeed").expect("étape Crossfeed absente");
+    eprintln!("crossfeed = {cf}");
+    assert_eq!(cf["bit_perfect"], false, "{cf}");
+    assert_eq!(cf["code"], "crossfeed", "{cf}");
+    assert_eq!(sp["bit_perfect"], false, "{sp}");
+    assert!(
+        !sp["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bit-perfect"),
+        "{sp}"
+    );
+}
+
+/// #5114 — le crossfeed COCHÉ mais absent du flux (renderer sans LPCM, piste
+/// servie telle quelle : cas 3 de #2742) n'affiche rien, et le fil intact
+/// reste bit-perfect. C'est le flux qui parle, pas le réglage.
+#[test]
+fn un_crossfeed_regle_que_le_flux_ne_porte_pas_n_affiche_rien_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(false);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
+    assert_eq!(sp["bit_perfect"], true, "{sp}");
+}
+
+/// #5114 — l'ordre de la chaîne : le crossfeed avant la compensation, comme
+/// `StreamingDsp::process` et le ré-encodage par le fichier.
+#[test]
+fn le_crossfeed_precede_la_compensation_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(true);
+    let fil = StreamInfo {
+        compensation_db: Some(0.12),
+        ..fil_avec_crossfeed("wav")
+    };
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil),
+    )
+    .unwrap();
+    let noms: Vec<&str> = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let cf = noms.iter().position(|n| *n == "Crossfeed");
+    let cp = noms.iter().position(|n| *n == "Compensation");
+    assert!(
+        cf.is_some() && cp.is_some() && cf < cp,
+        "le crossfeed vient AVANT la compensation : {noms:?}"
+    );
+}
+
+/// #5146 — cas 3 de #2742 : crossfeed seul, renderer sans LPCM, piste de la
+/// bibliothèque servie TELLE QUELLE. L'interrupteur de compensation est armé
+/// (défaut) et le crossfeed coché, mais le flux ne traverse aucun étage : ses
+/// octets sont ceux de la source. Le chemin du signal ne doit afficher ni
+/// Crossfeed ni Compensation, et le fil intact reste bit-perfect.
+///
+/// Avant, la compensation était PRÉVUE depuis les réglages
+/// (`compensation_reseau_prevue_with`) : le miroir comptait le crossfeed coché
+/// et inventait une étape « Compensation » — et « non bit-perfect » — sur ce
+/// fil intact.
+#[test]
+fn piste_servie_telle_quelle_aucune_compensation_fantome_5146() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(true);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
+    assert!(
+        etape(&sp, "Compensation").is_none(),
+        "aucune compensation n'est cuite dans un fil intact : {sp}"
+    );
+    assert_eq!(sp["bit_perfect"], true, "{sp}");
+}
+
+/// #5051 — une entrée audio en direct : l'étape « Capture » suit la source,
+/// et une reprise (ou un rééchantillonnage) retire le bit-perfect au lieu de
+/// le revendiquer.
+#[test]
+fn entree_audio_en_direct_dit_sa_compensation_et_ne_revendique_pas_le_bit_perfect() {
+    struct Etat(u64, bool);
+    impl tune_core::source_pcm::EtatDirect for Etat {
+        fn compensation(&self) -> tune_core::source_pcm::Compensation {
+            tune_core::source_pcm::Compensation {
+                methode: "tampon_avec_reprise",
+                reechantillonne: self.1,
+                reprises: self.0,
+                derive_ppm: Some(-4.2),
+            }
+        }
+    }
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("local".into());
+    let etat = |sid: &str| ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Entrée audio — Yeti X".into(),
+            source: "entree-audio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(48_000),
+            bit_depth: Some(24),
+            stream_id: Some(sid.into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let w = wire("wav", 48_000, 24);
+    let capture = |sp: &Value| {
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Capture")
+            .cloned()
+            .expect("étape Capture")
+    };
+
+    tune_core::source_pcm::inscrire_direct("ea-0", Arc::new(Etat(0, false)));
+    let sp = build_signal_path(&etat("ea-0"), &zone, &backend, None, "", Some(&w)).unwrap();
+    let c = capture(&sp);
+    assert_eq!(sp["steps"][1]["name"], "Capture", "juste après la source");
+    assert_eq!(c["bit_perfect"], true);
+    assert!(c["description"].as_str().unwrap().contains("0 reprise"));
+
+    tune_core::source_pcm::inscrire_direct("ea-2", Arc::new(Etat(2, false)));
+    let sp = build_signal_path(&etat("ea-2"), &zone, &backend, None, "", Some(&w)).unwrap();
+    assert_eq!(capture(&sp)["bit_perfect"], false);
+    assert_eq!(
+        sp["bit_perfect"], false,
+        "une reprise n'est pas bit-perfect"
+    );
+
+    tune_core::source_pcm::inscrire_direct("ea-r", Arc::new(Etat(0, true)));
+    let sp = build_signal_path(&etat("ea-r"), &zone, &backend, None, "", Some(&w)).unwrap();
+    let c = capture(&sp);
+    assert_eq!(c["bit_perfect"], false);
+    assert!(
+        c["description"]
+            .as_str()
+            .unwrap()
+            .contains("rééchantillonnage")
+    );
+    assert_eq!(sp["bit_perfect"], false);
+
+    for sid in ["ea-0", "ea-2", "ea-r"] {
+        tune_core::source_pcm::retirer_direct(sid);
+    }
 }

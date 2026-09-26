@@ -197,6 +197,7 @@ impl PluginManager {
     }
 
     pub async fn install_from_archive(&self, archive_data: &[u8]) -> Result<PluginInfo, String> {
+        // tmp-autorise: dossier au nom aléatoire (UUID v4), supprimé après l'installation.
         let temp_dir = std::env::temp_dir().join(format!("tune_plugin_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 

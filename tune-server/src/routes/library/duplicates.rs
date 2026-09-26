@@ -227,8 +227,8 @@ pub(super) async fn list_duplicates(
         lim = make_ph(1),
         off = make_ph(2),
     );
-    let limit_val = limit as i64;
-    let offset_val = offset as i64;
+    let limit_val = limit;
+    let offset_val = offset;
     let hash_params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
     let hash_rows = state
         .backend
@@ -248,7 +248,7 @@ pub(super) async fn list_duplicates(
                 return None;
             }
             Some(json!({
-                "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": row.get(2).and_then(|v| v.as_string()),
                 "file_path": file_path,
@@ -294,7 +294,7 @@ pub(super) async fn list_duplicates(
         .iter()
         .map(|row| {
             json!({
-                "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": row.get(2).and_then(|v| v.as_string()),
                 "file_path": row.get(3).and_then(|v| v.as_string()),
@@ -582,8 +582,8 @@ pub(super) async fn smart_duplicates(
         off = make_ph(2),
     );
 
-    let limit_val = limit as i64;
-    let offset_val = offset as i64;
+    let limit_val = limit;
+    let offset_val = offset;
     let params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
     let rows = state
         .backend
@@ -595,7 +595,7 @@ pub(super) async fn smart_duplicates(
         .map(|row| {
             json!({
                 "track_a": {
-                    "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
                     "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                     "artist": row.get(2).and_then(|v| v.as_string()),
                     "file_path": row.get(3).and_then(|v| v.as_string()),

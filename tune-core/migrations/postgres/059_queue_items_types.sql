@@ -15,24 +15,24 @@ BEGIN
   FOREACH col IN ARRAY ARRAY['position', 'is_current', 'duration_ms'] LOOP
     SELECT data_type, column_default INTO typ, def
       FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = 'queue_items'
+     WHERE table_schema = current_schema() AND table_name = 'queue_items'
        AND column_name = col;
     IF typ IN ('smallint', 'integer', 'text', 'character varying') THEN
       IF typ IN ('text', 'character varying') THEN
         BEGIN
           -- Evaluate the cast without changing a row. Catch syntax AND range
           -- errors, using the same bigint input rules as the ALTER below.
-          EXECUTE format('SELECT max(%I::bigint) FROM public.queue_items', col)
+          EXECUTE format('SELECT max(%I::bigint) FROM queue_items', col)
             INTO checked_value;
         EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
           RAISE NOTICE 'migration 059: SKIP queue_items.% (invalid bigint value)', col;
           CONTINUE;
         END;
       END IF;
-      EXECUTE format('ALTER TABLE public.queue_items ALTER COLUMN %I DROP DEFAULT', col);
-      EXECUTE format('ALTER TABLE public.queue_items ALTER COLUMN %I TYPE BIGINT USING %I::bigint', col, col);
+      EXECUTE format('ALTER TABLE queue_items ALTER COLUMN %I DROP DEFAULT', col);
+      EXECUTE format('ALTER TABLE queue_items ALTER COLUMN %I TYPE BIGINT USING %I::bigint', col, col);
       IF def IS NOT NULL THEN
-        EXECUTE format('ALTER TABLE public.queue_items ALTER COLUMN %I SET DEFAULT (%s)::bigint', col, def);
+        EXECUTE format('ALTER TABLE queue_items ALTER COLUMN %I SET DEFAULT (%s)::bigint', col, def);
       END IF;
     END IF;
   END LOOP;

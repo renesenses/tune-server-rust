@@ -180,6 +180,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test alarm_source_3715 i3715_alarm_postgres -- --nocapture
 
+      # Chasse PG du 25/09/2026 -- `GROUP BY` lache de l historique : une
+      # colonne nue hors du GROUP BY passe sur SQLite et fait tomber la requete
+      # entiere sur PostgreSQL. « Titres les plus ecoutes » et « Ce jour-la »
+      # rendaient `200 []` sur toute base PG. Jumeau SQLite dans ci.yml.
+      - name: GROUP BY strict de l historique sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
+
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
       # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
@@ -221,6 +230,35 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
+
+      # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
+      # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
+      # rien changer au schéma que Tune reçoit. Le test monte SES bases
+      # (`tune_gardes_5003_*`) et les supprime, même en échec : rien ne reste
+      # dans `tune_test`.
+      - name: Gardes de migration et schéma voisin sur PostgreSQL (#5003)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5003 -- --nocapture
+
+      # #5134 — la bascule SQLite -> PostgreSQL sur une VRAIE base : chaque
+      # clause ON CONFLICT de `copy_table` doit viser une clef de sa table, et
+      # les tables sans colonne `id` (masques, favoris de facette, doublons
+      # arbitres, appareils ignores) doivent arriver entieres, deux fois de
+      # suite. Bases jetables creees puis supprimees par le test.
+      - name: Bascule SQLite -> PostgreSQL, clefs de conflit (#5134)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_bascule_ -- --nocapture
+
+      # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
+      # chemin qui masque, le démasquage et la réparation sûre, joués sur la
+      # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
+      # cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Motif du masquage des zones sur PostgreSQL (#5077)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5077 -- --nocapture --test-threads=1
 
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
@@ -305,6 +343,35 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
+
+      # Chasse PG du 25/09/2026 -- deux ecritures propres a SQLite, avalees par
+      # leur appelant : `strftime` dans la fraicheur du cache d API (le cache des
+      # biographies n etait jamais relu) et `STRING_AGG($1)` dans la fusion
+      # manuelle des doublons (le bouton ne fusionnait rien). Jumeau SQLite
+      # dans ci.yml.
+      - name: Fonctions propres a SQLite dans les routes, sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_fonctions_sqlite_seules -- --nocapture --test-threads=1
+
+      # Reste de #5005 : les fusions AUTOMATIQUES d'albums en double (fin de
+      # scan, `POST /system/cleanup`) ecrivaient `GROUP_CONCAT(id)` en dur --
+      # « function group_concat(bigint) does not exist », erreur avalee, fusion
+      # morte sur PostgreSQL. Sans cette etape `TUNE_TEST_PG_URL` serait
+      # absente et la moitie PostgreSQL du banc sauterait.
+      - name: Fusions automatiques d'albums en double sur PostgreSQL (#5005)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_fusions_auto_albums -- --nocapture --test-threads=1
+
+      # Reste de #5005 -- `ai/recommendations.rs` : `t.artist_id = CAST(a.id AS
+      # TEXT)` (bigint = text refuse), `datetime('now', ...)`. Chaque requete etait
+      # avalee : recommandations retombees sur le hasard, Daily
+      # mixes vides, radio intelligente sans graine. Jumeau SQLite dans ci.yml.
+      - name: Recommandations IA sur PostgreSQL (#5005)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_recommandations_ia -- --nocapture --test-threads=1
 
       # #3726 — les ECRITURES, et non plus seulement les schemas.
       #
@@ -393,6 +460,26 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
 
+      # Chasse PG du 25/09/2026 -- le PREMIER demarrage d'une installation
+      # native. Toutes les autres etapes jouent sur une base dont les scripts
+      # ont ete appliques par `psql` AVANT le serveur : `ensure_schema` y trouve
+      # toujours ses tables. Celle-ci monte une base VIDE et laisse le serveur
+      # la creer, comme chez un utilisateur qui vient d'installer.
+      - name: Premier démarrage d'une base PostgreSQL neuve (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_premier_demarrage_base_neuve -- --nocapture --test-threads=1
+
+      # #4907 -- la meme musique dans plusieurs repertoires, par le VRAI scan :
+      # la copie identique devient un exemplaire (`track_copies`, migration
+      # 073), les vues gardent les memes compteurs, un fichier supprime ne
+      # retire que son exemplaire, et les identifiants de pistes ne bougent
+      # pas. La contre-epreuve SQLite du meme fichier tourne dans `ci.yml`.
+      - name: Exemplaires par repertoire sur PostgreSQL (#4907)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
@@ -456,6 +543,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dossier_cue_4625 pg_4625 -- --nocapture --test-threads=1
+      # Chasse PG du 25/09/2026 — les favoris LOCAUX (coeurs de piste, d'album,
+      # d'artiste) etaient lies en chaine sur des colonnes BIGINT : ajout en
+      # 500, liste vide, ordre manuel et retrait en echec sur toute base PG.
+      # Le scenario passe par les vraies routes ; son jumeau SQLite tourne dans
+      # ci.yml. `--test-threads=1` : le test vide la table des favoris.
+      - name: Favoris locaux sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_favoris_locaux_entiers -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -483,7 +579,35 @@ jobs:
       # PostgreSQL et le code le liait en texte : aucun crédit écrit, purge
       # jamais faite, GET des crédits en 500. SQLite l'avale, il faut le
       # moteur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      # #5034 — la SOURCE de la pochette d'album (migration PG 074). Les
+      # requêtes du scan et du surveillant sur `albums.cover_source` —
+      # absorption à cinq marqueurs comprise — jouées sur la VRAIE base, dans
+      # une table temporaire copiée du schéma migré. Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Source de la pochette d'album sur PostgreSQL (#5034)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5034 -- --nocapture --test-threads=1
+
       - name: Crédits de piste sur PostgreSQL (#4984)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
+
+      # #5007 — la purge des artistes orphelins. PostgreSQL refusait le DELETE
+      # entier par `albums_artist_id_fkey` dès qu'un artiste d'album n'avait
+      # aucune piste à lui : plus aucun orphelin purgé. Sans cette étape, le
+      # cas PG de `artist_repo.rs` prendrait son « saut annoncé ».
+      - name: Purge des artistes orphelins sur PostgreSQL (#5007)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5007 -- --nocapture
+
+      # #5026 — la règle « Étiquette » élargie : sous-requête sur `tracks`,
+      # GROUP BY sur la paire source + source_id, COUNT sur une table dérivée.
+      # SQLite en accepte plus que PostgreSQL ; sans cette étape, l'épreuve
+      # prendrait son « saut annoncé ».
+      - name: Règle Étiquette des collections sur PostgreSQL (#5026)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1

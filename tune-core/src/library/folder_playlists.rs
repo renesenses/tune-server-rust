@@ -51,7 +51,8 @@ type TrackRow = (i64, String, Option<i64>, i64);
 /// l'ordre où le moteur a rendu les lignes — c'est-à-dire, sur PostgreSQL,
 /// sur rien du tout. Le début de tranche les remet dans l'ordre du disque.
 fn candidate_dirs(rows: &[TrackRow]) -> Vec<(String, String, Vec<i64>)> {
-    let mut by_dir: BTreeMap<String, Vec<(&str, i64, Option<i64>, i64)>> = BTreeMap::new();
+    type PisteDuDossier<'a> = (&'a str, i64, Option<i64>, i64);
+    let mut by_dir: BTreeMap<String, Vec<PisteDuDossier>> = BTreeMap::new();
     for (id, path, album_id, debut_ms) in rows {
         let p = std::path::Path::new(path);
         let (Some(parent), Some(file)) = (p.parent(), p.file_name()) else {

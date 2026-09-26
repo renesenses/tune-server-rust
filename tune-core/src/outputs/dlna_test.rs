@@ -277,7 +277,7 @@ mod tests {
         // Find <u:ACTION in the SOAP body
         if let Some(start) = body.find("<u:") {
             let rest = &body[start + 3..];
-            if let Some(end) = rest.find(|c: char| c == ' ' || c == '>') {
+            if let Some(end) = rest.find([' ', '>']) {
                 return rest[..end].to_string();
             }
         }
@@ -2323,7 +2323,7 @@ mod tests {
                 .expect("une lecture refusée doit quand même nommer son URL de flux");
             let uris = uris_recues(&state).await;
             assert!(
-                uris.iter().any(|u| *u == url),
+                uris.contains(&url),
                 "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
             );
             assert!(
@@ -2461,7 +2461,7 @@ mod tests {
                 .expect("une lecture refusee doit quand meme nommer son URL de flux");
             let uris = uris_recues(&state).await;
             assert!(
-                uris.iter().any(|u| *u == url),
+                uris.contains(&url),
                 "aucun SetAVTransportURI ne porte l'URL du flux ({url}) : {uris:?}"
             );
             assert!(

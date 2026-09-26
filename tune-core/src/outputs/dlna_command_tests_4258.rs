@@ -211,7 +211,19 @@ async fn pause_and_resume_propagate_soap_faults_instead_of_false_success() {
             result.expect_err("renderer SOAP 701 must reject pause/resume, not report success");
         assert!(error.contains("701"), "{error}");
         assert_pair(&capture.text(), action, "soap_fault");
-        assert_eq!(renderer.received.lock().unwrap().len(), 1);
+        // #5050 — sur un 701, `pause()` lit `GetTransportInfo` ; ce renderer
+        // n'en rend rien d'exploitable : UNE seule commande est envoyée.
+        let sent = format!("\"{AV_TRANSPORT_URN}#{action}\"");
+        assert_eq!(
+            renderer
+                .received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| **a == sent)
+                .count(),
+            1
+        );
     }
 }
 

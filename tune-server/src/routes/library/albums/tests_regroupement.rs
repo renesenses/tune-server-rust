@@ -1118,3 +1118,150 @@ async fn un_seul_album_n_est_pas_un_coffret() {
         assert_eq!(corps["error"].as_str(), Some("coffret_trop_court"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Coffrets RÉUNIS — `GET /library/coffrets`, `POST /library/coffrets/{id}/defaire`
+// (GO de Bertrand du 25/09/2026 : regroupement automatique + onglet Coffrets)
+// ---------------------------------------------------------------------------
+
+/// Les deux disques d'*Early Works*, à la forme du .18 : dossiers aux années
+/// différentes, titres d'accord.
+fn early_works(state: &Etat) -> (i64, i64) {
+    let lg = artiste(state, "Laurent Garnier");
+    let d1 = album(state, "Early Works, Disc 1", lg);
+    let d2 = album(state, "Early Works, Disc 2", lg);
+    for n in 1..=2 {
+        piste(
+            state,
+            d1,
+            lg,
+            n,
+            &format!("/m/LG/1999-Early Works, Disc 1/{n:02}.flac"),
+        );
+    }
+    for n in 1..=3 {
+        piste(
+            state,
+            d2,
+            lg,
+            n,
+            &format!("/m/LG/2001-Early Works, Disc 2/{n:02}.flac"),
+        );
+    }
+    (d1, d2)
+}
+
+fn coffret_liste(corps: &Value, id: i64) -> Option<Value> {
+    corps["items"]
+        .as_array()?
+        .iter()
+        .find(|a| a["id"].as_i64() == Some(id))
+        .cloned()
+}
+
+#[tokio::test]
+async fn un_coffret_compose_a_la_main_est_liste_manuel_et_ne_se_defait_pas() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+    // Contre-épreuve : AVANT la composition, l'onglet ne montre rien.
+    let (statut, corps) = appel(&app, "GET", "/api/v1/library/coffrets").await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["count"].as_i64(), Some(0), "{corps}");
+
+    let (statut, _) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, b] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/coffrets").await;
+    let c = coffret_liste(&corps, a).expect("le coffret composé est listé");
+    assert_eq!(c["coffret"].as_str(), Some("manuel"), "{c}");
+    assert_eq!(c["disc_count"].as_i64(), Some(2), "{c}");
+    assert_eq!(c["title"].as_str(), Some("101"), "{c}");
+
+    // Un coffret MANUEL n'a pas été deviné : il n'y a rien à désavouer.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{a}/defaire"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(corps["error"].as_str(), Some("pas_un_coffret_auto"));
+    assert!(album_existe(&state, a));
+}
+
+#[tokio::test]
+async fn reunir_lister_defaire_et_ne_pas_reformer_par_les_routes() {
+    let (app, state) = serveur();
+    let (d1, d2) = early_works(&state);
+
+    // La détection voit le coffret — l'ancienne règle, qui ne lisait que le
+    // dossier, ne le voyait pas (années différentes).
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/albums/coffrets").await;
+    assert_eq!(corps["count"].as_i64(), Some(1), "{corps}");
+
+    // La PASSE automatique — celle du démarrage et des scans.
+    let r = tune_core::db::coffrets_auto::passe(&state.backend).unwrap();
+    assert_eq!(r.reunis, 1, "{r:?}");
+    assert!(!album_existe(&state, d2));
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/coffrets").await;
+    let c = coffret_liste(&corps, d1).expect("le coffret automatique est listé");
+    assert_eq!(c["coffret"].as_str(), Some("auto"), "{c}");
+    assert_eq!(c["title"].as_str(), Some("Early Works"), "{c}");
+    assert_eq!(c["disc_count"].as_i64(), Some(2), "{c}");
+
+    // DÉFAIRE, par la route.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{d1}/defaire"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let recree = corps["albums_recrees"][0]
+        .as_i64()
+        .expect("un album recréé");
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            recree
+        ),
+        3
+    );
+    let (_, corps) = appel(&app, "GET", "/api/v1/library/coffrets").await;
+    assert_eq!(corps["count"].as_i64(), Some(0), "{corps}");
+
+    // …et la passe suivante NE LE REFORME PAS.
+    let r = tune_core::db::coffrets_auto::passe(&state.backend).unwrap();
+    assert_eq!((r.reunis, r.laisses_refuses), (0, 1), "{r:?}");
+    assert!(album_existe(&state, recree));
+
+    // L'utilisateur peut toujours le réunir LUI-MÊME, depuis l'écran des
+    // coffrets éclatés : c'est revenir sur son refus.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/albums/coffrets/{d1}/regrouper"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert!(!album_existe(&state, recree));
+    assert!(
+        tune_core::db::coffrets_auto::refus(&state.backend).is_empty(),
+        "le refus survit à la réunion manuelle"
+    );
+    // Le disque 2 est bien le DISQUE 2 : ses pistes n'avaient pas de numéro.
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ? AND disc_number = 2",
+            d1
+        ),
+        3
+    );
+}

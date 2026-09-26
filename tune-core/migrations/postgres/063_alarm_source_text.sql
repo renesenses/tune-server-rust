@@ -5,9 +5,9 @@ DO $migration$
 DECLARE typ TEXT;
 BEGIN
  SELECT data_type INTO typ FROM information_schema.columns
- WHERE table_schema='public' AND table_name='alarms' AND column_name='source_id';
+ WHERE table_schema = current_schema() AND table_name='alarms' AND column_name='source_id';
  IF typ IN ('smallint','integer','bigint') THEN
-  ALTER TABLE public.alarms ALTER COLUMN source_id TYPE TEXT USING source_id::text;
+  ALTER TABLE alarms ALTER COLUMN source_id TYPE TEXT USING source_id::text;
  END IF;
 END
 $migration$;

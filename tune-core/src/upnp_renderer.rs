@@ -774,12 +774,11 @@ mod tests {
             RendererCommand::Seek(272_000)
         );
 
-        let vol = format!(
-            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+        let vol = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
 <u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
 <InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>37</DesiredVolume>
 </u:SetVolume></s:Body></s:Envelope>"#
-        );
+            .to_string();
         assert_eq!(parse_renderer_command(&vol), RendererCommand::SetVolume(37));
     }
 

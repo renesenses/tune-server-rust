@@ -142,11 +142,11 @@ pub(super) async fn import_roon(
                                         genre,
                                     ) = row;
 
-                                    if let Some(ref fp) = file_path {
-                                        if track_repo.get_by_path(fp).ok().flatten().is_some() {
-                                            skipped += 1;
-                                            continue;
-                                        }
+                                    if let Some(ref fp) = file_path
+                                        && track_repo.get_by_path(fp).ok().flatten().is_some()
+                                    {
+                                        skipped += 1;
+                                        continue;
                                     }
 
                                     let artist_name = artist.as_deref().unwrap_or("Unknown Artist");
@@ -351,11 +351,11 @@ pub(super) async fn import_plex(
                     .map(|s| s.to_string());
 
                 // Skip if we already have this track by file_path
-                if let Some(ref fp) = file_path {
-                    if track_repo.get_by_path(fp).ok().flatten().is_some() {
-                        skipped += 1;
-                        continue;
-                    }
+                if let Some(ref fp) = file_path
+                    && track_repo.get_by_path(fp).ok().flatten().is_some()
+                {
+                    skipped += 1;
+                    continue;
                 }
 
                 let artist = artist_repo.get_or_create(&artist_name, None, None).ok();
@@ -1036,11 +1036,11 @@ fn ecrire_les_pistes(
 
     for entry in entrees {
         // Skip if file_path exists and already in DB
-        if let Some(ref fp) = entry.file_path {
-            if track_repo.get_by_path(fp).ok().flatten().is_some() {
-                skipped += 1;
-                continue;
-            }
+        if let Some(ref fp) = entry.file_path
+            && track_repo.get_by_path(fp).ok().flatten().is_some()
+        {
+            skipped += 1;
+            continue;
         }
 
         let artist_name = entry.artist.as_deref().unwrap_or("Unknown Artist");
@@ -1102,29 +1102,29 @@ pub(super) async fn import_status(
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("import_task_{task_id}");
-    if let Some(data) = settings.get(&key).ok().flatten() {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
-            let mut reponse = json!({
-                "task_id": task_id,
-                "status": parsed["status"],
-                "imported": parsed["imported"],
-                "skipped": parsed["skipped"],
-                "errors": parsed["errors"],
-                "error_details": parsed["error_details"],
-            });
-            // Les champs d'`ImportReport` montent au PREMIER niveau : c'est là
-            // que l'écran les lit (`importReport.total_rows`, et non
-            // `importReport.report.total_rows`).
-            if let (Some(cible), Some(rapport)) = (
-                reponse.as_object_mut(),
-                champs_du_rapport(&parsed).as_object(),
-            ) {
-                for (nom, valeur) in rapport {
-                    cible.insert(nom.clone(), valeur.clone());
-                }
+    if let Some(data) = settings.get(&key).ok().flatten()
+        && let Ok(parsed) = serde_json::from_str::<Value>(&data)
+    {
+        let mut reponse = json!({
+            "task_id": task_id,
+            "status": parsed["status"],
+            "imported": parsed["imported"],
+            "skipped": parsed["skipped"],
+            "errors": parsed["errors"],
+            "error_details": parsed["error_details"],
+        });
+        // Les champs d'`ImportReport` montent au PREMIER niveau : c'est là
+        // que l'écran les lit (`importReport.total_rows`, et non
+        // `importReport.report.total_rows`).
+        if let (Some(cible), Some(rapport)) = (
+            reponse.as_object_mut(),
+            champs_du_rapport(&parsed).as_object(),
+        ) {
+            for (nom, valeur) in rapport {
+                cible.insert(nom.clone(), valeur.clone());
             }
-            return Json(reponse);
         }
+        return Json(reponse);
     }
     Json(json!({
         "task_id": task_id,
@@ -1230,20 +1230,19 @@ fn parse_jriver_xml(
                 if name == "Item" {
                     in_item = true;
                     fields.clear();
-                } else if name == "Field" && in_item {
-                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"Name")
+                } else if name == "Field"
+                    && in_item
+                    && let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"Name")
+                {
+                    let field_name = String::from_utf8_lossy(&attr.value).to_string();
+                    if let Ok(quick_xml::events::Event::Text(t)) = reader.read_event_into(&mut buf)
                     {
-                        let field_name = String::from_utf8_lossy(&attr.value).to_string();
-                        if let Ok(quick_xml::events::Event::Text(t)) =
-                            reader.read_event_into(&mut buf)
-                        {
-                            let decoded = t.decode().unwrap_or_default();
-                            let val = match quick_xml::escape::unescape(&decoded) {
-                                Ok(s) => s.to_string(),
-                                Err(_) => decoded.to_string(),
-                            };
-                            fields.insert(field_name, val);
-                        }
+                        let decoded = t.decode().unwrap_or_default();
+                        let val = match quick_xml::escape::unescape(&decoded) {
+                            Ok(s) => s.to_string(),
+                            Err(_) => decoded.to_string(),
+                        };
+                        fields.insert(field_name, val);
                     }
                 }
             }
@@ -1263,11 +1262,11 @@ fn parse_jriver_xml(
                     let file_path = fields.get("Filename").cloned();
 
                     // Skip if already in DB by file_path
-                    if let Some(ref fp) = file_path {
-                        if track_repo.get_by_path(fp).ok().flatten().is_some() {
-                            skipped += 1;
-                            continue;
-                        }
+                    if let Some(ref fp) = file_path
+                        && track_repo.get_by_path(fp).ok().flatten().is_some()
+                    {
+                        skipped += 1;
+                        continue;
                     }
 
                     let artist_id = artist_repo

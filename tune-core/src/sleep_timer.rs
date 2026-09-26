@@ -129,13 +129,12 @@ impl SleepTimer {
                     .stop(timer.zone_id, timer.device_id.as_deref())
                     .await;
 
-                if let Some(vol) = timer.original_volume {
-                    if let Err(error) = orchestrator
+                if let Some(vol) = timer.original_volume
+                    && let Err(error) = orchestrator
                         .set_volume(timer.zone_id, vol, timer.device_id.as_deref())
                         .await
-                    {
-                        warn!(zone_id = timer.zone_id, error = %error, "sleep_timer_restore_volume_failed");
-                    }
+                {
+                    warn!(zone_id = timer.zone_id, error = %error, "sleep_timer_restore_volume_failed");
                 }
 
                 *self.active.lock().await = None;

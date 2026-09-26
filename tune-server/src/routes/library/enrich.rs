@@ -343,7 +343,7 @@ pub(super) async fn enrich_all_library(
             // restee muette pendant toute la passe.
             annonce(&mut cadence, enriched);
 
-            let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
             let title = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
             let artist = row.get(2).and_then(|v| v.as_string());
             let album = row.get(3).and_then(|v| v.as_string());
@@ -672,15 +672,15 @@ async fn mb_lookup_recording(
     album: Option<&str>,
 ) -> Result<Option<String>, String> {
     let mut query_parts = vec![format!("recording:{title}")];
-    if let Some(a) = artist {
-        if !a.is_empty() {
-            query_parts.push(format!("artist:{a}"));
-        }
+    if let Some(a) = artist
+        && !a.is_empty()
+    {
+        query_parts.push(format!("artist:{a}"));
     }
-    if let Some(al) = album {
-        if !al.is_empty() {
-            query_parts.push(format!("release:{al}"));
-        }
+    if let Some(al) = album
+        && !al.is_empty()
+    {
+        query_parts.push(format!("release:{al}"));
     }
     let query = query_parts.join(" AND ");
 

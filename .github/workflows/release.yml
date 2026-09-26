@@ -173,7 +173,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -184,7 +184,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -372,7 +372,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -386,12 +386,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -531,6 +531,11 @@ jobs:
           mkdir -p package/plugins/party
           cp tune-server/tests/fixtures/plugins/party/main.wasm package/plugins/party/
           cp tune-server/tests/fixtures/plugins/party/manifest.json package/plugins/party/
+          # « Playlists converter » (WASM, Premium, #4715), livré comme Party et
+          # depuis son fixture commité, que les essais greffon_* éprouvent.
+          mkdir -p package/plugins/playlists-converter
+          cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm package/plugins/playlists-converter/
+          cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json package/plugins/playlists-converter/
           # Bundle airplay-daemon next to tune-server if it built for this target.
           DAEMON=""
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
@@ -623,6 +628,16 @@ jobs:
               echo "OK — package/tune-server porte disable-library-validation (#1641)"
             else
               echo "::error::package/tune-server est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib sur macOS (#1641)."
+              exit 1
+            fi
+            # Garde #4662, jumelle de celle du .app : les deux canaux macOS
+            # doivent porter le MÊME identifiant de code, sinon macOS ouvre deux
+            # sujets « Réseau local » pour le même produit.
+            LU=$(codesign -d -vv package/tune-server 2>&1 | sed -n 's/^Identifier=//p')
+            if [ "$LU" = "fr.mozaiklabs.tune-server" ]; then
+              echo "OK — package/tune-server porte Identifier=fr.mozaiklabs.tune-server (#4662)"
+            else
+              echo "::error::package/tune-server est signé Identifier=${LU:-<aucun>} au lieu de fr.mozaiklabs.tune-server — le tarball et le DMG ouvriraient deux sujets « Réseau local » distincts dans macOS (#4662)."
               exit 1
             fi
           elif [ "$RUNNER_OS" = "macOS" ]; then
@@ -728,6 +743,10 @@ jobs:
           mkdir package\plugins\party
           copy tune-server\tests\fixtures\plugins\party\main.wasm package\plugins\party\
           copy tune-server\tests\fixtures\plugins\party\manifest.json package\plugins\party\
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          mkdir package\plugins\playlists-converter
+          copy tune-server\tests\fixtures\plugins\playlists-converter\main.wasm package\plugins\playlists-converter\
+          copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
@@ -767,6 +786,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path "plugins\party" | Out-Null
           copy "tune-server\tests\fixtures\plugins\party\main.wasm" "plugins\party\"
           copy "tune-server\tests\fixtures\plugins\party\manifest.json" "plugins\party\"
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          New-Item -ItemType Directory -Force -Path "plugins\playlists-converter" | Out-Null
+          copy "tune-server\tests\fixtures\plugins\playlists-converter\main.wasm" "plugins\playlists-converter\"
+          copy "tune-server\tests\fixtures\plugins\playlists-converter\manifest.json" "plugins\playlists-converter\"
           @"
           !include "MUI2.nsh"
           Name "Tune Server"
@@ -801,6 +824,10 @@ jobs:
             SetOutPath "`$INSTDIR\plugins\party"
             File "plugins\party\main.wasm"
             File "plugins\party\manifest.json"
+            ; Bundled Playlists converter (WASM, Premium, #4715)
+            SetOutPath "`$INSTDIR\plugins\playlists-converter"
+            File "plugins\playlists-converter\main.wasm"
+            File "plugins\playlists-converter\manifest.json"
 
             ; Launcher script
             SetOutPath "`$INSTDIR"
@@ -904,7 +931,21 @@ jobs:
           mkdir -p "$APP/Contents/Resources/plugins/party"
           cp tune-server/tests/fixtures/plugins/party/main.wasm "$APP/Contents/Resources/plugins/party/"
           cp tune-server/tests/fixtures/plugins/party/manifest.json "$APP/Contents/Resources/plugins/party/"
-          # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          mkdir -p "$APP/Contents/Resources/plugins/playlists-converter"
+          cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm "$APP/Contents/Resources/plugins/playlists-converter/"
+          cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json "$APP/Contents/Resources/plugins/playlists-converter/"
+          # Lanceur AppleScript. #5141 — il RESTE VIVANT, parent du serveur :
+          # `exec` sans `&`, l'applet attend. L'ancien lanceur lançait le
+          # serveur en arrière-plan puis se terminait ; orphelin, le serveur
+          # n'était plus rattaché à Tune Server.app, et macOS lui refusait le
+          # réseau local (os error 65) même avec la clé de #4949 — alors que le
+          # même binaire, lancé depuis un Terminal resté ouvert, voyait tout.
+          # TUNE_PORT se surcharge par l'environnement (`open --env`), et
+          # TUNE_RELANCE_APRES_MAJ=1 (relance après mise à jour) n'ouvre pas
+          # d'onglet de plus (#1236). L'Info.plist porte
+          # OSAAppletShowStartupScreen=false : sans la clé, un applet recompilé
+          # a été vu bloqué sur son écran de démarrage modal, serveur jamais lancé.
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run
             set appPath to (path to me as text)
@@ -912,10 +953,14 @@ jobs:
             set resDir to posixApp & "Contents/Resources/"
             set serverBin to quoted form of (resDir & "tune-server")
             set webDir to quoted form of (resDir & "web")
-            set logFile to (POSIX path of (path to home folder)) & "Library/Logs/tune-server.log"
-            do shell script "export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=8888; " & serverBin & " >> " & quoted form of logFile & " 2>&1 &"
-            delay 1
-            open location "http://localhost:8888"
+            set tunePort to system attribute "TUNE_PORT"
+            if tunePort is "" then set tunePort to "8888"
+            if (system attribute "TUNE_RELANCE_APRES_MAJ") is not "1" then
+              do shell script "(sleep 2; /usr/bin/open " & quoted form of ("http://localhost:" & tunePort) & ") > /dev/null 2>&1 &"
+            end if
+            try
+              do shell script "mkdir -p \"$HOME/Library/Logs\"; export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=" & quoted form of tunePort & "; exec " & serverBin & " >> \"$HOME/Library/Logs/tune-server.log\" 2>&1"
+            end try
           end run
           ASCRIPT
           osacompile -o "$APP/Contents/MacOS/Tune Server.app" /tmp/tune-launcher.applescript
@@ -943,6 +988,8 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
             <key>NSAppleScriptEnabled</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>Tune capte une entrée audio (platine, S/PDIF, optique) pour la diffuser vers vos zones ; macOS traite toute entrée audio comme un micro. Tune captures an audio input (turntable, S/PDIF, optical) to stream it to your zones; macOS treats every audio input as a microphone.</string>
+            <key>OSAAppletShowStartupScreen</key><false/>
             <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
             <key>NSBonjourServices</key>
             <array>
@@ -969,16 +1016,32 @@ jobs:
             # libonnxruntime.dylib et l'analyse acoustique reste à 0 %. Le .app
             # était le SECOND chemin macOS, aussi nu que le premier.
             DROITS="$GITHUB_WORKSPACE/packaging/macos/tune-server.entitlements"
-            codesign --force --options runtime --entitlements "$DROITS" --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # #4662 — `--identifier`, comme sur le chemin tarball (sign_horodate).
+            # Sans lui, codesign FABRIQUE l'identifiant à partir du NOM DE FICHIER :
+            # le binaire imbriqué du .app repartait signé « tune-server » là où le
+            # tarball porte « fr.mozaiklabs.tune-server ». Or macOS accorde la
+            # permission « Réseau local » PAR IDENTIFIANT DE CODE : le même produit,
+            # dans la même version, ouvrait donc DEUX sujets TCC selon le canal
+            # d'installation, et l'utilisateur voyait plusieurs lignes « Tune » sans
+            # pouvoir savoir laquelle gouverne le processus qui tourne (capture de
+            # Cyrille, fil 1861). Mesuré sur les artefacts publiés de la v0.9.161 :
+            # tarball = fr.mozaiklabs.tune-server, DMG = tune-server.
+            # Commande tenue sur UNE ligne : la garde #1641 (runtime.rs) relit
+            # release.yml ligne à ligne ; une continuation `\` la rendrait aveugle.
+            codesign --force --options runtime --entitlements "$DROITS" --identifier fr.mozaiklabs.tune-server --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
             # signing) so the bundle stays valid and notarization does not reject
             # an unsigned executable.
             if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
-              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/airplay-daemon"
+              codesign --force --options runtime \
+                --identifier fr.mozaiklabs.airplay-daemon --sign "$IDENTITY" "$APP/Contents/Resources/airplay-daemon"
             fi
             if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
-              codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
+              codesign --force --options runtime \
+                --identifier fr.mozaiklabs.ffmpeg --sign "$IDENTITY" "$APP/Contents/Resources/ffmpeg"
             fi
+            # Le bundle, lui, tient son identifiant du CFBundleIdentifier écrit
+            # plus haut (fr.mozaiklabs.tune-server) : rien à passer ici.
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
             # Garde #1641, jumelle de celle du tarball : on relit la signature
             # produite sur le binaire IMBRIQUÉ, celui qui fera le `dlopen`.
@@ -991,6 +1054,28 @@ jobs:
             else
               echo "::error::Le tune-server du .app est signé en runtime durci SANS com.apple.security.cs.disable-library-validation — l'analyse acoustique (CLAP) ne pourra pas charger libonnxruntime.dylib (#1641)."
               exit 1
+            fi
+            # Garde #4662, dans l'esprit de la précédente : on relit l'identifiant
+            # PRODUIT, pas la commande écrite. Un `--identifier` oublié ne casse
+            # rien à la construction — il se voit six mois plus tard, dans le
+            # panneau « Réseau local » d'un testeur.
+            verifie_identifiant() {
+              local cible="$1" attendu="$2" lu
+              lu=$(codesign -d -vv "$cible" 2>&1 | sed -n 's/^Identifier=//p')
+              if [ "$lu" = "$attendu" ]; then
+                echo "OK — $cible porte Identifier=$attendu (#4662)"
+              else
+                echo "::error::$cible est signé Identifier=${lu:-<aucun>} au lieu de $attendu — le DMG et le tarball ouvriraient deux sujets « Réseau local » distincts dans macOS (#4662)."
+                exit 1
+              fi
+            }
+            verifie_identifiant "$APP/Contents/Resources/tune-server" fr.mozaiklabs.tune-server
+            verifie_identifiant "$APP" fr.mozaiklabs.tune-server
+            if [ -f "$APP/Contents/Resources/airplay-daemon" ]; then
+              verifie_identifiant "$APP/Contents/Resources/airplay-daemon" fr.mozaiklabs.airplay-daemon
+            fi
+            if [ -f "$APP/Contents/Resources/ffmpeg" ]; then
+              verifie_identifiant "$APP/Contents/Resources/ffmpeg" fr.mozaiklabs.ffmpeg
             fi
           fi
           DMG_DIR="dmg-staging"

@@ -161,6 +161,12 @@
 
 use std::collections::HashMap;
 
+/// Un service de streaming nommé, prêt à être interrogé hors du verrou du registre.
+type PoigneeDeService = (
+    String,
+    std::sync::Arc<tokio::sync::RwLock<Box<dyn StreamingService>>>,
+);
+
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -632,12 +638,12 @@ async fn federated_search(
     let mut track_results: Vec<Value> = Vec::with_capacity(tracks.len() + extra_tracks.len());
     for t in tracks.iter().chain(extra_tracks.iter()) {
         let mut v = t.to_json();
-        if let Some(id) = t.id {
-            if let Some(meta) = matched_metadata.get(&id) {
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("matched_metadata".into(), json!(meta));
-            }
+        if let Some(id) = t.id
+            && let Some(meta) = matched_metadata.get(&id)
+        {
+            v.as_object_mut()
+                .unwrap()
+                .insert("matched_metadata".into(), json!(meta));
         }
         track_results.push(v);
     }
@@ -647,15 +653,11 @@ async fn federated_search(
 
     // La moitié streaming ne change pas d'un octet : la liste blanche est la
     // même, lue plus haut, et la règle qu'elle applique ici est celle d'avant.
-    let service_results: serde_json::Map<String, Value>;
 
     // Les poignées d'abord, le verrou ensuite — puis les quatre recherches
     // EN MÊME TEMPS. Voir la note « Les services sont interrogés ensemble »
     // en tête de fichier.
-    let poignees: Vec<(
-        String,
-        std::sync::Arc<tokio::sync::RwLock<Box<dyn StreamingService>>>,
-    )> = {
+    let poignees: Vec<PoigneeDeService> = {
         let registry = state.services.lock().await;
         registry
             .list()
@@ -684,7 +686,9 @@ async fn federated_search(
             let nom_log = nom.clone();
             (nom, async move {
                 let svc = svc.read().await;
-                if !svc.auth_status().await.authenticated {
+                // #5103 — activé ET connecté : un service désactivé dans les
+                // Réglages ne répond plus, même si sa session reste ouverte.
+                if !svc.utilisable().await {
                     return None;
                 }
                 let Some((decalage, demandee)) = fenetre else {
@@ -720,7 +724,7 @@ async fn federated_search(
             })
         })
         .collect();
-    service_results = recherches_concurrentes(travaux).await;
+    let service_results: serde_json::Map<String, Value> = recherches_concurrentes(travaux).await;
 
     // #4803 — la suite du résultat fusionné : chaque source qui a une suite,
     // à `offset + limit`. Calculé AVANT que le `json!` ne consomme les listes.
@@ -820,6 +824,10 @@ fn avec_date_d_ajout(
 #[cfg(test)]
 #[path = "search_pagination_i4803_tests.rs"]
 mod tests_pagination_i4803;
+
+#[cfg(test)]
+#[path = "service_desactive_i5103_tests.rs"]
+mod tests_service_desactive_i5103;
 
 #[cfg(test)]
 mod tests_date_d_ajout {

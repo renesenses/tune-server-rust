@@ -94,7 +94,7 @@ BEGIN
   FOREACH c SLICE 1 IN ARRAY cols LOOP
     SELECT data_type, column_default INTO cur_type, col_def
       FROM information_schema.columns
-     WHERE table_name = c[1] AND column_name = c[2];
+     WHERE table_schema = current_schema() AND table_name = c[1] AND column_name = c[2];
 
     IF cur_type IN ('text', 'character varying') THEN
       EXECUTE format(

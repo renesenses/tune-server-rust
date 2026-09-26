@@ -164,7 +164,7 @@ pub fn parse_dsf(path: &str) -> Result<DsfInfo, String> {
     if channels == 0 || channels > 8 {
         return Err(format!("invalid channel count: {channels}"));
     }
-    if sample_rate < 2_000_000 || sample_rate > 50_000_000 {
+    if !(2_000_000..=50_000_000).contains(&sample_rate) {
         return Err(format!("unexpected DSD sample rate: {sample_rate}"));
     }
     if block_size == 0 {
@@ -227,11 +227,11 @@ pub fn read_dsf_blocks(path: &str, info: &DsfInfo) -> Result<Vec<u8>, String> {
     let channels = info.channels as usize;
 
     // Total bytes of actual DSD sample data per channel
-    let total_bytes_per_channel = (info.total_samples + 7) / 8; // 8 samples per byte
+    let total_bytes_per_channel = info.total_samples.div_ceil(8); // 8 samples per byte
     let total_bytes_per_channel = total_bytes_per_channel as usize;
 
     // Number of complete super-blocks (each contains one block per channel)
-    let blocks_per_channel = (total_bytes_per_channel + block_size - 1) / block_size;
+    let blocks_per_channel = total_bytes_per_channel.div_ceil(block_size);
 
     // Output: interleaved by byte (not by block)
     // Layout: for each byte position b, we output ch0[b], ch1[b], ...
@@ -324,8 +324,8 @@ impl<R: Read> DsfStreamReader<R> {
     pub fn depuis_lecteur(source: R, info: DsfInfo) -> Self {
         let block_size = info.block_size as usize;
         let channels = info.channels as usize;
-        let total_bytes_per_channel = ((info.total_samples + 7) / 8) as usize;
-        let blocks_per_channel = (total_bytes_per_channel + block_size - 1) / block_size;
+        let total_bytes_per_channel = info.total_samples.div_ceil(8) as usize;
+        let blocks_per_channel = total_bytes_per_channel.div_ceil(block_size);
         let super_block_size = block_size * channels;
 
         DsfStreamReader {
@@ -371,7 +371,7 @@ impl<R: Read> DsfStreamReader<R> {
 
         let block_size = self.info.block_size as usize;
         let channels = self.info.channels as usize;
-        let total_bytes_per_channel = ((self.info.total_samples + 7) / 8) as usize;
+        let total_bytes_per_channel = self.info.total_samples.div_ceil(8) as usize;
         let data_size = self.info.data_size as usize;
         let super_block_size = block_size * channels;
 

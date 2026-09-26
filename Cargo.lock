@@ -5221,7 +5221,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5236,7 +5236,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "axum",
  "bytes",
@@ -5257,7 +5257,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cd"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5274,8 +5274,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-circle"
+version = "0.9.166"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-cli"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5289,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5302,7 +5317,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "aes-gcm",
  "ape-decoder",
@@ -5389,7 +5404,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5400,8 +5415,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-entree-audio"
+version = "0.9.166"
+dependencies = [
+ "async-trait",
+ "axum",
+ "coreaudio-rs",
+ "cpal",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-ffi"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "axum",
  "serde_json",
@@ -5414,7 +5447,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "axum",
  "reqwest",
@@ -5425,7 +5458,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5438,7 +5471,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "serde",
@@ -5447,7 +5480,7 @@ dependencies = [
 
 [[package]]
 name = "tune-playlists-converter"
-version = "0.9.161"
+version = "0.9.166"
 dependencies = [
  "serde",
  "serde_json",
@@ -5525,7 +5558,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5542,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "tune-pont-roon"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5558,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5598,9 +5631,11 @@ dependencies = [
  "tracing-subscriber",
  "tune-bandcamp",
  "tune-cd",
+ "tune-circle",
  "tune-concerts",
  "tune-core",
  "tune-dj",
+ "tune-entree-audio",
  "tune-http-types",
  "tune-karaoke",
  "tune-plugin-converter",
@@ -5620,7 +5655,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-trait",
  "axum",
@@ -5634,7 +5669,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-stream",
  "axum",
@@ -5650,7 +5685,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.165"
+version = "0.9.166"
 dependencies = [
  "async-stream",
  "async-trait",

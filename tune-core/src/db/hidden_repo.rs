@@ -67,11 +67,44 @@ pub const ITEM_TYPE_ALBUM: &str = "album";
 /// requête (fin de file, autoplay) est le profil actif du serveur — voir
 /// [`profil_de_selection_automatique`].
 ///
-/// Périmètre : bibliothèque LOCALE seulement (`tracks.id`). `item_id` est un
-/// entier des deux côtés (SQLite INTEGER, PG BIGINT) : un titre de service
-/// `(source, source_id)` demanderait une table jumelle sur le modèle de
-/// `streaming_item_tags` — voie ouverte, pas livrée.
+/// Deux espaces d'identifiants, deux tables. Un titre LOCAL (`tracks.id`) vit
+/// ici, dans `hidden_items` (`item_id` est un entier des deux côtés). Un titre
+/// de SERVICE (Qobuz, Tidal, Bandcamp…) n'a pas d'entier : il vit dans la
+/// jumelle `streaming_hidden_items`, désigné par la paire `(source,
+/// source_id)` — la forme de `streaming_item_tags` et `streaming_favorites`
+/// (FabienM, fil 1946 réponse 6820 : « Il faut pouvoir bannir un titre
+/// service, pas uniquement local »). Jamais un entier seul : l'id local 7 et
+/// le titre Qobuz « 7 » ne désignent pas le même objet.
 pub const ITEM_TYPE_TRACK: &str = "track";
+
+/// La provenance d'un titre de service telle qu'on la compare : `Qobuz`,
+/// ` qobuz` et `qobuz` désignent le même service. Tout ce qui écrit ou lit
+/// `streaming_hidden_items` passe par ici — la file (`queue_items.source`),
+/// la lecture en cours et les favoris ne s'écrivent pas tous pareil.
+pub fn source_normalisee(source: &str) -> String {
+    source.trim().to_ascii_lowercase()
+}
+
+/// Un titre de SERVICE à bannir, avec l'instantané d'affichage figé au geste :
+/// l'écran « Titres bannis » se rend sans interroger le service, qui peut
+/// avoir retiré le titre ou être déconnecté (même raison que
+/// `streaming_item_tags`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TitreDeService {
+    pub source: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    /// L'album CHEZ LE SERVICE, pour que l'écran ramène à l'album de service.
+    #[serde(default)]
+    pub album_source_id: Option<String>,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+}
 
 /// Masquage GLOBAL : on écrit le profil pour préparer l'avenir, on ne le lit
 /// jamais — même valeur que les six sites `profile_id = 1` des facettes.
@@ -91,10 +124,48 @@ pub fn profil_de_selection_automatique(db: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(GLOBAL_PROFILE_ID)
 }
 
+/// #4806 suite — ajoute à l'ensemble d'exclusion d'une radio de SERVICE les
+/// `source_id` que le profil des sélections automatiques a bannis chez ce
+/// service. UNE définition pour les deux radios qui tirent dans le catalogue
+/// d'un service : la radio de fin de file (`poller::radio`,
+/// `autoplay_streaming_radio`) et « Plus comme ça » (`GET
+/// /streaming/{service}/tracks/{id}/similar`) — elles partagent déjà
+/// `auto_dj::pistes_similaires_du_service`, elles partagent aussi ce filtre.
+/// L'exclusion se fait AVANT le tirage : la borne se tient en titres jouables.
+/// Une base illisible n'empêche pas la radio : elle est journalisée, et rien
+/// n'est ajouté. Rend le nombre d'identifiants ajoutés.
+pub fn exclure_les_titres_de_service_bannis(
+    db: &Arc<dyn DbBackend>,
+    source: &str,
+    exclure: &mut std::collections::HashSet<String>,
+) -> usize {
+    let profil = profil_de_selection_automatique(db);
+    match HiddenRepo::with_backend(db.clone()).banned_streaming_ids_for_source(profil, source) {
+        Ok(bannis) => {
+            let n = bannis.len();
+            exclure.extend(bannis);
+            n
+        }
+        Err(e) => {
+            tracing::warn!(source, profil, error = %e, "radio_de_service_bans_illisibles");
+            0
+        }
+    }
+}
+
 /// Un titre banni, tel que la route de révision le rend.
+///
+/// Les deux espaces dans une même liste, sans ambiguïté : un titre LOCAL porte
+/// `track_id` et `source: null` ; un titre de SERVICE porte `track_id: null`
+/// et la paire `source` + `source_id` — la règle de `GET /tags/{id}/items`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BannedTrack {
-    pub track_id: i64,
+    pub track_id: Option<i64>,
+    /// Le service d'un titre de service (`qobuz`, `tidal`…), `None` en local.
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    /// L'album chez le service, pour un titre de service.
+    pub album_source_id: Option<String>,
     /// Titre vivant si la piste existe encore, sinon l'instantané figé au
     /// bannissement.
     pub title: String,
@@ -103,6 +174,7 @@ pub struct BannedTrack {
     pub album_title: Option<String>,
     /// `albums.cover_path` de l'album vivant, pour la vignette de l'écran
     /// « Titres bannis » (l'image se sert par `/library/albums/{id}/cover`).
+    /// Pour un titre de service : l'URL de pochette figée au bannissement.
     pub cover_path: Option<String>,
     pub banned_at: Option<String>,
     /// `false` = marqueur orphelin : l'id ne désigne plus de piste vivante.
@@ -225,6 +297,80 @@ pub mod sql {
              LEFT JOIN albums al ON al.id = t.album_id \
              WHERE hi.profile_id = {} AND hi.item_type = {} \
              ORDER BY hi.created_at DESC, hi.item_id ASC",
+            d.placeholder(1),
+            d.placeholder(2),
+        )
+    }
+}
+
+/// SQL des titres de SERVICE bannis (#4806), table `streaming_hidden_items`.
+pub mod sql_service {
+    use super::SqlDialect;
+
+    /// Rebannir met l'instantané à jour (le titre a pu être renommé chez le
+    /// service) sans toucher à la date du premier bannissement.
+    pub fn ban<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO streaming_hidden_items \
+             (profile_id, item_type, source, source_id, title, artist, album, album_source_id, cover_url, created_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (profile_id, item_type, source, source_id) DO UPDATE SET \
+             title = COALESCE(excluded.title, streaming_hidden_items.title), \
+             artist = COALESCE(excluded.artist, streaming_hidden_items.artist), \
+             album = COALESCE(excluded.album, streaming_hidden_items.album), \
+             album_source_id = COALESCE(excluded.album_source_id, streaming_hidden_items.album_source_id), \
+             cover_url = COALESCE(excluded.cover_url, streaming_hidden_items.cover_url)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.now_iso8601(),
+        )
+    }
+
+    pub fn unban<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM streaming_hidden_items \
+             WHERE profile_id = {} AND item_type = {} AND source = {} AND source_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+        )
+    }
+
+    pub fn count_one<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM streaming_hidden_items \
+             WHERE profile_id = {} AND item_type = {} AND source = {} AND source_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+        )
+    }
+
+    /// Toutes les paires bannies du profil : une requête, jamais une par ligne.
+    pub fn keys<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT source, source_id FROM streaming_hidden_items \
+             WHERE profile_id = {} AND item_type = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+        )
+    }
+
+    pub fn list<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT source, source_id, title, artist, album, album_source_id, cover_url, created_at \
+             FROM streaming_hidden_items \
+             WHERE profile_id = {} AND item_type = {} \
+             ORDER BY created_at DESC, source ASC, source_id ASC",
             d.placeholder(1),
             d.placeholder(2),
         )
@@ -417,8 +563,16 @@ impl HiddenRepo {
             .collect())
     }
 
-    /// Tous les titres bannis du profil, vivants comme orphelins.
+    /// Tous les titres bannis du profil, vivants comme orphelins — les titres
+    /// LOCAUX d'abord, puis les titres de SERVICE (#4806), chaque famille du
+    /// plus récent au plus ancien.
     pub fn list_banned_tracks(&self, profile_id: i64) -> Result<Vec<BannedTrack>, String> {
+        let mut out = self.list_banned_local_tracks(profile_id)?;
+        out.extend(self.list_banned_streaming_tracks(profile_id)?);
+        Ok(out)
+    }
+
+    fn list_banned_local_tracks(&self, profile_id: i64) -> Result<Vec<BannedTrack>, String> {
         let sql = self.dialect_sql(sql::list_tracks, sql::list_tracks);
         let params: [&dyn ToSqlValue; 2] = [&profile_id, &ITEM_TYPE_TRACK];
         let rows = self.db.query_many(&sql, &params)?;
@@ -433,7 +587,10 @@ impl HiddenRepo {
                 let live_title = r.get(5).and_then(|v| v.as_string());
                 let live_artist = r.get(6).and_then(|v| v.as_string());
                 Some(BannedTrack {
-                    track_id,
+                    track_id: Some(track_id),
+                    source: None,
+                    source_id: None,
+                    album_source_id: None,
                     title: live_title.unwrap_or(snapshot_name),
                     artist: live_artist.or({
                         if snapshot_artist.is_empty() {
@@ -447,6 +604,159 @@ impl HiddenRepo {
                     cover_path: r.get(9).and_then(|v| v.as_string()),
                     banned_at,
                     resolved,
+                })
+            })
+            .collect())
+    }
+
+    // --- Titres de SERVICE bannis (#4806) ------------------------------
+
+    /// Une ligne de file (ou la lecture en cours) est-elle bannie pour ce
+    /// profil ? Une ligne LOCALE se juge sur son `track_id`, et SEULEMENT
+    /// dessus ; une ligne de SERVICE (sans `track_id`) sur sa paire. Jamais
+    /// l'un pour l'autre : l'id local 7 banni ne bannit pas le titre Qobuz
+    /// « 7 ». Une erreur de lecture vaut « pas banni » — on joue plutôt que de
+    /// sauter à tort, la sélection automatique a déjà filtré en amont.
+    pub fn ligne_bannie(
+        &self,
+        profile_id: i64,
+        track_id: Option<i64>,
+        source: Option<&str>,
+        source_id: Option<&str>,
+    ) -> bool {
+        match (track_id, source, source_id) {
+            (Some(id), _, _) => self.is_track_banned(profile_id, id).unwrap_or(false),
+            (None, Some(src), Some(sid)) => self
+                .is_streaming_track_banned(profile_id, src, sid)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Bannit un titre de SERVICE pour ce profil. `Ok(false)` = désignation
+    /// incomplète (service ou identifiant vide) : rien n'est écrit, la route
+    /// rend 400. Idempotent ; rebannir rafraîchit l'instantané.
+    pub fn ban_streaming_track(&self, profile_id: i64, t: &TitreDeService) -> Result<bool, String> {
+        let source = source_normalisee(&t.source);
+        let source_id = t.source_id.trim().to_string();
+        if source.is_empty() || source_id.is_empty() {
+            return Ok(false);
+        }
+        let sql = self.dialect_sql(sql_service::ban, sql_service::ban);
+        let params: [&dyn ToSqlValue; 9] = [
+            &profile_id,
+            &ITEM_TYPE_TRACK,
+            &source,
+            &source_id,
+            &t.title,
+            &t.artist,
+            &t.album,
+            &t.album_source_id,
+            &t.cover_url,
+        ];
+        self.db.execute(&sql, &params)?;
+        info!(profile_id, source = %source, source_id = %source_id, title = ?t.title, "streaming_track_banned");
+        Ok(true)
+    }
+
+    /// Débannit un titre de service. `Ok(false)` = rien n'était banni.
+    pub fn unban_streaming_track(
+        &self,
+        profile_id: i64,
+        source: &str,
+        source_id: &str,
+    ) -> Result<bool, String> {
+        let source = source_normalisee(source);
+        let source_id = source_id.trim().to_string();
+        let sql = self.dialect_sql(sql_service::unban, sql_service::unban);
+        let params: [&dyn ToSqlValue; 4] = [&profile_id, &ITEM_TYPE_TRACK, &source, &source_id];
+        let n = self.db.execute(&sql, &params)?;
+        if n > 0 {
+            info!(profile_id, source = %source, source_id = %source_id, "streaming_track_unbanned");
+        }
+        Ok(n > 0)
+    }
+
+    pub fn is_streaming_track_banned(
+        &self,
+        profile_id: i64,
+        source: &str,
+        source_id: &str,
+    ) -> Result<bool, String> {
+        let source = source_normalisee(source);
+        let source_id = source_id.trim().to_string();
+        if source.is_empty() || source_id.is_empty() {
+            return Ok(false);
+        }
+        let sql = self.dialect_sql(sql_service::count_one, sql_service::count_one);
+        let params: [&dyn ToSqlValue; 4] = [&profile_id, &ITEM_TYPE_TRACK, &source, &source_id];
+        match self.db.query_one(&sql, &params)? {
+            None => Ok(false),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0) > 0),
+        }
+    }
+
+    /// Toutes les paires `(source normalisée, source_id)` bannies par ce
+    /// profil — ce que lisent la file et les générateurs qui épurent une
+    /// liste de titres de service après coup. Une seule requête ; la liste
+    /// d'un profil se compte en dizaines, pas en milliers.
+    pub fn banned_streaming_keys(
+        &self,
+        profile_id: i64,
+    ) -> Result<std::collections::HashSet<(String, String)>, String> {
+        let sql = self.dialect_sql(sql_service::keys, sql_service::keys);
+        let params: [&dyn ToSqlValue; 2] = [&profile_id, &ITEM_TYPE_TRACK];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let source = r.first().and_then(|v| v.as_string())?;
+                let source_id = r.get(1).and_then(|v| v.as_string())?;
+                Some((source_normalisee(&source), source_id))
+            })
+            .collect())
+    }
+
+    /// Les `source_id` bannis par ce profil CHEZ CE SERVICE — la forme que
+    /// prennent les ensembles d'exclusion de la radio de service
+    /// (`autoplay_streaming_radio`, « Plus comme ça »), qui ne comparent que
+    /// des identifiants d'un seul service.
+    pub fn banned_streaming_ids_for_source(
+        &self,
+        profile_id: i64,
+        source: &str,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let source = source_normalisee(source);
+        Ok(self
+            .banned_streaming_keys(profile_id)?
+            .into_iter()
+            .filter(|(s, _)| *s == source)
+            .map(|(_, id)| id)
+            .collect())
+    }
+
+    fn list_banned_streaming_tracks(&self, profile_id: i64) -> Result<Vec<BannedTrack>, String> {
+        let sql = self.dialect_sql(sql_service::list, sql_service::list);
+        let params: [&dyn ToSqlValue; 2] = [&profile_id, &ITEM_TYPE_TRACK];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let source = r.first().and_then(|v| v.as_string())?;
+                let source_id = r.get(1).and_then(|v| v.as_string())?;
+                Some(BannedTrack {
+                    track_id: None,
+                    source: Some(source),
+                    source_id: Some(source_id),
+                    album_source_id: r.get(5).and_then(|v| v.as_string()),
+                    title: r.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    artist: r.get(3).and_then(|v| v.as_string()),
+                    album_id: None,
+                    album_title: r.get(4).and_then(|v| v.as_string()),
+                    cover_path: r.get(6).and_then(|v| v.as_string()),
+                    banned_at: r.get(7).and_then(|v| v.as_string()),
+                    // L'instantané EST l'identité : rien à résoudre.
+                    resolved: true,
                 })
             })
             .collect())
@@ -773,7 +1083,7 @@ mod tests {
 
         let liste = repo.list_banned_tracks(1).unwrap();
         assert_eq!(liste.len(), 1);
-        assert_eq!(liste[0].track_id, t1);
+        assert_eq!(liste[0].track_id, Some(t1));
         assert_eq!(liste[0].title, "Roads");
         assert_eq!(liste[0].artist.as_deref(), Some("Portishead"));
         assert_eq!(liste[0].album_id, Some(al));
@@ -797,6 +1107,145 @@ mod tests {
         let repo = HiddenRepo::with_backend(db);
         assert!(!repo.ban_track(1, 4242).unwrap());
         assert!(repo.list_banned_tracks(1).unwrap().is_empty());
+    }
+
+    /// #4806 suite — un titre de SERVICE, désigné par sa paire : bannir,
+    /// normaliser la provenance, lister avec l'instantané, par profil,
+    /// débannir ; et jamais de confusion avec l'id local de même valeur.
+    #[test]
+    fn bannir_un_titre_de_service_par_sa_paire() {
+        let db = test_db();
+        let repo = HiddenRepo::with_backend(db.clone());
+        let ar = insert_artist(&db, "Alice Coltrane");
+        let al = insert_album(&db, "Journey", ar);
+        let locale = insert_track(&db, "Shiva-Loka", ar, al);
+        let homonyme = locale.to_string();
+        let titre = |id: &str| TitreDeService {
+            source: " Qobuz ".into(),
+            source_id: id.into(),
+            title: Some(format!("Titre {id}")),
+            artist: Some("Alice Coltrane".into()),
+            album: Some("Journey".into()),
+            album_source_id: Some("alb-9".into()),
+            cover_url: Some("https://exemple.invalid/c.jpg".into()),
+        };
+
+        assert!(
+            !repo
+                .is_streaming_track_banned(1, "qobuz", &homonyme)
+                .unwrap()
+        );
+        assert!(repo.ban_streaming_track(1, &titre(&homonyme)).unwrap());
+        assert!(
+            repo.ban_streaming_track(1, &titre(&homonyme)).unwrap(),
+            "idempotent"
+        );
+        assert!(
+            repo.is_streaming_track_banned(1, "QOBUZ", &homonyme)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .is_streaming_track_banned(1, "tidal", &homonyme)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .is_streaming_track_banned(2, "qobuz", &homonyme)
+                .unwrap()
+        );
+        // Deux espaces : le titre Qobuz « <id> » ne bannit pas la piste <id>.
+        assert!(!repo.is_track_banned(1, locale).unwrap());
+        assert!(!repo.ligne_bannie(1, Some(locale), Some("qobuz"), Some(&homonyme)));
+        assert!(repo.ligne_bannie(1, None, Some("Qobuz"), Some(&homonyme)));
+
+        let cles = repo.banned_streaming_keys(1).unwrap();
+        assert!(cles.contains(&("qobuz".to_string(), homonyme.clone())));
+        assert_eq!(
+            repo.banned_streaming_ids_for_source(1, "Qobuz")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            repo.banned_streaming_ids_for_source(1, "tidal")
+                .unwrap()
+                .is_empty()
+        );
+
+        let liste = repo.list_banned_tracks(1).unwrap();
+        assert_eq!(liste.len(), 1, "une seule ligne malgré deux bannissements");
+        assert_eq!(liste[0].track_id, None);
+        assert_eq!(liste[0].source.as_deref(), Some("qobuz"));
+        assert_eq!(liste[0].source_id.as_deref(), Some(homonyme.as_str()));
+        assert_eq!(liste[0].title, format!("Titre {homonyme}"));
+        assert_eq!(liste[0].album_source_id.as_deref(), Some("alb-9"));
+        assert_eq!(
+            liste[0].cover_path.as_deref(),
+            Some("https://exemple.invalid/c.jpg")
+        );
+        assert!(repo.list_banned_tracks(2).unwrap().is_empty());
+
+        // Désignation incomplète : rien n'est écrit.
+        assert!(
+            !repo
+                .ban_streaming_track(
+                    1,
+                    &TitreDeService {
+                        source: "qobuz".into(),
+                        source_id: "  ".into(),
+                        ..Default::default()
+                    }
+                )
+                .unwrap()
+        );
+
+        assert!(repo.unban_streaming_track(1, "QOBUZ", &homonyme).unwrap());
+        assert!(!repo.unban_streaming_track(1, "qobuz", &homonyme).unwrap());
+        assert!(repo.list_banned_tracks(1).unwrap().is_empty());
+    }
+
+    /// Le prédicat SQL des favoris de service, sur une vraie base : il écarte
+    /// la paire bannie (provenance écrite en majuscules dans le favori), et
+    /// seulement pour le bon profil.
+    #[test]
+    fn le_predicat_des_titres_de_service_bannis_filtre_en_sql() {
+        let db = test_db();
+        for (id, titre) in [("f1", "Un"), ("f2", "Deux")] {
+            let params: [&dyn ToSqlValue; 2] = [&id, &titre];
+            db.execute(
+                "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                 VALUES (1, 'track', 'Qobuz', ?, ?)",
+                &params,
+            )
+            .unwrap();
+        }
+        let repo = HiddenRepo::with_backend(db.clone());
+        let compte = |profil: i64| -> i64 {
+            let sql = format!(
+                "SELECT COUNT(*) FROM streaming_favorites sf WHERE {}",
+                crate::db::facet_filter::banned_streaming_excluded(
+                    profil,
+                    "sf.service",
+                    "sf.service_id"
+                )
+            );
+            db.query_one(&sql, &[]).unwrap().unwrap()[0]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(compte(1), 2, "témoin");
+        repo.ban_streaming_track(
+            1,
+            &TitreDeService {
+                source: "qobuz".into(),
+                source_id: "f1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(compte(1), 1);
+        assert_eq!(compte(2), 2, "autre profil");
     }
 
     /// Le profil des sélections sans requête : le réglage `active_profile_id`,

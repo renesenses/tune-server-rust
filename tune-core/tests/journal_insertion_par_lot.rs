@@ -201,10 +201,9 @@ fn un_lot_de_scan_nominal_n_ecrit_aucune_ligne_warn_par_piste() {
     // produire la moindre ligne au niveau livré.
     let mut lot: Vec<Track> = Vec::with_capacity(PISTES_PAR_LOT);
     for i in 0..PISTES_PAR_LOT {
-        let titre = if i < VARIANTES.len() {
-            VARIANTES[i].to_string()
-        } else {
-            format!("Piste ordinaire {i}")
+        let titre = match VARIANTES.get(i) {
+            Some(variante) => variante.to_string(),
+            None => format!("Piste ordinaire {i}"),
         };
         let mut piste = Track::new(titre);
         piste.album_id = Some(album_id);

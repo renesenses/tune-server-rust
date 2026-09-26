@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "ce01ee4a118c0f6e5dc50d404f778ec515956a86",
+    "web_sha": "106d5f4c7baa9a82fb950567f0c140aa201c1c43",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -149,6 +149,9 @@
         "delay_ms"
       ],
       "champs_optionnels": [
+        "head_shadow_enabled",
+        "cutoff_hz",
+        "slope_db_per_octave",
         "created_at"
       ]
     },
@@ -486,6 +489,23 @@
     },
     {
       "route": "/ext/concerts/location",
+      "methode": "GET",
+      "type": "LocalisationConcerts",
+      "liste": false,
+      "champs_obligatoires": [
+        "scope",
+        "city",
+        "country",
+        "radius_km"
+      ],
+      "champs_optionnels": [
+        "located",
+        "postal_code",
+        "code"
+      ]
+    },
+    {
+      "route": "/ext/concerts/location",
       "methode": "POST",
       "type": "LocalisationConcerts",
       "liste": false,
@@ -497,6 +517,7 @@
       ],
       "champs_optionnels": [
         "located",
+        "postal_code",
         "code"
       ]
     },
@@ -832,6 +853,50 @@
       "champs_optionnels": [
         "release_id"
       ]
+    },
+    {
+      "route": "/library/albums/{}/edition",
+      "methode": "GET",
+      "type": "EditionReponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "album",
+        "discs",
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "ecriture_balises"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/edition",
+      "methode": "PUT",
+      "type": "EditionReponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "album",
+        "discs",
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "ecriture_balises"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/edition/write-tags",
+      "methode": "POST",
+      "type": "RapportBalises",
+      "liste": false,
+      "champs_obligatoires": [
+        "dry_run",
+        "ecrits",
+        "a_ecrire",
+        "inchanges",
+        "plan",
+        "ignores",
+        "erreurs"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/library/albums/{}/reidentify",
@@ -1254,6 +1319,28 @@
         "accessible",
         "access_error"
       ]
+    },
+    {
+      "route": "/library/coffrets",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "count",
+        "items"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/coffrets/{}/defaire",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "cible",
+        "albums_recrees"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/library/duplicates{}",
@@ -2307,7 +2394,8 @@
         "marketplace",
         "slug",
         "install_proposed",
-        "existing_configuration"
+        "existing_configuration",
+        "premium"
       ]
     },
     {
@@ -2383,7 +2471,8 @@
         "marketplace",
         "slug",
         "install_proposed",
-        "existing_configuration"
+        "existing_configuration",
+        "premium"
       ]
     },
     {
@@ -5492,6 +5581,16 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/albums/{}/discs/attach",
+      "type": "unknown",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/albums/{}/discs/{}/detach",
+      "type": "unknown",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/artists",
       "type": "any",
       "raison": "type non structurel"
@@ -5503,6 +5602,16 @@
     },
     {
       "route": "/library/albums/{}/credits",
+      "type": "import('./library/credits').CreditAvecPiste[]",
+      "raison": "type introuvable dans les sources"
+    },
+    {
+      "route": "/streaming/{}/tracks/{}/credits",
+      "type": "import('./library/credits').CreditAvecPiste[]",
+      "raison": "type introuvable dans les sources"
+    },
+    {
+      "route": "/streaming/{}/albums/{}/credits",
       "type": "import('./library/credits').CreditAvecPiste[]",
       "raison": "type introuvable dans les sources"
     },
@@ -6123,7 +6232,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 305,
-    "appels_non_resolus": 152
+    "routes_cartographiees": 311,
+    "appels_non_resolus": 156
   }
 }

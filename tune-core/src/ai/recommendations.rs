@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
+use crate::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use crate::db::settings_repo::SettingsRepo;
 
 /// #4806 — le prédicat « pas banni pour le profil actif », alias `t`.
@@ -16,6 +17,28 @@ fn sans_titres_bannis(backend: &Arc<dyn DbBackend>) -> String {
     crate::db::facet_filter::banned_tracks_excluded(
         crate::db::hidden_repo::profil_de_selection_automatique(backend),
     )
+}
+
+// #5005 — ce fichier datait par `datetime('now', '-N days')` et joignait
+// `t.artist_id = CAST(a.id AS TEXT)` : deux écritures que SQLite
+// avale et que PostgreSQL refuse (`datetime` n'y existe pas ; `bigint = text`
+// n'y a pas d'opérateur). Chaque requête étant dans un `if let Ok(..)`, rien ne
+// se voyait : sur PostgreSQL, les recommandations retombaient sur le tirage au
+// hasard, les Daily mixes sortaient vides et la radio ignorait sa graine. Les
+// jointures comparent désormais des entiers (les deux schémas typent `id`,
+// `artist_id` et `album_id` en entier) ; les dates passent par le dialecte.
+
+/// Le fragment SQL propre au moteur de `backend`.
+fn dialect_sql(backend: &Arc<dyn DbBackend>, f: impl Fn(&dyn SqlDialect) -> String) -> String {
+    match backend.engine() {
+        Engine::Sqlite => f(&SqliteDialect),
+        Engine::Postgres => f(&PostgresDialect),
+    }
+}
+
+/// « `listened_at` date des `jours` derniers jours », sans alias.
+fn ecoute_depuis(backend: &Arc<dyn DbBackend>, jours: i64) -> String {
+    dialect_sql(backend, |d| d.since_days("listened_at", jours))
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +112,8 @@ pub fn get_recommendations(
     // #4806 — une recommandation est une sélection automatique : jamais un
     // titre banni par le profil actif.
     let sans_bannis = sans_titres_bannis(backend);
+    // #5005 — « pas écouté ces sept derniers jours », propre au moteur.
+    let recentes = ecoute_depuis(backend, 7);
 
     // --- Top genres from history (join tracks to get genre) ---
     let top_genres = backend
@@ -137,12 +162,12 @@ pub fn get_recommendations(
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE t.genre IN ({in_clause}) \
              AND t.id NOT IN ( \
                  SELECT CAST(track_id AS INTEGER) FROM listen_history \
-                 WHERE listened_at > datetime('now', '-7 days') \
+                 WHERE {recentes} \
              ) \
              AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
@@ -173,12 +198,12 @@ pub fn get_recommendations(
             let sql = format!(
                 "SELECT {TRACK_COLS} \
                  FROM tracks t \
-                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-                 LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                 LEFT JOIN artists a ON t.artist_id = a.id \
+                 LEFT JOIN albums al ON t.album_id = al.id \
                  WHERE COALESCE(a.name, t.album_artist) IN ({in_clause}) \
                  AND t.id NOT IN ( \
                      SELECT CAST(track_id AS INTEGER) FROM listen_history \
-                     WHERE listened_at > datetime('now', '-7 days') \
+                     WHERE {recentes} \
                  ) \
                  AND t.id NOT IN ({}) \
                  AND {sans_bannis} \
@@ -215,8 +240,8 @@ pub fn get_recommendations(
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
         );
@@ -243,6 +268,12 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
     let mut mixes = Vec::new();
     // #4806 — même règle que `get_recommendations`.
     let sans_bannis = sans_titres_bannis(backend);
+    // #5005 — bornes de dates propres au moteur (« Rediscover »).
+    let recentes = ecoute_depuis(backend, 7);
+    // « Il y a plus de 30 jours » s'écrit `NOT (<depuis 30 jours>)` :
+    // `listened_at` est `NOT NULL` sur les deux moteurs, la négation vaut `<`.
+    let depuis_30_jours = ecoute_depuis(backend, 30);
+    let depuis_180_jours = ecoute_depuis(backend, 180);
 
     // Get top genres
     let top_genres = backend
@@ -266,25 +297,25 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE t.genre = ? \
              AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT 15"
         );
 
-        if let Ok(rows) = backend.query_many(&sql, &[genre as &dyn ToSqlValue]) {
-            if rows.len() >= 3 {
-                let tracks: Vec<RecommendedTrack> = rows
-                    .iter()
-                    .map(|r| row_to_track(r, &format!("{genre} mix")))
-                    .collect();
-                mixes.push(DailyMix {
-                    name: format!("{genre} Mix"),
-                    description: format!("Your favorites in {genre}"),
-                    tracks,
-                });
-            }
+        if let Ok(rows) = backend.query_many(&sql, &[genre as &dyn ToSqlValue])
+            && rows.len() >= 3
+        {
+            let tracks: Vec<RecommendedTrack> = rows
+                .iter()
+                .map(|r| row_to_track(r, &format!("{genre} mix")))
+                .collect();
+            mixes.push(DailyMix {
+                name: format!("{genre} Mix"),
+                description: format!("Your favorites in {genre}"),
+                tracks,
+            });
         }
 
         if mixes.len() >= 5 {
@@ -297,31 +328,31 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE t.id IN ( \
                  SELECT CAST(track_id AS INTEGER) FROM listen_history \
-                 WHERE listened_at < datetime('now', '-30 days') \
-                 AND listened_at > datetime('now', '-180 days') \
+                 WHERE NOT ({depuis_30_jours}) \
+                 AND {depuis_180_jours} \
              ) \
              AND t.id NOT IN ( \
                  SELECT CAST(track_id AS INTEGER) FROM listen_history \
-                 WHERE listened_at > datetime('now', '-7 days') \
+                 WHERE {recentes} \
              ) \
              AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT 15"
         );
 
-        if let Ok(rows) = backend.query_many(&sql, &[]) {
-            if rows.len() >= 3 {
-                let tracks: Vec<RecommendedTrack> =
-                    rows.iter().map(|r| row_to_track(r, "rediscover")).collect();
-                mixes.push(DailyMix {
-                    name: "Rediscover".to_string(),
-                    description: "Tracks you haven't listened to in a while".to_string(),
-                    tracks,
-                });
-            }
+        if let Ok(rows) = backend.query_many(&sql, &[])
+            && rows.len() >= 3
+        {
+            let tracks: Vec<RecommendedTrack> =
+                rows.iter().map(|r| row_to_track(r, "rediscover")).collect();
+            mixes.push(DailyMix {
+                name: "Rediscover".to_string(),
+                description: "Tracks you haven't listened to in a while".to_string(),
+                tracks,
+            });
         }
     }
 
@@ -368,7 +399,7 @@ pub fn smart_radio(
             .query_one(
                 "SELECT t.genre, COALESCE(a.name, t.album_artist) \
                  FROM tracks t \
-                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
+                 LEFT JOIN artists a ON t.artist_id = a.id \
                  WHERE t.id = ?",
                 &[&tid],
             )
@@ -418,8 +449,8 @@ pub fn smart_radio(
             let sql = format!(
                 "SELECT {TRACK_COLS} \
                  FROM tracks t \
-                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-                 LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                 LEFT JOIN artists a ON t.artist_id = a.id \
+                 LEFT JOIN albums al ON t.album_id = al.id \
                  WHERE t.id IN ({placeholders}) AND {sans_bannis}"
             );
             let params: Vec<&dyn ToSqlValue> = ids.iter().map(|id| id as &dyn ToSqlValue).collect();
@@ -444,8 +475,8 @@ pub fn smart_radio(
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE t.genre = ? AND t.id != ? \
              AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
@@ -500,8 +531,8 @@ pub fn smart_radio(
                 let sql = format!(
                     "SELECT {TRACK_COLS} \
                      FROM tracks t \
-                     LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-                     LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                     LEFT JOIN artists a ON t.artist_id = a.id \
+                     LEFT JOIN albums al ON t.album_id = al.id \
                      WHERE COALESCE(a.name, t.album_artist) IN ({in_clause}) \
                      AND t.id NOT IN ({exclude_ids}) \
                      AND {sans_bannis} \
@@ -544,8 +575,8 @@ pub fn smart_radio(
             let sql = format!(
                 "SELECT {TRACK_COLS} \
                  FROM tracks t \
-                 LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-                 LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+                 LEFT JOIN artists a ON t.artist_id = a.id \
+                 LEFT JOIN albums al ON t.album_id = al.id \
                  WHERE COALESCE(a.name, t.album_artist) = ? \
                  AND t.id != ? \
                  AND t.id NOT IN ({exclude_ids}) \
@@ -580,8 +611,8 @@ pub fn smart_radio(
         let sql = format!(
             "SELECT {TRACK_COLS} \
              FROM tracks t \
-             LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
-             LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             LEFT JOIN artists a ON t.artist_id = a.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              WHERE t.id NOT IN ({exclude_ids}) \
              AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"

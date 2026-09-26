@@ -2,11 +2,15 @@
 /// l'utilisateur, réconciliées sur le modèle des favoris et des masquages.
 pub(crate) mod absorption;
 pub mod album_distinct_repo;
+/// La fusion des albums en double, commune au manuel, au scan et au nettoyage.
+pub mod album_doublons;
 pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+pub mod coffrets_auto;
 pub mod collection_folder_repo;
+pub mod edition_album;
 pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
@@ -27,6 +31,8 @@ pub mod migrations;
 pub mod models;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_ensure_schema_parity;
+#[cfg(all(test, feature = "postgres"))]
+mod pg_gardes_schema_5003;
 #[cfg(feature = "postgres")]
 pub mod pg_migrate;
 #[cfg(all(test, feature = "postgres"))]
@@ -42,6 +48,7 @@ mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
+pub mod rattrapage_metadonnees_5043;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
@@ -54,10 +61,13 @@ pub mod track_repo;
 pub mod tx_holder;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub mod verrou_ecriture;
+pub mod zone_motif_masquage;
 pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
 #[cfg(test)]
 mod lenteur_albums_4800_tests;
+#[cfg(test)]
+mod pochette_source_pg_tests_5034;
 pub mod upnp_revision;

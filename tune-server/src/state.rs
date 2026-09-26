@@ -219,10 +219,10 @@ impl AppState {
     /// because the choice is stored in the database, never in the config file
     /// (forum, Windows).
     pub fn display_audio_backend(&self) -> String {
-        if let Ok(guard) = self.active_audio_backend.read() {
-            if let Some(b) = guard.as_ref() {
-                return b.clone();
-            }
+        if let Ok(guard) = self.active_audio_backend.read()
+            && let Some(b) = guard.as_ref()
+        {
+            return b.clone();
         }
         self.effective_audio_backend()
     }
@@ -332,8 +332,14 @@ impl AppState {
         let backend: Arc<dyn DbBackend> =
             Self::create_backend(selected_engine, &tune_config, sqlite_db.as_ref(), db_path)?;
 
-        // Clean up any leftover temp transcode files from a previous crash.
-        tune_core::http::streamer::cleanup_leftover_transcode_files();
+        // Le ménage des `tune-transcode-*` laissés par un plantage ne se fait
+        // PAS ici : il se fait au DÉMARRAGE du processus, dans
+        // `startup::init_state` (#5142). `AppState::new` est aussi le
+        // constructeur de centaines d'épreuves ; chacune effaçait alors TOUS
+        // les fichiers de transcodage en cours du compte dans `temp_dir()`,
+        // y compris ceux d'un autre processus de test qui les écrivait encore.
+        // C'est ce qui faisait rougir `crossfeed_bibliotheque_reseau::cas_1`
+        // (« fichier introuvable ») pendant une gate de `tune-server`.
 
         let license = Arc::new(tune_core::license::LicenseManager::new_with_limit(
             backend.clone(),
@@ -390,10 +396,11 @@ impl AppState {
         //
         // L'inscription est INCONDITIONNELLE, comme les cinq autres, et non
         // gardée par l'état du greffon : `ServiceRegistry::get` ne consulte
-        // jamais `enabled`, et le service rend `enabled() == false` tant que
-        // personne ne l'a activé — il apparaît donc comme disponible et non
-        // connecté, exactement comme le greffon opt-in dont il est la seconde
-        // face. La LECTURE, elle, ne change pas de chemin : `resolve_stream`
+        // jamais `enabled`. La case « Actif » suit la liaison du compte tant
+        // que personne n'y a touché, et lier un compte la coche (fil 1952,
+        // voir `BandcampService`) : sans compte lié, il apparaît donc
+        // disponible, non connecté et décoché. La LECTURE, elle, ne change
+        // pas de chemin : `resolve_stream`
         // route toujours `source == "bandcamp"` vers `resolve_direct_url`.
         #[cfg(feature = "bandcamp")]
         services.register(Box::new(tune_bandcamp::BandcampService::new(
@@ -414,6 +421,8 @@ impl AppState {
             tune_config.advertised_ip.clone(),
         );
         orch.event_bus = Some(event_bus.clone());
+        // #5065 — `sources.changed` part sur le même bus.
+        orch.sources_physiques().brancher_bus(event_bus.clone());
         orch.license = Some(license.clone());
         let orchestrator = Arc::new(orch);
 
@@ -450,6 +459,7 @@ impl AppState {
         let plugins = Arc::new(Mutex::new(crate::plugins::build_loader(
             &event_bus,
             backend.clone(),
+            license.clone(),
         )));
 
         Ok(Self {
@@ -583,7 +593,7 @@ impl AppState {
                         .database_url
                         .as_deref()
                         .ok_or("TUNE_DATABASE_URL is required for postgres engine")?;
-                    let safe_url = pg_url.split('@').last().unwrap_or(pg_url);
+                    let safe_url = pg_url.split('@').next_back().unwrap_or(pg_url);
                     info!(engine = "postgres", url = %safe_url, "database_engine_selected");
 
                     // Connect to PG and run migrations synchronously
@@ -592,6 +602,11 @@ impl AppState {
                         tokio::runtime::Handle::current().block_on(async {
                             let pg = tune_core::db::postgres::PostgresDb::connect(pg_url).await?;
                             tune_core::db::migrations::run_pg_migrations(pg.pool()).await?;
+                            // Second passage du DDL auto-réparateur : sur une
+                            // base NEUVE, celui de `connect()` a tourné avant
+                            // que les scripts ne créent les tables (chasse PG
+                            // du 25/09/2026, voir `ensure_schema`).
+                            pg.ensure_schema().await;
                             let backend =
                                 tune_core::db::backend::PostgresBackend::new(pg.pool().clone());
                             Ok::<_, String>(Arc::new(backend) as Arc<dyn DbBackend>)
@@ -653,6 +668,58 @@ mod relay_slot_tests {
             "background.rs doit PUBLIER le client de relais dans l'AppState ; \
              sans cela /cloud/relay/status repond `connected: false` a vie, \
              relais connecte ou non"
+        );
+    }
+
+    /// #5142 — `AppState::new` est le constructeur de centaines d'épreuves.
+    /// Il effaçait tous les `tune-transcode-*` du compte dans `temp_dir()`,
+    /// donc aussi le transcodage qu'un AUTRE processus venait d'écrire et
+    /// allait renommer dans le cache : `crossfeed_bibliotheque_reseau::cas_1`
+    /// (tune-core) rougissait alors en `NotFound` pendant une gate de
+    /// `tune-server`.
+    ///
+    /// La garde porte sur le CORPS du constructeur, et non sur un fichier posé
+    /// dans `/tmp` : `/tmp` est partagé avec les gates des autres sessions du
+    /// compte, dont le code d'avant efface ce fichier, et une telle épreuve
+    /// serait elle-même intermittente (vu sur Shrek, 1 rouge sur 20).
+    #[test]
+    fn construire_un_etat_n_efface_pas_les_transcodages_du_compte_5142() {
+        let source = include_str!("state.rs");
+        let corps = source
+            .split("pub fn new(db_path: &str, port: u16, tune_config: TuneConfig)")
+            .nth(1)
+            // Le corps s'arrête à la première accolade fermante de niveau
+            // `impl` : les blocs internes sont plus indentés.
+            .and_then(|reste| reste.split("\n    }\n").next())
+            .expect("AppState::new introuvable dans state.rs");
+        assert!(
+            corps.contains("let streamer = Arc::new(AudioStreamer::new(port));"),
+            "la coupe doit tomber dans le corps de AppState::new"
+        );
+        assert!(
+            !corps.contains("cleanup_leftover_transcode_files"),
+            "AppState::new ne doit pas effacer les transcodages du compte : le \
+             menage des restes d'un plantage appartient au DEMARRAGE \
+             (`startup::init_state`)"
+        );
+    }
+
+    /// L'autre moitié : le ménage n'a pas disparu, il a DÉMÉNAGÉ dans le
+    /// démarrage des deux binaires (`bootstrap.rs` et `tune-ffi`), qui passent
+    /// tous deux par `init_state`. Le démarrage ne s'appelle pas ici (réseau,
+    /// licences), donc la garde porte sur le CORPS de la fonction.
+    #[test]
+    fn le_demarrage_fait_toujours_le_menage_des_transcodages_5142() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split("pub async fn init_state(")
+            .nth(1)
+            // Jusqu'à l'accolade fermante de la fonction, en colonne 0.
+            .and_then(|reste| reste.split("\n}\n").next())
+            .expect("init_state introuvable dans startup.rs");
+        assert!(
+            corps.contains("tune_core::http::streamer::cleanup_leftover_transcode_files();"),
+            "init_state doit toujours effacer les transcodages laisses par un plantage"
         );
     }
 

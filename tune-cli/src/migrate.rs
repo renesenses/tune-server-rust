@@ -22,7 +22,7 @@
 //!   intersection of the 001 schema and what exists on the source.
 
 #![allow(unused_imports, dead_code)]
-use std::path::PathBuf;
+use std::path::Path;
 
 #[cfg(feature = "postgres")]
 mod inner {
@@ -403,10 +403,9 @@ mod inner {
 
         while let Some(row) = rows.next().map_err(|e| format!("next {table}: {e}"))? {
             let mut values = Vec::with_capacity(cols.len());
-            for i in 0..cols.len() {
-                let v: rusqlite::types::Value = row
-                    .get(i)
-                    .map_err(|e| format!("{table}.{}: {e}", cols[i]))?;
+            for (i, col) in cols.iter().enumerate() {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| format!("{table}.{}: {e}", col))?;
                 values.push(sqlx::types::Json(sqlite_to_json(v)));
             }
             batch.push(values);
@@ -534,7 +533,7 @@ mod inner {
 
 #[cfg(feature = "postgres")]
 pub async fn migrate(
-    from: &PathBuf,
+    from: &Path,
     to: &str,
     batch_size: usize,
     only_table: Option<&str>,
@@ -545,7 +544,7 @@ pub async fn migrate(
 
 #[cfg(not(feature = "postgres"))]
 pub async fn migrate(
-    _from: &PathBuf,
+    _from: &Path,
     _to: &str,
     _batch_size: usize,
     _only_table: Option<&str>,

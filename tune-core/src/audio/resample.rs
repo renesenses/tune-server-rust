@@ -444,7 +444,7 @@ pub fn rubato_resample_chunk(
     let input_ref: &[f32] = if flush {
         // When flushing, drain leftover first, then feed silence
         if !resample_leftover.is_empty() {
-            combined = resample_leftover.drain(..).collect();
+            combined = std::mem::take(resample_leftover);
             &combined
         } else {
             &[]

@@ -291,10 +291,10 @@ async fn start_job(
 async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, AppError> {
     let store = job_store();
     let map = store.lock().await;
-    if !map.contains_key(&job_id) {
-        if let Some(status) = crate::audio_job_journal::recovered("declick", &job_id) {
-            return Ok(Json(status));
-        }
+    if !map.contains_key(&job_id)
+        && let Some(status) = crate::audio_job_journal::recovered("declick", &job_id)
+    {
+        return Ok(Json(status));
     }
     let job_arc = map
         .get(&job_id)
@@ -500,10 +500,10 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_audio_files(&path, out);
-        } else if let Some(s) = path.to_str() {
-            if can_decode_native(s) {
-                out.push(path);
-            }
+        } else if let Some(s) = path.to_str()
+            && can_decode_native(s)
+        {
+            out.push(path);
         }
     }
 }

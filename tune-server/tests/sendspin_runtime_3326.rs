@@ -4,6 +4,26 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tune_core::sendspin::psk::{CategoriePsk, PskPair};
 
+/// Ce qu'un lecteur accorde au serveur pour une trame, une inscription ou un
+/// départ : la borne que le serveur accorde lui-même à un lecteur pour un
+/// message (#5142). Ce n'est pas une mesure de latence — aucune assertion de
+/// ce fichier ne porte sur la vitesse de ces étapes-là — mais le garde-fou
+/// contre un serveur muet.
+///
+/// Il valait 3 s, trois fois moins que le protocole, et le serveur ne le
+/// tenait pas toujours sous charge. Le runtime `current_thread` du test porte
+/// à la fois le lecteur et le serveur, et chaque réponse du serveur passe par
+/// `spawn_blocking` (le magasin d'appairage, avec trois `sync_all` pour
+/// `client/pair-finalize`). Sonde du 26/09/2026 sur Shrek, 40 brûleurs CPU,
+/// 6 passages : 19 trames ont mis plus de 1,5 s, 5 plus de 3 s, la plus lente
+/// 3,5 s. D'où les `delai du protocole: Elapsed(())` de `parcours_psk`
+/// (3 rouges sur 20 avant, 0 sur 20 après).
+///
+/// Les attentes qui, elles, MESURENT une promptitude (« la révocation
+/// n'attend pas le délai Noise ») gardent leur borne plus courte que celle-ci
+/// : c'est ce qui les rend capables de rougir.
+const ATTENTE_DU_SERVEUR: Duration = tune_server::routes::sendspin::DELAI_MESSAGE;
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 struct Serveur {
@@ -48,7 +68,7 @@ impl Serveur {
         )
     }
     async fn disponible(&self, id: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(ATTENTE_DU_SERVEUR, async {
             loop {
                 let r = reqwest::get(self.url(id, "pair")).await.unwrap();
                 if r.status().is_success() {
@@ -73,7 +93,7 @@ struct Lecteur {
     fragmenter: bool,
 }
 async fn trame(ws: &mut Socket) -> Message {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(ATTENTE_DU_SERVEUR, async {
         loop {
             match ws
                 .next()
@@ -322,7 +342,7 @@ async fn parcours_psk(fragmenter: bool) {
         assert_eq!(s.disponible(&id_texte).await["authenticated"], true);
         l.ws.close(None).await.unwrap();
         drop(l);
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(ATTENTE_DU_SERVEUR, async {
             while reqwest::get(s.url(&id_texte, "pair"))
                 .await
                 .unwrap()

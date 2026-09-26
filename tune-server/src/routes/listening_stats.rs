@@ -65,7 +65,7 @@ async fn listening_stats(
              FROM listen_history",
             &[],
         )
-        .map_err(|e| AppError::internal(e))?
+        .map_err(AppError::internal)?
         .unwrap_or_default();
 
     let total_listens = totals_row.first().and_then(|v| v.as_i64()).unwrap_or(0);
@@ -139,7 +139,7 @@ async fn heatmap(State(state): State<AppState>) -> Result<Json<Value>, AppError>
          ORDER BY dow, hour"
     );
 
-    let rows = b.query_many(&sql, &[]).map_err(|e| AppError::internal(e))?;
+    let rows = b.query_many(&sql, &[]).map_err(AppError::internal)?;
 
     let items: Vec<Value> = rows
         .iter()
@@ -200,7 +200,7 @@ async fn history_daily(
          ORDER BY day"
     );
 
-    let rows = b.query_many(&sql, &[]).map_err(|e| AppError::internal(e))?;
+    let rows = b.query_many(&sql, &[]).map_err(AppError::internal)?;
 
     let items: Vec<Value> = rows
         .iter()
@@ -252,7 +252,7 @@ async fn wrapped(
              FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
             &[&year_start as &dyn ToSqlValue, &year_end],
         )
-        .map_err(|e| AppError::internal(e))?
+        .map_err(AppError::internal)?
         .unwrap_or_default();
 
     let total_listens = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
@@ -384,7 +384,7 @@ fn query_top_artists(
              GROUP BY artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     Ok(rows
         .iter()
@@ -408,7 +408,7 @@ fn query_top_albums(
              GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     Ok(rows
         .iter()
@@ -432,7 +432,7 @@ fn query_top_tracks(
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     Ok(rows
         .iter()
@@ -460,7 +460,7 @@ fn query_top_genres(
              GROUP BY t.genre ORDER BY plays DESC LIMIT ?",
             &[&limit as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     let mut genre_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for cols in &rows {
@@ -472,7 +472,7 @@ fn query_top_genres(
     }
 
     let mut sorted: Vec<(String, i64)> = genre_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
     sorted.truncate(limit as usize);
 
     Ok(sorted

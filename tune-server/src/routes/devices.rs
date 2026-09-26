@@ -279,6 +279,12 @@ fn mark_hidden_zones(items: &mut [Value], zone_repo: &ZoneRepo) {
         if let Some(obj) = item.as_object_mut() {
             obj.insert("zone_hidden".into(), json!(hidden_device_id.is_some()));
             if let Some(device_id) = hidden_device_id {
+                // #5077 — POURQUOI la zone est masquée, quand on le sait
+                // (`suppression_utilisateur`, `appareil_ignore`…). Absent :
+                // masquage d'avant la migration 112, motif inconnu.
+                if let Some(motif) = zone_repo.motif_masquage_par_appareil(&device_id) {
+                    obj.insert("hidden_zone_reason".into(), json!(motif));
+                }
                 obj.insert("hidden_zone_device_id".into(), json!(device_id));
             }
         }
@@ -1886,7 +1892,9 @@ async fn ignore_device(
     }
     forget_manual_device(&state, &device_id);
 
-    // La zone de l'appareil, s'il en a une : masquée, comme une suppression.
+    // La zone de l'appareil, s'il en a une : masquée, au motif `appareil_ignore`
+    // (#5077) — le seul que la réparation sûre sait défaire, quand l'appareil
+    // n'est plus ignoré. Une zone déjà masquée (supprimée) garde SON motif.
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let mut zones_masquees = Vec::new();
     let mut protocole = snapshot.device_type.clone();
@@ -1895,7 +1903,9 @@ async fn ignore_device(
             protocole = zone.output_type.clone().unwrap_or_default();
         }
         if let Some(zid) = zone.id
-            && zone_repo.delete(zid).is_ok()
+            && zone_repo
+                .masquer(zid, tune_core::db::zone_repo::MotifMasquage::AppareilIgnore)
+                .is_ok()
         {
             zones_masquees.push(zid);
         }
@@ -1917,7 +1927,10 @@ async fn ignore_device(
         {
             continue;
         }
-        if zone_repo.delete(zid).is_ok() {
+        if zone_repo
+            .masquer(zid, tune_core::db::zone_repo::MotifMasquage::AppareilIgnore)
+            .is_ok()
+        {
             zones_masquees.push(zid);
         }
     }
@@ -1926,7 +1939,9 @@ async fn ignore_device(
         if let Ok(Some(zone)) = zone_repo.get_by_device_id(jumelle)
             && let Some(zid) = zone.id
             && !zones_masquees.contains(&zid)
-            && zone_repo.delete(zid).is_ok()
+            && zone_repo
+                .masquer(zid, tune_core::db::zone_repo::MotifMasquage::AppareilIgnore)
+                .is_ok()
         {
             zones_masquees.push(zid);
         }
@@ -1965,13 +1980,31 @@ async fn unignore_device(
     match repo.unignore(&device_id) {
         Ok(liberes) => {
             info!(device_id = %device_id, released = liberes.len(), "device_unignored");
+            // #5077 — les zones que la cascade d'« Ignorer » avait masquées
+            // (motif `appareil_ignore`) reviennent si plus AUCUN ignoré ne
+            // les vise. Jamais une zone supprimée par l'utilisateur, jamais
+            // un masquage de motif inconnu. Un échec n'annule pas le déblocage.
+            let reparees = match tune_core::db::zone_motif_masquage::reparer_les_masquages_surs(
+                state.backend.clone(),
+            ) {
+                Ok(rapport) => rapport.demasquees,
+                Err(e) => {
+                    warn!(device_id = %device_id, error = %e, "zones_masquees_reparation_sautee");
+                    Vec::new()
+                }
+            };
+            for zone_id in &reparees {
+                state
+                    .event_bus
+                    .emit("zone.updated", json!({ "zone_id": zone_id }));
+            }
             // L'appareil ne revient qu'au prochain passage de découverte —
             // l'événement fait recharger Réglages > Réseau, où il réapparaîtra.
             state.event_bus.emit_typed(
                 tune_core::event_types::EventType::DeviceDiscovered,
                 json!({ "device_id": device_id, "reason": "unignored" }),
             );
-            Json(json!({ "released": liberes })).into_response()
+            Json(json!({ "released": liberes, "unhidden_zone_ids": reparees })).into_response()
         }
         Err(e) => {
             warn!(device_id = %device_id, error = %e, "device_unignore_failed");
@@ -2834,6 +2867,46 @@ mod list_devices_dedup_tests {
                 .and_then(Value::as_str),
             Some(hidden_id),
             "la restauration doit viser l'identité masquée, même secondaire"
+        );
+        // #5077 — le motif du masquage est exposé.
+        assert_eq!(
+            items[0].get("hidden_zone_reason").and_then(Value::as_str),
+            Some("suppression_utilisateur")
+        );
+    }
+
+    /// #5077 — un masquage d'avant la migration 112 (motif NUL) n'expose
+    /// AUCUN motif : on ne devine rien.
+    #[test]
+    fn un_masquage_de_motif_inconnu_n_expose_aucun_motif_5077() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let hidden_id = "airplay-00:06:78:7C:2E:26";
+        let zone_id = repo
+            .create("Marantz ND8006", Some("airplay"), Some(hidden_id))
+            .unwrap();
+        // L'ancienne forme du masquage : le bit seul.
+        backend
+            .execute(
+                "UPDATE zones SET is_hidden = 1 WHERE id = ?",
+                &[&zone_id as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap();
+        let mut items = build_device_list(
+            marantz_deux_identites(),
+            &std::collections::HashSet::new(),
+            &[],
+        );
+        mark_hidden_zones(&mut items, &repo);
+        assert_eq!(
+            items[0].get("zone_hidden").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            items[0].get("hidden_zone_reason").is_none(),
+            "un motif inconnu ne doit pas être inventé"
         );
     }
 

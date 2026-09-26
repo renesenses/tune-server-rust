@@ -1011,12 +1011,11 @@ fn parse_linn_playlist(xml: &str) -> Vec<LinnTrack> {
                 }
             }
             Ok(Event::End(ref e)) => {
-                if String::from_utf8_lossy(e.local_name().as_ref()) == "item" {
-                    if let Some(t) = cur.take() {
-                        if !t.title.is_empty() || !t.res.is_empty() {
-                            tracks.push(t);
-                        }
-                    }
+                if String::from_utf8_lossy(e.local_name().as_ref()) == "item"
+                    && let Some(t) = cur.take()
+                    && (!t.title.is_empty() || !t.res.is_empty())
+                {
+                    tracks.push(t);
                 }
                 tag.clear();
             }
@@ -1054,12 +1053,13 @@ fn linn_res_filename_stem(res: &str) -> String {
     let mut decoded = String::with_capacity(last.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'*' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&last[i + 1..i + 3], 16) {
-                decoded.push(b as char);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'*'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&last[i + 1..i + 3], 16)
+        {
+            decoded.push(b as char);
+            i += 3;
+            continue;
         }
         decoded.push(bytes[i] as char);
         i += 1;
@@ -1140,10 +1140,10 @@ async fn import_linn_file(
         // 2) Fallback: match by the resource filename stem.
         if found.is_none() && !lt.res.is_empty() {
             let stem = linn_res_filename_stem(&lt.res);
-            if !stem.is_empty() {
-                if let Ok(results) = track_repo.search(&stem, 1) {
-                    found = results.first().and_then(|t| t.id);
-                }
+            if !stem.is_empty()
+                && let Ok(results) = track_repo.search(&stem, 1)
+            {
+                found = results.first().and_then(|t| t.id);
             }
         }
 

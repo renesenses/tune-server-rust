@@ -41,10 +41,7 @@ async fn renderer_qui_annonce(sink: &'static str) -> (String, tokio::task::JoinH
                 // du client.
                 let mut brut = Vec::new();
                 let mut tampon = [0u8; 4096];
-                loop {
-                    let Ok(n) = sock.read(&mut tampon).await else {
-                        break;
-                    };
+                while let Ok(n) = sock.read(&mut tampon).await {
                     if n == 0 {
                         break;
                     }

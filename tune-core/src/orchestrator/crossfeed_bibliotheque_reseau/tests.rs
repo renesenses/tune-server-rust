@@ -203,6 +203,14 @@ struct Servi {
     progressif: bool,
     diaphonie_db: f64,
     premier_octet: Duration,
+    /// #5114 — ce que le flux ANNONCE porter (`StreamInfo::crossfeed`, lu par
+    /// `stream_output_wire`, l'accesseur du chemin du signal). Confronté à la
+    /// diaphonie MESURÉE dans les octets servis.
+    annonce_crossfeed: bool,
+    /// #5146 — la compensation que le flux ANNONCE cuire
+    /// (`StreamInfo::compensation_db`) : c'est elle, et non plus un miroir
+    /// des réglages, que le chemin du signal affiche.
+    annonce_compensation: Option<f64>,
 }
 
 async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
@@ -225,6 +233,13 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
         .get(&sid)
         .cloned()
         .expect("session inscrite");
+    let fil = m
+        .orch
+        .streamer
+        .stream_output_wire(&sid)
+        .await
+        .expect("fil publié");
+    let (annonce_crossfeed, annonce_compensation) = (fil.crossfeed, fil.compensation_db);
     let fichier = session.file_path.lock().await.clone();
     if let Some(chemin) = fichier {
         let premier_octet = t0.elapsed();
@@ -235,6 +250,8 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
             progressif: false,
             diaphonie_db: diaphonie_fichier(&chemin),
             premier_octet,
+            annonce_crossfeed,
+            annonce_compensation,
         };
     }
     // Session progressive : on tire le canal comme le ferait le renderer.
@@ -258,17 +275,22 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
         progressif: true,
         diaphonie_db: diaphonie_fichier(&wav.to_string_lossy()),
         premier_octet: premier_octet.expect("aucun octet servi"),
+        annonce_crossfeed,
+        annonce_compensation,
     }
 }
 
 fn journal(cas: &str, s: &Servi) {
     println!(
-        "#2742 {cas} : mime={} tel_quel={} progressif={} diaphonie={:.1} dB premier_octet={} ms",
+        "#2742 {cas} : mime={} tel_quel={} progressif={} diaphonie={:.1} dB premier_octet={} ms \
+         annonce_crossfeed={} annonce_compensation={:?}",
         s.mime,
         s.tel_quel,
         s.progressif,
         s.diaphonie_db,
-        s.premier_octet.as_millis()
+        s.premier_octet.as_millis(),
+        s.annonce_crossfeed,
+        s.annonce_compensation
     );
 }
 
@@ -286,6 +308,11 @@ fn porte_le_crossfeed_une_fois(cas: &str, s: &Servi) {
          donne un silence à droite",
         s.diaphonie_db
     );
+    // #5114 — et le flux le DIT : c'est ce que le chemin du signal affiche.
+    assert!(
+        s.annonce_crossfeed,
+        "{cas} : les octets portent le crossfeed, le flux doit l'annoncer"
+    );
 }
 
 fn ne_porte_aucun_crossfeed(cas: &str, s: &Servi) {
@@ -293,6 +320,10 @@ fn ne_porte_aucun_crossfeed(cas: &str, s: &Servi) {
         s.diaphonie_db < -60.0,
         "{cas} : aucune diaphonie attendue, mesuré {:.1} dB",
         s.diaphonie_db
+    );
+    assert!(
+        !s.annonce_crossfeed,
+        "{cas} : aucun crossfeed dans les octets, le flux ne doit pas en annoncer"
     );
 }
 
@@ -308,6 +339,10 @@ async fn cas_1_le_reencodage_existant_porte_le_crossfeed_2742() {
     assert_eq!(s.mime, "audio/flac", "le format servi ne change pas");
     assert!(!s.progressif, "le chemin reste le fichier, comme avant");
     porte_le_crossfeed_une_fois("cas 1", &s);
+    assert!(
+        s.annonce_compensation.is_some(),
+        "cas 1 : le fichier ré-encodé cuit la compensation, il doit l'annoncer"
+    );
 }
 
 /// Cas 2 — crossfeed SEUL, renderer qui ANNONCE le LPCM : WAV progressif, le
@@ -325,6 +360,10 @@ async fn cas_2_crossfeed_seul_part_en_wav_progressif_si_le_renderer_lit_le_lpcm_
         "session progressive, jamais le fichier entier"
     );
     porte_le_crossfeed_une_fois("cas 2", &s);
+    assert!(
+        s.annonce_compensation.is_some(),
+        "cas 2 : le relais progressif cuit la compensation, il doit l'annoncer"
+    );
 }
 
 /// Cas 3 — crossfeed SEUL, renderer SANS LPCM : rien ne change. La piste part
@@ -338,6 +377,14 @@ async fn cas_3_crossfeed_seul_sans_lpcm_la_piste_part_telle_quelle_2742() {
     assert_eq!(s.mime, "audio/flac", "format servi inchangé");
     assert!(s.tel_quel, "les octets de la source, sans ré-encodage");
     ne_porte_aucun_crossfeed("cas 3", &s);
+    // #5146 — la compensation est armée (défaut) et le crossfeed coché, mais
+    // la piste part telle quelle : aucun étage n'est traversé, et le flux ne
+    // doit en annoncer aucun. Le miroir des réglages en comptait une, que le
+    // chemin du signal affichait sur ces octets intacts.
+    assert_eq!(
+        s.annonce_compensation, None,
+        "cas 3 : octets intacts, aucune compensation ne doit être annoncée"
+    );
     let statut = crate::audio::crossfeed::crossfeed_status(true, false, true, false, false, false);
     assert_eq!(
         statut.reason,
@@ -411,9 +458,65 @@ async fn le_chemin_des_services_garde_une_seule_passe_2742() {
         progressif: false,
         diaphonie_db: diaphonie_pcm(&pcm, 16),
         premier_octet: Duration::ZERO,
+        // Le fait que les bras des services posent sur leur session.
+        annonce_crossfeed: chaine.is_active() && chaine.crossfeed_executable(),
+        annonce_compensation: chaine.compensation_cuite_db(),
     };
     journal("services", &s);
     porte_le_crossfeed_une_fois("services", &s);
+}
+
+/// #5114 — licence ÉCHUE : l'orchestrateur ne charge plus le crossfeed, le
+/// flux n'en porte donc pas (mesuré), ne l'annonce pas, et la compensation
+/// qu'il ANNONCE (#5146) est exactement celle de l'égaliseur seul — au lieu
+/// de compter aussi le gain moyen d'un crossfeed absent.
+#[tokio::test]
+async fn licence_echue_ni_crossfeed_servi_ni_compense_5114() {
+    let mut m = monter(Renderer::AnnonceLeLpcm, None).await;
+    armer_l_egaliseur(&m);
+    let premium = jouer(&m, None).await;
+    journal("licence valide", &premium);
+    let premium_db = premium
+        .annonce_compensation
+        .expect("égaliseur et crossfeed : compensés");
+    m.orch.license = Some(Arc::new(crate::license::LicenseManager::new(
+        m.orch.db.clone(),
+    )));
+    assert!(
+        !m.orch.license.as_ref().unwrap().premium_snapshot(),
+        "le témoin exige une licence échue"
+    );
+    assert!(m.orch.crossfeed_configure(m.zone_id).is_none());
+    let echue = jouer(&m, None).await;
+    journal("licence échue", &echue);
+    ne_porte_aucun_crossfeed("licence échue", &echue);
+    let echue_db = echue
+        .annonce_compensation
+        .expect("l'égaliseur, gratuit, reste compensé");
+    // L'étalon : la même zone sans crossfeed du tout.
+    SettingsRepo::with_backend(m.orch.db.clone())
+        .set(
+            &format!("zone_{}_crossfeed", m.zone_id),
+            r#"{"enabled":false}"#,
+        )
+        .unwrap();
+    let egaliseur_seul_db = jouer(&m, None)
+        .await
+        .annonce_compensation
+        .expect("égaliseur seul : compensé");
+    println!(
+        "#5114 compensation annoncée : premium {premium_db:.2} dB, licence échue {echue_db:.2} dB, \
+         égaliseur seul {egaliseur_seul_db:.2} dB"
+    );
+    assert!(
+        (echue_db - egaliseur_seul_db).abs() < 1e-9,
+        "licence échue : le flux doit annoncer la compensation de l'égaliseur seul \
+         ({egaliseur_seul_db:.2} dB), il annonce {echue_db:.2} dB"
+    );
+    assert!(
+        premium_db - echue_db > 0.05,
+        "le témoin exige un crossfeed qui déplace la cible : {premium_db:.2} / {echue_db:.2} dB"
+    );
 }
 
 /// Les deux règles pures du module, table complète.

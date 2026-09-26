@@ -3,9 +3,23 @@ use std::sync::Arc;
 use super::absorption::{self, table_absente};
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
-use super::models::Album;
+use super::models::{Album, SourcePochette};
 use super::sqlite::SqliteDb;
 use crate::TuneError;
+
+/// #5034 — la pochette d'un album et ce que la base sait de sa source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EtatPochette {
+    pub cover_path: Option<String>,
+    /// `None` : inconnue (ligne d'avant la migration 111, ou valeur d'une
+    /// version plus récente).
+    pub source: Option<SourcePochette>,
+    /// Le fichier d'où la pochette a été tirée : la piste pour une jaquette
+    /// intégrée, l'image pour une pochette de dossier.
+    pub fichier: Option<String>,
+    /// « mtime:taille » de ce fichier au moment de la lecture.
+    pub empreinte: Option<String>,
+}
 
 /// Engine-agnostic SQL builders for album_repo.
 pub mod sql {
@@ -197,6 +211,29 @@ pub mod sql {
         )
     }
 
+    /// Les pistes des albums LOCAUX marqués compilation, avec ce que la base
+    /// garde de leurs artistes — la matière de
+    /// [`super::AlbumRepo::recalculer_les_compilations`].
+    ///
+    /// Colonnes : id d'album, nom de l'artiste de l'album, balise
+    /// `album_artist` BRUTE de la piste, id et nom de l'artiste de la piste.
+    /// Sur un album marqué compilation, `tracks.artist_id` est l'artiste
+    /// PROPRE de chaque piste (le scan ne le rabat sur l'artiste d'album que
+    /// hors compilation) : c'est exactement ce que la règle lit.
+    ///
+    /// Aucun paramètre, aucune syntaxe propre à un moteur : `COALESCE(…, 0)`
+    /// lit le `INTEGER` de SQLite comme le `SMALLINT` de PostgreSQL (PG 028).
+    pub fn compilations_a_recalculer() -> &'static str {
+        "SELECT a.id, ar.name, t.album_artist, t.artist_id, tar.name \
+         FROM albums a \
+         JOIN tracks t ON t.album_id = a.id \
+         LEFT JOIN artists ar ON ar.id = a.artist_id \
+         LEFT JOIN artists tar ON tar.id = t.artist_id \
+         WHERE COALESCE(a.is_compilation, 0) <> 0 \
+           AND COALESCE(a.source, 'local') = 'local' \
+         ORDER BY a.id, t.id"
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album (C4).
     pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -322,11 +359,70 @@ pub mod sql {
         )
     }
 
+    /// Pose une pochette sur un album qui n'en a PAS — l'ancien `COALESCE`,
+    /// écrit en `WHERE cover_path IS NULL` pour que la SOURCE (#5034) ne
+    /// s'écrive qu'avec la pochette qu'elle décrit.
     pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET cover_path = COALESCE(cover_path, {}) WHERE id = {}",
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {} AND cover_path IS NULL",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    /// #5034 — pochette tirée du DISQUE, avec le fichier d'où elle sort et
+    /// son empreinte (« mtime:taille ») : c'est ce qui permet au scan suivant
+    /// de voir, d'un seul `stat`, que ce fichier a changé ou disparu.
+    pub fn poser_pochette_du_disque<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = {}, cover_source_stamp = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5)
+        )
+    }
+
+    /// #5034 — la pochette ET sa source partent ensemble.
+    pub fn retirer_pochette<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = NULL, cover_source = NULL, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn etat_pochette<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT cover_path, cover_source, cover_source_path, cover_source_stamp FROM albums WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// #5034 — les albums LOCAUX dont la pochette sort d'un fichier connu.
+    pub fn pochettes_tirees_du_disque() -> &'static str {
+        "SELECT id, cover_source_path, cover_source_stamp FROM albums \
+         WHERE cover_source IN ('embedded', 'folder') AND cover_source_path IS NOT NULL \
+         AND source = 'local' ORDER BY id"
+    }
+
+    /// #5034 — l'absorption d'un doublon reprend sa pochette quand la cible
+    /// n'en a pas : la SOURCE doit venir avec elle, jamais seule. Joué AVANT
+    /// la reprise générique des champs vides, tant que la cible est vide.
+    pub fn reprendre_la_source_de_pochette<D: SqlDialect>(d: &D) -> String {
+        // Cinq marqueurs distincts : `?` de SQLite est positionnel, un
+        // marqueur répété y compterait deux paramètres.
+        let p: Vec<String> = (1..=5).map(|i| d.placeholder(i)).collect();
+        format!(
+            "UPDATE albums SET \
+               cover_source = (SELECT d.cover_source FROM albums d WHERE d.id = {}), \
+               cover_source_path = (SELECT d.cover_source_path FROM albums d WHERE d.id = {}), \
+               cover_source_stamp = (SELECT d.cover_source_stamp FROM albums d WHERE d.id = {}) \
+             WHERE id = {} AND (cover_path IS NULL OR cover_path = '') \
+               AND EXISTS (SELECT 1 FROM albums d WHERE d.id = {} \
+                           AND d.cover_path IS NOT NULL AND d.cover_path <> '')",
+            p[0], p[1], p[2], p[3], p[4]
         )
     }
 
@@ -340,9 +436,10 @@ pub mod sql {
 
     pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET cover_path = {} WHERE id = {}",
+            "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -814,6 +911,58 @@ pub fn sql_label_repris_des_pistes() -> &'static str {
       GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
 }
 
+/// La remontée GLOBALE du label des pistes, bornée aux seuls albums à combler
+/// (#4836, suite).
+///
+/// Même fragment que [`sql_label_repris_des_pistes`], donc même règle
+/// (comblement seul, vote majoritaire, départage alphabétique) ; le `WHERE`
+/// ne fait que taire les lignes où l'`UPDATE` n'aurait rien changé. Deux
+/// effets : la passe est idempotente jusque dans son bilan (un second passage
+/// touche 0 ligne), et elle ne réécrit pas toute la table `albums` à chaque
+/// démarrage — sur PostgreSQL, un `UPDATE` sans filtre produit une nouvelle
+/// version de CHAQUE ligne, même inchangée.
+///
+/// Elle est rejouée à chaque démarrage (`migrations::run_migrations` et
+/// `run_pg_migrations`) et par la relecture des métadonnées : v0.9.164 ne la
+/// jouait qu'en fin de scan MANUEL, si bien qu'une base mise à jour gardait
+/// 0 album étiqueté (mesuré le 25/09 sur le .18 : 2 641 pistes étiquetées,
+/// 257 albums à combler, 0 album avec un label).
+pub fn sql_combler_les_labels_d_album() -> String {
+    format!(
+        "UPDATE albums SET {} \
+         WHERE (albums.label IS NULL OR albums.label = '') \
+           AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id \
+                       AND t.label IS NOT NULL AND t.label != '')",
+        sql_label_repris_des_pistes()
+    )
+}
+
+/// Le prédicat « ce champ de l'album est tenu par une édition manuelle » (C3),
+/// corrélé sur `albums.id`, pour les passes SQL du scan qui réécrivent un
+/// champ d'album sans passer par le dépôt. SQL commun aux deux moteurs.
+pub fn sql_champ_tenu_a_la_main(champ: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM album_metadata am WHERE am.album_id = albums.id \
+         AND am.key = 'edition_manuelle' AND am.value LIKE '%\"{champ}\"%')"
+    )
+}
+
+/// Bilan de [`AlbumRepo::recalculer_les_compilations`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BilanRecalculCompilations {
+    /// Albums marqués compilation examinés.
+    pub examines: usize,
+    /// Drapeaux baissés.
+    pub baisses: usize,
+    /// Dont albums rendus à leur artiste (sortis de « Various Artists »).
+    pub reattribues: usize,
+    /// Laissés tels quels : drapeau ou artiste tenu à la main (C3).
+    pub manuels: usize,
+    /// Laissés tels quels : sous « Various Artists » sans artiste à rendre.
+    pub indecis: usize,
+    pub erreurs: usize,
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -837,9 +986,11 @@ impl AlbumRepo {
     /// `cible` absorbe `doublon` (BIB-A2, phase 1) : tout ce qui désignait le
     /// doublon désigne désormais la cible, puis la ligne du doublon disparaît.
     ///
-    /// Les quatre « fusions » du dépôt (`merge-duplicates`, `/metadata/albums/
-    /// merge`, post-scan, maintenance) ne migrent que `tracks` : un favori, une
-    /// note, une étiquette ou un dossier posés sur le perdant meurent avec lui.
+    /// Les « fusions » historiques du dépôt ne migraient que `tracks` : un
+    /// favori, une note, une étiquette ou un dossier posés sur le perdant
+    /// mouraient avec lui. `merge-duplicates`, la fin de scan et le nettoyage
+    /// passent désormais par ici, via
+    /// [`crate::db::album_doublons::FusionDesDoublons`] (reste de #5005).
     /// Ici, dans l'ordre : champs vides de la cible repris du doublon (une
     /// pochette n'a pas de raison de disparaître), pistes, historique,
     /// suggestions, notes et métadonnées (à clé unique : le doublon cède quand
@@ -849,8 +1000,10 @@ impl AlbumRepo {
     /// `track_count` et `folder_path` de la cible recalculés.
     ///
     /// L'appelant a établi que les deux albums sont le même disque (même
-    /// dossier, même titre normalisé, pas de paire déclarée distincte) : ce
-    /// n'est pas décidé ici, et jamais automatiquement.
+    /// dossier et même titre normalisé pour la route `absorber` ; même titre,
+    /// même artiste, pas de paire déclarée distincte ni de releases
+    /// MusicBrainz différentes pour `FusionDesDoublons`) : ce n'est pas décidé
+    /// ici.
     pub fn absorber(&self, cible: i64, doublon: i64) -> Result<RapportDAbsorption, TuneError> {
         if cible == doublon {
             return Err(TuneError::from(
@@ -968,6 +1121,18 @@ impl AlbumRepo {
     /// Les champs de la cible restés vides prennent la valeur du doublon —
     /// jamais l'inverse : un champ renseigné sur la cible ne cède pas.
     fn reprendre_les_champs_vides(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
+        // #5034 — la source de la pochette voyage AVEC elle, avant que la
+        // reprise générique ne remplisse `cover_path`.
+        let sql = self.dialect_sql(
+            sql::reprendre_la_source_de_pochette,
+            sql::reprendre_la_source_de_pochette,
+        );
+        let params: [&dyn ToSqlValue; 5] = [&doublon, &doublon, &doublon, &cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => {}
+            Err(e) if table_absente(&e) => {}
+            Err(e) => return Err(TuneError::from(e)),
+        }
         const CHAMPS: [&str; 8] = [
             "cover_path",
             "year",
@@ -1437,6 +1602,16 @@ impl AlbumRepo {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
         }
 
+        // #4907 — le MÊME dossier recopié sous une autre racine de musique
+        // (NAS, disque local, sauvegarde) est la même parution, pas une
+        // édition de plus : sans ce rattrapage, chaque copie d'une racine à
+        // l'autre dédoublait l'album dans toutes les vues.
+        if self.find_id_by_folder(folder)?.is_none() {
+            if let Some(album) = self.album_du_dossier_miroir(folder, title)? {
+                return Ok(album);
+            }
+        }
+
         // Le disque a-t-il déjà une entrée, posée par un dossier frère ? Le
         // rangement Qobuz d'une compilation met chaque piste dans le dossier
         // de SON artiste ; sans ce rattrapage, une anthologie de 41 titres
@@ -1535,6 +1710,41 @@ impl AlbumRepo {
                 Ok(candidate)
             }
         }
+    }
+
+    /// L'album déjà rangé sous le dossier MIROIR de `folder` — le même chemin
+    /// relatif sous une autre racine de musique
+    /// ([`crate::library::exemplaires::dossiers_miroirs`]) — quand il porte le
+    /// même titre (#4907). Le titre est exigé en plus du chemin : un dossier
+    /// homonyme qui contiendrait une autre parution reste un autre album.
+    fn album_du_dossier_miroir(
+        &self,
+        folder: &str,
+        title: &str,
+    ) -> Result<Option<Album>, TuneError> {
+        let racines = crate::library::exemplaires::dossiers_de_musique(&*self.db);
+        let titre = title.trim().to_lowercase();
+        for miroir in crate::library::exemplaires::dossiers_miroirs(folder, &racines) {
+            let Some(id) = self.find_id_by_folder(&miroir)? else {
+                continue;
+            };
+            let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            let Some(row) = self.db.query_one_strong(&sql, &params)? else {
+                continue;
+            };
+            let album = row_to_album(&row);
+            if album.title.trim().to_lowercase() == titre {
+                tracing::info!(
+                    album_id = id,
+                    dossier = folder,
+                    miroir = %miroir,
+                    "album_miroir_rattache — même dossier sous une autre racine : même album"
+                );
+                return Ok(Some(album));
+            }
+        }
+        Ok(None)
     }
 
     /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».
@@ -1942,6 +2152,153 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Recalcule, SANS relire un seul fichier, le drapeau « compilation » des
+    /// albums déjà marqués, selon LA règle du 25/09/2026
+    /// ([`crate::library::regle_compilation`]).
+    ///
+    /// # Pourquoi
+    ///
+    /// Le scan ne fait que LEVER le drapeau (`mark_compilation`) : un album
+    /// d'un seul artiste marqué sous l'ancienne règle — « Here & Gone », dont
+    /// les fichiers portent `COMPILATION=1` — le resterait jusqu'au « Scan
+    /// complet », qui efface aussi tout ce que l'utilisateur a corrigé. La
+    /// base a déjà ce que la règle lit : la balise `album_artist` de chaque
+    /// piste et l'artiste propre de chaque piste.
+    ///
+    /// # Ce qu'elle fait — et ce qu'elle ne fait pas
+    ///
+    /// - elle ne fait que BAISSER : un album que la règle juge encore
+    ///   compilation n'est pas touché, et un album non marqué n'est pas lu.
+    ///   La balise `COMPILATION=0`, que la base ne garde pas, ne peut que
+    ///   baisser elle aussi : l'ignorer ici ne fait jamais monter à tort ;
+    /// - un album dont le drapeau OU l'artiste est tenu par une édition
+    ///   manuelle (C3, `album_metadata.edition_manuelle`) est laissé tel quel ;
+    /// - un album rangé sous « Various Artists » par l'ancienne règle est
+    ///   rendu à son artiste — celui de toutes ses pistes, ou son unique
+    ///   artiste d'album balisé — pour revenir dans SA discographie
+    ///   (`list_by_artist` ne lit que `albums.artist_id`). Sans artiste à
+    ///   lui rendre, il n'est pas touché (`indecis`) ;
+    /// - idempotente : une seconde passe ne trouve plus rien à faire. Elle est
+    ///   donc jouée à chaque démarrage et après chaque scan, sans marqueur.
+    pub fn recalculer_les_compilations(&self) -> Result<BilanRecalculCompilations, TuneError> {
+        use crate::library::regle_compilation::{IndicesCompilation, est_artistes_divers};
+
+        struct Ligne {
+            id: i64,
+            artiste: Option<String>,
+            indices: IndicesCompilation,
+            artistes_de_piste: std::collections::BTreeSet<(i64, String)>,
+            pistes_sans_artiste: bool,
+            balises_d_album: std::collections::BTreeMap<String, String>,
+        }
+
+        let rows = self
+            .db
+            .query_many_strong(sql::compilations_a_recalculer(), &[])?;
+        let mut albums: Vec<Ligne> = Vec::new();
+        for r in &rows {
+            let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if albums.last().is_none_or(|a| a.id != id) {
+                albums.push(Ligne {
+                    id,
+                    artiste: r.get(1).and_then(|v| v.as_string()),
+                    indices: IndicesCompilation::new(),
+                    artistes_de_piste: Default::default(),
+                    pistes_sans_artiste: false,
+                    balises_d_album: Default::default(),
+                });
+            }
+            let Some(a) = albums.last_mut() else { continue };
+            let balise = r.get(2).and_then(|v| v.as_string());
+            let artiste = r.get(4).and_then(|v| v.as_string());
+            a.indices
+                .ajouter_piste(balise.as_deref(), artiste.as_deref());
+            match (r.get(3).and_then(|v| v.as_i64()), artiste) {
+                (Some(aid), Some(nom)) => {
+                    a.artistes_de_piste.insert((aid, nom));
+                }
+                _ => a.pistes_sans_artiste = true,
+            }
+            if let Some(b) = balise
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+            {
+                a.balises_d_album.entry(b.to_lowercase()).or_insert(b);
+            }
+        }
+
+        let meta = crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(self.db.clone());
+        let artistes = crate::db::artist_repo::ArtistRepo::with_backend(self.db.clone());
+        let mut bilan = BilanRecalculCompilations {
+            examines: albums.len(),
+            ..Default::default()
+        };
+        for a in &albums {
+            let jugement = a.indices.juger();
+            if jugement.compilation {
+                continue;
+            }
+            // C3 — la main de l'utilisateur, dans les deux sens.
+            let tenus = meta.champs_edites_a_la_main(a.id).unwrap_or_default();
+            if tenus.iter().any(|c| c == "is_compilation" || c == "artist") {
+                bilan.manuels += 1;
+                continue;
+            }
+            // L'album est-il rangé sous la CONVENTION ? Il faut alors lui
+            // rendre son artiste, sans quoi il resterait hors de sa
+            // discographie.
+            let sous_la_convention = a.artiste.as_deref().is_none_or(est_artistes_divers);
+            let nouvel_artiste = if !sous_la_convention {
+                None
+            } else if let (false, [(aid, nom)]) = (
+                a.pistes_sans_artiste,
+                a.artistes_de_piste.iter().collect::<Vec<_>>().as_slice(),
+            ) && !est_artistes_divers(nom)
+            {
+                Some(*aid)
+            } else if let [(_, nom)] = a.balises_d_album.iter().collect::<Vec<_>>().as_slice()
+                && !est_artistes_divers(nom)
+            {
+                artistes
+                    .get_or_create(nom, None, None)
+                    .ok()
+                    .and_then(|x| x.id)
+            } else {
+                bilan.indecis += 1;
+                continue;
+            };
+            if sous_la_convention && nouvel_artiste.is_none() {
+                bilan.indecis += 1;
+                continue;
+            }
+            match self.reparer_compilation(a.id, false, nouvel_artiste) {
+                Ok(()) => {
+                    bilan.baisses += 1;
+                    if nouvel_artiste.is_some() {
+                        bilan.reattribues += 1;
+                    }
+                    tracing::info!(
+                        album_id = a.id,
+                        motif = jugement.motif.as_str(),
+                        ancien_artiste = ?a.artiste,
+                        nouvel_artiste_id = ?nouvel_artiste,
+                        "compilation_recalculee"
+                    );
+                }
+                Err(e) => {
+                    bilan.erreurs += 1;
+                    tracing::warn!(album_id = a.id, error = %e, "compilation_recalcul_echoue");
+                }
+            }
+        }
+        if bilan.baisses > 0 || bilan.erreurs > 0 {
+            tracing::info!(?bilan, "compilations_recalculees");
+        }
+        Ok(bilan)
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album, triés (C4).
     pub fn disc_numbers_of(&self, album_id: i64) -> Result<Vec<i32>, TuneError> {
         let sql = self.dialect_sql(sql::disc_numbers_of, sql::disc_numbers_of);
@@ -2050,11 +2407,86 @@ impl AlbumRepo {
         Ok(())
     }
 
-    pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), TuneError> {
+    /// Pose une pochette sur un album qui n'en a pas encore ; ne remplace
+    /// jamais une valeur en place. `source` dit d'où elle vient (#5034) : c'est
+    /// elle qui décide, plus tard, si un scan peut la retirer.
+    pub fn update_cover_path(
+        &self,
+        album_id: i64,
+        cover_path: &str,
+        source: SourcePochette,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
-        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 3] = [&cover_path, &source, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// #5034 — pochette tirée du disque : jaquette d'une piste ou image du
+    /// dossier, avec le fichier qui l'a donnée et son empreinte.
+    pub fn poser_pochette_du_disque(
+        &self,
+        album_id: i64,
+        cover_path: &str,
+        source: SourcePochette,
+        fichier: &str,
+        empreinte: Option<&str>,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::poser_pochette_du_disque, sql::poser_pochette_du_disque);
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 5] = [&cover_path, &source, &fichier, &empreinte, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// #5034 — retire la pochette d'un album, et sa source avec elle.
+    pub fn retirer_pochette(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::retirer_pochette, sql::retirer_pochette);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// #5034 — la pochette d'un album et ce que la base sait de sa source.
+    ///
+    /// Lue sur la connexion d'ÉCRITURE (`query_one_strong`) : le scan
+    /// l'interroge au milieu du lot qui vient de créer la ligne album, que
+    /// les connexions de lecture ne voient pas encore.
+    pub fn etat_pochette(&self, album_id: i64) -> Result<Option<EtatPochette>, TuneError> {
+        let sql = self.dialect_sql(sql::etat_pochette, sql::etat_pochette);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        Ok(self.db.query_one_strong(&sql, &params)?.map(|cols| {
+            let texte = |i: usize| {
+                cols.get(i)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+            };
+            EtatPochette {
+                cover_path: texte(0),
+                source: texte(1).as_deref().and_then(SourcePochette::depuis_colonne),
+                fichier: texte(2),
+                empreinte: texte(3),
+            }
+        }))
+    }
+
+    /// #5034 — `(album, fichier source, empreinte)` de chaque album local dont
+    /// la pochette sort d'un fichier du disque.
+    pub fn pochettes_tirees_du_disque(
+        &self,
+    ) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
+        let rows = self.db.query_many(sql::pochettes_tirees_du_disque(), &[])?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first().and_then(|v| v.as_i64())?,
+                    cols.get(1).and_then(|v| v.as_string())?,
+                    cols.get(2).and_then(|v| v.as_string()),
+                ))
+            })
+            .collect())
     }
 
     /// Like `update_cover_path` but always overwrites the existing value.
@@ -2084,13 +2516,18 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Écrase la pochette en place. `source` dit d'où vient la nouvelle
+    /// (#5034) ; le fichier d'origine est oublié — ce n'est pas une pochette
+    /// du disque, ou son fichier n'est pas suivi.
     pub fn force_update_cover_path(
         &self,
         album_id: i64,
         cover_path: &str,
+        source: SourcePochette,
     ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_cover_path, sql::force_update_cover_path);
-        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        let source = source.as_str();
+        let params: [&dyn ToSqlValue; 3] = [&cover_path, &source, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -2115,6 +2552,13 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Comble le label de TOUS les albums qui n'en ont pas, depuis leurs
+    /// pistes — voir [`sql_combler_les_labels_d_album`]. Rend le nombre
+    /// d'albums comblés.
+    pub fn combler_les_labels_depuis_les_pistes(&self) -> Result<usize, TuneError> {
+        Ok(self.db.execute(&sql_combler_les_labels_d_album(), &[])?)
     }
 
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
@@ -3814,6 +4258,177 @@ mod tests {
         db
     }
 
+    /// LA règle du 25/09/2026, rejouée sur une base EXISTANTE sans relire un
+    /// fichier (`recalculer_les_compilations`) — les cas mesurés sur le .18.
+    ///
+    /// - « Here & Gone » : un seul artiste, drapeau levé (balise
+    ///   `COMPILATION=1`), artiste d'album David Sanborn ⇒ baissé, reste dans
+    ///   SA discographie et quitte la section « Compilations » de sa page ;
+    /// - « A Love Supreme, Disc 1 » rangé sous « Various Artists » par
+    ///   l'ancienne règle ⇒ baissé ET rendu à John Coltrane, dont il rejoint
+    ///   la discographie, comme son Disc 2 ;
+    /// - « Jazz in Paris » (artiste d'album Various Artists) et une
+    ///   compilation faite main (artistes variés) ⇒ intouchées ;
+    /// - un drapeau tenu à la main (C3) ⇒ intouché ;
+    /// - seconde passe ⇒ plus rien à faire.
+    #[test]
+    fn le_recalcul_baisse_le_drapeau_des_albums_d_un_seul_artiste() {
+        use crate::db::album_metadata_repo::AlbumMetadataRepo;
+
+        let db = test_db();
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS album_metadata (
+                     album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY (album_id, key)
+                 );",
+            )
+            .unwrap();
+        let artistes = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+        let nouvel = |nom: &str| artistes.create(&Artist::new(nom.into())).unwrap();
+        let va = nouvel("Various Artists");
+        let sanborn = nouvel("David Sanborn");
+        let coltrane = nouvel("John Coltrane");
+        let django = nouvel("Django Reinhardt");
+        let grappelli = nouvel("Stéphane Grappelli");
+        let ellington = nouvel("Duke Ellington");
+        let album = |titre: &str, artiste: i64, drapeau: bool| {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(artiste);
+            a.is_compilation = drapeau;
+            repo.create(&a).unwrap()
+        };
+
+        let here_and_gone = album("Here & Gone", sanborn, true);
+        seed_track_with_album_artist(
+            &db,
+            here_and_gone,
+            sanborn,
+            1,
+            "/m/hg/01.flac",
+            Some("David Sanborn"),
+        );
+        seed_track_with_album_artist(
+            &db,
+            here_and_gone,
+            sanborn,
+            2,
+            "/m/hg/02.flac",
+            Some("David Sanborn"),
+        );
+
+        let disc1 = album("A Love Supreme, Disc 1", va, true);
+        seed_track(&db, disc1, coltrane, 1, "/m/als1/01.flac");
+        seed_track(&db, disc1, coltrane, 2, "/m/als1/02.flac");
+        let disc2 = album("A Love Supreme, Disc 2", coltrane, false);
+        seed_track(&db, disc2, coltrane, 1, "/m/als2/01.flac");
+
+        let jazz_in_paris = album("Jazz in Paris", va, true);
+        seed_track_with_album_artist(
+            &db,
+            jazz_in_paris,
+            django,
+            1,
+            "/m/jip/01.flac",
+            Some("Various Artists"),
+        );
+        seed_track_with_album_artist(
+            &db,
+            jazz_in_paris,
+            django,
+            2,
+            "/m/jip/02.flac",
+            Some("Various Artists"),
+        );
+
+        let faite_main = album("Swing", va, true);
+        seed_track(&db, faite_main, django, 1, "/m/swing/01.flac");
+        seed_track(&db, faite_main, grappelli, 2, "/m/swing/02.flac");
+
+        let tenu = album("Tenu à la main", ellington, true);
+        seed_track(&db, tenu, ellington, 1, "/m/tenu/01.flac");
+        AlbumMetadataRepo::new(db.clone())
+            .marquer_edition_manuelle(tenu, &["is_compilation"])
+            .unwrap();
+
+        // Avant : « Here & Gone » figure dans la section Compilations de la
+        // page de David Sanborn ? Non — il est DANS sa discographie (son
+        // artist_id), et le filtre « Compilations » le montre.
+        let drapeau = |id: i64| repo.get(id).unwrap().unwrap().is_compilation;
+        let artiste = |id: i64| repo.get(id).unwrap().unwrap().artist_id;
+        let titres = |v: Vec<Album>| v.into_iter().map(|a| a.title).collect::<Vec<_>>();
+        assert!(
+            titres(repo.list_compilations_with_artist_track(coltrane).unwrap())
+                .contains(&"A Love Supreme, Disc 1".to_string())
+        );
+
+        let bilan = repo.recalculer_les_compilations().unwrap();
+        assert_eq!(
+            (
+                bilan.examines,
+                bilan.baisses,
+                bilan.reattribues,
+                bilan.manuels,
+                bilan.indecis,
+                bilan.erreurs
+            ),
+            (5, 2, 1, 1, 0, 0),
+            "{bilan:?}"
+        );
+
+        assert!(
+            !drapeau(here_and_gone),
+            "Here & Gone : la balise seule ne suffit plus"
+        );
+        assert_eq!(artiste(here_and_gone), Some(sanborn));
+        assert!(!drapeau(disc1));
+        assert_eq!(
+            artiste(disc1),
+            Some(coltrane),
+            "le Disc 1 est rendu à John Coltrane"
+        );
+        assert!(
+            drapeau(jazz_in_paris),
+            "(a) artiste d'album Various Artists"
+        );
+        assert!(drapeau(faite_main), "(b) deux artistes principaux");
+        assert!(
+            drapeau(tenu),
+            "C3 : un drapeau tenu à la main n'est pas touché"
+        );
+
+        // Effet sur la page artiste (#4767) : les deux disques d'A Love
+        // Supreme sont dans la discographie de John Coltrane, et plus dans
+        // sa section « Compilations ».
+        let disco = titres(repo.list_by_artist(coltrane).unwrap());
+        assert!(
+            disco.contains(&"A Love Supreme, Disc 1".to_string()),
+            "{disco:?}"
+        );
+        assert!(
+            disco.contains(&"A Love Supreme, Disc 2".to_string()),
+            "{disco:?}"
+        );
+        assert!(titres(repo.list_compilations_with_artist_track(coltrane).unwrap()).is_empty());
+        assert!(titres(repo.list_by_artist(sanborn).unwrap()).contains(&"Here & Gone".to_string()));
+        // Django reste dans la section Compilations (Jazz in Paris, Swing).
+        assert_eq!(
+            repo.list_compilations_with_artist_track(django)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Idempotente.
+        let bilan = repo.recalculer_les_compilations().unwrap();
+        assert_eq!(bilan.baisses, 0, "{bilan:?}");
+    }
+
     /// Phase 5 UPnP : la mention réciproque, et ses deux contre-épreuves
     /// imposées par le chantier — homonymes d'artistes différents, éditions.
     #[test]
@@ -4435,13 +5050,15 @@ mod tests {
         let repo = AlbumRepo::new(db);
 
         let id = repo.create(&Album::new("Test Album".into())).unwrap();
-        repo.update_cover_path(id, "abc123").unwrap();
+        repo.update_cover_path(id, "abc123", SourcePochette::Dossier)
+            .unwrap();
 
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
         // COALESCE: does NOT overwrite existing cover_path
-        repo.update_cover_path(id, "new_hash").unwrap();
+        repo.update_cover_path(id, "new_hash", SourcePochette::Dossier)
+            .unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("abc123"));
     }
@@ -4452,13 +5069,15 @@ mod tests {
         let repo = AlbumRepo::new(db);
 
         let id = repo.create(&Album::new("Test Album".into())).unwrap();
-        repo.update_cover_path(id, "abc123").unwrap();
+        repo.update_cover_path(id, "abc123", SourcePochette::Dossier)
+            .unwrap();
 
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
         // force: DOES overwrite existing cover_path (used by rescan endpoints)
-        repo.force_update_cover_path(id, "new_hash").unwrap();
+        repo.force_update_cover_path(id, "new_hash", SourcePochette::Televersee)
+            .unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("new_hash"));
     }

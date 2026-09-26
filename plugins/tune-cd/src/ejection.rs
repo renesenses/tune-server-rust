@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use crate::fournisseur::SOURCE;
 use crate::hote::HoteLecture;
 use crate::lecteur::{LecteurDisque, Presence};
+use crate::source::PublicationSource;
 
 /// Zones sur lesquelles le greffon a lancé le disque.
 pub type ZonesDuDisque = Arc<Mutex<HashSet<i64>>>;
@@ -25,6 +26,9 @@ pub struct Surveillant {
     pub hote: Arc<dyn HoteLecture>,
     pub zones: ZonesDuDisque,
     derniere: Option<Presence>,
+    /// #5065 — la source `cd` du registre commun, remise à jour à chaque
+    /// changement de présence (insertion, éjection, lecteur débranché).
+    publication: Option<Arc<PublicationSource>>,
 }
 
 impl Surveillant {
@@ -38,7 +42,13 @@ impl Surveillant {
             hote,
             zones,
             derniere: None,
+            publication: None,
         }
+    }
+
+    pub fn avec_publication(mut self, publication: Arc<PublicationSource>) -> Self {
+        self.publication = Some(publication);
+        self
     }
 
     /// Un tour de surveillance. Rend les zones arrêtées.
@@ -48,6 +58,11 @@ impl Surveillant {
             .await
             .unwrap_or(Presence::AucunLecteur);
         let avant = self.derniere.replace(presence);
+        if avant != Some(presence)
+            && let Some(p) = &self.publication
+        {
+            p.publier(presence).await;
+        }
         let mut arretees = Vec::new();
         if avant == Some(Presence::Disque) && presence != Presence::Disque {
             let zones: Vec<i64> = self.zones.lock().await.drain().collect();

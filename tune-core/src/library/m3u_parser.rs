@@ -114,10 +114,10 @@ fn parse_pls(text: &str) -> Vec<M3UEntry> {
             if let Ok(idx) = digits.parse::<u32>() {
                 files.insert(idx, val);
             }
-        } else if let Some(digits) = key.strip_prefix("title") {
-            if let Ok(idx) = digits.parse::<u32>() {
-                titles.insert(idx, val);
-            }
+        } else if let Some(digits) = key.strip_prefix("title")
+            && let Ok(idx) = digits.parse::<u32>()
+        {
+            titles.insert(idx, val);
         }
     }
     files

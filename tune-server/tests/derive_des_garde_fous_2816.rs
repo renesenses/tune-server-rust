@@ -218,9 +218,7 @@ fn resoudre(depuis: &str, cible: &str) -> Option<String> {
         match element {
             "." | "" => {}
             ".." => {
-                if pile.pop().is_none() {
-                    return None;
-                }
+                pile.pop()?;
             }
             autre => pile.push(autre),
         }

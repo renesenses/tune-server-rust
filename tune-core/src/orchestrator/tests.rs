@@ -1235,7 +1235,9 @@ fn le_transcodage_fichier_epargne_la_sortie_locale() {
 /// Niveau efficace d'un PCM stéréo 16 bits, en dBFS.
 fn rms_dbfs_16(pcm: &[u8], depuis: usize) -> f64 {
     let ech: Vec<f64> = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .skip(depuis * 2)
         .map(|o| i16::from_le_bytes([o[0], o[1]]) as f64 / 32768.0)
         .collect();
@@ -1984,8 +1986,10 @@ fn la_chaine_streaming_applique_replaygain_puis_egaliseur() {
     rg.process(&mut pcm, 16);
     assert_ne!(pcm, source);
     for (i, (a, b)) in source
-        .chunks_exact(2)
-        .zip(pcm.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(pcm.as_chunks::<2>().0.iter())
         .enumerate()
         .take(64)
     {
@@ -2859,7 +2863,7 @@ fn ecrire_dsf_carre(path: &std::path::Path, blocs_par_canal: usize) {
     // Disposition DSF : bloc du canal 0, bloc du canal 1, bloc suivant du
     // canal 0… Les deux canaux portent le même carré.
     for indice_bloc in 0..blocs_par_canal * CANAUX {
-        let octet: u8 = if (indice_bloc / CANAUX) % 2 == 0 {
+        let octet: u8 = if (indice_bloc / CANAUX).is_multiple_of(2) {
             0xFF
         } else {
             0x00
@@ -3132,7 +3136,7 @@ fn ecrire_wav_carre(path: &std::path::Path, duree_ms: u64) {
     ));
     let demi_periode = (SR / 86).max(1) as usize;
     for t in 0..trames {
-        let v: i16 = if (t / demi_periode) % 2 == 0 {
+        let v: i16 = if (t / demi_periode).is_multiple_of(2) {
             24_000
         } else {
             -24_000
@@ -8615,6 +8619,49 @@ async fn la_portee_distingue_la_relance_de_la_piste_suivante_4680() {
     );
 }
 
+/// #4680, moitié crossfeed — `crossfeed_applied_live: false` confondait « rien
+/// ne joue » et « la piste suivante » : les écrans annonçaient « prendra effet
+/// à la piste suivante » dans les deux cas. La portée les sépare.
+#[tokio::test]
+async fn la_portee_du_crossfeed_distingue_rien_ne_joue_de_la_piste_suivante_4680() {
+    use crate::orchestrator::PorteeDuReglage;
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407("dlna:uuid-4680-crossfeed").await;
+    // Le flux servi ne porte aucun crossfeed, et aucun n'est demandé : le son
+    // est déjà conforme.
+    assert_eq!(
+        orch.refresh_zone_crossfeed_portee(zone_id).await,
+        PorteeDuReglage::Immediate
+    );
+    // Un crossfeed est coché pendant la lecture : aucune relance n'est
+    // programmée pour lui, il ne s'entendra qu'à la piste suivante.
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    let portee = orch.refresh_zone_crossfeed_portee(zone_id).await;
+    assert_eq!(portee, PorteeDuReglage::PisteSuivante);
+    assert_eq!(portee.code(), "next_track");
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 0);
+    // Une zone où rien ne joue : rien à annoncer, surtout pas « piste
+    // suivante » — c'est le cas que le booléen confondait.
+    let muette = ZoneRepo::with_backend(orch.db.clone())
+        .create("Muette", Some("dlna"), Some("dlna:uuid-4680-muette"))
+        .unwrap();
+    settings
+        .set(
+            &format!("zone_{muette}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    let portee = orch.refresh_zone_crossfeed_portee(muette).await;
+    assert_eq!(portee, PorteeDuReglage::RienNeJoue);
+    assert_eq!(portee.code(), "not_playing", "et surtout pas `next_track`");
+}
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision
@@ -9157,7 +9204,9 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
     chaine.process(&mut pcm, 16);
     let voie = |c: usize| -> f64 {
         let e: f64 = pcm
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|f| {
                 let v = i16::from_le_bytes([f[2 * c], f[2 * c + 1]]) as f64 / 32768.0;
                 v * v

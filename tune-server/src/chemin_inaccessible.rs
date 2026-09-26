@@ -63,10 +63,8 @@ pub fn est_un_chemin_unc(chemin: &str) -> bool {
 /// Ne rend rien quand aucun conseil utile ne s'applique — mieux vaut la seule
 /// erreur système qu'une phrase qui envoie chercher ailleurs.
 pub fn cle_du_conseil(chemin: &str, sous_windows: bool) -> Option<(&'static str, String)> {
-    if sous_windows {
-        if let Some(lettre) = lettre_de_lecteur(chemin) {
-            return Some(("browse.hint.windowsMappedDrive", format!("{lettre}:")));
-        }
+    if sous_windows && let Some(lettre) = lettre_de_lecteur(chemin) {
+        return Some(("browse.hint.windowsMappedDrive", format!("{lettre}:")));
     }
     if est_un_chemin_unc(chemin) {
         return Some(("browse.hint.uncUnreachable", String::new()));

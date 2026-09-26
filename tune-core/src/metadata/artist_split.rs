@@ -179,11 +179,11 @@ fn reattach_name_suffixes(parts: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for p in parts {
         let key = p.trim().to_lowercase();
-        if NAME_SUFFIXES.contains(&key.as_str()) {
-            if let Some(last) = out.last_mut() {
-                *last = format!("{last}, {}", p.trim());
-                continue;
-            }
+        if NAME_SUFFIXES.contains(&key.as_str())
+            && let Some(last) = out.last_mut()
+        {
+            *last = format!("{last}, {}", p.trim());
+            continue;
         }
         out.push(p);
     }
@@ -205,12 +205,12 @@ fn split_ampersand(s: &str) -> (Vec<String>, bool) {
         if p.is_empty() {
             continue;
         }
-        if let Some(last) = out.last_mut() {
-            if starts_with_article(p) {
-                // Re-attach the ensemble to the leader: one performing entity.
-                *last = format!("{last} & {p}");
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && starts_with_article(p)
+        {
+            // Re-attach the ensemble to the leader: one performing entity.
+            *last = format!("{last} & {p}");
+            continue;
         }
         if !out.is_empty() {
             did = true;

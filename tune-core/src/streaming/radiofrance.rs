@@ -169,17 +169,16 @@ impl RadioFranceApi {
     pub async fn list_shows(&self, station: RfStation) -> Result<Vec<RfShow>, String> {
         let code = station.code();
 
-        if let Ok(cache) = self.shows_cache.lock() {
-            if let Some(entry) = cache.get(code) {
-                if entry.fetched_at.elapsed() < CACHE_TTL {
-                    debug!(
-                        station = code,
-                        count = entry.shows.len(),
-                        "radiofrance_shows_cache_hit"
-                    );
-                    return Ok(entry.shows.clone());
-                }
-            }
+        if let Ok(cache) = self.shows_cache.lock()
+            && let Some(entry) = cache.get(code)
+            && entry.fetched_at.elapsed() < CACHE_TTL
+        {
+            debug!(
+                station = code,
+                count = entry.shows.len(),
+                "radiofrance_shows_cache_hit"
+            );
+            return Ok(entry.shows.clone());
         }
 
         let query = r#"

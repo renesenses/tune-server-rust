@@ -7,6 +7,7 @@ pub mod coffrets;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod disques_abimes;
+pub mod empreinte_audio;
 pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
@@ -458,7 +459,7 @@ pub fn genre_key(genre: &str) -> String {
 ///   - `Dsf`  -> `dsd` (DSD over PCM, stored in .dsf container)
 ///   - `Dff`  -> `dsd` (DSD Interchange File Format)
 ///   - `Mp4`  -> `alac` when bit_depth is present (ALAC is lossless, has bit depth)
-///             -> `aac` otherwise (AAC is lossy, no bit depth reported by lofty)
+///     -> `aac` otherwise (AAC is lossy, no bit depth reported by lofty)
 ///   - Other values pass through unchanged (already lowercase).
 pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
     match raw {
@@ -900,7 +901,7 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     let tag_size = syncsafe_to_u32(&data[6..10]) as usize;
 
     // We handle ID3v2.2, v2.3 and v2.4.
-    if major_version < 2 || major_version > 4 {
+    if !(2..=4).contains(&major_version) {
         return None;
     }
 
@@ -1157,13 +1158,15 @@ fn decode_id3v2_string(encoding: u8, data: &[u8]) -> String {
 
 /// Decode a UTF-16 byte slice to a String.
 fn decode_utf16(data: &[u8], little_endian: bool) -> String {
-    let pairs = data.chunks_exact(2);
-    let code_units: Vec<u16> = pairs
+    let code_units: Vec<u16> = data
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             if little_endian {
-                u16::from_le_bytes([chunk[0], chunk[1]])
+                u16::from_le_bytes(*chunk)
             } else {
-                u16::from_be_bytes([chunk[0], chunk[1]])
+                u16::from_be_bytes(*chunk)
             }
         })
         .collect();
@@ -2310,11 +2313,13 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     let mut probed_bit_depth: Option<u16> = None;
     let format = {
         let mut fmt = normalize_format(&ext, props.bit_depth());
-        if fmt == "aac" && (ext == "m4a" || ext == "mp4") && props.bit_depth().is_none() {
-            if let Some((probed, bd)) = probe_m4a_props(path) {
-                fmt = probed;
-                probed_bit_depth = bd;
-            }
+        if fmt == "aac"
+            && (ext == "m4a" || ext == "mp4")
+            && props.bit_depth().is_none()
+            && let Some((probed, bd)) = probe_m4a_props(path)
+        {
+            fmt = probed;
+            probed_bit_depth = bd;
         }
         Some(fmt)
     };
@@ -2935,10 +2940,10 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
         if len < nlen || i + len > data.len() {
             continue;
         }
-        if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len]) {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
+        if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len])
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
         }
     }
     None
@@ -3101,6 +3106,9 @@ impl DrapeauCompilation {
     ///
     /// `Illisible` vaut `false` : une graphie qu'on ne sait pas lire n'est pas
     /// une affirmation.
+    ///
+    /// La production lit le tri-état ; ce booléen ne sert plus qu'aux épreuves.
+    #[cfg(test)]
     pub(crate) fn actif(&self) -> bool {
         matches!(self, DrapeauCompilation::Vrai)
     }
@@ -3416,17 +3424,11 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             .unwrap_or("")
             .to_lowercase();
         if matches!(ext.as_str(), "dsf" | "dff")
-            && tag.title().map_or(true, |t| t.trim().is_empty())
+            && tag.title().is_none_or(|t| t.trim().is_empty())
+            && let Some(meta) = dsf_dff_fallback_complete(path, Some(tag))
+            && meta.title.as_deref().is_some_and(|t| !t.trim().is_empty())
         {
-            if let Some(meta) = dsf_dff_fallback_complete(path, Some(tag)) {
-                if meta
-                    .title
-                    .as_deref()
-                    .map_or(false, |t| !t.trim().is_empty())
-                {
-                    return Ok(meta);
-                }
-            }
+            return Ok(meta);
         }
     }
 
@@ -3474,12 +3476,11 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
+        && let Some(g) = mp3_first_tag_genre_if_dual(path)
     {
-        if let Some(g) = mp3_first_tag_genre_if_dual(path) {
-            // Le premier tag REMPLACE la fusion de lofty : c'est tout ce que
-            // lisent les autres lecteurs, valeurs multiples comprises.
-            raw_genres = vec![g];
-        }
+        // Le premier tag REMPLACE la fusion de lofty : c'est tout ce que
+        // lisent les autres lecteurs, valeurs multiples comprises.
+        raw_genres = vec![g];
     }
     let genres = genres_from_tag_values(&raw_genres);
     let genre = genres
@@ -3515,26 +3516,26 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let mut title = tag.title().map(|s| s.to_string());
     let mut artist = tag.artist().map(|s| s.to_string());
     let mut album = tag.album().map(|s| s.to_string());
-    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+    if title.as_deref().is_none_or(|t| t.trim().is_empty()) {
         // `LeadingProbe` : sonde spéculative, ne rien trouver est le cas
         // normal — elle ne journalise donc aucun rejet. Sans cette
         // distinction, chaque fichier sans titre d'une bibliothèque
         // produirait une ligne de journal par scan.
-        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false) {
-            if let Some(id3) = parse_id3v2_tag(&raw) {
-                let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
-                    if cur.as_deref().map_or(true, |x| x.trim().is_empty()) {
-                        alt.filter(|s| !s.trim().is_empty())
-                            .map(|s| s.to_string())
-                            .or(cur)
-                    } else {
-                        cur
-                    }
-                };
-                title = prefer(title, id3.title());
-                artist = prefer(artist, id3.artist());
-                album = prefer(album, id3.album());
-            }
+        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false)
+            && let Some(id3) = parse_id3v2_tag(&raw)
+        {
+            let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
+                if cur.as_deref().is_none_or(|x| x.trim().is_empty()) {
+                    alt.filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string())
+                        .or(cur)
+                } else {
+                    cur
+                }
+            };
+            title = prefer(title, id3.title());
+            artist = prefer(artist, id3.artist());
+            album = prefer(album, id3.album());
         }
     }
 
@@ -3562,7 +3563,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     // Le dossier parent n'est pas toujours l'album : sous `.../Titre/CD2/`,
     // c'est un disque, et l'album est au-dessus (#1656).
     let (album_du_chemin, _, disque_du_chemin) = album_artiste_du_chemin(path);
-    if album.as_deref().map_or(true, |a| a.trim().is_empty()) {
+    if album.as_deref().is_none_or(|a| a.trim().is_empty()) {
         album = album_du_chemin;
     }
     let track_number = tag.track().or(fname_track);

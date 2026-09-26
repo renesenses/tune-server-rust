@@ -130,7 +130,7 @@ mod postgres {
                     &db,
                     &format!(
                         "SELECT COUNT(*) FROM information_schema.columns \
-                         WHERE table_name = '{table}' AND column_name = 'id'"
+                         WHERE table_schema = current_schema() AND table_name = '{table}' AND column_name = 'id'"
                     )
                 ),
                 0,
@@ -144,7 +144,7 @@ mod postgres {
             entier(
                 &db,
                 "SELECT COUNT(*) FROM information_schema.columns \
-                 WHERE table_name = 'artists' AND column_name = 'id'"
+                 WHERE table_schema = current_schema() AND table_name = 'artists' AND column_name = 'id'"
             ),
             1,
             "témoin de décor : `artists` doit porter une colonne `id`, sinon \

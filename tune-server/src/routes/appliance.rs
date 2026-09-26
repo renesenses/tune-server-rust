@@ -262,22 +262,19 @@ async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
     // Current WiFi SSID + signal (only meaningful when wifi_connected)
     let mut wifi_ssid = Value::Null;
     let mut wifi_signal = Value::Null;
-    if wifi_connected {
-        if let Ok(list) = nmcli(
+    if wifi_connected
+        && let Ok(list) = nmcli(
             &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi"],
             SCAN_TIMEOUT,
             &lang,
         )
         .await
-        {
-            if let Some(active) = parse_wifi_list(&list)
-                .into_iter()
-                .find(|n| n["in_use"] == json!(true))
-            {
-                wifi_ssid = active["ssid"].clone();
-                wifi_signal = active["signal"].clone();
-            }
-        }
+        && let Some(active) = parse_wifi_list(&list)
+            .into_iter()
+            .find(|n| n["in_use"] == json!(true))
+    {
+        wifi_ssid = active["ssid"].clone();
+        wifi_signal = active["signal"].clone();
     }
     Ok(Json(corps_du_statut(
         devices,

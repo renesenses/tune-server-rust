@@ -10,6 +10,8 @@ mod config;
 mod config_backup;
 mod convert;
 mod database;
+#[cfg(test)]
+mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
@@ -18,6 +20,8 @@ pub(crate) mod enrich;
 /// Périmètre de l'explorateur de dossiers (#1275).
 pub(crate) mod explorateur;
 mod import_pont_roon;
+// #5141 — remplacement du paquet `Tune Server.app` complet sur macOS.
+pub(crate) mod paquet_macos;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 // #2507 : et par `/library/artwork/enrich*` — le bouton « Enrichir les images
@@ -459,7 +463,7 @@ pub(crate) fn version_de_schema(state: &AppState) -> Option<i32> {
         tune_core::db::engine::Engine::Sqlite => state
             .db
             .as_ref()
-            .and_then(|db| tune_core::db::migrations::current_version(db).ok()),
+            .and_then(|db| tune_core::db::migrations::current_version_sans_ecrivain(db).ok()),
         tune_core::db::engine::Engine::Postgres => state
             .backend
             .query_one("SELECT MAX(version) FROM schema_version", &[])

@@ -95,6 +95,8 @@ pub async fn scrobble(
     .await
 }
 
+// Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 pub async fn scrobble_full(
     api_key: &str,
     api_secret: &str,

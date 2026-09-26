@@ -6,8 +6,10 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd"]
-local-audio = ["tune-core/local-audio"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio"]
+# La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
+# sans elle, le greffon compile et dit que la capture n'est pas compilée.
+local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
 # de toute ligne de build publiée (licence de `dst-decoder` non tranchée,
@@ -50,8 +52,9 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
-# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
-# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+# Concerts (#2363) : la tache d'abonnement, la lecture et la localisation,
+# sorties du coeur toujours-compile. Au catalogue, Premium (`Feature::Concerts`,
+# refus porte par le greffon lui-meme). Compile par les lignes de release.
 concerts = ["dep:tune-concerts"]
 # Pont Roon (#3914) — Premium : importer l'archive du moissonneur (crédits,
 # images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution
@@ -61,6 +64,17 @@ pont-roon = ["dep:tune-pont-roon"]
 # Bandcamp : le greffon est opt-in à l'exécution (`default_enabled = false`) et
 # hors catalogue tant qu'aucun écran ne le consomme. Choix à valider.
 cd = ["dep:tune-cd"]
+# Tune Circle, étape T1 (#5018) : le cercle (inviter, accepter, révoquer),
+# relayé vers l'API cloud de mozaiklabs avec la session SSO du serveur. Dans
+# `default` comme `cd` : opt-in à l'exécution (`default_enabled = false`) et
+# hors catalogue tant qu'aucun écran ne le consomme. Gratuit ou Premium : à
+# valider.
+circle = ["dep:tune-circle"]
+# Entrée audio en direct (#5051) : capter une entrée USB (platine, S/PDIF,
+# optique) et la diffuser vers une zone. Dans `default` comme `cd` : opt-in à
+# l'exécution (`default_enabled = false`), hors catalogue tant qu'aucun écran
+# ne le consomme.
+entree-audio = ["dep:tune-entree-audio"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -83,6 +97,8 @@ tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tune-cd = { path = "../plugins/tune-cd", optional = true }
+tune-circle = { path = "../plugins/tune-circle", optional = true }
+tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tokio = { workspace = true }
@@ -189,6 +205,12 @@ path = "tests/dr_liste_albums_4521.rs"
 [[test]]
 name = "titres_bannis_4806"
 path = "tests/titres_bannis_4806.rs"
+
+# #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
+# réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "titres_de_service_bannis_4806"
+path = "tests/titres_de_service_bannis_4806.rs"
 
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
@@ -329,6 +351,14 @@ name = "pg_3181_sections_accueil"
 path = "tests/pg_3181_sections_accueil.rs"
 required-features = ["postgres"]
 
+# Premier demarrage d une base PostgreSQL NEUVE (chasse PG du 25/09/2026) :
+# `ensure_schema` tournait avant les scripts numerotes, sur des tables encore
+# absentes, et quatorze colonnes manquaient jusqu au redemarrage suivant.
+[[test]]
+name = "pg_premier_demarrage_base_neuve"
+path = "tests/pg_premier_demarrage_base_neuve.rs"
+required-features = ["postgres"]
+
 # #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
 # la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
 # porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête
@@ -342,12 +372,44 @@ name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
 
+# SQL propre a SQLite dans des routes jouees sur PostgreSQL (chasse PG du
+# 25/09/2026) : `strftime` du cache d API, `STRING_AGG($1)` de la fusion des
+# doublons. Pas de `required-features` : la contre-epreuve SQLite tourne dans la
+# suite ordinaire.
+[[test]]
+name = "pg_fonctions_sqlite_seules"
+path = "tests/pg_fonctions_sqlite_seules.rs"
+
+# Reste de #5005 : la fin de scan et `POST /system/cleanup` fusionnaient les
+# albums en double par `GROUP_CONCAT` en dur -- mortes sur PostgreSQL -- et
+# sans respecter les paires declarees distinctes (#1276). Le banc joue le vrai
+# scan, le nettoyage et la route manuelle, sur SQLite et PostgreSQL. Pas de
+# `required-features` : la moitie SQLite joue dans la suite ordinaire.
+[[test]]
+name = "pg_fusions_auto_albums"
+path = "tests/pg_fusions_auto_albums.rs"
+
+# Reste de #5005 : `ai/recommendations.rs` joignait `bigint = text` (`CAST(a.id
+# AS TEXT)`) et datait par `datetime('now', ...)` -- recommandations, Daily
+# mixes et radio intelligente mortes sur PostgreSQL. Pas de `required-features` :
+# la contre-epreuve SQLite tourne dans la suite ordinaire.
+[[test]]
+name = "pg_recommandations_ia"
+path = "tests/pg_recommandations_ia.rs"
+
 # #4625 — la vue par dossiers compte et liste les pistes découpées par une
 # feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
 # cible, le fichier ne serait jamais compilé.
 [[test]]
 name = "dossier_cue_4625"
 path = "tests/dossier_cue_4625.rs"
+
+# GROUP BY lache de l historique (chasse PG du 25/09/2026) : top-tracks et
+# « Ce jour-la » toujours vides sur PostgreSQL. Pas de `required-features` : la
+# contre-epreuve SQLite tourne dans la suite ordinaire.
+[[test]]
+name = "pg_group_by_strict_historique"
+path = "tests/pg_group_by_strict_historique.rs"
 
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
@@ -908,6 +970,11 @@ path = "tests/albums_masques_dans_le_rapport_4319.rs"
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
 
+# #5068 — la limite d'envoi du site (429) rendue en code stable `rate_limited`.
+[[test]]
+name = "bug_report_limite_5068"
+path = "tests/bug_report_limite_5068.rs"
+
 # Les étiquettes — types admis, playlists, et depuis le 22/09/2026 le refus
 # d'un `item_id` nul. Le fichier existait, mais `autotests = false` plus haut le
 # laissait hors compilation : ses gardes n'étaient exécutées par personne.
@@ -945,6 +1012,11 @@ path = "tests/dossiers_de_collections_4853.rs"
 name = "compensation_de_niveau_4685"
 path = "tests/compensation_de_niveau_4685.rs"
 
+# #5069 — la part de la compensation que le volume COURANT rend réellement.
+[[test]]
+name = "compensation_rendue_au_volume_5069"
+path = "tests/compensation_rendue_au_volume_5069.rs"
+
 # #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
 # bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
 # de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.
@@ -952,12 +1024,26 @@ path = "tests/compensation_de_niveau_4685.rs"
 name = "crossfeed_presets_4684"
 path = "tests/crossfeed_presets_4684.rs"
 
+# #5081 — l'ombre de la tête du crossfeed par les routes (`/zones/{id}/dsp`,
+# `/crossfeed/presets`). `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "crossfeed_ombre_5081"
+path = "tests/crossfeed_ombre_5081.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
 [[test]]
 name = "pg_scan_converge_4602"
 path = "tests/pg_scan_converge_4602.rs"
+
+# #4907 — la même musique dans plusieurs répertoires : exemplaires, vues sans
+# doublon, identifiants conservés, sur SQLite et sur PostgreSQL
+# (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "exemplaires_par_repertoire_4907"
+path = "tests/exemplaires_par_repertoire_4907.rs"
 
 # « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
 # faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
@@ -1015,6 +1101,11 @@ path = "tests/collections_albums_manquants_901.rs"
 name = "identification_lot_4805"
 path = "tests/identification_lot_4805.rs"
 
+# #4836 — le pilote remplit le label des albums (doublure MusicBrainz locale).
+[[test]]
+name = "labels_par_le_pilote_4836"
+path = "tests/labels_par_le_pilote_4836.rs"
+
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
 # le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne
@@ -1037,6 +1128,13 @@ path = "tests/reseau_local_macos_4949.rs"
 [[test]]
 name = "ignorer_un_appareil_ne_masque_que_ses_zones_4957"
 path = "tests/ignorer_un_appareil_ne_masque_que_ses_zones_4957.rs"
+
+# #5077 — le MOTIF du masquage d'une zone par les vraies routes : « Ignorer »
+# pose `appareil_ignore`, « Ne plus ignorer » rend la zone ; une suppression
+# par l'utilisateur ne revient jamais.
+[[test]]
+name = "motif_de_masquage_des_zones_5077"
+path = "tests/motif_de_masquage_des_zones_5077.rs"
 
 # `library/stats` dit si l'import UPnP est complet (plafond, paginations
 # interrompues) — champ additif `upnp_import`.
@@ -1100,6 +1198,13 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
+# étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
+[[test]]
+name = "pg_etiquette_collection_5026"
+path = "tests/pg_etiquette_collection_5026.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service
@@ -1108,3 +1213,27 @@ required-features = ["postgres"]
 [[test]]
 name = "playlists_pistes_de_service"
 path = "tests/playlists_pistes_de_service.rs"
+
+# Favoris LOCAUX sur PostgreSQL (chasse PG du 25/09/2026) : `ProfileRepo` liait
+# `favorites.profile_id`/`item_id` en chaine alors que ces colonnes sont BIGINT
+# sur les deux naissances d'une base PG. PAS de `required-features` : la
+# contre-epreuve SQLite tourne dans la suite ordinaire ; seule l'epreuve PG porte
+# `#[cfg(feature = "postgres")]`. `autotests = false` : sans cette cible, le
+# fichier ne serait jamais compile.
+[[test]]
+name = "pg_favoris_locaux_entiers"
+path = "tests/pg_favoris_locaux_entiers.rs"
+
+# #4442 — le transfert vers une zone réseau reprend à la position de la
+# source. `autotests = false` en tête de ce manifeste : sans cette cible, le
+# fichier ne serait jamais compilé, ni en local ni en CI.
+[[test]]
+name = "transfert_reprend_la_position_4442"
+path = "tests/transfert_reprend_la_position_4442.rs"
+
+# #5124 : le rapport de bogue, l'export des journaux et le ticket de support
+# sortent sans adresse, chemin personnel ni jeton — lu sur les routes montées
+# et sur les envois captés par un nuage simulé.
+[[test]]
+name = "rapport_sans_donnees_personnelles_5124"
+path = "tests/rapport_sans_donnees_personnelles_5124.rs"

@@ -60,7 +60,7 @@ impl std::fmt::Debug for Identite {
 impl Identite {
     /// Tire une identité neuve du générateur du système.
     pub fn generer() -> Self {
-        let prive = StaticSecret::random_from_rng(&mut rand_core::OsRng);
+        let prive = StaticSecret::random_from_rng(rand_core::OsRng);
         Self::depuis_secret(prive)
     }
 

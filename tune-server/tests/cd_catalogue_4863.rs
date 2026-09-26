@@ -112,8 +112,8 @@ async fn cd_est_propose_s_installe_repond_et_se_desinstalle() {
     assert_eq!(code, StatusCode::OK, "{lecteur}");
     assert_eq!(
         lecteur["plateforme_prise_en_charge"],
-        cfg!(target_os = "linux"),
-        "hors Linux, un ÉTAT « non pris en charge », pas une erreur — {lecteur}"
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        "Linux et macOS pris en charge (#4863) ; ailleurs, un ÉTAT « non pris en charge », pas une erreur — {lecteur}"
     );
     assert!(lecteur["presence"].is_string(), "{lecteur}");
 

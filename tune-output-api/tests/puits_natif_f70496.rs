@@ -80,7 +80,7 @@ fn un_bloc_dop_traverse_le_puits_octet_pour_octet() {
     assert_eq!(envoye.len(), 64 * 2 * 3);
     // La fabrique produit bien la forme DoP attendue, avant de la faire
     // traverser : sans cela, le témoin garderait un bloc quelconque.
-    for (trame, paire) in envoye.chunks_exact(6).enumerate() {
+    for (trame, paire) in envoye.as_chunks::<6>().0.iter().enumerate() {
         let marqueur = if trame % 2 == 0 { 0x05 } else { 0xFA };
         assert_eq!(paire[2], marqueur, "marqueur gauche, trame {trame}");
         assert_eq!(paire[5], marqueur, "marqueur droit, trame {trame}");

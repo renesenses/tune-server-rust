@@ -244,7 +244,7 @@ async fn discogs_label_releases(
     Query(q): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let token = discogs_token(&state);
-    let params_owned = vec![
+    let params_owned = [
         ("page", q.page.to_string()),
         ("per_page", q.per_page.to_string()),
     ];

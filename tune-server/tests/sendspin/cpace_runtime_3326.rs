@@ -99,7 +99,8 @@ async fn lire(l: &mut Lecteur, typ: &str) -> Value {
     v["payload"].clone()
 }
 async fn phase(s: &Serveur, id: &str, attendue: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    // La borne du protocole, comme les autres attentes du serveur (#5142).
+    tokio::time::timeout(ATTENTE_DU_SERVEUR, async {
         loop {
             let v = s.disponible(id).await;
             if v["phase"] == attendue {
@@ -348,7 +349,7 @@ async fn i3326_cpace_websocket_code_reprise_annulation_et_reconnexion() {
                 let lt = lt.unwrap();
                 l.ws.close(None).await.unwrap();
                 drop(l);
-                tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::time::timeout(ATTENTE_DU_SERVEUR, async {
                     while reqwest::get(s.url(&id_texte, "pair"))
                         .await
                         .unwrap()

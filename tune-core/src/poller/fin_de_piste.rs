@@ -117,7 +117,7 @@ impl PositionPoller {
                         let new_pos = zone_state.queue_position + 1;
                         if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                             warn!(zone_id, error = %e, "autoplay_play_failed");
-                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            self.orchestrator.stop(zone_id, device_id).await;
                         }
                         return;
                     }
@@ -174,7 +174,7 @@ impl PositionPoller {
                     );
                     if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
-                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        self.orchestrator.stop(zone_id, device_id).await;
                     }
                     return;
                 }
@@ -237,7 +237,7 @@ impl PositionPoller {
                     );
                     if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
-                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        self.orchestrator.stop(zone_id, device_id).await;
                     }
                     return;
                 }
@@ -255,7 +255,7 @@ impl PositionPoller {
                     crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
                 if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
                     warn!(zone_id, error = %e, "autoplay_append_queue_failed");
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    self.orchestrator.stop(zone_id, device_id).await;
                     return;
                 }
 
@@ -278,7 +278,7 @@ impl PositionPoller {
                 info!(zone_id, new_pos, "autoplay_starting_generated_track");
                 if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                     warn!(zone_id, error = %e, "autoplay_play_failed");
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    self.orchestrator.stop(zone_id, device_id).await;
                 }
                 return;
             }
@@ -296,8 +296,7 @@ impl PositionPoller {
             repeat = ?zone_state.repeat,
             "queue_ended"
         );
-        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-        return;
+        self.orchestrator.stop(zone_id, device_id).await;
     }
 
     async fn continuer_aleatoirement(
@@ -463,7 +462,21 @@ impl PositionPoller {
                     match Self::next_position_after(zone_state, attempt_pos) {
                         // Same slot again means repeat-one on a dead track:
                         // skipping would spin forever.
-                        Some(p) if p != attempt_pos => attempt_pos = p,
+                        Some(p) if p != attempt_pos => {
+                            // #4806 — après un échec aussi, les titres bannis
+                            // qui suivent sont enjambés : sans cela, un titre
+                            // banni juste derrière une piste injouable serait
+                            // joué.
+                            attempt_pos = match self
+                                .orchestrator
+                                .enjamber_les_pistes_bannies(zone_id, p)
+                                .await
+                            {
+                                crate::orchestrator::Enjambee::Rien => p,
+                                crate::orchestrator::Enjambee::Reprise(q) => q,
+                                crate::orchestrator::Enjambee::FileEpuisee => break,
+                            };
+                        }
                         _ => break,
                     }
                 }
@@ -666,21 +679,27 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
     ) -> GaplessPrep {
-        let Some(next_pos) = Self::next_position(zone_state) else {
+        // #4806 / #5143 — une suivante BANNIE (locale ou de service) n'est
+        // jamais armée : armée, elle serait jouée par le renderer sans que la
+        // file ait son mot à dire. On arme la prochaine JOUABLE, celle que
+        // l'avance de la file jouerait : l'enchaînement sans blanc est gardé
+        // par-dessus la bannie.
+        let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
 
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de
         // ce que le renderer aura reellement accepte.
-        let arme = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+        let ligne = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
             .get_at(zone_id, next_pos)
             .ok()
-            .flatten()
-            .map(|e| ArmedNext {
-                row_id: e.id,
-                position: next_pos,
-            });
+            .flatten();
+
+        let arme = ligne.map(|e| ArmedNext {
+            row_id: e.id,
+            position: next_pos,
+        });
 
         // Local-file gapless (OAAT native DSD): the output reads the next
         // track's `.dsf` directly, so resolve it as a local file WITHOUT a
@@ -733,7 +752,7 @@ impl PositionPoller {
                     .await;
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
-                    outputs.get(device_id).map(|a| a.clone())
+                    outputs.get(device_id)
                 };
                 let Some(output_arc) = output_arc else {
                     return GaplessPrep::NotArmed;
@@ -780,11 +799,11 @@ impl PositionPoller {
             }
             Ok(_) => {
                 info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                return GaplessPrep::NotArmed;
+                GaplessPrep::NotArmed
             }
             Err(e) => {
                 warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                return GaplessPrep::NotArmed;
+                GaplessPrep::NotArmed
             }
         }
     }

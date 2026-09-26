@@ -710,7 +710,7 @@ mod tests {
         let masquee = zone_masquee(1, "local:Ancien nom", Some(AUDIO_GD));
         let parc = vec![sortie("Nouveau nom", AUDIO_GD)];
         assert_eq!(
-            decider(&[masquee.clone()], &parc),
+            decider(std::slice::from_ref(&masquee), &parc),
             vec![Decision::Rien { zone_id: 1 }],
             "déplacer une zone que l'utilisateur a supprimée la ferait \
              réapparaître ailleurs"

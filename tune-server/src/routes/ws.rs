@@ -99,8 +99,7 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.ends_with(".*") {
-        let prefix = &pattern[..pattern.len() - 2];
+    if let Some(prefix) = pattern.strip_suffix(".*") {
         return event_type.starts_with(prefix);
     }
     event_type == pattern
@@ -112,7 +111,8 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 /// truth without polling.
 async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-    let zones = zone_repo.list().unwrap_or_default();
+    // #5077 — même liste que `GET /zones` : une zone masquée qui joue en est.
+    let zones = crate::routes::zones::zones_a_montrer(state).await;
     let audio_backend_pref = state.display_audio_backend();
     #[cfg(feature = "local-audio")]
     let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);

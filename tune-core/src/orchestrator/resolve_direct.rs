@@ -276,11 +276,11 @@ impl PlaybackOrchestrator {
         let info = StreamInfo {
             format: ext.clone(),
             mime_type: mime.clone(),
-            sample_rate: sample_rate.unwrap_or(44100) as u32,
+            sample_rate: sample_rate.unwrap_or(44100),
             bit_depth: bit_depth.unwrap_or(16),
-            channels: channels as u16,
+            channels,
             file_size,
-            duration_ms: Some(duration_ms as u64),
+            duration_ms: Some(duration_ms),
             ..Default::default()
         };
 
@@ -312,7 +312,7 @@ impl PlaybackOrchestrator {
             duration_ms: Some(duration_ms as i64),
             source: "upload".into(),
             mime_type: mime,
-            sample_rate: sample_rate.map(|s| s as u32),
+            sample_rate,
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
             origin_url: None,
@@ -1323,8 +1323,14 @@ impl PlaybackOrchestrator {
             duration_ms: req.duration_ms.map(|d| d as u64),
             ..Default::default()
         };
-        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        // #5114 — le porteur d'abord : le flux dit s'il cuit le crossfeed.
         let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let info = StreamInfo {
+            crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
+            compensation_db: dsp.compensation_cuite_db(),
+            ..info
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
         let tx = if dsp.is_active() {
             info!(
                 zone_id = req.zone_id,

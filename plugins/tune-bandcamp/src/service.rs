@@ -76,13 +76,14 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tune_core::TuneError;
 use tune_core::db::backend::DbBackend;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::streaming::traits::{
     AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamQuality,
     StreamTrack, StreamUrl, StreamingService,
 };
 
 use crate::{
-    BC_SEARCH_API, EchecLiaison, album_depuis_url, chercher_une_categorie, compte_lie,
+    BC_SEARCH_API, CLE_ACTIF, EchecLiaison, album_depuis_url, chercher_une_categorie, compte_lie,
     delier_compte, discographie_depuis_url, lier_compte, page_de_collection, pochette,
 };
 
@@ -108,20 +109,34 @@ fn qualite_bandcamp() -> StreamQuality {
 }
 
 /// Bandcamp dans le registre des services de streaming.
+///
+/// # La case « Actif » (fil 1952, décision du 26/09)
+///
+/// Depuis #5130, `enabled()` n'est plus un simple affichage : un service
+/// décoché sort de la recherche fédérée, de l'accueil, des pages artiste et de
+/// la barre latérale ([`StreamingService::utilisable`]). Or Bandcamp naissait
+/// décoché et la liaison ne le cochait pas : le compte de Didier était lié
+/// (`authenticated: true`) et Bandcamp absent partout.
+///
+/// La règle est désormais celle des autres services — Amazon en tête, dont la
+/// case suit la connexion tant que personne n'y a touché :
+///
+/// - la case lue est la clé commune `streaming_bandcamp_enabled`
+///   ([`crate::CLE_ACTIF`]), et non un champ en mémoire : la liaison passe
+///   aussi par `POST /ext/bandcamp/collection/link`, qui n'a pas accès à ce
+///   service, et une seconde copie de l'état aurait menti après elle ;
+/// - lier un compte écrit `"true"` ([`crate::lier_compte`]) ;
+/// - clé ABSENTE (jamais touchée) : la case suit la liaison. C'est le
+///   rattrapage des comptes déjà liés, sans migration ni écriture au
+///   démarrage, et il ne peut pas revenir sur un « décoché » exprès : seul
+///   `POST /streaming/bandcamp/disable` écrit `"false"`.
 pub struct BandcampService {
     backend: Arc<dyn DbBackend>,
-    enabled: bool,
 }
 
 impl BandcampService {
     pub fn new(backend: Arc<dyn DbBackend>) -> Self {
-        Self {
-            backend,
-            // Comme le greffon : opt-in. `enabled` ne garde AUCUNE des routes
-            // utilisées ici — ni `registry.get`, ni la route de file — il ne
-            // décide que de l'affichage dans le gestionnaire de services.
-            enabled: false,
-        }
+        Self { backend }
     }
 }
 
@@ -357,12 +372,29 @@ impl StreamingService for BandcampService {
         "bandcamp"
     }
 
+    /// La case « Actif » — voir la note de [`BandcampService`].
     fn enabled(&self) -> bool {
-        self.enabled
+        let reglages = SettingsRepo::with_backend(self.backend.clone());
+        match reglages.get(CLE_ACTIF) {
+            Ok(Some(v)) if v == "true" => true,
+            Ok(Some(v)) if v == "false" => false,
+            // Jamais touchée : elle suit la liaison.
+            Ok(_) => matches!(compte_lie(&self.backend), Ok(Some(_))),
+            Err(e) => {
+                tracing::error!(erreur = %e, "bandcamp_case_actif_illisible");
+                false
+            }
+        }
     }
 
+    /// Écrit la clé commune. `POST /streaming/bandcamp/enable|disable`
+    /// l'écrit aussi, et `restore_all_tokens` réécrit au démarrage la valeur
+    /// qu'il vient d'y lire : les deux sont sans effet de plus.
     fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        let reglages = SettingsRepo::with_backend(self.backend.clone());
+        if let Err(e) = reglages.set(CLE_ACTIF, if enabled { "true" } else { "false" }) {
+            tracing::error!(erreur = %e, enabled, "bandcamp_case_actif_ecriture_en_echec");
+        }
     }
 
     /// Lier un compte : `{"username": "<pseudo>"}`.
@@ -1092,5 +1124,151 @@ mod dates_favoris_2778 {
             methode.contains(&appel),
             "la méthode de service doit employer la conversion qui conserve la date de chaque article"
         );
+    }
+}
+
+/// Fil 1952 (Didier) — la case « Actif » de Bandcamp suit la règle commune.
+///
+/// Didier : Bandcamp « connecté » (pseudo lié) mais décoché, donc absent de la
+/// recherche, de l'accueil et de la barre latérale depuis #5130. Décision de
+/// Bertrand (26/09) : lier son compte coche la case, et un compte déjà lié
+/// dont personne n'a touché la case est actif.
+#[cfg(test)]
+mod case_actif_fil1952 {
+    use super::*;
+    use tune_core::streaming::registry::ServiceRegistry;
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn reglages(b: &Arc<dyn DbBackend>) -> SettingsRepo {
+        SettingsRepo::with_backend(b.clone())
+    }
+
+    /// Un compte lié tel que l'a laissé une liaison d'AVANT ce correctif :
+    /// pseudo et fan_id, et aucune clé de case.
+    fn compte_deja_lie(b: &Arc<dyn DbBackend>) {
+        reglages(b).set(crate::CLE_PSEUDO, "didierv").unwrap();
+        reglages(b).set(crate::CLE_FAN_ID, "897100").unwrap();
+    }
+
+    /// Ce que fait `AppState` au démarrage : inscrire, puis relire les
+    /// réglages par le registre. Rend l'état vu par les routes.
+    async fn demarrer(b: &Arc<dyn DbBackend>) -> (bool, bool) {
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(BandcampService::new(b.clone())));
+        registre.restore_all_tokens(b).await;
+        let svc = registre.get("bandcamp").expect("bandcamp inscrit");
+        let svc = svc.read().await;
+        (svc.enabled(), svc.utilisable().await)
+    }
+
+    /// Une page de profil Bandcamp servie en local, pour lier sans réseau.
+    async fn profil_local() -> String {
+        let app = axum::Router::new().route(
+            "/{pseudo}",
+            axum::routing::get(|| async {
+                axum::response::Html("<div data-blob=\"{&quot;fan_id&quot;:897100}\"></div>")
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        format!("http://{adresse}")
+    }
+
+    #[test]
+    fn la_cle_est_celle_du_registre_et_des_routes_enable_disable() {
+        let svc = BandcampService::new(base());
+        assert_eq!(
+            CLE_ACTIF,
+            format!("streaming_{}_enabled", svc.name()),
+            "la case doit vivre sous la clé que lisent restore_all_tokens et \
+             POST /streaming/{{service}}/enable|disable"
+        );
+    }
+
+    #[tokio::test]
+    async fn lier_son_compte_coche_la_case_meme_decochee_avant() {
+        let b = base();
+        // L'utilisateur avait décoché Bandcamp, puis lie son compte.
+        reglages(&b).set(CLE_ACTIF, "false").unwrap();
+        let racine = profil_local().await;
+        let compte = crate::lier_compte_sur(&b, "didierv", &racine)
+            .await
+            .unwrap_or_else(|_| panic!("la liaison locale a échoué"));
+        assert_eq!(compte.fan_id, 897100);
+        assert_eq!(
+            reglages(&b).get(CLE_ACTIF).unwrap().as_deref(),
+            Some("true"),
+            "lier son compte Bandcamp doit COCHER la case Actif (fil 1952)"
+        );
+        assert_eq!(
+            demarrer(&b).await,
+            (true, true),
+            "compte lié : Bandcamp doit être activé ET utilisable"
+        );
+    }
+
+    #[tokio::test]
+    async fn compte_deja_lie_jamais_touche_est_actif_au_demarrage() {
+        let b = base();
+        compte_deja_lie(&b);
+        assert_eq!(
+            demarrer(&b).await,
+            (true, true),
+            "le compte de Didier (lié, case jamais touchée) doit être actif \
+             au démarrage — sinon absent de la recherche, de l'accueil et de \
+             la barre (fil 1952)"
+        );
+        // Rien n'a été écrit : l'état « jamais touché » reste distinct.
+        assert_eq!(reglages(&b).get(CLE_ACTIF).unwrap(), None);
+        // Idempotent : un second démarrage rend la même chose.
+        assert_eq!(demarrer(&b).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn decoche_expres_reste_decoche_apres_redemarrage() {
+        let b = base();
+        compte_deja_lie(&b);
+        // Ce que fait `POST /streaming/bandcamp/disable`.
+        reglages(&b).set(CLE_ACTIF, "false").unwrap();
+        assert_eq!(
+            demarrer(&b).await,
+            (false, false),
+            "un Bandcamp décoché exprès ne doit pas être recoché au démarrage"
+        );
+        assert_eq!(demarrer(&b).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn sans_compte_lie_la_case_reste_decochee() {
+        let b = base();
+        assert_eq!(demarrer(&b).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn la_case_survit_au_redemarrage_et_suit_set_enabled() {
+        let b = base();
+        compte_deja_lie(&b);
+        {
+            let mut svc = BandcampService::new(b.clone());
+            svc.set_enabled(false);
+            assert!(!svc.enabled());
+        }
+        assert_eq!(demarrer(&b).await, (false, false));
+        {
+            let mut svc = BandcampService::new(b.clone());
+            svc.set_enabled(true);
+        }
+        assert_eq!(demarrer(&b).await, (true, true));
     }
 }

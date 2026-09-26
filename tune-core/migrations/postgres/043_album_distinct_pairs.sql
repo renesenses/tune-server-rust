@@ -57,7 +57,7 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'album_distinct_pairs'
+         WHERE table_schema = current_schema() AND table_name = 'album_distinct_pairs'
            AND column_name = 'profile_id'
            AND data_type IN ('text', 'character varying')
     ) THEN
@@ -70,7 +70,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'album_distinct_pairs'
+         WHERE table_schema = current_schema() AND table_name = 'album_distinct_pairs'
            AND column_name = 'album_a_id'
            AND data_type IN ('text', 'character varying')
     ) THEN
@@ -80,7 +80,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'album_distinct_pairs'
+         WHERE table_schema = current_schema() AND table_name = 'album_distinct_pairs'
            AND column_name = 'album_b_id'
            AND data_type IN ('text', 'character varying')
     ) THEN

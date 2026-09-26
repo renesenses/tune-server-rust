@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 
 use crate::SmartHttpState;
 use crate::catalogue;
+use crate::etiquettes_streaming;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -91,7 +92,7 @@ pub fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     let nom = r.get(1).and_then(|v| v.as_string());
     let description = r.get(7).and_then(|v| v.as_string());
     let mut objet = json!({
-        "id": r.get(0).and_then(|v| v.as_i64()),
+        "id": r.first().and_then(|v| v.as_i64()),
         "name": nom,
         "rules": rules,
         "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
@@ -134,6 +135,10 @@ pub fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
 ///
 /// Fonction à part, et synchrone, pour être éprouvée : une garde textuelle
 /// laissait passer le débranchement de l'addition sans rien voir.
+///
+/// La production appelle `compte_albums_ventile` ; celle-ci ne sert plus
+/// qu'aux épreuves, d'où le `cfg(test)` (clippy 1.98, `dead_code`).
+#[cfg(test)]
 pub(crate) fn compte_albums(
     backend: &dyn tune_core::db::backend::DbBackend,
     sql_bibliotheque: &str,
@@ -181,10 +186,15 @@ pub(crate) fn compte_albums_ventile(
             .unwrap_or(0)
     };
     let en_base = un(sql_bibliotheque);
+    // #5026 — les albums de service ÉTIQUETÉS s'ajoutent aux favoris de
+    // service ; `etiquettes_streaming` écarte ceux que les favoris rendent déjà.
     let en_service =
         source_streaming::requete_compte(rules_json, match_mode, Objet::Album, profile_id)
             .map(|sql| un(&sql))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + etiquettes_streaming::requete_compte(rules_json, match_mode, profile_id)
+                .map(|sql| un(&sql))
+                .unwrap_or(0);
     (en_base, en_service)
 }
 
@@ -604,55 +614,55 @@ pub fn build_album_query(
 
         // --- credit rules use a subquery, handle separately ---
         if field == "credit" {
-            if op == "has" {
-                if let Some(obj) = value_raw.and_then(|v| v.as_object()) {
-                    let mut sub_conds = Vec::new();
-                    if let Some(role) = obj
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        sub_conds.push(format!(
-                            "LOWER(tc.role) LIKE LOWER('%{}%')",
-                            role.replace('\'', "''")
-                        ));
-                    }
-                    if let Some(artist) = obj
-                        .get("artist_name")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        sub_conds.push(format!(
-                            "LOWER(tc.artist_name) LIKE LOWER('%{}%')",
-                            artist.replace('\'', "''")
-                        ));
-                    }
-                    if let Some(instr) = obj
-                        .get("instrument")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        // MÊME canonisation qu'à l'écriture des crédits
-                        // (#2799 §4). L'enrichissement range désormais
-                        // « grand piano » / « electric piano » sous `piano` ;
-                        // si la règle cherchait le libellé brut saisi par
-                        // l'utilisateur, une collection `instrument: Grand
-                        // Piano` ne trouverait plus rien alors que les lignes
-                        // existent. Deux normalisations, deux résultats.
-                        let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
-                        let motif = if canon.is_empty() { instr } else { &canon };
-                        sub_conds.push(format!(
-                            "LOWER(tc.instrument) LIKE LOWER('%{}%')",
-                            motif.replace('\'', "''")
-                        ));
-                    }
-                    if !sub_conds.is_empty() {
-                        conditions.push(format!(
-                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+            if op == "has"
+                && let Some(obj) = value_raw.and_then(|v| v.as_object())
+            {
+                let mut sub_conds = Vec::new();
+                if let Some(role) = obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    sub_conds.push(format!(
+                        "LOWER(tc.role) LIKE LOWER('%{}%')",
+                        role.replace('\'', "''")
+                    ));
+                }
+                if let Some(artist) = obj
+                    .get("artist_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    sub_conds.push(format!(
+                        "LOWER(tc.artist_name) LIKE LOWER('%{}%')",
+                        artist.replace('\'', "''")
+                    ));
+                }
+                if let Some(instr) = obj
+                    .get("instrument")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    // MÊME canonisation qu'à l'écriture des crédits
+                    // (#2799 §4). L'enrichissement range désormais
+                    // « grand piano » / « electric piano » sous `piano` ;
+                    // si la règle cherchait le libellé brut saisi par
+                    // l'utilisateur, une collection `instrument: Grand
+                    // Piano` ne trouverait plus rien alors que les lignes
+                    // existent. Deux normalisations, deux résultats.
+                    let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
+                    let motif = if canon.is_empty() { instr } else { &canon };
+                    sub_conds.push(format!(
+                        "LOWER(tc.instrument) LIKE LOWER('%{}%')",
+                        motif.replace('\'', "''")
+                    ));
+                }
+                if !sub_conds.is_empty() {
+                    conditions.push(format!(
+                        "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
                              JOIN track_credits tc ON tc.track_id = t2.id WHERE {})",
-                            sub_conds.join(" AND ")
-                        ));
-                    }
+                        sub_conds.join(" AND ")
+                    ));
                 }
             }
             continue;
@@ -697,10 +707,11 @@ pub fn build_album_query(
         if field == "play_count" || field == "last_played_at" {
             let int_v = value.parse::<i64>().unwrap_or(0);
             let cond = match (field, op) {
-                ("play_count", "=" | "==") if int_v == 0 => format!(
+                ("play_count", "=" | "==") if int_v == 0 => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id)"
-                ),
+                        .to_string()
+                }
                 ("play_count", "=") => format!(
                     "al.id IN (SELECT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id \
@@ -737,10 +748,11 @@ pub fn build_album_query(
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
                     )
                 }
-                ("last_played_at", "is_null") => format!(
+                ("last_played_at", "is_null") => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id)"
-                ),
+                        .to_string()
+                }
                 _ => continue,
             };
             conditions.push(cond);
@@ -921,7 +933,7 @@ fn execute_album_query(
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "year": r.get(3).and_then(|v| v.as_i64()),
@@ -951,33 +963,47 @@ fn avec_albums_de_service(
     sort_order: &str,
     max_limit: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
-    let Some(sql) = source_streaming::requete(
-        rules_json,
-        match_mode,
-        Objet::Album,
-        profile_id,
-        sort_by,
-        sort_order,
-        max_limit,
-    ) else {
+    // #5026 — puis les albums de service ÉTIQUETÉS qu'une règle « Étiquette »
+    // positive nomme (`etiquettes_streaming`), sans ceux que les favoris
+    // viennent de rendre. Même forme JSON, même borne.
+    let requetes = [
+        source_streaming::requete(
+            rules_json,
+            match_mode,
+            Objet::Album,
+            profile_id,
+            sort_by,
+            sort_order,
+            max_limit,
+        ),
+        etiquettes_streaming::requete(
+            rules_json, match_mode, profile_id, sort_by, sort_order, max_limit,
+        ),
+    ];
+    if requetes.iter().all(Option::is_none) {
         return Ok(albums);
-    };
-    let lignes = state
-        .backend
-        .query_many(&sql, &[])
-        .map_err(AppError::internal)?;
-    albums.extend(lignes.iter().map(|c| source_streaming::album_json(c)));
+    }
+    for sql in requetes.iter().flatten() {
+        let lignes = state
+            .backend
+            .query_many(sql, &[])
+            .map_err(AppError::internal)?;
+        albums.extend(lignes.iter().map(|c| source_streaming::album_json(c)));
+    }
     if let Some(n) = max_limit.filter(|n| *n >= 0) {
         albums.truncate(n as usize);
     }
     Ok(albums)
 }
 
+/// Critères d'une collection : (rules, match_mode, sort_by, sort_order, max_limit).
+type CriteresDeCollection = (String, String, String, String, Option<i64>);
+
 /// Load a smart collection's criteria from the DB.
 fn load_collection_criteria(
     state: &SmartHttpState,
     id: i64,
-) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
+) -> Result<Option<CriteresDeCollection>, AppError> {
     let row = state
         .backend
         .query_one(
@@ -989,7 +1015,7 @@ fn load_collection_criteria(
 
     Ok(row.map(|r| {
         (
-            r.get(0)
+            r.first()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into()),
             r.get(1)
@@ -2030,6 +2056,163 @@ mod tests {
                 panic!("le catalogue doit répondre")
             };
             assert_eq!(r.len(), 2, "le plafond vaut pour tout le résultat");
+        }
+    }
+
+    /// 🔴 #5026 — Sevy Tabroc, fil 1937 : « Sept Oct 2026 (1) » dans le
+    /// sélecteur, « 0 albums correspondent » dans l'aperçu.
+    ///
+    /// La règle « Étiquette » est élargie (décision de Bertrand, 25/09) : un
+    /// album entre s'il porte l'étiquette, si son artiste la porte, si AU
+    /// MOINS UNE de ses pistes la porte, ou — album de SERVICE — s'il est
+    /// étiqueté dans `streaming_item_tags`. L'épreuve passe par les HANDLERS
+    /// (aperçu, collection enregistrée, liste des collections), sur une base
+    /// MIGRÉE : c'est le `total` de l'aperçu que le sélecteur web affiche
+    /// depuis web#1607.
+    mod etiquette_elargie_5026 {
+        use crate::SmartHttpState;
+        use axum::response::IntoResponse;
+        use serde_json::Value;
+        use std::sync::Arc;
+        use tune_core::db::backend::{DbBackend, ToSqlValue};
+        use tune_core::db::sqlite::SqliteDb;
+        use tune_http_types::ActiveProfile;
+
+        const PORTE: &str = r#"[{"field":"tag","op":"is","value":"12"}]"#;
+        const PORTE_PAS: &str = r#"[{"field":"tag","op":"is_not","value":"12"}]"#;
+
+        fn etat() -> SmartHttpState {
+            let db = SqliteDb::open_in_memory().expect("base");
+            db.init_schema().expect("schéma");
+            tune_core::db::migrations::run_migrations(&db).expect("migrations");
+            db.execute_batch(
+                "INSERT INTO artists (id, name) VALUES (1,'A'); \
+                 INSERT INTO albums (id, title, artist_id) VALUES \
+                   (1,'Local étiqueté',1),(2,'Piste étiquetée',1),(3,'Rien',1),(4,'Sans artiste',NULL); \
+                 INSERT INTO tracks (id, album_id, title, file_path) VALUES \
+                   (10,1,'a','/m/10.flac'),(20,2,'b','/m/20.flac'),(21,2,'c','/m/21.flac'), \
+                   (30,3,'d','/m/30.flac'),(40,4,'e','/m/40.flac'),(99,NULL,'orpheline','/m/99.flac'); \
+                 INSERT INTO tags (id, name) VALUES (12,'Sept Oct 2026'); \
+                 INSERT INTO item_tags (tag_id, item_type, item_id) VALUES \
+                   (12,'album',1),(12,'track',20),(12,'track',99); \
+                 INSERT INTO streaming_item_tags \
+                   (tag_id, item_type, source, source_id, title, artist, cover_url, created_at) VALUES \
+                   (12,'album','qobuz','q1','Sevy','Artiste Q','https://c/q1.jpg','2026-09-25T15:00:00Z');",
+            )
+            .expect("bibliothèque témoin");
+            let backend: Arc<dyn DbBackend> = Arc::new(db);
+            SmartHttpState::new(backend)
+        }
+
+        async fn apercu(e: &SmartHttpState, regles: &str) -> Value {
+            let Ok(r) = super::super::preview_albums(
+                axum::extract::State(e.clone()),
+                ActiveProfile(1),
+                axum::Json(super::super::PreviewRequest {
+                    rules: serde_json::from_str(regles).expect("json"),
+                    match_mode: Some("all".into()),
+                    sort_by: None,
+                    sort_order: None,
+                    max_limit: None,
+                }),
+            )
+            .await
+            else {
+                panic!("l'aperçu doit répondre")
+            };
+            r.0
+        }
+
+        fn titres(albums: &Value) -> Vec<String> {
+            albums
+                .as_array()
+                .expect("liste")
+                .iter()
+                .map(|a| a["title"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        /// La requête exacte du sélecteur web (`regleDEtiquette`, web#1607).
+        #[tokio::test]
+        async fn l_apercu_rend_la_piste_et_l_album_de_service() {
+            let e = etat();
+            let r = apercu(&e, PORTE).await;
+            assert_eq!(
+                titres(&r["albums"]),
+                vec!["Local étiqueté", "Piste étiquetée", "Sevy"],
+                "{r}"
+            );
+            assert_eq!(r["total"], 3, "le nombre que le sélecteur affiche : {r}");
+            let service = &r["albums"][2];
+            assert_eq!(service["id"], Value::Null, "{service}");
+            assert_eq!(service["source"], "qobuz", "{service}");
+            assert_eq!(service["source_id"], "q1", "{service}");
+            assert_eq!(service["cover_path"], "https://c/q1.jpg", "{service}");
+        }
+
+        /// La négation : ni l'album, ni l'artiste, ni AUCUNE piste — et la
+        /// piste orpheline (sans album) ne vide pas le résultat.
+        #[tokio::test]
+        async fn la_negation_ecarte_l_album_dont_une_piste_porte_l_etiquette() {
+            let e = etat();
+            let r = apercu(&e, PORTE_PAS).await;
+            assert_eq!(titres(&r["albums"]), vec!["Rien", "Sans artiste"], "{r}");
+            assert_eq!(r["total"], 2, "{r}");
+        }
+
+        /// La collection ENREGISTRÉE rend ce que l'aperçu montre, et la liste
+        /// des collections le compte.
+        #[tokio::test]
+        async fn la_collection_et_son_compteur_suivent() {
+            let e = etat();
+            let id = e
+                .backend
+                .execute_returning_id(
+                    "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                     VALUES ('Nouveautés Sept Oct 2026', ?1, 'all', 'title', 'asc')",
+                    &[&PORTE as &dyn ToSqlValue],
+                )
+                .expect("collection");
+
+            let Ok(reponse) = super::super::resolve_albums(
+                axum::extract::State(e.clone()),
+                ActiveProfile(1),
+                axum::extract::Path(id),
+            )
+            .await
+            else {
+                panic!("la collection doit répondre")
+            };
+            let reponse = reponse.into_response();
+            let corps = axum::body::to_bytes(reponse.into_body(), 1 << 20)
+                .await
+                .expect("corps");
+            let albums: Value = serde_json::from_slice(&corps).expect("json");
+            assert_eq!(
+                titres(&albums),
+                vec!["Local étiqueté", "Piste étiquetée", "Sevy"],
+                "{albums}"
+            );
+
+            let Ok(liste) =
+                super::super::list_collections(axum::extract::State(e.clone()), ActiveProfile(1))
+                    .await
+            else {
+                panic!("la liste doit répondre")
+            };
+            let col = liste
+                .0
+                .as_array()
+                .expect("liste")
+                .iter()
+                .find(|c| c["id"].as_i64() == Some(id))
+                .cloned()
+                .expect("la collection est listée");
+            assert_eq!(col["album_count"], 3, "{col}");
+            // Un album de service n'a pas de pistes à compter : le compte de
+            // pistes serait partiel, il n'est pas rendu (#4466).
+            assert!(col["track_count"].is_null(), "{col}");
+            assert_eq!(col["track_count_partiel"], true, "{col}");
         }
     }
 }

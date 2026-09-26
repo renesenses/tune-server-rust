@@ -22,7 +22,7 @@ pub(super) async fn get_zone_dsp(
     let crossfeed_status =
         crossfeed_status_de_zone(&state, id, crossfeed["enabled"].as_bool().unwrap_or(false)).await;
     // #4685 — additif : un client qui l'ignore voit le même écran qu'avant.
-    let level_compensation = compensation_de_niveau_de_zone(&state, id);
+    let level_compensation = compensation_de_niveau_de_zone(&state, id).await;
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -53,7 +53,8 @@ pub(super) async fn get_zone_dsp(
 ///
 /// ```json
 /// { "enabled": true, "eq_db": -10.62, "crossfeed_db": -1.05,
-///   "compensation_db": 11.67, "local_output_only": true }
+///   "compensation_db": 11.67, "rendered_db": 3.0, "unrendered_db": 8.67,
+///   "volume": 0.708, "local_output_only": false, "applied_by": "output_volume" }
 /// ```
 ///
 /// `eq_db` / `crossfeed_db` : ce que chaque étage fait au niveau MOYEN
@@ -62,11 +63,32 @@ pub(super) async fn get_zone_dsp(
 /// `compensation_db` : ce qui est rendu par le volume quand l'interrupteur
 /// est ouvert, 0 sinon. C'est une DEMANDE : à volume plein, le rabot à
 /// l'unité la mange (la ligne `local_gain_rabote_a_l_unite` le dit au
-/// journal). `local_output_only` : la compensation passe par le volume de la
-/// sortie LOCALE ; une zone réseau ne la reçoit pas.
-pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
+/// journal). `local_output_only` : faux depuis #5071 — une zone réseau la
+/// reçoit aussi. `applied_by` dit PAR OÙ : `output_volume` (sortie locale,
+/// par le volume raboté à l'unité) ou `stream_gain` (zone réseau, gain cuit
+/// dans le flux après l'égaliseur, borné à la crête : il peut rendre MOINS
+/// que `compensation_db` sur une piste dont les crêtes n'ont pas la place).
+///
+/// #5069 — `rendered_db` / `unrendered_db` : ce que le volume COURANT de la
+/// zone peut réellement en rendre, et ce qu'il ne peut pas. Sur la sortie
+/// locale (`applied_by = output_volume`), la demande est multipliée au volume
+/// puis rabotée à l'unité (`effective_volume_units`, ligne
+/// `local_gain_rabote_a_l_unite`) : au volume maximal, rien ne passe.
+/// L'écran annonçait pourtant « +8.4 dB rendus par le volume » à 100 % — un
+/// testeur perdait 8,4 dB sans que rien ne le lui dise. `volume` est le
+/// volume linéaire (0..1) sur lequel ce partage est calculé. Le ReplayGain de
+/// la piste, propre à chaque morceau, n'y entre pas. Sur une zone réseau
+/// (`stream_gain`), le volume ne rabote pas le gain cuit dans le flux :
+/// `rendered_db` y vaut la demande, `unrendered_db` 0.
+pub(super) async fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
     let enabled = state.orchestrator.zone_compensation_de_niveau(zone_id);
     let (eq_db, crossfeed_db) = state.orchestrator.gain_moyen_du_dsp_de_zone(zone_id);
+    let sortie_locale = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .is_none_or(|id| id.starts_with("local:"));
     // `+ 0.0` : pas de « -0 » dans le JSON quand rien n'est à rendre.
     let arrondi = |db: f64| (db * 100.0).round() / 100.0 + 0.0;
     let compensation_db = if enabled {
@@ -74,13 +96,69 @@ pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> 
     } else {
         0.0
     };
+    let volume = volume_de_zone(state, zone_id).await;
+    // #5069 × #5071 : le partage par le volume ne vaut que pour la sortie
+    // locale. Une zone réseau reçoit le gain cuit dans son flux, que le volume
+    // ne rabote pas.
+    let (rendu, non_rendu) = if sortie_locale {
+        part_rendue_par_le_volume(compensation_db, volume)
+    } else {
+        (compensation_db, 0.0)
+    };
     json!({
         "enabled": enabled,
         "eq_db": arrondi(eq_db),
         "crossfeed_db": arrondi(crossfeed_db),
         "compensation_db": compensation_db,
-        "local_output_only": true,
+        "rendered_db": arrondi(rendu),
+        "unrendered_db": arrondi(non_rendu),
+        "volume": (volume * 1000.0).round() / 1000.0,
+        "local_output_only": false,
+        "applied_by": if sortie_locale { "output_volume" } else { "stream_gain" },
     })
+}
+
+/// #5069 — le volume linéaire (0..1) de la zone, pris à la même source que
+/// `GET /zones/{id}` (`routes/zones/lecture.rs`) : l'état de lecture s'il est
+/// connu, sinon la colonne persistée (échelle 0..100).
+async fn volume_de_zone(state: &AppState, zone_id: i64) -> f64 {
+    let vivant = state.playback.get_state(zone_id).await.volume;
+    let v = if vivant > 0.0 {
+        vivant
+    } else {
+        ZoneRepo::with_backend(state.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .map_or(1.0, |z| z.volume / 100.0)
+    };
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// #5069 — partage une compensation demandée entre ce que le volume `volume`
+/// (linéaire, 0..1) rend et ce que le rabot à l'unité mange.
+///
+/// Le gain effectif est `volume × 10^(compensation/20)`, borné à 1 : la marge
+/// disponible est donc `−20·log10(volume)` dB. Une compensation négative (une
+/// atténuation) passe toujours en entier. Rend `(rendu, non_rendu)`, en dB.
+pub(super) fn part_rendue_par_le_volume(compensation_db: f64, volume: f64) -> (f64, f64) {
+    if !compensation_db.is_finite() {
+        return (0.0, 0.0);
+    }
+    if compensation_db <= 0.0 {
+        return (compensation_db, 0.0);
+    }
+    let marge_db = if volume <= 0.0 {
+        f64::INFINITY
+    } else {
+        (-20.0 * volume.min(1.0).log10()).max(0.0)
+    };
+    let rendu = compensation_db.min(marge_db);
+    (rendu, compensation_db - rendu)
 }
 
 /// Cache of computed convolver responses, keyed by zone id. The value pairs
@@ -137,10 +215,10 @@ pub(super) async fn convolver_response(
     let fingerprint = format!("{ir_path}|{}|{mtime}", meta.len());
 
     let cache = CONVOLVER_RESPONSE_CACHE.get_or_init(Default::default);
-    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id) {
-        if *fp == fingerprint {
-            return Json(body.clone()).into_response();
-        }
+    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id)
+        && *fp == fingerprint
+    {
+        return Json(body.clone()).into_response();
     }
 
     // ~200 log-spaced points × up to 128k taps of f64 accumulation: fast, but
@@ -205,16 +283,50 @@ pub(super) async fn convolver_response(
 /// Les bornes du crossfeed, publiées pour que le bout des curseurs d'un client
 /// soit EXACTEMENT celui que le serveur applique (#4683). `amount_max` est le
 /// point mono (Side entièrement replié) : c'est lui que « 100 % » désigne.
+///
+/// #5081 — et celles de l'ombre de la tête. Leur présence est aussi ce qui
+/// dit à un client que ce serveur connaît le filtre : un serveur d'avant ne
+/// les publie pas, et le client cache alors ses contrôles.
 pub(crate) fn crossfeed_limits() -> Value {
     json!({
         "amount_max": tune_core::audio::crossfeed::MAX_AMOUNT,
         "delay_ms_max": tune_core::audio::crossfeed::MAX_DELAY_MS,
+        "cutoff_hz_min": tune_core::audio::crossfeed::COUPURE_MIN_HZ,
+        "cutoff_hz_max": tune_core::audio::crossfeed::COUPURE_MAX_HZ,
+        "slope_db_per_octave_min": tune_core::audio::crossfeed::PENTE_MIN_DB_OCT,
+        "slope_db_per_octave_max": tune_core::audio::crossfeed::PENTE_MAX_DB_OCT,
+    })
+}
+
+/// #5081 — les trois champs de l'ombre de la tête, normalisés et bornés, lus
+/// dans `v`, et à défaut dans `repli` (le réglage déjà enregistré) : un client
+/// d'avant #5081, qui n'envoie que `{ enabled, amount, delay_ms }`, ne ferme
+/// pas le filtre qu'un autre écran a ouvert. Sans l'un ni l'autre : éteint,
+/// 700 Hz, 6 dB/oct.
+pub(crate) fn ombre_normalisee(v: &Value, repli: &Value) -> Value {
+    let champ = |cle: &str| v.get(cle).or_else(|| repli.get(cle));
+    let (cutoff_hz, slope) = tune_core::audio::crossfeed::borner_ombre(
+        champ("cutoff_hz")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(f64::from(tune_core::audio::crossfeed::COUPURE_DEFAUT_HZ)),
+        champ("slope_db_per_octave")
+            .and_then(|p| p.as_f64())
+            .unwrap_or(f64::from(tune_core::audio::crossfeed::PENTE_DEFAUT_DB_OCT)),
+    );
+    json!({
+        "head_shadow_enabled": champ("head_shadow_enabled")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false),
+        "cutoff_hz": cutoff_hz,
+        "slope_db_per_octave": slope,
     })
 }
 
 /// Read the `zone_{id}_crossfeed` settings row into a normalised JSON object,
 /// falling back to defaults (disabled, amount 0.30, delay 0.30 ms) for any
-/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`.
+/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`, plus the
+/// #5081 head-shadow fields `{ head_shadow_enabled, cutoff_hz,
+/// slope_db_per_octave }` (off, 700 Hz, 6 dB/oct when never written).
 pub(super) fn read_crossfeed_config(
     settings: &tune_core::db::settings_repo::SettingsRepo,
     id: i64,
@@ -228,10 +340,14 @@ pub(super) fn read_crossfeed_config(
     let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
     let amount = v.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.30);
     let delay_ms = v.get("delay_ms").and_then(|d| d.as_f64()).unwrap_or(0.30);
+    let ombre = ombre_normalisee(&v, &Value::Null);
     json!({
         "enabled": enabled,
         "amount": amount,
         "delay_ms": delay_ms,
+        "head_shadow_enabled": ombre["head_shadow_enabled"],
+        "cutoff_hz": ombre["cutoff_hz"],
+        "slope_db_per_octave": ombre["slope_db_per_octave"],
     })
 }
 
@@ -323,44 +439,42 @@ pub(super) async fn set_zone_dsp(
 ) -> impl IntoResponse {
     // Authorize the whole request before any write: EQ is free, crossfeed is
     // separately Premium. A mixed request must never partially mutate EQ.
-    if body.get("crossfeed").is_some() {
-        if let Err(resp) = crate::premium_guard::require_premium_localise(
+    if body.get("crossfeed").is_some()
+        && let Err(resp) = crate::premium_guard::require_premium_localise(
             &state.license,
             tune_core::license::Feature::Crossfeed,
             &headers,
         )
         .await
-        {
-            return resp;
-        }
+    {
+        return resp;
     }
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     for (key, plugin) in [("eq_profile", "equalizer"), ("crossfeed", "crossfeed")] {
-        if body.get(key).is_some() {
-            if let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin) {
-                return response;
-            }
+        if body.get(key).is_some()
+            && let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin)
+        {
+            return response;
         }
     }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;
     let mut eq_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
-    if let Some(eq_val) = body.get("eq_profile") {
-        if let Ok(profile) =
+    if let Some(eq_val) = body.get("eq_profile")
+        && let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
-        {
-            let key = format!("zone_{id}_eq_profile");
-            let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
-            // Persister ne suffit pas : sans ceci le reglage n'atteint le son
-            // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
-            // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
-            // ne le faisait pas.
-            let portee = state.orchestrator.apply_eq_change_portee(id).await;
-            eq_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
-            eq_portee = Some(portee);
-        }
+    {
+        let key = format!("zone_{id}_eq_profile");
+        let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+        // Persister ne suffit pas : sans ceci le reglage n'atteint le son
+        // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
+        // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
+        // ne le faisait pas.
+        let portee = state.orchestrator.apply_eq_change_portee(id).await;
+        eq_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        eq_portee = Some(portee);
     }
 
     // Handle crossfeed sub-object if present (local-output headphone effect).
@@ -369,6 +483,7 @@ pub(super) async fn set_zone_dsp(
     // même borne que les préréglages, #4684). Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
+    let mut cf_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
     // au CLIC dise déjà si le réglage aura le moindre effet.
     let mut crossfeed_status: Option<tune_core::audio::crossfeed::CrossfeedStatus> = None;
@@ -387,10 +502,16 @@ pub(super) async fn set_zone_dsp(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.30),
         );
+        // #5081 — l'ombre de la tête ; un champ absent du corps garde la
+        // valeur enregistrée (`ombre_normalisee`).
+        let ombre = ombre_normalisee(cf_val, &read_crossfeed_config(&settings, id));
         let normalised = json!({
             "enabled": enabled,
             "amount": amount,
             "delay_ms": delay_ms,
+            "head_shadow_enabled": ombre["head_shadow_enabled"],
+            "cutoff_hz": ombre["cutoff_hz"],
+            "slope_db_per_octave": ombre["slope_db_per_octave"],
         });
         let key = format!("zone_{id}_crossfeed");
         let _ = settings.set(
@@ -401,8 +522,11 @@ pub(super) async fn set_zone_dsp(
         // Meme raison que pour l'egaliseur juste au-dessus : persister ne
         // suffit pas. Sans ceci, activer le crossfeed ou deplacer `amount` /
         // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
-        // (#1786).
-        cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
+        // (#1786). #4680 — et la réponse dit QUAND : un booléen seul
+        // confondait « rien ne joue », « piste suivante » et un retrait à chaud.
+        let portee = state.orchestrator.refresh_zone_crossfeed_portee(id).await;
+        cf_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        cf_portee = Some(portee);
         // #2742 — et si la zone ne peut PAS faire tourner de crossfeed, le
         // serveur le dit au lieu d'enregistrer en silence. Journalisé au
         // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
@@ -425,6 +549,9 @@ pub(super) async fn set_zone_dsp(
     // il ne crée aucun traitement, il rend par le volume ce que l'égaliseur
     // (gratuit) ou le crossfeed (Premium, déjà gardé) retirent.
     let mut compensation_appliquee_a_chaud = false;
+    // #5071 — quand la bascule s'entend, comme `eq_portee` ; `null` sans
+    // `level_compensation` dans le corps.
+    let mut compensation_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     if let Some(enabled) = body
         .get("level_compensation")
         .and_then(|v| v.get("enabled"))
@@ -432,11 +559,21 @@ pub(super) async fn set_zone_dsp(
     {
         let cle = tune_core::orchestrator::PlaybackOrchestrator::cle_compensation_de_niveau(id);
         let _ = settings.set(&cle, if enabled { "true" } else { "false" });
-        compensation_appliquee_a_chaud = state.orchestrator.refresh_zone_compensation(id).await;
+        // #5071 — sortie locale : à chaud, par le volume. Zone réseau : le
+        // flux porte la compensation, il est refabriqué par le chemin même
+        // d'un changement d'égaliseur (anti-rebond, plancher, flux conservé
+        // quand rien ne change).
+        let portee = state
+            .orchestrator
+            .apply_compensation_change_portee(id)
+            .await;
+        compensation_appliquee_a_chaud =
+            portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        compensation_portee = Some(portee);
     }
     // Rendu à CHAQUE écriture : changer l'égaliseur ou le crossfeed change
     // aussi ce que la compensation rend.
-    let level_compensation = compensation_de_niveau_de_zone(&state, id);
+    let level_compensation = compensation_de_niveau_de_zone(&state, id).await;
 
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
@@ -465,9 +602,12 @@ pub(super) async fn set_zone_dsp(
         "eq_portee": eq_portee.map(|p| p.code()),
         // Idem pour le crossfeed (#1786).
         "crossfeed_applied_live": cf_applique_a_chaud,
+        // #4680 — même contrat que `eq_portee` ; `null` sans `crossfeed`.
+        "crossfeed_portee": cf_portee.map(|p| p.code()),
         // #4685 — l'interrupteur et ce qu'il rend, après cette écriture.
         "level_compensation": level_compensation,
         "level_compensation_applied_live": compensation_appliquee_a_chaud,
+        "level_compensation_portee": compensation_portee.map(|p| p.code()),
     }))
     .into_response()
 }

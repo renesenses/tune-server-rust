@@ -155,6 +155,10 @@ const MIGRATION_TABLES: &[&str] = &[
     // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
     // l'etiquetage est le seul moyen de ranger.
     "streaming_item_tags",
+    // Titres de service bannis (#4806). Sans cette ligne, tous les titres
+    // Qobuz/Tidal/Bandcamp bannis redeviendraient jouables par l'aleatoire
+    // et la radio a la bascule SQLite -> PostgreSQL.
+    "streaming_hidden_items",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -276,7 +280,12 @@ CREATE TABLE IF NOT EXISTS albums (
     release_type TEXT,
     -- Curseur de la passe des crédits MusicBrainz (#4767). NUL = jamais
     -- interrogé.
-    credits_mb_at TEXT
+    credits_mb_at TEXT,
+    -- Source de la pochette et fichier d'origine (#5034, SQLite 111 / PG 074).
+    -- NUL = inconnue. TEXT des deux côtés.
+    cover_source TEXT,
+    cover_source_path TEXT,
+    cover_source_stamp TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -416,7 +425,11 @@ CREATE TABLE IF NOT EXISTS zones (
     dlna_cap_16bit TEXT DEFAULT 0,
     lyrics_offset_ms TEXT DEFAULT 0,
     last_seen_at TEXT,
-    output_endpoint_id TEXT
+    output_endpoint_id TEXT,
+    -- Motif et date du masquage (#5077, SQLite 112 / PG 075). NUL = inconnu.
+    -- TEXT des deux côtés.
+    motif_masquage TEXT,
+    masquee_le TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -693,6 +706,23 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
     PRIMARY KEY (tag_id, item_type, source, source_id)
 );
 
+-- Titres de SERVICE bannis (#4806) — jumelle de `hidden_items` pour la paire
+-- `source` + `source_id`. `profile_id` en BIGINT et non TEXT : la copie lie
+-- NATIVEMENT les entiers, et les filtres le comparent a un entier.
+CREATE TABLE IF NOT EXISTS streaming_hidden_items (
+    profile_id BIGINT NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, source, source_id)
+);
+
 -- Registre DURABLE des serveurs multimedia (#2219, phase 1). Une base creee
 -- par la bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
 -- rejoue JAMAIS les scripts numerotes : sans cette declaration ici, la
@@ -928,6 +958,7 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 CREATE TABLE IF NOT EXISTS upnp_library_sources (
     source_key TEXT PRIMARY KEY,
     udn TEXT NOT NULL,
@@ -1008,6 +1039,12 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
 ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 
+-- Source de la pochette d'album (SQLite migration v111, #5034). Sans défaut :
+-- NUL = inconnue, l'état de toute ligne d'avant la migration.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_path TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_stamp TEXT;
+
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
 
@@ -1027,6 +1064,10 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT;
+-- Motif et date du masquage d'une zone (SQLite migration v112, #5077). Sans
+-- défaut : NUL = inconnu, l'état de tout masquage d'avant la migration.
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS motif_masquage TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS masquee_le TEXT;
 
 -- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;
@@ -1084,14 +1125,14 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 /// mirrors migration 013). No Rust write path can produce '' — the model
 /// field is `Option<f64>` and binds natively — so once converted the column
 /// stays clean.
-const PG_NORMALIZE_FILE_MTIME: &str = r#"
+pub(crate) const PG_NORMALIZE_FILE_MTIME: &str = r#"
 DO $$
 DECLARE
     cur_type TEXT;
 BEGIN
     SELECT data_type INTO cur_type
       FROM information_schema.columns
-     WHERE table_name = 'tracks' AND column_name = 'file_mtime';
+     WHERE table_schema = current_schema() AND table_name = 'tracks' AND column_name = 'file_mtime';
     IF cur_type IN ('text', 'character varying') THEN
         UPDATE tracks SET file_mtime = NULL WHERE file_mtime = '';
         ALTER TABLE tracks ALTER COLUMN file_mtime TYPE DOUBLE PRECISION
@@ -1267,10 +1308,31 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let batch_size = 1000;
     let mut copied = 0;
 
-    // Build the INSERT template. For tables with a composite PK
-    // (track_metadata) or a text PK (settings), we need to handle
-    // ON CONFLICT differently.
-    let conflict_clause = match table {
+    let conflict_clause = conflict_clause(table);
+
+    for chunk in rows.chunks(batch_size) {
+        insert_batch(pool, table, &columns, chunk, conflict_clause).await?;
+        copied += chunk.len();
+        if total > 5000 && copied % 5000 == 0 {
+            info!(table, copied, total, "pg_migrate_batch_progress");
+        }
+    }
+
+    Ok(total)
+}
+
+/// La clause `ON CONFLICT` de la copie d'une table.
+///
+/// Elle doit viser la CLEF de la table — sa clef primaire ou un index
+/// unique — telle que `PG_FULL_SCHEMA` la declare. PostgreSQL refuse une
+/// cible qui n'en est pas une, et le refus fait tomber TOUT le lot : la table
+/// part alors en `pg_migrate_table_skipped`, ses lignes restent en SQLite.
+/// Le test `pg_bascule_chaque_clause_vise_une_clef` confronte chaque table de
+/// `MIGRATION_TABLES` au catalogue d'un vrai PostgreSQL.
+fn conflict_clause(table: &str) -> &'static str {
+    // For tables with a composite PK (track_metadata) or a text PK
+    // (settings), we need to handle ON CONFLICT differently.
+    match table {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "track_metadata" => "ON CONFLICT (track_id, key) DO NOTHING",
         "album_metadata" => "ON CONFLICT (album_id, key) DO NOTHING",
@@ -1280,6 +1342,10 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         // Cette table n'a PAS de colonne `id` : la clause par defaut
         // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
         "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
+        // Meme cas (#4806) : pas de colonne `id`, la clef est la paire.
+        "streaming_hidden_items" => {
+            "ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"
+        }
         // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
         // seule identite d'un appareil UPnP qui survive a un changement de
         // port (#2219, phase 1).
@@ -1291,19 +1357,19 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",
+        // Pas de colonne `id` non plus : la clef primaire, lue dans les
+        // migrations SQLite et PostgreSQL. Sans ces lignes, la clause par
+        // defaut ci-dessous faisait echouer leur copie (« column "id" does not
+        // exist ») et la bascule perdait en silence les albums et titres
+        // masques ou bannis (#1391), les favoris de facette (#2442), les
+        // arbitrages de doublons (#1276) et les appareils ignores (#1280).
+        "favorite_facets" => "ON CONFLICT (profile_id, facet, value) DO NOTHING",
+        "hidden_items" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
+        "album_distinct_pairs" => "ON CONFLICT (profile_id, album_a_id, album_b_id) DO NOTHING",
+        "ignored_devices" => "ON CONFLICT (device_id) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
-    };
-
-    for chunk in rows.chunks(batch_size) {
-        insert_batch(pool, table, &columns, chunk, conflict_clause).await?;
-        copied += chunk.len();
-        if total > 5000 && copied % 5000 == 0 {
-            info!(table, copied, total, "pg_migrate_batch_progress");
-        }
     }
-
-    Ok(total)
 }
 
 /// Insert a batch of rows into PG using a single multi-row INSERT.
@@ -1417,3 +1483,272 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
 // (ici l.569 et db/postgres.rs) et `queue_items_id_seq` (db/postgres.rs). Le
 // correctif demande un PostgreSQL réel pour être prouvé ; il n'est PAS fait ici,
 // et rebrancher cette fonction-là ne l'aurait pas fait non plus.
+
+/// La bascule SQLite -> PostgreSQL sur un VRAI PostgreSQL, table par table.
+///
+/// Sautes sans `TUNE_TEST_PG_URL` ; l'etape « Bascule SQLite -> PostgreSQL,
+/// clefs de conflit » de `test-postgres.yml` les execute (#5134).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Connection, PgConnection, Row};
+
+    /// Remplace le nom de base dans une URL `postgresql://…/nom[?…]`.
+    fn url_vers_base(url: &str, base: &str) -> String {
+        let (avant, apres) = match url.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (url, None),
+        };
+        let racine = avant.rsplit_once('/').map(|(r, _)| r).unwrap_or(avant);
+        match apres {
+            Some(q) => format!("{racine}/{base}?{q}"),
+            None => format!("{racine}/{base}"),
+        }
+    }
+
+    /// Detruit puis recree une base jetable, avec `unaccent` comme la CI, et
+    /// rend son URL. `nom` est une constante de ce module, jamais une entree.
+    async fn base_jetable(url: &str, nom: &str) -> String {
+        let mut maintenance = PgConnection::connect(url)
+            .await
+            .unwrap_or_else(|e| panic!("connexion a {url} : {e}"));
+        for ordre in [
+            format!("DROP DATABASE IF EXISTS {nom} WITH (FORCE)"),
+            format!("CREATE DATABASE {nom}"),
+        ] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(ordre.clone()))
+                .execute(&mut maintenance)
+                .await
+                .unwrap_or_else(|e| panic!("{ordre} : {e}"));
+        }
+        maintenance.close().await.ok();
+        let cible = url_vers_base(url, nom);
+        let mut c = PgConnection::connect(&cible).await.unwrap();
+        sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS unaccent")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        c.close().await.ok();
+        cible
+    }
+
+    async fn supprimer_base(url: &str, nom: &str) {
+        if let Ok(mut m) = PgConnection::connect(url).await {
+            let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {nom} WITH (FORCE)"
+            )))
+            .execute(&mut m)
+            .await;
+        }
+    }
+
+    /// Les tables de `MIGRATION_TABLES` qui n'ont PAS de colonne `id` : elles
+    /// ne peuvent pas tomber dans la clause par defaut `ON CONFLICT (id)`.
+    /// Chacune recoit deux lignes dans la base SQLite de depart.
+    const LIGNES_SQLITE: &str = "
+        INSERT INTO hidden_items (profile_id, item_type, item_id, item_name, item_artist)
+            VALUES (1, 'album', 11, 'Kind of Blue', 'Miles Davis'),
+                   (1, 'track', 12, 'So What', 'Miles Davis');
+        INSERT INTO favorite_facets (profile_id, facet, value)
+            VALUES (1, 'label', 'ECM'), (1, 'label', 'Blue Note');
+        INSERT INTO album_distinct_pairs (profile_id, album_a_id, album_b_id, a_name, b_name)
+            VALUES (1, 21, 22, 'Live', 'Live (remaster)'),
+                   (1, 23, 24, 'Best of', 'Best of II');
+        INSERT INTO ignored_devices (device_id, mac, host, name, device_type)
+            VALUES ('uuid:tv-salon', 'aa:bb:cc:dd:ee:01', '192.168.1.40', 'TV salon', 'upnp'),
+                   ('uuid:box', 'aa:bb:cc:dd:ee:02', '192.168.1.1', 'Box', 'upnp');
+    ";
+    const TABLES_SANS_ID: [&str; 4] = [
+        "hidden_items",
+        "favorite_facets",
+        "album_distinct_pairs",
+        "ignored_devices",
+    ];
+
+    fn sqlite_de_depart() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(LIGNES_SQLITE)
+            .expect("lignes SQLite de depart");
+        db
+    }
+
+    async fn compte(url: &str, table: &str) -> i64 {
+        let mut c = PgConnection::connect(url).await.unwrap();
+        let n: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        c.close().await.ok();
+        n
+    }
+
+    /// Aller-retour : la bascule copie les lignes des tables sans `id`, en
+    /// entier et a l'identique.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_tables_sans_id_aller_retour() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_sans_id";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+
+        let r = migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("bascule : {e}"));
+        let mut pertes = Vec::new();
+        for table in TABLES_SANS_ID {
+            let erreurs: Vec<&String> = r
+                .errors
+                .iter()
+                .filter(|e| e.starts_with(&format!("{table}:")))
+                .collect();
+            let detail = r.details.iter().find(|d| d.table == table).unwrap();
+            let en_pg = compte(&cible, table).await;
+            if !erreurs.is_empty() || detail.skipped || detail.rows != 2 || en_pg != 2 {
+                pertes.push(format!(
+                    "{table} : {en_pg} ligne(s) sur 2 en PostgreSQL, erreurs {erreurs:?}"
+                ));
+            }
+        }
+        assert!(
+            pertes.is_empty(),
+            "lignes perdues a la bascule :\n{}",
+            pertes.join("\n")
+        );
+
+        // Le contenu, pas seulement le nombre.
+        let mut c = PgConnection::connect(&cible).await.unwrap();
+        let masques: Vec<String> =
+            sqlx::query("SELECT item_type || ':' || item_id FROM hidden_items ORDER BY 1")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+                .iter()
+                .map(|l| l.get::<String, _>(0))
+                .collect();
+        assert_eq!(masques, ["album:11", "track:12"]);
+        let labels: Vec<String> = sqlx::query("SELECT value FROM favorite_facets ORDER BY 1")
+            .fetch_all(&mut c)
+            .await
+            .unwrap()
+            .iter()
+            .map(|l| l.get::<String, _>(0))
+            .collect();
+        assert_eq!(labels, ["Blue Note", "ECM"]);
+        c.close().await.ok();
+
+        supprimer_base(&url, BASE).await;
+    }
+
+    /// Reprise d'une copie interrompue : la meme table recopiee sur une base
+    /// qui porte deja ses lignes. C'est le cas que la clause `ON CONFLICT`
+    /// sert : ni erreur, ni doublon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_tables_sans_id_reprise_sans_doublon() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_reprise";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&cible)
+            .await
+            .unwrap();
+        sqlx::raw_sql(PG_FULL_SCHEMA)
+            .execute(&pool)
+            .await
+            .expect("PG_FULL_SCHEMA");
+
+        let mut echecs = Vec::new();
+        for table in TABLES_SANS_ID {
+            for passage in ["copie", "reprise"] {
+                match migrate_table(&sqlite, &pool, table).await {
+                    Ok(2) => {}
+                    autre => echecs.push(format!("{table} ({passage}) : {autre:?}")),
+                }
+            }
+            let en_pg = compte(&cible, table).await;
+            if en_pg != 2 {
+                echecs.push(format!(
+                    "{table} : {en_pg} ligne(s) en PostgreSQL au lieu de 2"
+                ));
+            }
+        }
+        pool.close().await;
+        supprimer_base(&url, BASE).await;
+        assert!(
+            echecs.is_empty(),
+            "reprise de la copie :\n{}",
+            echecs.join("\n")
+        );
+    }
+
+    /// Chaque clause de `conflict_clause` doit nommer EXACTEMENT les colonnes
+    /// d'une clef primaire ou d'un index unique de sa table, lus dans le
+    /// catalogue du PostgreSQL que `PG_FULL_SCHEMA` vient de monter. Garde
+    /// toute table ajoutee plus tard a `MIGRATION_TABLES` sans sa clause.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_chaque_clause_vise_une_clef() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_clefs";
+        let cible = base_jetable(&url, BASE).await;
+        let mut c = PgConnection::connect(&cible).await.unwrap();
+        sqlx::raw_sql(PG_FULL_SCHEMA)
+            .execute(&mut c)
+            .await
+            .expect("PG_FULL_SCHEMA");
+
+        let mut ecarts = Vec::new();
+        for table in MIGRATION_TABLES {
+            let clause = conflict_clause(table);
+            let mut visees: Vec<String> = clause
+                .split_once('(')
+                .and_then(|(_, r)| r.split_once(')'))
+                .map(|(cols, _)| cols.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default();
+            visees.sort();
+
+            let clefs: Vec<Vec<String>> = sqlx::query(
+                "SELECT array_agg(a.attname::text ORDER BY a.attname::text) \
+                 FROM pg_index i \
+                 JOIN pg_class t ON t.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey) \
+                 WHERE n.nspname = 'public' AND t.relname = $1 AND i.indisunique \
+                 GROUP BY i.indexrelid",
+            )
+            .bind(*table)
+            .fetch_all(&mut c)
+            .await
+            .unwrap()
+            .iter()
+            .map(|l| l.get::<Vec<String>, _>(0))
+            .collect();
+
+            if !clefs.contains(&visees) {
+                ecarts.push(format!("{table} : « {clause} », clefs reelles {clefs:?}"));
+            }
+        }
+        c.close().await.ok();
+        supprimer_base(&url, BASE).await;
+        assert!(
+            ecarts.is_empty(),
+            "clause ON CONFLICT sans clef correspondante — la bascule perdrait ces tables :\n{}",
+            ecarts.join("\n")
+        );
+    }
+}

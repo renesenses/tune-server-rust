@@ -66,6 +66,15 @@ pub enum Feature {
     /// crédits par piste, images d'artistes, pochettes (Bertrand, 16/09/2026 :
     /// « en plugin PREMIUM »).
     PontRoon,
+    /// « Concerts » (#2363) : les dates à venir des artistes de la
+    /// bibliothèque, autour de la commune saisie. Sa propre tuile, incluse
+    /// dans Premium, sans achat séparé (Bertrand, 30/08 et 25/09/2026).
+    ///
+    /// Le greffon `tune-concerts` la déclare par
+    /// `TunePlugin::required_feature` : le payant est une propriété du
+    /// GREFFON, pas d'un chemin d'URL, et la décision (complet / refusé,
+    /// bientôt réduit pour les comptes gratuits) tient chez lui.
+    Concerts,
 }
 
 impl Feature {
@@ -100,6 +109,7 @@ impl Feature {
             Feature::Declick,
             Feature::AcousticAnalysis,
             Feature::PontRoon,
+            Feature::Concerts,
         ]
     }
 
@@ -124,6 +134,7 @@ impl Feature {
             Feature::AiRecommendations => "AI Recommendations",
             Feature::AcousticAnalysis => "Acoustic Analysis",
             Feature::PontRoon => "Roon Bridge",
+            Feature::Concerts => "Concerts",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -165,6 +176,7 @@ impl Feature {
             Feature::AiRecommendations => "ai_recommendations",
             Feature::AcousticAnalysis => "acoustic_analysis",
             Feature::PontRoon => "pont_roon",
+            Feature::Concerts => "concerts",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -1249,6 +1261,108 @@ fn is_expired(timestamp: &str, days: i64) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Refus d'un module payant
+// ---------------------------------------------------------------------------
+
+/// Où acheter un droit, et où lier son compte. Une seule définition, lue par
+/// `premium_guard` (tune-server) et par les greffons qui refusent eux-mêmes.
+pub const URL_OFFRE_PREMIUM: &str = "https://mozaiklabs.fr/pricing";
+
+// Descendu de `tune-server/src/premium_guard.rs`, qui le ré-exporte : un
+// greffon natif (« Concerts », #2363) décide lui-même de son refus et ne peut
+// pas dépendre de `tune-server` — l'inverse ferait un cycle. Une seule forme
+// de refus de module pour l'hôte et pour les greffons, pas deux.
+/// Pourquoi un **module payant** (SKU séparé, ex. « diretta ») est indisponible.
+///
+/// Les modules ne passent pas par [`Feature`] : ils ne sont pas des options du
+/// palier premium mais des achats distincts, et leur droit voyage
+/// **uniquement avec le compte lié** — jamais avec la clé de licence. D'où les
+/// deux raisons, qui appellent deux gestes opposés de la part de
+/// l'utilisateur : lier son compte, ou acheter le module.
+///
+/// Cette distinction est tout l'objet de #2392. Un bêta-testeur du module
+/// Diretta a réinstallé Fedora, changé de système de fichiers et recompilé
+/// trente minutes durant, parce que le serveur ne disait **rien** : son droit
+/// était valide depuis sept jours, il lui manquait une connexion de compte.
+/// Le refus n'existait nulle part — ni en journal au-dessus de `debug`, ni
+/// dans une réponse d'API. Le nommer est le correctif.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleRefusal {
+    /// Aucun compte lié : le droit ne peut pas parvenir au serveur, même
+    /// acheté et même avec une clé premium valide saisie.
+    AccountNotLinked,
+    /// Compte lié, mais ce module-ci n'est pas possédé.
+    NotOwned,
+}
+
+impl ModuleRefusal {
+    /// La raison du refus, ou `None` si le module est bien possédé.
+    ///
+    /// `account_linked` = un jeton de compte (`mozaik_access_token`) est
+    /// stocké. Il départage les deux seuls écrans aujourd'hui identiques.
+    pub fn evaluate(module_owned: bool, account_linked: bool) -> Option<Self> {
+        match (module_owned, account_linked) {
+            (true, _) => None,
+            // L'ordre compte : sans compte lié, on ne SAIT pas si le module est
+            // possédé — la liste est vide parce que personne n'a pu la lire, pas
+            // parce que l'achat manque. Annoncer « non possédé » à quelqu'un qui
+            // a payé, c'est le renvoyer acheter deux fois.
+            (false, false) => Some(Self::AccountNotLinked),
+            (false, true) => Some(Self::NotOwned),
+        }
+    }
+
+    /// Le **code** stable, seul terme du contrat avec le client.
+    ///
+    /// Piège relevé sur #2419 : `require_premium` composait son `message` en
+    /// anglais (`"… requires Tune Premium"`) et l'interface l'affichait tel
+    /// quel dans un écran traduit. Ce guide-ci a tenu le premier ; depuis
+    /// #2419 `require_premium` porte lui aussi un `code`, et sa phrase suit
+    /// l'`Accept-Language`. Les deux familles de refus se lisent pareil.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AccountNotLinked => "module_account_not_linked",
+            Self::NotOwned => "module_not_owned",
+        }
+    }
+
+    /// Le geste attendu de l'utilisateur — l'« actionnable » du refus.
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::AccountNotLinked => "link_account",
+            Self::NotOwned => "purchase_module",
+        }
+    }
+
+    /// Repli anglais, pour le journal et pour un client qui ne connaîtrait pas
+    /// encore le code. **Jamais** destiné à être affiché tel quel.
+    fn message(self, module: &str) -> String {
+        match self {
+            Self::AccountNotLinked => format!(
+                "the {module} module is a paid add-on: link your Mozaiklabs account so the server can receive the entitlement"
+            ),
+            Self::NotOwned => {
+                format!("the {module} module is a paid add-on and this account does not own it")
+            }
+        }
+    }
+
+    /// Le refus, dans la **même forme** que celui de `premium_guard::require_premium` (tune-server) :
+    /// `error` + `message` + `upgrade_url`, plus le `code` et l'`action` qui
+    /// portent le sens. Une seule famille de refus premium, pas deux.
+    pub fn to_json(self, module: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": "module_required",
+            "code": self.code(),
+            "module": module,
+            "action": self.action(),
+            "message": self.message(module),
+            "upgrade_url": URL_OFFRE_PREMIUM,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,13 +1418,15 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentysix_features() {
+    fn all_premium_has_twentyseven_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
         // rien et tournait sur des installations gratuites ; puis à 26 avec
-        // `PontRoon` (16/09/2026, décision de Bertrand).
-        assert_eq!(Feature::all_premium().len(), 26);
+        // `PontRoon` (16/09/2026, décision de Bertrand) ; puis à 27 avec
+        // `Concerts` (#2363) — sa propre tuile, incluse dans Premium (Bertrand,
+        // 30/08 et 25/09/2026).
+        assert_eq!(Feature::all_premium().len(), 27);
     }
 
     #[test]

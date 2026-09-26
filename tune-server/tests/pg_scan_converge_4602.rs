@@ -356,6 +356,44 @@ const BIBLIOTHEQUE: &[Piste] = &[
             ("TRACKNUMBER", "2"),
         ],
     },
+    // 13. Coffret rangé UN DOSSIER PAR DISQUE, le numéro dans le titre
+    //     (coffrets automatiques, GO du 25/09/2026). Forme exacte du .18 :
+    //     des années DIFFÉRENTES en tête des deux dossiers, et le disque 2
+    //     tagué « disque 1 », comme chaque disque rippé à part.
+    Piste {
+        dossier: "Laurent Garnier/1999-Early Works, Disc 1",
+        fichier: "01.flac",
+        balises: &[
+            ("TITLE", "Wake Up"),
+            ("ARTIST", "Laurent Garnier"),
+            ("ALBUM", "Early Works, Disc 1"),
+            ("DISCNUMBER", "1"),
+            ("TRACKNUMBER", "1"),
+        ],
+    },
+    Piste {
+        dossier: "Laurent Garnier/2001-Early Works, Disc 2",
+        fichier: "01.flac",
+        balises: &[
+            ("TITLE", "Acid Eiffel"),
+            ("ARTIST", "Laurent Garnier"),
+            ("ALBUM", "Early Works, Disc 2"),
+            ("DISCNUMBER", "1"),
+            ("TRACKNUMBER", "1"),
+        ],
+    },
+    // 14. …et sa contre-épreuve : un disque 2 SEUL reste un album à part.
+    Piste {
+        dossier: "Christian McBride/2006-Live at Tonic, Disc 2",
+        fichier: "01.flac",
+        balises: &[
+            ("TITLE", "Sonic Tonic"),
+            ("ARTIST", "Christian McBride"),
+            ("ALBUM", "Live at Tonic, Disc 2"),
+            ("DISCNUMBER", "2"),
+            ("TRACKNUMBER", "1"),
+        ],
+    },
 ];
 
 /// Une pochette `cover.png` propre au dossier : c'est elle qui arme la
@@ -477,6 +515,7 @@ async fn jouer(state: &AppState, etiquette: &str) -> Vec<Comptes> {
         if i == 0 {
             eprintln!("[{etiquette}] rapport : {rapport}");
         }
+        verifier_coffret(state, etiquette, i + 1);
         passes.push(c);
     }
 
@@ -489,6 +528,7 @@ async fn jouer(state: &AppState, etiquette: &str) -> Vec<Comptes> {
         .execute_batch("UPDATE tracks SET album_id = NULL")
         .expect("simuler une base abîmée");
     let (repare, _) = scanner(state, true).await;
+    verifier_coffret(state, etiquette, 99);
     eprintln!("[{etiquette}] après « Scan complet » sur base abîmée : {repare:?}");
     assert_eq!(
         repare.sans_album, 0,
@@ -498,6 +538,44 @@ async fn jouer(state: &AppState, etiquette: &str) -> Vec<Comptes> {
 
     let _ = std::fs::remove_dir_all(&racine);
     passes
+}
+
+/// Le coffret *Early Works* est RÉUNI par la passe qui suit le scan — sur le
+/// VRAI chemin, `POST /system/scan` — et le disque isolé ne l'est pas.
+///
+/// Ce témoin garde le SITE D'APPEL (`routes/system/scan.rs`) : les témoins de
+/// `tune-core` n'appellent que la passe elle-même.
+fn verifier_coffret(state: &AppState, etiquette: &str, passe: usize) {
+    let db = state.backend.as_ref();
+    let titres = |t: &str| {
+        compte(
+            db,
+            &format!("SELECT COUNT(*) FROM albums WHERE title = '{t}'"),
+        )
+    };
+    assert_eq!(
+        (
+            titres("Early Works"),
+            titres("Early Works, Disc 1"),
+            titres("Early Works, Disc 2")
+        ),
+        (1, 0, 0),
+        "{etiquette}, passe {passe} : le coffret n'est pas réuni après le scan"
+    );
+    assert_eq!(
+        compte(
+            db,
+            "SELECT COUNT(DISTINCT t.disc_number) FROM tracks t \
+             JOIN albums a ON a.id = t.album_id WHERE a.title = 'Early Works'",
+        ),
+        2,
+        "{etiquette}, passe {passe} : deux disques attendus dans le coffret"
+    );
+    assert_eq!(
+        titres("Live at Tonic, Disc 2"),
+        1,
+        "{etiquette}, passe {passe} : un disque SEUL a été touché"
+    );
 }
 
 /// Ce qu'un moteur doit tenir, passe après passe : toutes les pistes posées
@@ -549,10 +627,11 @@ async fn le_scan_range_chaque_piste_dans_un_album_et_rend_les_memes_comptes_a_ch
             .expect("vider la bibliothèque PostgreSQL");
         let p = jouer(&pg, "postgres").await;
         verifier("PostgreSQL", &p);
-        // ⚠️ Le NOMBRE d'albums n'est pas comparé entre moteurs : la fusion
-        // post-scan des albums homonymes (`routes/system/scan.rs`, #593) est
-        // écrite en `GROUP_CONCAT` et ne tourne que sur SQLite. C'est un
-        // arbitrage ouvert, pas un oubli de ce banc — voir la PR de #4602.
+        // ⚠️ Le NOMBRE d'albums n'est pas comparé entre moteurs. La fusion
+        // post-scan des albums homonymes (#593), longtemps morte sur
+        // PostgreSQL (`GROUP_CONCAT` en dur), tourne sur les deux moteurs
+        // depuis le reste de #5005 — elle a son propre banc,
+        // `pg_fusions_auto_albums.rs`.
         return;
     }
     eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL de #4602 SAUTÉE");

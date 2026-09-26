@@ -1,4 +1,3 @@
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::db::sqlite::SqliteDb;
@@ -23,9 +22,10 @@ pub struct ZoneInfo {
     pub output_type: String,
 }
 
+/// Délègue à [`crate::confidentialite::anonymiser`], la seule fonction de
+/// nettoyage (#5124) : un second jeu d'expressions divergerait.
 pub fn sanitize_path(text: &str) -> String {
-    let re = Regex::new(r"(/(?:home|Users|mnt|media)/)([^/\s]+)").unwrap();
-    re.replace_all(text, "${1}<user>").to_string()
+    crate::confidentialite::anonymiser_avec(text, None)
 }
 
 pub fn collect_system_info(
@@ -139,13 +139,13 @@ mod tests {
     #[test]
     fn sanitize_unix_paths() {
         let input = "/home/bertrand/Music/song.flac";
-        assert_eq!(sanitize_path(input), "/home/<user>/Music/song.flac");
+        assert_eq!(sanitize_path(input), "~/Music/song.flac");
     }
 
     #[test]
     fn sanitize_macos_paths() {
         let input = "/Users/john/Music/album/track.mp3";
-        assert_eq!(sanitize_path(input), "/Users/<user>/Music/album/track.mp3");
+        assert_eq!(sanitize_path(input), "~/Music/album/track.mp3");
     }
 
     #[test]

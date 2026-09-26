@@ -63,6 +63,7 @@ const THROTTLE_KEY: &str = "audio_embedding_throttle";
 ///   décoder, servir un flux et répondre à l'interface.
 /// - `rapide` : tous les cœurs — le comportement d'avant, désormais un choix
 ///   explicite et non plus le défaut silencieux.
+///
 /// Réglage de débit par défaut, choisi d'après la taille de la machine.
 ///
 /// `equilibre` (la moitié des cœurs) était le défaut universel : sur .18
@@ -1781,7 +1782,7 @@ mod tests {
     #[test]
     fn clap_window_resamples_true_source_rate_to_48k() {
         // 1 s of 44.1 kHz mono must come out ~1 s of 48 kHz (#1498).
-        let samples: Vec<i32> = (0..44_100).map(|i| ((i % 100) * 100) as i32).collect();
+        let samples: Vec<i32> = (0..44_100).map(|i| (i % 100) * 100).collect();
         let out = prepare_clap_window(&samples, 1, 16, 44_100);
         let ratio = out.len() as f64 / 48_000.0;
         assert!((0.98..1.02).contains(&ratio), "got {} samples", out.len());

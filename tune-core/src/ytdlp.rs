@@ -28,31 +28,52 @@ fn cache() -> &'static Mutex<Option<PathBuf>> {
 /// on Windows, `~/Library/Application Support/Tune` on macOS, `~/.cache/tune`
 /// (or `$XDG_CACHE_HOME/tune`) on Linux. Overridable with `TUNE_TOOLS_DIR`.
 pub fn tools_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("TUNE_TOOLS_DIR") {
-        if !custom.is_empty() {
-            let p = PathBuf::from(custom);
-            std::fs::create_dir_all(&p).ok();
-            return p;
-        }
+    if let Ok(custom) = std::env::var("TUNE_TOOLS_DIR")
+        && !custom.is_empty()
+    {
+        let p = PathBuf::from(custom);
+        std::fs::create_dir_all(&p).ok();
+        return p;
     }
-    let base: PathBuf = if cfg!(target_os = "windows") {
-        std::env::var("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("TuneServer"))
-            .unwrap_or_else(|_| PathBuf::from("TuneServer"))
-    } else if cfg!(target_os = "macos") {
-        std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/Tune"))
-            .unwrap_or_else(|_| std::env::temp_dir().join("tune"))
-    } else {
-        std::env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .unwrap_or_else(|_| std::env::temp_dir())
-            .join("tune")
-    };
+    let lire = |nom: &str| std::env::var(nom).ok();
+    let base = base_des_outils(
+        &lire,
+        // tmp-autorise: base seule : base_des_outils y joint l'UID du compte (#4770).
+        &std::env::temp_dir(),
+        crate::chemins_de_travail::uid_courant(),
+    );
     let dir = base.join("tools");
     std::fs::create_dir_all(&dir).ok();
     dir
+}
+
+/// La base du dossier d'outils, variables d'environnement et repli **passés**.
+///
+/// Sans `HOME` (ni `XDG_CACHE_HOME` sous Linux), le repli était un nom FIXE
+/// sous `temp_dir()` : `…/tune`, partagé par tous les comptes de la machine
+/// (#4770). Le premier compte qui le créait en devenait propriétaire ; chez
+/// les suivants, `create_dir_all(...).ok()` avalait le refus et le
+/// téléchargement de `yt-dlp` échouait ensuite. Le repli passe désormais par
+/// [`crate::chemins_de_travail`] : `temp_dir()/tune-<uid>`.
+///
+/// Tout est paramètre pour que le test simule deux comptes sans toucher à
+/// l'environnement du processus, qui est partagé par les tests parallèles.
+fn base_des_outils(lire: &dyn Fn(&str) -> Option<String>, temp: &Path, uid: u32) -> PathBuf {
+    let repli = || crate::chemins_de_travail::racine_de_travail_sous(temp, "tune", uid);
+    if cfg!(target_os = "windows") {
+        lire("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("TuneServer"))
+            .unwrap_or_else(|| PathBuf::from("TuneServer"))
+    } else if cfg!(target_os = "macos") {
+        lire("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support/Tune"))
+            .unwrap_or_else(repli)
+    } else {
+        lire("XDG_CACHE_HOME")
+            .map(|d| PathBuf::from(d).join("tune"))
+            .or_else(|| lire("HOME").map(|h| PathBuf::from(h).join(".cache").join("tune")))
+            .unwrap_or_else(repli)
+    }
 }
 
 /// Local filename we store the binary under (platform-specific).
@@ -98,13 +119,13 @@ pub fn binary() -> Option<PathBuf> {
 /// configured path (the `yt_dlp_path` setting), then the auto-download location,
 /// then a `yt-dlp` on `PATH`. Returns the resolved path (also cached).
 pub async fn resolve(configured_path: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = configured_path {
-        if !p.is_empty() {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                set_binary(pb.clone());
-                return Some(pb);
-            }
+    if let Some(p) = configured_path
+        && !p.is_empty()
+    {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            set_binary(pb.clone());
+            return Some(pb);
         }
     }
     let local = local_binary_path();
@@ -150,10 +171,10 @@ pub async fn download() -> Result<(PathBuf, String), String> {
     let mut req = client
         .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
         .header("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
     let release: serde_json::Value = req
         .send()
@@ -255,5 +276,61 @@ mod tests {
         let p = local_binary_path();
         assert!(p.ends_with(binary_filename()));
         assert!(p.parent().unwrap().ends_with("tools"));
+    }
+
+    /// Le témoin de #4770 pour les outils : sans `HOME`, deux comptes ne
+    /// visent plus le même dossier, et le second peut y écrire même quand
+    /// le premier a déjà créé le sien (ou l'ancien nom fixe) en `555`.
+    ///
+    /// Contre-épreuve : remettre `temp.join("tune")` comme repli dans
+    /// `base_des_outils` — le test rougit sur l'écriture refusée.
+    #[cfg(unix)]
+    #[test]
+    fn sans_home_deux_comptes_ont_chacun_leurs_outils() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::chemins_de_travail::uid_courant() == 0 {
+            eprintln!("témoin ignoré : exécuté en root, les modes ne mordent pas");
+            return;
+        }
+        let racine = crate::test_scratch::scratch_dir("tune-ytdlp-deux-comptes");
+        let rien = |_: &str| None;
+        let le_sien = base_des_outils(&rien, racine.path(), 1001);
+        let le_mien = base_des_outils(&rien, racine.path(), 1000);
+        assert_ne!(
+            le_mien, le_sien,
+            "deux comptes partagent le dossier d'outils"
+        );
+
+        let ancien = racine.path().join("tune");
+        for d in [&ancien, &le_sien] {
+            std::fs::create_dir_all(d.join("tools")).expect("outils « de l'autre compte »");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).expect("mode 555");
+        }
+        let cree = std::fs::create_dir_all(le_mien.join("tools"))
+            .and_then(|_| std::fs::write(le_mien.join("tools").join("yt-dlp"), b"#!"));
+        for d in [&ancien, &le_sien] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        cree.unwrap_or_else(|e| panic!("écriture refusée dans {le_mien:?} : {e}"));
+        assert!(
+            le_mien.starts_with(racine.path()),
+            "repli hors du dossier temporaire"
+        );
+    }
+
+    /// Quand `HOME` est là, rien ne change : le repli ne sert que sans lui.
+    #[test]
+    fn avec_home_le_dossier_d_outils_ne_change_pas() {
+        let home = |nom: &str| (nom == "HOME").then(|| "/home/moi".to_string());
+        let base = base_des_outils(&home, Path::new("/ailleurs"), 1000);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                base,
+                Path::new("/home/moi/Library/Application Support/Tune")
+            );
+        } else if !cfg!(target_os = "windows") {
+            assert_eq!(base, Path::new("/home/moi/.cache/tune"));
+        }
     }
 }

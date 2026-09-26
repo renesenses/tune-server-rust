@@ -22,6 +22,13 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
     if name.starts_with("tune-stream-") || name.starts_with("tune-prefetch-") {
         return true;
     }
+    // La copie de travail de « Écrire dans les fichiers » (édition d'album,
+    // tranche 4) : posée à CÔTÉ du fichier, le temps d'y écrire les balises,
+    // puis renommée sur lui. Le surveillant ne doit jamais en faire une piste.
+    if name.starts_with(crate::metadata::tag_writer::PREFIXE_COPIE_DE_TRAVAIL) {
+        return true;
+    }
+    // tmp-autorise: comparaison seule : on LIT la racine pour reconnaître nos propres temporaires.
     path.starts_with(std::env::temp_dir())
 }
 
@@ -38,6 +45,18 @@ mod tune_temp_file_tests {
         assert!(is_tune_temp_file(Path::new("/music/tune-stream-abc.flac")));
         assert!(is_tune_temp_file(Path::new(
             "/anywhere/else/tune-stream-abc.flac"
+        )));
+    }
+
+    /// La copie de travail d'« Écrire dans les fichiers » vit dans le dossier
+    /// de l'album, sous une extension audio : seul son nom l'écarte.
+    #[test]
+    fn ecarte_la_copie_de_travail_des_balises() {
+        assert!(is_tune_temp_file(Path::new(
+            "/music/Album/tune-balises-4242-0-17.flac"
+        )));
+        assert!(!is_tune_temp_file(Path::new(
+            "/music/Album/tune-balises.flac"
         )));
     }
 

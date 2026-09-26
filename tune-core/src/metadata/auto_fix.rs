@@ -449,6 +449,8 @@ mod tests {
         .unwrap();
     }
 
+    // Fabrique d'épreuve, un argument par champ du banc (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     fn seed_track(
         db: &SqliteDb,
         id: i64,

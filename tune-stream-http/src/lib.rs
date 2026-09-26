@@ -3920,7 +3920,7 @@ mod tests {
             avant.extend_from_slice(&bloc);
         }
         assert_eq!(&avant[..4], b"RIFF");
-        assert!(avant[44..].iter().any(|o| *o == 0x11));
+        assert!(avant[44..].contains(&0x11));
 
         // ── La reconnexion décrite par #3513 ─────────────────────────────────
         let seconde = super::handle_stream(
@@ -3981,7 +3981,7 @@ mod tests {
         let (_, pcm) = tokio::join!(drainage_premiere, lecture_seconde);
 
         assert!(
-            pcm.iter().any(|o| *o == 0x22),
+            pcm.contains(&0x22),
             "la nouvelle connexion doit porter le direct semé APRES la reprise"
         );
         assert!(

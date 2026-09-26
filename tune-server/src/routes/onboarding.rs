@@ -224,13 +224,13 @@ async fn step_streaming(
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Store credentials if provided (for services that use token auth)
-    if let Some(creds) = &body.credentials {
-        if let Some(obj) = creds.as_object() {
-            for (key, value) in obj {
-                let skey = format!("{}_{}", body.service, key);
-                if let Some(sval) = value.as_str() {
-                    settings.set(&skey, sval).ok();
-                }
+    if let Some(creds) = &body.credentials
+        && let Some(obj) = creds.as_object()
+    {
+        for (key, value) in obj {
+            let skey = format!("{}_{}", body.service, key);
+            if let Some(sval) = value.as_str() {
+                settings.set(&skey, sval).ok();
             }
         }
     }

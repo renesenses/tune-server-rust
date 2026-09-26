@@ -239,10 +239,15 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::add_favorite, sql::add_favorite);
-        // Bind ids as strings: the Postgres mirror stores these columns as TEXT,
-        // so binding i64 made `text = bigint` / int-into-text errors → 500.
-        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
-        let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
+        // Identifiants liés en ENTIER : `favorites.profile_id` et `item_id`
+        // sont BIGINT sur les deux naissances d'une base PostgreSQL (la
+        // migration 012 les convertit sur une base basculée depuis SQLite).
+        // Les lier en chaîne — ce que faisait ce dépôt jusqu'au 25/09/2026, du
+        // temps où le miroir PG les portait en TEXT — rendait « column
+        // "profile_id" is of type bigint but expression is of type text » :
+        // aucun cœur ne se posait sur PostgreSQL. Voir
+        // `tune-server/tests/pg_favoris_locaux_entiers.rs`.
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
         // Fige l'identité (titre/artiste/chemin) au moment de l'ajout, pour
         // re-rattacher le favori si un rescan renouvelle les rowids (racines
@@ -260,7 +265,7 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::remove_favorite, sql::remove_favorite);
-        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
+        let (pid, iid) = (profile_id, item_id);
         let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -273,7 +278,7 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::count_favorite, sql::count_favorite);
-        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
+        let (pid, iid) = (profile_id, item_id);
         let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         match self.db.query_one(&sql, &params)? {
             None => Ok(false),
@@ -293,7 +298,7 @@ impl ProfileRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<Favorite>, String> {
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let rows = if let Some(t) = item_type {
             let sql = self.dialect_sql(sql::list_favorites_by_type, sql::list_favorites_by_type);
             let params: [&dyn ToSqlValue; 2] = [&pid, &t];
@@ -319,7 +324,7 @@ impl ProfileRepo {
         item_type: Option<&str>,
         tri: TriFavoris,
     ) -> Result<Vec<Favorite>, String> {
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let mut rows = if let Some(t) = item_type {
             let sql = self.dialect_sql(
                 sql::list_favorites_by_type_pour_tri,
@@ -400,7 +405,7 @@ impl ProfileRepo {
             .filter(|id| vus.insert(*id))
             .collect();
 
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let raz = self.dialect_sql(sql::raz_ordre_manuel, sql::raz_ordre_manuel);
         let pose = self.dialect_sql(sql::poser_rang_manuel, sql::poser_rang_manuel);
 
@@ -410,11 +415,12 @@ impl ProfileRepo {
             let params: [&dyn ToSqlValue; 2] = [&pid, &item_type];
             tx.execute(&raz, &params)?;
             for (rang, item_id) in uniques.iter().enumerate() {
-                // Rangs et identifiants liés en TEXTE : le miroir PostgreSQL
-                // porte ces colonnes en TEXT, et y lier un i64 rend
-                // « column is of type text but expression is of type bigint »
-                // — le 500 que `add_favorite` documente déjà juste au-dessus.
-                let (rang, iid) = ((rang as i64 + 1).to_string(), item_id.to_string());
+                // Le RANG reste lié en texte : `favorites.position` est TEXT
+                // sur PostgreSQL (y lier un i64 rend « column is of type text
+                // but expression is of type bigint »). Les IDENTIFIANTS, eux,
+                // sont BIGINT sur PG et se lient en entier — voir
+                // `add_favorite`.
+                let (rang, iid) = ((rang as i64 + 1).to_string(), *item_id);
                 let params: [&dyn ToSqlValue; 4] = [&rang, &pid, &item_type, &iid];
                 ranges += tx.execute(&pose, &params)?;
             }

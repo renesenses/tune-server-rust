@@ -380,7 +380,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
     if channels == 0 || channels > 8 {
         return Err(format!("invalid channel count: {channels}"));
     }
-    if sample_rate < 2_000_000 || sample_rate > 50_000_000 {
+    if !(2_000_000..=50_000_000).contains(&sample_rate) {
         return Err(format!("unexpected DSD sample rate: {sample_rate}"));
     }
 
@@ -1294,8 +1294,7 @@ mod tests_dst {
         let mut lecteur = DffStreamReader::open(chemin, &info, 4096).unwrap();
         let err = lecteur
             .next_chunk()
-            .err()
-            .expect("une trame corrompue doit être refusée");
+            .expect_err("une trame corrompue doit être refusée");
         assert!(
             err.contains("DST frame 0"),
             "la trame doit être nommée : {err}"
