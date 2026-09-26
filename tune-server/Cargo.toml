@@ -196,6 +196,13 @@ path = "tests/titres_bannis_4806.rs"
 name = "titres_de_service_bannis_4806"
 path = "tests/titres_de_service_bannis_4806.rs"
 
+# #5138 — la vue Oxygen (dix-huit pages de 2 000 pistes) sur une base de
+# 34 000 pistes : résultat identique, exécuteur jamais tenu. `autotests =
+# false` : sans cette cible, jamais compilé. Rangée au MILIEU, pas en queue.
+[[test]]
+name = "pistes_bibliotheque_lentes_5138"
+path = "tests/pistes_bibliotheque_lentes_5138.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois

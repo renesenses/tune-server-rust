@@ -2838,6 +2838,28 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
 pub(crate) const TRACKS_SOURCE_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_source_source_id ON tracks(source, source_id)";
 
+/// Index de la CLÉ DE COPIE (#5138) : album, disque, numéro et titre replié,
+/// écrits EXACTEMENT comme le côté `mieux` de
+/// [`super::facet_filter::copie_de_moindre_qualite_exclue`].
+///
+/// Sans lui, ce `NOT EXISTS` corrélé ne trouvait que `idx_tracks_album_id` :
+/// pour CHAQUE piste il relisait toutes les pistes de son album dans la
+/// table et y évaluait trois expressions — n × (pistes par album). Mesuré
+/// sur un banc de 34 091 pistes : 0,9 à 1,1 s pour le seul prédicat, et le
+/// compteur comme la liste le paient à chaque page. Chez JeromeQ (0.9.165,
+/// 34 091 pistes) : 7 à 9,7 s par requête, deux requêtes par page, dix-huit
+/// pages pour la vue Oxygen. Avec l'index, la sous-requête cherche la clé
+/// entière et ne trouve, hors vrai doublon, que la piste elle-même.
+///
+/// SQLite seulement : un index d'EXPRESSION ne sert que si le texte de
+/// l'expression est celui de la requête, ce que le plan vérifie
+/// (`lenteur_pistes_5138_tests`). PostgreSQL n'a pas été mesuré ici : son
+/// planificateur peut changer ce `NOT EXISTS` en anti-jointure, et un index
+/// d'expression y exige une autre écriture — hors de ce correctif. Posé dans la passe
+/// rejouée à chaque démarrage, comme [`TRACKS_SOURCE_ID_INDEX`], pour ne pas
+/// prendre de numéro de migration.
+pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_cle_de_copie ON tracks(album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), LOWER(TRIM(COALESCE(title, ''))))";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -3519,6 +3541,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // silence sur toute base deja montee. PG : `run_pg_migrations`, meme passe.
     if let Err(e) = db.execute_batch(TRACKS_SOURCE_ID_INDEX) {
         warn!(error = %e, "sqlite_tracks_source_id_index_failed");
+    }
+    // Clé de copie (#5138) : même passe, même raison — voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_CLE_DE_COPIE_INDEX) {
+        warn!(error = %e, "sqlite_tracks_cle_de_copie_index_failed");
     }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
