@@ -4,6 +4,7 @@ pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
 pub mod coffrets;
+pub mod credits_balises;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod disques_abimes;
@@ -3736,7 +3737,19 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Lyricist) {
         meta.insert("lyricist".into(), v);
     }
-    if let Some(v) = get(ItemKey::Performer) {
+    // #5160 — TOUTES les balises du même nom, pas la première : Picard écrit
+    // un `PERFORMER=…` par musicien, et `get_string` n'en rendait qu'un. Les
+    // valeurs sont jointes par `; `, la forme que le tiroir des crédits
+    // découpe (`credits_balises::decouper_valeur`).
+    let toutes = |key: ItemKey| {
+        let valeurs: Vec<&str> = tag
+            .get_strings(key)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .collect();
+        (!valeurs.is_empty()).then(|| valeurs.join("; "))
+    };
+    if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
     }
     if let Some(v) = get(ItemKey::Remixer) {
@@ -3745,7 +3758,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
-    if let Some(v) = get(ItemKey::Producer) {
+    if let Some(v) = toutes(ItemKey::Producer) {
         meta.insert("producer".into(), v);
     }
 
@@ -6139,6 +6152,83 @@ mod tests {
 /// Un test sur une chaîne ne dirait rien du chemin réel : le bloc de DR est
 /// lu par `read_vorbis_header`, à côté de lofty, et c'est cette conjonction
 /// que le témoin traverse.
+/// #5160 — un `PERFORMER` (ou `PRODUCER`) par musicien, la forme de Picard :
+/// `read_extended_metadata` ne rangeait que le PREMIER (`get_string`), et le
+/// tiroir des crédits, qui les relit dans `track_metadata`, perdait tous les
+/// autres. Vrai conteneur FLAC, lu par la fonction de production.
+#[cfg(test)]
+mod balises_de_credit_multiples_5160 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+    use std::path::Path;
+
+    fn piste(
+        epreuve: &str,
+        tags: &[(&str, &str)],
+    ) -> (crate::test_scratch::ScratchDir, std::path::PathBuf) {
+        let dossier = crate::test_scratch::scratch_dir(&format!("credits-5160-{epreuve}"));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let chemin = dossier.join("01.flac");
+        std::fs::copy(&source, &chemin).expect("copie du gabarit");
+        let mut fh = std::fs::File::open(&chemin).expect("ouverture du gabarit");
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+        drop(fh);
+        if flac.vorbis_comments().is_none() {
+            flac.set_vorbis_comments(VorbisComments::default());
+        }
+        let vc = flac.vorbis_comments_mut().expect("bloc Vorbis Comment");
+        for (k, v) in tags {
+            // `push`, pas `insert` : `insert` remplace la balise du même nom.
+            vc.push(k.to_string(), v.to_string());
+        }
+        flac.save_to_path(&chemin, WriteOptions::default())
+            .expect("écriture des tags");
+        (dossier, chemin)
+    }
+
+    #[test]
+    fn toutes_les_balises_performer_et_producer_sont_rangees_5160() {
+        let (_d, chemin) = piste(
+            "multiples",
+            &[
+                ("PERFORMER", "Christian McBride (bass)"),
+                ("PERFORMER", "Nasheet Waits (drums)"),
+                ("PRODUCER", "Christian McBride"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)"),
+            "#5160 — le second PERFORMER est perdu. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Christian McBride; Todd Whitelock"),
+            "#5160 — le second PRODUCER est perdu. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN — une seule balise, déjà jointe par `;` (la capture de
+    /// Reivax66) : rangée telle quelle.
+    #[test]
+    fn une_balise_unique_reste_telle_quelle_5160() {
+        let (_d, chemin) = piste(
+            "unique",
+            &[("PRODUCER", "Christian McBride; Todd Whitelock")],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Christian McBride; Todd Whitelock")
+        );
+        assert_eq!(meta.get("performer"), None, "Relevé : {meta:?}");
+    }
+}
+
 #[cfg(test)]
 mod provenance_du_dr_3924 {
     use lofty::config::{ParseOptions, WriteOptions};

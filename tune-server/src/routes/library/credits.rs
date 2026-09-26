@@ -83,7 +83,7 @@ pub(super) async fn track_credits(
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -97,7 +97,76 @@ pub(super) async fn track_credits(
             })
         })
         .collect();
+    // #5160 — puis les crédits des balises du fichier.
+    let existantes = std::collections::HashMap::from([(id, items.clone())]);
+    let balises = credits_des_balises_par_piste(&state, &[id], &existantes)
+        .remove(&id)
+        .unwrap_or_default();
+    ajouter_credits_des_balises(&mut items, balises, None);
     Ok(Json(json!(items)))
+}
+
+/// #5160 — les crédits des BALISES (`PERFORMER`, `PRODUCER`…, rangés au scan
+/// dans `track_metadata`) de `track_ids`, groupés par piste, sans une personne
+/// que `existantes` (lignes de `track_credits`) crédite déjà au même rôle.
+/// UN appel pour tout l'album : une requête par clé de crédit, pas par piste.
+fn credits_des_balises_par_piste(
+    state: &AppState,
+    track_ids: &[i64],
+    existantes: &std::collections::HashMap<i64, Vec<Value>>,
+) -> std::collections::HashMap<i64, Vec<tune_core::metadata::credits_balises::CreditDeBalise>> {
+    use tune_core::metadata::credits_balises::{cle_de_doublon, credits_des_balises};
+    let deja: std::collections::HashSet<_> = existantes
+        .iter()
+        .flat_map(|(track_id, lignes)| {
+            lignes.iter().map(move |l| {
+                cle_de_doublon(
+                    *track_id,
+                    l["role"].as_str().unwrap_or(""),
+                    l["artist_name"].as_str().unwrap_or(""),
+                )
+            })
+        })
+        .collect();
+    let mut par_piste: std::collections::HashMap<i64, Vec<_>> = std::collections::HashMap::new();
+    for c in credits_des_balises(&state.backend, track_ids, &deja) {
+        par_piste.entry(c.track_id).or_default().push(c);
+    }
+    par_piste
+}
+
+/// Ajoute à `items` (les lignes de `track_credits` d'UNE piste) ses crédits de
+/// balises. Ces lignes n'existent pas en base : `id` est nul, `position`
+/// continue celle des lignes MusicBrainz. `piste` porte les champs de piste
+/// de la réponse d'album (`track_title`, `track_number`, `disc_number`).
+fn ajouter_credits_des_balises(
+    items: &mut Vec<Value>,
+    balises: Vec<tune_core::metadata::credits_balises::CreditDeBalise>,
+    piste: Option<&Value>,
+) {
+    let mut position = items
+        .iter()
+        .filter_map(|l| l["position"].as_i64())
+        .max()
+        .map_or(0, |p| p + 1);
+    for c in balises {
+        let mut ligne = json!({
+            "id": Value::Null,
+            "track_id": c.track_id,
+            "artist_id": c.artist_id,
+            "artist_name": c.artist_name,
+            "role": c.role,
+            "instrument": c.instrument,
+            "position": position,
+        });
+        if let (Some(piste), Some(objet)) = (piste, ligne.as_object_mut()) {
+            for champ in ["track_title", "track_number", "disc_number"] {
+                objet.insert(champ.to_string(), piste[champ].clone());
+            }
+        }
+        items.push(ligne);
+        position += 1;
+    }
 }
 
 pub(super) async fn artist_credits(
@@ -181,23 +250,63 @@ pub(super) async fn album_credits(
         .backend
         .query_many(&sql, &[&id_str as &dyn ToSqlValue])
         .map_err(|e| AppError::internal(e))?;
-    let items: Vec<Value> = rows
+    let mut par_piste: std::collections::HashMap<i64, Vec<Value>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let track_id = r.get(1).and_then(|v| v.as_i64());
+        let ligne = json!({
+            "id": r.get(0).and_then(|v| v.as_i64()),
+            "track_id": track_id,
+            "artist_id": r.get(2).and_then(|v| v.as_i64()),
+            "artist_name": r.get(3).and_then(|v| v.as_string()),
+            "role": r.get(4).and_then(|v| v.as_string()),
+            "instrument": r.get(5).and_then(|v| v.as_string()),
+            "position": r.get(6).and_then(|v| v.as_i64()),
+            "track_title": r.get(7).and_then(|v| v.as_string()),
+            "track_number": r.get(8).and_then(|v| v.as_i64()),
+            "disc_number": r.get(9).and_then(|v| v.as_i64()),
+        });
+        par_piste
+            .entry(track_id.unwrap_or(0))
+            .or_default()
+            .push(ligne);
+    }
+
+    // #5160 — les pistes de l'album, dans l'ordre du tiroir, pour y joindre
+    // les crédits de leurs BALISES : une piste sans aucune ligne dans
+    // `track_credits` (aucune passe MusicBrainz, aucun import Roon) doit
+    // quand même rendre ses `PERFORMER` / `PRODUCER`.
+    let sql_pistes = format!(
+        "SELECT t.id, t.title, t.track_number, t.disc_number FROM tracks t \
+         WHERE {cle_album} ORDER BY t.disc_number, t.track_number, t.id"
+    );
+    let pistes = state
+        .backend
+        .query_many(&sql_pistes, &[&id_str as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
+    let pistes: Vec<(i64, Value)> = pistes
         .into_iter()
-        .map(|r| {
-            json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
-                "track_id": r.get(1).and_then(|v| v.as_i64()),
-                "artist_id": r.get(2).and_then(|v| v.as_i64()),
-                "artist_name": r.get(3).and_then(|v| v.as_string()),
-                "role": r.get(4).and_then(|v| v.as_string()),
-                "instrument": r.get(5).and_then(|v| v.as_string()),
-                "position": r.get(6).and_then(|v| v.as_i64()),
-                "track_title": r.get(7).and_then(|v| v.as_string()),
-                "track_number": r.get(8).and_then(|v| v.as_i64()),
-                "disc_number": r.get(9).and_then(|v| v.as_i64()),
-            })
+        .filter_map(|r| {
+            let track_id = r.first().and_then(|v| v.as_i64())?;
+            Some((
+                track_id,
+                json!({
+                    "track_title": r.get(1).and_then(|v| v.as_string()),
+                    "track_number": r.get(2).and_then(|v| v.as_i64()),
+                    "disc_number": r.get(3).and_then(|v| v.as_i64()),
+                }),
+            ))
         })
         .collect();
+    let ids: Vec<i64> = pistes.iter().map(|(id, _)| *id).collect();
+    let mut balises = credits_des_balises_par_piste(&state, &ids, &par_piste);
+    let mut items: Vec<Value> = Vec::new();
+    for (track_id, piste) in &pistes {
+        let mut lignes = par_piste.remove(track_id).unwrap_or_default();
+        let siennes = balises.remove(track_id).unwrap_or_default();
+        ajouter_credits_des_balises(&mut lignes, siennes, Some(piste));
+        items.extend(lignes);
+    }
     Ok(Json(json!(items)))
 }
 

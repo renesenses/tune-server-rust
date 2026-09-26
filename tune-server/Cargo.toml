@@ -1072,6 +1072,12 @@ path = "tests/page_artiste_sections_4767.rs"
 name = "credits_album_1572"
 path = "tests/credits_album_1572.rs"
 
+# #5160 — les PERFORMER / PRODUCER des balises (track_metadata) dans le tiroir
+# « Crédits », fil 1965. SQLite toujours ; PostgreSQL si TUNE_TEST_PG_URL.
+[[test]]
+name = "credits_balises_5160"
+path = "tests/credits_balises_5160.rs"
+
 # #4767 — crédits MusicBrainz par disque (fixture réelle de *Déjà vu*) :
 # idempotence, sections « Collaborations » / « Reprises » de la page artiste,
 # focus par pistes créditées, route `/system/enrich-credits`.
