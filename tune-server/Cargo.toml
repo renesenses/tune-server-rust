@@ -350,6 +350,14 @@ required-features = ["postgres"]
 name = "pg_fonctions_sqlite_seules"
 path = "tests/pg_fonctions_sqlite_seules.rs"
 
+# Reste de #5005 : `ai/recommendations.rs` joignait `bigint = text` (`CAST(a.id
+# AS TEXT)`) et datait par `datetime('now', ...)` -- recommandations, Daily
+# mixes et radio intelligente mortes sur PostgreSQL. Pas de `required-features` :
+# la contre-epreuve SQLite tourne dans la suite ordinaire.
+[[test]]
+name = "pg_recommandations_ia"
+path = "tests/pg_recommandations_ia.rs"
+
 # #4625 — la vue par dossiers compte et liste les pistes découpées par une
 # feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
 # cible, le fichier ne serait jamais compilé.

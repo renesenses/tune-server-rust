@@ -320,6 +320,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_fonctions_sqlite_seules -- --nocapture --test-threads=1
 
+      # Reste de #5005 -- `ai/recommendations.rs` : `t.artist_id = CAST(a.id AS
+      # TEXT)` (bigint = text refuse), `datetime('now', ...)`. Chaque requete etait
+      # avalee : recommandations retombees sur le hasard, Daily
+      # mixes vides, radio intelligente sans graine. Jumeau SQLite dans ci.yml.
+      - name: Recommandations IA sur PostgreSQL (#5005)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_recommandations_ia -- --nocapture --test-threads=1
+
       # #3726 — les ECRITURES, et non plus seulement les schemas.
       #
       # Les trois portes ci-dessus comparent des SCHEMAS entre eux. Aucune ne
