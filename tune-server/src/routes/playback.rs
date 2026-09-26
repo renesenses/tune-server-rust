@@ -368,8 +368,9 @@ pub(crate) fn entrees_de_file(
 /// (`insert_at` l'écarte) — `GET /playlists/{id}/tracks` l'omet aussi, donc
 /// l'indice du client désigne toujours la même ligne.
 ///
-/// Un titre banni (#4806) est une piste LOCALE : l'avance de la file le
-/// saute déjà, comme dans toute file.
+/// Un titre banni (#4806), local ou de service, est sauté par l'avance de la
+/// file, comme dans toute file ; la ligne de départ, elle, est un choix de
+/// l'utilisateur et se joue.
 async fn jouer_playlist_mixte(
     state: &AppState,
     zone_id: i64,
@@ -3426,14 +3427,54 @@ pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
     state: &AppState,
     track_id: i64,
 ) -> Vec<Value> {
+    passer_les_zones_qui_jouent(state, &PisteVisee::Locale(track_id)).await
+}
+
+/// Le titre que vise un bannissement : une piste de la bibliothèque, ou un
+/// titre de SERVICE désigné par sa paire (#4806 suite). Deux espaces
+/// d'identifiants — jamais l'un pour l'autre.
+pub(crate) enum PisteVisee {
+    Locale(i64),
+    Service { source: String, source_id: String },
+}
+
+impl PisteVisee {
+    /// Cette lecture en cours est-elle le titre visé ? Un titre de service
+    /// se reconnaît à sa paire et seulement quand la lecture n'a PAS de
+    /// `track_id` : une piste locale dont le `source_id` vaudrait la même
+    /// chaîne n'est pas concernée.
+    fn est_jouee_par(&self, np: &tune_core::playback::NowPlaying) -> bool {
+        match self {
+            PisteVisee::Locale(id) => np.track_id == Some(*id),
+            PisteVisee::Service { source, source_id } => {
+                np.track_id.is_none()
+                    && tune_core::db::hidden_repo::source_normalisee(&np.source) == *source
+                    && np.source_id.as_deref().map(str::trim) == Some(source_id.as_str())
+            }
+        }
+    }
+}
+
+/// #4806 — un titre (local ou de service) vient d'être BANNI alors qu'il
+/// joue : chaque zone qui le joue passe au suivant. Voir
+/// [`passer_les_zones_qui_jouent_la_piste`].
+pub(crate) async fn passer_les_zones_qui_jouent(
+    state: &AppState,
+    visee: &PisteVisee,
+) -> Vec<Value> {
     let mut passees = Vec::new();
     for zs in state.playback.all_states().await {
         if zs.state == tune_core::playback::PlayState::Stopped {
             continue;
         }
-        if zs.now_playing.as_ref().and_then(|np| np.track_id) != Some(track_id) {
+        if !zs
+            .now_playing
+            .as_ref()
+            .is_some_and(|np| visee.est_jouee_par(np))
+        {
             continue;
         }
+        let track_id = zs.now_playing.as_ref().and_then(|np| np.track_id);
         let zone_id = zs.zone_id;
         let titre = zs
             .now_playing
@@ -3462,7 +3503,7 @@ pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
         };
         info!(
             zone_id,
-            track_id,
+            track_id = ?track_id,
             title = %titre,
             queue_position = zs.queue_position,
             suivante = ?suivante,
@@ -3553,19 +3594,34 @@ async fn get_queue(
     let mut zs = ps.clone();
     zs.queue_length = length as i64;
     // #4806 — `banned` par ligne, pour le profil qui regarde : la file n'est
-    // pas purgée, la ligne reste et l'écran la grise. Une ligne de service
-    // (`track_id` absent) n'est jamais bannie, quel que soit son `source_id`.
+    // pas purgée, la ligne reste et l'écran la grise. Une ligne locale se juge
+    // sur son `track_id`, une ligne de SERVICE (`track_id` absent) sur sa
+    // paire `source` + `source_id` — jamais l'une pour l'autre.
     let ids_locaux: Vec<i64> = entries.iter().filter_map(|e| e.track_id).collect();
-    let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+    let bans = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    let bannis = bans
         .banned_track_ids(profile.id(), &ids_locaux)
         .ou_defaut_journalise();
+    let bannis_de_service = if entries.iter().any(|e| e.track_id.is_none()) {
+        bans.banned_streaming_keys(profile.id())
+            .ou_defaut_journalise()
+    } else {
+        Default::default()
+    };
     let tracks: Vec<Value> = entries
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
-                let bannie = e.track_id.is_some_and(|id| bannis.contains(&id));
+                let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
+                    (Some(id), _, _) => bannis.contains(&id),
+                    (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
+                        tune_core::db::hidden_repo::source_normalisee(src),
+                        sid.trim().to_string(),
+                    )),
+                    _ => false,
+                };
                 obj.insert("banned".into(), Value::Bool(bannie));
             }
             let suivant = entries.get(idx + 1);
