@@ -158,9 +158,12 @@ fn couper_la_compensation(m: &Montage) {
         .unwrap();
 }
 
-/// Ce que le renderer reçoit : le PCM décodé du fichier servi.
+/// Ce que le renderer reçoit : le PCM décodé du fichier servi, et la
+/// compensation que la session ANNONCE porter (`StreamInfo::compensation_db`,
+/// ce que le chemin du signal affiche — #5146).
 struct Servi {
     pcm: Vec<u8>,
+    compensation_db: Option<f64>,
 }
 
 async fn jouer(m: &Montage) -> Servi {
@@ -195,9 +198,19 @@ async fn jouer(m: &Montage) -> Servi {
         .await
         .clone()
         .expect("une session FICHIER : l'égaliseur ré-encode la piste entière");
+    let compensation_db = m
+        .orch
+        .streamer
+        .stream_output_wire(&sid)
+        .await
+        .expect("fil publié")
+        .compensation_db;
     let d = crate::audio::decode::decode_to_pcm(&chemin, None, None, 0.0, 0.0).unwrap();
     assert_eq!((d.channels, d.bit_depth), (2, 16));
-    Servi { pcm: d.pcm_bytes() }
+    Servi {
+        pcm: d.pcm_bytes(),
+        compensation_db,
+    }
 }
 
 /// L'étalon : la source passée par l'égaliseur SEUL — les octets que le code
@@ -214,13 +227,12 @@ fn egaliseur_seul(m: &Montage) -> Vec<u8> {
 #[tokio::test]
 async fn le_flux_reseau_porte_toute_la_compensation_quand_la_crete_le_permet_5071() {
     let m = monter(0.05, DEVICE, true).await;
-    let cible = PlaybackOrchestrator::compensation_reseau_prevue_with(
-        &m.orch.db,
-        m.orch.license.as_deref(),
-        m.zone_id,
-    )
-    .expect("une zone DLNA avec égaliseur doit être compensée");
     let servi = jouer(&m).await;
+    // #5146 — la cible que le flux ANNONCE : c'est elle que le chemin du
+    // signal affiche, et c'est elle que les octets doivent rendre.
+    let cible = servi
+        .compensation_db
+        .expect("une zone DLNA avec égaliseur doit être compensée");
     let etalon = egaliseur_seul(&m);
     let rendu = rms_db(&servi.pcm) - rms_db(&etalon);
     println!("#5071 signal bas : cible {cible:.2} dB, rendu {rendu:.2} dB");
@@ -241,13 +253,10 @@ async fn le_flux_reseau_porte_toute_la_compensation_quand_la_crete_le_permet_507
 #[tokio::test]
 async fn un_signal_fort_est_compense_sans_un_echantillon_ecrete_5071() {
     let m = monter(0.9, DEVICE, true).await;
-    let cible = PlaybackOrchestrator::compensation_reseau_prevue_with(
-        &m.orch.db,
-        m.orch.license.as_deref(),
-        m.zone_id,
-    )
-    .unwrap();
     let servi = jouer(&m).await;
+    let cible = servi
+        .compensation_db
+        .expect("le flux annonce sa compensation");
     let etalon = egaliseur_seul(&m);
     let rendu = rms_db(&servi.pcm) - rms_db(&etalon);
     let crete = crete_relative(&servi.pcm, 16);
@@ -279,16 +288,9 @@ async fn un_signal_fort_est_compense_sans_un_echantillon_ecrete_5071() {
 async fn compensation_coupee_le_flux_est_inchange_5071() {
     let m = monter(0.05, DEVICE, true).await;
     couper_la_compensation(&m);
-    assert!(
-        PlaybackOrchestrator::compensation_reseau_prevue_with(
-            &m.orch.db,
-            m.orch.license.as_deref(),
-            m.zone_id
-        )
-        .is_none()
-    );
     let servi = jouer(&m).await;
     assert!(servi.pcm == egaliseur_seul(&m), "le flux a changé");
+    assert_eq!(servi.compensation_db, None, "aucune compensation annoncée");
 }
 
 /// Sans égaliseur ni crossfeed : la compensation (active par défaut) n'a rien
@@ -296,14 +298,6 @@ async fn compensation_coupee_le_flux_est_inchange_5071() {
 #[tokio::test]
 async fn sans_dsp_la_piste_part_telle_quelle_5071() {
     let m = monter(0.9, DEVICE, false).await;
-    assert!(
-        PlaybackOrchestrator::compensation_reseau_prevue_with(
-            &m.orch.db,
-            m.orch.license.as_deref(),
-            m.zone_id
-        )
-        .is_none()
-    );
     let req = PlayRequest {
         zone_id: m.zone_id,
         output_device_id: Some(DEVICE.into()),
@@ -328,6 +322,16 @@ async fn sans_dsp_la_piste_part_telle_quelle_5071() {
         .await
         .clone()
         .expect("fichier servi");
+    assert_eq!(
+        m.orch
+            .streamer
+            .stream_output_wire(&sid)
+            .await
+            .expect("fil publié")
+            .compensation_db,
+        None,
+        "une piste servie telle quelle n'annonce aucune compensation"
+    );
     assert_eq!(
         std::fs::read(&chemin).unwrap(),
         std::fs::read(&m.source).unwrap(),

@@ -2367,6 +2367,9 @@ impl PlaybackOrchestrator {
                     )
                 })
                 .flatten();
+            // Ce que le fichier servi porte, dit par son `StreamInfo` comme le
+            // crossfeed ci-dessus : le chemin du signal le lit au lieu de le prévoir.
+            let compensation_cuite_db = compensation.as_ref().map(|c| c.cible_db());
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
@@ -2505,6 +2508,7 @@ impl PlaybackOrchestrator {
                     file_size: Some(file_size),
                     duration_ms: Some(track_duration_ms as u64),
                     crossfeed: crossfeed_cuit,
+                    compensation_db: compensation_cuite_db,
                     ..Default::default()
                 };
                 let session_id = self
@@ -2767,6 +2771,7 @@ impl PlaybackOrchestrator {
                             file_size: Some(file_size),
                             duration_ms: Some(track_duration_ms as u64),
                             crossfeed: crossfeed_cuit,
+                            compensation_db: compensation_cuite_db,
                             ..Default::default()
                         };
                         let session_id = self
@@ -2926,6 +2931,7 @@ impl PlaybackOrchestrator {
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
             info.crossfeed = relais && dsp.crossfeed_executable();
+            info.compensation_db = dsp.compensation_cuite_db().filter(|_| relais);
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
 
             // LAT-F1 (phase 0) : la chaîne DSP de la zone AU FIL DE L'EAU.

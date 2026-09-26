@@ -1327,6 +1327,7 @@ impl PlaybackOrchestrator {
         let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
         let info = StreamInfo {
             crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
+            compensation_db: dsp.compensation_cuite_db(),
             ..info
         };
         let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;

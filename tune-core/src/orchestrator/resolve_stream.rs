@@ -1513,6 +1513,7 @@ impl PlaybackOrchestrator {
         // la session de fichier dira si ses octets portent le crossfeed.
         // Le remux (sans traitement) ne l'appelle jamais, d'où `dash_dsp_active`.
         let dash_crossfeed = dash_dsp_active && dash_dsp.crossfeed_executable();
+        let dash_compensation = dash_dsp.compensation_cuite_db().filter(|_| dash_dsp_active);
         let flux = {
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
@@ -1643,6 +1644,7 @@ impl PlaybackOrchestrator {
                         file_size: Some(file_size),
                         duration_ms: None,
                         crossfeed: dash_crossfeed,
+                        compensation_db: dash_compensation,
                         ..Default::default()
                     };
                     // Store into the warm cache (atomic rename) when enabled, so
@@ -1895,6 +1897,7 @@ impl PlaybackOrchestrator {
             // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
             let info = StreamInfo {
                 crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
+                compensation_db: aac_dsp.compensation_cuite_db(),
                 ..info
             };
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
@@ -2043,6 +2046,9 @@ impl PlaybackOrchestrator {
             let https_dsp_active = https_dsp.is_active();
             // #5114 — lu avant que le porteur parte dans la tâche de décodage.
             let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
+            let https_compensation = https_dsp
+                .compensation_cuite_db()
+                .filter(|_| https_dsp_active);
 
             // #5080 — traitement actif vers une zone réseau : WAV progressif,
             // le traitement au fil de l'eau, quand la bibliothèque y aurait
@@ -2236,6 +2242,7 @@ impl PlaybackOrchestrator {
                             file_size: Some(file_size),
                             duration_ms: None,
                             crossfeed: https_crossfeed,
+                            compensation_db: https_compensation,
                             ..Default::default()
                         };
                         let session_id = self

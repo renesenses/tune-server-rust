@@ -3902,9 +3902,18 @@ fn flac_16_en_lecture_5071() -> ZoneState {
     }
 }
 
+/// #5146 — un fil qui porte la compensation de niveau, tel que la session le
+/// publie (`StreamInfo::compensation_db`).
+fn fil_compense(format: &str, compensation_db: f64) -> StreamInfo {
+    StreamInfo {
+        compensation_db: Some(compensation_db),
+        ..wire(format, 44_100, 16)
+    }
+}
+
 /// #5071 — sur une zone RÉSEAU, la compensation de niveau est cuite dans le
-/// flux : le chemin du signal la NOMME, avec son gain, non bit-perfect, et
-/// placée après le DSP — là où elle a lieu.
+/// flux : le chemin du signal la NOMME, avec son gain — celui que le flux
+/// publie (#5146) —, non bit-perfect, et placée après le DSP, là où elle a lieu.
 #[test]
 fn la_compensation_reseau_est_une_etape_du_chemin_5071() {
     let (backend, zone) = dlna_zone();
@@ -3915,14 +3924,18 @@ fn la_compensation_reseau_est_une_etape_du_chemin_5071() {
         &backend,
         Some("Marantz ND8006"),
         "",
-        Some(&wire("flac", 44_100, 16)),
+        Some(&fil_compense("flac", 4.27)),
     )
     .unwrap();
     let comp = etape(&sp, "Compensation").expect("étape Compensation absente");
     eprintln!("compensation = {comp}");
     assert_eq!(comp["bit_perfect"], false, "{comp}");
     assert_eq!(comp["code"], "level_compensation");
-    assert!(comp["compensation_db"].as_f64().unwrap() > 0.5, "{comp}");
+    assert_eq!(
+        comp["compensation_db"].as_f64(),
+        Some(4.27),
+        "le gain affiché est celui que le flux publie : {comp}"
+    );
     assert_eq!(sp["bit_perfect"], false);
     let noms: Vec<&str> = sp["steps"]
         .as_array()
@@ -4080,13 +4093,17 @@ fn un_crossfeed_regle_que_le_flux_ne_porte_pas_n_affiche_rien_5114() {
 #[test]
 fn le_crossfeed_precede_la_compensation_5114() {
     let (backend, zone) = zone_reseau_crossfeed_5114(true);
+    let fil = StreamInfo {
+        compensation_db: Some(0.12),
+        ..fil_avec_crossfeed("wav")
+    };
     let sp = build_signal_path(
         &flac_16_en_lecture_5071(),
         &zone,
         &backend,
         Some("Marantz ND8006"),
         "",
-        Some(&fil_avec_crossfeed("wav")),
+        Some(&fil),
     )
     .unwrap();
     let noms: Vec<&str> = sp["steps"]
@@ -4103,46 +4120,33 @@ fn le_crossfeed_precede_la_compensation_5114() {
     );
 }
 
-/// #5114 — licence ÉCHUE : l'orchestrateur ne charge pas le crossfeed, le
-/// flux part intact. Le miroir de la compensation passe par la MÊME garde :
-/// il ne compte plus ce crossfeed absent, aucune étape Compensation n'est
-/// inventée et le fil reste bit-perfect. Le témoin : la même zone, sans
-/// garde, dont le flux porte le crossfeed — elle EST compensée.
+/// #5146 — cas 3 de #2742 : crossfeed seul, renderer sans LPCM, piste de la
+/// bibliothèque servie TELLE QUELLE. L'interrupteur de compensation est armé
+/// (défaut) et le crossfeed coché, mais le flux ne traverse aucun étage : ses
+/// octets sont ceux de la source. Le chemin du signal ne doit afficher ni
+/// Crossfeed ni Compensation, et le fil intact reste bit-perfect.
+///
+/// Avant, la compensation était PRÉVUE depuis les réglages
+/// (`compensation_reseau_prevue_with`) : le miroir comptait le crossfeed coché
+/// et inventait une étape « Compensation » — et « non bit-perfect » — sur ce
+/// fil intact.
 #[test]
-fn licence_echue_le_miroir_ne_compense_pas_un_crossfeed_absent_5114() {
+fn piste_servie_telle_quelle_aucune_compensation_fantome_5146() {
     let (backend, zone) = zone_reseau_crossfeed_5114(true);
-    let echue = tune_core::license::LicenseManager::new(backend.clone());
-    assert!(
-        !echue.premium_snapshot(),
-        "le témoin exige une licence échue"
-    );
-    let ps = flac_16_en_lecture_5071();
-    let temoin = build_signal_path_sous_licence(
-        &ps,
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
         &zone,
         &backend,
-        None,
-        Some("Marantz ND8006"),
-        "",
-        Some(&fil_avec_crossfeed("wav")),
-    )
-    .unwrap();
-    assert!(
-        etape(&temoin, "Compensation").is_some(),
-        "le témoin doit compenser le crossfeed : {temoin}"
-    );
-    let sp = build_signal_path_sous_licence(
-        &ps,
-        &zone,
-        &backend,
-        Some(&echue),
         Some("Marantz ND8006"),
         "",
         Some(&wire("flac", 44_100, 16)),
     )
     .unwrap();
-    assert!(etape(&sp, "Compensation").is_none(), "{sp}");
     assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
+    assert!(
+        etape(&sp, "Compensation").is_none(),
+        "aucune compensation n'est cuite dans un fil intact : {sp}"
+    );
     assert_eq!(sp["bit_perfect"], true, "{sp}");
 }
 

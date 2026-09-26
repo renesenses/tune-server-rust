@@ -1578,8 +1578,7 @@ impl PlaybackOrchestrator {
         Self::eq_profile_configure_with(&self.db, zone_id)
     }
 
-    /// Même lecture, sans orchestrateur — c'est par là que le chemin du
-    /// signal compose la compensation réseau (#5071).
+    /// Même lecture, sans orchestrateur.
     fn eq_profile_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
@@ -1804,8 +1803,7 @@ impl PlaybackOrchestrator {
 
     /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
     /// garde de licence : la même, écrite une fois, sur le même
-    /// `LicenseManager`. C'est par là que le miroir de la compensation réseau
-    /// lit le crossfeed. `None` : aucune garde, comme un orchestrateur sans
+    /// `LicenseManager`. `None` : aucune garde, comme un orchestrateur sans
     /// licence (les tests).
     fn crossfeed_configure_sous_licence(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
@@ -1909,58 +1907,6 @@ impl PlaybackOrchestrator {
             Some("true") => true,
             _ => Self::COMPENSATION_DE_NIVEAU_PAR_DEFAUT,
         }
-    }
-
-    /// #5071 — la compensation qu'un flux RÉSEAU bâti maintenant pour cette
-    /// zone porterait, en dB, lisible SANS orchestrateur : c'est par là que le
-    /// chemin du signal la dit.
-    ///
-    /// Miroir de [`Self::compensation_du_flux_reseau`] appelée par les
-    /// chargeurs de la lecture : PURE, interrupteur coupé, sortie `local:`
-    /// (qui compense par son volume) ou ni égaliseur ni crossfeed ⇒ `None`.
-    /// Sondé à 44,1 kHz stéréo, comme [`Self::gain_moyen_du_dsp_de_zone`].
-    ///
-    /// #5114 — `license` porte la garde de licence du crossfeed, la MÊME que
-    /// [`Self::crossfeed_configure`] (et par la même fonction) : sans elle,
-    /// une licence échue faisait compter au miroir un crossfeed que le flux
-    /// ne porte pas, et la cible était surestimée de son gain moyen. `None` :
-    /// aucune garde, comme un orchestrateur sans licence.
-    pub fn compensation_reseau_prevue_with(
-        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
-        license: Option<&crate::license::LicenseManager>,
-        zone_id: i64,
-    ) -> Option<f64> {
-        if crate::audio::audiophile::zone_enabled(db, zone_id)
-            || !Self::zone_compensation_de_niveau_with(db, zone_id)
-        {
-            return None;
-        }
-        let sortie_locale = ZoneRepo::with_backend(db.clone())
-            .get(zone_id)
-            .ok()
-            .flatten()
-            .and_then(|z| z.output_device_id)
-            .is_none_or(|id| id.starts_with("local:"));
-        if sortie_locale {
-            return None;
-        }
-        let eq = Self::eq_profile_configure_with(db, zone_id)
-            .map(|p| crate::audio::eq::EqProcessor::new(&p, 44_100, 2))
-            .filter(|p| p.is_enabled())
-            .map(|p| p.gain_moyen_db());
-        let cf = Self::crossfeed_configure_sous_licence(db, license, zone_id).map(
-            |(amount, delay_ms)| {
-                crate::audio::crossfeed::CrossfeedProcessor::new(44_100, amount, delay_ms)
-                    .gain_moyen_db()
-            },
-        );
-        if eq.is_none() && cf.is_none() {
-            return None;
-        }
-        crate::audio::compensation_reseau::CompensationReseau::depuis_db(
-            -(eq.unwrap_or(0.0) + cf.unwrap_or(0.0)),
-        )
-        .map(|c| c.cible_db())
     }
 
     /// #4685 — ce que l'égaliseur et le crossfeed de la zone font au niveau

@@ -139,7 +139,6 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             &ps,
             z,
             &state.backend,
-            Some(&*state.license),
             renderer_label,
             audio_backend,
             wire.as_ref(),

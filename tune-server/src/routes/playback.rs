@@ -698,7 +698,6 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             &zone_state,
             zone,
             &state.backend,
-            Some(&*state.license),
             renderer_label,
             audio_backend,
             wire.as_ref(),

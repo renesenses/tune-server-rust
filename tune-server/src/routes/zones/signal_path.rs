@@ -4,20 +4,11 @@ pub fn build_signal_path_pub(
     ps: &ZoneState,
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    licence: Option<&tune_core::license::LicenseManager>,
     renderer_label: Option<&str>,
     audio_backend: &str,
     wire: Option<&StreamInfo>,
 ) -> Option<Value> {
-    build_signal_path_sous_licence(
-        ps,
-        zone,
-        backend,
-        licence,
-        renderer_label,
-        audio_backend,
-        wire,
-    )
+    build_signal_path(ps, zone, backend, renderer_label, audio_backend, wire)
 }
 
 /// #1395 — sur la ZONE, dire quel backend de sortie locale tourne vraiment,
@@ -555,23 +546,6 @@ pub(super) fn build_signal_path(
     audio_backend: &str,
     wire: Option<&StreamInfo>,
 ) -> Option<Value> {
-    build_signal_path_sous_licence(ps, zone, backend, None, renderer_label, audio_backend, wire)
-}
-
-/// [`build_signal_path`], sous la licence du serveur (#5114).
-///
-/// `licence` est le `LicenseManager` que l'orchestrateur consulte avant de
-/// charger le crossfeed : le miroir de la compensation réseau passe par la
-/// MÊME garde. `None` : aucune garde, comme un orchestrateur sans licence.
-pub(super) fn build_signal_path_sous_licence(
-    ps: &ZoneState,
-    zone: &Zone,
-    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    licence: Option<&tune_core::license::LicenseManager>,
-    renderer_label: Option<&str>,
-    audio_backend: &str,
-    wire: Option<&StreamInfo>,
-) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
     }
@@ -594,15 +568,8 @@ pub(super) fn build_signal_path_sous_licence(
     // mesuré le publie, et `None` laisse chaque verdict à sa déduction.
     let transformations_reelles = ps.transformations_reelles.as_ref();
 
-    let traitements = relever_les_traitements(
-        backend,
-        licence,
-        zone,
-        np,
-        output_type,
-        runtime_signal_path,
-        wire,
-    );
+    let traitements =
+        relever_les_traitements(backend, zone, np, output_type, runtime_signal_path, wire);
     let forcages = decider_les_forcages(
         zone,
         backend,
@@ -1954,10 +1921,11 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
-    /// #5071 — la compensation de niveau cuite dans le flux RÉSEAU, en dB.
-    /// `None` sur une sortie locale (elle compense par son volume, une
-    /// préférence et non une dégradation), en PURE, interrupteur coupé, ou
-    /// sans égaliseur ni crossfeed.
+    /// #5071 — la compensation de niveau cuite dans le flux RÉSEAU, en dB,
+    /// telle que la session la publie (`StreamInfo::compensation_db`, #5146).
+    /// `None` sans session, ou quand le flux n'en porte pas : sortie locale
+    /// (elle compense par son volume), PURE, interrupteur coupé, piste servie
+    /// telle quelle.
     compensation_reseau_db: Option<f64>,
     /// #5114 — le flux servi porte le crossfeed dans ses octets, tel que la
     /// session le publie (`StreamInfo::crossfeed`). `false` sans session.
@@ -1969,7 +1937,6 @@ struct Traitements {
 /// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
 fn relever_les_traitements(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-    licence: Option<&tune_core::license::LicenseManager>,
     zone: &Zone,
     np: &tune_core::playback::NowPlaying,
     output_type: &str,
@@ -2010,15 +1977,16 @@ fn relever_les_traitements(
     let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
 
     // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
-    // échantillon du flux : une étape, et le verdict en tient compte. Même
-    // lecture que les chargeurs de la lecture (`compensation_du_flux_reseau`).
+    // échantillon du flux : une étape, et le verdict en tient compte.
     //
-    // #5114 — sous la MÊME garde de licence que le crossfeed réellement
-    // chargé : une licence échue ne fait plus compter un crossfeed absent.
-    let compensation_reseau_db =
-        tune_core::orchestrator::PlaybackOrchestrator::compensation_reseau_prevue_with(
-            backend, licence, zid,
-        );
+    // #5146 — LUE sur le fil (`StreamInfo::compensation_db`), comme le
+    // crossfeed juste en dessous, et non plus prévue depuis les réglages par
+    // `compensation_reseau_prevue_with`. Le miroir ne savait pas si le flux
+    // servi traversait un étage de compensation : sur une piste partie telle
+    // quelle (cas 3 de #2742, crossfeed seul vers un renderer sans LPCM), il
+    // comptait le crossfeed et affichait une compensation — et « non
+    // bit-perfect » — sur des octets intacts. Le flux, lui, sait ce qu'il cuit.
+    let compensation_reseau_db = wire.and_then(|w| w.compensation_db);
     let crossfeed_du_flux = wire.is_some_and(|w| w.crossfeed);
 
     // Volume at 100% means no software volume adjustment.
