@@ -258,16 +258,25 @@ pub(super) fn lot_du_surveillant(
     );
     let racines = [racine.to_string_lossy().into_owned()];
     let mut attente = Vec::new();
-    traiter_le_lot_du_surveillant(
-        db,
-        prets,
-        &ReglagesDuSurveillant {
-            exclusions: &[],
-            racines: &racines,
-            quality_split: true,
-        },
-        &mut attente,
-    );
+    // Hors du runtime de l'épreuve, comme dans la boucle de production
+    // (`spawn_blocking`) : le surveillant prend la porte des lots de scan
+    // (#5072) par `blocking_lock`, qui panique sur un fil de Tokio.
+    std::thread::scope(|fils| {
+        fils.spawn(|| {
+            traiter_le_lot_du_surveillant(
+                db,
+                prets,
+                &ReglagesDuSurveillant {
+                    exclusions: &[],
+                    racines: &racines,
+                    quality_split: true,
+                },
+                &mut attente,
+            )
+        })
+        .join()
+        .expect("le lot du surveillant a paniqué");
+    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
