@@ -400,6 +400,12 @@ pub(crate) fn dossier_de_travail_sur(dossier: &Path) -> Result<(), String> {
 pub(crate) fn dossier_de_travail_prive(dans: Option<&Path>) -> Result<tempfile::TempDir, String> {
     let mut b = tempfile::Builder::new();
     b.prefix(".tune-maj-paquet-");
+    // Créé fermé d'emblée : `tempfile` suit sinon le umask (0755).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        b.permissions(std::fs::Permissions::from_mode(0o700));
+    }
     let dossier = match dans {
         Some(parent) => b.tempdir_in(parent),
         None => b.tempdir(),
@@ -937,6 +943,41 @@ mod tests {
             corps["macos_paquet"]["erreur"],
             "signature du nouveau paquet refusée"
         );
+    }
+
+    /// Le lanceur du paquet RESTE le parent du serveur : `exec` sans `&`.
+    /// Orphelin, le serveur n'est plus rattaché à l'app et macOS lui refuse le
+    /// réseau local, clé de #4949 ou non (#5141).
+    #[test]
+    fn le_lanceur_du_paquet_reste_parent_du_serveur() {
+        let release = include_str!("../../../../.github/workflows/release.yml");
+        let debut = release
+            .find("cat > /tmp/tune-launcher.applescript")
+            .expect("heredoc du lanceur introuvable dans release.yml");
+        let fin = debut
+            + release[debut..]
+                .find("\n          ASCRIPT\n")
+                .expect("fin du heredoc du lanceur introuvable");
+        let lanceur = &release[debut..fin];
+        let lancement: Vec<&str> = lanceur
+            .lines()
+            .filter(|l| l.contains("serverBin &") && l.contains("do shell script"))
+            .collect();
+        assert_eq!(
+            lancement.len(),
+            1,
+            "une seule ligne lance le serveur : {lancement:?}"
+        );
+        let ligne = lancement[0];
+        assert!(
+            ligne.contains("exec \" & serverBin"),
+            "le serveur doit être lancé par `exec` : {ligne}"
+        );
+        assert!(
+            !ligne.trim_end().ends_with("2>&1 &\""),
+            "le serveur ne doit plus partir en arrière-plan : {ligne}"
+        );
+        assert!(lanceur.contains("TUNE_RELANCE_APRES_MAJ"));
     }
 
     /// Câblage : la réparation au démarrage est LANCÉE, pas seulement écrite.

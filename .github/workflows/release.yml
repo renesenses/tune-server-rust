@@ -922,7 +922,9 @@ jobs:
           # même binaire, lancé depuis un Terminal resté ouvert, voyait tout.
           # TUNE_PORT se surcharge par l'environnement (`open --env`), et
           # TUNE_RELANCE_APRES_MAJ=1 (relance après mise à jour) n'ouvre pas
-          # d'onglet de plus (#1236).
+          # d'onglet de plus (#1236). L'Info.plist porte
+          # OSAAppletShowStartupScreen=false : sans la clé, un applet recompilé
+          # a été vu bloqué sur son écran de démarrage modal, serveur jamais lancé.
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run
             set appPath to (path to me as text)
@@ -965,6 +967,7 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
             <key>NSAppleScriptEnabled</key><true/>
+            <key>OSAAppletShowStartupScreen</key><false/>
             <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
             <key>NSBonjourServices</key>
             <array>
