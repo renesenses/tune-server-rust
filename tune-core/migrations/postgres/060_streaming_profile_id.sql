@@ -11,14 +11,14 @@ DECLARE
 BEGIN
   SELECT data_type, column_default INTO typ, def
     FROM information_schema.columns
-   WHERE table_schema = 'public' AND table_name = 'streaming_favorites'
+   WHERE table_schema = current_schema() AND table_name = 'streaming_favorites'
      AND column_name = 'profile_id';
   IF typ IN ('text', 'character varying', 'integer', 'smallint') THEN
-    ALTER TABLE public.streaming_favorites ALTER COLUMN profile_id DROP DEFAULT;
-    ALTER TABLE public.streaming_favorites ALTER COLUMN profile_id TYPE BIGINT
+    ALTER TABLE streaming_favorites ALTER COLUMN profile_id DROP DEFAULT;
+    ALTER TABLE streaming_favorites ALTER COLUMN profile_id TYPE BIGINT
       USING profile_id::bigint;
     IF def IS NOT NULL THEN
-      EXECUTE format('ALTER TABLE public.streaming_favorites ALTER COLUMN profile_id SET DEFAULT (%s)::bigint', def);
+      EXECUTE format('ALTER TABLE streaming_favorites ALTER COLUMN profile_id SET DEFAULT (%s)::bigint', def);
     END IF;
   END IF;
 END

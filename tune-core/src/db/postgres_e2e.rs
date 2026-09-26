@@ -795,7 +795,7 @@ async fn pg_settings_round_trip() {
     // expected to be present. Skip if not.
     let exists = db
         .query_one(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = 'settings'",
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'settings'",
             &[],
         )
         .unwrap_or(None);
@@ -864,7 +864,7 @@ async fn pg_1220_numeric_columns_have_numeric_types() {
         let row = db
             .query_one(
                 "SELECT data_type FROM information_schema.columns \
-                 WHERE table_name = $1 AND column_name = $2",
+                 WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
                 &[&t, &cc],
             )
             .unwrap();
@@ -1005,7 +1005,7 @@ async fn pg_1706_ensure_schema_heals_queue_items_numbering() {
     // The statement that used to abort the batch is now guarded, so everything
     // AFTER it ran: queue_items exists…
     let exists: Option<String> = sqlx::query_scalar(
-        "SELECT table_name FROM information_schema.tables WHERE table_name = 'queue_items'",
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'queue_items'",
     )
     .fetch_optional(db.pool())
     .await
@@ -1019,7 +1019,7 @@ async fn pg_1706_ensure_schema_heals_queue_items_numbering() {
     for col in ["track_number", "disc_number"] {
         let dt: Option<String> = sqlx::query_scalar(
             "SELECT data_type FROM information_schema.columns \
-             WHERE table_name = 'queue_items' AND column_name = $1",
+             WHERE table_schema = current_schema() AND table_name = 'queue_items' AND column_name = $1",
         )
         .bind(col)
         .fetch_optional(db.pool())
@@ -1113,7 +1113,7 @@ async fn pg_2860_continuer_lecoute_et_ajouts_recents() {
     let type_album_id = |db: &Arc<dyn DbBackend>| -> String {
         db.query_many(
             "SELECT data_type FROM information_schema.columns \
-             WHERE table_name = 'listen_history' AND column_name = 'album_id'",
+             WHERE table_schema = current_schema() AND table_name = 'listen_history' AND column_name = 'album_id'",
             &[],
         )
         .unwrap()

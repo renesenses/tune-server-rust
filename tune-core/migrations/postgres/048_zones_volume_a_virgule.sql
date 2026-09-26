@@ -35,7 +35,7 @@ DECLARE
 BEGIN
   SELECT data_type INTO cur_type
     FROM information_schema.columns
-   WHERE table_name = 'zones' AND column_name = 'volume';
+   WHERE table_schema = current_schema() AND table_name = 'zones' AND column_name = 'volume';
 
   IF cur_type IS NULL THEN
     RAISE NOTICE 'zones.volume absente — rien a convertir';

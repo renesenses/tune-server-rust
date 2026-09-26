@@ -49,7 +49,7 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'hidden_items'
+         WHERE table_schema = current_schema() AND table_name = 'hidden_items'
            AND column_name = 'profile_id'
            AND data_type IN ('text', 'character varying')
     ) THEN
@@ -62,7 +62,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'hidden_items'
+         WHERE table_schema = current_schema() AND table_name = 'hidden_items'
            AND column_name = 'item_id'
            AND data_type IN ('text', 'character varying')
     ) THEN

@@ -43,7 +43,7 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'favorite_facets'
+         WHERE table_schema = current_schema() AND table_name = 'favorite_facets'
            AND column_name = 'profile_id'
            AND data_type IN ('text', 'character varying')
     ) THEN

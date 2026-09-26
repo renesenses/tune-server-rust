@@ -4134,7 +4134,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // in-place cast is safe; no-op once the column is integer.
     let version_type: Option<String> = sqlx::query_scalar(
         "SELECT data_type FROM information_schema.columns \
-         WHERE table_name = 'schema_version' AND column_name = 'version'",
+         WHERE table_schema = current_schema() AND table_name = 'schema_version' AND column_name = 'version'",
     )
     .fetch_optional(pool)
     .await
