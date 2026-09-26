@@ -82,7 +82,11 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // séparer imposerait un second appel — et laisserait l'étiquette absente
     // tant qu'il n'a pas répondu. C'est aussi la troisième sonde de la base :
     // elle touche `settings`, une table que les deux comptages ne lisent pas.
-    let name_result = SettingsRepo::with_backend(state.backend.clone()).get("server_name");
+    // #5086 — par le pool de lecture : cette route est la sonde « le serveur
+    // répond-il ? ». Par l'écrivain, elle attendait tout écrivain en cours, et
+    // un serveur qui servait passait pour « injoignable ».
+    let name_result =
+        SettingsRepo::with_backend(state.backend.clone()).get_sans_ecrivain("server_name");
     let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
     let sondes = [

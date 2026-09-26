@@ -2654,9 +2654,12 @@ fn statut_publie(stocke: String, droit_tenu: bool) -> String {
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
+    // #5086 — lu par le pool, pas par l'écrivain : un statut PUBLIÉ n'a pas à
+    // attendre la fin d'une écriture, et c'est `SCAN_GATE`, plus bas, qui fait
+    // foi pendant un scan. Par l'écrivain, Support › Diagnostic rendait « — ».
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let status = settings
-        .get("scan_status")
+        .get_sans_ecrivain("scan_status")
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
@@ -2669,7 +2672,7 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings
-        .get("scan_result")
+        .get_sans_ecrivain("scan_result")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
