@@ -8615,6 +8615,49 @@ async fn la_portee_distingue_la_relance_de_la_piste_suivante_4680() {
     );
 }
 
+/// #4680, moitié crossfeed — `crossfeed_applied_live: false` confondait « rien
+/// ne joue » et « la piste suivante » : les écrans annonçaient « prendra effet
+/// à la piste suivante » dans les deux cas. La portée les sépare.
+#[tokio::test]
+async fn la_portee_du_crossfeed_distingue_rien_ne_joue_de_la_piste_suivante_4680() {
+    use crate::orchestrator::PorteeDuReglage;
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407("dlna:uuid-4680-crossfeed").await;
+    // Le flux servi ne porte aucun crossfeed, et aucun n'est demandé : le son
+    // est déjà conforme.
+    assert_eq!(
+        orch.refresh_zone_crossfeed_portee(zone_id).await,
+        PorteeDuReglage::Immediate
+    );
+    // Un crossfeed est coché pendant la lecture : aucune relance n'est
+    // programmée pour lui, il ne s'entendra qu'à la piste suivante.
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    let portee = orch.refresh_zone_crossfeed_portee(zone_id).await;
+    assert_eq!(portee, PorteeDuReglage::PisteSuivante);
+    assert_eq!(portee.code(), "next_track");
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 0);
+    // Une zone où rien ne joue : rien à annoncer, surtout pas « piste
+    // suivante » — c'est le cas que le booléen confondait.
+    let muette = ZoneRepo::with_backend(orch.db.clone())
+        .create("Muette", Some("dlna"), Some("dlna:uuid-4680-muette"))
+        .unwrap();
+    settings
+        .set(
+            &format!("zone_{muette}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    let portee = orch.refresh_zone_crossfeed_portee(muette).await;
+    assert_eq!(portee, PorteeDuReglage::RienNeJoue);
+    assert_eq!(portee.code(), "not_playing", "et surtout pas `next_track`");
+}
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision
