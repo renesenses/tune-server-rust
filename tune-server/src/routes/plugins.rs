@@ -363,13 +363,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     .flatten()
                     .map(|v| v != "false")
                     .unwrap_or(true);
-                #[cfg(feature = "plugins-wasm")]
-                let loaded = state
-                    .wasm_plugins
-                    .get()
-                    .is_some_and(|reg| reg.get(&id).is_some());
-                #[cfg(not(feature = "plugins-wasm"))]
-                let loaded = false;
+                let loaded = wasm_charge(&state, &id);
                 // Le SEUL endroit où ce serveur détient un énoncé de
                 // compatibilité écrit par le greffon lui-même :
                 // `min_server_version`, jusqu'ici lu par le manifeste et par
@@ -578,8 +572,27 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
 /// La seule autorité est l'instantané que `plugins::init` a publié après
 /// `setup_all` : il ne contient que ce qui a réellement chargé. Un réglage en
 /// base ne dit rien de l'instant présent — c'est tout le sujet de #3484.
+///
+/// Un greffon **wasm** chargé n'y figure pas : il vit dans le registre
+/// `state.wasm_plugins`, le même que lit `loaded` dans `GET /plugins`. Sans
+/// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
+/// `disable` taisait celui qu'il faut pour le décharger (#5112).
 fn greffon_charge(state: &AppState, name: &str) -> bool {
-    plugin_snapshot(state).iter().any(|p| p.name == name)
+    plugin_snapshot(state).iter().any(|p| p.name == name) || wasm_charge(state, name)
+}
+
+/// Le greffon wasm `name` est-il dans le registre publié au démarrage ?
+#[cfg(feature = "plugins-wasm")]
+fn wasm_charge(state: &AppState, name: &str) -> bool {
+    state
+        .wasm_plugins
+        .get()
+        .is_some_and(|reg| reg.get(name).is_some())
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+fn wasm_charge(_state: &AppState, _name: &str) -> bool {
+    false
 }
 
 /// 🔴 #3484 — activer un greffon n'en démarre AUCUN.
