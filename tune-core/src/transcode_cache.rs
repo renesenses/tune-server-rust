@@ -168,6 +168,7 @@ pub fn cache_path_dsp(
     let hex = format!("{:x}", h.finalize());
     let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
     Some(
+        // tmp-autorise: cache tune-tcache-<empreinte> ; l'éviction ne touche que les fichiers du compte courant (evict_in, #4992).
         std::env::temp_dir()
             .join(name)
             .to_string_lossy()
@@ -210,6 +211,7 @@ pub fn cache_path_streaming(
     h.update(channels.to_le_bytes());
     let hex = format!("{:x}", h.finalize());
     let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
+    // tmp-autorise: cache tune-tcache-<empreinte> ; l'éviction ne touche que les fichiers du compte courant (evict_in, #4992).
     std::env::temp_dir()
         .join(name)
         .to_string_lossy()
@@ -251,6 +253,7 @@ pub fn evict() {
 /// Eviction with an explicit byte cap (the testable core of [`evict`]).
 fn evict_with_cap(cap: u64) {
     evict_in(
+        // tmp-autorise: base seule : evict_in ne compte et ne supprime que les fichiers de l'UID passé (#4992).
         &std::env::temp_dir(),
         cap,
         crate::chemins_de_travail::uid_courant(),

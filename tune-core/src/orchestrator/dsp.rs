@@ -419,6 +419,7 @@ impl PlaybackOrchestrator {
         };
         let ext = if use_wav { "wav" } else { "flac" };
         let tmp_path =
+            // tmp-autorise: fichier au nom aléatoire (UUID v4), propre au préchargement.
             std::env::temp_dir().join(format!("tune-prefetch-{}.{ext}", uuid::Uuid::new_v4()));
         let tmp_str = tmp_path.to_string_lossy().to_string();
         // Match the encoded header's bit depth (out_bd) to the actual PCM.

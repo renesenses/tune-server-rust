@@ -342,6 +342,7 @@ fn dirs_home() -> String {
     let lire = |nom: &str| std::env::var(nom).ok();
     dirs_home_avec(
         &lire,
+        // tmp-autorise: base seule : dirs_home_avec y joint l'UID du compte (#4770).
         &std::env::temp_dir(),
         crate::chemins_de_travail::uid_courant(),
     )

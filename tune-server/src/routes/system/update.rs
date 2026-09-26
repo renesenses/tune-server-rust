@@ -2626,10 +2626,15 @@ pub(super) async fn update_install(
         // --- Extract ---
         set_phase("extracting");
 
-        let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+        // #4770 : un dossier par compte. `tune-update-<version>` était un nom
+        // fixe : le premier compte à mettre à jour vers une version donnée le
+        // créait, et un autre compte ne pouvait plus y extraire la sienne.
+        let tmp_dir =
+            tune_core::chemins_de_travail::racine_de_travail(&format!("tune-update-{version}"));
         // Sweep leftover tune-update-* dirs from earlier updates. The success
         // path used to never remove the extraction dir, so one accumulated per
         // version (Benjithom, Windows: a new folder on every update).
+        // tmp-autorise: balayage en LECTURE de la racine ; seuls les tune-update-* du compte courant se laissent supprimer (sticky bit de /tmp).
         if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
             for e in entries.flatten() {
                 if e.file_name().to_string_lossy().starts_with("tune-update-") {

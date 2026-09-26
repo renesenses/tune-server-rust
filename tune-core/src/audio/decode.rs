@@ -1107,6 +1107,7 @@ fn stager_pour_decodage(
     max_duration_s: f64,
 ) -> Option<Arc<StagedFile>> {
     let src_path = Path::new(src);
+    // tmp-autorise: base seule : la copie de préchargement y porte un nom UUID (tune-stage-<uuid>).
     let tmp_dir = std::env::temp_dir();
     // ⚠️ Le critère est le TYPE de montage, pas le numéro de périphérique.
     // `st_dev` diffère pour TOUT point de montage distinct — y compris un

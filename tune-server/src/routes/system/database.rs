@@ -328,6 +328,7 @@ pub(super) async fn database_import(
     };
 
     // Write to a unique temp file (safe for concurrent imports)
+    // tmp-autorise: fichier au nom aléatoire (UUID v4), supprimé après l'import.
     let tmp_path = std::env::temp_dir().join(format!("tune_import_{}.db", uuid::Uuid::new_v4()));
     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
         return (

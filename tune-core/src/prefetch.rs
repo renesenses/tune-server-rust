@@ -389,6 +389,7 @@ impl PrefetchEngine {
                     .unwrap_or(&upstream_url)
                     .to_string()
             } else {
+                // tmp-autorise: fichier au nom aléatoire (UUID v4), propre au préchargement.
                 let tmp_path = std::env::temp_dir()
                     .join(format!("tune-prefetch-{}.{}", uuid::Uuid::new_v4(), codec))
                     .to_string_lossy()
