@@ -1189,3 +1189,10 @@ path = "tests/pg_favoris_locaux_entiers.rs"
 [[test]]
 name = "transfert_reprend_la_position_4442"
 path = "tests/transfert_reprend_la_position_4442.rs"
+
+# #5124 : le rapport de bogue, l'export des journaux et le ticket de support
+# sortent sans adresse, chemin personnel ni jeton — lu sur les routes montées
+# et sur les envois captés par un nuage simulé.
+[[test]]
+name = "rapport_sans_donnees_personnelles_5124"
+path = "tests/rapport_sans_donnees_personnelles_5124.rs"
