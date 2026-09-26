@@ -1120,6 +1120,23 @@ const BC_WISHLIST_API: &str = "https://bandcamp.com/api/fancollection/1/wishlist
 const BC_JETON_DEBUT: &str = "9999999999::a::";
 const CLE_PSEUDO: &str = "bandcamp_username";
 const CLE_FAN_ID: &str = "bandcamp_fan_id";
+/// La case « Actif » de Bandcamp dans le gestionnaire de services.
+///
+/// 🔴 C'est la clé que TOUT le reste du serveur lit et écrit pour chaque
+/// service : `ServiceRegistry::restore_all_tokens` au démarrage,
+/// `POST /streaming/{service}/enable` et `/disable` — tous sous la forme
+/// `format!("streaming_{name}_enabled")`. Une clé propre à Bandcamp ferait
+/// deux vérités. Trois états, et c'est ce qui permet le rattrapage du fil
+/// 1952 (Didier) sans migration :
+///
+/// - absente : personne n'a jamais touché la case → elle suit la liaison ;
+/// - `"true"` : cochée, par l'utilisateur ou par une liaison ;
+/// - `"false"` : décochée — seul `POST /streaming/bandcamp/disable` l'écrit,
+///   donc toujours un geste de l'utilisateur, qu'on respecte.
+pub(crate) const CLE_ACTIF: &str = "streaming_bandcamp_enabled";
+/// La racine des pages de profil. Paramètre de [`lier_compte_sur`] pour que
+/// l'épreuve de la liaison tourne sans réseau.
+const BC_RACINE_PROFILS: &str = "https://bandcamp.com";
 
 /// Extraire le `fan_id` d'une page de profil Bandcamp publique.
 ///
@@ -1187,12 +1204,22 @@ pub(crate) async fn lier_compte(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     pseudo_brut: &str,
 ) -> Result<CompteLie, EchecLiaison> {
+    lier_compte_sur(backend, pseudo_brut, BC_RACINE_PROFILS).await
+}
+
+/// [`lier_compte`], la racine des profils en paramètre (l'épreuve la pointe
+/// sur un serveur local).
+pub(crate) async fn lier_compte_sur(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    pseudo_brut: &str,
+    racine: &str,
+) -> Result<CompteLie, EchecLiaison> {
     let pseudo = pseudo_brut.trim().to_string();
     if pseudo.is_empty() || pseudo.contains('/') {
         return Err(EchecLiaison::PseudoInvalide);
     }
     let client = tune_core::http::client::shared();
-    let url = format!("https://bandcamp.com/{pseudo}");
+    let url = format!("{racine}/{pseudo}");
     let reponse = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (compatible; Tune)")
@@ -1227,9 +1254,16 @@ pub(crate) async fn lier_compte(
     // 🔴 #2778 — ces deux `?` remplacent deux `let _ = …`. Un échec d'écriture
     // NOMME désormais la clé fautive au lieu de rendre `linked: true` sur
     // rien.
+    //
+    // Fil 1952 (Didier) : lier son compte COCHE aussi la case « Actif »
+    // (décision de Bertrand, 26/09). Depuis #5130, un service décoché
+    // disparaît de la recherche, de l'accueil et de la barre ; un compte lié
+    // mais décoché était donc lié pour rien. Lier est un geste explicite :
+    // il l'emporte même sur un « décoché » antérieur.
     for (cle, valeur) in [
         (CLE_PSEUDO, pseudo.clone()),
         (CLE_FAN_ID, fan_id.to_string()),
+        (CLE_ACTIF, "true".to_string()),
     ] {
         if let Err(e) = reglages.set(cle, &valeur) {
             tracing::error!(pseudo = %pseudo, cle, erreur = %e, "bandcamp_liaison_ecriture_en_echec");
