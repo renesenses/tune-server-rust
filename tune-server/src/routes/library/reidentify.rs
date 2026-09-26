@@ -79,6 +79,17 @@ pub(super) struct Identification {
     pub meilleur: Option<musicbrainz_release::MBReleaseMatch>,
     /// Ce qui a été écrit. `None` sur `not_found` / `no_tracks`.
     pub applied: Option<tune_core::metadata::reidentify::AppliedIdentification>,
+    /// 🔴 `true` quand MusicBrainz **n'a pas répondu** — `503`, coupure, délai
+    /// dépassé (#4991).
+    ///
+    /// Le `verdict` reste `not_found` dans ce cas, et c'est délibéré : la route
+    /// par album rend depuis toujours `not_found` à l'utilisateur qui
+    /// ré-identifie, et son contrat ne bouge pas. Ce drapeau est là pour le
+    /// seul appelant qui en a besoin — le pilote de lot de
+    /// [`super::identification_lot`], dont le disjoncteur ne doit compter que
+    /// les refus. Douze albums introuvables d'affilée ne sont pas une panne ;
+    /// douze refus, si.
+    pub refus_musicbrainz: bool,
 }
 
 /// Pourquoi une identification n'a même pas pu être tentée. À distinguer d'un
@@ -117,6 +128,9 @@ pub(super) async fn identifier_album(
             searched_artist: String::new(),
             meilleur: None,
             applied: None,
+            // MusicBrainz n'a même pas été interrogé : cet album n'apprend
+            // rien sur sa santé.
+            refus_musicbrainz: false,
         });
     }
 
@@ -141,7 +155,7 @@ pub(super) async fn identifier_album(
     // 2. Chercher le pressage. Volontairement SANS le MBID d'avant : c'est lui
     //    qu'on soupçonne, et le scan a pu le lire dans des balises fausses
     //    (`scan_import.rs:443`). On repart du titre et de l'artiste.
-    let candidats = musicbrainz_release::lookup_release_candidates(
+    let recherche = musicbrainz_release::lookup_release_candidates(
         &album.title,
         &artist,
         Some(tracks.len() as u32),
@@ -149,12 +163,24 @@ pub(super) async fn identifier_album(
     )
     .await;
 
-    let Some(meilleur) = candidats.into_iter().next() else {
+    // 🔴 #4991 — relevé AVANT de consommer la recherche. « MusicBrainz n'a pas
+    // ce pressage » et « MusicBrainz n'a pas répondu » donnent tous deux une
+    // liste vide ; seul ce drapeau les sépare, et le pilote de lot en dépend.
+    let refus_musicbrainz = recherche.service_refuse();
+
+    let Some(meilleur) = recherche.meilleur() else {
         // Rien trouvé : l'album doit se retrouver EXACTEMENT comme avant.
         if let Err(e) = restore_album_identification(&state.backend, album_id, &cleared) {
             warn!(album_id, error = %e, "reidentify_restore_failed");
         }
-        info!(album_id, title = %album.title, "reidentify_not_found");
+        if refus_musicbrainz {
+            // Un refus se DIT dans le journal, là où un « rien trouvé » se
+            // constate. Le verdict, lui, ne bouge pas : la route par album
+            // rend `not_found` comme avant.
+            warn!(album_id, title = %album.title, "reidentify_musicbrainz_refuse");
+        } else {
+            info!(album_id, title = %album.title, "reidentify_not_found");
+        }
         return Ok(Identification {
             verdict: "not_found",
             tracks_total: tracks.len(),
@@ -164,6 +190,7 @@ pub(super) async fn identifier_album(
             searched_artist: artist,
             meilleur: None,
             applied: None,
+            refus_musicbrainz,
         });
     };
 
@@ -234,6 +261,8 @@ pub(super) async fn identifier_album(
         searched_artist: artist,
         meilleur: Some(meilleur),
         applied: Some(applied),
+        // MusicBrainz a répondu, et son pressage est posé.
+        refus_musicbrainz: false,
     })
 }
 
