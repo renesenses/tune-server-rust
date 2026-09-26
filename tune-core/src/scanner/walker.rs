@@ -1950,6 +1950,19 @@ pub fn scan_files_batched(
     files: &[PathBuf],
     with_hash: bool,
     batch_size: usize,
+    on_batch: impl FnMut(Vec<ScannedFile>, usize, usize) -> EcrituresDuLot,
+) -> ScanStats {
+    scan_files_batched_avec_arret(files, with_hash, batch_size, || false, on_batch)
+}
+
+/// Comme `scan_files_batched`, mais ne commence plus de lecture après l'arrêt.
+/// Les lectures système déjà en vol gardent leurs propres délais ; on attend
+/// leur retour avant de libérer le scan. Un lot interrompu n'est pas importé.
+pub fn scan_files_batched_avec_arret(
+    files: &[PathBuf],
+    with_hash: bool,
+    batch_size: usize,
+    arret: impl Fn() -> bool + Sync,
     mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize) -> EcrituresDuLot,
 ) -> ScanStats {
     let total = files.len();
@@ -1977,6 +1990,9 @@ pub fn scan_files_batched(
         .into_iter()
         .enumerate()
     {
+        if arret() {
+            break;
+        }
         // La lecture d'abord (#4681) : tant qu'une zone joue, une pause entre
         // deux lots. Le lot suivant — 500 fichiers lus en parallèle, puis leur
         // transaction d'écriture — n'enchaîne pas sur le précédent. Pas avant
@@ -1996,6 +2012,7 @@ pub fn scan_files_batched(
         let read_batch = || {
             chunk
                 .par_iter()
+                .filter(|_| !arret())
                 .map(|path| {
                     let path: &Path = path;
                     // NFC-normalize: see comment in scan_files_parallel
@@ -2082,6 +2099,9 @@ pub fn scan_files_batched(
             None => read_batch(),
         };
 
+        if arret() {
+            break;
+        }
         let batch_timeouts = batch_timeout_counter.load(Ordering::Relaxed);
 
         // Update aggregate stats
@@ -2228,6 +2248,38 @@ pub fn scan_directories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arret_apres_un_lot_ne_lit_pas_le_suivant_5202() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..2)
+            .map(|i| {
+                let dossier = dir.path().join(i.to_string());
+                std::fs::create_dir_all(&dossier).unwrap();
+                let path = dossier.join("vide.wav");
+                std::fs::write(&path, []).unwrap();
+                path
+            })
+            .collect();
+        let arret = std::sync::atomic::AtomicBool::new(false);
+        let mut lots = 0;
+        let stats = scan_files_batched_avec_arret(
+            &files,
+            false,
+            1,
+            || arret.load(Ordering::SeqCst),
+            |_, _, _| {
+                lots += 1;
+                arret.store(true, Ordering::SeqCst);
+                EcrituresDuLot::SANS_PERTE
+            },
+        );
+        assert_eq!(lots, 1, "#5202 : aucun lot après l'arrêt");
+        assert_eq!(
+            stats.empty_files, 1,
+            "#5202 : le second fichier ne doit même pas être lu"
+        );
+    }
 
     /// Un disque à plateaux ne parallélise pas : 32 lectures concurrentes font
     /// osciller une tête unique entre 32 endroits. Chaque fichier demande deux
