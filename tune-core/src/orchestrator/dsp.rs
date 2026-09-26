@@ -936,7 +936,21 @@ impl PlaybackOrchestrator {
             .filter(|f| (f - 1.0).abs() > 1e-6)
             .map(|f| f.to_bits().to_string())
             .unwrap_or_default();
-        format!("eq={eq}\u{1f}ir={ir}\u{1f}cf={crossfeed}\u{1f}rg={replaygain}")
+        // #5071 — l'interrupteur de compensation change les octets d'un flux
+        // réseau dès qu'un égaliseur ou un crossfeed y est cuit : le basculer
+        // doit refabriquer le flux, comme un changement de profil. Sans
+        // égaliseur ni crossfeed, il ne touche rien : l'empreinte reste celle
+        // d'avant, et le flux est conservé.
+        let compensation = if (!eq.is_empty() || !crossfeed.is_empty())
+            && self.zone_compensation_de_niveau(zone_id)
+        {
+            "1"
+        } else {
+            ""
+        };
+        format!(
+            "eq={eq}\u{1f}ir={ir}\u{1f}cf={crossfeed}\u{1f}rg={replaygain}\u{1f}lc={compensation}"
+        )
     }
 
     /// Retenir le traitement avec lequel le flux `stream_id` a été résolu.
@@ -1419,7 +1433,7 @@ impl PlaybackOrchestrator {
             }
             _ => None,
         };
-        StreamingDsp {
+        let mut dsp = StreamingDsp {
             replaygain,
             eq: self.load_eq_processor(zone_id, sample_rate, channels),
             convolver: self.load_convolver(zone_id, sample_rate, channels),
@@ -1431,7 +1445,63 @@ impl PlaybackOrchestrator {
             // biquads de l'égaliseur juste au-dessus.
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
+            compensation: None,
+        };
+        // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
+        // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
+        dsp.compensation = self.compensation_du_flux_reseau(
+            zone_id,
+            dsp.eq.as_ref(),
+            dsp.crossfeed.as_ref().filter(|_| channels == 2),
+        );
+        dsp
+    }
+
+    /// #5071 — la compensation de niveau à cuire dans un flux RÉSEAU, depuis
+    /// l'égaliseur et le crossfeed que ce flux porte réellement.
+    ///
+    /// Même règle que la sortie locale (`LocalOutput::recalculer_la_compensation`) :
+    /// la cible est l'inverse du gain MOYEN des deux étages, et l'interrupteur
+    /// `zone_{id}_level_compensation` (vrai par défaut) l'arme. `None` :
+    ///
+    /// - sur une sortie `local:` — elle compense déjà par son volume, et une
+    ///   seconde compensation dans le flux la doublerait ;
+    /// - en PURE — ni égaliseur ni crossfeed n'y sont construits : si PURE
+    ///   interdit l'égaliseur, il interdit aussi ce qui le compense ;
+    /// - interrupteur coupé, ou aucun des deux étages : le flux reste intact.
+    pub(super) fn compensation_du_flux_reseau(
+        &self,
+        zone_id: i64,
+        eq: Option<&crate::audio::eq::EqProcessor>,
+        crossfeed: Option<&crate::audio::crossfeed::CrossfeedProcessor>,
+    ) -> Option<crate::audio::compensation_reseau::CompensationReseau> {
+        if eq.is_none() && crossfeed.is_none() {
+            return None;
         }
+        if self.zone_audiophile(zone_id) || !self.zone_compensation_de_niveau(zone_id) {
+            return None;
+        }
+        let sortie_locale = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_none_or(|id| id.starts_with("local:"));
+        if sortie_locale {
+            return None;
+        }
+        let dsp_db = eq.map(|e| e.gain_moyen_db()).unwrap_or(0.0)
+            + crossfeed.map(|c| c.gain_moyen_db()).unwrap_or(0.0);
+        let compensation =
+            crate::audio::compensation_reseau::CompensationReseau::depuis_db(-dsp_db);
+        if let Some(ref c) = compensation {
+            info!(
+                zone_id,
+                compensation_db = c.cible_db(),
+                "compensation_reseau_armee"
+            );
+        }
+        compensation
     }
 
     /// La zone a-t-elle un crossfeed réellement actif ?
@@ -1468,13 +1538,22 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
+        Self::eq_profile_configure_with(&self.db, zone_id)
+    }
+
+    /// Même lecture, sans orchestrateur — c'est par là que le chemin du
+    /// signal compose la compensation réseau (#5071).
+    fn eq_profile_configure_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> Option<crate::audio::eq::EqProfile> {
         if !crate::audio::premium_plugins::enabled(
-            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
             "equalizer",
         ) {
             return None;
         }
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
             .get(&key)
@@ -1637,13 +1716,23 @@ impl PlaybackOrchestrator {
         {
             return None;
         }
+        Self::crossfeed_configure_with(&self.db, zone_id)
+    }
+
+    /// [`Self::crossfeed_configure`] sans orchestrateur, donc SANS la garde
+    /// de licence (seul l'orchestrateur la porte) — c'est par là que le chemin
+    /// du signal compose la compensation réseau (#5071).
+    fn crossfeed_configure_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> Option<(f32, f32)> {
         if !crate::audio::premium_plugins::enabled(
-            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
             "crossfeed",
         ) {
             return None;
         }
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let cfg: serde_json::Value = settings
             .get(&format!("zone_{zone_id}_crossfeed"))
             .ok()
@@ -1724,6 +1813,52 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #5071 — la compensation qu'un flux RÉSEAU bâti maintenant pour cette
+    /// zone porterait, en dB, lisible SANS orchestrateur : c'est par là que le
+    /// chemin du signal la dit.
+    ///
+    /// Miroir de [`Self::compensation_du_flux_reseau`] appelée par les
+    /// chargeurs de la lecture : PURE, interrupteur coupé, sortie `local:`
+    /// (qui compense par son volume) ou ni égaliseur ni crossfeed ⇒ `None`.
+    /// Sondé à 44,1 kHz stéréo, comme [`Self::gain_moyen_du_dsp_de_zone`].
+    /// Seule différence assumée : la garde de licence du crossfeed vit dans
+    /// l'orchestrateur ; une licence échue que le chemin du signal ne voit
+    /// pas surestimerait la cible du crossfeed (~1 dB), jamais le contraire.
+    pub fn compensation_reseau_prevue_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> Option<f64> {
+        if crate::audio::audiophile::zone_enabled(db, zone_id)
+            || !Self::zone_compensation_de_niveau_with(db, zone_id)
+        {
+            return None;
+        }
+        let sortie_locale = ZoneRepo::with_backend(db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_none_or(|id| id.starts_with("local:"));
+        if sortie_locale {
+            return None;
+        }
+        let eq = Self::eq_profile_configure_with(db, zone_id)
+            .map(|p| crate::audio::eq::EqProcessor::new(&p, 44_100, 2))
+            .filter(|p| p.is_enabled())
+            .map(|p| p.gain_moyen_db());
+        let cf = Self::crossfeed_configure_with(db, zone_id).map(|(amount, delay_ms)| {
+            crate::audio::crossfeed::CrossfeedProcessor::new(44_100, amount, delay_ms)
+                .gain_moyen_db()
+        });
+        if eq.is_none() && cf.is_none() {
+            return None;
+        }
+        crate::audio::compensation_reseau::CompensationReseau::depuis_db(
+            -(eq.unwrap_or(0.0) + cf.unwrap_or(0.0)),
+        )
+        .map(|c| c.cible_db())
+    }
+
     /// #4685 — ce que l'égaliseur et le crossfeed de la zone font au niveau
     /// MOYEN, en dB, `(égaliseur, crossfeed)` — tels que la sortie locale les
     /// installerait, gardes comprises (PURE, droits, greffon, case décochée) :
@@ -1780,6 +1915,39 @@ impl PlaybackOrchestrator {
             info!(zone_id, device_id = %device_id, active, "zone_compensation_refreshed_live");
             true
         }
+    }
+
+    /// #5071 — l'interrupteur de compensation vient de changer : le faire
+    /// entendre, sur une sortie locale comme sur une zone réseau.
+    ///
+    /// - sortie locale vivante : [`Self::refresh_zone_compensation`], à chaud,
+    ///   par le volume — rien ne change pour elle ;
+    /// - zone RÉSEAU : la compensation est cuite dans le flux, donc la
+    ///   basculer doit le refabriquer. C'est EXACTEMENT le chemin d'un
+    ///   changement de profil d'égaliseur ([`Self::apply_eq_change_portee`]) :
+    ///   même anti-rebond (deux gestes rapprochés, une seule relance), même
+    ///   plancher, même reprise à la position, et même garde de #4407 — un
+    ///   flux qui porte déjà le traitement demandé (aucun égaliseur ni
+    ///   crossfeed : l'interrupteur n'y change rien) est CONSERVÉ, sans coupure.
+    pub async fn apply_compensation_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        if self.refresh_zone_compensation(zone_id).await {
+            return PorteeDuReglage::Immediate;
+        }
+        let sortie_locale = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_some_and(|id| id.starts_with("local:"));
+        if sortie_locale {
+            // Rien ne joue sur la sortie locale : la prochaine lecture posera
+            // l'interrupteur (`transport.rs`), comme avant #5071.
+            return PorteeDuReglage::PisteSuivante;
+        }
+        self.apply_eq_change_portee(zone_id).await
     }
 
     /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)
