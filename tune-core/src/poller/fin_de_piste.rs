@@ -680,7 +680,12 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
     ) -> GaplessPrep {
-        let Some(next_pos) = Self::next_position(zone_state) else {
+        // #4806 / #5143 — une suivante BANNIE (locale ou de service) n'est
+        // jamais armée : armée, elle serait jouée par le renderer sans que la
+        // file ait son mot à dire. On arme la prochaine JOUABLE, celle que
+        // l'avance de la file jouerait : l'enchaînement sans blanc est gardé
+        // par-dessus la bannie.
+        let Some(next_pos) = Self::prochaine_position_jouable(&self.db, zone_id, zone_state) else {
             return GaplessPrep::NotArmed;
         };
 
@@ -691,32 +696,6 @@ impl PositionPoller {
             .get_at(zone_id, next_pos)
             .ok()
             .flatten();
-
-        // #4806 — une suivante BANNIE (locale ou de service) n'est jamais
-        // armée : armée, elle serait jouée par le renderer sans que la file
-        // ait son mot à dire. Non armée, la fin de piste passe par
-        // `avancer_avec_reprises`, qui l'enjambe. On perd l'enchaînement sans
-        // blanc pour CETTE transition seulement, pas le titre suivant.
-        if let Some(e) = ligne.as_ref() {
-            let bans = crate::db::hidden_repo::HiddenRepo::with_backend(self.db.clone());
-            let profil = crate::db::hidden_repo::profil_de_selection_automatique(&self.db);
-            if bans.ligne_bannie(
-                profil,
-                e.track_id,
-                e.source.as_deref(),
-                e.source_id.as_deref(),
-            ) {
-                debug!(
-                    zone_id,
-                    next_pos,
-                    track_id = ?e.track_id,
-                    source = ?e.source,
-                    source_id = ?e.source_id,
-                    "gapless_suivante_bannie_non_armee"
-                );
-                return GaplessPrep::NotArmed;
-            }
-        }
 
         let arme = ligne.map(|e| ArmedNext {
             row_id: e.id,

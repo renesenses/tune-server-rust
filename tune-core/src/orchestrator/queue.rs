@@ -11,6 +11,67 @@ pub enum Enjambee {
     FileEpuisee,
 }
 
+impl Enjambee {
+    /// La position à jouer quand l'enjambée est partie de `position` :
+    /// `position` elle-même, la reprise, ou `None` si la file est finie.
+    pub fn position_depuis(self, position: i64) -> Option<i64> {
+        match self {
+            Enjambee::Rien => Some(position),
+            Enjambee::Reprise(p) => Some(p),
+            Enjambee::FileEpuisee => None,
+        }
+    }
+}
+
+/// #5143 — LE cœur de « la prochaine piste jouable » : depuis `position`,
+/// les lignes de file bannies pour le profil des sélections automatiques
+/// (locales par `track_id`, de service par `source` + `source_id`), et où
+/// reprendre. Pur : ni journal, ni événement.
+///
+/// Un seul parcours pour tous ceux qui désignent la suivante :
+/// l'avance (`enjamber_les_pistes_bannies`, qui y ajoute l'annonce), et ceux
+/// qui la préparent sans la jouer — préchargement, pré-transcodage,
+/// armement sans blanc, via `PositionPoller::prochaine_position_jouable`.
+/// Chacun parcourait la file à sa façon : la suivante préchargée était B
+/// (banni) quand l'avance jouait C.
+pub fn lignes_bannies_a_enjamber(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+    position: i64,
+) -> (Enjambee, Vec<crate::db::play_queue_repo::QueueEntry>) {
+    let queue_repo = PlayQueueRepo::with_backend(db.clone());
+    let Ok(total) = queue_repo.count_all(zone_id) else {
+        return (Enjambee::Rien, Vec::new());
+    };
+    let bans = crate::db::hidden_repo::HiddenRepo::with_backend(db.clone());
+    let profil = crate::db::hidden_repo::profil_de_selection_automatique(db);
+    let mut p = position.max(0);
+    let mut enjambees = Vec::new();
+    while p < total {
+        let Ok(Some(entry)) = queue_repo.get_at(zone_id, p) else {
+            break;
+        };
+        if !bans.ligne_bannie(
+            profil,
+            entry.track_id,
+            entry.source.as_deref(),
+            entry.source_id.as_deref(),
+        ) {
+            break;
+        }
+        enjambees.push(entry);
+        p += 1;
+    }
+    let verdict = if enjambees.is_empty() {
+        Enjambee::Rien
+    } else if p >= total {
+        Enjambee::FileEpuisee
+    } else {
+        Enjambee::Reprise(p)
+    };
+    (verdict, enjambees)
+}
+
 impl PlaybackOrchestrator {
     /// Remove any gapless-prepared stream session for a zone.
     /// Called when a zone starts a new track or stops, so the
@@ -68,7 +129,15 @@ impl PlaybackOrchestrator {
             let Some(cur_pos) = queue.iter().find(|q| q.is_current).map(|q| q.position) else {
                 return;
             };
-            let Some(next) = queue.iter().find(|q| q.position == cur_pos + 1) else {
+            // #5143 — la suivante que l'avance jouera : une bannie est
+            // enjambée, jamais transcodée pour rien.
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+                .0
+                .position_depuis(cur_pos + 1)
+            else {
+                return;
+            };
+            let Some(next) = queue.iter().find(|q| q.position == next_pos) else {
                 return;
             };
             let Some(next_file) = next.file_path.clone() else {
@@ -179,11 +248,28 @@ impl PlaybackOrchestrator {
             else {
                 return;
             };
-            let Some(item) = sq.get(cur_idx + 1) else {
+            // #5143 — la ligne qui SUIT dans la file unifiée, bannies
+            // enjambées : celle que l'avance jouera. Une suivante locale n'a
+            // rien à préchauffer ici.
+            let Some(cur_pos) = sq[cur_idx]["position"].as_i64() else {
                 return;
             };
-            let source = item["source"].as_str().unwrap_or("").to_string();
-            let source_id = item["source_id"].as_str().unwrap_or("").to_string();
+            let Some(next_pos) = lignes_bannies_a_enjamber(&db, zone_id, cur_pos + 1)
+                .0
+                .position_depuis(cur_pos + 1)
+            else {
+                return;
+            };
+            let Some(item) = PlayQueueRepo::with_backend(db.clone())
+                .get_at(zone_id, next_pos)
+                .ok()
+                .flatten()
+                .filter(|e| e.track_id.is_none())
+            else {
+                return;
+            };
+            let source = item.source.clone().unwrap_or_default();
+            let source_id = item.source_id.clone().unwrap_or_default();
             if source.is_empty() || source_id.is_empty() {
                 return;
             }
@@ -483,35 +569,15 @@ impl PlaybackOrchestrator {
     /// `source_id` vaut un id local banni n'est pas enjambée pour autant, et
     /// inversement — voir [`HiddenRepo::ligne_bannie`].
     pub async fn enjamber_les_pistes_bannies(&self, zone_id: i64, position: i64) -> Enjambee {
-        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
-        let Ok(total) = queue_repo.count_all(zone_id) else {
-            return Enjambee::Rien;
-        };
-        let bans = crate::db::hidden_repo::HiddenRepo::with_backend(self.db.clone());
-        let profil = crate::db::hidden_repo::profil_de_selection_automatique(&self.db);
-        let mut p = position.max(0);
-        let mut enjambees = 0usize;
-        while p < total {
-            let Ok(Some(entry)) = queue_repo.get_at(zone_id, p) else {
-                break;
-            };
-            let bannie = bans.ligne_bannie(
-                profil,
-                entry.track_id,
-                entry.source.as_deref(),
-                entry.source_id.as_deref(),
-            );
-            if !bannie {
-                break;
-            }
+        let (verdict, enjambees) = lignes_bannies_a_enjamber(&self.db, zone_id, position);
+        for entry in &enjambees {
             info!(
                 zone_id,
-                position = p,
+                position = entry.position,
                 track_id = ?entry.track_id,
                 source = ?entry.source,
                 source_id = ?entry.source_id,
                 title = ?entry.title,
-                profil,
                 "file_enjambe_piste_bannie"
             );
             if let Some(ref bus) = self.event_bus {
@@ -519,23 +585,21 @@ impl PlaybackOrchestrator {
                     "playback.track_skipped",
                     serde_json::json!({
                         "zone_id": zone_id,
-                        "position": p,
+                        "position": entry.position,
                         "title": entry.title,
                         "reason": "piste_bannie",
                     }),
                 );
             }
-            enjambees += 1;
-            p += 1;
         }
-        if enjambees == 0 {
-            Enjambee::Rien
-        } else if p >= total {
-            info!(zone_id, enjambees, "file_epuisee_apres_pistes_bannies");
-            Enjambee::FileEpuisee
-        } else {
-            Enjambee::Reprise(p)
+        if verdict == Enjambee::FileEpuisee {
+            info!(
+                zone_id,
+                enjambees = enjambees.len(),
+                "file_epuisee_apres_pistes_bannies"
+            );
         }
+        verdict
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
