@@ -332,8 +332,14 @@ impl AppState {
         let backend: Arc<dyn DbBackend> =
             Self::create_backend(selected_engine, &tune_config, sqlite_db.as_ref(), db_path)?;
 
-        // Clean up any leftover temp transcode files from a previous crash.
-        tune_core::http::streamer::cleanup_leftover_transcode_files();
+        // Le ménage des `tune-transcode-*` laissés par un plantage ne se fait
+        // PAS ici : il se fait au DÉMARRAGE du processus, dans
+        // `startup::init_state` (#5142). `AppState::new` est aussi le
+        // constructeur de centaines d'épreuves ; chacune effaçait alors TOUS
+        // les fichiers de transcodage en cours du compte dans `temp_dir()`,
+        // y compris ceux d'un autre processus de test qui les écrivait encore.
+        // C'est ce qui faisait rougir `crossfeed_bibliotheque_reseau::cas_1`
+        // (« fichier introuvable ») pendant une gate de `tune-server`.
 
         let license = Arc::new(tune_core::license::LicenseManager::new_with_limit(
             backend.clone(),
@@ -662,6 +668,58 @@ mod relay_slot_tests {
             "background.rs doit PUBLIER le client de relais dans l'AppState ; \
              sans cela /cloud/relay/status repond `connected: false` a vie, \
              relais connecte ou non"
+        );
+    }
+
+    /// #5142 — `AppState::new` est le constructeur de centaines d'épreuves.
+    /// Il effaçait tous les `tune-transcode-*` du compte dans `temp_dir()`,
+    /// donc aussi le transcodage qu'un AUTRE processus venait d'écrire et
+    /// allait renommer dans le cache : `crossfeed_bibliotheque_reseau::cas_1`
+    /// (tune-core) rougissait alors en `NotFound` pendant une gate de
+    /// `tune-server`.
+    ///
+    /// La garde porte sur le CORPS du constructeur, et non sur un fichier posé
+    /// dans `/tmp` : `/tmp` est partagé avec les gates des autres sessions du
+    /// compte, dont le code d'avant efface ce fichier, et une telle épreuve
+    /// serait elle-même intermittente (vu sur Shrek, 1 rouge sur 20).
+    #[test]
+    fn construire_un_etat_n_efface_pas_les_transcodages_du_compte_5142() {
+        let source = include_str!("state.rs");
+        let corps = source
+            .split("pub fn new(db_path: &str, port: u16, tune_config: TuneConfig)")
+            .nth(1)
+            // Le corps s'arrête à la première accolade fermante de niveau
+            // `impl` : les blocs internes sont plus indentés.
+            .and_then(|reste| reste.split("\n    }\n").next())
+            .expect("AppState::new introuvable dans state.rs");
+        assert!(
+            corps.contains("let streamer = Arc::new(AudioStreamer::new(port));"),
+            "la coupe doit tomber dans le corps de AppState::new"
+        );
+        assert!(
+            !corps.contains("cleanup_leftover_transcode_files"),
+            "AppState::new ne doit pas effacer les transcodages du compte : le \
+             menage des restes d'un plantage appartient au DEMARRAGE \
+             (`startup::init_state`)"
+        );
+    }
+
+    /// L'autre moitié : le ménage n'a pas disparu, il a DÉMÉNAGÉ dans le
+    /// démarrage des deux binaires (`bootstrap.rs` et `tune-ffi`), qui passent
+    /// tous deux par `init_state`. Le démarrage ne s'appelle pas ici (réseau,
+    /// licences), donc la garde porte sur le CORPS de la fonction.
+    #[test]
+    fn le_demarrage_fait_toujours_le_menage_des_transcodages_5142() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split("pub async fn init_state(")
+            .nth(1)
+            // Jusqu'à l'accolade fermante de la fonction, en colonne 0.
+            .and_then(|reste| reste.split("\n}\n").next())
+            .expect("init_state introuvable dans startup.rs");
+        assert!(
+            corps.contains("tune_core::http::streamer::cleanup_leftover_transcode_files();"),
+            "init_state doit toujours effacer les transcodages laisses par un plantage"
         );
     }
 

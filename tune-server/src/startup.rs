@@ -251,6 +251,12 @@ fn spawn_asio_warm_scan() {
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    // Les fichiers de transcodage laissés par un plantage précédent. Une fois
+    // par DÉMARRAGE, et non à chaque `AppState::new` (#5142) : ce constructeur
+    // sert aussi aux épreuves, qui effaçaient les transcodages en cours d'un
+    // autre processus du même compte. Aucune lecture n'a encore pu commencer
+    // ici, comme avant.
+    tune_core::http::streamer::cleanup_leftover_transcode_files();
     // Turn any update markers left by a just-applied update into a persisted
     // last_update_result the UI can show. Catches a silent Windows bat-swap
     // failure (came back on the old binary) instead of it looking like a no-op.
