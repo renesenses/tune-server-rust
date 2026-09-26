@@ -1294,6 +1294,12 @@ async fn pg_config_backup_zones_volume_fixe() {
     // l'export et la restauration.
     scenarios_playlists::une_playlist_mixte_fait_l_aller_retour(&db, &db);
     scenarios_playlists::une_sauvegarde_a_titres_de_service_se_restaure(&db);
+    // #5113 — piste locale absente de la cible : signalee, ou retrouvee par
+    // son empreinte quand elle est unique.
+    scenarios_playlists::une_piste_locale_absente_est_signalee(&db);
+    scenarios_playlists::une_piste_absente_d_une_ancienne_sauvegarde_est_signalee(&db);
+    scenarios_playlists::une_piste_se_retrouve_par_son_empreinte(&db);
+    scenarios_playlists::l_export_porte_le_chemin_et_l_empreinte(&db);
 
     // #4983 — la restauration des favoris, meme raison d'etre jouee ici.
     use crate::config_backup::scenarios_favoris;
