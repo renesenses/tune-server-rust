@@ -830,6 +830,7 @@ impl PlaybackOrchestrator {
         let advance_track_id = np.track_id;
         let advance_source = np.source.clone();
         let advance_source_id = np.source_id.clone();
+        let advance_stream_id = np.stream_id.clone();
         let ecoute = (advance_source != "radio").then(|| {
             (
                 np.title.clone(),
@@ -897,6 +898,12 @@ impl PlaybackOrchestrator {
         // forwarders de l'ancienne piste puis on démarre un décodage dédié,
         // position 0, comme pour une lecture explicite en passthrough.
         self.playback.bump_levels_gen(zone_id);
+        // #5078 — une source PCM pré-armée (CD) : ses fenêtres attendaient
+        // cette avance, elles partent maintenant sous le `play_seq` courant.
+        if let Some(flux) = advance_stream_id.as_deref() {
+            let play_seq = self.playback.current_play_seq(zone_id).await;
+            super::source_pcm::adopter_les_niveaux_pre_armes(flux, play_seq);
+        }
         if let (Some(bus), Some(track_id)) = (self.event_bus.clone(), advance_track_id) {
             let track = crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
                 .get(track_id)
