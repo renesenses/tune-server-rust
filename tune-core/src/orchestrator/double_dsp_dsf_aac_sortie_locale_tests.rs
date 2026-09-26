@@ -347,7 +347,9 @@ fn zone(orch: &PlaybackOrchestrator, type_sortie: &str, device: &str) -> i64 {
 /// Les octets servis : le canal d'une session, ou l'URL rendue telle quelle.
 async fn octets_servis(orch: &PlaybackOrchestrator, url: &str, stream_id: Option<&str>) -> Vec<u8> {
     let Some(sid) = stream_id else {
-        return reqwest::get(url)
+        return crate::http::client::shared()
+            .get(url)
+            .send()
             .await
             .unwrap()
             .bytes()
