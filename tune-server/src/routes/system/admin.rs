@@ -137,9 +137,11 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
     let albums = AlbumRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
+    // #5086 — par le pool de lecture : une sonde de santé n'attend pas
+    // l'écrivain SQLite.
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let scan_status = settings
-        .get("scan_status")
+        .get_sans_ecrivain("scan_status")
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
