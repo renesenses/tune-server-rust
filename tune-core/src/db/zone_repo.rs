@@ -893,6 +893,39 @@ impl ZoneRepo {
         }
     }
 
+    /// 🔴 #5077 — les zones à MONTRER : les visibles, plus toute zone MASQUÉE
+    /// dont l'identifiant figure dans `en_lecture`.
+    ///
+    /// Stéphane Villerio (DMP-A6, 0.9.165, fils 1926 et 1951) : la zone DLNA 11
+    /// joue, les pistes s'enchaînent, et « Lecture en cours » reste vide. Sa
+    /// fiche le dit : `Zones (0)` — aucune zone visible — pendant que le
+    /// journal montre `orchestrator_play zone_id=11`. La zone a été masquée en
+    /// 0.9.163/0.9.164 par l'ignorance de l'appareil AirPlay de même adresse
+    /// (#4957) ; la 0.9.165 empêche un nouveau masquage, mais une zone déjà
+    /// masquée le reste. #4970 a rendu cette zone au SONDEUR (l'enchaînement
+    /// revient) ; `GET /zones` et l'instantané WebSocket, eux, lisaient
+    /// toujours [`Self::list`], qui l'écarte. Le client, qui relit `/zones` à
+    /// chaque `playback.*`, perdait donc la zone qu'il regardait : plus de
+    /// piste courante, « Aucune lecture en cours ».
+    ///
+    /// Une zone qui joue — ou qui est en pause — est une zone qu'on écoute :
+    /// elle se montre, masquée ou non. Arrêtée, elle redevient invisible,
+    /// comme avant. Relue par son identifiant ([`Self::get`] ne filtre pas le
+    /// masquage) ; une zone réellement effacée entre-temps est simplement
+    /// ignorée.
+    pub fn list_avec_masquees_en_lecture(&self, en_lecture: &[i64]) -> Result<Vec<Zone>, String> {
+        let mut zones = self.list()?;
+        for &id in en_lecture {
+            if zones.iter().any(|z| z.id == Some(id)) {
+                continue;
+            }
+            if let Some(zone) = self.get(id)? {
+                zones.push(zone);
+            }
+        }
+        Ok(zones)
+    }
+
     pub fn create(
         &self,
         name: &str,
