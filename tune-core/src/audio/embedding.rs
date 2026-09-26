@@ -78,6 +78,16 @@ fn default_throttle() -> &'static str {
     if cores <= 8 { "eco" } else { "equilibre" }
 }
 
+/// Plafond de fils ONNX du mode `equilibre` (#5138).
+///
+/// `equilibre` valait « la moitié des cœurs » : 4 fils sur les 8 cœurs de
+/// JeromeQ (journal : `audio_embedder_loaded intra_threads=4`), et le banc de
+/// Shrek mesure alors **2,8 cœurs occupés en continu** par la seule passe
+/// acoustique — les « trois cœurs à 100 % » de sa capture. Une analyse de fond
+/// facultative n'a aucune raison de prendre plus de deux cœurs sur une machine
+/// qui sert de la musique ; qui veut aller plus vite choisit `rapide`.
+const FILS_EQUILIBRE_MAX: usize = 2;
+
 fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -88,7 +98,7 @@ fn intra_threads_for(settings: &crate::db::settings_repo::SettingsRepo) -> usize
         "eco" => 1,
         "rapide" => cores,
         // Comme pour la pause : une valeur inconnue retombe sur l'équilibre.
-        _ => (cores / 2).max(1),
+        _ => (cores / 2).clamp(1, FILS_EQUILIBRE_MAX),
     }
 }
 
@@ -290,10 +300,69 @@ fn process_rss_mb() -> Option<u64> {
 // Storage layout, constants and cosine live in the always-compiled read side.
 use super::embedding_store::{self, CandidatAcoustique, EMBED_DIM, MODEL_ID};
 
+/// Ce qui transforme une fenêtre de 10 s en vecteur : le modèle CLAP en
+/// production, un faux dans les essais — qui n'ont ni le modèle de 287 Mo ni le
+/// runtime onnxruntime (#5138).
+///
+/// `Send + 'static` : l'inférence tourne sur le vivier BLOQUANT de tokio, jamais
+/// sur un ouvrier de l'exécuteur (voir [`analyze_embedding_batch`]).
+pub trait Inference: Send + 'static {
+    /// Une fenêtre mono 48 kHz → un vecteur normé.
+    fn inferer(&mut self, waveform: &[f32]) -> Result<Vec<f32>, String>;
+}
+
+/// Demande d'arrêt du serveur, vue par la passe acoustique (#5138).
+static ARRET_DEMANDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Les options d'exécution de chaque session vivante : c'est par elles qu'une
+/// inférence EN COURS s'interrompt (`RunOptions::terminate`).
+static TERMINAISONS: std::sync::Mutex<Vec<std::sync::Weak<ort::session::RunOptions>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// L'arrêt du serveur est demandé : la passe acoustique s'arrête à la
+/// prochaine frontière de piste, et l'inférence en cours est interrompue.
+///
+/// Appelé par le gestionnaire d'arrêt de `tune-server`. Sans lui, l'arrêt
+/// attendait l'inférence en cours, et une inférence en cours sur un exécuteur
+/// gelé ne rend jamais la main (#5138 : `shutdown_signal_received` puis
+/// `shutdown_timeout_forcing_exit` chez JeromeQ).
+pub fn arreter() {
+    ARRET_DEMANDE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let terminaisons = TERMINAISONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut interrompues = 0usize;
+    for t in terminaisons.iter().filter_map(std::sync::Weak::upgrade) {
+        if t.terminate().is_ok() {
+            interrompues += 1;
+        }
+    }
+    info!(interrompues, "audio_embed_arret_demande");
+}
+
+/// L'arrêt a-t-il été demandé ?
+pub fn arret_demande() -> bool {
+    ARRET_DEMANDE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Lever la demande d'arrêt. Pour les essais seulement : en production un
+/// arrêt ne se reprend pas. `pub` pour la même raison que
+/// `oublier_la_lecture_pour_les_essais` : les essais sont une caisse externe.
+pub fn reprendre_apres_arret_pour_les_essais() {
+    ARRET_DEMANDE.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A loaded CLAP audio embedder. Cheap to reuse across many tracks in the
 /// background analysis pass; `embed` is the per-track hot path.
 pub struct AudioEmbedder {
     session: Session,
+    /// Partagées avec [`TERMINAISONS`] pour que [`arreter`] puisse
+    /// interrompre une inférence en cours.
+    execution: Arc<ort::session::RunOptions>,
+}
+
+impl Inference for AudioEmbedder {
+    fn inferer(&mut self, waveform: &[f32]) -> Result<Vec<f32>, String> {
+        self.embed(waveform)
+    }
 }
 
 impl AudioEmbedder {
@@ -303,14 +372,38 @@ impl AudioEmbedder {
     /// `intra_threads` caps how many threads onnxruntime may use *inside* a
     /// single inference. See [`intra_threads_for`] for why that matters more
     /// than the pause between files.
+    ///
+    /// #5138 — trois bornes de plus, parce que `intra_threads` seul ne disait
+    /// pas tout ce que la session consomme :
+    /// - `inter_threads(1)` et exécution SÉQUENTIELLE : le graphe CLAP est une
+    ///   chaîne, un vivier inter-opérateurs n'y gagne rien et ajoute des fils ;
+    /// - pas d'ATTENTE ACTIVE (`spinning`) : par défaut les fils d'onnxruntime
+    ///   tournent à vide entre deux opérateurs pour gagner quelques
+    ///   microsecondes. Un cœur qui tourne à vide est un cœur que la lecture
+    ///   n'a pas.
     pub fn load(model_path: &Path, intra_threads: usize) -> Result<Self, String> {
         let session = Session::builder()
             .map_err(|e| format!("ort builder: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| format!("ort intra_threads({intra_threads}): {e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| format!("ort inter_threads(1): {e}"))?
+            .with_parallel_execution(false)
+            .map_err(|e| format!("ort parallel_execution(false): {e}"))?
+            .with_intra_op_spinning(false)
+            .map_err(|e| format!("ort intra_op_spinning(false): {e}"))?
+            .with_inter_op_spinning(false)
+            .map_err(|e| format!("ort inter_op_spinning(false): {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
-        Ok(Self { session })
+        let execution =
+            Arc::new(ort::session::RunOptions::new().map_err(|e| format!("ort run options: {e}"))?);
+        {
+            let mut t = TERMINAISONS.lock().unwrap_or_else(|e| e.into_inner());
+            t.retain(|w| w.strong_count() > 0);
+            t.push(Arc::downgrade(&execution));
+        }
+        Ok(Self { session, execution })
     }
 
     /// Embed a mono 48 kHz waveform into a normalised 512-d vector.
@@ -327,6 +420,9 @@ impl AudioEmbedder {
         if waveform.is_empty() {
             return Err("empty waveform".into());
         }
+        if arret_demande() {
+            return Err("arrêt du serveur demandé".into());
+        }
         let mut buf = vec![0f32; WINDOW_SAMPLES];
         for (i, s) in buf.iter_mut().enumerate() {
             *s = quantize_i16(waveform[i % waveform.len()]);
@@ -336,7 +432,7 @@ impl AudioEmbedder {
             .map_err(|e| format!("ort input tensor: {e}"))?;
         let outputs = self
             .session
-            .run(ort::inputs!["waveform" => input])
+            .run_with_options(ort::inputs!["waveform" => input], &self.execution)
             .map_err(|e| format!("ort run: {e}"))?;
         let (_shape, data) = outputs["audio_embedding"]
             .try_extract_tensor::<f32>()
@@ -420,9 +516,17 @@ fn to_mono_f32(samples: &[i32], channels: u32, bit_depth: u16) -> Vec<f32> {
 /// Returns how many were processed (0 ⇒ nothing left, caller idles). Mirrors
 /// `replaygain::analyze_track_batch`: bounded, throttled, resumable via the
 /// `audio_embed_analyzed` sentinel.
-pub async fn analyze_embedding_batch(
+///
+/// #5138 — l'embedder arrive sous `Arc<Mutex<_>>` parce que l'inférence part sur
+/// le vivier BLOQUANT. Elle tournait à même la tâche async : chaque piste tenait
+/// un ouvrier de l'exécuteur le temps d'une inférence (~0,3 s à 4 fils sur
+/// Shrek, bien plus sur une machine chargée), et tout ce qui attendait son tour
+/// sur cet ouvrier — un flux de lecture, une requête de l'interface, le
+/// battement du détecteur de gel — attendait avec. Le banc le mesure : un flux
+/// simulé y prend 3 famines en 45 s sur 8 ouvriers, 133 sur un seul.
+pub async fn analyze_embedding_batch<E: Inference>(
     backend: &Arc<dyn DbBackend>,
-    embedder: &mut AudioEmbedder,
+    embedder: &Arc<std::sync::Mutex<E>>,
 ) -> usize {
     // Skip DSD/DSF/DFF: the DSD→PCM resampler can spin on some SACD rips,
     // hanging the (non-cancellable) decode thread forever and freezing the whole
@@ -473,10 +577,31 @@ pub async fn analyze_embedding_batch(
     let mut deferred = 0usize;
     let mut yielded_to_playback = false;
     for r in &rows {
+        // #5138 — l'arrêt du serveur prime sur tout : pas une piste de plus.
+        if arret_demande() {
+            info!("audio_embed_arret_mid_lot — arrêt du serveur, fin du lot");
+            break;
+        }
         // Playback can start mid-batch; yield at once so neither the decode
         // nor the inference competes with the audio pipeline (#1515) — the
         // same mid-batch bail as the ReplayGain pass (#1310).
-        if let Some(zone) = crate::audio::replaygain::playing_zone_name(backend) {
+        //
+        // #5138 — le témoin de lecture EN MÉMOIRE d'abord (`priorite`, alimenté
+        // par `ZoneRepo::save_play_state`) : une lecture atomique. La requête
+        // sur `zones` ne vient qu'ensuite, et hors de l'exécuteur : chez
+        // JeromeQ, cette requête-ci a attendu 8,4 s une connexion libre
+        // (`slow_query ms=0 attente_ms=8419 sql=SELECT name FROM zones WHERE
+        // last_play_state = 'playing'`), en tenant un ouvrier tout ce temps.
+        let zone_qui_joue = if crate::taches_de_fond::priorite::lecture_en_cours() {
+            Some("?".to_string())
+        } else {
+            let b = backend.clone();
+            tokio::task::spawn_blocking(move || crate::audio::replaygain::playing_zone_name(&b))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(zone) = zone_qui_joue {
             info!(
                 zone = %zone,
                 "audio_embed_yield_to_playback — zone playing, pausing sweep mid-batch"
@@ -613,44 +738,52 @@ pub async fn analyze_embedding_batch(
             }
         };
 
-        if let Some(d) = decoded {
-            let wav = prepare_clap_window(&d.samples_i32, d.channels, d.bit_depth, d.sample_rate);
-            match embedder.embed(&wav) {
-                Ok(emb) => {
-                    let row = vec![
-                        SqlValue::Int(track_id),
-                        SqlValue::Text(MODEL_ID.to_string()),
-                        SqlValue::Blob(embedding_store::to_bytes(&emb)),
-                        SqlValue::Int(now),
-                    ];
-                    // Portable upsert (SQLite ≥ 3.24 + PG): track_id is the PK.
-                    let _ = backend
-                        .execute_many(
-                            "INSERT INTO track_audio_embedding \
-                             (track_id, model, embedding, analyzed_at) VALUES (?, ?, ?, ?) \
-                             ON CONFLICT (track_id) DO UPDATE SET \
-                             model = excluded.model, embedding = excluded.embedding, \
-                             analyzed_at = excluded.analyzed_at, source = NULL",
-                            &[row],
-                        )
-                        .into_iter()
-                        .next();
+        // #5138 — tout ce qui suit le décodage est du travail SYNCHRONE : le
+        // rééchantillonnage de la fenêtre, l'inférence ONNX, l'écriture du
+        // vecteur et du témoin (qui attendent le verrou d'écriture unique de
+        // la base). Un seul aller sur le vivier bloquant, jamais sur un
+        // ouvrier de l'exécuteur.
+        let emb = Arc::clone(embedder);
+        let b = backend.clone();
+        let repo_bloquant = TrackMetadataRepo::with_backend(backend.clone());
+        let ecrit = tokio::task::spawn_blocking(move || {
+            if let Some(d) = decoded {
+                let wav =
+                    prepare_clap_window(&d.samples_i32, d.channels, d.bit_depth, d.sample_rate);
+                let resultat = emb.lock().unwrap_or_else(|e| e.into_inner()).inferer(&wav);
+                match resultat {
+                    Ok(v) => ecrire_empreinte(&b, track_id, &v, now),
+                    Err(e) => warn!(track_id, error = %e, "audio_embed_infer_failed"),
                 }
-                Err(e) => warn!(track_id, error = %e, "audio_embed_infer_failed"),
             }
-        }
-
-        // Stamp the sentinel with the current MODEL_ID whether or not it
-        // produced a vector, so a broken or silent file drops out of the sweep
-        // (until the next model bump) instead of being retried every pass.
-        if stamp_embedding_processed(&repo, track_id) {
-            done += 1;
+            // Pas de témoin sur une inférence interrompue par l'arrêt : la
+            // piste n'a rien d'illisible, elle sera reprise au démarrage.
+            if arret_demande() {
+                return false;
+            }
+            // Stamp the sentinel with the current MODEL_ID whether or not it
+            // produced a vector, so a broken or silent file drops out of the
+            // sweep (until the next model bump) instead of being retried every
+            // pass.
+            stamp_embedding_processed(&repo_bloquant, track_id)
+        })
+        .await;
+        match ecrit {
+            Ok(true) => done += 1,
+            Ok(false) => {}
+            // L'inférence a paniqué : dit, et la passe continue.
+            Err(e) => warn!(track_id, error = %e, "audio_embed_infer_interrupted"),
         }
         // Relu à chaque fichier : baisser le débit pendant que l'analyse tourne
         // doit se sentir tout de suite, pas au prochain démarrage du serveur.
-        let pause = per_file_pause_ms(&crate::db::settings_repo::SettingsRepo::with_backend(
-            backend.clone(),
-        ));
+        let pause = {
+            let b = backend.clone();
+            tokio::task::spawn_blocking(move || {
+                per_file_pause_ms(&crate::db::settings_repo::SettingsRepo::with_backend(b))
+            })
+            .await
+            .unwrap_or(PER_FILE_PAUSE_MS)
+        };
         if pause > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
         }
@@ -677,6 +810,28 @@ pub async fn analyze_embedding_batch(
         "audio_embedding_batch"
     );
     done
+}
+
+/// Écrire le vecteur d'une piste. Upsert portable (SQLite ≥ 3.24 + PG) :
+/// `track_id` est la clé primaire.
+fn ecrire_empreinte(backend: &Arc<dyn DbBackend>, track_id: i64, emb: &[f32], now: i64) {
+    let row = vec![
+        SqlValue::Int(track_id),
+        SqlValue::Text(MODEL_ID.to_string()),
+        SqlValue::Blob(embedding_store::to_bytes(emb)),
+        SqlValue::Int(now),
+    ];
+    let _ = backend
+        .execute_many(
+            "INSERT INTO track_audio_embedding \
+             (track_id, model, embedding, analyzed_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (track_id) DO UPDATE SET \
+             model = excluded.model, embedding = excluded.embedding, \
+             analyzed_at = excluded.analyzed_at, source = NULL",
+            &[row],
+        )
+        .into_iter()
+        .next();
 }
 
 /// Idle wait when disabled or the sweep is drained.
@@ -1118,7 +1273,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
     tokio::spawn(async move {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-        let mut embedder: Option<AudioEmbedder> = None;
+        let mut embedder: Option<Arc<std::sync::Mutex<AudioEmbedder>>> = None;
         // Whether we are currently held back by the memory budget, so the
         // warning is logged on the way in and the recovery on the way out —
         // once each, not once per retry.
@@ -1159,6 +1314,11 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         let mut modele_present = false;
         let mut dernier_essai_modele: Option<std::time::Instant> = None;
         loop {
+            // #5138 — l'arrêt du serveur termine la passe, session relâchée.
+            if arret_demande() {
+                info!("audio_embed_arret — passe acoustique terminée");
+                return;
+            }
             let settings = SettingsRepo::with_backend(backend.clone());
             // Garde premium. Vérifié à CHAQUE tour, et non une seule fois au
             // démarrage : une clé posée ou retirée doit prendre effet sans
@@ -1473,7 +1633,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                                     intra_threads = threads,
                                     "audio_embedder_loaded"
                                 );
-                                embedder = Some(e);
+                                embedder = Some(Arc::new(std::sync::Mutex::new(e)));
                                 loaded_threads = threads;
                             }
                             Ok(Ok(Err(e))) => warn!(error = %e, "audio_embedder_load_failed"),
@@ -1528,7 +1688,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         }
                     }
                 }
-                if let Some(emb) = embedder.as_mut() {
+                if let Some(emb) = embedder.as_ref() {
                     // Une passe lourde à la fois (#1576) : si ReplayGain
                     // décode, on attend notre tour — les deux ensemble ont
                     // déjà éteint une machine.
@@ -1588,6 +1748,10 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         }
     });
 }
+
+/// Banc de mesure de #5138 (ignoré : vrai modèle, vrai runtime).
+#[cfg(all(test, target_os = "linux"))]
+mod banc_5138;
 
 #[cfg(test)]
 mod tests {
@@ -1942,9 +2106,10 @@ mod tests {
         } else {
             assert_eq!(
                 obtenu,
-                (cores() / 2).max(1),
+                (cores() / 2).clamp(1, super::FILS_EQUILIBRE_MAX),
                 "au-delà de huit cœurs le défaut doit être `equilibre` — la \
-                 moitié de la machine ({} cœurs ici)",
+                 moitié de la machine, plafonnée à {} fils (#5138) ({} cœurs ici)",
+                super::FILS_EQUILIBRE_MAX,
                 cores()
             );
         }
@@ -1963,8 +2128,25 @@ mod tests {
         // genoux, ni brider quelqu'un qui a demandé autre chose.
         assert_eq!(
             super::intra_threads_for(&settings_with_throttle(Some("n'importe quoi"))),
-            (cores() / 2).max(1)
+            (cores() / 2).clamp(1, super::FILS_EQUILIBRE_MAX)
         );
+    }
+
+    /// #5138 — ni le défaut ni `equilibre` ne dépassent deux fils ONNX, quelle
+    /// que soit la machine. JeromeQ (8 cœurs, `equilibre`) en avait QUATRE, et
+    /// le banc mesure 2,8 cœurs occupés en continu à ce réglage. Seul `rapide`,
+    /// choisi explicitement, prend la machine.
+    #[test]
+    fn equilibre_et_defaut_ne_depassent_jamais_deux_fils() {
+        for v in [None, Some("equilibre"), Some("n'importe quoi"), Some("eco")] {
+            let n = super::intra_threads_for(&settings_with_throttle(v));
+            assert!(
+                (1..=2).contains(&n),
+                "{v:?} → {n} fils ONNX ({} cœurs ici) : une analyse de fond ne \
+                 doit pas prendre plus de deux cœurs sans qu'on le lui demande",
+                cores()
+            );
+        }
     }
 
     #[test]
