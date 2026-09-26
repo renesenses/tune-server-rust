@@ -985,6 +985,11 @@ path = "tests/dossiers_de_collections_4853.rs"
 name = "compensation_de_niveau_4685"
 path = "tests/compensation_de_niveau_4685.rs"
 
+# #5069 — la part de la compensation que le volume COURANT rend réellement.
+[[test]]
+name = "compensation_rendue_au_volume_5069"
+path = "tests/compensation_rendue_au_volume_5069.rs"
+
 # #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
 # bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
 # de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.
