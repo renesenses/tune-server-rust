@@ -271,8 +271,8 @@ async fn start_rip(
         .output_dir
         .or_else(|| settings.get("cd_rip_output_dir").ok().flatten())
         .unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("tune-rip")
+            // #4770 : un dossier par compte, jamais un nom fixe partagé.
+            tune_core::chemins_de_travail::racine_de_travail("tune-rip")
                 .to_string_lossy()
                 .to_string()
         });

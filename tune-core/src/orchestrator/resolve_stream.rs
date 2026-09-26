@@ -915,6 +915,7 @@ impl PlaybackOrchestrator {
                 &upstream_url,
                 &upstream_headers,
                 &codec,
+                // tmp-autorise: base seule : telecharger_pour_session y crée un fichier tempfile au nom aléatoire.
                 &std::env::temp_dir(),
             )
             .await
@@ -1280,6 +1281,7 @@ impl PlaybackOrchestrator {
         let sr = stream_data.quality.sample_rate;
         let bd = stream_data.quality.bit_depth.max(16).min(24);
 
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
         let tmp_path = std::env::temp_dir()
             .join(format!("tune-dash-transcode-{}.flac", uuid::Uuid::new_v4()))
             .to_string_lossy()
@@ -1772,6 +1774,7 @@ impl PlaybackOrchestrator {
         upstream_headers: Vec<(String, String)>,
         codec: &str,
     ) -> Result<String, String> {
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
         let tmp_dl = std::env::temp_dir()
             .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
             .to_string_lossy()
@@ -2054,6 +2057,7 @@ impl PlaybackOrchestrator {
                 // #4366 — même rejeu qu'au canal AAC : ce chemin télécharge la
                 // même URL, il tomberait sur le même 403.
                 let upstream_headers = stream_data.headers.clone();
+                // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
                 let tmp_dl = std::env::temp_dir()
                     .join(format!(
                         "tune-stream-{}.{}",
@@ -2062,6 +2066,7 @@ impl PlaybackOrchestrator {
                     ))
                     .to_string_lossy()
                     .to_string();
+                // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
                 let tmp_wav = std::env::temp_dir()
                     .join(format!(
                         "tune-stream-pretranscode-{}.{}",

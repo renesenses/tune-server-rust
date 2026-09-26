@@ -1013,6 +1013,7 @@ fn spawn_dash_temp_gc() {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             ticker.tick().await;
+            // tmp-autorise: balayage en LECTURE de la racine ; ne supprime que des tune-dash-*.mp4 au nom UUID, ceux d'un autre compte restent protégés par le sticky bit de /tmp.
             let dir = std::env::temp_dir();
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;

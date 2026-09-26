@@ -107,6 +107,7 @@ impl PlaybackOrchestrator {
             }
             // Transcode into a fresh temp file, then atomically rename it into the
             // cache (crash-safe: a partial write never lands under a cache name).
+            // tmp-autorise: fichier au nom aléatoire (UUID v4), renommé dans le cache ou supprimé.
             let tmp = std::env::temp_dir()
                 .join(format!(
                     "tune-transcode-{}.{}",
@@ -226,6 +227,7 @@ impl PlaybackOrchestrator {
             // Decode the fMP4 → encode (FLAC/WAV, WAV capped at 16-bit) → temp,
             // then atomically rename into the cache. Mirrors the play path.
             let is_wav = out_fmt == "wav";
+            // tmp-autorise: fichier au nom aléatoire (UUID v4), renommé dans le cache ou supprimé.
             let tmp = std::env::temp_dir()
                 .join(format!(
                     "tune-dash-warm-{}.{}",

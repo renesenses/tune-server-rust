@@ -555,6 +555,7 @@ pub fn default_log_file_path() -> std::path::PathBuf {
     let path = chemin_du_journal(
         &lire,
         SystemeDuJournal::courant(),
+        // tmp-autorise: base seule : chemin_du_journal y joint l'UID du compte (#4770).
         &std::env::temp_dir(),
         tune_core::chemins_de_travail::uid_courant(),
     );
@@ -575,6 +576,7 @@ pub(crate) fn emplacement_par_defaut_du_journal() -> std::path::PathBuf {
     chemin_du_journal(
         &sans_surcharge_du_journal(&lire),
         SystemeDuJournal::courant(),
+        // tmp-autorise: base seule : chemin_du_journal y joint l'UID du compte (#4770).
         &std::env::temp_dir(),
         tune_core::chemins_de_travail::uid_courant(),
     )

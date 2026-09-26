@@ -38,6 +38,7 @@ pub fn tools_dir() -> PathBuf {
     let lire = |nom: &str| std::env::var(nom).ok();
     let base = base_des_outils(
         &lire,
+        // tmp-autorise: base seule : base_des_outils y joint l'UID du compte (#4770).
         &std::env::temp_dir(),
         crate::chemins_de_travail::uid_courant(),
     );

@@ -2414,6 +2414,7 @@ impl PlaybackOrchestrator {
             // renamed into the cache. A crash mid-transcode therefore can
             // never leave a partial file under a cache name that a later hit
             // would serve.
+            // tmp-autorise: fichier au nom aléatoire (UUID v4), renommé dans le cache ou supprimé.
             let tmp_path = std::env::temp_dir()
                 .join(format!(
                     "tune-transcode-{}.{}",
