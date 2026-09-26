@@ -64,6 +64,7 @@ pub(crate) mod transaction_du_lot;
 pub mod tx_holder;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub mod verrou_ecriture;
+pub mod zone_motif_masquage;
 pub mod zone_repo;
 
 #[cfg(test)]

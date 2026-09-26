@@ -425,7 +425,11 @@ CREATE TABLE IF NOT EXISTS zones (
     dlna_cap_16bit TEXT DEFAULT 0,
     lyrics_offset_ms TEXT DEFAULT 0,
     last_seen_at TEXT,
-    output_endpoint_id TEXT
+    output_endpoint_id TEXT,
+    -- Motif et date du masquage (#5077, SQLite 112 / PG 075). NUL = inconnu.
+    -- TEXT des deux côtés.
+    motif_masquage TEXT,
+    masquee_le TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
@@ -1060,6 +1064,10 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_lpcm TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS dlna_cap_16bit TEXT DEFAULT 0;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_seen_at TEXT;
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS output_endpoint_id TEXT;
+-- Motif et date du masquage d'une zone (SQLite migration v112, #5077). Sans
+-- défaut : NUL = inconnu, l'état de tout masquage d'avant la migration.
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS motif_masquage TEXT;
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS masquee_le TEXT;
 
 -- listen_history: streaming source id + album id + profile scoping (v32/v37/v45)
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;

@@ -291,6 +291,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // comme le dedoublonnage juste au-dessus, AVANT que la moindre tache de
     // decouverte ne demarre.
     masquer_les_zones_reflet(state);
+    // #5077 — la réparation sûre des masquages : une zone masquée par la
+    // cascade d'« Ignorer » dont l'appareil n'est plus ignoré revient. Rien
+    // d'autre : un motif inconnu (masquage d'avant la migration 112) ou une
+    // suppression par l'utilisateur n'est jamais touché.
+    reparer_les_masquages_de_zones(state);
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     recalculer_les_compilations(state);
@@ -625,7 +630,8 @@ fn nos_facades_par_zone(db: &Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<
 ///
 /// ## Masquer, et non supprimer
 ///
-/// [`tune_core::db::zone_repo::ZoneRepo::delete`] pose `is_hidden = 1`. C'est
+/// [`tune_core::db::zone_repo::ZoneRepo::masquer`] pose `is_hidden = 1`, au
+/// motif `zone_reflet` (#5077), que la réparation sûre ne défait jamais. C'est
 /// ce qu'il faut : la ligne garde son `output_device_id`, donc
 /// `is_device_hidden` reconnaît l'UDN au tour de découverte suivant et
 /// `get_or_create` rend la zone masquée **telle quelle** au lieu d'en créer une
@@ -687,8 +693,8 @@ fn masquer_les_zones_reflet(state: &AppState) -> usize {
             );
             continue;
         }
-        match zone_repo.delete(zid) {
-            Ok(()) => {
+        match zone_repo.masquer(zid, tune_core::db::zone_repo::MotifMasquage::ZoneReflet) {
+            Ok(_) => {
                 masquees += 1;
                 info!(
                     zone_id = zid,
@@ -799,6 +805,21 @@ fn cleanup_orphan_queues(state: &AppState) {
                 tracing::warn!(error = %e, "orphan_queue_cleanup_failed");
             }
         }
+    }
+}
+
+/// #5077 — voir [`tune_core::db::zone_motif_masquage::reparer_les_masquages_surs`].
+/// Un échec (base d'avant la migration 112, liste d'ignorés illisible) ne
+/// démasque rien et ne bloque pas le démarrage.
+fn reparer_les_masquages_de_zones(state: &AppState) {
+    match tune_core::db::zone_motif_masquage::reparer_les_masquages_surs(state.backend.clone()) {
+        Ok(rapport) if !rapport.demasquees.is_empty() => info!(
+            demasquees = ?rapport.demasquees,
+            gardees = ?rapport.gardees,
+            "zones_masquees_reparees"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "zones_masquees_reparation_sautee"),
     }
 }
 

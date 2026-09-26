@@ -251,6 +251,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_bascule_ -- --nocapture
 
+      # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
+      # chemin qui masque, le démasquage et la réparation sûre, joués sur la
+      # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
+      # cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Motif du masquage des zones sur PostgreSQL (#5077)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5077 -- --nocapture --test-threads=1
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
