@@ -390,10 +390,11 @@ impl AppState {
         //
         // L'inscription est INCONDITIONNELLE, comme les cinq autres, et non
         // gardée par l'état du greffon : `ServiceRegistry::get` ne consulte
-        // jamais `enabled`, et le service rend `enabled() == false` tant que
-        // personne ne l'a activé — il apparaît donc comme disponible et non
-        // connecté, exactement comme le greffon opt-in dont il est la seconde
-        // face. La LECTURE, elle, ne change pas de chemin : `resolve_stream`
+        // jamais `enabled`. La case « Actif » suit la liaison du compte tant
+        // que personne n'y a touché, et lier un compte la coche (fil 1952,
+        // voir `BandcampService`) : sans compte lié, il apparaît donc
+        // disponible, non connecté et décoché. La LECTURE, elle, ne change
+        // pas de chemin : `resolve_stream`
         // route toujours `source == "bandcamp"` vers `resolve_direct_url`.
         #[cfg(feature = "bandcamp")]
         services.register(Box::new(tune_bandcamp::BandcampService::new(
