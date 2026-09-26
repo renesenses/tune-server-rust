@@ -335,16 +335,94 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
     // de troncature comprise — et non plus la somme des gains positifs
     // (9,0 / 6,0 dB) : deux cloches empilées à 1 kHz sonnent au-delà de leur
     // gain crête, et depuis #4594 c'est cette borne-là, seule, qui est
-    // réservée. Le panneau lit `automatic_headroom_db` à chaud : il annonce
+    // réservée. Le panneau lit `reserve_db_at` à chaud (#5171) : il annonce
     // donc toujours ce qui est RÉELLEMENT retiré au signal, sans qu'une
     // valeur soit recopiée quelque part. Le verdict bit-perfect, lui, ne
     // dépend pas du chiffre mais de l'EXISTENCE d'un EQ actif
     // (`zone_eq_alters_signal`) : il reste faux.
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
-        Some("EQ actif (pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")
+        Some("EQ actif (réserve sûre, pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")
     );
     assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+}
+
+/// #5171 — en réserve « Réaliste », le chemin du signal dit la réserve
+/// choisie, le pré-gain qu'elle applique VRAIMENT (plus petit que la L1 du
+/// mode sûr) et la présence du limiteur, avec son compteur.
+#[test]
+fn eq_step_names_the_realistic_headroom_and_its_limiter_5171() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let mut profile = tune_core::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![tune_core::audio::eq::EqBandSpec {
+            gain: 6.0,
+            ..Default::default()
+        }],
+        headroom_mode: tune_core::audio::eq::HeadroomMode::Realistic,
+        ..Default::default()
+    };
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(&profile).unwrap(),
+        )
+        .unwrap();
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+
+    let sp = build_signal_path(
+        &alac_hires_playing(),
+        &zone,
+        &backend,
+        Some("Marantz"),
+        "",
+        Some(&wire("alac", 96_000, 24)),
+    )
+    .unwrap();
+
+    let sr = tune_core::audio::eq::DEBIT_DE_REFERENCE_HZ;
+    let realiste = profile.reserve_db_at(0, sr);
+    profile.headroom_mode = tune_core::audio::eq::HeadroomMode::Safe;
+    let sure = profile.reserve_db_at(0, sr);
+    assert!(realiste > sure + 0.3, "réaliste {realiste} / sûre {sure}");
+    let dsp = step_desc(&sp, "DSP").expect("étape DSP");
+    assert!(
+        dsp.starts_with(&format!(
+            "EQ actif (réserve réaliste, pré-gain auto {realiste:.1} dB, limiteur de sécurité"
+        )),
+        "le chemin du signal n'annonce pas la réserve réaliste appliquée \
+         ({realiste:.1} dB, sûre {sure:.1} dB) : {dsp}"
+    );
+    let h = &sp["eq_headroom"];
+    assert_eq!(h["mode"], "realistic", "{h}");
+    assert!(
+        (h["reserve_db"][0].as_f64().unwrap() - realiste).abs() < 0.01,
+        "{h}"
+    );
+    assert!(h["limiter"]["trames_limitees"].is_u64(), "{h}");
+    assert_eq!(h["limiter"]["portee"], "processus", "{h}");
+}
+
+/// #5171 — la phrase du limiteur dit s'il a agi, et combien.
+#[test]
+fn la_phrase_du_limiteur_dit_s_il_a_agi_5171() {
+    let mut r = tune_core::audio::limiteur::ReleveLimiteur {
+        trames_vues: 1_000_000,
+        trames_limitees: 0,
+        pourcentage: 0.0,
+        reduction_max_db: 0.0,
+        pistes_limitees: 0,
+    };
+    assert_eq!(phrase_du_limiteur(&r), "limiteur de sécurité, n'a pas agi");
+    r.trames_limitees = 120;
+    r.pourcentage = 0.012;
+    r.reduction_max_db = -1.46;
+    assert_eq!(
+        phrase_du_limiteur(&r),
+        "limiteur de sécurité, a agi sur 120 trames (0.012 %) depuis le démarrage, -1.5 dB au plus"
+    );
 }
 
 /// #2205/#2233 : le backend Windows connaît déjà le verdict exact à la
