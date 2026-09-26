@@ -18,5 +18,8 @@ mod plugin_events;
 mod plugin_party_e2e;
 #[path = "plugin_uninstall_4194.rs"]
 mod plugin_uninstall_4194;
+// #5112 — `restart_required` d'`enable`/`disable` sur un greffon WASM.
+#[path = "plugin_wasm_restart_required_5112.rs"]
+mod plugin_wasm_restart_required_5112;
 #[path = "plugin_wasm_routes.rs"]
 mod plugin_wasm_routes;
