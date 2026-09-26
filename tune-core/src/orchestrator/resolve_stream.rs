@@ -1965,7 +1965,7 @@ impl PlaybackOrchestrator {
     /// MIME ? Sinon transcodage WAV (LPCM) ; sinon relais du flux CDN par
     /// session mandataire, bit-perfect, avec la sonde de niveaux en parallèle.
     #[allow(clippy::too_many_arguments)] // les arguments de `resoudre_flux_https`, plus le codec
-    async fn relayer_le_flux(
+    pub(super) async fn relayer_le_flux(
         &self,
         req: &PlayRequest,
         source_id: &str,
@@ -2022,6 +2022,37 @@ impl PlaybackOrchestrator {
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
             let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
             let https_dsp_active = https_dsp.is_active();
+
+            // #5080 — traitement actif vers une zone réseau : WAV progressif,
+            // le traitement au fil de l'eau, quand la bibliothèque y aurait
+            // droit. Sans cela, le bras ci-dessous attend la piste ENTIÈRE —
+            // téléchargée, décodée, traitée, ré-encodée — avant de rendre une
+            // adresse : plus d'une minute de silence sur un Hi-Res long.
+            if https_dsp_active
+                && let Some(bd_servie) = self
+                    .profondeur_du_wav_progressif_de_service(
+                        service_name,
+                        stream_data,
+                        &codec_lower,
+                        zone_output_type.as_deref(),
+                        device_id,
+                        renderer_supports_mime,
+                        &https_dsp,
+                    )
+                    .await
+            {
+                return Ok(self
+                    .servir_le_service_en_wav_progressif(
+                        req,
+                        service_name,
+                        stream_data,
+                        codec_lower,
+                        sr,
+                        bd_servie,
+                        https_dsp,
+                    )
+                    .await);
+            }
 
             if streaming_needs_pretranscode(
                 renderer_supports_mime,
@@ -2305,6 +2336,111 @@ impl PlaybackOrchestrator {
             }
         };
         Ok(flux)
+    }
+
+    /// #5080 — la profondeur du WAV progressif à servir, ou `None` quand le
+    /// flux doit rester sur le pré-transcodage par le fichier.
+    ///
+    /// La décision de la bibliothèque (`resolve_local.rs`, `dsp_progressif_wav`)
+    /// appliquée au bras des services : même opt-in (`dsp_progressif_reseau`),
+    /// même consentement d'un crossfeed seul (#2742), même sonde LPCM du
+    /// renderer, et le flux doit se décoder au fil de l'eau. Profondeur : celle
+    /// de la source bornée à 24 bits quand le renderer lit le FLAC amont ;
+    /// 16 bits quand il le refuse — le profil LPCM historique de #1137, que le
+    /// pré-transcodage WAV servait déjà.
+    #[allow(clippy::too_many_arguments)] // les faits déjà établis par `relayer_le_flux`
+    async fn profondeur_du_wav_progressif_de_service(
+        &self,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        codec_lower: &str,
+        zone_output_type: Option<&str>,
+        device_id: &str,
+        renderer_supports_mime: bool,
+        dsp: &StreamingDsp,
+    ) -> Option<u16> {
+        let decodable = decodage_progressif_par_range(service_name, codec_lower, &stream_data.url);
+        let sortie_reseau = is_network_output_type(zone_output_type);
+        let opt_in = SettingsRepo::with_backend(self.db.clone())
+            .get("dsp_progressif_reseau")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        let autre_traitement =
+            dsp.replaygain.is_some() || dsp.eq.is_some() || dsp.convolver.is_some();
+        let consenti = super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
+            opt_in,
+            dsp.crossfeed.is_some(),
+            autre_traitement,
+        );
+        let actif = dsp.is_active();
+        // La sonde SOAP n'est consultée que si tout le reste est réuni.
+        if !service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, true) {
+            return None;
+        }
+        let bd = if renderer_supports_mime {
+            cap_output_bit_depth(stream_data.quality.bit_depth)
+        } else {
+            16
+        };
+        let lpcm = !device_id.is_empty() && self.dlna_accepte_lpcm(device_id, bd > 16).await;
+        service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, lpcm).then_some(bd)
+    }
+
+    /// #5080 — sert un flux de service en WAV progressif, traitement de zone
+    /// au fil de l'eau : session ouverte TOUT DE SUITE, adresse rendue tout de
+    /// suite, décodage (source Range, sinon téléchargement) dans une tâche
+    /// détachée — le même producteur que le bras local/OAAT, avec le relais
+    /// DSP de LAT-F1 entre le décodeur et la session. Le premier chunk est
+    /// l'en-tête WAV : il est épargné (`skip_header`).
+    #[allow(clippy::too_many_arguments)] // les faits déjà établis par `relayer_le_flux`
+    async fn servir_le_service_en_wav_progressif(
+        &self,
+        req: &PlayRequest,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        codec_lower: String,
+        sr: u32,
+        bd: u16,
+        dsp: StreamingDsp,
+    ) -> FluxHttps {
+        info!(
+            zone_id = req.zone_id,
+            service = service_name,
+            codec = %codec_lower,
+            sample_rate = sr,
+            bit_depth = bd,
+            "streaming_dsp_progressif_wav_target"
+        );
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready) = self
+            .ouvrir_la_session_wav(wav_info, service_name, &codec_lower, sr, bd)
+            .await;
+        let tx = spawn_streaming_dsp_relay(dsp, bd, true, tx);
+        let tache = self.capturer_pour_le_transcodage(
+            req,
+            service_name,
+            stream_data.url.clone(),
+            stream_data.headers.clone(),
+            codec_lower,
+            sr,
+            bd,
+            &session_id,
+        );
+        tokio::spawn(Self::transcoder_le_flux_en_wav(tache, tx, data_ready));
+        let server_ip = self.server_ip();
+        let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+        (url, Some(session_id), "audio/wav".to_string(), None)
     }
 }
 
