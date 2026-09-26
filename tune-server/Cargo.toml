@@ -952,6 +952,12 @@ path = "tests/compensation_de_niveau_4685.rs"
 name = "crossfeed_presets_4684"
 path = "tests/crossfeed_presets_4684.rs"
 
+# #5081 — l'ombre de la tête du crossfeed par les routes (`/zones/{id}/dsp`,
+# `/crossfeed/presets`). `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "crossfeed_ombre_5081"
+path = "tests/crossfeed_ombre_5081.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.

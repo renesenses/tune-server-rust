@@ -2401,6 +2401,11 @@ impl PlaybackOrchestrator {
                 empreinte_dsp,
                 crossfeed.as_ref().map(|(_, reglage)| *reglage),
             );
+            // #5081 — et l'ombre de la tête du processeur chargé.
+            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(
+                empreinte_dsp,
+                crossfeed.as_ref().and_then(|(p, _)| p.ombre()),
+            );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
                 &out_ext,

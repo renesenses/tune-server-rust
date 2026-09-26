@@ -927,9 +927,18 @@ impl PlaybackOrchestrator {
             .chemin_ir_configure(zone_id)
             .filter(|p| std::path::Path::new(p).exists())
             .unwrap_or_default();
+        // #5081 — l'ombre de la tête change les octets : elle entre aussi.
         let crossfeed = self
             .crossfeed_configure(zone_id)
-            .map(|(amount, delay_ms)| format!("{amount}:{delay_ms}"))
+            .map(
+                |(amount, delay_ms)| match self.crossfeed_ombre_configuree(zone_id) {
+                    Some(o) => format!(
+                        "{amount}:{delay_ms}:{}:{}",
+                        o.cutoff_hz, o.slope_db_per_octave
+                    ),
+                    None => format!("{amount}:{delay_ms}"),
+                },
+            )
             .unwrap_or_default();
         let replaygain = track_id
             .map(|tid| crate::audio::replaygain::playback_factor(&self.db, tid))
@@ -1616,11 +1625,30 @@ impl PlaybackOrchestrator {
             return None;
         }
         let (amount, delay_ms) = self.crossfeed_configure(zone_id)?;
-        Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+        // #5081 — le filtre d'ombre de la tête, éteint par défaut.
+        Some(crate::audio::crossfeed::CrossfeedProcessor::avec_ombre(
             sample_rate,
             amount,
             delay_ms,
+            self.crossfeed_ombre_configuree(zone_id),
         ))
+    }
+
+    /// #5081 — l'ombre de la tête du crossfeed de la zone, lue dans la même
+    /// clé `zone_{id}_crossfeed` que [`Self::crossfeed_configure`]. `None`
+    /// quand l'interrupteur est éteint ou absent (réglage d'avant #5081).
+    /// Ne décide pas si le crossfeed tourne : c'est `crossfeed_configure`.
+    pub(super) fn crossfeed_ombre_configuree(
+        &self,
+        zone_id: i64,
+    ) -> Option<tune_plugin_crossfeed::OmbreDeTete> {
+        let cfg: serde_json::Value =
+            crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+                .get(&format!("zone_{zone_id}_crossfeed"))
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())?;
+        crate::audio::crossfeed::ombre_du_reglage(&cfg)
     }
 
     /// Le crossfeed CONFIGURÉ de la zone — `(amount, delay_ms)` bornés — sans
