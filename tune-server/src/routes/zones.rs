@@ -531,6 +531,28 @@ pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
     list_zones(State(state)).await
 }
 
+/// 🔴 #5077 — les zones que le client doit VOIR : les visibles, plus toute
+/// zone masquée qui joue ou est en pause
+/// ([`ZoneRepo::list_avec_masquees_en_lecture`]).
+///
+/// `GET /zones` et l'instantané WebSocket passent par ici : le client relit
+/// `/zones` à chaque `playback.*`, et une zone qu'il regarde ne doit pas
+/// disparaître de la liste pendant qu'elle joue (DMP-A6, fils 1926 et 1951 :
+/// « Aucune lecture en cours » pendant un album qui s'enchaîne).
+pub(crate) async fn zones_a_montrer(state: &AppState) -> Vec<Zone> {
+    let en_lecture: Vec<i64> = state
+        .playback
+        .all_states()
+        .await
+        .into_iter()
+        .filter(|s| s.state != PlayState::Stopped)
+        .map(|s| s.zone_id)
+        .collect();
+    ZoneRepo::with_backend(state.backend.clone())
+        .list_avec_masquees_en_lecture(&en_lecture)
+        .unwrap_or_default()
+}
+
 mod dsp;
 pub use dsp::*;
 
@@ -547,6 +569,8 @@ mod fusion_tests;
 mod identite_appareil_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
+#[cfg(test)]
+mod zone_masquee_en_lecture_affichee_5077;
 #[cfg(test)]
 mod zone_sans_appareil_guard;
 
