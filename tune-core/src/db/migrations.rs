@@ -3564,6 +3564,32 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         );",
     )
     .ok();
+    // Titres de SERVICE bannis (#4806) — la jumelle de `hidden_items` pour
+    // l'espace d'identifiants du streaming, sur le modele de
+    // `streaming_item_tags` juste au-dessus. SANS migration numerotee, et
+    // c'est voulu : ce rattrapage tourne a CHAQUE demarrage, sur toute base
+    // SQLite existante ou neuve (le CORE_SCHEMA de `sqlite.rs` la porte
+    // aussi), exactement comme `streaming_favorites`. Un numero reserve pour
+    // un lot qui n'est pas encore fusionne casserait la contiguite
+    // (`migration_count_matches`) ; une table neuve n'en a pas besoin.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_hidden_items (\
+            profile_id INTEGER NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            album_source_id TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\
+            PRIMARY KEY (profile_id, item_type, source, source_id)\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item \
+            ON streaming_hidden_items(item_type, source, source_id);",
+    )
+    .ok();
     // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
@@ -7412,6 +7438,52 @@ mod tests {
              PostgreSQL deja converties (schema_version 99) resteraient sans \
              la table pour toujours"
         );
+    }
+
+    /// `streaming_hidden_items` (#4806 suite, titres de SERVICE bannis) doit
+    /// exister partout ou une base arrive a la vie — SANS migration numerotee,
+    /// comme `streaming_favorites` : le rattrapage de `run_migrations` (toute
+    /// base SQLite), le CORE_SCHEMA, `PG_FULL_SCHEMA` avec sa copie et sa
+    /// clause de conflit (bascule SQLite -> PG), et `ENSURE_TABLES` (toute
+    /// base PostgreSQL, a chaque demarrage).
+    #[test]
+    fn les_titres_de_service_bannis_existent_sur_tous_les_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // 1. Une base SQLite qui ne passe QUE par `run_migrations` (sans
+        //    CORE_SCHEMA prealable) a la table : c'est le rattrapage.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch("DROP TABLE streaming_hidden_items;")
+            .unwrap();
+        run_migrations(&db).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'streaming_hidden_items'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 1, "le rattrapage de run_migrations ne pose pas la table");
+        // 2. CORE_SCHEMA.
+        let sqlite = fs::read_to_string(racine.join("src/db/sqlite.rs")).unwrap();
+        assert!(sqlite.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
+        // 3. Bascule SQLite -> PG : schema, copie, clause de conflit.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(pg_neuf.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
+        assert!(
+            pg_neuf.contains("\"streaming_hidden_items\","),
+            "`streaming_hidden_items` n'est pas dans MIGRATION_TABLES : les \
+             titres de service bannis seraient perdus a la bascule"
+        );
+        assert!(
+            pg_neuf.contains("ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"),
+            "pas de colonne `id` : la clause par defaut echouerait"
+        );
+        // 4. ENSURE_TABLES — le seul chemin PostgreSQL, a chaque demarrage.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(ensure.contains("CREATE TABLE IF NOT EXISTS streaming_hidden_items"));
     }
 
     /// `media_servers` (#2219, phase 1) doit exister sur les QUATRE chemins,

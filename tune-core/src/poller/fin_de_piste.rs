@@ -463,7 +463,21 @@ impl PositionPoller {
                     match Self::next_position_after(zone_state, attempt_pos) {
                         // Same slot again means repeat-one on a dead track:
                         // skipping would spin forever.
-                        Some(p) if p != attempt_pos => attempt_pos = p,
+                        Some(p) if p != attempt_pos => {
+                            // #4806 — après un échec aussi, les titres bannis
+                            // qui suivent sont enjambés : sans cela, un titre
+                            // banni juste derrière une piste injouable serait
+                            // joué.
+                            attempt_pos = match self
+                                .orchestrator
+                                .enjamber_les_pistes_bannies(zone_id, p)
+                                .await
+                            {
+                                crate::orchestrator::Enjambee::Rien => p,
+                                crate::orchestrator::Enjambee::Reprise(q) => q,
+                                crate::orchestrator::Enjambee::FileEpuisee => break,
+                            };
+                        }
                         _ => break,
                     }
                 }
@@ -673,14 +687,41 @@ impl PositionPoller {
         // L'identite de ce qu'on s'apprete a armer, lue AVANT de le resoudre :
         // une ligne de file, pas une position (#3026). C'est la seule trace de
         // ce que le renderer aura reellement accepte.
-        let arme = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
+        let ligne = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone())
             .get_at(zone_id, next_pos)
             .ok()
-            .flatten()
-            .map(|e| ArmedNext {
-                row_id: e.id,
-                position: next_pos,
-            });
+            .flatten();
+
+        // #4806 — une suivante BANNIE (locale ou de service) n'est jamais
+        // armée : armée, elle serait jouée par le renderer sans que la file
+        // ait son mot à dire. Non armée, la fin de piste passe par
+        // `avancer_avec_reprises`, qui l'enjambe. On perd l'enchaînement sans
+        // blanc pour CETTE transition seulement, pas le titre suivant.
+        if let Some(e) = ligne.as_ref() {
+            let bans = crate::db::hidden_repo::HiddenRepo::with_backend(self.db.clone());
+            let profil = crate::db::hidden_repo::profil_de_selection_automatique(&self.db);
+            if bans.ligne_bannie(
+                profil,
+                e.track_id,
+                e.source.as_deref(),
+                e.source_id.as_deref(),
+            ) {
+                debug!(
+                    zone_id,
+                    next_pos,
+                    track_id = ?e.track_id,
+                    source = ?e.source,
+                    source_id = ?e.source_id,
+                    "gapless_suivante_bannie_non_armee"
+                );
+                return GaplessPrep::NotArmed;
+            }
+        }
+
+        let arme = ligne.map(|e| ArmedNext {
+            row_id: e.id,
+            position: next_pos,
+        });
 
         // Local-file gapless (OAAT native DSD): the output reads the next
         // track's `.dsf` directly, so resolve it as a local file WITHOUT a

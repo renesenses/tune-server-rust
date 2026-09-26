@@ -329,6 +329,17 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/ban",
             post(tracks::ban_track).delete(tracks::unban_track),
         )
+        // Titres de SERVICE bannis (#4806 suite, FabienM fil 1946 réponse
+        // 6820). Deux `POST` plutôt qu'un `POST` et un `DELETE` de chemin :
+        // la désignation `source` + `source_id` voyage dans le CORPS, parce
+        // qu'un `source_id` peut contenir une barre oblique — la forme de
+        // `/tags/{id}/streaming-items` (#3699). Le segment fixe `streaming`
+        // passe avant `{id}` dans le routeur.
+        .route("/tracks/streaming/ban", post(tracks::ban_streaming_track))
+        .route(
+            "/tracks/streaming/unban",
+            post(tracks::unban_streaming_track),
+        )
         // PUT mirrors POST /metadata/tracks/{id}/edit so track editing lives on
         // the same REST family as albums/artists (PUT /library/…/{id}).
         .route(

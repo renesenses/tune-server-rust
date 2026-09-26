@@ -824,6 +824,26 @@ CREATE TABLE IF NOT EXISTS hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
 
+-- Titres de SERVICE bannis (#4806, FabienM fil 1946 réponse 6820) — la
+-- jumelle de `hidden_items` pour l'espace d'identifiants du streaming, comme
+-- `streaming_item_tags` l'est de `item_tags` : un titre Qobuz, Tidal ou
+-- Bandcamp n'a pas d'entier, il porte la paire `source` + `source_id`.
+-- Présente AUSSI dans le rattrapage de `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS streaming_hidden_items (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
 -- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums
 -- (grouped / merge-duplicates) tourne sur une base née de `init_schema` seul,

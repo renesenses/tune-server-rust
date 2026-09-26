@@ -1281,8 +1281,13 @@ fn borne_plus_comme_ca(limit: Option<usize>) -> usize {
 ///  - 502 : le titre source n'a pas pu être lu chez le service ;
 ///  - 200 `[]` : aucun voisin trouvé — une réponse, pas une panne.
 ///
-/// Titres bannis : la radio n'en exclut aucun sur cette base (la fonction
-/// `banned` de #4818 n'y est pas) ; la route suit la radio.
+/// Titres bannis (#4806 suite) : la route suit la radio de fin de file
+/// (`autoplay_streaming_radio`) — un titre de ce service banni par le profil
+/// actif du serveur n'est jamais proposé, et l'exclusion se fait AVANT le
+/// tirage pour que la borne se tienne en titres jouables. Le profil est celui
+/// des sélections automatiques (`profil_de_selection_automatique`) : ce
+/// routeur ne porte pas l'extracteur `ActiveProfile`, qui vit dans
+/// `tune-server`.
 async fn service_track_similar(
     State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
@@ -1321,6 +1326,11 @@ async fn service_track_similar(
     if !source.id.is_empty() {
         exclure.insert(source.id.clone());
     }
+    tune_core::db::hidden_repo::exclure_les_titres_de_service_bannis(
+        &state.backend,
+        &service,
+        &mut exclure,
+    );
     let similaires = tune_core::playback::auto_dj::pistes_similaires_du_service(
         &arc,
         &source.artist,

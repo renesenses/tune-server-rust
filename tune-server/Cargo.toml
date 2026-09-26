@@ -190,6 +190,12 @@ path = "tests/dr_liste_albums_4521.rs"
 name = "titres_bannis_4806"
 path = "tests/titres_bannis_4806.rs"
 
+# #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
+# réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "titres_de_service_bannis_4806"
+path = "tests/titres_de_service_bannis_4806.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois

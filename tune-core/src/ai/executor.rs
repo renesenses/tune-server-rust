@@ -313,6 +313,19 @@ impl ToolExecutor {
         let Some(next_pos) = crate::poller::PositionPoller::next_position(&current) else {
             return json!({ "status": "end_of_queue", "message": "no more tracks in queue" });
         };
+        // #4806 — comme la route « Suivant » : les titres bannis (locaux et
+        // de service) sont enjambés.
+        let next_pos = match self
+            .orchestrator
+            .enjamber_les_pistes_bannies(self.zone_id, next_pos)
+            .await
+        {
+            crate::orchestrator::Enjambee::Rien => next_pos,
+            crate::orchestrator::Enjambee::Reprise(p) => p,
+            crate::orchestrator::Enjambee::FileEpuisee => {
+                return json!({ "status": "end_of_queue", "message": "no more tracks in queue" });
+            }
+        };
 
         match self
             .orchestrator

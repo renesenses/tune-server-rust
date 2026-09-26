@@ -403,6 +403,22 @@ pub fn banned_tracks_excluded(profile_id: i64) -> String {
     )
 }
 
+/// Prédicat « ce titre de SERVICE n'est PAS banni pour ce profil » (#4806) —
+/// la jumelle de [`banned_tracks_excluded`] pour la paire `(source,
+/// source_id)`, table `streaming_hidden_items`. `source_col` et `id_col` sont
+/// les colonnes de la requête englobante (`sf.service`, `sf.service_id` pour
+/// les favoris de service) — des NOMS écrits par le code, jamais une saisie.
+///
+/// La provenance est comparée en minuscules : c'est la forme sous laquelle
+/// `hidden_repo::source_normalisee` l'écrit.
+pub fn banned_streaming_excluded(profile_id: i64, source_col: &str, id_col: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM streaming_hidden_items hsb \
+         WHERE hsb.profile_id = {profile_id} AND hsb.item_type = 'track' \
+         AND hsb.source = LOWER(TRIM({source_col})) AND hsb.source_id = {id_col})"
+    )
+}
+
 /// Le nom de l'artiste d'un album, en sous-requête corrélée.
 ///
 /// Volontairement PAS une jointure : le prédicat de doublon ci-dessous doit

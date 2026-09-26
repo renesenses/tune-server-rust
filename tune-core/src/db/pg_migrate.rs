@@ -155,6 +155,10 @@ const MIGRATION_TABLES: &[&str] = &[
     // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
     // l'etiquetage est le seul moyen de ranger.
     "streaming_item_tags",
+    // Titres de service bannis (#4806). Sans cette ligne, tous les titres
+    // Qobuz/Tidal/Bandcamp bannis redeviendraient jouables par l'aleatoire
+    // et la radio a la bascule SQLite -> PostgreSQL.
+    "streaming_hidden_items",
     "favorites",
     // Favoris de facette (#2442). Sans cette ligne, les labels mis en favori
     // seraient perdus à la bascule SQLite → PostgreSQL.
@@ -698,6 +702,23 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
     PRIMARY KEY (tag_id, item_type, source, source_id)
 );
 
+-- Titres de SERVICE bannis (#4806) — jumelle de `hidden_items` pour la paire
+-- `source` + `source_id`. `profile_id` en BIGINT et non TEXT : la copie lie
+-- NATIVEMENT les entiers, et les filtres le comparent a un entier.
+CREATE TABLE IF NOT EXISTS streaming_hidden_items (
+    profile_id BIGINT NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (profile_id, item_type, source, source_id)
+);
+
 -- Registre DURABLE des serveurs multimedia (#2219, phase 1). Une base creee
 -- par la bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
 -- rejoue JAMAIS les scripts numerotes : sans cette declaration ici, la
@@ -933,6 +954,7 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 CREATE TABLE IF NOT EXISTS upnp_library_sources (
     source_key TEXT PRIMARY KEY,
     udn TEXT NOT NULL,
@@ -1291,6 +1313,10 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         // Cette table n'a PAS de colonne `id` : la clause par defaut
         // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
         "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
+        // Meme cas (#4806) : pas de colonne `id`, la clef est la paire.
+        "streaming_hidden_items" => {
+            "ON CONFLICT (profile_id, item_type, source, source_id) DO NOTHING"
+        }
         // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
         // seule identite d'un appareil UPnP qui survive a un changement de
         // port (#2219, phase 1).

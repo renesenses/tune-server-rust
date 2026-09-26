@@ -146,6 +146,24 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (tag_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id)",
+    // Titres de SERVICE bannis (#4806). SEUL chemin des bases PostgreSQL
+    // existantes, numerotees comme converties : pas de script numerote (voir
+    // le rattrapage SQLite de `run_migrations`), ce rattrapage rejoue a CHAQUE
+    // demarrage suffit — c'est deja le regime de `streaming_favorites`.
+    "CREATE TABLE IF NOT EXISTS streaming_hidden_items (\
+            profile_id BIGINT NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            album_source_id TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\
+            PRIMARY KEY (profile_id, item_type, source, source_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
     // Registre DURABLE des serveurs multimedia (#2219, phase 1). Quatrieme
     // chemin, meme raison : une base PostgreSQL convertie AVANT cette version
     // porte `schema_version = 99` et ne recevra jamais la migration 058. Or la
