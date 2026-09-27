@@ -875,6 +875,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // Memory RSS
     let rss_mb = get_rss_mb();
+    // #5189 — température du processeur pour l'écran « État du serveur ».
+    let cpu_temp_c = temperature_processeur().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -907,6 +909,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "uptime_seconds": uptime_secs,
         "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
+        // #5189 — °C, au dixième ; `null` sans capteur lisible (macOS,
+        // Windows, conteneur, machine virtuelle) ou si sysfs tarde.
+        "cpu_temp_c": cpu_temp_c,
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -993,6 +998,22 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             },
         },
     }))
+}
+
+/// Température du processeur, en °C au dixième (#5189).
+///
+/// Réutilise la lecture sysfs du garde thermique
+/// (`tune_core::audio::thermal::cpu_package_temp_celsius`) : paquet CPU quand
+/// il est identifiable, sinon maximum des zones. La lecture est synchrone et
+/// certains pilotes `hwmon` (disques) peuvent tarder : elle passe par
+/// `spawn_blocking` et abandonne au-delà de 300 ms. Le rapport de diagnostic
+/// ne doit jamais attendre un capteur.
+async fn temperature_processeur() -> Option<f64> {
+    let lecture = tokio::task::spawn_blocking(tune_core::audio::thermal::cpu_package_temp_celsius);
+    match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
+        Ok(Ok(Some(c))) => Some((c * 10.0).round() / 10.0),
+        _ => None,
+    }
 }
 
 /// Read process RSS in megabytes. Returns None on unsupported platforms.
