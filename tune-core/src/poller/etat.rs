@@ -1,4 +1,5 @@
 use super::*;
+use crate::http::streamer::RadioSourceInfo;
 
 pub(super) struct ZonePollState {
     pub(super) gapless_sent: bool,
@@ -239,6 +240,9 @@ pub(super) struct ZonePollState {
         Option<OutputSignalPathStatus>,
         Option<TransformationsReelles>,
     ),
+    /// Codec amont déjà annoncé pour la radio en cours. Le conteneur WAV de
+    /// sortie ne dit rien de la compression de la station (#4346).
+    pub(super) radio_source_annonce: (Option<String>, Option<RadioSourceInfo>),
 }
 
 impl ZonePollState {
@@ -296,6 +300,7 @@ impl ZonePollState {
             famine_releve_at: None,
             etat: EtatDeLecture::Neuve,
             contrat_annonce: (None, None),
+            radio_source_annonce: (None, None),
         }
     }
 
@@ -322,6 +327,23 @@ impl ZonePollState {
     /// plus aucun contrat (`play` les a effacés). La référence repart de là.
     pub(super) fn reprendre_le_contrat_a_zero(&mut self) {
         self.contrat_annonce = (None, None);
+        self.radio_source_annonce = (None, None);
+    }
+
+    /// Le panneau doit relire la zone quand le codec devient connu, change,
+    /// ou redevient inconnu après la perte d'une session radio.
+    pub(super) fn codec_radio_a_change(
+        &mut self,
+        stream_id: Option<&str>,
+        source: Option<RadioSourceInfo>,
+    ) -> bool {
+        let connu = source.filter(|s| s.format.is_some());
+        let ancien = self.radio_source_annonce.1;
+        let change = self.radio_source_annonce.0.as_deref() != stream_id || ancien != connu;
+        self.radio_source_annonce = (stream_id.map(str::to_owned), connu);
+        // Une nouvelle session encore inconnue, comme la disparition d'une
+        // session connue, change aussi ce que GET /zones doit afficher.
+        change && (connu.is_some() || ancien.is_some())
     }
 }
 
