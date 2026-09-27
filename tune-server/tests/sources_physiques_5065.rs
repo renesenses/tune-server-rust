@@ -73,7 +73,8 @@ async fn sources_suit_l_installation_du_greffon_cd() {
 
     // ── Installé : la source `cd` suit la machine. Hors plateforme prise en
     // charge, elle est là en `non_pris_en_charge` et « jouer » rend 409 ;
-    // sur une plateforme prise en charge SANS lecteur (Shrek), rien.
+    // sur une plateforme prise en charge SANS lecteur (Shrek), elle est LÀ
+    // aussi, `indisponible` (#5065, étape 3 : grisée, jamais absente).
     let app = demarrer(&base).await;
     let liste = sources(&app).await;
     if !tune_cd::lecteur::plateforme_prise_en_charge() {
@@ -92,7 +93,28 @@ async fn sources_suit_l_installation_du_greffon_cd() {
         assert_eq!(code, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["error"], "lecture_non_prise_en_charge", "{v}");
     } else if tune_cd::lecteur::lecteur_du_systeme().is_none() {
-        assert_eq!(liste, json!([]));
+        let cd: Vec<&Value> = liste
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["id"] == "cd")
+            .collect();
+        assert_eq!(
+            cd,
+            vec![
+                &json!({ "id": "cd", "type": "cd", "greffon": "cd", "nom": "Lecteur CD",
+                          "etat": "indisponible", "detail": { "raison": "aucun_lecteur" } })
+            ],
+            "{liste}"
+        );
+        let (code, v) = appel(
+            &app,
+            "POST",
+            "/api/v1/sources/cd/jouer",
+            json!({ "zone_id": 1 }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
     }
     let (code, _) = appel(&app, "DELETE", "/api/v1/plugins/cd", Value::Null).await;
     assert_eq!(code, StatusCode::OK);

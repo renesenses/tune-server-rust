@@ -47,6 +47,21 @@ impl Simulees {
         s
     }
 
+    /// Branche une entrée de plus (deux voies).
+    pub fn brancher(&self, nom: &str, frequence: u32) {
+        self.entrees.lock().unwrap().push(EntreeSimulee {
+            canaux: 2,
+            nom: nom.into(),
+            frequence: Arc::new(AtomicU32::new(frequence)),
+            zeros: Arc::default(),
+        });
+    }
+
+    /// Débranche l'entrée `nom`.
+    pub fn debrancher(&self, nom: &str) {
+        self.entrees.lock().unwrap().retain(|e| e.nom != nom);
+    }
+
     pub fn regler_frequence(&self, nom: &str, f: u32) {
         for e in self.entrees.lock().unwrap().iter() {
             if e.nom == nom {
