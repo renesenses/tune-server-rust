@@ -16,6 +16,91 @@ use super::credits_mb::{LigneCredit, REGLAGE_AVANCEMENT_CREDITS, lignes_credits}
 /// seconde pour rien.
 const JALON_STATUT: i32 = 25;
 
+/// Un champ de balise peut contenir plusieurs personnes séparées par `;`.
+/// Seul le suffixe explicite `(instrument)` est interprété ; les autres noms
+/// restent tels qu'ils sont écrits dans le fichier.
+fn personnes_de_la_balise(
+    valeur: &str,
+    role: &str,
+) -> impl Iterator<Item = (String, Option<String>)> {
+    valeur.split(';').filter_map(move |entree| {
+        let entree = entree.trim();
+        if entree.is_empty() {
+            return None;
+        }
+        if role == "performer"
+            && let Some(sans_parenthese) = entree.strip_suffix(')')
+            && let Some((nom, instrument)) = sans_parenthese.rsplit_once(" (")
+            && !nom.trim().is_empty()
+            && !instrument.trim().is_empty()
+        {
+            return Some((nom.trim().to_owned(), Some(instrument.trim().to_owned())));
+        }
+        Some((entree.to_owned(), None))
+    })
+}
+
+/// Ajoute les crédits portés par le fichier à la réponse existante. Une ligne
+/// structurée MusicBrainz/Roon garde sa fiche et sa position ; une balise de
+/// même personne et de même rôle peut seulement compléter son instrument.
+fn ajouter_credits_des_balises(
+    items: &mut Vec<Value>,
+    rows: Vec<Vec<tune_core::db::backend::SqlValue>>,
+    album: bool,
+) {
+    let mut prochaines_positions = std::collections::HashMap::<i64, i64>::new();
+    for row in rows {
+        let Some(track_id) = row.first().and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(role) = row.get(1).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(valeur) = row.get(2).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let position = prochaines_positions.entry(track_id).or_insert_with(|| {
+            items
+                .iter()
+                .filter(|item| item["track_id"].as_i64() == Some(track_id))
+                .filter_map(|item| item["position"].as_i64())
+                .max()
+                .unwrap_or(-1)
+                + 1
+        });
+        for (nom, instrument) in personnes_de_la_balise(valeur, role) {
+            if let Some(existant) = items.iter_mut().find(|item| {
+                item["track_id"].as_i64() == Some(track_id)
+                    && item["role"].as_str() == Some(role)
+                    && item["artist_name"]
+                        .as_str()
+                        .is_some_and(|n| n.trim().to_lowercase() == nom.to_lowercase())
+            }) {
+                if existant["instrument"].is_null() && instrument.is_some() {
+                    existant["instrument"] = json!(instrument);
+                }
+                continue;
+            }
+            let mut item = json!({
+                "id": null,
+                "track_id": track_id,
+                "artist_id": null,
+                "artist_name": nom,
+                "role": role,
+                "instrument": instrument,
+                "position": *position,
+            });
+            if album {
+                item["track_title"] = json!(row.get(3).and_then(|v| v.as_string()));
+                item["track_number"] = json!(row.get(4).and_then(|v| v.as_i64()));
+                item["disc_number"] = json!(row.get(5).and_then(|v| v.as_i64()));
+            }
+            items.push(item);
+            *position += 1;
+        }
+    }
+}
+
 /// Identifiant de la passe au registre `background_tasks` (#2129).
 ///
 /// Le réglage `REGLAGE_AVANCEMENT_CREDITS` et sa route `/enrich-credits/status`
@@ -83,7 +168,7 @@ pub(super) async fn track_credits(
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -97,6 +182,20 @@ pub(super) async fn track_credits(
             })
         })
         .collect();
+    let id_str = id.to_string();
+    let (cle_piste, piste_param): (&str, &dyn ToSqlValue) = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => ("CAST(track_id AS TEXT) = ?", &id_str),
+        tune_core::db::engine::Engine::Sqlite => ("track_id = ?", &id),
+    };
+    let sql = format!(
+        "SELECT track_id, key, value FROM track_metadata \
+         WHERE {cle_piste} AND key IN ('performer', 'producer') ORDER BY key"
+    );
+    let balises = state
+        .backend
+        .query_many(&sql, &[piste_param])
+        .map_err(AppError::internal)?;
+    ajouter_credits_des_balises(&mut items, balises, false);
     Ok(Json(json!(items)))
 }
 
@@ -142,7 +241,8 @@ pub(super) async fn artist_credits(
 }
 
 /// Crédits d'un ALBUM (#1572, fil forum 1921, FabienM) : les lignes de
-/// `track_credits` de toutes ses pistes, avec la piste concernée.
+/// `track_credits` et les balises locales de toutes ses pistes, avec la piste
+/// concernée.
 ///
 /// La réponse est la liste PLATE de `GET /library/tracks/{id}/credits`, plus
 /// `track_title`, `track_number` et `disc_number` : le client regroupe par
@@ -181,7 +281,7 @@ pub(super) async fn album_credits(
         .backend
         .query_many(&sql, &[&id_str as &dyn ToSqlValue])
         .map_err(|e| AppError::internal(e))?;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -198,6 +298,24 @@ pub(super) async fn album_credits(
             })
         })
         .collect();
+    let (jointure_metadonnees, cle_album_metadonnees) = match state.backend.engine() {
+        Engine::Postgres => (
+            "CAST(tm.track_id AS TEXT) = CAST(t.id AS TEXT)",
+            "CAST(t.album_id AS TEXT) = ?",
+        ),
+        Engine::Sqlite => ("tm.track_id = t.id", "t.album_id = ?"),
+    };
+    let sql = format!(
+        "SELECT t.id, tm.key, tm.value, t.title, t.track_number, t.disc_number \
+         FROM tracks t JOIN track_metadata tm ON {jointure_metadonnees} \
+         WHERE {cle_album_metadonnees} AND tm.key IN ('performer', 'producer') \
+         ORDER BY t.disc_number, t.track_number, t.id, tm.key"
+    );
+    let balises = state
+        .backend
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue])
+        .map_err(AppError::internal)?;
+    ajouter_credits_des_balises(&mut items, balises, true);
     Ok(Json(json!(items)))
 }
 
@@ -1211,5 +1329,75 @@ mod tests_tache_de_fond_credits {
         assert_eq!(traitees(0, 0, 37), 37, "37 pistes sautées sont 37 traitées");
         assert_eq!(traitees(5, 2, 3), 10);
         assert_eq!(traitees(0, 0, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_balises_5160 {
+    use super::*;
+
+    #[tokio::test]
+    async fn les_balises_de_fichier_entrent_dans_les_credits_de_piste_et_d_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (71, 'Christian McBride');
+                 INSERT INTO albums (id, title, artist_id) VALUES (72, 'New Jawn', 71);
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (73, 'Walkin Funny', '/musique/73.flac', 72, 1, 1);
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (74, 'Second titre', '/musique/74.flac', 72, 2, 1);
+                 INSERT INTO tracks (id, title, file_path) VALUES (75, 'Autre album', '/musique/75.flac');
+                 INSERT INTO track_credits (track_id, artist_name, role, position)
+                    VALUES (73, 'Christian McBride', 'performer', 0);
+                 INSERT INTO track_credits (track_id, artist_name, role, position)
+                    VALUES (74, 'Crédit Roon', 'producer', 0);
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (73, 'performer', 'Christian McBride (bass); Nasheet Waits (drums)');
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (73, 'producer', 'Christian McBride; Todd Whitelock');
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (75, 'performer', 'Ne doit pas fuir');",
+            )
+            .unwrap();
+
+        let Json(piste) = track_credits(State(state.clone()), Path(73))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits de piste"));
+        let piste = piste.as_array().unwrap();
+        assert_eq!(piste.len(), 4, "un doublon MusicBrainz ne se rajoute pas");
+        assert!(piste.iter().any(|c| {
+            c["artist_name"] == "Christian McBride"
+                && c["role"] == "performer"
+                && c["instrument"] == "bass"
+                && c["id"].as_i64().is_some()
+        }));
+        assert!(piste.iter().any(|c| {
+            c["artist_name"] == "Nasheet Waits"
+                && c["role"] == "performer"
+                && c["instrument"] == "drums"
+        }));
+        assert!(
+            piste
+                .iter()
+                .any(|c| { c["artist_name"] == "Todd Whitelock" && c["role"] == "producer" })
+        );
+
+        let Json(album) = album_credits(State(state), Path(72))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
+        let album = album.as_array().unwrap();
+        assert_eq!(album.len(), 5, "crédits des deux pistes, sans autre album");
+        assert!(album.iter().any(|c| {
+            c["artist_name"] == "Crédit Roon" && c["track_id"] == 74 && c["id"].as_i64().is_some()
+        }));
+        assert!(album.iter().any(|c| {
+            c["artist_name"] == "Nasheet Waits"
+                && c["track_title"] == "Walkin Funny"
+                && c["track_number"] == 1
+                && c["disc_number"] == 1
+        }));
+        assert!(!album.iter().any(|c| c["artist_name"] == "Ne doit pas fuir"));
     }
 }
