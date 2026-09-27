@@ -337,6 +337,22 @@ pub enum SuivantePreparee {
     Inconnue,
 }
 
+/// #4382 — ce que le TRANSPORT de l'appareil déclare jouer et tenir en
+/// suivante, lu à la source (UPnP : `GetMediaInfo` → `CurrentURI`,
+/// `NextURI`).
+///
+/// Une lecture pour le journal, jamais une décision : après un `Next`
+/// acquitté, c'est la seule chose qui dit si l'appareil a changé de piste
+/// alors que `GetPositionInfo` rapporte encore la position gelée de la
+/// piste finie.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaDuTransport {
+    /// `CurrentURI` : l'URI que le transport dit jouer.
+    pub courante: Option<String>,
+    /// `NextURI` : la suivante qu'il dit tenir.
+    pub suivante: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputStatus {
     pub state: TransportState,
@@ -2243,6 +2259,15 @@ pub trait OutputTarget: Send + Sync {
     /// [`SuivantePreparee::Tenue`]. Défaut : refus, donc le repli.
     async fn basculer_sur_la_suivante_preparee(&self) -> Result<(), String> {
         Err("cette sortie ne prepare pas la suivante".to_string())
+    }
+
+    /// #4382 — ce que le transport déclare jouer et tenir en suivante
+    /// ([`MediaDuTransport`]). Lecture seule, réservée au journal de la
+    /// surveillance qui suit une bascule ou une adoption (quelques sondages
+    /// par fin de piste, jamais le chemin chaud). Défaut `None` : la sortie
+    /// ne sait pas le dire.
+    async fn media_du_transport(&self) -> Option<MediaDuTransport> {
+        None
     }
 
     fn diagnostics_json(&self) -> Option<serde_json::Value> {

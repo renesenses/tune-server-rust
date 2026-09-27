@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use super::traits::{
-    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, PlayMedia,
-    SuivantePreparee, TransportState,
+    MediaDuTransport, OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget,
+    PlayMedia, SuivantePreparee, TransportState,
 };
 
 #[derive(Debug, Clone)]
@@ -59,6 +59,7 @@ pub struct MockOutput {
     suivante_preparee: Arc<std::sync::Mutex<SuivantePreparee>>,
     /// #3967 — chaque `Next` reçu.
     bascule_calls: Arc<AtomicU64>,
+    media_du_transport_calls: Arc<AtomicU64>,
     /// #3967 — le `Next` fait-il VRAIMENT avancer l'appareil ? Un renderer qui
     /// acquitte `Next` sans bouger est le cas que le repli doit rattraper.
     bascule_honoree: Arc<AtomicBool>,
@@ -90,6 +91,7 @@ impl MockOutput {
             signal_path: Arc::new(std::sync::Mutex::new(None)),
             suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
             bascule_calls: Arc::new(AtomicU64::new(0)),
+            media_du_transport_calls: Arc::new(AtomicU64::new(0)),
             bascule_honoree: Arc::new(AtomicBool::new(true)),
             echec: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -263,6 +265,12 @@ impl MockOutput {
         self.bascule_calls.load(Ordering::Relaxed)
     }
 
+    /// #4382 — nombre de lectures `media_du_transport` (une par sondage de
+    /// la fenêtre de surveillance).
+    pub fn media_du_transport_call_count(&self) -> u64 {
+        self.media_du_transport_calls.load(Ordering::Relaxed)
+    }
+
     /// Simulate a gapless transition: renderer moves to the next URI
     /// and reports the new track's duration/position.
     pub async fn simulate_gapless_transition(&self, new_duration_ms: u64) {
@@ -418,6 +426,18 @@ impl OutputTarget for MockOutput {
         }
         self.position_ms.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// #4382 — le transport du mock : l'URI qu'il joue, la suivante qu'il
+    /// tient. Un `Next` honoré les fait avancer ; acquitté seulement, rien
+    /// ne bouge — la signature du DMP-A6.
+    async fn media_du_transport(&self) -> Option<MediaDuTransport> {
+        self.media_du_transport_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Some(MediaDuTransport {
+            courante: self.current_uri.lock().await.clone(),
+            suivante: self.next_uri.lock().await.clone(),
+        })
     }
 }
 

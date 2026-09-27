@@ -1455,6 +1455,10 @@ impl PositionPoller {
                     debug!(zone_id, etat = ?zone_state.state, "gapless_adoption_horloge_levee");
                     ps.adoption_horloge = None;
                 } else {
+                    // #4382 — ce que le renderer fait pendant la fenêtre, au
+                    // journal de terrain. Lecture seule, avant la décision.
+                    self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
+                        .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
                     match decisions::suite_de_l_adoption(
                         status.position_ms,

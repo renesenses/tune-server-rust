@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{
-    OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee, TransportState,
+    MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee,
+    TransportState,
 };
 use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
@@ -2778,6 +2779,29 @@ impl OutputTarget for DlnaOutput {
         }
         info!(device = %self.name, "dlna_bascule_sur_la_suivante_preparee");
         Ok(())
+    }
+
+    /// #4382 — `GetMediaInfo`, lu tel quel : `CurrentURI` et `NextURI`.
+    ///
+    /// Journal du 27/09 (0.9.166) : `Next` acquitté, puis trois sondages où
+    /// `GetPositionInfo` rend la position gelée (237 000) et l'URI de la
+    /// piste FINIE, puis la relance. Rien ne dit si le transport, lui, avait
+    /// changé de piste. Cette lecture le dit — une action SOAP, seulement
+    /// pendant la surveillance d'une bascule.
+    async fn media_du_transport(&self) -> Option<MediaDuTransport> {
+        let xml = self
+            .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .ok()?;
+        let lire = |balise: &str| {
+            extract_tag(&xml, balise)
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+        };
+        Some(MediaDuTransport {
+            courante: lire("CurrentURI"),
+            suivante: lire("NextURI"),
+        })
     }
 }
 
