@@ -131,6 +131,17 @@ struct SondeImage {
 /// poller perd l'armement gapless, l'avance en fin de piste et le préchargement.
 fn sonder_image(image: &Path) -> SondeImage {
     use lofty::file::AudioFile;
+    // #5298 — une image de CD brute n'a pas d'en-tête : sa taille EST sa
+    // durée, et son format est celui du CD audio, par définition.
+    if crate::audio::image_cdda::est_image_cdda(image) {
+        use crate::audio::image_cdda::{CADENCE, CANAUX, PROFONDEUR, duree_ms};
+        return SondeImage {
+            duree_ms: duree_ms(image),
+            sample_rate: Some(CADENCE as i32),
+            bit_depth: Some(PROFONDEUR as i32),
+            channels: Some(CANAUX as i32),
+        };
+    }
     match lofty::read_from_path(image) {
         Ok(tagged) => {
             let p = tagged.properties();
@@ -157,8 +168,17 @@ fn sonder_image(image: &Path) -> SondeImage {
 /// autour d'elle. C'est le cas de toute feuille « gapless » (un `FILE` par
 /// piste), et c'est ce qui autorise à lui poser un `file_path` — voir
 /// [`piste_en_ligne`].
+///
+/// ⛔ Jamais pour une image de CD brute (#5298). Le scan ordinaire ne voit pas
+/// un `.bin` : lui poser un `file_path` le mettrait hors de ses fichiers
+/// découverts, et la purge de fin de scan effacerait la piste qu'on vient
+/// d'écrire. Toutes les passes par chemin (balises, ReplayGain) le prendraient
+/// en outre pour un fichier audio ordinaire.
 fn occupe_le_fichier_entier(piste: &PisteCue, tranches_du_fichier: usize) -> bool {
-    tranches_du_fichier == 1 && piste.debut_ms == 0 && piste.fin_ms.is_none()
+    tranches_du_fichier == 1
+        && piste.debut_ms == 0
+        && piste.fin_ms.is_none()
+        && !crate::audio::image_cdda::est_image_cdda(&piste.media)
 }
 
 /// Combien de tranches chaque fichier image porte, dans cet album.
@@ -436,7 +456,26 @@ fn ecrire_album(
         if !fichier_entier {
             images_decoupees.insert(piste.media.clone());
         }
-        let mut ligne = piste_en_ligne(piste, album, ligne_album, artist_id, sonde, fichier_entier);
+        // Le `PERFORMER` d'une piste — le CD-Text d'un disque à plusieurs
+        // interprètes — est SON artiste ; l'album garde le sien (#5298). Sans
+        // cela, le soliste invité d'une piste disparaissait derrière
+        // l'interprète de l'album.
+        let artiste_de_la_piste = piste
+            .interprete
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && *n != nom_artiste)
+            .and_then(|n| artist_repo.get_or_create(n, None, None).ok())
+            .and_then(|a| a.id)
+            .or(artist_id);
+        let mut ligne = piste_en_ligne(
+            piste,
+            album,
+            ligne_album,
+            artiste_de_la_piste,
+            sonde,
+            fichier_entier,
+        );
         let media = ligne.cue_media_path.clone().unwrap_or_default();
         let debut = ligne.cue_start_ms.unwrap_or(0);
 
