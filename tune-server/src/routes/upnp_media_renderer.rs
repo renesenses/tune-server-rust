@@ -241,14 +241,23 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // #5167 : une zone reprise par Tune n'est plus la lecture de CE renderer.
+    // Lui montrer PLAYING, c'est faire croire au point de contrôle que SA
+    // piste en pause vient d'être relancée sur l'appareil — le pont LMS en
+    // déduit une reprise « non sollicitée », relance LMS, et LMS renvoie un
+    // `Play` qui évince la lecture Tune avec l'ancienne URI.
+    let reprise = zone_reprise_par_tune(&session, &ps);
     let transport_state = match ps.state {
+        _ if reprise => "STOPPED",
         tune_core::playback::PlayState::Playing => "PLAYING",
         tune_core::playback::PlayState::Paused => "PAUSED_PLAYBACK",
         tune_core::playback::PlayState::Stopped => "STOPPED",
     };
+    let position_ms = if reprise { 0 } else { ps.position_ms };
     let duration_ms = ps
         .now_playing
         .as_ref()
+        .filter(|_| !reprise)
         .map(|np| np.duration_ms)
         .filter(|d| *d > 0)
         .or(session.duration_ms)
@@ -269,7 +278,7 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
     };
     RendererSnapshot {
         transport_state,
-        position_ms: ps.position_ms,
+        position_ms,
         duration_ms,
         uri: session.uri,
         volume,
@@ -414,14 +423,29 @@ async fn avtransport_control(
         RendererCommand::Stop => {
             // Arrêt COMMANDÉ : la suivante en attente s'efface AVANT le stop,
             // sinon le watcher lirait « stoppé + next posée » et relancerait.
+            //
+            // #5167 : si Tune a repris la zone, ce Stop vise la lecture du
+            // point de contrôle, qui n'existe plus. Le contexte UPnP est
+            // clos, la lecture Tune continue.
+            let ps = state.playback.get_state(zone_id).await;
+            let mut reprise = false;
             if let Ok(mut s) = sessions().lock()
                 && let Some(session) = s.get_mut(&zone_id)
             {
+                reprise = zone_reprise_par_tune(session, &ps);
                 session.next = None;
-                session.play_seq = None;
+                // Zone reprise : garder le propriétaire, pour que la façade
+                // continue de dire STOPPED au lieu de réafficher la lecture Tune.
+                if !reprise {
+                    session.play_seq = None;
+                }
                 session.revision = nouvelle_revision();
             }
-            state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+            if reprise {
+                info!(zone_id, "upnp_renderer_stop_ignore_zone_reprise_par_tune");
+            } else {
+                state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+            }
             upnp_renderer::empty_response("Stop")
         }
         RendererCommand::Seek(ms) => {
@@ -574,6 +598,17 @@ fn lecture_de_session(session: &RendererSession, ps: &tune_core::playback::ZoneS
     ps.now_playing.as_ref().is_some_and(|np| {
         np.source == "upnp" && np.source_id.as_deref() == Some(session.uri.as_str())
     })
+}
+
+/// Tune a-t-il repris la zone depuis la dernière lecture de CE renderer ? (#5167)
+///
+/// Vrai seulement quand c'est SÛR : la session a inscrit sa lecture
+/// (`play_seq` propriétaire), une lecture plus récente a eu lieu depuis
+/// (`play_seq` de la zone différent), et ce qui est en cours n'est plus l'URI
+/// de la session. Sans lecture inscrite, rien n'est affirmé et le renderer
+/// garde son comportement d'avant.
+fn zone_reprise_par_tune(session: &RendererSession, ps: &tune_core::playback::ZoneState) -> bool {
+    session.play_seq.is_some_and(|owner| owner != ps.play_seq) && !lecture_de_session(session, ps)
 }
 
 /// Une commande UPnP qui réussit rattache sa lecture au contexte encore actif
@@ -1425,6 +1460,165 @@ mod publication_de_zone_4626_tests {
             reponse.status(),
             StatusCode::NOT_FOUND,
             "seule la chaîne « true » publie une zone (`zone_renderer_enabled`)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bascule_lms_5167_tests {
+    use super::*;
+    use tune_core::playback::{NowPlaying, PlayState};
+
+    fn enveloppe(action: &str, corps: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID>{corps}</u:{action}></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// La commande passe par la ROUTE réelle, comme le pont LMS l'envoie.
+    async fn commande(state: &AppState, zone_id: i64, action: &str, corps: &str) -> String {
+        let reponse = avtransport_control(
+            State(state.clone()),
+            Path(zone_id),
+            enveloppe(action, corps),
+        )
+        .await;
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&octets).to_string()
+    }
+
+    fn etat_annonce(xml: &str) -> &str {
+        xml.split("<CurrentTransportState>")
+            .nth(1)
+            .and_then(|r| r.split("</CurrentTransportState>").next())
+            .unwrap_or("")
+    }
+
+    /// 🔴 #5167 — bascule LMS → Tune (Belkadi Yacine, 0.9.165, fil 1967).
+    ///
+    /// Le pont UPnPBridge de LMS (squeeze2upnp) suit le renderer en sondant
+    /// `GetTransportInfo`. Son lecteur est en pause (`SQ_PAUSE`) : le testeur a
+    /// mis LMS en pause, la zone est en pause sur `bridge-3.wav`. Le testeur
+    /// lance un album depuis Tune. Si la façade annonce alors PLAYING, le pont
+    /// y lit une reprise « non sollicitée » (`_SyncNotifState` : PLAYING en
+    /// `SQ_PAUSE` ⇒ `SQ_PLAY`, param vrai ⇒ CLI `play` vers LMS), LMS dépause,
+    /// et le pont envoie un `Play` NU : Tune rejoue `bridge-3.wav` par-dessus
+    /// l'album, 0,5 s après le premier clic. Le flux resservi en milieu de
+    /// fichier n'a plus d'en-tête WAV ⇒ `ContainerUnrecognised`.
+    ///
+    /// La façade doit dire STOPPED (le pont en fait un `stop` LMS), et le Stop
+    /// qui en revient ne doit pas arrêter la lecture Tune.
+    ///
+    /// Un seul `#[tokio::test]` : `sessions()` est une statique de processus.
+    #[tokio::test]
+    async fn une_zone_reprise_par_tune_n_est_plus_annoncee_en_lecture() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        // Zones de garde : les autres témoins du module utilisent les basses.
+        for i in 0..20 {
+            let _ = repo.create(&format!("garde {i}"), None, None).unwrap();
+        }
+        let zone_id = repo.create("DENAFRIPS", None, None).unwrap();
+        let temoin = repo.create("temoin sans reprise", None, None).unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        for id in [zone_id, temoin] {
+            reglages
+                .set(&format!("zone_{id}_upnp_renderer"), "true")
+                .unwrap();
+        }
+        let uri = "http://192.168.0.39:42029/bridge-3.wav";
+
+        // 1. Le pont pose l'URI et lance la lecture ; elle est inscrite comme
+        //    lecture de la session, exactement comme après un Play réussi.
+        for id in [zone_id, temoin] {
+            commande(
+                &state,
+                id,
+                "SetAVTransportURI",
+                &format!("<CurrentURI>{uri}</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"),
+            )
+            .await;
+            state.playback.bump_generation(id).await;
+            state
+                .playback
+                .play(
+                    id,
+                    NowPlaying {
+                        title: "Alem (feat. Arastaman) (Dub Version)".into(),
+                        source: "upnp".into(),
+                        source_id: Some(uri.into()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let session = sessions().lock().unwrap().get(&id).cloned().unwrap();
+            memoriser_lecture_renderer(&state, id, &session).await;
+            // 2. LMS en pause.
+            state.playback.pause(id).await;
+        }
+        assert_eq!(
+            etat_annonce(&commande(&state, zone_id, "GetTransportInfo", "").await),
+            "PAUSED_PLAYBACK"
+        );
+
+        // 3. Le testeur lance l'album depuis Tune : nouvelle lecture native.
+        state.playback.bump_generation(zone_id).await;
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "Asian Songs & Rhythms, No. 40".into(),
+                    source: "local".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // 4. Le sondage du pont.
+        let info = commande(&state, zone_id, "GetTransportInfo", "").await;
+        assert_eq!(
+            etat_annonce(&info),
+            "STOPPED",
+            "#5167 : la zone reprise par Tune est annoncée « {} » au pont LMS — \
+             il y lit une reprise non sollicitée de SA piste, relance LMS, et le \
+             Play qui en revient évince l'album avec bridge-3.wav",
+            etat_annonce(&info)
+        );
+
+        // 5. Le pont répercute l'arrêt (LMS `stop` ⇒ AVTStop) : la lecture
+        //    Tune doit continuer.
+        commande(&state, zone_id, "Stop", "").await;
+        let ps = state.playback.get_state(zone_id).await;
+        assert_eq!(
+            ps.state,
+            PlayState::Playing,
+            "#5167 : le Stop du pont, qui visait sa propre piste, a arrêté l'album Tune"
+        );
+        assert_eq!(
+            ps.now_playing.as_ref().map(|np| np.source.as_str()),
+            Some("local")
+        );
+        assert_eq!(
+            etat_annonce(&commande(&state, zone_id, "GetTransportInfo", "").await),
+            "STOPPED",
+            "après le Stop ignoré, la façade ne doit pas réafficher la lecture Tune"
+        );
+
+        // Contre-épreuve : sans reprise par Tune, la façade suit la zone, et
+        // un Stop du point de contrôle arrête bien SA lecture.
+        state.playback.resume(temoin).await;
+        assert_eq!(
+            etat_annonce(&commande(&state, temoin, "GetTransportInfo", "").await),
+            "PLAYING"
+        );
+        commande(&state, temoin, "Stop", "").await;
+        assert_eq!(
+            state.playback.get_state(temoin).await.state,
+            PlayState::Stopped,
+            "un Stop sur la lecture du renderer doit toujours l'arrêter"
         );
     }
 }
