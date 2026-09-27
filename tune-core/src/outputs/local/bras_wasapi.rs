@@ -34,9 +34,9 @@
 
 // ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------
 
-use std::io::Read;
-
 use super::backend::{Observation, RefusDOuverture, Vidage};
+use super::chaine_native::{FinDeChaine, HoteDeChaineNative, Suivante, jouer_la_chaine_native};
+use super::enchainement_exclusif::{lire_l_entete_enchainee, ouvrir_la_piste_suivante};
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
 use super::*;
 use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
@@ -86,6 +86,18 @@ pub(super) struct EntreesWasapi {
     pub(super) pure_bypass: Arc<AtomicBool>,
     pub(super) mono_downmix: Arc<AtomicBool>,
     pub(super) dop_active: Arc<AtomicBool>,
+    // ── #5204 : l'enchaînement sans blanc ──────────────────────────────
+    /// La réserve de `set_next_media`, que ce bras CONSOMME désormais à l'EOF.
+    pub(super) next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    /// La sonde vivante de `supports_internal_gapless()` : levée quand la
+    /// chaîne ne peut plus rien enchaîner.
+    pub(super) chain_exhausted: Arc<AtomicBool>,
+    /// Ce que la sortie publie du morceau en cours, basculé à l'enchaînement.
+    pub(super) current_uri: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) track_title: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) duration_ms: Arc<AtomicU64>,
+    pub(super) seek_offset_ms: Arc<AtomicU64>,
 }
 
 /// WASAPI en mode exclusif événementiel : le backend de tous les DAC Windows
@@ -274,6 +286,95 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
     }
 }
 
+/// #5204 — ce que la chaîne native emprunte au bras WASAPI : ses témoins
+/// d'arrêt, sa publication (verdict, position, morceau), et la réserve de
+/// `set_next_media`, que le bras consomme enfin à l'EOF.
+struct HoteWasapi<'a, F: FnMut(bool, bool)> {
+    stop_rx: &'a std::sync::mpsc::Receiver<()>,
+    force_silent: &'a Arc<AtomicBool>,
+    position_ms: &'a AtomicU64,
+    publier: &'a mut F,
+    next_media: &'a std::sync::Mutex<Option<PendingNextMedia>>,
+    /// La suivante retirée de la réserve, en attente de la décision de format.
+    en_cours: Option<PendingNextMedia>,
+    current_uri: &'a std::sync::Mutex<Option<String>>,
+    track_title: &'a std::sync::Mutex<Option<String>>,
+    track_artist: &'a std::sync::Mutex<Option<String>>,
+    duration_ms: &'a AtomicU64,
+    seek_offset_ms: &'a AtomicU64,
+    track_ended_naturally: &'a AtomicBool,
+    track_ended_generation: &'a AtomicU64,
+    dop_active: &'a AtomicBool,
+    volume: &'a Arc<AtomicU32>,
+    user_volume: &'a Arc<AtomicU32>,
+    rg_factor: &'a Arc<AtomicU32>,
+}
+
+impl<F: FnMut(bool, bool)> HoteDeChaineNative for HoteWasapi<'_, F> {
+    type Lecteur = super::LecteurHttpAnnulable;
+
+    fn arret_recu(&mut self) -> bool {
+        self.stop_rx.try_recv().is_ok()
+    }
+
+    fn silence_force(&self) -> bool {
+        self.force_silent.load(Ordering::Relaxed)
+    }
+
+    fn publier_le_verdict(&mut self, dop: bool, bit_perfect: bool) {
+        (self.publier)(dop, bit_perfect);
+    }
+
+    fn publier_la_position(&mut self, position_ms: u64) {
+        self.position_ms.store(position_ms, Ordering::Relaxed);
+    }
+
+    fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
+        let Some(suivante) = self.next_media.lock().unwrap().take() else {
+            return Suivante::Aucune;
+        };
+        info!(
+            next_title = ?suivante.title,
+            next_url = %suivante.url,
+            "local_audio_gapless_chaining_next_track"
+        );
+        let Some(mut lecteur) = ouvrir_la_piste_suivante(&suivante.url, self.force_silent) else {
+            return Suivante::Refusee;
+        };
+        match lire_l_entete_enchainee(&mut lecteur, self.force_silent) {
+            Ok(entete) => {
+                self.en_cours = Some(suivante);
+                Suivante::Prete { lecteur, entete }
+            }
+            Err(_) => Suivante::Refusee,
+        }
+    }
+
+    /// Même bascule que le chemin partagé, une fois l'enchaînement acquis :
+    /// le morceau suivant est publié, la position repart de zéro — le sondeur
+    /// y lit une transition interne et avance la file sans `play`. La
+    /// décision DoP de la nouvelle piste repart de zéro, comme en début de
+    /// piste : elle n'hérite pas de l'état DoP/volume de la précédente.
+    fn piste_enchainee(&mut self) {
+        let Some(suivante) = self.en_cours.take() else {
+            return;
+        };
+        self.track_ended_naturally.store(false, Ordering::SeqCst);
+        self.track_ended_generation.store(0, Ordering::SeqCst);
+        *self.current_uri.lock().unwrap() = Some(suivante.url);
+        *self.track_title.lock().unwrap() = suivante.title;
+        *self.track_artist.lock().unwrap() = suivante.artist;
+        if let Some(duree) = suivante.duration_ms {
+            self.duration_ms.store(duree, Ordering::SeqCst);
+        }
+        self.seek_offset_ms.store(0, Ordering::SeqCst);
+        self.position_ms.store(0, Ordering::SeqCst);
+        if self.dop_active.swap(false, Ordering::SeqCst) {
+            sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, false);
+        }
+    }
+}
+
 /// Joue la piste sur WASAPI en mode exclusif événementiel, au format source,
 /// par l'anneau natif i32, jusqu'à la fin du flux ou l'ordre d'arrêt.
 /// Terminal : quand il rend, le fil de lecture n'a plus rien à faire.
@@ -291,7 +392,7 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         soft_mute,
         data_offset,
         header_buf,
-        mut reader,
+        reader,
         seek_offset,
         my_generation,
         starvation,
@@ -314,6 +415,13 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         pure_bypass,
         mono_downmix,
         dop_active,
+        next_media,
+        chain_exhausted,
+        current_uri,
+        track_title,
+        track_artist,
+        duration_ms,
+        seek_offset_ms,
     } = entrees;
 
     let sample_rate = spec.cadence();
@@ -399,7 +507,6 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     };
 
     let mut total_frames_fed: u64 = 0;
-    let mut read_buf = vec![0u8; 65536];
     let mut bit_perfect_state = None;
 
     let mut etage = EtageNatif::monter(
@@ -484,68 +591,60 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         sync_volume_to_dop(&volume, &user_volume_ref, &rg_factor_ref, false);
     }
 
-    let mut http_eof_wasapi = false;
-    loop {
-        if stop_rx.try_recv().is_ok() {
-            break;
-        }
-        if force_silent.load(Ordering::Relaxed) {
-            debug!("local_audio_wasapi_exclusive_aborted_by_stop");
-            break;
-        }
-
-        match reader.read(&mut read_buf) {
-            Ok(0) => {
-                http_eof_wasapi = true;
-                break;
-            }
-            Ok(n) => {
-                match etage.decoder_et_pousser(&read_buf[..n], &mut *puits) {
-                    EcritureNative::Poussee {
-                        trames_source,
-                        dop,
-                        bit_perfect,
-                    }
-                    | EcritureNative::PuitsMort {
-                        trames_source,
-                        dop,
-                        bit_perfect,
-                    } => {
-                        total_frames_fed += trames_source;
-                        publier_le_verdict(dop, bit_perfect);
-                    }
-                    EcritureNative::RienAPousser => {}
-                }
-
-                let pos =
-                    (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
-                position_ms.store(pos, Ordering::Relaxed);
-            }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                continue;
-            }
-            Err(e) => {
-                warn!(error = %e, "local_audio_wasapi_exclusive_read_error");
-                http_eof_wasapi = true;
-                break;
-            }
-        }
+    // #5204 — la boucle de lecture ET l'enchaînement : à l'EOF, la piste
+    // préparée par `set_next_media` entre dans le MÊME anneau si elle a le
+    // même format — le flux WASAPI reste ouvert, aucun blanc. À format
+    // différent, la chaîne rend la main : la piste se termine et la fin
+    // naturelle rouvre le périphérique au nouveau format (0.9.165).
+    let mut hote = HoteWasapi {
+        stop_rx: &stop_rx,
+        force_silent: &force_silent,
+        position_ms: &position_ms,
+        publier: &mut publier_le_verdict,
+        next_media: &next_media,
+        en_cours: None,
+        current_uri: &current_uri,
+        track_title: &track_title,
+        track_artist: &track_artist,
+        duration_ms: &duration_ms,
+        seek_offset_ms: &seek_offset_ms,
+        track_ended_naturally: &track_ended_naturally,
+        track_ended_generation: &track_ended_generation,
+        dop_active: &dop_active,
+        volume: &volume,
+        user_volume: &user_volume_ref,
+        rg_factor: &rg_factor_ref,
+    };
+    let issue = jouer_la_chaine_native(
+        &mut hote,
+        reader,
+        &mut etage,
+        &mut *puits,
+        total_frames_fed,
+        seek_offset,
+    );
+    let total_frames_fed = issue.trames;
+    let http_eof_wasapi = issue.http_eof;
+    if issue.pistes_enchainees > 0 || issue.fin == FinDeChaine::FormatDifferent {
+        info!(
+            device = %device_name,
+            pistes_enchainees = issue.pistes_enchainees,
+            fin = ?issue.fin,
+            "local_audio_wasapi_exclusive_chain_ended"
+        );
     }
 
-    // Less than 32 initial 24-bit frames cannot be
-    // classified, but the integer ring can still carry
-    // them safely. Keep them raw and at unity rather
-    // than guessing PCM and applying sample arithmetic.
-    if http_eof_wasapi && let Some(reliquat) = etage.vider(&mut *puits) {
-        total_frames_fed += reliquat.trames;
-        info!(
-            backend = "WASAPI",
-            bytes = reliquat.octets,
-            "windows_exclusive_short_24bit_stream_forced_raw"
-        );
+    // La chaîne est finie : ce fil n'enchaînera plus rien. Le DIRE au sondeur,
+    // qui relit la capacité pendant qu'il attend (#1919, même règle que le
+    // chemin partagé) — sauf si une lecture plus récente nous a supplantés :
+    // la sonde appartient alors déjà au fil suivant.
+    if doit_declarer_chaine_epuisee(
+        force_silent.load(Ordering::Relaxed),
+        play_generation.load(Ordering::SeqCst),
+        my_generation,
+    ) {
+        chain_exhausted.store(true, Ordering::SeqCst);
+        debug!("local_audio_gapless_chain_exhausted");
     }
 
     // WASAPI exclusive now follows the same DSP tail

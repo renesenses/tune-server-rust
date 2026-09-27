@@ -142,20 +142,32 @@ fn seul_le_fil_en_titre_declare_sa_chaine_epuisee() {
     assert!(!doit_declarer_chaine_epuisee(true, 8, 7));
 }
 
-/// Une sortie EXCLUSIVE ne devient pas enchaînable parce que sa boucle est
-/// vivante : elle ne consomme jamais le `next_media` mis en réserve.
-/// Verrou anti-régression sur le correctif de DEvir (ASIO Fireface).
+/// Une sortie exclusive dont le bras ne consomme jamais le `next_media` mis en
+/// réserve (ASIO, CoreAudio « hog ») ne devient pas enchaînable parce que sa
+/// boucle est vivante. Verrou anti-régression sur le correctif de DEvir (ASIO
+/// Fireface).
+///
+/// #5204 : WASAPI exclusif, lui, enchaîne désormais à format égal — voir
+/// `gapless_exclusif_5204.rs`. La règle ne se lit donc plus sur
+/// `exclusive_mode` seul, mais sur le bras que `play_url` emprunte.
 #[test]
-fn une_sortie_exclusive_reste_non_enchainable() {
-    let sortie = LocalOutput::new_with_exclusive("Fireface ASIO".to_string(), true);
-    assert!(
-        !sortie.supports_internal_gapless(),
-        "ASIO/WASAPI exclusif : boucle dédiée qui sort à l'EOF sans consommer next_media"
-    );
+fn une_sortie_exclusive_asio_ou_coreaudio_reste_non_enchainable() {
+    use super::enchainement_exclusif::{bras_de_cette_plateforme, bras_de_lecture};
+    for bras in [
+        bras_de_lecture("windows", true, true, "asio"),
+        bras_de_lecture("macos", false, true, "auto"),
+    ] {
+        assert!(
+            !bras.sait_enchainer(),
+            "{bras:?} : boucle dédiée qui sort à l'EOF sans consommer next_media"
+        );
+    }
+    let sortie = LocalOutput::with_options("Fireface ASIO".to_string(), true, "asio");
     sortie.set_chain_exhausted_for_test(false);
-    assert!(
-        !sortie.supports_internal_gapless(),
-        "remettre la sonde à zéro ne doit JAMAIS rendre une sortie exclusive enchaînable"
+    assert_eq!(
+        sortie.supports_internal_gapless(),
+        bras_de_cette_plateforme(true, "asio").sait_enchainer(),
+        "remettre la sonde à zéro ne doit JAMAIS rendre enchaînable un bras qui ne l'est pas"
     );
 }
 

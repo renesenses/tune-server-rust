@@ -287,6 +287,37 @@ impl<'a> EtageNatif<'a> {
         })
     }
 
+    /// #5204 — **la frontière d'une piste enchaînée** sur un transport natif
+    /// exclusif, qui n'a ni rééchantillonneur ni adaptation de canaux.
+    ///
+    /// `Err(Rouvrir)` : le format change, on n'enchaîne PAS. Rien n'a été
+    /// touché — ni l'étage ni le puits : la piste courante se termine comme si
+    /// l'en-tête suivant avait été illisible, et la fin naturelle rouvre le
+    /// périphérique au nouveau format.
+    ///
+    /// `Ok(())` : même format. L'état du DSP est CONSERVÉ (l'audio est
+    /// continu, sa queue ne se rend pas ici), mais la décision PCM/DoP est
+    /// reprise à zéro pour la nouvelle piste (#2296/#2232) : quarantaine
+    /// 24 bits réarmée, DoP déverrouillé. Le reste non aligné de la piste
+    /// précédente — moins d'une trame — est jeté, comme le chemin partagé le
+    /// jette ; l'appelant a déjà forcé brut un reliquat de quarantaine par
+    /// [`EtageNatif::vider`].
+    pub(super) fn enchainer_la_piste(
+        &mut self,
+        suivante: AudioSpec,
+    ) -> Result<(), super::enchainement_exclusif::EnchainementNatif> {
+        use super::enchainement_exclusif::{EnchainementNatif, decider_l_enchainement_natif};
+        match decider_l_enchainement_natif(self.spec, self.sortie, suivante) {
+            EnchainementNatif::Rouvrir => Err(EnchainementNatif::Rouvrir),
+            EnchainementNatif::Enchainer => {
+                self.en_attente.clear();
+                self.must_classify_24_bit = suivante.profondeur() == ProfondeurPcm::Entier24;
+                self.dop_latched = false;
+                Ok(())
+            }
+        }
+    }
+
     /// Ce que l'étage a réellement fait au signal : aucun rééchantillonnage ni
     /// adaptation de canaux (le format ouvert est le format source), et le
     /// DSP tel que `local_dsp_runtime_state` le décrit — appliqué, ou
