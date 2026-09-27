@@ -307,14 +307,41 @@ pub(super) async fn list_tracks(
     Query(p): Query<TrackFilterQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, AppError> {
-    let repo = TrackRepo::with_backend(state.backend.clone());
-    let limit = p.limit.unwrap_or(50);
-    let offset = p.offset.unwrap_or(0);
-
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
-    let mut filter = track_filter_from_raw(raw.as_deref())?;
+    let filter = track_filter_from_raw(raw.as_deref())?;
+    // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
+    // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
+    // compteur chez JeromeQ gelaient ce fil pour tout le reste du serveur :
+    // `gel_executeur_detecte` pendant la navigation, lecture hachée, arrêt
+    // qui dépasse son délai. `spawn_blocking` les met sur le pool de fils
+    // bloquants, comme la grille d'albums depuis #4800.
+    let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
+    let profile_id = profile.id();
+    match tokio::task::spawn_blocking(move || lire_la_page_de_pistes(&state, profile_id, p, filter))
+        .await
+    {
+        Ok(corps) => Ok(Json(corps)),
+        Err(e) => {
+            tracing::error!(error = %e, "list_tracks_tache_bloquante_perdue");
+            Ok(Json(
+                json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
+            ))
+        }
+    }
+}
+
+/// Le corps de `GET /library/tracks`, exécuté HORS de l'exécuteur async.
+fn lire_la_page_de_pistes(
+    state: &AppState,
+    profile_id: i64,
+    p: TrackFilterQuery,
+    mut filter: tune_core::db::facet_filter::TrackFilter,
+) -> Value {
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let limit = p.limit.unwrap_or(50);
+    let offset = p.offset.unwrap_or(0);
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
@@ -329,7 +356,7 @@ pub(super) async fn list_tracks(
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| super::facets::resolve_collection(&state, name))
+        .map(|name| super::facets::resolve_collection(state, name))
         .unwrap_or_default();
 
     filter.collection_ids = scope.albums;
@@ -343,25 +370,26 @@ pub(super) async fn list_tracks(
     if filter.is_active() {
         match repo.list_filtered(&filter, limit, offset) {
             Ok((items, total)) => {
-                let items = joindre_dr_par_piste(&state, profile.id(), items);
-                Ok(Json(
-                    json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-                ))
+                let items = joindre_dr_par_piste(state, profile_id, items);
+                json!({"items": items, "total": total, "limit": limit, "offset": offset})
             }
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
-                Ok(Json(
-                    json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
-                ))
+                json!({"items": [], "total": 0, "limit": limit, "offset": offset})
             }
         }
     } else {
         // Même exclusion des albums masqués que le chemin facetté (#1391) :
         // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
-        let total = repo.count_visible().unwrap_or(0);
-        let items = match repo.list_visible(limit, offset) {
-            Ok(tracks) => tracks,
+        //
+        // #5138 — la page et son total en UNE requête : le `WHERE` n'est plus
+        // évalué deux fois par page. Seule une page vide (décalage au-delà de
+        // la fin) ou une erreur recompte.
+        let (items, total) = match repo.list_visible_avec_total(limit, offset) {
+            Ok((tracks, Some(total))) => (tracks, total),
+            Ok((tracks, None)) => (tracks, repo.count_visible().unwrap_or(0)),
             Err(e) => {
+                let total = repo.count_visible().unwrap_or(0);
                 tracing::error!(
                     error = %e,
                     limit,
@@ -369,13 +397,11 @@ pub(super) async fn list_tracks(
                     total,
                     "list_tracks_query_failed — stats show {total} tracks but query returned error"
                 );
-                Vec::new()
+                (Vec::new(), total)
             }
         };
-        let items = joindre_dr_par_piste(&state, profile.id(), items);
-        Ok(Json(
-            json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-        ))
+        let items = joindre_dr_par_piste(state, profile_id, items);
+        json!({"items": items, "total": total, "limit": limit, "offset": offset})
     }
 }
 

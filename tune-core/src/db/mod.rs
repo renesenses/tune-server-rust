@@ -70,4 +70,5 @@ mod album_dr_provenance_tests;
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+mod lenteur_pistes_5138_tests;
 pub mod upnp_revision;
