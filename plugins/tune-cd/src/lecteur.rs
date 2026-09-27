@@ -51,6 +51,12 @@ impl fmt::Display for ErreurCd {
 pub trait LecteurDisque: Send + Sync {
     /// Le chemin du périphérique, pour l'affichage (`/dev/sr0`).
     fn chemin(&self) -> String;
+    /// Change quand le lecteur physique suivi est remplacé. Les lecteurs
+    /// fixes gardent la valeur par défaut ; le lecteur branchable suit ses
+    /// acquisitions, même si la présence reste `Disque` entre deux sondages.
+    fn generation_lecteur(&self) -> u64 {
+        0
+    }
     /// Présence du lecteur et du disque. Doit rester bon marché : elle est
     /// interrogée chaque seconde pendant une lecture pour voir l'éjection.
     fn presence(&self) -> Presence;
@@ -126,6 +132,7 @@ pub struct LecteurBranchable {
 struct EtatRecherche {
     courant: Option<Arc<dyn LecteurDisque>>,
     derniere_recherche: Option<Instant>,
+    generation: u64,
 }
 
 impl LecteurBranchable {
@@ -147,6 +154,9 @@ impl LecteurBranchable {
         {
             e.derniere_recherche = Some(Instant::now());
             e.courant = (self.recherche)();
+            if e.courant.is_some() {
+                e.generation = e.generation.wrapping_add(1);
+            }
             if let Some(l) = &e.courant {
                 tracing::info!(lecteur = %l.chemin(), "cd_lecteur_detecte");
             }
@@ -173,6 +183,13 @@ impl LecteurDisque for LecteurBranchable {
             .as_ref()
             .map(|l| l.chemin())
             .unwrap_or_else(|| self.motif.clone())
+    }
+
+    fn generation_lecteur(&self) -> u64 {
+        self.etat
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
     }
 
     fn presence(&self) -> Presence {
