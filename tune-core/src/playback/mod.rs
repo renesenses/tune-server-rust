@@ -855,6 +855,12 @@ pub struct PlaybackManager {
     /// [`Self::position_audible_ms`]. Absent = sortie qui ne dit pas ce
     /// qu'elle retient (rendu réseau) : le forwarder garde son cadencement.
     horloges_de_sortie: std::sync::Mutex<HashMap<i64, HorlogeDeSortie>>,
+    /// #4384 — les crêtes relevées APRÈS le DSP par la sortie locale qui joue
+    /// la zone. Voir [`crate::audio::crete_de_sortie`] et
+    /// [`Self::crete_de_sortie`]. Absent = aucun relevé : le forwarder garde
+    /// son estimation.
+    cretes_de_sortie:
+        std::sync::Mutex<HashMap<i64, Arc<crate::audio::crete_de_sortie::CretesDeSortie>>>,
 }
 
 impl Default for PlaybackManager {
@@ -875,6 +881,7 @@ impl PlaybackManager {
             gains_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
+            cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -911,6 +918,54 @@ impl PlaybackManager {
             .lock()
             .expect("horloges_de_sortie lock")
             .remove(&zone_id);
+        // Et ses crêtes (#4384) : elles décrivent le DSP d'une autre sortie.
+        self.cretes_de_sortie
+            .lock()
+            .expect("cretes_de_sortie lock")
+            .remove(&zone_id);
+    }
+
+    /// #4384 — partage le registre des crêtes APRÈS DSP de la sortie locale
+    /// qui va jouer cette zone. Voir [`Self::crete_de_sortie`].
+    pub fn brancher_les_cretes_de_sortie(
+        &self,
+        zone_id: i64,
+        cretes: Arc<crate::audio::crete_de_sortie::CretesDeSortie>,
+    ) {
+        self.cretes_de_sortie
+            .lock()
+            .expect("cretes_de_sortie lock")
+            .insert(zone_id, cretes);
+    }
+
+    /// #4384 — la crête linéaire `(gauche, droite)` des échantillons que la
+    /// sortie locale de la zone a envoyés vers le DAC sur `[debut_ms, fin_ms)`
+    /// de la piste, APRÈS égaliseur, convolveur, crossfeed et repli mono, mais
+    /// AVANT le gain de rendu ([`Self::gain_de_rendu_units`]). `None` : pas de
+    /// sortie locale branchée, ou rien de relevé pour cet intervalle.
+    pub fn crete_de_sortie(&self, zone_id: i64, debut_ms: f64, fin_ms: f64) -> Option<(f64, f64)> {
+        let cretes = self
+            .cretes_de_sortie
+            .lock()
+            .expect("cretes_de_sortie lock")
+            .get(&zone_id)
+            .cloned()?;
+        cretes.crete_entre(debut_ms, fin_ms)
+    }
+
+    /// #4384 — le SEUL gain que la sortie locale applique encore après son
+    /// DSP : volume × ReplayGain × compensation (ce que les rappels de rendu
+    /// multiplient), en millièmes. `1000` quand rien n'est branché.
+    ///
+    /// À la différence de [`Self::gain_de_sortie_units`], il ne contient PAS
+    /// le gain moyen du DSP : il s'applique à une crête relevée après le DSP,
+    /// qui le contient déjà échantillon par échantillon.
+    pub fn gain_de_rendu_units(&self, zone_id: i64) -> u32 {
+        self.gains_de_sortie
+            .lock()
+            .expect("gains lock")
+            .get(&zone_id)
+            .map_or(1000, |g| g.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Fil 1908 — partage l'horloge de la sortie locale qui va jouer cette
@@ -959,9 +1014,10 @@ impl PlaybackManager {
     /// #4685 — produit du gain de rendu (volume × ReplayGain × compensation)
     /// et du gain MOYEN du DSP. Compensation active et non rabotée, les deux
     /// derniers s'annulent : l'aiguille retrouve le niveau du fichier au
-    /// volume près, ce qui est exactement ce que la compensation promet. La
-    /// crête, elle, reste celle d'avant le DSP — l'égaliseur et le crossfeed
-    /// ne sont toujours pas mesurés échantillon par échantillon (#4384).
+    /// volume près, ce qui est exactement ce que la compensation promet. Ce
+    /// produit sert le RMS et le spectre ; la crête d'une sortie locale se lit
+    /// désormais APRÈS le DSP ([`Self::crete_de_sortie`] ×
+    /// [`Self::gain_de_rendu_units`], #4384).
     pub fn gain_de_sortie_units(&self, zone_id: i64) -> u32 {
         let lire = |carte: &std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>| {
             carte

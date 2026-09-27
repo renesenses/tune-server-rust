@@ -57,7 +57,7 @@ fn puits_empreinte() -> CaptureOutput {
 /// aucun repli mono. C'est l'état d'une zone qui ne fait que lire — celui où
 /// « pas un octet de différence » est vérifiable à l'octet près.
 pub(super) struct DspAuRepos {
-    eq: std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    pub(super) eq: std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
     convolver: std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
     crossfeed: std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: AtomicBool,
