@@ -697,6 +697,13 @@ impl YouTubeService {
         Ok(stream_url.to_string())
     }
 
+    /// #4366 — oublie l'URL mise en cache pour `track_id`. Après un 403 et un
+    /// rafraîchissement de yt-dlp, la relance doit RÉSOUDRE de nouveau : servie
+    /// par le cache, elle reprendrait l'URL qui vient d'être refusée.
+    pub async fn oublier_url(&self, track_id: &str) {
+        self.url_cache.lock().await.entries.remove(track_id);
+    }
+
     // ------------------------------------------------------------------
     // yt-dlp stream URL extraction (fallback)
     // ------------------------------------------------------------------
