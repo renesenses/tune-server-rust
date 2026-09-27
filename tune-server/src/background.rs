@@ -787,18 +787,34 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 }
             }
 
-            info!(
-                registered,
-                total = devices.len(),
-                pass,
-                "ssdp_startup_scan_complete"
-            );
+            let serveurs = scanner.media_servers().await.len();
+            journaliser_fin_de_passe_ssdp(registered, devices.len(), serveurs, pass);
 
             if pass > 1 && registered == 0 {
                 break;
             }
         }
     });
+}
+
+/// #5226 — fin d'une passe du lot SSDP de démarrage.
+///
+/// `total` est le nombre de RENDERERS rendus par `rescan()` : les serveurs
+/// multimédia vivent dans un autre registre du scanner. La ligne ne comptait
+/// qu'eux, et l'instruction de #3575 y a lu « aucun serveur multimédia
+/// découvert » là où les serveurs n'étaient simplement pas comptés. Elle porte
+/// désormais `serveurs=` à côté. Les noms existants (`registered`, `total`,
+/// `pass`) ne bougent pas : le journal du 23/09 et d'autres les citent.
+pub(crate) fn journaliser_fin_de_passe_ssdp(
+    registered: u32,
+    total: usize,
+    serveurs: usize,
+    pass: u32,
+) {
+    info!(
+        registered,
+        total, serveurs, pass, "ssdp_startup_scan_complete"
+    );
 }
 
 /// Plein rythme d'un sondeur d'intégration : l'hôte répond, on le rappelle
@@ -4604,6 +4620,62 @@ mod sondeur_branche_sur_le_bus_du_websocket {
              jamais annoncé, et le panneau reste « WASAPI (shared — Windows \
              mixer) » / « Transcodé » tant que l'auditeur ne touche pas au \
              volume — ce que PURE lui interdit (fils 1890/1857, #4559)."
+        );
+    }
+}
+
+#[cfg(test)]
+mod compteurs_ssdp_du_demarrage_5226 {
+    use super::journaliser_fin_de_passe_ssdp;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Journal(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Un état qui ne contient qu'UN serveur multimédia et aucun renderer : la
+    /// fin de passe doit écrire `serveurs=1`, et garder `total=0` distinct.
+    #[test]
+    fn la_fin_de_passe_nomme_les_serveurs_multimedia() {
+        let journal = Journal::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(abonne, || journaliser_fin_de_passe_ssdp(0, 0, 1, 1));
+
+        let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_startup_scan_complete"))
+            .unwrap_or_else(|| panic!("aucune trace ssdp_startup_scan_complete :\n{texte}"));
+        assert!(
+            ligne.contains("serveurs=1"),
+            "la fin de passe ne compte pas les SERVEURS MULTIMÉDIA : c'est ce \
+             silence qui a fait conclure « aucun serveur » dans #3575.\n\
+             ligne : {ligne}"
+        );
+        assert!(
+            ligne.contains("total=0") && ligne.contains("registered=0"),
+            "les compteurs des renderers doivent rester lisibles et DISTINCTS \
+             de celui des serveurs.\nligne : {ligne}"
         );
     }
 }

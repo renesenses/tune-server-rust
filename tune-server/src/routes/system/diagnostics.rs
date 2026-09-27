@@ -1080,8 +1080,12 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     let devices = scanner.devices().await;
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
+    // #5226 — `discovered_devices` ne compte que les renderers ; le registre
+    // des serveurs multimédia est compté à côté.
+    let serveurs_decouverts = state.media_servers.lock().await.len();
     Json(json!({
         "discovered_devices": devices.len(),
+        "discovered_media_servers": serveurs_decouverts,
         "registered_outputs": output_count,
         // L'etat du canal TCP de SlimProto (port 3483). Sans ce champ, un bind
         // refuse ne vivait que dans une ligne de journal, dans une tache
@@ -2317,7 +2321,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push('\n');
 
     md.push_str("## Network\n");
-    md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    // #5226 — « Discovered devices » ne comptait QUE les renderers, et se
+    // lisait « appareils découverts », serveurs compris : l'instruction de
+    // #3575 y a lu « aucun serveur » avec `Discovered devices: 0`. Les deux
+    // registres ont désormais chacun leur compteur, nommé pour ce qu'il compte.
+    md.push_str(&format!("- Renderers decouverts: {}\n", devices.len()));
     // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
     // multimedia ». « Discovered devices » ne compte QUE les renderers ; le
     // registre des serveurs multimedia est un autre registre, et ce rapport
@@ -2631,6 +2639,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
+            // #5226 — `discovered_devices` ne compte que les renderers.
+            "discovered_media_servers": serveurs_multimedia.len(),
             "registered_outputs": output_count,
             "slimproto": tune_core::slimproto::etat_ecoute(),
             "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
