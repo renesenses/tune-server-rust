@@ -8,8 +8,41 @@ pub use tune_plugin_equalizer::{
     SpeakerPlacement,
 };
 use tune_plugin_native::stage::Stage;
+/// #5215 — durée de la rampe qui accompagne une bascule d'égaliseur EN VOL.
+///
+/// Couper l'égaliseur retirait d'un coup un préampli de −12,56 dB : au casque,
+/// une marche de 12 dB (Levente Toth, fil 1974). Le mutex relu à chaque
+/// paquet rendait le remplacement instantané, donc la marche aussi.
+///
+/// 200 ms, parce que c'est l'ordre de la constante d'intégration de la
+/// sonie : en deçà, l'oreille entend encore une MARCHE (20 ms suffisent
+/// contre le clic, pas contre le sursaut) ; au-delà, le geste « couper l'EQ
+/// pour comparer » paraît retardé. La rampe ne sert QUE les bascules d'un
+/// réglage en cours de lecture ([`EqProcessor::prendre_la_releve`]) : un
+/// début de piste passe par `LocalOutput::set_eq`, sans rampe.
+pub const RAMPE_DE_BASCULE_MS: u32 = 200;
+
+/// #5215 — écart de niveau (préampli ou niveau moyen, en dB) au-delà duquel
+/// un remplacement d'égaliseur est fondu plutôt qu'instantané.
+///
+/// En deçà, rien ne change : un cran de curseur reste immédiat (#1725), son
+/// biquad hérite de l'historique et ne claque pas.
+pub const SEUIL_DE_RAMPE_DB: f64 = 1.0;
+
+/// Fondu enchaîné en cours : le signal passe de `depart` (l'égaliseur qu'on
+/// quitte, ou le signal SEC quand `None`) au traitement courant.
+struct Fondu {
+    depart: Option<Box<EqProcessor>>,
+    total: usize,
+    fait: usize,
+    tampon: Vec<f32>,
+}
+
 pub struct EqProcessor {
     engine: Engine,
+    sample_rate: u32,
+    channels: u16,
+    fondu: Option<Fondu>,
     /// #4685 — niveau moyen du filtre, réserve comprise, calculé UNE fois à
     /// la construction (voir [`Self::gain_moyen_db`]).
     gain_moyen_db: f64,
@@ -20,6 +53,10 @@ enum Engine {
     Bundled(tune_plugin_equalizer::EqProcessor),
     Native(Stage),
     Unavailable,
+    /// #5215 — égaliseur COUPÉ en vol : ne filtre rien, ne sert qu'à porter
+    /// le fondu depuis l'égaliseur qu'on vient de quitter. Retiré par la
+    /// chaîne locale dès le fondu fini (voir [`EqProcessor::est_neutre_au_repos`]).
+    Neutre,
 }
 impl EqProcessor {
     pub fn new(profile: &EqProfile, sample_rate: u32, channels: u16) -> Self {
@@ -49,17 +86,116 @@ impl EqProcessor {
         // signé exécute la même arithmétique que le moteur embarqué (même
         // crate), et ne publie pas d'autre porte. Un moteur indisponible ne
         // filtre rien — il n'a donc rien à compenser.
-        let gain_moyen_db = if matches!(engine, Engine::Unavailable) {
+        let gain_moyen_db = if matches!(engine, Engine::Unavailable | Engine::Neutre) {
             0.0
         } else {
             profile.gain_moyen_db_at(channels, f64::from(sample_rate))
         };
         Self {
             engine,
+            sample_rate,
+            channels,
+            fondu: None,
             gain_moyen_db,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    fn neutre(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            engine: Engine::Neutre,
+            sample_rate,
+            channels,
+            fondu: None,
+            gain_moyen_db: 0.0,
+            clipping: Default::default(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// #5215 — `neuf` remplace `precedent` PENDANT la lecture.
+    ///
+    /// Hérite de l'historique des filtres comme avant (#1725), et arme en plus
+    /// un fondu enchaîné de [`RAMPE_DE_BASCULE_MS`] quand la bascule change le
+    /// niveau : activation, coupure, ou préampli / niveau moyen déplacé de
+    /// plus de [`SEUIL_DE_RAMPE_DB`]. Le fondu mélange les DEUX sorties
+    /// (ancienne et nouvelle chaîne), il suit donc le préampli comme la
+    /// courbe, sans marche ni clic.
+    ///
+    /// Une coupure rend un égaliseur `Neutre` qui porte le fondu vers le
+    /// signal sec ; la chaîne locale le retire une fois le fondu fini.
+    pub fn prendre_la_releve(neuf: Option<Self>, precedent: Option<Self>) -> Option<Self> {
+        match (neuf, precedent) {
+            (None, None) => None,
+            (Some(mut neuf), None) => {
+                neuf.armer_le_fondu(None);
+                Some(neuf)
+            }
+            (None, Some(precedent)) => {
+                if precedent.est_neutre_au_repos() {
+                    return None;
+                }
+                if matches!(precedent.engine, Engine::Neutre) {
+                    // Déjà en train de descendre vers le sec : on le laisse finir.
+                    return Some(precedent);
+                }
+                let mut neutre = Self::neutre(precedent.sample_rate, precedent.channels);
+                neutre.armer_le_fondu(Some(precedent));
+                Some(neutre)
+            }
+            (Some(mut neuf), Some(mut precedent)) => {
+                neuf.inherit_state_from(&precedent);
+                let compatible = neuf.sample_rate == precedent.sample_rate
+                    && neuf.channels == precedent.channels;
+                if !compatible {
+                    return Some(neuf);
+                }
+                if neuf.ecart_de_niveau_db(&precedent) > SEUIL_DE_RAMPE_DB {
+                    neuf.armer_le_fondu(Some(precedent));
+                } else if let Some(fondu) = precedent.fondu.take() {
+                    // Petit cran pendant un fondu : le nouveau reprend le fondu
+                    // là où il en est, au lieu de sauter à sa fin.
+                    neuf.fondu = Some(fondu);
+                }
+                Some(neuf)
+            }
+        }
+    }
+
+    fn armer_le_fondu(&mut self, depart: Option<Self>) {
+        let total =
+            (u64::from(self.sample_rate) * u64::from(RAMPE_DE_BASCULE_MS) / 1000).max(1) as usize;
+        self.fondu = Some(Fondu {
+            depart: depart.map(Box::new),
+            total,
+            fait: 0,
+            tampon: Vec::new(),
+        });
+    }
+
+    fn ecart_de_niveau_db(&self, autre: &Self) -> f64 {
+        let preamp = (0..self.channels.max(1))
+            .map(|c| (self.preamp_db(c).unwrap_or(0.0) - autre.preamp_db(c).unwrap_or(0.0)).abs())
+            .fold(0.0_f64, f64::max);
+        preamp.max((self.gain_moyen_db - autre.gain_moyen_db).abs())
+    }
+
+    /// #5215 — un fondu de bascule est-il en cours ?
+    pub fn en_fondu(&self) -> bool {
+        self.fondu.is_some()
+    }
+
+    /// #5215 — égaliseur COUPÉ : `Neutre`, fondu en cours ou non. Il ne
+    /// compte pas comme un égaliseur monté.
+    pub fn est_neutre(&self) -> bool {
+        matches!(self.engine, Engine::Neutre)
+    }
+
+    /// #5215 — égaliseur coupé dont le fondu est fini : identité exacte, à
+    /// retirer de la chaîne.
+    pub fn est_neutre_au_repos(&self) -> bool {
+        self.est_neutre() && self.fondu.is_none()
     }
 
     /// #4685 — ce que cet égaliseur, réserve automatique comprise, fait
@@ -73,35 +209,62 @@ impl EqProcessor {
         match &mut self.engine {
             Engine::Bundled(p) => p.process_pcm(pcm, depth),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_pcm(pcm, depth)),
-            Engine::Unavailable => EqProcessStats::default(),
+            Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
         }
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        let Some(mut fondu) = self.fondu.take() else {
+            return self.traiter_sans_fondu(samples);
+        };
+        fondu.tampon.clear();
+        fondu.tampon.extend_from_slice(samples);
+        if let Some(depart) = fondu.depart.as_mut() {
+            depart.process_interleaved(&mut fondu.tampon);
+        }
+        let stats = self.traiter_sans_fondu(samples);
+        let canaux = self.channels.max(1) as usize;
+        for (i, (trame, avant)) in samples
+            .chunks_mut(canaux)
+            .zip(fondu.tampon.chunks(canaux))
+            .enumerate()
+        {
+            let t = ((fondu.fait + i + 1) as f32 / fondu.total as f32).min(1.0);
+            for (s, a) in trame.iter_mut().zip(avant) {
+                *s = *a + (*s - *a) * t;
+            }
+        }
+        fondu.fait += samples.len() / canaux;
+        if fondu.fait < fondu.total {
+            self.fondu = Some(fondu);
+        }
+        stats
+    }
+    fn traiter_sans_fondu(&mut self, samples: &mut [f32]) -> EqProcessStats {
         match &mut self.engine {
             Engine::Bundled(p) => p.process_interleaved(samples),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
-            Engine::Unavailable => EqProcessStats::default(),
+            Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
         }
     }
     pub fn is_enabled(&self) -> bool {
         match &self.engine {
             Engine::Bundled(p) => p.is_enabled(),
             Engine::Native(p) => p.info["enabled"].as_bool().unwrap_or(false),
-            Engine::Unavailable => false,
+            Engine::Unavailable | Engine::Neutre => false,
         }
     }
     pub fn response(&self, sample_rate: u32) -> serde_json::Value {
         match &self.engine {
             Engine::Bundled(p) => p.response(sample_rate),
             Engine::Native(p) => p.info["response"].clone(),
-            Engine::Unavailable => serde_json::Value::Null,
+            Engine::Unavailable | Engine::Neutre => serde_json::Value::Null,
         }
     }
     pub fn preamp_db(&self, channel: u16) -> Option<f64> {
         match &self.engine {
             Engine::Bundled(p) => p.preamp_db(channel),
             Engine::Native(p) => p.info["preamp_db"].get(channel as usize)?.as_f64(),
-            Engine::Unavailable => None,
+            Engine::Unavailable | Engine::Neutre => None,
         }
     }
     pub fn process_stats(&self) -> EqProcessStats {
@@ -111,14 +274,14 @@ impl EqProcessor {
                 overs: p.report.clipped_samples,
                 non_finite_samples: p.report.non_finite_samples,
             },
-            Engine::Unavailable => EqProcessStats::default(),
+            Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
         }
     }
     pub fn ecretage(&self) -> super::ecretage::CompteurDEcretage {
         match &self.engine {
             Engine::Bundled(p) => p.ecretage(),
             Engine::Native(_) => self.clipping,
-            Engine::Unavailable => Default::default(),
+            Engine::Unavailable | Engine::Neutre => Default::default(),
         }
     }
     pub fn inherit_state_from(&mut self, previous: &Self) {
@@ -176,5 +339,65 @@ fn record_native(
             tracing::error!(%error,"native_equalizer_processing_failed");
             EqProcessStats::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod rampe_de_bascule_5215 {
+    use super::*;
+
+    fn egaliseur(gain: f64) -> EqProcessor {
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 8000.0,
+                gain,
+                q: 1.0,
+                band_type: "peak".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        EqProcessor::new(&profil, 48_000, 2)
+    }
+
+    /// Un cran de curseur reste IMMÉDIAT (#1725) : pas de fondu sous le seuil.
+    #[test]
+    fn un_petit_cran_reste_instantane() {
+        let neuf = EqProcessor::prendre_la_releve(Some(egaliseur(12.3)), Some(egaliseur(12.0)))
+            .expect("un égaliseur reste monté");
+        assert!(
+            !neuf.en_fondu(),
+            "0,3 dB de préampli ne doit pas armer de rampe"
+        );
+    }
+
+    /// Un préampli déplacé de plusieurs dB est fondu.
+    #[test]
+    fn un_gros_ecart_de_preampli_arme_la_rampe() {
+        let neuf = EqProcessor::prendre_la_releve(Some(egaliseur(3.0)), Some(egaliseur(12.0)))
+            .expect("un égaliseur reste monté");
+        assert!(neuf.en_fondu());
+    }
+
+    /// Un petit cran PENDANT une rampe la reprend là où elle en est.
+    #[test]
+    fn un_petit_cran_pendant_la_rampe_la_poursuit() {
+        let active = EqProcessor::prendre_la_releve(Some(egaliseur(12.0)), None).unwrap();
+        assert!(active.en_fondu());
+        let neuf = EqProcessor::prendre_la_releve(Some(egaliseur(12.3)), Some(active)).unwrap();
+        assert!(
+            neuf.en_fondu(),
+            "la rampe d'activation ne doit pas sauter à sa fin"
+        );
+    }
+
+    /// Couper rend un neutre qui ne compte pas comme un égaliseur actif.
+    #[test]
+    fn couper_rend_un_neutre_en_fondu() {
+        let coupe = EqProcessor::prendre_la_releve(None, Some(egaliseur(12.0))).unwrap();
+        assert!(coupe.est_neutre() && coupe.en_fondu() && !coupe.is_enabled());
+        assert_eq!(coupe.gain_moyen_db(), 0.0);
+        assert!(EqProcessor::prendre_la_releve(None, None).is_none());
     }
 }
