@@ -128,7 +128,28 @@ pub(super) fn joindre_dr_par_piste(
     // #4806 — même seam, même raison : `banned` sur toutes les surfaces
     // d'un coup, sans filtrer aucune.
     super::albums::attacher_banni(state, profile_id, &mut items);
+    attacher_termes_de_chemin(&mut items);
     items
+}
+
+/// #5192 — `path_terms` sur chaque piste : le nom de son dernier dossier et
+/// celui de son fichier, tels que les compare le texte libre d'Oxygen, CÔTÉ
+/// SERVEUR (`facet_filter::condition_texte_libre`) comme CÔTÉ NAVIGATEUR. Le
+/// client lit cette valeur au lieu de redécouper `file_path` : une seule
+/// définition, `full_text_search::termes_de_chemin`.
+pub(super) fn attacher_termes_de_chemin(items: &mut [Value]) {
+    for item in items.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let chemin = obj
+            .get("file_path")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("cue_media_path").and_then(Value::as_str))
+            .map(str::to_string);
+        let termes = tune_core::library::full_text_search::termes_de_chemin(chemin.as_deref());
+        obj.insert("path_terms".into(), Value::String(termes));
+    }
 }
 
 /// `POST /library/tracks/{id}/ban` — bannit un titre LOCAL pour le profil
@@ -307,14 +328,41 @@ pub(super) async fn list_tracks(
     Query(p): Query<TrackFilterQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, AppError> {
-    let repo = TrackRepo::with_backend(state.backend.clone());
-    let limit = p.limit.unwrap_or(50);
-    let offset = p.offset.unwrap_or(0);
-
     // Facettes à plusieurs valeurs : la clé répétée (`?format=aiff&format=flac`)
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
-    let mut filter = track_filter_from_raw(raw.as_deref())?;
+    let filter = track_filter_from_raw(raw.as_deref())?;
+    // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
+    // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
+    // compteur chez JeromeQ gelaient ce fil pour tout le reste du serveur :
+    // `gel_executeur_detecte` pendant la navigation, lecture hachée, arrêt
+    // qui dépasse son délai. `spawn_blocking` les met sur le pool de fils
+    // bloquants, comme la grille d'albums depuis #4800.
+    let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
+    let profile_id = profile.id();
+    match tokio::task::spawn_blocking(move || lire_la_page_de_pistes(&state, profile_id, p, filter))
+        .await
+    {
+        Ok(corps) => Ok(Json(corps)),
+        Err(e) => {
+            tracing::error!(error = %e, "list_tracks_tache_bloquante_perdue");
+            Ok(Json(
+                json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
+            ))
+        }
+    }
+}
+
+/// Le corps de `GET /library/tracks`, exécuté HORS de l'exécuteur async.
+fn lire_la_page_de_pistes(
+    state: &AppState,
+    profile_id: i64,
+    p: TrackFilterQuery,
+    mut filter: tune_core::db::facet_filter::TrackFilter,
+) -> Value {
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let limit = p.limit.unwrap_or(50);
+    let offset = p.offset.unwrap_or(0);
 
     // Resolve the collection name so /library/tracks?collection=<name> filters
     // to its members. A MANUAL collection resolves to album ids (JSON settings);
@@ -329,7 +377,7 @@ pub(super) async fn list_tracks(
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| super::facets::resolve_collection(&state, name))
+        .map(|name| super::facets::resolve_collection(state, name))
         .unwrap_or_default();
 
     filter.collection_ids = scope.albums;
@@ -343,25 +391,26 @@ pub(super) async fn list_tracks(
     if filter.is_active() {
         match repo.list_filtered(&filter, limit, offset) {
             Ok((items, total)) => {
-                let items = joindre_dr_par_piste(&state, profile.id(), items);
-                Ok(Json(
-                    json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-                ))
+                let items = joindre_dr_par_piste(state, profile_id, items);
+                json!({"items": items, "total": total, "limit": limit, "offset": offset})
             }
             Err(e) => {
                 tracing::error!(error = %e, "list_tracks_filtered_query_failed");
-                Ok(Json(
-                    json!({"items": [], "total": 0, "limit": limit, "offset": offset}),
-                ))
+                json!({"items": [], "total": 0, "limit": limit, "offset": offset})
             }
         }
     } else {
         // Même exclusion des albums masqués que le chemin facetté (#1391) :
         // sans elle, la vue par défaut fuirait ce que la vue filtrée cache.
-        let total = repo.count_visible().unwrap_or(0);
-        let items = match repo.list_visible(limit, offset) {
-            Ok(tracks) => tracks,
+        //
+        // #5138 — la page et son total en UNE requête : le `WHERE` n'est plus
+        // évalué deux fois par page. Seule une page vide (décalage au-delà de
+        // la fin) ou une erreur recompte.
+        let (items, total) = match repo.list_visible_avec_total(limit, offset) {
+            Ok((tracks, Some(total))) => (tracks, total),
+            Ok((tracks, None)) => (tracks, repo.count_visible().unwrap_or(0)),
             Err(e) => {
+                let total = repo.count_visible().unwrap_or(0);
                 tracing::error!(
                     error = %e,
                     limit,
@@ -369,13 +418,11 @@ pub(super) async fn list_tracks(
                     total,
                     "list_tracks_query_failed — stats show {total} tracks but query returned error"
                 );
-                Vec::new()
+                (Vec::new(), total)
             }
         };
-        let items = joindre_dr_par_piste(&state, profile.id(), items);
-        Ok(Json(
-            json!({"items": items, "total": total, "limit": limit, "offset": offset}),
-        ))
+        let items = joindre_dr_par_piste(state, profile_id, items);
+        json!({"items": items, "total": total, "limit": limit, "offset": offset})
     }
 }
 
@@ -3201,3 +3248,76 @@ mod magasin_etendu_relu_par_la_passe_3816 {
 #[cfg(test)]
 #[path = "rescan_metadata_errors_3816.rs"]
 mod rescan_metadata_errors_3816;
+
+/// #5192 — `GET /library/tracks` sert `path_terms` (la définition UNIQUE des
+/// termes de chemin, que le client web compare au lieu de redécouper
+/// `file_path`) et son texte libre `q` les compare ; le rail des facettes
+/// compte la même sélection.
+#[cfg(test)]
+mod tests_termes_de_chemin_5192 {
+    use super::*;
+    use crate::routes::active_profile::ActiveProfile;
+    use tune_core::db::models::Track;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_liste_sert_path_terms_et_son_texte_libre_les_compare() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = TrackRepo::with_backend(state.backend.clone());
+        for (titre, chemin) in [
+            (
+                "Langsam, schleppend",
+                "/music/Classique/Mahler_Kondrashin/01-Langsam.flac",
+            ),
+            ("Urlicht", "/music/Classique/Solti/04-Urlicht.flac"),
+        ] {
+            let mut t = Track::new(titre.into());
+            t.file_path = Some(chemin.into());
+            t.label = Some("Melodiya".into());
+            repo.create(&t).unwrap();
+        }
+        let liste = |raw: &'static str| {
+            let state = state.clone();
+            async move {
+                let Json(v) = list_tracks(
+                    State(state),
+                    ActiveProfile(1),
+                    Query(TrackFilterQuery::default()),
+                    RawQuery(Some(raw.to_string())),
+                )
+                .await
+                .ok()
+                .expect("la route répond");
+                v
+            }
+        };
+
+        let v = liste("limit=50").await;
+        let termes: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["path_terms"].as_str().expect("path_terms servi"))
+            .collect();
+        assert!(
+            termes.contains(&"Mahler Kondrashin 01 Langsam"),
+            "{termes:?}"
+        );
+
+        let v = liste("q=mahler%20kondrashin").await;
+        assert_eq!(v["total"], 1, "{v}");
+        assert_eq!(v["items"][0]["title"], "Langsam, schleppend");
+        assert_eq!(v["items"][0]["path_terms"], "Mahler Kondrashin 01 Langsam");
+
+        // Le rail compte la MÊME sélection que la liste.
+        let Json(f) = super::super::facets::library_facets(
+            Query(Default::default()),
+            RawQuery(Some("fields=label&q=mahler%20kondrashin".into())),
+            State(state.clone()),
+        )
+        .await
+        .ok()
+        .expect("les facettes répondent");
+        assert_eq!(f["label"][0]["value"], "Melodiya", "{f}");
+        assert_eq!(f["label"][0]["count"], 1, "{f}");
+    }
+}

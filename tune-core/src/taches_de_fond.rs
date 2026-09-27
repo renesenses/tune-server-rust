@@ -72,6 +72,12 @@ use crate::db::settings_repo::SettingsRepo;
 /// relever (#4681).
 pub mod priorite;
 
+/// L'ordre des passes qui décodent : la place de la plage dynamique (#5169).
+pub mod ordre;
+
+/// Le rattrapage des rapports `foo_dr.txt`, sans décodage (#5168).
+pub mod rapports_dr;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir
@@ -251,6 +257,9 @@ pub fn hydrater(backend: &Arc<dyn DbBackend>) {
         }
     }
     PAUSES.store(masque, Ordering::Relaxed);
+    // #5169 — le réglage d'ordre est une décision de l'utilisateur, comme la
+    // pause : il survit au redémarrage par le même chemin.
+    ordre::hydrater(backend);
     if masque != 0 {
         tracing::info!(
             suspendus = ?suspendus().iter().map(|t| t.id()).collect::<Vec<_>>(),

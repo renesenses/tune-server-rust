@@ -120,6 +120,35 @@ async fn la_fiche_et_le_rapport_comptent_les_serveurs_multimedia() {
          section Network obtenue :\n{}",
         md.split("## Network").nth(1).unwrap_or("<absente>")
     );
+    // #5226 — « Discovered devices: 0 » à côté d'un serveur connu a été lu
+    // « aucun serveur » (#3575). Le compteur des renderers porte désormais
+    // son nom, et le JSON du rapport compte les deux registres séparément.
+    let network = md.split("## Network").nth(1).unwrap_or("<absente>");
+    assert!(
+        md.contains("- Renderers decouverts: 0"),
+        "le compteur des renderers doit dire ce qu'il compte : un état à UN \
+         serveur et zéro renderer se lisait « Discovered devices: 0 », soit \
+         « aucun appareil » (#5226).\nsection Network obtenue :\n{network}"
+    );
+    assert!(
+        !md.contains("Discovered devices"),
+        "l'ancien libellé ambigu est toujours écrit (#5226).\n\
+         section Network obtenue :\n{network}"
+    );
+    assert_eq!(
+        rapport["network"]["discovered_media_servers"], 1,
+        "le JSON du rapport doit compter les serveurs multimédia à côté des \
+         renderers (#5226) : {}",
+        rapport["network"]
+    );
+    assert_eq!(rapport["network"]["discovered_devices"], 0);
+    let (code, reseau) = obtenir(&app, "/api/v1/system/diagnostics/network").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        reseau["discovered_media_servers"], 1,
+        "le diagnostic réseau doit compter les serveurs multimédia (#5226) : {reseau}"
+    );
+    assert_eq!(reseau["discovered_devices"], 0);
     assert!(
         md.contains("Freebox Server") && md.contains("192.168.0.254"),
         "le rapport compte sans nommer : il faut savoir LEQUEL manque.\n\

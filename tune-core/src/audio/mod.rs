@@ -14,6 +14,7 @@ pub mod channels;
 /// crête (jamais d'écrêtage).
 pub mod compensation_reseau;
 pub mod convolver;
+pub mod crete_de_sortie;
 pub mod crossfeed;
 pub mod dash_growth;
 pub mod decode;
@@ -56,6 +57,7 @@ pub mod formats;
 pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
+pub mod limiteur;
 pub mod m4a;
 /// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
 /// un décodeur livré la lit, compté-nommé sinon (#3633).

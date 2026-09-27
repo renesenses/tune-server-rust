@@ -3,6 +3,7 @@
   "brands": [
     {
       "name": "Sonos",
+      "default_quirks": { "max_sample_rate": 48000 },
       "models": [
         { "name": "One", "quirks": { "max_sample_rate": 48000 } },
         { "name": "One SL", "quirks": { "max_sample_rate": 48000 } },
@@ -13,7 +14,24 @@
         { "name": "Move", "quirks": { "max_sample_rate": 48000 } },
         { "name": "Roam", "quirks": { "max_sample_rate": 48000 } },
         { "name": "Port", "quirks": { "max_sample_rate": 48000 } },
-        { "name": "Amp", "quirks": { "max_sample_rate": 48000 } }
+        { "name": "Amp", "quirks": { "max_sample_rate": 48000 } },
+        { "name": "Era 100", "quirks": {} },
+        { "name": "Era 300", "quirks": {} },
+        { "name": "Ray", "quirks": {} },
+        { "name": "Ace", "quirks": {} },
+        { "name": "Arc Ultra", "quirks": {} },
+        { "name": "Beam Gen 2", "quirks": {} },
+        { "name": "Sub", "quirks": {} },
+        { "name": "Sub Mini", "quirks": {} },
+        { "name": "Move 2", "quirks": {} },
+        { "name": "Roam 2", "quirks": {} },
+        { "name": "Roam SL", "quirks": {} },
+        { "name": "Play:1", "quirks": {} },
+        { "name": "Play:3", "quirks": {} },
+        { "name": "Playbar", "quirks": {} },
+        { "name": "Playbase", "quirks": {} },
+        { "name": "Connect", "quirks": {} },
+        { "name": "Connect:Amp", "quirks": {} }
       ]
     },
     {

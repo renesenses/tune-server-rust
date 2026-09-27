@@ -173,3 +173,102 @@ async fn pg_4984_les_credits_s_ecrivent_se_purgent_et_se_relisent() {
 
     menage(&state);
 }
+
+/// #5160 : les deux routes doivent voir les balises locales sur une vraie base
+/// PG, où les identifiants de `track_metadata` ont connu TEXT puis BIGINT.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_5160_les_balises_de_credit_entrent_dans_la_piste_et_l_album() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    const MARQUE_5160: &str = "credits-5160";
+    let state = etat_postgres(&url);
+    let b = &state.backend;
+    let menage = || {
+        for sql in [
+            format!(
+                "DELETE FROM track_metadata WHERE track_id IN \
+                 (SELECT id FROM tracks WHERE title = '{MARQUE_5160}')"
+            ),
+            format!(
+                "DELETE FROM track_credits WHERE track_id IN \
+                 (SELECT id FROM tracks WHERE title = '{MARQUE_5160}')"
+            ),
+            format!("DELETE FROM tracks WHERE title = '{MARQUE_5160}'"),
+            format!("DELETE FROM albums WHERE title = '{MARQUE_5160}'"),
+            format!("DELETE FROM artists WHERE name = '{MARQUE_5160}'"),
+        ] {
+            b.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("ménage « {sql} » : {e}"));
+        }
+    };
+    menage();
+
+    let artist_id = b
+        .execute_returning_id(
+            "INSERT INTO artists (name) VALUES (?)",
+            &[&MARQUE_5160 as &dyn ToSqlValue],
+        )
+        .expect("artiste PG #5160");
+    let album_id = b
+        .execute_returning_id(
+            "INSERT INTO albums (title, artist_id) VALUES (?, ?)",
+            &[
+                &MARQUE_5160 as &dyn ToSqlValue,
+                &artist_id as &dyn ToSqlValue,
+            ],
+        )
+        .expect("album PG #5160");
+    let track_id = b
+        .execute_returning_id(
+            "INSERT INTO tracks (title, album_id) VALUES (?, ?)",
+            &[
+                &MARQUE_5160 as &dyn ToSqlValue,
+                &album_id as &dyn ToSqlValue,
+            ],
+        )
+        .expect("piste PG #5160");
+    b.execute(
+        "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) \
+         VALUES (?, 'Alice', 'performer', 'guitar', 0)",
+        &[&track_id as &dyn ToSqlValue],
+    )
+    .expect("crédit structuré PG #5160");
+    for (cle, valeur) in [
+        ("performer", "Alice (guitar); Alice (vocals)"),
+        ("producer", "Bob; Carol"),
+    ] {
+        b.execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (?, ?, ?)",
+            &[
+                &track_id as &dyn ToSqlValue,
+                &cle as &dyn ToSqlValue,
+                &valeur as &dyn ToSqlValue,
+            ],
+        )
+        .expect("balise PG #5160");
+    }
+
+    for route in [
+        format!("/api/v1/library/tracks/{track_id}/credits"),
+        format!("/api/v1/library/albums/{album_id}/credits"),
+    ] {
+        let credits = get_json(&state, &route).await;
+        let credits = credits.as_array().expect("liste de crédits PG #5160");
+        assert_eq!(credits.len(), 4, "{route} : {credits:?}");
+        assert!(credits.iter().any(|c| {
+            c["artist_name"] == "Alice" && c["instrument"] == "guitar" && c["id"].as_i64().is_some()
+        }));
+        assert!(credits.iter().any(|c| {
+            c["artist_name"] == "Alice" && c["instrument"] == "vocals" && c["id"].is_null()
+        }));
+        assert!(
+            credits
+                .iter()
+                .any(|c| c["artist_name"] == "Bob" && c["role"] == "producer")
+        );
+        assert!(credits.iter().all(|c| c["track_id"] == track_id));
+    }
+    menage();
+}

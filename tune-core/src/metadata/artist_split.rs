@@ -129,28 +129,46 @@ pub fn is_allowlisted(name: &str, extra: &[String]) -> bool {
             .any(|g| fold_diacritics(g.trim()).to_lowercase() == key)
 }
 
-/// Case-insensitive `replace` (ASCII-fold on the needle boundaries is enough
-/// here since all markers are ASCII).
+/// Case-insensitive `replace`.
+///
+/// #5236 — la comparaison se fait CARACTÈRE PAR CARACTÈRE, sur `haystack`
+/// seul. L'ancienne version indexait `haystack.to_lowercase()` avec des
+/// positions en octets de `haystack` : dès qu'une minuscule change de taille
+/// (« İ » → « i̇ », 2 → 3 octets ; « ẞ » → « ß », 3 → 2), les positions
+/// tombaient au milieu d'un caractère et le serveur paniquait au démarrage
+/// (passe `recalculer_les_compilations`, v0.9.166).
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return haystack.to_string();
     }
-    let hay_l = haystack.to_lowercase();
-    let need_l = needle.to_lowercase();
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
     while i < haystack.len() {
-        if hay_l[i..].starts_with(&need_l) {
+        let rest = &haystack[i..];
+        if let Some(n) = prefix_len_ci(rest, needle) {
             out.push_str(replacement);
-            i += needle.len();
+            i += n;
         } else {
-            // advance one char (respecting UTF-8 boundaries)
-            let ch = haystack[i..].chars().next().unwrap();
+            // `i` est toujours une frontière de caractère de `haystack`.
+            let Some(ch) = rest.chars().next() else { break };
             out.push(ch);
             i += ch.len_utf8();
         }
     }
     out
+}
+
+/// Longueur en octets, DANS `hay`, du préfixe de `hay` égal à `needle` sans
+/// tenir compte de la casse (caractère par caractère), ou `None`.
+fn prefix_len_ci(hay: &str, needle: &str) -> Option<usize> {
+    let mut chars = hay.char_indices();
+    for nc in needle.chars() {
+        let (_, hc) = chars.next()?;
+        if hc != nc && !hc.to_lowercase().eq(nc.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(chars.next().map_or(hay.len(), |(j, _)| j))
 }
 
 /// Whether `s` begins with a leading article (`the`, `his`, `les`, …).
@@ -558,5 +576,60 @@ mod tests {
                 "Alfia Bakieva"
             ]
         );
+    }
+
+    /// #5236 — des caractères dont la minuscule n'a PAS la même taille en
+    /// octets que la majuscule : « İ » (2 → 3), « ẞ » (3 → 2), « Ⱥ » (2 → 3),
+    /// « Ω » (U+2126, 3 → 2), « K » (U+212A, 3 → 1).
+    const TAILLE_CHANGEANTE: &[char] = &['İ', 'ẞ', 'Ⱥ', 'Ⱦ', '\u{2126}', '\u{212A}'];
+
+    #[test]
+    fn replace_ci_ne_panique_pas_quand_la_minuscule_change_de_taille() {
+        assert_eq!(replace_ci("İlhan and Ömer", " and ", " & "), "İlhan & Ömer");
+        assert_eq!(replace_ci("ẞéb AND Ⱥé", " and ", " & "), "ẞéb & Ⱥé");
+        assert_eq!(
+            replace_ci("İstanbul Devlet Senfoni Orkestrası", " and ", " & "),
+            "İstanbul Devlet Senfoni Orkestrası"
+        );
+        assert_eq!(replace_ci("Ⱥé feat. İİ", " feat. ", "|"), "Ⱥé|İİ");
+        // Aucun caractère n'est perdu ni dédoublé quand rien ne correspond.
+        for &c in TAILLE_CHANGEANTE {
+            let s = format!("{c}é{c} x {c}");
+            assert_eq!(replace_ci(&s, " and ", " & "), s);
+        }
+    }
+
+    #[test]
+    fn le_decoupage_d_un_credit_turc_ou_allemand_ne_panique_pas() {
+        assert_eq!(
+            split("İstanbul Devlet Senfoni Orkestrası feat. Ⱥlpha"),
+            vec!["İstanbul Devlet Senfoni Orkestrası", "Ⱥlpha"]
+        );
+        assert_eq!(split("İlhan and Ömer"), vec!["İlhan", "Ömer"]);
+        assert_eq!(split("GROẞE Band & Ⱥnna"), vec!["GROẞE Band", "Ⱥnna"]);
+    }
+
+    /// Balayage : TOUT caractère du plan multilingue de base dont la minuscule
+    /// change de taille, placé autour de chaque marqueur. Aucune panique.
+    #[test]
+    fn aucun_caractere_a_minuscule_de_taille_changeante_ne_fait_paniquer() {
+        let mut vus = 0;
+        for c in (0u32..0x1_0000).filter_map(char::from_u32) {
+            let bas: usize = c.to_lowercase().map(char::len_utf8).sum();
+            if bas == c.len_utf8() {
+                continue;
+            }
+            vus += 1;
+            for gabarit in [
+                "{c}x and y{c}é",
+                "{c}{c} feat. {c}é, {c}ö & The {c}",
+                "é{c} vs {c}; {c} with {c}ä",
+            ] {
+                let s = gabarit.replace("{c}", &c.to_string());
+                let _ = analyze_artist_credit(&s, &[], true);
+                let _ = analyze_artist_credit(&s, &[], false);
+            }
+        }
+        assert!(vus > 10, "le balayage doit trouver des cas ({vus})");
     }
 }

@@ -20,6 +20,10 @@
     "enabled": {
       "type": "boolean"
     },
+    "headroom_mode": {
+      "description": "Réserve anti-saturation de l'égaliseur (#5171).\n\n`safe` (défaut, norme L1, aucune saturation possible) ou `realistic`\n(maximum réel de la réponse en fréquence, plus un limiteur de sécurité\ndoux). Voir [`HeadroomMode`].\n\nAbsent du JSON quand il vaut `safe` : un profil enregistré avant ce\nchamp se relit à l'identique, et un profil « Sûr » s'écrit octet pour\noctet comme avant — y compris les réglages passés au greffon natif.",
+      "$ref": "#/$defs/HeadroomMode"
+    },
     "listening": {
       "description": "Macro environment",
       "$ref": "#/$defs/ListeningMode"
@@ -87,6 +91,21 @@
       },
       "required": [
         "freq"
+      ]
+    },
+    "HeadroomMode": {
+      "description": "Réserve anti-saturation de l'égaliseur, au choix de l'utilisateur (#5171).",
+      "oneOf": [
+        {
+          "description": "Norme L1 de la cascade ([`EqProfile::automatic_headroom_db_at`]) :\naucune saturation possible, quelle que soit l'entrée. Le comportement\nd'avant #5171, au bit près.",
+          "type": "string",
+          "const": "safe"
+        },
+        {
+          "description": "Maximum réel de la réponse en fréquence plus [`MARGE_REALISTE_DB`]\n([`EqProfile::reserve_realiste_db_at`]), suivi du limiteur de sécurité\n(`tune_plugin_audio_support::limiteur`) qui n'agit que sur les crêtes\ntransitoires que ce maximum ne voit pas.",
+          "type": "string",
+          "const": "realistic"
+        }
       ]
     },
     "ListeningMode": {

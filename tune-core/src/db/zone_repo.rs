@@ -24,6 +24,90 @@ pub struct ZoneMasquee {
     pub masquee_le: Option<String>,
 }
 
+#[cfg(all(test, feature = "postgres"))]
+mod pg_5263_tests {
+    use sqlx::{Connection, Row};
+
+    use super::{Engine, sql};
+
+    #[tokio::test]
+    async fn pg_5263_doublons_text_reportent_leurs_reglages_avant_suppression() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL #5263 sautée");
+            return;
+        };
+        let mut db = sqlx::PgConnection::connect(&url)
+            .await
+            .expect("TUNE_TEST_PG_URL posée mais PostgreSQL injoignable");
+        // Table temporaire propre à cette connexion : aucun effet sur les
+        // zones du banc partagé, même si les tests PostgreSQL tournent en //.
+        sqlx::query(
+            "CREATE TEMP TABLE zones (id TEXT PRIMARY KEY, output_device_id TEXT, \
+             fixed_volume TEXT DEFAULT '0', alac_passthrough TEXT DEFAULT '0', \
+             aac_passthrough TEXT DEFAULT '0', autoplay_enabled TEXT DEFAULT '0', \
+             dlna_lpcm TEXT DEFAULT '0', dlna_wav24 TEXT DEFAULT '0', \
+             dlna_cap_16bit TEXT DEFAULT '0', dlna_native_flac TEXT DEFAULT '0', \
+             dlna_play_delay_ms TEXT DEFAULT '0', sync_delay_ms TEXT DEFAULT '0', \
+             lyrics_offset_ms TEXT DEFAULT '0', max_sample_rate TEXT, \
+             dsd_mode TEXT DEFAULT 'auto')",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO zones (id, output_device_id, fixed_volume, sync_delay_ms, dsd_mode) \
+             VALUES ('9', 'lecteur-5263', '0', '0', 'auto'), \
+                    ('10', 'lecteur-5263', '1', '17', 'native')",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
+
+        let ids: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql::doublons_par_appareil(
+            Engine::Postgres,
+        )))
+        .fetch_all(&mut db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ligne| ligne.get::<String, _>(1))
+        .collect();
+        assert_eq!(ids, ["9", "10"], "l'ordre des zones est numérique");
+
+        for instruction in sql::merge_duplicate_settings(Engine::Postgres) {
+            // La chaîne est assemblée exclusivement depuis les colonnes et
+            // valeurs constantes de REGLAGES_A_FUSIONNER.
+            sqlx::query(sqlx::AssertSqlSafe(instruction))
+                .execute(&mut db)
+                .await
+                .unwrap_or_else(|e| panic!("fusion des réglages TEXT PostgreSQL impossible : {e}"));
+        }
+        let avant =
+            sqlx::query("SELECT fixed_volume, sync_delay_ms, dsd_mode FROM zones WHERE id = '9'")
+                .fetch_one(&mut db)
+                .await
+                .unwrap();
+        assert_eq!(avant.get::<String, _>(0), "1");
+        assert_eq!(avant.get::<String, _>(1), "17");
+        assert_eq!(avant.get::<String, _>(2), "native");
+
+        sqlx::query(sqlx::AssertSqlSafe(sql::deduplicate(Engine::Postgres)))
+            .execute(&mut db)
+            .await
+            .unwrap();
+        let compte: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM zones WHERE id = '9'")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(compte, 1, "la zone 9, plus ancienne que 10, doit survivre");
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM zones")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "le doublon doit être supprimé après le report");
+    }
+}
+
 /// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
 /// inconnu : masquage d'avant la migration 112, ou zone visible.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,8 +209,14 @@ pub mod sql {
 
     /// Delete duplicate zones, keeping only the one with the lowest id for each
     /// output_device_id. Returns the DELETE statement.
-    pub fn deduplicate() -> &'static str {
-        "DELETE FROM zones WHERE id NOT IN (SELECT MIN(id) FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id) AND output_device_id IS NOT NULL AND output_device_id IN (SELECT output_device_id FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id HAVING COUNT(*) > 1)"
+    pub fn deduplicate(engine: Engine) -> String {
+        let id = match engine {
+            Engine::Postgres => "CAST(id AS BIGINT)",
+            Engine::Sqlite => "id",
+        };
+        format!(
+            "DELETE FROM zones WHERE {id} NOT IN (SELECT MIN({id}) FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id) AND output_device_id IS NOT NULL AND output_device_id IN (SELECT output_device_id FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id HAVING COUNT(*) > 1)"
+        )
     }
 
     /// Rendre son prefixe `local:` a une zone locale qui l'a perdu.
@@ -206,37 +296,68 @@ pub mod sql {
     /// Meme regroupement que [`Self::deduplicate`] — `MIN(id)` survit — mais
     /// rendu ligne par ligne, pour pouvoir traiter les reglages qui ne sont pas
     /// des colonnes.
-    pub fn doublons_par_appareil() -> &'static str {
-        "SELECT output_device_id, id FROM zones \
+    pub fn doublons_par_appareil(engine: Engine) -> String {
+        let id = match engine {
+            Engine::Postgres => "CAST(id AS BIGINT)",
+            Engine::Sqlite => "id",
+        };
+        format!(
+            "SELECT output_device_id, id FROM zones \
          WHERE output_device_id IS NOT NULL \
            AND output_device_id IN ( \
              SELECT output_device_id FROM zones \
              WHERE output_device_id IS NOT NULL \
              GROUP BY output_device_id HAVING COUNT(*) > 1 ) \
-         ORDER BY output_device_id, id"
+         ORDER BY output_device_id, {id}"
+        )
     }
 
     /// Instructions de fusion, dans l'ordre. Chacune ne touche QUE les zones
     /// conservees d'un groupe en doublon, et seulement quand elles sont restees
     /// au defaut — un reglage explicite n'est jamais ecrase.
-    pub fn merge_duplicate_settings(_engine: Engine) -> Vec<String> {
-        let survivantes = "SELECT MIN(id) FROM zones \
+    /// PostgreSQL garde certains réglages de zone en TEXT, tandis que d'autres
+    /// ont été convertis en SMALLINT. Comparer leur représentation textuelle
+    /// évite `COALESCE(text, 0)` sans modifier le type stocké ni ses rédacteurs.
+    pub(super) fn valeur_ou_defaut(
+        engine: Engine,
+        colonne: &str,
+        defaut: &str,
+    ) -> (String, String) {
+        match engine {
+            Engine::Postgres => (
+                format!("COALESCE(CAST({colonne} AS TEXT), '{defaut}')"),
+                format!("'{defaut}'"),
+            ),
+            Engine::Sqlite => (format!("COALESCE({colonne}, {defaut})"), defaut.to_owned()),
+        }
+    }
+
+    pub fn merge_duplicate_settings(engine: Engine) -> Vec<String> {
+        let id = match engine {
+            Engine::Postgres => "CAST(id AS BIGINT)",
+            Engine::Sqlite => "id",
+        };
+        let survivantes = format!(
+            "SELECT MIN({id}) FROM zones \
              WHERE output_device_id IS NOT NULL \
-             GROUP BY output_device_id HAVING COUNT(*) > 1";
+             GROUP BY output_device_id HAVING COUNT(*) > 1"
+        );
         let mut sorties = Vec::new();
 
         for (colonne, defaut) in REGLAGES_A_FUSIONNER {
+            let (valeur, zero) = valeur_ou_defaut(engine, colonne, defaut);
+            let (valeur_doublon, _) = valeur_ou_defaut(engine, &format!("d.{colonne}"), defaut);
             sorties.push(format!(
                 "UPDATE zones SET {colonne} = ( \
                     SELECT MAX(d.{colonne}) FROM zones d \
                     WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
                  ) \
-                 WHERE id IN ({survivantes}) \
-                   AND COALESCE({colonne}, {defaut}) = {defaut} \
+                 WHERE {id} IN ({survivantes}) \
+                   AND {valeur} = {zero} \
                    AND EXISTS ( \
                     SELECT 1 FROM zones d \
                     WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
-                      AND COALESCE(d.{colonne}, {defaut}) <> {defaut} \
+                      AND {valeur_doublon} <> {zero} \
                    )"
             ));
         }
@@ -248,7 +369,7 @@ pub mod sql {
                     WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
                       AND d.{colonne} IS NOT NULL \
                  ) \
-                 WHERE id IN ({survivantes}) \
+                 WHERE {id} IN ({survivantes}) \
                    AND {colonne} IS NULL \
                    AND EXISTS ( \
                     SELECT 1 FROM zones d \
@@ -265,7 +386,7 @@ pub mod sql {
                 WHERE d.output_device_id = zones.output_device_id AND d.id <> zones.id \
                   AND d.dsd_mode IS NOT NULL AND d.dsd_mode <> 'auto' \
              ) \
-             WHERE id IN ({survivantes}) \
+             WHERE {id} IN ({survivantes}) \
                AND COALESCE(dsd_mode, 'auto') = 'auto' \
                AND EXISTS ( \
                 SELECT 1 FROM zones d \
@@ -1234,7 +1355,7 @@ impl ZoneRepo {
         self.reparer_prefixe_local()?;
         self.merge_duplicate_settings()?;
         self.reporter_reglages_de_doublons()?;
-        self.db.execute(sql::deduplicate(), &[])
+        self.db.execute(&sql::deduplicate(self.db.engine()), &[])
     }
 
     /// Reporter sur la survivante les reglages de zone ranges dans `settings`.
@@ -1260,7 +1381,10 @@ impl ZoneRepo {
     /// reversible, un effacement ne l'est pas, et rien ne presse : le menage
     /// des cles orphelines est un sujet distinct.
     pub fn reporter_reglages_de_doublons(&self) -> Result<(), String> {
-        let lignes = match self.db.query_many_strong(sql::doublons_par_appareil(), &[]) {
+        let lignes = match self
+            .db
+            .query_many_strong(&sql::doublons_par_appareil(self.db.engine()), &[])
+        {
             Ok(l) => l,
             // Base anterieure a `output_device_id` : rien a reporter.
             Err(e) if e.contains("no such column") || e.contains("does not exist") => return Ok(()),

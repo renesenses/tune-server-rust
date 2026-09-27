@@ -86,6 +86,7 @@ fn jouer_puis_casser(role: RoleDeLaBoucle, depart_ms: u64, duree_ms: u64) -> Iss
         open_failure: &constat,
         debut_du_flux: std::time::Instant::now(),
         duree_de_la_piste_ms: &duree,
+        cretes_de_sortie: None,
     };
     let dsp = DspAuRepos::neuf();
     let mut conversion = etage(&dsp, Vec::new(), 44_100, 2, 16, 44_100, 2);

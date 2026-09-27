@@ -438,6 +438,15 @@ mod bras_wasapi;
 #[cfg(any(target_os = "windows", test))]
 mod etage_natif;
 
+// #5204 — l'enchaînement sans blanc en mode exclusif : quel bras enchaîne, la
+// règle de la frontière à format égal, et la lecture de l'en-tête suivant
+// (partagée avec le chemin cpal). Pur, compilé partout.
+mod enchainement_exclusif;
+// #5204 — la boucle d'un bras natif exclusif et son enchaînement, générique
+// sur la source : jugée sur Shrek avec des pistes en mémoire.
+#[cfg(any(target_os = "windows", test))]
+mod chaine_native;
+
 // REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
 // partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
 // observer, drainer.
@@ -732,6 +741,11 @@ pub struct LocalOutput {
     /// replis (rate de repli, cascade entière) parce qu'il appartient à la
     /// sortie, pas au flux.
     starvation: Arc<RingStarvation>,
+    /// #4384 — les crêtes des échantillons APRÈS `apply_local_dsp`, relevées
+    /// par la boucle producteur et lues par le forwarder de niveaux. Comme
+    /// `starvation`, il appartient à la sortie et survit aux flux. Voir
+    /// [`crate::audio::crete_de_sortie`].
+    cretes_de_sortie: Arc<crate::audio::crete_de_sortie::CretesDeSortie>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -755,12 +769,41 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     if dop {
         return 1000;
     }
+    let (rg_units, porte_par_l_eq) = decomposer_le_facteur_de_rendu(rg_units);
     let user = user_units as f64 / 1000.0;
     let rg = rg_units as f64 / 1000.0;
     // Clamped to unity: above it, a ReplayGain boost would push peaks past
     // full scale and the user, who never touched the slider, would hear
     // distortion appear out of nowhere.
-    ((user * rg).clamp(0.0, 1.0) * 1000.0).round() as u32
+    //
+    // #5227 — puis divisé par la part de compensation que l'égaliseur porte
+    // déjà dans ses échantillons : le produit rendu reste le même, rabot
+    // compris, mais cette part-là traverse l'anneau avec le filtre.
+    ((user * rg).clamp(0.0, 1.0) * 1000.0 * 1000.0 / porte_par_l_eq as f64).round() as u32
+}
+
+/// #5227 — `rg_factor` porte DEUX nombres, en millièmes : le facteur
+/// ReplayGain × compensation (16 bits bas, ≤ 64 000) et la part de cette
+/// compensation que l'égaliseur multiplie lui-même avant l'anneau (16 bits
+/// hauts ; 0 = 1 000, rien de porté).
+///
+/// Empaquetés dans le même atomique parce que c'est lui que les six boucles
+/// de rendu, et `sync_volume_to_dop`, lisent déjà : un second atomique aurait
+/// dû traverser chaque bras, dont deux ne compilent que sous Windows. Une
+/// valeur posée à l'ancienne (moins de 65 536) se lit exactement comme avant.
+fn composer_le_facteur_de_rendu(rg_compense: u32, porte_par_l_eq: u32) -> u32 {
+    let rg = rg_compense.min(64_000);
+    let porte = porte_par_l_eq.clamp(1000, 64_000);
+    if porte == 1000 {
+        rg
+    } else {
+        (porte << 16) | rg
+    }
+}
+
+fn decomposer_le_facteur_de_rendu(facteur: u32) -> (u32, u32) {
+    let porte = facteur >> 16;
+    (facteur & 0xFFFF, if porte == 0 { 1000 } else { porte })
 }
 
 /// Dit à voix haute que le produit « volume × ReplayGain » a été RABOTÉ à
@@ -784,6 +827,7 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
     if dop {
         return;
     }
+    let rg_units = decomposer_le_facteur_de_rendu(rg_units).0;
     let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
     if demande <= 1.0 {
         return;
@@ -875,6 +919,17 @@ impl LocalOutput {
     /// `effective_volume_units` rend l'unité de toute façon) le DSP est
     /// contourné : rien à compenser.
     fn recalculer_la_compensation(&self) {
+        // #5227 — la part que l'égaliseur installé multiplie déjà dans ses
+        // échantillons. Nulle sous PURE : `apply_local_dsp` ne l'applique pas.
+        let porte_par_l_eq = if self.pure_bypass.load(Ordering::Relaxed) {
+            1.0
+        } else {
+            self.eq
+                .lock()
+                .ok()
+                .and_then(|e| e.as_ref().map(|p| p.compensation_portee()))
+                .unwrap_or(1.0)
+        };
         let dsp_db = if self.pure_bypass.load(Ordering::Relaxed) {
             0.0
         } else {
@@ -894,8 +949,11 @@ impl LocalOutput {
         };
         let dsp_db = if dsp_db.is_finite() { dsp_db } else { 0.0 };
         let en_millemes = |db: f64| (10.0_f64.powf(db / 20.0) * 1000.0).round();
+        // Le crête-mètre multiplie ce gain par le volume rendu : la part
+        // portée par l'égaliseur, retirée du volume, revient donc ici, et le
+        // produit que lit l'aiguille ne bouge pas.
         self.gain_moyen_dsp.store(
-            en_millemes(dsp_db).clamp(0.0, 64_000.0) as u32,
+            (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32,
             Ordering::SeqCst,
         );
         let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
@@ -907,7 +965,10 @@ impl LocalOutput {
         // Borné à ×64 : le produit est de toute façon raboté à l'unité par
         // `effective_volume_units`, la borne ne protège que l'`u32`.
         let compose = (rg * 10.0_f64.powf(compensation / 20.0)).clamp(0.0, 64_000.0);
-        let compose = compose.round() as u32;
+        let compose = composer_le_facteur_de_rendu(
+            compose.round() as u32,
+            (porte_par_l_eq * 1000.0).round() as u32,
+        );
         // Une lecture installe ReplayGain, crossfeed et égaliseur l'un après
         // l'autre : ne recalculer (et ne journaliser un rabot) que si le
         // facteur a réellement bougé. Rien d'autre ne peut avoir rendu
@@ -936,6 +997,13 @@ impl LocalOutput {
     /// `PlaybackManager::brancher_l_horloge_de_sortie`.
     pub fn horloge_de_sortie(&self) -> (Arc<AtomicU64>, Arc<RingStarvation>) {
         (self.position_ms.clone(), self.starvation.clone())
+    }
+
+    /// #4384 — le registre des crêtes APRÈS le DSP de cette sortie, partagé
+    /// (pas copié) avec le forwarder de niveaux. Voir
+    /// `PlaybackManager::brancher_les_cretes_de_sortie`.
+    pub fn cretes_de_sortie(&self) -> Arc<crate::audio::crete_de_sortie::CretesDeSortie> {
+        self.cretes_de_sortie.clone()
     }
 
     fn recompute_effective_volume(&self) {
@@ -1080,6 +1148,7 @@ impl LocalOutput {
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
             starvation: Arc::new(RingStarvation::new()),
+            cretes_de_sortie: Arc::new(crate::audio::crete_de_sortie::CretesDeSortie::new()),
         }
     }
 
@@ -1093,9 +1162,39 @@ impl LocalOutput {
     /// Rebuilt at each play so the biquad coefficients match the resolved
     /// stream's sample rate and channel count, and so a profile edited between
     /// two tracks takes effect on the next one.
-    pub fn set_eq(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+    pub fn set_eq(&self, mut eq: Option<super::super::audio::eq::EqProcessor>) {
+        self.faire_porter_la_compensation(&mut eq);
         *self.eq.lock().unwrap() = eq;
         self.recalculer_la_compensation();
+    }
+
+    /// #5227 — confier à l'égaliseur qu'on installe la compensation de SON
+    /// niveau moyen, pour qu'elle traverse l'anneau avec son préampli au lieu
+    /// de changer le volume ~2 s trop tôt. Figée à l'installation : un
+    /// interrupteur de compensation basculé ensuite passe par le volume seul
+    /// (`recalculer_la_compensation` divise par ce qui est porté), sans rien
+    /// changer à ce qui est déjà dans l'anneau.
+    fn faire_porter_la_compensation(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if let Some(p) = eq.as_mut() {
+            let facteur = if self.compensation_de_niveau.load(Ordering::Relaxed)
+                && !self.pure_bypass.load(Ordering::Relaxed)
+            {
+                10.0_f64.powf(-p.gain_moyen_db() / 20.0)
+            } else {
+                1.0
+            };
+            p.porter_la_compensation(facteur);
+        }
+    }
+
+    /// #5227 — la compensation que l'égaliseur installé porte lui-même (1,0 =
+    /// aucune).
+    pub fn compensation_portee_par_l_eq(&self) -> f64 {
+        self.eq
+            .lock()
+            .ok()
+            .and_then(|e| e.as_ref().map(|p| p.compensation_portee()))
+            .unwrap_or(1.0)
     }
 
     /// Remplacer l'égaliseur **pendant** la lecture, en emportant l'historique
@@ -1111,23 +1210,33 @@ impl LocalOutput {
     /// Distinct de [`Self::set_eq`] à dessein : au début d'une piste il n'y a
     /// pas d'historique à conserver, et celui de la piste précédente serait
     /// faux.
-    pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+    pub fn replace_eq_live(&self, mut eq: Option<super::super::audio::eq::EqProcessor>) {
+        self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
-            match (eq, emplacement.as_ref()) {
-                (Some(mut neuf), Some(precedent)) => {
-                    neuf.inherit_state_from(precedent);
-                    *emplacement = Some(neuf);
-                }
-                (suivant, _) => *emplacement = suivant,
-            }
+            let precedent = emplacement.take();
+            *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
+                // PURE : la chaîne est contournée, rien à fondre — et rien ne
+                // doit rester monté qui ferait croire à un DSP actif.
+                eq
+            } else {
+                // #5215 — héritage des filtres ET, si le niveau bouge
+                // (coupure, activation, préampli déplacé), fondu enchaîné de
+                // `RAMPE_DE_BASCULE_MS` au lieu d'une marche instantanée.
+                super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent)
+            };
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
     }
 
     pub fn has_eq(&self) -> bool {
-        self.eq.lock().unwrap().is_some()
+        // #5215 — un égaliseur coupé qui finit son fondu n'est plus « monté ».
+        self.eq
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.est_neutre())
     }
 
     /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
@@ -3108,6 +3217,11 @@ fn apply_local_dsp(
     if let Ok(mut e) = eq.lock() {
         if let Some(ref mut p) = *e {
             p.process_interleaved(samples);
+            // #5215 — l'égaliseur coupé a fini de fondre vers le sec : on le
+            // retire, la chaîne redevient exactement celle d'un EQ absent.
+            if p.est_neutre_au_repos() {
+                *e = None;
+            }
         }
     }
     if let Ok(mut conv) = convolver.lock() {
@@ -3267,7 +3381,9 @@ fn local_dsp_is_identity(
     // « octets source conservés » et le repli ne serait jamais appliqué — le
     // réglage serait accepté et resterait sans effet.
     !mono_downmix.load(Ordering::Relaxed)
-        && eq.lock().is_ok_and(|guard| guard.is_none())
+        && eq
+            .lock()
+            .is_ok_and(|guard| guard.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }
@@ -3814,6 +3930,13 @@ impl Etage for EtageDeConversion<'_> {
 pub(super) trait BlocDecode {
     fn nb_echantillons(&self) -> usize;
     fn contient_un_echantillon_non_nul(&self) -> bool;
+    /// #4384 — les échantillons entrelacés APRÈS le DSP de la sortie, et le
+    /// nombre de trames SOURCE qu'ils couvrent : ce que le crête-mètre doit
+    /// mesurer. `None` quand le bloc ne les porte pas sous cette forme (mots
+    /// natifs, DoP) — le crête-mètre garde alors son estimation.
+    fn apres_dsp(&self) -> Option<(&[f32], u64)> {
+        None
+    }
 }
 
 impl BlocDecode for ProcessedLocalPcm {
@@ -3823,6 +3946,14 @@ impl BlocDecode for ProcessedLocalPcm {
 
     fn contient_un_echantillon_non_nul(&self) -> bool {
         self.samples.iter().any(|&s| s != 0.0)
+    }
+
+    /// Sortis de `process_pcm_chunk`, donc d'`apply_local_dsp` : égaliseur,
+    /// convolveur, crossfeed et repli mono compris. Ne reste en aval que
+    /// l'adaptation de canaux, le rééchantillonnage et le gain de rendu. Un
+    /// porteur DoP n'est pas un signal : pas de crête.
+    fn apres_dsp(&self) -> Option<(&[f32], u64)> {
+        (!self.dop).then_some((self.samples.as_slice(), self.source_frames))
     }
 }
 
@@ -3984,6 +4115,10 @@ struct BoucleProducteur<'a> {
     /// Sert à distinguer une erreur de fin de corps (#1254 : la piste est au
     /// bout, c'est une fin) d'une coupure du flux en cours de piste.
     duree_de_la_piste_ms: &'a AtomicU64,
+    /// #4384 — où relever la crête de chaque bloc APRÈS le DSP, datée dans la
+    /// piste. `None` pour les bras exclusifs ASIO et CoreAudio et les bancs :
+    /// le crête-mètre y garde son estimation d'avant.
+    cretes_de_sortie: Option<&'a crate::audio::crete_de_sortie::CretesDeSortie>,
 }
 
 /// Durée inconnue pour [`BoucleProducteur::duree_de_la_piste_ms`] : une erreur
@@ -4197,7 +4332,25 @@ impl BoucleProducteur<'_> {
 
             let premiere_donnee = compteurs.premiere_donnee_journalisee;
             let trames_deja_servies = compteurs.total_frames_fed;
+            // #4384 — début du bloc dans la piste, au même référentiel que la
+            // position publiée (`CompteursDePiste::position_ms`) et que les
+            // fenêtres du forwarder de niveaux.
+            let cadence = etage.cadence_source();
+            let debut_du_bloc_ms = if cadence == 0 {
+                f64::NAN
+            } else {
+                trames_deja_servies as f64 * 1000.0 / f64::from(cadence)
+                    + compteurs.seek_offset as f64
+            };
             let pousse = etage.pousser(puits, refuser_le_porteur_dop, &mut |bloc| {
+                // #4384 — la crête de ce qui part vers le DAC, relevée ICI,
+                // après le DSP : le forwarder de niveaux la lira quand la
+                // fenêtre correspondante sortira.
+                if let Some(cretes) = self.cretes_de_sortie
+                    && let Some((echantillons, trames)) = bloc.apres_dsp()
+                {
+                    cretes.relever(echantillons, trames, cadence, debut_du_bloc_ms);
+                }
                 // Silence total au démarrage : le signe d'un décodage qui a
                 // échoué. Diagnostic de la piste initiale seule, comme avant.
                 if initiale && (!premiere_donnee || trames_deja_servies == 0) {
@@ -4303,10 +4456,14 @@ impl OutputTarget for LocalOutput {
         .with_linear_volume(1000)
     }
 
-    /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
-    /// that returns at EOF without consuming the staged `next_media`, so it
-    /// cannot chain internally — the poller must fall back to natural-end
-    /// advance. Only the shared cpal path performs internal gapless chaining.
+    /// La capacité suit le BRAS que `play_url` emprunte réellement
+    /// ([`bras_de_lecture`]) : le chemin cpal partagé et, depuis #5204, WASAPI
+    /// exclusif enchaînent la piste préparée sans refermer le périphérique.
+    /// ASIO et CoreAudio exclusifs sortent encore à l'EOF sans consommer
+    /// `next_media` : ils ne peuvent pas enchaîner, et le sondeur doit
+    /// retomber sur l'avance de fin naturelle. Avant #5204 la réponse était
+    /// `!exclusive_mode` : WASAPI exclusif perdait le gapless même entre deux
+    /// pistes de même format (Jean Valjean, fil 1890).
     ///
     /// Et « performe » se conjugue au présent : la réponse est une **sonde
     /// vivante**, pas une capacité gravée. Une boucle d'enchaînement qui s'est
@@ -4314,7 +4471,9 @@ impl OutputTarget for LocalOutput {
     /// poller attend une transition d'un fil qui n'existe plus (`#1323` sur
     /// OAAT, `#1919` ici). Voir [`LocalOutput::chain_exhausted`].
     fn supports_internal_gapless(&self) -> bool {
-        !self.exclusive_mode && !self.chain_exhausted.load(Ordering::Relaxed)
+        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+            .sait_enchainer()
+            && !self.chain_exhausted.load(Ordering::Relaxed)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -4541,6 +4700,10 @@ impl OutputTarget for LocalOutput {
         // #3205 : le compteur de famine suit le flux dans le fil de lecture et
         // sera confié à l'anneau de la branche effectivement retenue.
         let starvation = self.starvation.clone();
+        // #4384 — un flux neuf : les crêtes de la lecture précédente ne
+        // décrivent plus rien.
+        self.cretes_de_sortie.oublier();
+        let cretes_de_sortie = self.cretes_de_sortie.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -5290,8 +5453,15 @@ impl OutputTarget for LocalOutput {
                 return;
             }
 
+            // #5204 — le bras se choisit par la MÊME règle que celle dont
+            // `supports_internal_gapless()` déduit la capacité publiée au
+            // sondeur : les deux ne peuvent plus diverger.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let bras =
+                enchainement_exclusif::bras_de_cette_plateforme(exclusive_mode, &audio_backend);
+
             #[cfg(target_os = "macos")]
-            if exclusive_mode {
+            if bras == enchainement_exclusif::BrasDeLecture::CoreAudioExclusif {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_coreaudio::jouer_via_coreaudio(bras_coreaudio::EntreesCoreAudio {
@@ -5332,7 +5502,7 @@ impl OutputTarget for LocalOutput {
 
             // ------- Exclusive mode path (Windows ASIO) -------
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            if exclusive_mode && audio_backend == "asio" {
+            if bras == enchainement_exclusif::BrasDeLecture::AsioExclusif {
                 // R6 bis (#2219) : le bras vit dans `local/bras_asio.rs`. Tout
                 // ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_asio::jouer_via_asio(bras_asio::EntreesAsio {
@@ -5376,7 +5546,7 @@ impl OutputTarget for LocalOutput {
 
             // ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------
             #[cfg(target_os = "windows")]
-            if exclusive_mode && audio_backend != "asio" {
+            if bras == enchainement_exclusif::BrasDeLecture::WasapiExclusif {
                 // R6 bis (#2219) : le bras vit dans `local/bras_wasapi.rs`.
                 // Tout ce qu'il lisait ici lui est DÉPLACÉ — il est terminal.
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
@@ -5410,6 +5580,15 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     dop_active,
+                    // #5204 — le bras consomme la réserve et enchaîne à
+                    // format égal, sans refermer le flux.
+                    next_media: next_media_ref,
+                    chain_exhausted: chain_exhausted_ref,
+                    current_uri: uri_ref,
+                    track_title: title_ref,
+                    track_artist: artist_ref,
+                    duration_ms: duration_ms_arc,
+                    seek_offset_ms: seek_offset_arc,
                 });
                 return;
             }
@@ -5717,6 +5896,7 @@ impl OutputTarget for LocalOutput {
                 // Relue au moment de l'erreur : `play_media` ne la pose
                 // qu'APRÈS le retour de `play_url`, fil déjà lancé.
                 duree_de_la_piste_ms: duration_ms_arc.as_ref(),
+                cretes_de_sortie: Some(cretes_de_sortie.as_ref()),
             };
             let mut compteurs = CompteursDePiste {
                 total_bytes_read,
@@ -5853,89 +6033,27 @@ impl OutputTarget for LocalOutput {
                 // remis à 0 devenait le `fed_position_ms` du drainage, qui
                 // rapportait donc 0 au lieu de la fin du morceau.
 
-                // Fetch the next track's HTTP stream
-                let next_response =
-                    match LecteurHttpAnnulable::ouvrir(&next.url, force_silent.clone()) {
-                        Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
-                        Ok(r) => {
-                            warn!(
-                                status = %r.status(),
-                                url = %next.url,
-                                "local_audio_gapless_http_error"
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            if force_silent.load(Ordering::SeqCst) {
-                                debug!("local_audio_gapless_http_fetch_cancelled");
-                            } else {
-                                warn!(
-                                    error = %e,
-                                    url = %next.url,
-                                    "local_audio_gapless_http_fetch_failed"
-                                );
-                            }
-                            break;
-                        }
-                    };
-
-                // Read header bytes from the next track.
-                // The next track's transcode session may have only just
-                // been started, so its very first read can time out before
-                // the WAV header is available. Retry on TimedOut/WouldBlock —
-                // mirroring the initial-track header read above — instead of
-                // aborting the gapless chain, which would skip the track.
-                let mut next_reader = next_response;
-                let mut next_header = vec![0u8; 4096];
-                let nh_read = loop {
-                    if force_silent.load(Ordering::Relaxed) {
-                        break 0;
-                    }
-                    match next_reader.read(&mut next_header) {
-                        Ok(n) => break n,
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::TimedOut
-                                || e.kind() == std::io::ErrorKind::WouldBlock =>
-                        {
-                            // Stream not ready yet — wait for the producer.
-                            continue;
-                        }
-                        Err(e) => {
-                            if !force_silent.load(Ordering::SeqCst) {
-                                warn!(error = %e, "local_audio_gapless_header_read_failed");
-                            }
-                            break 0;
-                        }
-                    }
-                };
-                if nh_read == 0 {
-                    if !force_silent.load(Ordering::SeqCst) {
-                        warn!("local_audio_gapless_header_read_empty");
-                    }
-                    break;
-                }
-                next_header.truncate(nh_read);
-
-                // Parse the WAV header of the next track
-                let Some((new_ch, new_sr, new_bd, new_data_offset)) =
-                    parse_wav_header(&next_header)
+                // Fetch the next track's HTTP stream, then read and type its
+                // WAV header. #5204 : les deux gestes vivent dans
+                // `enchainement_exclusif`, partagés avec le bras WASAPI
+                // exclusif — mêmes relances sur `TimedOut`/`WouldBlock`, mêmes
+                // noms d'événement. Tout refus (HTTP en erreur, en-tête vide,
+                // flux non-WAV) laisse la piste courante se terminer
+                // proprement : la fin naturelle relance la suivante.
+                let Some(mut next_reader) =
+                    enchainement_exclusif::ouvrir_la_piste_suivante(&next.url, &force_silent)
                 else {
-                    // Not a WAV stream — cannot chain gaplessly.
-                    // Fall through to normal end-of-track handling.
-                    info!("local_audio_gapless_next_not_wav_falling_back");
                     break;
                 };
-
-                // Le format de la piste enchaînée devient un TYPE avant qu'une
-                // seule de ses trames ne soit décodée, et AVANT que la queue du
-                // DSP ne soit rendue : un refus ici laisse la piste courante se
-                // terminer proprement, exactement comme un en-tête illisible.
-                // Inatteignable en pratique — `parse_wav_header` ne rend que 0,
-                // 16, 24 ou 32 bits et jamais zéro canal.
-                let Some(nouvelle_spec) = AudioSpec::depuis_entete(new_sr, new_bd, new_ch) else {
-                    info!("local_audio_gapless_next_not_wav_falling_back");
+                let Ok(entete_suivante) =
+                    enchainement_exclusif::lire_l_entete_enchainee(&mut next_reader, &force_silent)
+                else {
                     break;
                 };
+                let nouvelle_spec = entete_suivante.spec;
+                let new_sr = nouvelle_spec.cadence();
+                let new_ch = nouvelle_spec.canaux();
+                let new_bd = nouvelle_spec.profondeur().bits_declares();
 
                 info!(
                     new_sr,
@@ -6024,12 +6142,7 @@ impl OutputTarget for LocalOutput {
                 // croire qu'un chemin l'oublie.
 
                 // Process initial PCM data from the header read
-                let gapless_pcm = if new_data_offset < next_header.len() {
-                    next_header[new_data_offset..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                etage.en_attente.extend_from_slice(&gapless_pcm);
+                etage.en_attente.extend_from_slice(entete_suivante.amorce());
                 // Même frontière que la piste initiale : la piste chaînée
                 // conserve l'état du DSP mais prend une nouvelle décision
                 // PCM/DoP avant son premier échantillon (#2296/#2232).
@@ -6074,6 +6187,7 @@ impl OutputTarget for LocalOutput {
                     // La durée de CETTE piste, pas celle de la précédente que
                     // `duration_ms_arc` garde quand la suivante n'en a pas.
                     duree_de_la_piste_ms: &duree_enchainee_ms,
+                    cretes_de_sortie: Some(cretes_de_sortie.as_ref()),
                 };
                 let mut gapless_read_buf = vec![0u8; 65536];
                 let mut compteurs_enchaines = CompteursDePiste {
@@ -6846,6 +6960,11 @@ mod bitperfect_strict_3973;
 #[cfg(test)]
 mod gapless_changement_de_cadence_4953;
 
+// #5204 — gapless en mode exclusif : à format égal, la sortie enchaîne sans
+// refermer le flux ; sinon elle rouvre le périphérique.
+#[cfg(test)]
+mod gapless_exclusif_5204;
+
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
 /// `crate::audio::periode_alsa` : elles tournent dans la porte `test` de la CI,
@@ -7073,6 +7192,10 @@ mod empreinte_du_puits_r1;
 /// Fil 1915 — une erreur de lecture loin de la fin n'est pas une fin de piste.
 #[cfg(test)]
 mod piste_tronquee_1915;
+
+/// #4384 — la crête d'une sortie locale est relevée APRÈS le DSP.
+#[cfg(test)]
+mod crete_apres_dsp_4384;
 
 /// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
 /// étage → boucle commune → puits, relevée sur la route directe d'avant.

@@ -466,3 +466,139 @@ async fn une_adoption_a_l_horloge_ne_se_confirme_pas_sur_un_renderer_arrete() {
         "sans signe de vie, le repli relance la piste ADOPTÉE"
     );
 }
+
+// ── #4382 — la fenêtre de surveillance d'une bascule doit SE DIRE ──────────
+//
+// Journal de Villerio du 27/09 (0.9.166, ticket 179), la seule transition du
+// rapport :
+//
+// ```text
+// 09:41:37.475 dlna_suivante_tenue … actions=Play,Pause,Stop,Seek,Next,Previous
+// 09:41:52.464 dlna_bascule_sur_la_suivante_preparee device=DMP-A6
+// 09:41:52.465 gapless_adoption_a_l_horloge … position_ms=237000 preuve=Bascule
+// 09:41:55.469 WARN gapless_adoption_horloge_infirmee_relance age_secs=3 position_ms=237000
+// 09:41:55.544 dlna_play …                        <-- ~6 s de blanc à l'oreille
+// ```
+//
+// Entre le `Next` et la relance, AUCUNE ligne : on ne sait pas si l'appareil
+// a changé de piste sans le rapporter à `GetPositionInfo` (et la relance
+// coupe une lecture qui avait lieu), ou s'il n'a rien fait (et la relance est
+// la seule issue). C'est ce qui décide du correctif. Chaque sondage de la
+// fenêtre doit donc porter, au niveau INFO : les octets tirés du flux adopté
+// depuis l'adoption, et ce que le transport déclare (`GetMediaInfo`).
+
+impl Banc {
+    /// Combien de fois la fenêtre a lu le transport (`GetMediaInfo`).
+    async fn lectures_du_transport(&self) -> u64 {
+        let reg = self.outputs.lock().await;
+        let arc = reg.get(APPAREIL).unwrap();
+        let sortie = arc.lock().await;
+        let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        mock.media_du_transport_call_count()
+    }
+}
+
+/// La signature du 27/09 : `Next` acquitté, jamais honoré. CHAQUE sondage de
+/// la fenêtre — celui où l'on attend comme celui qui relance — doit lire le
+/// transport, et la relance doit partir exactement comme avant : la lecture
+/// ne change rien à la décision.
+///
+/// (Le contenu de la ligne n'est pas éprouvé par capture du journal : dans ce
+/// binaire, `tracing` met en cache l'intérêt des points d'appel pour tout le
+/// processus et une capture posée le temps d'un `await` se retrouve vide de
+/// façon imprévisible — voir `tune-core/Cargo.toml`, #2665. Le comptage de
+/// lectures, lui, est déterministe.)
+#[tokio::test]
+async fn chaque_sondage_de_la_fenetre_d_une_bascule_ignoree_lit_le_transport() {
+    let mut banc = Banc::monter().await;
+    banc.l_appareil_dit_de_la_suivante(SuivantePreparee::Tenue)
+        .await;
+    banc.l_appareil_honore_le_next(false).await;
+    let (flux, _) = banc.armer().await;
+    banc.la_signature_du_dmp_a6(&flux).await;
+    banc.la_fin_a_l_horloge().await;
+    assert_eq!(banc.bascules().await, 1);
+    assert!(banc.surveillance().is_some());
+    assert_eq!(
+        banc.surveillance().unwrap().octets_a_l_adoption,
+        Some(OCTETS_TIRES_1845),
+        "l'adoption doit retenir ce que le renderer avait déjà tiré : c'est la \
+         référence de ce qu'il tire PENDANT la fenêtre"
+    );
+    assert_eq!(banc.lectures_du_transport().await, 0);
+
+    // Un sondage dans le délai : on attend, et on regarde.
+    banc.renderer_a(POSITION_GELEE_MS, 1).await;
+    banc.tic().await;
+    assert!(banc.surveillance().is_some(), "dans le délai, on attend");
+    assert_eq!(
+        banc.lectures_du_transport().await,
+        1,
+        "le sondage de la fenêtre doit lire le transport (`GetMediaInfo`) : sans \
+         cette lecture, le journal de terrain ne dit pas si l'appareil a changé \
+         de piste pendant que `GetPositionInfo` rendait la position gelée"
+    );
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+
+    // Délai écoulé : le sondage qui RELANCE lit aussi, puis relance.
+    banc.poll_states
+        .get_mut(&banc.zone_id)
+        .unwrap()
+        .adoption_horloge
+        .as_mut()
+        .unwrap()
+        .depuis = Instant::now() - Duration::from_secs(BASCULE_DELAI_SECS + 1);
+    banc.renderer_a(POSITION_GELEE_MS, BASCULE_DELAI_SECS + 1)
+        .await;
+    banc.tic().await;
+    assert_eq!(
+        banc.lectures_du_transport().await,
+        2,
+        "le sondage qui relance doit porter son échantillon lui aussi"
+    );
+    assert_eq!(
+        banc.play_complets().await,
+        vec![ARMEE.to_string()],
+        "la relance part exactement comme avant"
+    );
+}
+
+/// Le miroir : l'appareil HONORE le `Next`. Le premier sondage lit le
+/// transport, puis confirme — la lecture ne retarde rien.
+#[tokio::test]
+async fn la_fenetre_d_une_bascule_honoree_lit_le_transport_puis_confirme() {
+    let mut banc = Banc::monter().await;
+    banc.l_appareil_dit_de_la_suivante(SuivantePreparee::Tenue)
+        .await;
+    let (flux, _) = banc.armer().await;
+    banc.la_signature_du_dmp_a6(&flux).await;
+    banc.la_fin_a_l_horloge().await;
+    assert_eq!(banc.bascules().await, 1);
+
+    banc.renderer_a(2_000, 2).await;
+    banc.tic().await;
+    assert_eq!(banc.lectures_du_transport().await, 1);
+    assert!(
+        banc.surveillance().is_none(),
+        "la bascule est confirmée au même sondage"
+    );
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+}
+
+/// Les octets tirés DEPUIS l'adoption, pas le cumul : c'est ce qui départage
+/// « il consomme le flux adopté » de « il le garde en tampon ».
+#[test]
+fn les_octets_de_la_fenetre_se_comptent_depuis_l_adoption() {
+    use decisions::octets_depuis_adoption;
+    assert_eq!(
+        octets_depuis_adoption(Some(OCTETS_TIRES_1845 + 12_345), Some(OCTETS_TIRES_1845)),
+        Some(12_345)
+    );
+    assert_eq!(octets_depuis_adoption(Some(10), None), None);
+    assert_eq!(octets_depuis_adoption(None, Some(10)), None);
+    assert_eq!(
+        octets_depuis_adoption(Some(5), Some(10)),
+        Some(0),
+        "une session recréée ne rend pas un nombre négatif"
+    );
+}

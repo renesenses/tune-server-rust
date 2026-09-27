@@ -1061,7 +1061,10 @@ const VARIANT_PATTERNS: &[&str] = &[
 ];
 
 fn strip_variant_suffix(title: &str) -> String {
-    let lower = title.to_lowercase();
+    // #5236 — `to_ascii_lowercase` garde la taille en octets : les positions
+    // trouvées dans `lower` restent valables dans `title` (motifs ASCII).
+    // `to_lowercase` la change (« İ » → « i̇ ») et faisait paniquer.
+    let lower = title.to_ascii_lowercase();
     for pat in VARIANT_PATTERNS {
         if let Some(pos) = lower.find(pat) {
             let prefix = title[..pos].trim_end_matches(['(', '[', '-', ' ']);
@@ -2463,6 +2466,22 @@ pub(super) async fn batch_update_albums(
     }
 
     Json(serde_json::json!({ "updated": updated, "total": body.album_ids.len() })).into_response()
+}
+
+#[cfg(test)]
+mod tests_variantes_5236 {
+    use super::strip_variant_suffix;
+
+    /// #5236 — la position du motif, lue dans la minuscule, coupait le titre
+    /// au milieu d'un caractère quand « İ » grandit en minuscule : panique.
+    #[test]
+    fn strip_variant_suffix_ne_panique_pas_sur_une_minuscule_de_taille_changeante() {
+        assert_eq!(strip_variant_suffix("İİİİİİİ deluxeéé"), "İİİİİİİ");
+        assert_eq!(
+            strip_variant_suffix("İstanbul (Deluxe Edition)"),
+            "İstanbul"
+        );
+    }
 }
 
 #[cfg(test)]

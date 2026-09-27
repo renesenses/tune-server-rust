@@ -32,8 +32,9 @@
 //! ## Ce qu'il ne fait pas
 //!
 //! Il ne lit pas les balises du fichier image (une feuille CUE EST la source de
-//! métadonnées, c'est tout son objet) et ne cherche pas de pochette : la ligne
-//! `albums` porte son dossier, les passes existantes s'en chargent.
+//! métadonnées, c'est tout son objet). Les albums écrits sont retenus dans le
+//! bilan : l'appelant réévalue leurs pochettes avec le cache et la politique
+//! de sa passe, même si l'album a déjà une image de dossier (#5222).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,6 +57,9 @@ use crate::db::track_repo::TrackRepo;
 /// écrites. Ces compteurs-là parlent de la base.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BilanCue {
+    /// Identités écrites par cette passe, dédupliquées pour ne relire la
+    /// pochette qu'une fois par album, et jamais hors du périmètre parcouru.
+    albums_ecrits: HashSet<i64>,
     /// Albums pour lesquels au moins une piste a été posée ou rafraîchie.
     pub albums: usize,
     /// Pistes virtuelles créées par ce scan.
@@ -84,6 +88,19 @@ pub struct BilanCue {
     /// Écritures refusées par la base. Jamais fatales : une feuille bancale ne
     /// doit pas emporter le scan.
     pub echecs: usize,
+}
+
+impl BilanCue {
+    /// Les images CUE sortent de l'import ordinaire : elles doivent néanmoins
+    /// suivre la même priorité jaquette intégrée > image du dossier (#5222).
+    /// Appeler après écriture des tranches, afin que `cue_media_path` soit
+    /// visible à la relecture de l'album. La règle commune protège notamment
+    /// les pochettes téléversées et les fournisseurs lors des passes rapides.
+    pub fn reevaluer_pochettes(&self, db: &Arc<dyn DbBackend>, cache_dir: &Path, complet: bool) {
+        for &album in &self.albums_ecrits {
+            crate::library::pochette_disque::reevaluer_l_album(db, album, cache_dir, complet, None);
+        }
+    }
 }
 
 /// L'artiste attribué à un album CUE qui ne nomme personne.
@@ -507,6 +524,7 @@ fn ecrire_album(
         // piste « image entière » de 74 minutes à côté de ses 15 tranches.
         images_couvertes.extend(images_decoupees);
         if let Some(id) = ligne_album {
+            bilan.albums_ecrits.insert(id);
             let _ = album_repo.update_track_count(id);
         }
     }

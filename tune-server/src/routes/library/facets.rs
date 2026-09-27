@@ -408,15 +408,12 @@ fn build_facet_conditions(
         //
         // ⚠️ `unaccent()` des DEUX côtés, comme le jumeau `list_filtered` : sans
         // lui, `q=cafe` comptait sans « Café » mais la liste le rendait (#1864).
-        let p = ph.take();
-        let p2 = ph.take();
-        conds.push(format!(
-            "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR t.artist_id IN \
-             (SELECT id FROM artists WHERE LOWER(unaccent(name)) LIKE LOWER(unaccent({p2}))))"
-        ));
-        let like = format!("%{query}%");
-        params.push(SqlValue::Text(like.clone()));
-        params.push(SqlValue::Text(like));
+        //
+        // #5192 — la rédaction PARTAGÉE avec `list_filtered` : titre, artiste,
+        // album, label et termes de chemin, comme le navigateur.
+        let (c, valeurs) = tune_core::db::facet_filter::condition_texte_libre(&mut ph, query);
+        conds.push(c);
+        params.extend(valeurs);
     }
     (conds, params)
 }

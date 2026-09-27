@@ -875,6 +875,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
     // Memory RSS
     let rss_mb = get_rss_mb();
+    // #5189 — température du processeur pour l'écran « État du serveur ».
+    let cpu_temp_c = temperature_processeur().await;
 
     // #3205 — le seul chiffre qui dise si l'audio a réellement sauté.
     let ring_starvation = releve_famine_anneau(&state).await;
@@ -907,6 +909,9 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "uptime_seconds": uptime_secs,
         "process_started_at": state.process_started_at_rfc3339(),
         "memory_rss_mb": rss_mb,
+        // #5189 — °C, au dixième ; `null` sans capteur lisible (macOS,
+        // Windows, conteneur, machine virtuelle) ou si sysfs tarde.
+        "cpu_temp_c": cpu_temp_c,
         "db_backend": db_backend,
         "active_zones": zone_count,
         "zone_poller_metrics": zone_poller_metrics,
@@ -995,6 +1000,22 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Température du processeur, en °C au dixième (#5189).
+///
+/// Réutilise la lecture sysfs du garde thermique
+/// (`tune_core::audio::thermal::cpu_package_temp_celsius`) : paquet CPU quand
+/// il est identifiable, sinon maximum des zones. La lecture est synchrone et
+/// certains pilotes `hwmon` (disques) peuvent tarder : elle passe par
+/// `spawn_blocking` et abandonne au-delà de 300 ms. Le rapport de diagnostic
+/// ne doit jamais attendre un capteur.
+async fn temperature_processeur() -> Option<f64> {
+    let lecture = tokio::task::spawn_blocking(tune_core::audio::thermal::cpu_package_temp_celsius);
+    match tokio::time::timeout(std::time::Duration::from_millis(300), lecture).await {
+        Ok(Ok(Some(c))) => Some((c * 10.0).round() / 10.0),
+        _ => None,
+    }
+}
+
 /// Read process RSS in megabytes. Returns None on unsupported platforms.
 fn get_rss_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -1080,8 +1101,12 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     let devices = scanner.devices().await;
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
+    // #5226 — `discovered_devices` ne compte que les renderers ; le registre
+    // des serveurs multimédia est compté à côté.
+    let serveurs_decouverts = state.media_servers.lock().await.len();
     Json(json!({
         "discovered_devices": devices.len(),
+        "discovered_media_servers": serveurs_decouverts,
         "registered_outputs": output_count,
         // L'etat du canal TCP de SlimProto (port 3483). Sans ce champ, un bind
         // refuse ne vivait que dans une ligne de journal, dans une tache
@@ -2317,7 +2342,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push('\n');
 
     md.push_str("## Network\n");
-    md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    // #5226 — « Discovered devices » ne comptait QUE les renderers, et se
+    // lisait « appareils découverts », serveurs compris : l'instruction de
+    // #3575 y a lu « aucun serveur » avec `Discovered devices: 0`. Les deux
+    // registres ont désormais chacun leur compteur, nommé pour ce qu'il compte.
+    md.push_str(&format!("- Renderers decouverts: {}\n", devices.len()));
     // #2718 et tickets support 61, 87, 97, 98 — « plus de serveurs
     // multimedia ». « Discovered devices » ne compte QUE les renderers ; le
     // registre des serveurs multimedia est un autre registre, et ce rapport
@@ -2631,6 +2660,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
+            // #5226 — `discovered_devices` ne compte que les renderers.
+            "discovered_media_servers": serveurs_multimedia.len(),
             "registered_outputs": output_count,
             "slimproto": tune_core::slimproto::etat_ecoute(),
             "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),

@@ -54,6 +54,10 @@ pub enum EtatSource {
     Signal,
     /// L'entrée est ouverte, sans signal.
     Silence,
+    /// L'entrée est présente et utilisable, mais personne ne l'écoute : son
+    /// signal n'est pas mesuré (#5065, étape 3 — rien n'est capté sans un
+    /// geste de l'utilisateur).
+    Disponible,
     /// Le système refuse l'accès au périphérique (micro sous macOS…).
     AutorisationRefusee,
     /// La plateforme du serveur ne sait pas lire cette source.
@@ -329,6 +333,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EtatSource::AutorisationRefusee).unwrap(),
             "autorisation_refusee"
+        );
+        assert_eq!(
+            serde_json::to_value(EtatSource::Disponible).unwrap(),
+            "disponible"
         );
     }
 

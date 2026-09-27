@@ -54,7 +54,7 @@ use crate::db::migrations::run_migrations;
 use crate::db::sqlite::SqliteDb;
 use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
-use crate::http::streamer::AudioStreamer;
+use crate::http::streamer::{AudioStreamer, RadioSourceInfo, StreamInfo, StreamSession};
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::OutputRegistry;
 use crate::outputs::mock::MockOutput;
@@ -97,6 +97,7 @@ struct Banc {
     poller: PositionPoller,
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
+    streamer: Arc<AudioStreamer>,
     zone_id: i64,
     recu: tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
     poll_states: HashMap<i64, ZonePollState>,
@@ -117,10 +118,11 @@ impl Banc {
             MockOutput::new(APPAREIL, "Haut-parleurs").with_type("local"),
         ));
         let playback = Arc::new(PlaybackManager::new());
+        let streamer = Arc::new(AudioStreamer::new(0));
         let orchestrator = Arc::new(PlaybackOrchestrator::new(
             db.clone(),
             playback.clone(),
-            Arc::new(AudioStreamer::new(0)),
+            streamer.clone(),
             Arc::new(Mutex::new(ServiceRegistry::new())),
             outputs.clone(),
             None,
@@ -139,6 +141,7 @@ impl Banc {
             poller,
             playback,
             outputs,
+            streamer,
             zone_id,
             recu,
             poll_states: HashMap::new(),
@@ -163,6 +166,40 @@ impl Banc {
         self.poll_states
             .entry(self.zone_id)
             .or_insert_with(|| ZonePollState::new(generation));
+    }
+
+    async fn jouer_radio(&mut self) -> Arc<StreamSession> {
+        let (stream_id, _tx, _ready, session) = self
+            .streamer
+            .create_radio_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44_100,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+        self.playback
+            .play(
+                self.zone_id,
+                NowPlaying {
+                    title: "Radio témoin".into(),
+                    source: "radio".into(),
+                    duration_ms: 300_000,
+                    stream_id: Some(stream_id),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let generation = self.playback.get_state(self.zone_id).await.track_generation;
+        self.poll_states
+            .entry(self.zone_id)
+            .or_insert_with(|| ZonePollState::new(generation));
+        session
     }
 
     /// Ce que la SORTIE rend au sondeur ce tour-ci.
@@ -313,6 +350,102 @@ async fn chaque_nouvelle_piste_reannonce_son_contrat() {
          client, lui, a relu une zone SANS contrat entre les deux : sans cette \
          annonce son panneau reste faux pour toute la piste (#4559)."
     );
+}
+
+/// #4346 : le canal WAV existe avant que le décodeur ait reconnu le MP3.
+/// Le verdict de la radio doit passer de « inconnu » à « avec perte » sans
+/// attendre un geste sur le volume ou le sondage périodique du client.
+#[tokio::test]
+async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
+    let mut banc = Banc::monter().await;
+    let session = banc.jouer_radio().await;
+    banc.dater_le_debut(Duration::from_secs(20));
+    banc.sortie(1_000, None).await;
+    banc.tic().await;
+    assert_eq!(banc.annonces(), 0, "le codec est encore inconnu");
+
+    session.publish_radio_source(RadioSourceInfo {
+        format: Some("mp3"),
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+    });
+    assert_eq!(
+        banc.streamer
+            .stream_output_wire(&session.id)
+            .await
+            .and_then(|wire| wire.radio_source)
+            .and_then(|source| source.format),
+        Some("mp3"),
+        "le banc doit publier le codec sur la session que lit le sondeur"
+    );
+    assert_eq!(
+        banc.playback
+            .get_state(banc.zone_id)
+            .await
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref()),
+        Some(session.id.as_str()),
+        "la zone doit encore jouer cette session radio"
+    );
+    banc.sortie(2_000, None).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.poll_states
+            .get(&banc.zone_id)
+            .and_then(|ps| ps.radio_source_annonce.1)
+            .and_then(|source| source.format),
+        Some("mp3"),
+        "le sondeur doit avoir observé le codec radio"
+    );
+    assert_eq!(
+        banc.annonces(),
+        1,
+        "le codec MP3 est connu mais le client ne relit pas le verdict de la radio (#4346)"
+    );
+
+    banc.sortie(3_000, None).await;
+    banc.tic().await;
+    assert_eq!(banc.annonces(), 0, "un codec stable ne relance pas les GET");
+
+    session.publish_radio_source(RadioSourceInfo {
+        format: Some("flac"),
+        sample_rate: Some(48_000),
+        bit_depth: Some(16),
+    });
+    banc.sortie(4_000, None).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.annonces(),
+        1,
+        "un nouveau codec amont change le verdict"
+    );
+
+    banc.streamer.remove_session(&session.id).await;
+    banc.sortie(5_000, None).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.annonces(),
+        1,
+        "une session perdue rend le codec inconnu et doit effacer l'ancien verdict"
+    );
+    banc.sortie(6_000, None).await;
+    banc.tic().await;
+    assert_eq!(banc.annonces(), 0, "la perte stable reste muette");
+}
+
+#[test]
+fn un_nouveau_stream_radio_ne_reutilise_pas_le_codec_precedent() {
+    let mut ps = ZonePollState::new(1);
+    let mp3 = RadioSourceInfo {
+        format: Some("mp3"),
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+    };
+    assert!(ps.codec_radio_a_change(Some("ancien"), Some(mp3)));
+    assert!(ps.codec_radio_a_change(Some("nouveau"), None));
+    assert_eq!(ps.radio_source_annonce, (Some("nouveau".into()), None));
+    assert!(!ps.codec_radio_a_change(Some("nouveau"), None));
 }
 
 // ───────────────────────── garde d'implantation ─────────────────────────

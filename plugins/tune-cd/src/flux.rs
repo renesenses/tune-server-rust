@@ -27,6 +27,8 @@ pub const ESSAIS: u32 = 3;
 
 pub struct FluxPiste {
     lecteur: Arc<dyn LecteurDisque>,
+    /// Le flux reste lié au lecteur sur lequel sa TOC a été lue.
+    generation_lecteur: u64,
     /// Prochain secteur à lire (LBA).
     prochain: u32,
     /// Premier secteur HORS de la plage (LBA) : jamais lu.
@@ -40,8 +42,19 @@ pub struct FluxPiste {
 impl FluxPiste {
     /// Le flux des secteurs `[debut, fin)`.
     pub fn new(lecteur: Arc<dyn LecteurDisque>, debut: u32, fin: u32) -> Self {
+        let generation = lecteur.generation_lecteur();
+        Self::new_avec_generation(lecteur, debut, fin, generation)
+    }
+
+    pub fn new_avec_generation(
+        lecteur: Arc<dyn LecteurDisque>,
+        debut: u32,
+        fin: u32,
+        generation_lecteur: u64,
+    ) -> Self {
         Self {
             lecteur,
+            generation_lecteur,
             prochain: debut,
             fin: fin.max(debut),
             tampon: Vec::new(),
@@ -56,6 +69,7 @@ impl FluxPiste {
     }
 
     fn remplir(&mut self) -> std::io::Result<()> {
+        self.verifier_lecteur()?;
         let n = (self.fin - self.prochain).min(SECTEURS_PAR_BLOC);
         let lba = self.prochain;
         let mut bloc = vec![0u8; n as usize * OCTETS_PAR_SECTEUR];
@@ -63,6 +77,7 @@ impl FluxPiste {
         for _ in 0..ESSAIS {
             match self.lecteur.lire_secteurs(lba, n, &mut bloc) {
                 Ok(()) => {
+                    self.verifier_lecteur()?;
                     derniere = None;
                     break;
                 }
@@ -76,6 +91,13 @@ impl FluxPiste {
         self.prochain += n;
         self.tampon = bloc;
         self.lu_dans_tampon = 0;
+        Ok(())
+    }
+
+    fn verifier_lecteur(&self) -> std::io::Result<()> {
+        if self.lecteur.generation_lecteur() != self.generation_lecteur {
+            return Err(ejection());
+        }
         Ok(())
     }
 
@@ -133,6 +155,7 @@ fn journaliser_perte(debut: u32, fin: u32) {
 
 impl Read for FluxPiste {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.verifier_lecteur()?;
         if self.lu_dans_tampon == self.tampon.len() {
             if self.prochain >= self.fin {
                 return Ok(0);
@@ -150,8 +173,12 @@ impl Read for FluxPiste {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lecteur::Presence;
+    use crate::lecteur::tests::SystemeFactice;
     use crate::simule::{LecteurSimule, contenu_des_secteurs};
     use crate::toc::{PisteToc, Toc};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn lecteur() -> Arc<LecteurSimule> {
         Arc::new(LecteurSimule::new(
@@ -211,5 +238,28 @@ mod tests {
         let e = tout_lire(&mut f).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::NotConnected);
         assert_eq!(f.secteurs_perdus, 0);
+    }
+
+    #[test]
+    fn le_flux_refuse_les_secteurs_du_lecteur_de_remplacement() {
+        let systeme = Arc::new(SystemeFactice::default());
+        systeme.branche.store(true, Ordering::SeqCst);
+        let lecteur = Arc::new(systeme.lecteur(Duration::ZERO));
+        assert_eq!(lecteur.presence(), Presence::Disque);
+        let mut flux = FluxPiste::new(lecteur.clone(), 0, 200);
+        let mut bloc = [0u8; OCTETS_PAR_SECTEUR];
+        flux.read_exact(&mut bloc).unwrap();
+
+        // A disparaît ; B est trouvé au même sondage, avant le surveillant.
+        systeme
+            .dernier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .debrancher();
+        assert_eq!(lecteur.presence(), Presence::Disque);
+        let erreur = flux.read(&mut bloc).unwrap_err();
+        assert_eq!(erreur.kind(), std::io::ErrorKind::NotConnected);
     }
 }
