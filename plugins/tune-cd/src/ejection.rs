@@ -26,6 +26,7 @@ pub struct Surveillant {
     pub hote: Arc<dyn HoteLecture>,
     pub zones: ZonesDuDisque,
     derniere: Option<Presence>,
+    derniere_generation: Option<u64>,
     /// #5065 — la source `cd` du registre commun, remise à jour à chaque
     /// changement de présence (insertion, éjection, lecteur débranché).
     publication: Option<Arc<PublicationSource>>,
@@ -42,6 +43,7 @@ impl Surveillant {
             hote,
             zones,
             derniere: None,
+            derniere_generation: None,
             publication: None,
         }
     }
@@ -54,17 +56,17 @@ impl Surveillant {
     /// Un tour de surveillance. Rend les zones arrêtées.
     pub async fn un_tour(&mut self) -> Vec<i64> {
         let lecteur = self.lecteur.clone();
-        let presence = tokio::task::spawn_blocking(move || lecteur.presence())
-            .await
-            .unwrap_or(Presence::AucunLecteur);
+        let (presence, generation) = tokio::task::spawn_blocking(move || {
+            let presence = lecteur.presence();
+            (presence, lecteur.generation_lecteur())
+        })
+        .await
+        .unwrap_or((Presence::AucunLecteur, 0));
         let avant = self.derniere.replace(presence);
-        if avant != Some(presence)
-            && let Some(p) = &self.publication
-        {
-            p.publier(presence).await;
-        }
+        let generation_avant = self.derniere_generation.replace(generation);
+        let lecteur_remplace = generation_avant.is_some_and(|g| g != generation);
         let mut arretees = Vec::new();
-        if avant == Some(Presence::Disque) && presence != Presence::Disque {
+        if avant == Some(Presence::Disque) && (presence != Presence::Disque || lecteur_remplace) {
             let zones: Vec<i64> = self.zones.lock().await.drain().collect();
             for zone_id in zones {
                 if self.hote.source_en_cours(zone_id).await.as_deref() == Some(SOURCE) {
@@ -73,6 +75,13 @@ impl Surveillant {
                     arretees.push(zone_id);
                 }
             }
+        }
+        // La publication d'un nouveau disque peut consulter MusicBrainz :
+        // arrêter d'abord les zones encore liées à l'ancien lecteur.
+        if (avant != Some(presence) || lecteur_remplace)
+            && let Some(p) = &self.publication
+        {
+            p.publier(presence).await;
         }
         arretees
     }
@@ -96,8 +105,10 @@ impl Surveillant {
 pub(crate) mod tests {
     use super::*;
     use crate::hote::ElementFile;
+    use crate::lecteur::tests::SystemeFactice;
     use crate::simule::LecteurSimule;
     use async_trait::async_trait;
+    use std::sync::atomic::Ordering;
 
     /// Un hôte qui retient ce qu'on lui demande.
     #[derive(Default)]
@@ -151,5 +162,34 @@ pub(crate) mod tests {
         assert!(zones.lock().await.is_empty());
         // Un second tour sans disque n'arrête plus rien.
         assert!(s.un_tour().await.is_empty());
+    }
+
+    /// A disparaît alors que B est déjà visible : la présence reste `Disque`,
+    /// mais continuer la lecture servirait désormais les secteurs de B.
+    #[tokio::test]
+    async fn lecteur_remplace_sans_intervalle_vide_arrete_la_lecture() {
+        let systeme = Arc::new(SystemeFactice::default());
+        systeme.branche.store(true, Ordering::SeqCst);
+        let lecteur: Arc<dyn LecteurDisque> = Arc::new(systeme.lecteur(Duration::ZERO));
+        let hote = Arc::new(HoteTemoin::default());
+        let zones: ZonesDuDisque = Arc::default();
+        hote.sources.lock().await.insert(7, SOURCE.into());
+        zones.lock().await.insert(7);
+        let mut s = Surveillant::new(lecteur.clone(), hote.clone(), zones);
+
+        assert!(s.un_tour().await.is_empty());
+        let generation_a = lecteur.generation_lecteur();
+        systeme
+            .dernier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .debrancher();
+
+        assert_eq!(s.un_tour().await, vec![7]);
+        assert_eq!(lecteur.presence(), Presence::Disque);
+        assert_ne!(lecteur.generation_lecteur(), generation_a);
+        assert_eq!(*hote.arrets.lock().await, vec![7]);
     }
 }
