@@ -33,10 +33,9 @@
 //!
 //! ## Ce que le passage respecte, et pourquoi il ne le contourne pas
 //!
-//! * l'analyse coupée (`replaygain_mode = off` ou coche décochée, #2496) :
-//!   refus à l'ouverture, arrêt en cours de route. « Désactivé » doit
-//!   désactiver, y compris à la demande — le refus NOMME le réglage
-//!   ([`super::motif_d_inaction`]) pour que l'utilisateur sache quoi armer ;
+//! * la pause de la plage dynamique : le passage attend, il ne se referme pas.
+//!   Le réglage ReplayGain, lui, ne l'arrête PLUS (#5246, décision de Bertrand
+//!   du 27/09/2026) : la plage dynamique se mesure même ReplayGain coupé ;
 //! * la lecture (#1310) : le passage attend, il ne décode pas par-dessus ;
 //! * la garde thermique (#1576) : même hystérésis que la cascade.
 
@@ -49,8 +48,8 @@ use crate::audio::thermal::ThermalGate;
 use crate::db::backend::DbBackend;
 
 use super::{
-    ANALYSIS_SLOT, PLAYBACK_BACKOFF_SECS, analysis_enabled, any_zone_playing,
-    compter_les_candidats_dr, motif_d_inaction, rattraper_un_lot_de_dr,
+    ANALYSIS_SLOT, PLAYBACK_BACKOFF_SECS, any_zone_playing, compter_les_candidats_dr,
+    rattraper_un_lot_de_dr,
 };
 
 /// Les délais du passage. Ceux de la cascade en production ; raccourcis par
@@ -284,9 +283,9 @@ impl PasseDr {
                 return Err(Refus::DejaEnCours(e.releve));
             }
         }
-        if let Some(motif) = motif_d_inaction(&backend) {
-            return Err(Refus::AnalyseDesactivee(motif));
-        }
+        // #5246 — plus de refus sur le réglage ReplayGain : la plage dynamique
+        // se mesure même ReplayGain coupé (décision de Bertrand, 27/09/2026).
+        // `Refus::AnalyseDesactivee` reste dans le contrat, il n'est plus rendu.
         // Compté HORS verrou : un `COUNT(*)` à cinq `NOT EXISTS` ne se tient
         // pas sous le verrou que la route prend pour lire l'avancement.
         let candidats = compter_les_candidats_dr(&backend).max(0);
@@ -331,12 +330,10 @@ impl PasseDr {
         let mut lots_vides = 0u32;
 
         let fin = loop {
-            // Mêmes gardes que la cascade, relues À CHAQUE tour : un réglage
-            // coupé ou une lecture démarrée pendant un lot ne doit pas
-            // attendre le lot suivant pour être vu (#2496, #1310).
-            if !analysis_enabled(&backend) {
-                break Fin::AnalyseDesactivee;
-            }
+            // Mêmes gardes que la cascade, relues À CHAQUE tour : une pause ou
+            // une lecture démarrée pendant un lot ne doit pas attendre le lot
+            // suivant pour être vue (#1310). Le réglage ReplayGain n'en fait
+            // plus partie (#5246).
             // Pause demandée, AVANT la garde thermique et la garde lecture :
             // c'est une décision de l'utilisateur, elle prime sur les gardes
             // automatiques. Le passage n'est pas refermé — sa jauge reste où
@@ -388,8 +385,7 @@ impl PasseDr {
             if compter_les_candidats_dr(&backend) <= 0 {
                 break Fin::Terminee;
             }
-            if !analysis_enabled(&backend)
-                || any_zone_playing(&backend)
+            if any_zone_playing(&backend)
                 || crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique)
             {
                 continue;
@@ -571,25 +567,33 @@ mod tests {
         assert_eq!(attendre_la_fin(&p).await.derniere_fin, Some(Fin::Terminee));
     }
 
-    /// L'analyse coupée (#2496) refuse en NOMMANT le réglage : « Désactivé »
-    /// désactive, y compris à la demande, et l'utilisateur sait quoi armer.
+    /// #5246 — ReplayGain sur « Désactivé », le passage à la demande MESURE
+    /// quand même, y compris une piste que la passe ReplayGain n'a jamais vue
+    /// (ni `rg_analyzed` ni gain de tags). Décision de Bertrand du 27/09/2026 :
+    /// seuls le calcul et l'application du gain restent coupés. Il remplace
+    /// `l_analyse_coupee_refuse_en_nommant_le_reglage` (#2496), dont c'est
+    /// exactement l'inverse.
     #[tokio::test]
-    async fn l_analyse_coupee_refuse_en_nommant_le_reglage() {
-        let (db, backend) = base_avec_piste("/nulle/part.flac");
-        TrackMetadataRepo::new(db.clone())
-            .set(42, "rg_analyzed", "1700000000")
-            .unwrap();
+    async fn replaygain_coupe_le_passage_a_la_demande_mesure_quand_meme() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
         crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
             .set(super::super::MODE_KEY, "off")
             .unwrap();
         let p = passe();
-        match p.demarrer(backend, Box::new(|_| {})) {
-            Err(Refus::AnalyseDesactivee(motif)) => {
-                assert!(motif.contains("replaygain_mode = off"), "{motif}");
-            }
-            autre => panic!("refus attendu : {autre:?}"),
-        }
-        assert!(!p.releve().actif);
-        assert!(!p.releve().a_parle(), "un refus n'ouvre rien");
+        let ouverture = p
+            .demarrer(backend.clone(), Box::new(|_| {}))
+            .expect("ReplayGain coupé ne doit plus refuser la plage dynamique (#5246)");
+        assert_eq!(ouverture.total, 1, "la piste jamais analysée est candidate");
+        let fin = attendre_la_fin(&p).await;
+        let t = temoins(&db);
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert!(
+            !t.contains_key("rg_track_gain"),
+            "ReplayGain coupé : aucun gain ne doit être écrit"
+        );
+        assert_eq!(fin.derniere_fin, Some(Fin::Terminee));
     }
 }

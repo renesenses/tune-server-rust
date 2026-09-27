@@ -695,7 +695,8 @@ pub(super) async fn couverture_empreintes(
         "dsd_exclues": n(3),
         "candidates": candidates,
         "groupes_par_contenu": groupes,
-        "analyse_active": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+        // #5246 — les empreintes ne dépendent plus du réglage ReplayGain.
+        "analyse_active": true,
     })))
 }
 
@@ -727,7 +728,8 @@ pub(super) async fn empreinter_maintenant(
         "lots": lots,
         "traitees": traitees,
         "restantes": restantes,
-        "analyse_active": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+        // #5246 — les empreintes ne dépendent plus du réglage ReplayGain.
+        "analyse_active": true,
     })))
 }
 
