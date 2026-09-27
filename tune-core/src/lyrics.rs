@@ -1258,7 +1258,7 @@ mod tests {
 
     async fn chercher(base: &str) -> LrclibRaw {
         fetch_lrclib_raw_sur(
-            &reqwest::Client::new(),
+            crate::http::client::shared(),
             base,
             "Sóley",
             "Pretty Face",
