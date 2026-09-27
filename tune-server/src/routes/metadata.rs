@@ -1552,8 +1552,13 @@ fn normalize_artist_for_grouping(name: &str) -> String {
 
 /// Strip trailing ensemble/featuring suffixes from artist name.
 fn strip_ensemble_suffix(name: &str) -> String {
-    let lower = name.to_lowercase();
-    let lower = lower.trim();
+    // #5236 — on coupe `name` avec des positions lues dans `lower` : les deux
+    // doivent avoir la même taille en octets. `to_ascii_lowercase` la garde
+    // (motifs ASCII) ; `to_lowercase` la change (« İ » → « i̇ ») et faisait
+    // paniquer. Et on coupe le nom ÉLAGUÉ, comme `lower`.
+    let name = name.trim();
+    let lower = name.to_ascii_lowercase();
+    let lower = lower.as_str();
 
     // Ensemble words that can appear at the end.
     let ensemble_words = &[
@@ -3438,5 +3443,29 @@ mod artiste_des_pistes_douteuses_1199 {
         )
         .await;
         assert_eq!(c2, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod tests_ensemble_5236 {
+    use super::{normalize_artist_for_grouping, strip_ensemble_suffix};
+
+    /// #5236 — la position du motif, lue dans la minuscule, coupait le nom au
+    /// milieu d'un caractère quand « İ » grandit en minuscule : panique.
+    #[test]
+    fn strip_ensemble_suffix_ne_panique_pas_sur_une_minuscule_de_taille_changeante() {
+        assert_eq!(
+            strip_ensemble_suffix("İİİİİİİİİİ all starsééé"),
+            "İİİİİİİİİİ"
+        );
+        assert_eq!(strip_ensemble_suffix("İlhan Ersahin Trio"), "İlhan Ersahin");
+        assert_eq!(
+            strip_ensemble_suffix("İİİİİİİİİİİİ feat. Ömer"),
+            "İİİİİİİİİİİİ"
+        );
+        assert_eq!(
+            normalize_artist_for_grouping("İlhan Ersahin Quartet"),
+            normalize_artist_for_grouping("İlhan Ersahin")
+        );
     }
 }
