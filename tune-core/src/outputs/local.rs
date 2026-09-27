@@ -769,12 +769,41 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     if dop {
         return 1000;
     }
+    let (rg_units, porte_par_l_eq) = decomposer_le_facteur_de_rendu(rg_units);
     let user = user_units as f64 / 1000.0;
     let rg = rg_units as f64 / 1000.0;
     // Clamped to unity: above it, a ReplayGain boost would push peaks past
     // full scale and the user, who never touched the slider, would hear
     // distortion appear out of nowhere.
-    ((user * rg).clamp(0.0, 1.0) * 1000.0).round() as u32
+    //
+    // #5227 — puis divisé par la part de compensation que l'égaliseur porte
+    // déjà dans ses échantillons : le produit rendu reste le même, rabot
+    // compris, mais cette part-là traverse l'anneau avec le filtre.
+    ((user * rg).clamp(0.0, 1.0) * 1000.0 * 1000.0 / porte_par_l_eq as f64).round() as u32
+}
+
+/// #5227 — `rg_factor` porte DEUX nombres, en millièmes : le facteur
+/// ReplayGain × compensation (16 bits bas, ≤ 64 000) et la part de cette
+/// compensation que l'égaliseur multiplie lui-même avant l'anneau (16 bits
+/// hauts ; 0 = 1 000, rien de porté).
+///
+/// Empaquetés dans le même atomique parce que c'est lui que les six boucles
+/// de rendu, et `sync_volume_to_dop`, lisent déjà : un second atomique aurait
+/// dû traverser chaque bras, dont deux ne compilent que sous Windows. Une
+/// valeur posée à l'ancienne (moins de 65 536) se lit exactement comme avant.
+fn composer_le_facteur_de_rendu(rg_compense: u32, porte_par_l_eq: u32) -> u32 {
+    let rg = rg_compense.min(64_000);
+    let porte = porte_par_l_eq.clamp(1000, 64_000);
+    if porte == 1000 {
+        rg
+    } else {
+        (porte << 16) | rg
+    }
+}
+
+fn decomposer_le_facteur_de_rendu(facteur: u32) -> (u32, u32) {
+    let porte = facteur >> 16;
+    (facteur & 0xFFFF, if porte == 0 { 1000 } else { porte })
 }
 
 /// Dit à voix haute que le produit « volume × ReplayGain » a été RABOTÉ à
@@ -798,6 +827,7 @@ fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bo
     if dop {
         return;
     }
+    let rg_units = decomposer_le_facteur_de_rendu(rg_units).0;
     let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
     if demande <= 1.0 {
         return;
@@ -889,6 +919,17 @@ impl LocalOutput {
     /// `effective_volume_units` rend l'unité de toute façon) le DSP est
     /// contourné : rien à compenser.
     fn recalculer_la_compensation(&self) {
+        // #5227 — la part que l'égaliseur installé multiplie déjà dans ses
+        // échantillons. Nulle sous PURE : `apply_local_dsp` ne l'applique pas.
+        let porte_par_l_eq = if self.pure_bypass.load(Ordering::Relaxed) {
+            1.0
+        } else {
+            self.eq
+                .lock()
+                .ok()
+                .and_then(|e| e.as_ref().map(|p| p.compensation_portee()))
+                .unwrap_or(1.0)
+        };
         let dsp_db = if self.pure_bypass.load(Ordering::Relaxed) {
             0.0
         } else {
@@ -908,8 +949,11 @@ impl LocalOutput {
         };
         let dsp_db = if dsp_db.is_finite() { dsp_db } else { 0.0 };
         let en_millemes = |db: f64| (10.0_f64.powf(db / 20.0) * 1000.0).round();
+        // Le crête-mètre multiplie ce gain par le volume rendu : la part
+        // portée par l'égaliseur, retirée du volume, revient donc ici, et le
+        // produit que lit l'aiguille ne bouge pas.
         self.gain_moyen_dsp.store(
-            en_millemes(dsp_db).clamp(0.0, 64_000.0) as u32,
+            (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32,
             Ordering::SeqCst,
         );
         let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
@@ -921,7 +965,10 @@ impl LocalOutput {
         // Borné à ×64 : le produit est de toute façon raboté à l'unité par
         // `effective_volume_units`, la borne ne protège que l'`u32`.
         let compose = (rg * 10.0_f64.powf(compensation / 20.0)).clamp(0.0, 64_000.0);
-        let compose = compose.round() as u32;
+        let compose = composer_le_facteur_de_rendu(
+            compose.round() as u32,
+            (porte_par_l_eq * 1000.0).round() as u32,
+        );
         // Une lecture installe ReplayGain, crossfeed et égaliseur l'un après
         // l'autre : ne recalculer (et ne journaliser un rabot) que si le
         // facteur a réellement bougé. Rien d'autre ne peut avoir rendu
@@ -1115,9 +1162,39 @@ impl LocalOutput {
     /// Rebuilt at each play so the biquad coefficients match the resolved
     /// stream's sample rate and channel count, and so a profile edited between
     /// two tracks takes effect on the next one.
-    pub fn set_eq(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+    pub fn set_eq(&self, mut eq: Option<super::super::audio::eq::EqProcessor>) {
+        self.faire_porter_la_compensation(&mut eq);
         *self.eq.lock().unwrap() = eq;
         self.recalculer_la_compensation();
+    }
+
+    /// #5227 — confier à l'égaliseur qu'on installe la compensation de SON
+    /// niveau moyen, pour qu'elle traverse l'anneau avec son préampli au lieu
+    /// de changer le volume ~2 s trop tôt. Figée à l'installation : un
+    /// interrupteur de compensation basculé ensuite passe par le volume seul
+    /// (`recalculer_la_compensation` divise par ce qui est porté), sans rien
+    /// changer à ce qui est déjà dans l'anneau.
+    fn faire_porter_la_compensation(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if let Some(p) = eq.as_mut() {
+            let facteur = if self.compensation_de_niveau.load(Ordering::Relaxed)
+                && !self.pure_bypass.load(Ordering::Relaxed)
+            {
+                10.0_f64.powf(-p.gain_moyen_db() / 20.0)
+            } else {
+                1.0
+            };
+            p.porter_la_compensation(facteur);
+        }
+    }
+
+    /// #5227 — la compensation que l'égaliseur installé porte lui-même (1,0 =
+    /// aucune).
+    pub fn compensation_portee_par_l_eq(&self) -> f64 {
+        self.eq
+            .lock()
+            .ok()
+            .and_then(|e| e.as_ref().map(|p| p.compensation_portee()))
+            .unwrap_or(1.0)
     }
 
     /// Remplacer l'égaliseur **pendant** la lecture, en emportant l'historique
@@ -1133,23 +1210,33 @@ impl LocalOutput {
     /// Distinct de [`Self::set_eq`] à dessein : au début d'une piste il n'y a
     /// pas d'historique à conserver, et celui de la piste précédente serait
     /// faux.
-    pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
+    pub fn replace_eq_live(&self, mut eq: Option<super::super::audio::eq::EqProcessor>) {
+        self.faire_porter_la_compensation(&mut eq);
         {
             let mut emplacement = self.eq.lock().unwrap();
-            match (eq, emplacement.as_ref()) {
-                (Some(mut neuf), Some(precedent)) => {
-                    neuf.inherit_state_from(precedent);
-                    *emplacement = Some(neuf);
-                }
-                (suivant, _) => *emplacement = suivant,
-            }
+            let precedent = emplacement.take();
+            *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
+                // PURE : la chaîne est contournée, rien à fondre — et rien ne
+                // doit rester monté qui ferait croire à un DSP actif.
+                eq
+            } else {
+                // #5215 — héritage des filtres ET, si le niveau bouge
+                // (coupure, activation, préampli déplacé), fondu enchaîné de
+                // `RAMPE_DE_BASCULE_MS` au lieu d'une marche instantanée.
+                super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent)
+            };
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
     }
 
     pub fn has_eq(&self) -> bool {
-        self.eq.lock().unwrap().is_some()
+        // #5215 — un égaliseur coupé qui finit son fondu n'est plus « monté ».
+        self.eq
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.est_neutre())
     }
 
     /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
@@ -3130,6 +3217,11 @@ fn apply_local_dsp(
     if let Ok(mut e) = eq.lock() {
         if let Some(ref mut p) = *e {
             p.process_interleaved(samples);
+            // #5215 — l'égaliseur coupé a fini de fondre vers le sec : on le
+            // retire, la chaîne redevient exactement celle d'un EQ absent.
+            if p.est_neutre_au_repos() {
+                *e = None;
+            }
         }
     }
     if let Ok(mut conv) = convolver.lock() {
@@ -3289,7 +3381,9 @@ fn local_dsp_is_identity(
     // « octets source conservés » et le repli ne serait jamais appliqué — le
     // réglage serait accepté et resterait sans effet.
     !mono_downmix.load(Ordering::Relaxed)
-        && eq.lock().is_ok_and(|guard| guard.is_none())
+        && eq
+            .lock()
+            .is_ok_and(|guard| guard.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }

@@ -314,6 +314,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
             None,
             None,
             false,
+            None,
         )
     })
     .await

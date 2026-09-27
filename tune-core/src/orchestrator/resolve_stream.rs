@@ -186,7 +186,9 @@ impl PlaybackOrchestrator {
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 // Serveur de médias : aucune zone, donc aucun réglage strict (#3973).
-                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None, false)
+                decode_radio_stream_to_pcm(
+                    radio_url, tx, data_ready, session, None, None, false, None,
+                )
             })
             .await;
 

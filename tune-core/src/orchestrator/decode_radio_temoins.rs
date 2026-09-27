@@ -89,6 +89,7 @@ async fn le_decodeur_radio_rend_le_pcm_du_mp3_servi() {
             None,
             Some(levels_tx),
             false,
+            None,
         )
     });
 
@@ -158,6 +159,7 @@ async fn la_fin_du_flux_amont_reconnecte_la_meme_session() {
             None,
             None,
             false,
+            None,
         )
     });
 
@@ -237,6 +239,7 @@ async fn une_page_web_a_la_reconnexion_est_dite_sans_attendre() {
             None,
             None,
             false,
+            None,
         )
     });
 
@@ -257,4 +260,89 @@ async fn une_page_web_a_la_reconnexion_est_dite_sans_attendre() {
     drain
         .await
         .expect("le drain se termine quand le canal se ferme");
+}
+
+/// Décode la station jusqu'à `n` morceaux, en déposant `profil` dans le poste
+/// de relève après le `apres`-ième (jamais si `None`). Rend les morceaux et le
+/// nombre de relèves faites par le décodeur.
+async fn decoder_avec_releve(
+    n: usize,
+    releve: Option<(usize, crate::audio::eq::EqProfile)>,
+) -> (Vec<Vec<u8>>, u64) {
+    let (url, _connexions) = station_factice(vec![("audio/mpeg", MP3.to_vec())]);
+    let session = session_radio().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let data_ready = Arc::new(tokio::sync::Notify::new());
+    let poste = super::eq_en_vol::EqEnVol::pour_la_radio();
+    let poste_du_decodeur = poste.clone();
+    let data_ready_pour_le_decodeur = data_ready.clone();
+    let decodeur = tokio::task::spawn_blocking(move || {
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready_pour_le_decodeur,
+            session,
+            None,
+            None,
+            false,
+            Some(poste_du_decodeur),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(10), data_ready.notified())
+        .await
+        .expect("premier morceau en moins de 10 s");
+    let mut morceaux = Vec::new();
+    while morceaux.len() < n {
+        if let Some((apres, ref profil)) = releve
+            && morceaux.len() == apres
+        {
+            poste.poser(Some(profil.clone()));
+        }
+        let m = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("un morceau en moins de 10 s")
+            .expect("le décodeur ne doit pas fermer le canal : le flux continue");
+        morceaux.push(m);
+    }
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(15), decodeur).await;
+    (morceaux, poste.releves())
+}
+
+/// #4407 — un égaliseur déposé dans le poste d'un flux radio EN COURS est
+/// relevé par le décodeur, dans la MÊME session : les premiers morceaux sont
+/// ceux d'un flux sans égaliseur, les derniers sont égalisés, et le canal ne
+/// s'est jamais fermé.
+///
+/// Le décodage d'un même MP3 est déterministe : un second décodeur sans
+/// relève sert d'étalon, morceau pour morceau.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_egaliseur_depose_en_vol_est_releve_par_le_decodeur_radio_4407() {
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 1000.0,
+            gain: 12.0,
+            q: 0.71,
+            band_type: "peak".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (etalon, aucune) = decoder_avec_releve(16, None).await;
+    let (servi, releves) = decoder_avec_releve(16, Some((2, profil))).await;
+    assert_eq!(aucune, 0);
+    assert_eq!(
+        releves, 1,
+        "le décodeur doit relever le profil déposé, une fois"
+    );
+    assert_eq!(
+        servi[..2],
+        etalon[..2],
+        "avant le dépôt, le flux est celui d'un flux sans égaliseur"
+    );
+    assert_ne!(
+        servi[15], etalon[15],
+        "après le dépôt, le flux en cours porte l'égaliseur"
+    );
 }

@@ -2927,7 +2927,7 @@ impl PlaybackOrchestrator {
             // Chargé AVANT la session (#5114) : le flux doit dire, dans son
             // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
             // réellement posé sur le canal le sait.
-            let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
+            let mut dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
             info.crossfeed = relais && dsp.crossfeed_executable();
@@ -2952,8 +2952,22 @@ impl PlaybackOrchestrator {
             // propre boucle de lecture. Les cumuler doublait la courbe de
             // l'égaliseur en dB et élevait le facteur ReplayGain au carré —
             // voir `relais_dsp_progressif`.
-            let tx = if relais {
-                tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
+            //
+            // #4407 — sur une zone RÉSEAU, le relais est posé même sans
+            // traitement (il rend alors chaque bloc intact) : c'est lui qui
+            // porte le poste de relève, et donc un égaliseur activé ou changé
+            // en cours de piste sans refaire la session UPnP.
+            let relais_en_vol = !is_local_output;
+            let tx = if relais || relais_en_vol {
+                if relais {
+                    tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");
+                }
+                if relais_en_vol {
+                    let poste =
+                        super::eq_en_vol::EqEnVol::pour_le_relais(dsp.compensation.is_some());
+                    self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
+                    dsp.en_vol = Some(poste);
+                }
                 spawn_streaming_dsp_relay(dsp, out_bd, true, tx)
             } else {
                 tx

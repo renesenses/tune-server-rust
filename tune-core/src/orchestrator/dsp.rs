@@ -18,8 +18,9 @@ struct Etiquettes {
 /// l'anti-rebond (`EQ_REPLAY_DEBOUNCE_MS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PorteeDuReglage {
-    /// Le son est déjà conforme : sortie locale modifiée à chaud, ou flux
-    /// réseau qui porte déjà ce traitement.
+    /// Le son est déjà conforme : sortie locale modifiée à chaud, flux
+    /// réseau qui porte déjà ce traitement, ou flux réseau fabriqué au fil de
+    /// l'eau dont le porteur relève l'égaliseur au bloc suivant (#4407).
     Immediate,
     /// Zone réseau : le flux va être relancé à la position courante.
     Relance,
@@ -44,7 +45,7 @@ impl PorteeDuReglage {
     /// portée s'en déduit, pour qu'elle ne puisse pas diverger du journal.
     fn du_chemin(chemin: &str) -> Self {
         match chemin {
-            "local_a_chaud" | "flux_conserve_signal_identique" => Self::Immediate,
+            "local_a_chaud" | "flux_conserve_signal_identique" | "eq_en_vol" => Self::Immediate,
             "replay_programme" => Self::Relance,
             "rien_ne_joue" => Self::RienNeJoue,
             _ => Self::PisteSuivante,
@@ -816,9 +817,13 @@ impl PlaybackOrchestrator {
     ///
     /// - **sortie locale** : [`Self::refresh_zone_eq`] remplace l'`EqProcessor`
     ///   derrière son mutex — immédiat, inaudible, aucune coupure ;
-    /// - **tout le reste** (DLNA, navigateur) : le fichier transcodé est déjà
-    ///   écrit et téléchargé, rien à remplacer. [`Self::schedule_eq_replay`]
-    ///   programme un redémarrage anti-rebondi (#1710).
+    /// - **flux réseau fabriqué au fil de l'eau** (radio décodée, relais DSP
+    ///   progressif) : le nouvel égaliseur est déposé dans le poste de relève
+    ///   du flux et posé au bloc suivant, sans nouvelle session UPnP (#4407) ;
+    /// - **tout le reste** (fichier pré-transcodé, passthrough) : les octets
+    ///   sont déjà écrits et téléchargés, rien à remplacer.
+    ///   [`Self::schedule_eq_replay`] programme un redémarrage anti-rebondi
+    ///   (#1710), et `eq_change_journal` dit pourquoi (`en_vol_impossible`).
     ///
     /// Rend `true` quand le réglage a atteint le son **immédiatement** — donc
     /// uniquement sur le chemin local. Un redémarrage programmé rend `false` :
@@ -854,6 +859,9 @@ impl PlaybackOrchestrator {
         } else {
             "sans_chemin"
         };
+        // #4407 — pourquoi l'égaliseur n'a pas pu être posé en vol dans le
+        // flux réseau, quand on retombe sur la relance. `None` ailleurs.
+        let mut en_vol_impossible: Option<&'static str> = None;
         if !applique_a_chaud {
             // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
             // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
@@ -872,12 +880,27 @@ impl PlaybackOrchestrator {
                 // réglage en base : une relance abandonnée laisse l'ancien
                 // traitement dans le flux, et la comparaison le voit.
                 "flux_conserve_signal_identique"
-            } else if self.schedule_eq_replay(zone_id) {
-                "replay_programme"
+            } else if let Err(raison) = np.as_ref().map_or(Err("rien_ne_joue"), |np| {
+                self.poser_l_eq_en_vol(zone_id, np)
+            }) {
+                // #4407 — l'égaliseur ne peut pas être remplacé dans CE flux
+                // (fichier pré-transcodé, passthrough, autre étage à
+                // refabriquer…) : la relance reste le seul chemin, et le
+                // journal dit pourquoi.
+                en_vol_impossible = Some(raison);
+                if self.schedule_eq_replay(zone_id) {
+                    "replay_programme"
+                } else {
+                    // `schedule_eq_replay` a déjà dit POURQUOI (#2595) ; ici on
+                    // retient seulement que rien ne partira.
+                    "replay_refuse_position_inconnue"
+                }
             } else {
-                // `schedule_eq_replay` a déjà dit POURQUOI (#2595) ; ici on
-                // retient seulement que rien ne partira.
-                "replay_refuse_position_inconnue"
+                // #4407 — le flux que Tune fabrique au fil de l'eau (radio
+                // décodée, relais progressif) relève le nouvel égaliseur au
+                // bloc suivant : même session, aucun `SetAVTransportURI`,
+                // aucun blanc. Fondu de 200 ms (#5215) si le niveau bouge.
+                "eq_en_vol"
             };
         }
 
@@ -887,7 +910,7 @@ impl PlaybackOrchestrator {
         // pas le cout de la trace qui la raconte. Passe ce point, plus rien ne
         // touche le son.
         let duree = debut.elapsed();
-        self.journaliser_le_changement_d_eq(zone_id, &rapport, chemin, duree);
+        self.journaliser_le_changement_d_eq(zone_id, &rapport, chemin, en_vol_impossible, duree);
 
         if let Some(ref bus) = self.event_bus {
             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
@@ -967,6 +990,116 @@ impl PlaybackOrchestrator {
         empreinte
     }
 
+    /// #4407 — retenir le poste de relève d'égaliseur du flux `stream_id`.
+    pub(super) fn noter_eq_en_vol(
+        &self,
+        zone_id: i64,
+        stream_id: &str,
+        poste: std::sync::Arc<super::eq_en_vol::EqEnVol>,
+    ) {
+        let mut postes = self.eq_en_vol_des_flux.lock().unwrap();
+        let notes = postes.entry(zone_id).or_default();
+        notes.retain(|(sid, _)| sid != stream_id);
+        notes.push((stream_id.to_string(), poste));
+        let trop = notes.len().saturating_sub(Self::FLUX_TRAITES_PAR_ZONE);
+        notes.drain(..trop);
+    }
+
+    /// #4407 — le poste de relève du flux `stream_id`, s'il en a un.
+    pub(super) fn poste_eq_en_vol(
+        &self,
+        zone_id: i64,
+        stream_id: &str,
+    ) -> Option<std::sync::Arc<super::eq_en_vol::EqEnVol>> {
+        self.eq_en_vol_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == stream_id))
+            .map(|(_, p)| p.clone())
+    }
+
+    /// #4407 — poser le nouvel égaliseur DANS le flux réseau qui joue, sans
+    /// refaire la session UPnP. `Err(raison)` quand c'est impossible : la
+    /// raison part dans `eq_change_journal` (`en_vol_impossible`) et
+    /// l'appelant retombe sur la relance.
+    ///
+    /// Possible seulement quand Tune fabrique ce flux AU FIL DE L'EAU — radio
+    /// décodée, relais DSP progressif — et que l'égaliseur est la seule chose
+    /// qui manque au flux. Impossible :
+    /// - `flux_sans_poste_de_releve` : fichier pré-transcodé (octets déjà
+    ///   écrits, souvent déjà téléchargés), passthrough, URL directe ;
+    /// - `porteur_termine` : le décodeur ou le relais s'est arrêté ;
+    /// - `mode_pure` : PURE gouverne plus que l'égaliseur ;
+    /// - `compensation_de_niveau_cuite` : la compensation (#5071) dépend de
+    ///   l'égaliseur, le porteur ne la recalcule pas ;
+    /// - `traitement_servi_inconnu` / `autre_etage_a_refabriquer` : un autre
+    ///   étage que l'égaliseur diverge, ou rien ne permet de l'exclure.
+    pub(super) fn poser_l_eq_en_vol(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> Result<(), &'static str> {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        // Le registre tient une référence, le porteur l'autre : seul, le
+        // poste n'a plus personne pour le relever.
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return Err("porteur_termine");
+        }
+        if self.zone_audiophile(zone_id) {
+            return Err("mode_pure");
+        }
+        let profil = self
+            .load_eq_profile(zone_id)
+            .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled());
+        let voulu = self.empreinte_du_traitement(zone_id, np.track_id);
+        if !poste.cuit_seulement_l_egaliseur {
+            if poste.compensation_cuite
+                || (profil.is_some() && self.zone_compensation_de_niveau(zone_id))
+            {
+                return Err("compensation_de_niveau_cuite");
+            }
+            let servi = self
+                .traitement_des_flux
+                .lock()
+                .unwrap()
+                .get(&zone_id)
+                .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+            let Some(servi) = servi else {
+                return Err("traitement_servi_inconnu");
+            };
+            if Self::empreinte_hors_egaliseur(&servi) != Self::empreinte_hors_egaliseur(&voulu) {
+                return Err("autre_etage_a_refabriquer");
+            }
+        }
+        poste.poser(profil);
+        // Le flux porte désormais ce traitement : un second envoi du même
+        // réglage retombera sur `flux_conserve_signal_identique`.
+        self.noter_traitement_du_flux(zone_id, sid, voulu);
+        info!(
+            zone_id,
+            stream_id = sid,
+            depots = poste.poses(),
+            "eq_en_vol_depose"
+        );
+        Ok(())
+    }
+
+    /// L'empreinte de [`Self::empreinte_du_traitement`] sans son champ `eq=` :
+    /// ce que la relève en vol ne change pas.
+    fn empreinte_hors_egaliseur(empreinte: &str) -> String {
+        empreinte
+            .split('\u{1f}')
+            .filter(|champ| !champ.starts_with("eq="))
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    }
+
     /// Retenir le traitement avec lequel le flux `stream_id` a été résolu.
     pub(super) fn noter_traitement_du_flux(
         &self,
@@ -1032,6 +1165,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         rapport: &RapportEqAChaud,
         chemin: &str,
+        en_vol_impossible: Option<&str>,
         duree: std::time::Duration,
     ) {
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -1062,6 +1196,9 @@ impl PlaybackOrchestrator {
             preamp_db_d = rapport.preamp_db_droite.unwrap_or(0.0),
             chemin,
             premier_echec = rapport.echec.map(EchecEqLocal::nom).unwrap_or("-"),
+            // #4407 — pourquoi l'égaliseur n'a pas été posé en vol dans le
+            // flux réseau (« - » quand la question ne se posait pas).
+            en_vol_impossible = en_vol_impossible.unwrap_or("-"),
             duree_ms = duree.as_micros() as f64 / 1000.0,
             amortissement = %Self::amortissement_du_chemin(chemin),
             "eq_change_journal"
@@ -1101,6 +1238,9 @@ impl PlaybackOrchestrator {
     pub fn amortissement_du_chemin(chemin: &str) -> String {
         match chemin {
             "local_a_chaud" => "aucun".to_string(),
+            // #4407 — relevé au bloc suivant du flux, comme le chemin local :
+            // aucun anti-rebond, seulement le fondu de bascule (#5215).
+            "eq_en_vol" => format!("rampe_{}ms", crate::audio::eq::RAMPE_DE_BASCULE_MS),
             "replay_programme" => format!(
                 "anti_rebond_{}ms_plancher_{}ms",
                 Self::EQ_REPLAY_DEBOUNCE_MS,
@@ -1483,6 +1623,8 @@ impl PlaybackOrchestrator {
             crossfeed: self.load_crossfeed_processor(zone_id, sample_rate),
             channels,
             compensation: None,
+            sample_rate,
+            en_vol: None,
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
