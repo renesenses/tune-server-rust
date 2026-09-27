@@ -141,7 +141,10 @@ impl Processor for Instance {
         let c = self.engine.ecretage();
         let stats = self.engine.process_stats();
         serde_json::json!({"response":self.engine.response(self.format.sample_rate()),"enabled":self.engine.is_enabled(),"preamp_db":(0..self.format.channels()).map(|ch|self.engine.preamp_db(ch)).collect::<Vec<_>>(),"overs":stats.overs,"non_finite_samples":stats.non_finite_samples,
-            "clipping":{"samples_seen":c.echantillons_vus,"clipped_samples":c.echantillons_ecretes,"max_excess_lsb":c.exces_max_lsb,"max_peak":c.crete_max,"first_clip":c.premier_ecretage_a}})
+            "clipping":{"samples_seen":c.echantillons_vus,"clipped_samples":c.echantillons_ecretes,"max_excess_lsb":c.exces_max_lsb,"max_peak":c.crete_max,"first_clip":c.premier_ecretage_a},
+            // #5171 — la réserve choisie et, en mode réaliste, le limiteur.
+            "headroom_mode":self.engine.headroom_mode().code(),
+            "limiter":self.engine.limiteur().map(|l|serde_json::json!({"frames_seen":l.trames_vues,"limited_frames":l.trames_limitees,"max_reduction_db":l.reduction_max_db}))})
     }
     fn reset(&mut self, _: ResetReason) {
         self.engine.reset_history();

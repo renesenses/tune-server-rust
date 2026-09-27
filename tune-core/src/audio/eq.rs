@@ -4,8 +4,8 @@
 use super::ecretage::{CompteurDEcretage, EtageEcretant, Portee, REGISTRE, dire_fin, dire_premier};
 use std::sync::atomic::{AtomicBool, Ordering};
 pub use tune_plugin_equalizer::{
-    DEBIT_DE_REFERENCE_HZ, EqBandSpec, EqProcessStats, EqProfile, ListeningMode, RoomSize,
-    SpeakerPlacement,
+    DEBIT_DE_REFERENCE_HZ, EqBandSpec, EqProcessStats, EqProfile, HeadroomMode, ListeningMode,
+    RoomSize, SpeakerPlacement,
 };
 use tune_plugin_native::stage::Stage;
 pub struct EqProcessor {
