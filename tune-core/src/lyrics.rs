@@ -2,7 +2,9 @@
 //!
 //! - Parses LRC-format timestamped lyrics into `Vec<LyricLine>` (delegates
 //!   to the canonical parser in [`crate::metadata::lyrics`]).
-//! - Fetches from <https://lrclib.net/api/get> (no API key required).
+//! - Fetches from <https://lrclib.net/api/get> (no API key required) ; when
+//!   that entry has no synced lyrics, completes it with a synced version of
+//!   the same duration found by `/api/search` (#5248).
 //! - Caches results in the `lyrics_cache` DB table (SQLite and Postgres),
 //!   including negative results which are retried after 14 days.
 
@@ -373,6 +375,15 @@ pub fn album_de_repli(album_name: Option<&str>) -> Option<String> {
     (propre != album).then_some(propre)
 }
 
+/// Racine de l'API LRCLIB. Les témoins la remplacent par un serveur local
+/// (voir [`fetch_lrclib_raw_sur`]) : aucune requête ne sort vers le réseau.
+const LRCLIB_BASE: &str = "https://lrclib.net";
+
+/// Écart de durée toléré entre la piste et une version LRCLIB pour que ses
+/// paroles synchronisées soient retenues (#5248). Au-delà, les horodatages
+/// d'une autre version (autre mixage, fondu différent) dériveraient.
+pub const ECART_DE_DUREE_SYNCHRO_SECS: f64 = 2.0;
+
 /// Fetch raw lyrics from LRCLIB for a given artist/track/album/duration.
 ///
 /// Returns `Ok(None)` when LRCLIB has no entry (HTTP 404), `Err` on
@@ -383,6 +394,11 @@ pub fn album_de_repli(album_name: Option<&str>) -> Option<String> {
 /// 24/96 »), on rejoue avec le titre nettoyé. L'ordre compte : le titre tel
 /// quel passe TOUJOURS en premier, donc rien de ce qui marche aujourd'hui ne
 /// peut régresser. Un 429/503 sort par `?` sans rien retenter.
+///
+/// #5248 — quand `/api/get` rend des paroles SANS `syncedLyrics`, on
+/// interroge `/api/search` et on retient une version synchronisée dont la
+/// durée est à ±[`ECART_DE_DUREE_SYNCHRO_SECS`] de la piste. Voir
+/// [`completer_par_la_recherche`].
 pub async fn fetch_lrclib_raw(
     client: &reqwest::Client,
     artist: &str,
@@ -390,24 +406,205 @@ pub async fn fetch_lrclib_raw(
     album_name: Option<&str>,
     duration_secs: Option<i64>,
 ) -> Result<Option<LrclibRaw>, String> {
-    let premier = lrclib_get(client, artist, track_name, album_name, duration_secs).await?;
-    if premier.is_some() {
-        return Ok(premier);
+    fetch_lrclib_raw_sur(
+        client,
+        LRCLIB_BASE,
+        artist,
+        track_name,
+        album_name,
+        duration_secs,
+    )
+    .await
+}
+
+/// [`fetch_lrclib_raw`] contre une racine d'API donnée. Public pour les
+/// témoins, qui la pointent sur un serveur local.
+pub async fn fetch_lrclib_raw_sur(
+    client: &reqwest::Client,
+    base: &str,
+    artist: &str,
+    track_name: &str,
+    album_name: Option<&str>,
+    duration_secs: Option<i64>,
+) -> Result<Option<LrclibRaw>, String> {
+    let mut trouve =
+        lrclib_get(client, base, artist, track_name, album_name, duration_secs).await?;
+    if trouve.is_none()
+        && let Some(propre) = album_de_repli(album_name)
+    {
+        debug!(album_nettoye = %propre, "lrclib_retry_album_nettoye");
+        trouve = lrclib_get(
+            client,
+            base,
+            artist,
+            track_name,
+            Some(propre.as_str()),
+            duration_secs,
+        )
+        .await?;
     }
-    match album_de_repli(album_name) {
-        Some(propre) => {
-            debug!(album_nettoye = %propre, "lrclib_retry_album_nettoye");
-            lrclib_get(
+    match trouve {
+        Some(raw) if !a_des_paroles_synchronisees(&raw) => Ok(Some(
+            completer_par_la_recherche(
                 client,
+                base,
+                raw,
                 artist,
                 track_name,
-                Some(propre.as_str()),
+                album_name,
                 duration_secs,
             )
-            .await
-        }
-        None => Ok(None),
+            .await,
+        )),
+        autre => Ok(autre),
     }
+}
+
+fn a_des_paroles_synchronisees(raw: &LrclibRaw) -> bool {
+    raw.synced_lyrics
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// #5248 — `/api/get` a rendu une version NON synchronisée alors que
+/// d'autres versions de la même piste le sont.
+///
+/// Mesuré le 27/09/2026 sur « Pretty Face » (Sóley, *We Sink*, 280 s) :
+/// `/api/get` rend l'entrée 682553, texte brut seulement, pendant que
+/// `/api/search` en liste trois synchronisées, dont une de 280,0 s. La vue TV
+/// faisait alors défiler le texte sans jamais surligner de ligne.
+///
+/// La recherche se fait sur le titre et l'artiste SEULS : la version de même
+/// durée est justement rangée sous un autre album (« N/A »), qu'un filtre
+/// `album_name` écarterait. L'album et la durée servent au CHOIX :
+/// * durée connue, et à ±[`ECART_DE_DUREE_SYNCHRO_SECS`] — sinon rien n'est
+///   retenu : les horodatages d'une autre version dériveraient ;
+/// * même titre (casse et espaces près) — la recherche est floue ;
+/// * à égalité, le même album d'abord, puis l'écart de durée le plus faible.
+///
+/// Un seul appel de plus, et seulement dans ce cas-là : une entrée
+/// synchronisée ou un 404 n'en coûtent aucun. Toute panne de la recherche
+/// (réseau, 429, réponse illisible) rend le résultat de `/api/get` tel quel —
+/// ce complément ne fait jamais perdre les paroles qu'on avait. Le texte brut
+/// d'origine est gardé quand la version retenue n'en porte pas.
+async fn completer_par_la_recherche(
+    client: &reqwest::Client,
+    base: &str,
+    raw: LrclibRaw,
+    artist: &str,
+    track_name: &str,
+    album_name: Option<&str>,
+    duration_secs: Option<i64>,
+) -> LrclibRaw {
+    let Some(duree) = duration_secs.filter(|d| *d > 0) else {
+        return raw;
+    };
+    let resultats = match lrclib_search(client, base, artist, track_name).await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, "lrclib_search_echec — paroles de /api/get gardees");
+            return raw;
+        }
+    };
+    match choisir_la_version_synchronisee(&resultats, track_name, album_name, duree as f64) {
+        Some(choisie) => {
+            debug!(
+                duree_lrclib = choisie.duration,
+                "lrclib_search_version_synchronisee_retenue (#5248)"
+            );
+            LrclibRaw {
+                synced_lyrics: choisie.synced_lyrics.clone(),
+                plain_lyrics: choisie
+                    .plain_lyrics
+                    .clone()
+                    .filter(|p| !p.trim().is_empty())
+                    .or(raw.plain_lyrics),
+            }
+        }
+        None => raw,
+    }
+}
+
+/// Une entrée de `/api/search`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LrclibSearchHit {
+    #[serde(default)]
+    pub track_name: Option<String>,
+    #[serde(default)]
+    pub album_name: Option<String>,
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub synced_lyrics: Option<String>,
+    #[serde(default)]
+    pub plain_lyrics: Option<String>,
+}
+
+/// La règle de choix de #5248, pure — voir [`completer_par_la_recherche`].
+pub fn choisir_la_version_synchronisee<'a>(
+    resultats: &'a [LrclibSearchHit],
+    track_name: &str,
+    album_name: Option<&str>,
+    duree_secs: f64,
+) -> Option<&'a LrclibSearchHit> {
+    let titre = normalize_meta(track_name);
+    let album = album_name.map(normalize_meta).filter(|a| !a.is_empty());
+    resultats
+        .iter()
+        .filter(|h| {
+            h.synced_lyrics
+                .as_deref()
+                .is_some_and(|s| !parse_lrc(s).is_empty())
+        })
+        .filter(|h| h.track_name.as_deref().map(normalize_meta).as_deref() == Some(&titre))
+        .filter_map(|h| {
+            let ecart = (h.duration? - duree_secs).abs();
+            (ecart <= ECART_DE_DUREE_SYNCHRO_SECS).then_some((h, ecart))
+        })
+        .min_by(|(a, ea), (b, eb)| {
+            let autre_album = |h: &LrclibSearchHit| {
+                album.is_some() && h.album_name.as_deref().map(normalize_meta) != album
+            };
+            autre_album(a).cmp(&autre_album(b)).then(ea.total_cmp(eb))
+        })
+        .map(|(h, _)| h)
+}
+
+/// Un appel à `/api/search` sur le titre et l'artiste (#5248). Même délai
+/// court et même comptage des 429/503 que [`lrclib_get`].
+async fn lrclib_search(
+    client: &reqwest::Client,
+    base: &str,
+    artist: &str,
+    track_name: &str,
+) -> Result<Vec<LrclibSearchHit>, String> {
+    let url = format!(
+        "{base}/api/search?artist_name={}&track_name={}",
+        urlencoding::encode(artist),
+        urlencoding::encode(track_name),
+    );
+    debug!(url = %url, "lrclib_search");
+    let resp = client
+        .get(&url)
+        .header("User-Agent", format!("Tune/{}", crate::version()))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("lrclib search failed: {e}"))?;
+    if !resp.status().is_success() {
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            LRCLIB_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+            warn!(status = %resp.status(), "lrclib_rate_limited");
+        }
+        return Err(format!("lrclib search returned {}", resp.status()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("lrclib search parse error: {e}"))
 }
 
 /// Un appel à `/api/get`, et rien d'autre.
@@ -416,13 +613,14 @@ pub async fn fetch_lrclib_raw(
 /// fail fast.
 async fn lrclib_get(
     client: &reqwest::Client,
+    base: &str,
     artist: &str,
     track_name: &str,
     album_name: Option<&str>,
     duration_secs: Option<i64>,
 ) -> Result<Option<LrclibRaw>, String> {
     let mut url = format!(
-        "https://lrclib.net/api/get?artist_name={}&track_name={}",
+        "{base}/api/get?artist_name={}&track_name={}",
         urlencoding::encode(artist),
         urlencoding::encode(track_name),
     );
@@ -965,5 +1163,204 @@ mod tests {
             album_de_repli(Some("Innuendo - 24/96")),
             Some("Innuendo".to_string())
         );
+    }
+
+    // ── #5248 : `/api/get` rend du texte brut, `/api/search` du synchronisé ──
+    //
+    // Réponses LRCLIB SIMULÉES par un serveur local : aucune requête ne sort
+    // vers le réseau. Les quatre entrées reproduisent celles relevées le
+    // 27/09/2026 pour « Pretty Face » (Sóley, *We Sink*, 4:40).
+
+    use std::sync::Mutex;
+
+    const LRC_280: &str = "[00:01.00] ligne de la version de 280 s\n[00:05.00] suite";
+    const LRC_282: &str = "[00:01.50] ligne de la version de 282 s\n[00:05.50] suite";
+    const TEXTE_BRUT: &str = "ligne de la version de 280 s\nsuite";
+
+    fn resultats_pretty_face() -> serde_json::Value {
+        serde_json::json!([
+            {"id": 18577148, "trackName": "Pretty Face", "artistName": "Sóley",
+             "albumName": "We Sink - DR11", "duration": 282.4,
+             "plainLyrics": TEXTE_BRUT, "syncedLyrics": LRC_282},
+            {"id": 682553, "trackName": "Pretty Face", "artistName": "Soley",
+             "albumName": "We Sink", "duration": 280.0,
+             "plainLyrics": TEXTE_BRUT, "syncedLyrics": null},
+            {"id": 12002352, "trackName": "Pretty Face", "artistName": "Sóley",
+             "albumName": "N/A", "duration": 280.0,
+             "plainLyrics": TEXTE_BRUT, "syncedLyrics": LRC_280},
+            {"id": 16324126, "trackName": "Pretty Face", "artistName": "Sóley",
+             "albumName": "We Sink", "duration": 282.5,
+             "plainLyrics": TEXTE_BRUT, "syncedLyrics": LRC_282}
+        ])
+    }
+
+    /// Un faux LRCLIB : `/api/get` rend `get`, `/api/search` rend `search`
+    /// (ou un 500 si `None`). Chaque requête est notée avec sa chaîne de
+    /// requête, pour compter les appels et vérifier leurs paramètres.
+    async fn faux_lrclib(
+        get: serde_json::Value,
+        search: Option<serde_json::Value>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::extract::RawQuery;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get as route_get;
+
+        let journal: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (j_get, j_search) = (journal.clone(), journal.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/get",
+                route_get(move |RawQuery(q): RawQuery| {
+                    let get = get.clone();
+                    let j = j_get.clone();
+                    async move {
+                        j.lock()
+                            .unwrap()
+                            .push(format!("get?{}", q.unwrap_or_default()));
+                        axum::Json(get)
+                    }
+                }),
+            )
+            .route(
+                "/api/search",
+                route_get(move |RawQuery(q): RawQuery| {
+                    let search = search.clone();
+                    let j = j_search.clone();
+                    async move {
+                        j.lock()
+                            .unwrap()
+                            .push(format!("search?{}", q.unwrap_or_default()));
+                        match search {
+                            Some(v) => axum::Json(v).into_response(),
+                            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port local");
+        let port = listener.local_addr().expect("adresse locale").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://127.0.0.1:{port}"), journal)
+    }
+
+    /// Ce que rend `/api/get` pour la piste de Levente : l'entrée 682553,
+    /// texte brut seulement.
+    fn get_non_synchronise() -> serde_json::Value {
+        serde_json::json!({"id": 682553, "trackName": "Pretty Face",
+            "artistName": "Soley", "albumName": "We Sink", "duration": 280.0,
+            "plainLyrics": TEXTE_BRUT, "syncedLyrics": null})
+    }
+
+    async fn chercher(base: &str) -> LrclibRaw {
+        fetch_lrclib_raw_sur(
+            &reqwest::Client::new(),
+            base,
+            "Sóley",
+            "Pretty Face",
+            Some("We Sink"),
+            Some(280),
+        )
+        .await
+        .expect("pas d'erreur")
+        .expect("des paroles")
+    }
+
+    /// LE CAS DU TESTEUR. `/api/get` rend du texte brut ; `/api/search` liste
+    /// une version synchronisée de même durée (280,0 s, album « N/A »). Elle
+    /// doit être retenue — et pas celles de 282,4 et 282,5 s, hors des ±2 s.
+    #[tokio::test]
+    async fn texte_brut_de_api_get_la_recherche_rend_la_version_synchronisee_de_meme_duree() {
+        let (base, journal) =
+            faux_lrclib(get_non_synchronise(), Some(resultats_pretty_face())).await;
+        let raw = chercher(&base).await;
+        assert_eq!(
+            raw.synced_lyrics.as_deref(),
+            Some(LRC_280),
+            "/api/get sans syncedLyrics : la version synchronisée de même durée \
+             trouvée par /api/search doit être retenue (#5248)"
+        );
+        assert!(!parse_lrc(raw.synced_lyrics.as_deref().unwrap()).is_empty());
+        assert_eq!(raw.plain_lyrics.as_deref(), Some(TEXTE_BRUT));
+
+        let j = journal.lock().unwrap().clone();
+        assert_eq!(j.len(), 2, "un get, une recherche, rien de plus : {j:?}");
+        assert!(j[0].starts_with("get?"), "{j:?}");
+        assert!(j[1].starts_with("search?"), "{j:?}");
+        assert!(
+            !j[1].contains("album_name"),
+            "la version de même durée est rangée sous un AUTRE album : la \
+             recherche ne doit pas filtrer sur l'album ({j:?})"
+        );
+    }
+
+    /// `/api/get` rend déjà du synchronisé : AUCUN appel de plus.
+    #[tokio::test]
+    async fn api_get_synchronise_aucune_recherche() {
+        let get = serde_json::json!({"trackName": "Pretty Face", "duration": 280.0,
+            "plainLyrics": TEXTE_BRUT, "syncedLyrics": LRC_282});
+        let (base, journal) = faux_lrclib(get, Some(resultats_pretty_face())).await;
+        let raw = chercher(&base).await;
+        assert_eq!(raw.synced_lyrics.as_deref(), Some(LRC_282));
+        let j = journal.lock().unwrap().clone();
+        assert_eq!(
+            j.len(),
+            1,
+            "aucune recherche quand get est synchronisé : {j:?}"
+        );
+    }
+
+    /// Aucune version synchronisée à ±2 s : le texte brut de `/api/get` est
+    /// rendu tel quel. Une version d'une autre durée dériverait.
+    #[tokio::test]
+    async fn aucune_version_synchronisee_a_deux_secondes_le_texte_brut_reste() {
+        let loin = serde_json::json!([
+            {"trackName": "Pretty Face", "albumName": "We Sink", "duration": 282.5,
+             "syncedLyrics": LRC_282},
+            {"trackName": "Pretty Face", "albumName": "We Sink", "duration": 277.9,
+             "syncedLyrics": LRC_282}
+        ]);
+        let (base, _) = faux_lrclib(get_non_synchronise(), Some(loin)).await;
+        let raw = chercher(&base).await;
+        assert_eq!(raw.synced_lyrics, None);
+        assert_eq!(raw.plain_lyrics.as_deref(), Some(TEXTE_BRUT));
+    }
+
+    /// La recherche tombe en panne : on garde ce que `/api/get` avait rendu.
+    #[tokio::test]
+    async fn panne_de_la_recherche_le_texte_brut_reste() {
+        let (base, journal) = faux_lrclib(get_non_synchronise(), None).await;
+        let raw = chercher(&base).await;
+        assert_eq!(raw.synced_lyrics, None);
+        assert_eq!(raw.plain_lyrics.as_deref(), Some(TEXTE_BRUT));
+        assert_eq!(journal.lock().unwrap().len(), 2);
+    }
+
+    /// La règle de choix : même titre exigé, puis le même album d'abord, puis
+    /// l'écart de durée le plus faible.
+    #[test]
+    fn le_choix_prefere_le_meme_album_puis_la_duree_la_plus_proche() {
+        let hits: Vec<LrclibSearchHit> = serde_json::from_value(serde_json::json!([
+            {"trackName": "Autre titre", "albumName": "We Sink", "duration": 280.0,
+             "syncedLyrics": LRC_280},
+            {"trackName": "Pretty Face", "albumName": "N/A", "duration": 280.0,
+             "syncedLyrics": LRC_280},
+            {"trackName": "pretty  face", "albumName": "We Sink", "duration": 281.5,
+             "syncedLyrics": LRC_282}
+        ]))
+        .unwrap();
+        let choisi =
+            choisir_la_version_synchronisee(&hits, "Pretty Face", Some("We Sink"), 280.0).unwrap();
+        assert_eq!(choisi.album_name.as_deref(), Some("We Sink"));
+        assert_eq!(choisi.duration, Some(281.5));
+        // Sans album connu : la durée la plus proche.
+        let choisi = choisir_la_version_synchronisee(&hits, "Pretty Face", None, 280.0).unwrap();
+        assert_eq!(choisi.album_name.as_deref(), Some("N/A"));
+        // Durée inconnue d'une entrée, ou titre différent : jamais retenue.
+        assert!(choisir_la_version_synchronisee(&hits[..1], "Pretty Face", None, 280.0).is_none());
     }
 }
