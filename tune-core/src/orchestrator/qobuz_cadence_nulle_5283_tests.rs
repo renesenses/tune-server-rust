@@ -222,11 +222,9 @@ async fn octets_de_la_session(orch: &PlaybackOrchestrator, sid: &str) -> Vec<u8>
         .cloned()
         .expect("session inscrite");
     let mut octets = Vec::new();
-    loop {
-        match tokio::time::timeout(Duration::from_secs(5), session.recv_chunk()).await {
-            Ok(Some(c)) => octets.extend_from_slice(&c),
-            Ok(None) | Err(_) => break,
-        }
+    while let Ok(Some(c)) = tokio::time::timeout(Duration::from_secs(5), session.recv_chunk()).await
+    {
+        octets.extend_from_slice(&c);
     }
     octets
 }
