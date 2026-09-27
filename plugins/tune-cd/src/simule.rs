@@ -23,6 +23,8 @@ struct Etat {
     ejection_apres: Option<u32>,
     appels: u32,
     ejecte: bool,
+    /// Le lecteur lui-même a disparu (#5161 : câble USB retiré).
+    debranche: bool,
 }
 
 pub struct LecteurSimule {
@@ -74,6 +76,11 @@ impl LecteurSimule {
         e.ejection_apres = None;
     }
 
+    /// Le lecteur est débranché : il se dit « aucun lecteur ».
+    pub fn debrancher(&self) {
+        self.etat.lock().unwrap().debranche = true;
+    }
+
     pub fn tentatives(&self, lba: u32) -> u32 {
         self.etat
             .lock()
@@ -91,7 +98,10 @@ impl LecteurDisque for LecteurSimule {
     }
 
     fn presence(&self) -> Presence {
-        if self.etat.lock().unwrap().ejecte {
+        let e = self.etat.lock().unwrap();
+        if e.debranche {
+            Presence::AucunLecteur
+        } else if e.ejecte {
             Presence::Vide
         } else {
             Presence::Disque
@@ -99,7 +109,8 @@ impl LecteurDisque for LecteurSimule {
     }
 
     fn lire_toc(&self) -> Result<Toc, ErreurCd> {
-        if self.etat.lock().unwrap().ejecte {
+        let e = self.etat.lock().unwrap();
+        if e.ejecte || e.debranche {
             return Err(ErreurCd::AucunDisque);
         }
         Ok(self.toc.clone())
@@ -111,7 +122,7 @@ impl LecteurDisque for LecteurSimule {
         if e.ejection_apres.is_some_and(|n| e.appels > n) {
             e.ejecte = true;
         }
-        if e.ejecte {
+        if e.ejecte || e.debranche {
             return Err(ErreurCd::AucunDisque);
         }
         if lba + nombre > self.toc.fin || sortie.len() != nombre as usize * OCTETS_PAR_SECTEUR {
