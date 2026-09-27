@@ -200,6 +200,114 @@ fn paires_depuis_groupe(critere: &'static str, groupe: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn ph(engine: Engine, i: usize) -> String {
+    match engine {
+        Engine::Sqlite => SqliteDialect.placeholder(i),
+        Engine::Postgres => PostgresDialect.placeholder(i),
+    }
+}
+
+/// Les deux côtés d'une paire sont LOCAUX — `t1` et `t2`.
+fn paire_locale() -> String {
+    format!(
+        "{} AND {}",
+        tune_core::db::track_repo::sql::est_local("t1"),
+        tune_core::db::track_repo::sql::est_local("t2"),
+    )
+}
+
+/// Faisceau `fichier_identique` : même `audio_hash`.
+///
+/// Les quatre requêtes de cette route sont sorties de leurs fonctions pour
+/// être **exécutables** par un témoin : une garde qui n'en comparerait que la
+/// chaîne serait satisfaite par sa propre cible et ne dirait rien des lignes
+/// rendues.
+fn sql_doublons_par_hachage(engine: Engine) -> String {
+    format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.audio_hash, t1.duration_ms,
+                t2.id, t2.file_path, ar2.name,
+                t1.format, t1.sample_rate, t1.bit_depth, t2.format, t2.sample_rate, t2.bit_depth
+         FROM tracks t1
+         JOIN tracks t2 ON t1.audio_hash = t2.audio_hash AND t1.id < t2.id
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+         WHERE {paire_locale}
+           AND t1.audio_hash IS NOT NULL AND t1.audio_hash != ''
+         LIMIT {lim} OFFSET {off}",
+        paire_locale = paire_locale(),
+        lim = ph(engine, 1),
+        off = ph(engine, 2),
+    )
+}
+
+/// Faisceau `etiquettes_identiques` : même titre, même durée, même artiste.
+///
+/// 🔴 Celui-ci n'exige AUCUN chemin de fichier — d'où la fuite mesurée sur le
+/// .18 (50 867 paires sur 52 204 impliquant une piste `upnp`).
+fn sql_doublons_par_etiquettes(engine: Engine) -> String {
+    format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms,
+                t2.id, t2.file_path, ar2.name,
+                t1.format, t1.sample_rate, t1.bit_depth, t2.format, t2.sample_rate, t2.bit_depth
+         FROM tracks t1
+         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title)
+                       AND t1.duration_ms = t2.duration_ms
+                       AND t1.id < t2.id
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+         WHERE {paire_locale}
+           AND LOWER(ar1.name) = LOWER(ar2.name)
+           AND (t1.audio_hash IS NULL OR t2.audio_hash IS NULL OR t1.audio_hash != t2.audio_hash)
+         LIMIT {lim} OFFSET {off}",
+        paire_locale = paire_locale(),
+        lim = ph(engine, 1),
+        off = ph(engine, 2),
+    )
+}
+
+/// Faisceau `contenu_identique` : les pistes porteuses d'une empreinte de
+/// contenu, regroupées ensuite en Rust.
+fn sql_pistes_a_empreinte_de_contenu() -> String {
+    format!(
+        "SELECT t.id, t.title, ar.name, t.file_path, t.duration_ms, t.format, t.sample_rate, \
+                t.bit_depth, t.audio_fingerprint \
+         FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE {piste_locale} AND t.audio_fingerprint IS NOT NULL",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+    )
+}
+
+/// `GET /library/duplicates/smart` — même titre, même artiste, durées à 3 s.
+fn sql_doublons_intelligents(engine: Engine) -> String {
+    format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms, t1.format, t1.sample_rate, t1.bit_depth, \
+                t2.id, t2.file_path, t2.duration_ms, t2.format, t2.sample_rate, t2.bit_depth, ar2.name \
+         FROM tracks t1 \
+         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title) AND t1.id < t2.id \
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id \
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id \
+         WHERE {paire_locale} \
+           AND LOWER(ar1.name) = LOWER(ar2.name) \
+           AND ABS(COALESCE(t1.duration_ms,0) - COALESCE(t2.duration_ms,0)) < 3000 \
+         LIMIT {lim} OFFSET {off}",
+        paire_locale = paire_locale(),
+        lim = ph(engine, 1),
+        off = ph(engine, 2),
+    )
+}
+
+/// `GET /library/duplicates` — les paires de doublons proposées à l'écran.
+///
+/// 🔴 Les trois faisceaux (hachage, métadonnées, contenu) ne regardent que la
+/// bibliothèque **LOCALE**, des DEUX côtés de la paire. Ce n'était le cas
+/// d'aucun : ni `t1` ni `t2` ne portaient de condition de source, et le
+/// faisceau « métadonnées » n'exige même pas de chemin de fichier — il
+/// suffisait d'un titre, d'une durée et d'un artiste identiques. Mesuré sur le
+/// .18 de Bertrand le 27/09/2026 : **52 204 paires rendues, dont 50 867
+/// (97,4 %) impliquant au moins une piste `source = 'upnp'`**. Ce n'était donc
+/// pas un défaut dormant ici, et la paire mène à
+/// `POST /library/duplicates/resolve`, qui RETIRE une piste de la
+/// bibliothèque.
 pub(super) async fn list_duplicates(
     State(state): State<AppState>,
     Query(p): Query<ParamsDoublons>,
@@ -208,25 +316,8 @@ pub(super) async fn list_duplicates(
     let offset = p.offset.unwrap_or(0);
     let filtre = critere_demande(p.critere.as_deref()).map_err(AppError::bad_request)?;
 
-    let make_ph = |i: usize| match state.backend.engine() {
-        Engine::Sqlite => SqliteDialect.placeholder(i),
-        Engine::Postgres => PostgresDialect.placeholder(i),
-    };
-
     // Duplicates by audio_hash
-    let hash_sql = format!(
-        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.audio_hash, t1.duration_ms,
-                t2.id, t2.file_path, ar2.name,
-                t1.format, t1.sample_rate, t1.bit_depth, t2.format, t2.sample_rate, t2.bit_depth
-         FROM tracks t1
-         JOIN tracks t2 ON t1.audio_hash = t2.audio_hash AND t1.id < t2.id
-         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
-         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
-         WHERE t1.audio_hash IS NOT NULL AND t1.audio_hash != ''
-         LIMIT {lim} OFFSET {off}",
-        lim = make_ph(1),
-        off = make_ph(2),
-    );
+    let hash_sql = sql_doublons_par_hachage(state.backend.engine());
     let limit_val = limit;
     let offset_val = offset;
     let hash_params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
@@ -269,22 +360,7 @@ pub(super) async fn list_duplicates(
         .collect();
 
     // Duplicates by (title + artist_name + duration_ms) where no hash match
-    let meta_sql = format!(
-        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms,
-                t2.id, t2.file_path, ar2.name,
-                t1.format, t1.sample_rate, t1.bit_depth, t2.format, t2.sample_rate, t2.bit_depth
-         FROM tracks t1
-         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title)
-                       AND t1.duration_ms = t2.duration_ms
-                       AND t1.id < t2.id
-         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
-         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
-         WHERE LOWER(ar1.name) = LOWER(ar2.name)
-           AND (t1.audio_hash IS NULL OR t2.audio_hash IS NULL OR t1.audio_hash != t2.audio_hash)
-         LIMIT {lim} OFFSET {off}",
-        lim = make_ph(1),
-        off = make_ph(2),
-    );
+    let meta_sql = sql_doublons_par_etiquettes(state.backend.engine());
     let meta_params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
     let meta_rows = state
         .backend
@@ -381,13 +457,10 @@ pub(super) async fn list_duplicates(
 /// colonne : liste vide, sans bruit. `limit`/`offset` portent sur les groupes.
 fn doublons_par_contenu(state: &AppState, limit: i64, offset: i64) -> Vec<Value> {
     use tune_core::audio::empreinte::{Empreinte, grouper_par_contenu};
-    let rows = match state.backend.query_many(
-        "SELECT t.id, t.title, ar.name, t.file_path, t.duration_ms, t.format, t.sample_rate, \
-                t.bit_depth, t.audio_fingerprint \
-         FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id \
-         WHERE t.audio_fingerprint IS NOT NULL",
-        &[],
-    ) {
+    let rows = match state
+        .backend
+        .query_many(&sql_pistes_a_empreinte_de_contenu(), &[])
+    {
         Ok(r) => r,
         Err(e) => {
             if !(e.contains("no such column") || e.contains("does not exist")) {
@@ -563,24 +636,7 @@ pub(super) async fn smart_duplicates(
     let limit = p.limit.unwrap_or(100);
     let offset = p.offset.unwrap_or(0);
 
-    let make_ph = |i: usize| match state.backend.engine() {
-        Engine::Sqlite => SqliteDialect.placeholder(i),
-        Engine::Postgres => PostgresDialect.placeholder(i),
-    };
-
-    let sql = format!(
-        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms, t1.format, t1.sample_rate, t1.bit_depth, \
-                t2.id, t2.file_path, t2.duration_ms, t2.format, t2.sample_rate, t2.bit_depth, ar2.name \
-         FROM tracks t1 \
-         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title) AND t1.id < t2.id \
-         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id \
-         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id \
-         WHERE LOWER(ar1.name) = LOWER(ar2.name) \
-           AND ABS(COALESCE(t1.duration_ms,0) - COALESCE(t2.duration_ms,0)) < 3000 \
-         LIMIT {lim} OFFSET {off}",
-        lim = make_ph(1),
-        off = make_ph(2),
-    );
+    let sql = sql_doublons_intelligents(state.backend.engine());
 
     let limit_val = limit;
     let offset_val = offset;
@@ -786,3 +842,191 @@ pub(super) mod tests_contenu;
 mod tests_empreintes;
 #[cfg(test)]
 mod tests_paires;
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+///
+/// Le faisceau « étiquettes identiques » est celui qui FUITAIT vraiment : il
+/// n'exige pas même de chemin de fichier, seulement un titre, une durée et un
+/// artiste communs. Sur le .18 de Bertrand, 50 867 des 52 204 paires rendues
+/// impliquaient au moins une piste `source = 'upnp'`.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use crate::state::AppState;
+
+    fn banc() -> AppState {
+        let s = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &s.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+            &[],
+        )
+        .expect("artiste");
+        // Deux copies LOCALES, et deux copies DISTANTES — toutes quatre avec un
+        // chemin de fichier, même titre, même durée, même artiste.
+        for (id, chemin, source) in [
+            (1i64, "/m/a/so-what.flac", "local"),
+            (2, "/m/b/so-what.flac", "local"),
+            (3, "/u/a/so-what.flac", "upnp"),
+            (4, "/u/b/so-what.flac", "upnp"),
+        ] {
+            let c = chemin.to_string();
+            let src = source.to_string();
+            b.execute(
+                "INSERT INTO tracks (id, title, artist_id, file_path, duration_ms, source) \
+                 VALUES (?1, 'So What', 1, ?2, 545000, ?3)",
+                &[&id as &dyn ToSqlValue, &c, &src],
+            )
+            .expect("piste");
+        }
+        s
+    }
+
+    /// Les identifiants cités par le faisceau « étiquettes identiques ».
+    async fn ids_par_etiquettes(s: &AppState) -> Vec<i64> {
+        let p = ParamsDoublons {
+            limit: Some(500),
+            offset: Some(0),
+            critere: Some("etiquettes_identiques".to_string()),
+        };
+        // `AppError` n'implémente pas `Debug` : on déplie à la main plutôt que
+        // par `expect`.
+        let Ok(Json(v)) = list_duplicates(State(s.clone()), Query(p)).await else {
+            panic!("la route doit répondre");
+        };
+        let mut ids = Vec::new();
+        for ligne in v["duplicates"]["by_metadata"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            for cle in ["id", "dup_id"] {
+                if let Some(n) = ligne[cle].as_i64() {
+                    ids.push(n);
+                }
+            }
+        }
+        ids
+    }
+
+    /// 🔴 Une piste non locale QUI PORTE UN CHEMIN n'est pas proposée à la
+    /// suppression. La paire mène à `POST /library/duplicates/resolve`, qui
+    /// RETIRE une piste de la bibliothèque.
+    #[tokio::test]
+    async fn les_paires_ecartent_le_non_local_qui_porte_un_chemin() {
+        let s = banc();
+        let ids = ids_par_etiquettes(&s).await;
+        for distant in [3i64, 4] {
+            assert!(
+                !ids.contains(&distant),
+                "la piste {distant} est `source = upnp` : elle ne doit PAS être \
+                 proposée comme doublon — cités {ids:?}"
+            );
+        }
+    }
+
+    /// Les identifiants que rend une requête de PAIRE (`t1`, `t2`).
+    fn ids_de_paires(s: &AppState, sql: &str) -> Vec<i64> {
+        let (lim, off) = (500i64, 0i64);
+        let params: &[&dyn ToSqlValue] = &[&lim, &off];
+        let mut ids = Vec::new();
+        for r in s.backend.query_many(sql, params).expect("requête") {
+            // `t1.id` est la 1re colonne des deux requêtes de paire ; `t2.id`
+            // est la 7e pour le hachage, la 6e pour les étiquettes, la 9e pour
+            // la variante « intelligente ». On ramasse toutes les colonnes
+            // entières plausibles : le témoin porte sur la PRÉSENCE d'une
+            // piste distante, pas sur la position d'une colonne.
+            for v in r.iter() {
+                if let Some(n) = v.as_i64()
+                    && (1..=4).contains(&n)
+                {
+                    ids.push(n);
+                }
+            }
+        }
+        ids
+    }
+
+    /// 🔴 Faisceau `fichier_identique` : même `audio_hash`.
+    #[test]
+    fn le_hachage_ecarte_le_non_local_et_garde_le_local() {
+        let s = banc();
+        s.backend
+            .execute("UPDATE tracks SET audio_hash = 'abc'", &[])
+            .expect("hachage");
+        let ids = ids_de_paires(&s, &sql_doublons_par_hachage(s.backend.engine()));
+        for distant in [3i64, 4] {
+            assert!(
+                !ids.contains(&distant),
+                "la piste {distant} est `source = upnp` : elle ne doit PAS être \
+                 appariée par hachage — cités {ids:?}"
+            );
+        }
+        assert!(
+            ids.contains(&1) && ids.contains(&2),
+            "les deux copies LOCALES doivent rester appariées — cités {ids:?}"
+        );
+    }
+
+    /// 🔴 Faisceau `contenu_identique` : les pistes à empreinte de contenu.
+    #[test]
+    fn le_contenu_ecarte_le_non_local_et_garde_le_local() {
+        let s = banc();
+        s.backend
+            .execute(
+                "UPDATE tracks SET audio_fingerprint = 'env100ms-v1:0000'",
+                &[],
+            )
+            .expect("empreinte");
+        let ids: Vec<i64> = s
+            .backend
+            .query_many(&sql_pistes_a_empreinte_de_contenu(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        for distant in [3i64, 4] {
+            assert!(
+                !ids.contains(&distant),
+                "la piste {distant} est `source = upnp` : son contenu ne doit \
+                 PAS être comparé — rendues {ids:?}"
+            );
+        }
+        assert!(
+            ids.contains(&1) && ids.contains(&2),
+            "les copies LOCALES doivent rester comparées — rendues {ids:?}"
+        );
+    }
+
+    /// 🔴 `GET /library/duplicates/smart` — hors des dix-neuf routes de la
+    /// demande, mais c'est la MÊME liste de doublons, servie autrement.
+    #[test]
+    fn les_doublons_intelligents_ecartent_le_non_local_et_gardent_le_local() {
+        let s = banc();
+        let ids = ids_de_paires(&s, &sql_doublons_intelligents(s.backend.engine()));
+        for distant in [3i64, 4] {
+            assert!(
+                !ids.contains(&distant),
+                "la piste {distant} est `source = upnp` : elle ne doit PAS être \
+                 proposée — cités {ids:?}"
+            );
+        }
+        assert!(
+            ids.contains(&1) && ids.contains(&2),
+            "les copies LOCALES doivent rester proposées — cités {ids:?}"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[tokio::test]
+    async fn les_paires_gardent_les_copies_locales() {
+        let s = banc();
+        let ids = ids_par_etiquettes(&s).await;
+        for local in [1i64, 2] {
+            assert!(
+                ids.contains(&local),
+                "la copie LOCALE {local} doit rester proposée — cités {ids:?}"
+            );
+        }
+    }
+}

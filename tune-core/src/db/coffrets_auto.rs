@@ -139,12 +139,23 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 /// 🔴 `MIN(file_path)` : les disques d'un coffret n'ont qu'un dossier chacun,
 /// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
 /// l'autre. `MAX` ne sert qu'à savoir si l'album tient dans un seul dossier.
-const SQL_ALBUMS_ET_DOSSIERS: &str = "\
-    SELECT t.album_id, al.title, MIN(t.file_path), MAX(t.file_path), al.artist_id, ar.name \
-    FROM tracks t JOIN albums al ON al.id = t.album_id \
-    LEFT JOIN artists ar ON ar.id = al.artist_id \
-    WHERE t.file_path IS NOT NULL AND t.file_path <> '' \
-    GROUP BY t.album_id, al.title, al.artist_id, ar.name";
+///
+/// 🔴 `COALESCE(t.source, 'local') = 'local'` — et pas le chemin de fichier
+/// seul. Le chemin n'est pas un substitut de la source : rien n'interdit à une
+/// source distante d'en porter un, et cet inventaire alimente à la fois
+/// l'écran des coffrets éclatés, le geste de regroupement et la passe
+/// automatique ([`passe`]), qui RÉUNIT des albums. Voir
+/// [`tune_core::db::track_repo::sql::est_local`] pour le choix de la forme.
+fn sql_albums_et_dossiers() -> String {
+    format!(
+        "SELECT t.album_id, al.title, MIN(t.file_path), MAX(t.file_path), al.artist_id, ar.name \
+         FROM tracks t JOIN albums al ON al.id = t.album_id \
+         LEFT JOIN artists ar ON ar.id = al.artist_id \
+         WHERE {piste_locale} AND t.file_path IS NOT NULL AND t.file_path <> '' \
+         GROUP BY t.album_id, al.title, al.artist_id, ar.name",
+        piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+    )
+}
 
 pub fn marqueurs(db: &Arc<dyn DbBackend>) -> Result<HashMap<i64, Marqueur>, TuneError> {
     let (p1, _) = placeholders(db);
@@ -165,7 +176,7 @@ pub fn marqueurs(db: &Arc<dyn DbBackend>) -> Result<HashMap<i64, Marqueur>, Tune
 pub fn inventaire(db: &Arc<dyn DbBackend>) -> Result<Inventaire, TuneError> {
     let mut albums = Vec::new();
     let mut plusieurs_dossiers = HashSet::new();
-    for r in db.query_many(SQL_ALBUMS_ET_DOSSIERS, &[])? {
+    for r in db.query_many(&sql_albums_et_dossiers(), &[])? {
         let Some(id) = r.first().and_then(|v| v.as_i64()) else {
             continue;
         };
@@ -532,13 +543,20 @@ pub struct CoffretListe {
 /// ⚠️ Le second critère exclut à dessein le double album rangé dans UN
 /// dossier (pistes 1-01 à 2-12) : c'est un album, pas un coffret rangé disque
 /// par disque. Les albums masqués (#1391) n'y figurent pas.
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, et cela se lit sur la SOURCE des
+/// deux côtés — la piste ET l'album. Le chemin de fichier ne tenait pas ce
+/// rôle : une source distante peut en porter un.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
     let sql = format!(
         "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN(t.file_path), MAX(t.file_path) \
          FROM tracks t JOIN albums a ON a.id = t.album_id \
-         WHERE t.file_path IS NOT NULL AND t.file_path <> '' AND {} \
+         WHERE {piste_locale} AND {album_local} \
+           AND t.file_path IS NOT NULL AND t.file_path <> '' AND {caches} \
          GROUP BY t.album_id",
-        super::facet_filter::hidden_albums_excluded()
+        piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        album_local = crate::db::track_repo::sql::est_local("a"),
+        caches = super::facet_filter::hidden_albums_excluded()
     );
     let marques = marqueurs(db)?;
     let mut rendu = Vec::new();

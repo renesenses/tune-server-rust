@@ -620,6 +620,35 @@ pub mod sql {
     /// [`chemin_ouvrable`] sous forme de constante, pour les projections.
     pub const CHEMIN_OUVRABLE: &str = chemin_ouvrable!();
 
+    /// Le prédicat « cette ligne appartient à la bibliothèque LOCALE ».
+    ///
+    /// 🔴 Une seule écriture pour tout le dépôt, parce que les deux formes
+    /// possibles ne disent pas la même chose :
+    ///
+    /// - `source = 'local'` **nu** écarte en silence les lignes anciennes dont
+    ///   la colonne est `NULL`. La colonne est `TEXT DEFAULT 'local'` mais
+    ///   reste **nullable**, sur SQLite comme sur PostgreSQL : une ligne
+    ///   écrite avant que le défaut existe porte `NULL` et est pourtant
+    ///   locale ;
+    /// - `COALESCE(source, 'local') = 'local'` la garde. C'est la forme
+    ///   retenue, déjà celle de `identification_lot` et de
+    ///   `compositeur_depuis_credits`.
+    ///
+    /// ⛔ Ce prédicat ne remplace pas [`A_UN_FICHIER`], il s'y ajoute : « la
+    /// ligne est locale » et « le fichier est ouvrable » sont deux questions.
+    /// Le chemin de fichier n'a JAMAIS été un substitut de la source — rien
+    /// n'interdit à une source distante d'en porter un.
+    ///
+    /// `COALESCE` et la comparaison de chaînes valent à l'identique sur les
+    /// deux moteurs ; aucun paramètre n'est lié, donc aucun risque de
+    /// divergence de typage.
+    pub fn est_local(alias: &str) -> String {
+        format!("COALESCE({alias}.source, 'local') = 'local'")
+    }
+
+    /// [`est_local`] pour l'alias `t`, celui des requêtes de pistes.
+    pub const PISTE_LOCALE: &str = "COALESCE(t.source, 'local') = 'local'";
+
     /// Le corps `FROM` des requêtes de pistes, sans la projection.
     ///
     /// Isolé pour que les COMPTAGES portent les MÊMES jointures que la liste
@@ -2958,14 +2987,38 @@ impl TrackRepo {
         Ok((ids, total))
     }
 
+    /// Le PRÉDICAT « cette piste est douteuse », partagé par le compte et la
+    /// liste — sans quoi la barre de l'écran métadonnées annoncerait un total
+    /// que la liste ne peut pas rendre.
+    ///
+    /// 🔴 La bibliothèque **LOCALE** seulement. Ici, contrairement aux autres
+    /// passes de l'écran, il n'y avait *aucun* filtre — ni source, ni chemin de
+    /// fichier. Mesuré sur le .18 de Bertrand le 27/09/2026 : **3 931 pistes
+    /// rendues, dont 2 418 `source = 'upnp'`**. La liste alimente
+    /// `POST /metadata/batch/artist` ; réparer l'artiste d'une piste d'un
+    /// serveur UPnP n'a pas de sens, le prochain rafraîchissement l'efface.
+    ///
+    /// ⚠️ Le prédicat douteux est une chaîne de `OR` : la condition de source
+    /// est jointe par `AND` **autour de la parenthèse entière**. Sans elle,
+    /// `A AND B OR C OR D` se lirait `(A AND B) OR C OR D` et ne filtrerait
+    /// rien du tout.
+    fn where_doubtful() -> String {
+        format!(
+            "WHERE {piste_locale} \
+               AND ((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
+                OR (al.title IS NULL OR al.title = ''))",
+            piste_locale = sql::PISTE_LOCALE,
+        )
+    }
+
     pub fn count_doubtful(&self) -> Result<i64, TuneError> {
         let sql = format!(
             "SELECT COUNT(*) FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              LEFT JOIN albums al ON t.album_id = al.id \
-             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = '')"
+             {}",
+            Self::where_doubtful()
         );
         Ok(self
             .db
@@ -2981,12 +3034,9 @@ impl TrackRepo {
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "{} \
-             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = '') \
-             ORDER BY t.id LIMIT {} OFFSET {}",
+            "{} {} ORDER BY t.id LIMIT {} OFFSET {}",
             sql::select_track(),
+            Self::where_doubtful(),
             make_ph(1),
             make_ph(2)
         );
@@ -5529,5 +5579,110 @@ mod tests {
             "{sql}"
         );
         assert!(sql.ends_with("WHERE id = $25"), "{sql}");
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » sur la liste des pistes
+/// douteuses — Bertrand, 27/09/2026.
+///
+/// 🔴 Ici, contrairement aux autres passes de l'écran métadonnées, il n'y
+/// avait AUCUN filtre : ni source, ni chemin de fichier. Le défaut n'était pas
+/// dormant — mesuré sur le .18 le 27/09/2026 : 3 931 pistes rendues, dont
+/// 2 418 `source = 'upnp'`.
+#[cfg(test)]
+mod tests_doubtful_source_locale_20260927 {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    fn banc() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Ultimate')", &[])
+            .unwrap();
+        // Trois pistes SANS artiste, donc douteuses toutes les trois : une
+        // locale, une à `source` NULL (ligne ancienne, locale), une `upnp` —
+        // et la distante porte un chemin, le cas absent de la base de Bertrand.
+        for (id, chemin, source) in [
+            (1i64, "/m/ultimate/01.m4a", Some("local")),
+            (2, "/m/ultimate/02.m4a", None),
+            (3, "/u/ultimate/03.m4a", Some("upnp")),
+        ] {
+            let c = chemin.to_string();
+            match source {
+                Some(s) => {
+                    let s = s.to_string();
+                    db.execute(
+                        "INSERT INTO tracks (id, title, album_id, file_path, source, duration_ms) \
+                         VALUES (?1, ?2, 1, ?3, ?4, 300000)",
+                        &[&id as &dyn ToSqlValue, &format!("p{id}"), &c, &s],
+                    )
+                    .unwrap();
+                }
+                None => {
+                    db.execute(
+                        "INSERT INTO tracks (id, title, album_id, file_path, source, duration_ms) \
+                         VALUES (?1, ?2, 1, ?3, NULL, 300000)",
+                        &[&id as &dyn ToSqlValue, &format!("p{id}"), &c],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        db
+    }
+
+    #[test]
+    fn la_liste_ecarte_une_piste_non_locale_qui_porte_un_chemin() {
+        let repo = TrackRepo::with_backend(banc());
+        let ids: Vec<i64> = repo
+            .list_doubtful(100, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.id)
+            .collect();
+        assert!(
+            !ids.contains(&3),
+            "la piste 3 est `source = upnp` : elle ne doit PAS être proposée à \
+             la réparation d'artiste — rendues {ids:?}"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn la_liste_garde_le_local_y_compris_une_source_nulle() {
+        let repo = TrackRepo::with_backend(banc());
+        let ids: Vec<i64> = repo
+            .list_doubtful(100, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.id)
+            .collect();
+        assert!(
+            ids.contains(&1),
+            "la piste LOCALE 1 doit rester proposée — rendues {ids:?}"
+        );
+        assert!(
+            ids.contains(&2),
+            "une ligne ANCIENNE à `source` NULL est locale — rendues {ids:?}"
+        );
+    }
+
+    /// 🔴 Le COMPTE et la LISTE portent le même prédicat, sinon la barre de
+    /// l'écran annonce un total que la liste ne peut pas rendre.
+    #[test]
+    fn le_compte_et_la_liste_disent_la_meme_chose() {
+        let repo = TrackRepo::with_backend(banc());
+        let liste = repo.list_doubtful(100, 0).unwrap().len() as i64;
+        assert_eq!(
+            repo.count_doubtful().unwrap(),
+            liste,
+            "le compte doit valoir la liste"
+        );
+        assert_eq!(liste, 2, "les deux pistes locales, pas la distante");
     }
 }
