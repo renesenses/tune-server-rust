@@ -227,7 +227,7 @@ async fn i4836_le_surveillant_remonte_le_label_du_fichier_qu_il_range() {
             unsupported: None,
             audio_hash: None,
             file_size: 1234,
-            mtime: 1,
+            mtime: 1.0,
         };
     // Le chemin du surveillant : `ChangeType::Added`, puis `Modified`
     // (suppression de l'ancienne ligne, relecture, réinsertion).

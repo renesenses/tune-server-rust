@@ -71,7 +71,7 @@ use tune_server::routes::system::scan::{CarteDesChemins, VerdictEcriture, verdic
 /// L'album d'Alain : quatorze pistes.
 const PISTES_DE_L_ALBUM: usize = 14;
 /// Ce que le parcours a lu sur le disque pour chacune.
-const MTIME_DISQUE: u64 = 1_754_635_989;
+const MTIME_DISQUE: f64 = 1_754_635_989.0;
 const TAILLE_DISQUE: u64 = 41_236_112;
 
 /// Une base SQLite SUR DISQUE, écrite puis relue : le schéma éprouvé est celui
@@ -123,7 +123,7 @@ fn poser_les_lignes_importees(repo: &TrackRepo, chemins: &[String]) {
 fn piste_lue_sur_le_disque(chemin: &str, titre: &str) -> Track {
     let mut piste = Track::new(titre.to_string());
     piste.file_path = Some(chemin.to_string());
-    piste.file_mtime = Some(MTIME_DISQUE as f64);
+    piste.file_mtime = Some(MTIME_DISQUE);
     piste.file_size = Some(TAILLE_DISQUE as i64);
     piste
 }
@@ -286,7 +286,13 @@ fn temoin_un_scan_sans_conflit_ne_change_pas_de_comportement() {
     // puisque la ligne était déjà locale. Le drapeau `adopter` ne doit pas être
     // un « vrai » constant : il commanderait alors une écriture inutile sur
     // toute la bibliothèque à chaque scan.
-    match verdict_ecriture(&chemins[0], MTIME_DISQUE + 60, TAILLE_DISQUE, false, &carte) {
+    match verdict_ecriture(
+        &chemins[0],
+        MTIME_DISQUE + 60.0,
+        TAILLE_DISQUE,
+        false,
+        &carte,
+    ) {
         VerdictEcriture::MettreAJour { adopter, .. } => assert!(
             !adopter,
             "une ligne déjà locale n'a personne à qui être reprise"

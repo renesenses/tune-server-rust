@@ -121,7 +121,7 @@ fn jouer(racine: &std::path::Path, pistes: &[Piste]) -> Vec<Verdict> {
             unsupported: None,
             audio_hash: Some(format!("hash-{}-{}", p.dossier, p.fichier)),
             file_size: 4096,
-            mtime: 1_700_000_000,
+            mtime: 1_700_000_000.0,
         });
     }
 
