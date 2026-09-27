@@ -1370,6 +1370,10 @@ fn settle_partition(
 }
 
 #[cfg(test)]
+#[path = "copie_albums_tests_5223.rs"]
+mod copie_albums_tests_5223;
+
+#[cfg(test)]
 mod registre_du_scan_tests {
     /// Le scan de demarrage inscrit son execution au registre (#2080) sur
     /// TOUTES ses sorties. Les deux sorties anticipees comptent autant que la
@@ -2931,7 +2935,3 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
-
-#[cfg(test)]
-#[path = "copie_albums_tests_5223.rs"]
-mod copie_albums_tests_5223;
