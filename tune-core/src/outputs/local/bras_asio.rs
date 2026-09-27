@@ -1034,6 +1034,8 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
             // Chemin exclusif mono-piste : durée non transmise, erreur de
             // lecture = fin de flux comme avant (fil 1915 hors périmètre).
             duree_de_la_piste_ms: &super::DUREE_DE_PISTE_INCONNUE,
+            // #4384 — bras exclusif : crête-mètre sur son estimation d'avant.
+            cretes_de_sortie: None,
         };
         let mut compteurs = CompteursDePiste {
             total_bytes_read: 0,

@@ -374,13 +374,31 @@ fn spawn_paced_levels_forwarder(
             // mesure inchangée.
             let gain_units = playback.gain_de_sortie_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
-            let lvl = crate::audio::levels::compute_levels_avec_gain(
+            let mut lvl = crate::audio::levels::compute_levels_avec_gain(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
                 gain,
             );
+            // #4384 — la CRÊTE, elle, se lit sur les échantillons tels qu'ils
+            // partent vers le DAC quand la sortie locale les a relevés : après
+            // égaliseur, convolveur, crossfeed et repli mono, qu'aucun gain
+            // scalaire ne résume (une bande à −12 dB sur la fréquence de la
+            // crête la baisse de 12 dB, le gain moyen de la courbe à peine).
+            // Seul reste à appliquer le gain de rendu — PAS le gain moyen du
+            // DSP, déjà dans les échantillons. Bornée à la pleine échelle :
+            // c'est tout ce que le DAC peut recevoir.
+            let debut_ms = position.as_secs_f64() * 1000.0;
+            if let Some((gauche, droite)) = playback.crete_de_sortie(
+                zone_id,
+                debut_ms,
+                debut_ms + window.as_secs_f64() * 1000.0,
+            ) {
+                let rendu = f64::from(playback.gain_de_rendu_units(zone_id)) / 1000.0;
+                lvl.peak_left = (gauche * rendu).min(1.0);
+                lvl.peak_right = (droite * rendu).min(1.0);
+            }
             let (peak_hold_left_db, peak_hold_right_db) =
                 peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
             bus.emit(
@@ -407,8 +425,9 @@ fn spawn_paced_levels_forwarder(
                     // (#1694) : un client ancien l'ignore, un client neuf y
                     // lit le transitoire même s'il a raté la trame qui le
                     // portait. Sample peak, sur la même échelle que
-                    // `peak_*_db` : gain de sortie compris (#4384), traitements
-                    // non scalaires de `apply_local_dsp` exclus.
+                    // `peak_*_db` : gain de sortie compris (#4384), et sur une
+                    // sortie locale qui les relève, les traitements non
+                    // scalaires d'`apply_local_dsp` aussi.
                     "peak_hold_left_db": peak_hold_left_db,
                     "peak_hold_right_db": peak_hold_right_db,
                     // Gain DÉJÀ compris dans tous les champs ci-dessus, en dB
@@ -1668,6 +1687,9 @@ mod double_dsp_dsf_aac_sortie_locale_tests;
 #[cfg(test)]
 mod mesure_saut_cd_5079;
 
+/// #4384 — la crête d'une zone locale se lit après son DSP.
+#[cfg(test)]
+mod crete_apres_dsp_4384;
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]
