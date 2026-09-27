@@ -3914,14 +3914,22 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     sortie.set_crossfeed(Some(cf));
 
     let perte = eq_db + cf_db;
+    // #5227 — la part de l'égaliseur est portée par l'égaliseur lui-même
+    // (elle doit traverser l'anneau avec son préampli) : le volume ne rend
+    // plus que celle du crossfeed, et le produit rendu est inchangé.
+    let porte = sortie.compensation_portee_par_l_eq();
+    assert!(
+        (20.0 * porte.log10() + eq_db).abs() < 0.01,
+        "l'égaliseur porte sa propre compensation : {porte}"
+    );
     let rendu = gain.load(Ordering::SeqCst) as i64;
     assert!(
-        (rendu - millemes(-20.0 - perte)).abs() <= 1,
-        "volume effectif {rendu} ‰, attendu {} ‰ (−20 dB + {:.2} dB rendus)",
-        millemes(-20.0 - perte),
-        -perte
+        (rendu - millemes(-20.0 - cf_db)).abs() <= 1,
+        "volume effectif {rendu} ‰, attendu {} ‰ (−20 dB + {:.2} dB rendus par le volume)",
+        millemes(-20.0 - cf_db),
+        -cf_db
     );
-    assert!((i64::from(dsp.load(Ordering::SeqCst)) - millemes(perte)).abs() <= 1);
+    assert!((i64::from(dsp.load(Ordering::SeqCst)) - millemes(cf_db)).abs() <= 1);
     // L'aiguille : volume × compensation × gain moyen du DSP = le curseur.
     let aiguille = i64::from(mesure.gain_de_sortie_units(7));
     assert!(
@@ -3932,7 +3940,10 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     // Interrupteur ouvert → le volume redevient le curseur, et l'aiguille
     // montre la perte du DSP.
     sortie.set_compensation_de_niveau(false);
-    assert_eq!(gain.load(Ordering::SeqCst), 100);
+    // Ce que l'égaliseur porte déjà est retiré du volume : rendu total =
+    // le curseur seul.
+    let rendu = gain.load(Ordering::SeqCst) as i64;
+    assert!((rendu - millemes(-20.0 + eq_db)).abs() <= 1, "{rendu} ‰");
     let aiguille = i64::from(mesure.gain_de_sortie_units(7));
     assert!(
         (aiguille - millemes(-20.0 + perte)).abs() <= 1,
@@ -3942,7 +3953,11 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     // Volume plein : la compensation est rabotée à l'unité, jamais au-delà.
     sortie.set_compensation_de_niveau(true);
     sortie.set_volume(1.0).await.expect("set_volume");
-    assert_eq!(gain.load(Ordering::SeqCst), 1000, "raboté à l'unité");
+    let rendu = gain.load(Ordering::SeqCst) as i64;
+    assert!(
+        (rendu - millemes(eq_db)).abs() <= 1,
+        "raboté à l'unité, part portée par l'égaliseur retirée : {rendu} ‰"
+    );
 
     // PURE : DSP contourné, rien à compenser ni à retrancher de la mesure.
     sortie.set_volume(0.1).await.expect("set_volume");
@@ -4046,6 +4061,8 @@ fn crete_5215(signal: &[f32]) -> f32 {
 #[test]
 fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
     let sortie = LocalOutput::new("Casque".to_string());
+    // Le fondu du filtre seul : la compensation (#5227) a son témoin à part.
+    sortie.set_compensation_de_niveau(false);
     let eq = egaliseur_a_preampli_negatif_5215();
     let preampli = eq.preamp_db(0).expect("préampli chiffré");
     assert!(
@@ -4093,6 +4110,7 @@ fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
 #[test]
 fn reactiver_l_egaliseur_en_vol_descend_au_niveau_du_preampli_par_une_rampe_5215() {
     let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
     let mut trame = 0;
     let mut signal = jouer_5215(&sortie, &mut trame, 51);
     let eq = egaliseur_a_preampli_negatif_5215();
@@ -4129,5 +4147,129 @@ fn en_pure_la_coupure_ne_laisse_rien_de_monte_5215() {
     assert!(
         sortie.eq.lock().unwrap().is_none(),
         "PURE : aucune rampe, aucun égaliseur neutre resté monté"
+    );
+}
+
+// -----------------------------------------------------------------------
+// #5227 — compensation active, volume sous 100 % : pas de bouffée
+//
+// L'égaliseur s'applique AVANT l'anneau (~2 s de profondeur), le volume au
+// rappel, APRÈS. La compensation rendue par le volume remontait donc le
+// niveau aussitôt, alors que le préampli qu'elle compense n'arrivait au DAC
+// qu'une latence d'anneau plus tard : ~+12 dB pendant ce délai. Le témoin
+// rejoue cette géométrie : la sortie d'`apply_local_dsp` traverse une file de
+// `LATENCE_5227` paquets, puis est multipliée par le volume lu AU MOMENT où
+// le rappel la joue.
+// -----------------------------------------------------------------------
+
+const LATENCE_5227: usize = 100;
+
+/// Égaliseur dont la compensation est quasi exacte à 40 Hz : une crête
+/// étroite tout en haut du spectre, donc un niveau moyen ≈ le préampli.
+fn egaliseur_compensable_5227() -> crate::audio::eq::EqProcessor {
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 18_000.0,
+            gain: 12.0,
+            q: 4.0,
+            band_type: "peak".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::audio::eq::EqProcessor::new(&profil, TAUX_5215, 2)
+}
+
+/// Joue `paquets` paquets à travers la chaîne, puis l'anneau simulé, et rend
+/// la voie gauche telle que le DAC la reçoit.
+fn jouer_avec_anneau_5227(
+    sortie: &LocalOutput,
+    anneau: &mut std::collections::VecDeque<Vec<f32>>,
+    trame: &mut usize,
+    paquets: usize,
+) -> Vec<f32> {
+    let mut dac = Vec::new();
+    for _ in 0..paquets {
+        anneau.push_back(jouer_5215(sortie, trame, 1));
+        if anneau.len() > LATENCE_5227 {
+            let paquet = anneau.pop_front().unwrap();
+            let v = sortie.gain_de_rendu().load(Ordering::SeqCst) as f32 / 1000.0;
+            dac.extend(paquet.iter().map(|s| s * v));
+        }
+    }
+    dac
+}
+
+async fn bascule_compensee_5227(activer: bool) -> (f32, f32, f32) {
+    use crate::outputs::traits::OutputTarget;
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(true);
+    sortie.set_volume(0.1).await.expect("set_volume");
+    if !activer {
+        sortie.set_eq(Some(egaliseur_compensable_5227()));
+    }
+    let mut anneau = std::collections::VecDeque::new();
+    let mut trame = 0;
+    // Anneau plein, régime établi.
+    let avant = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 30);
+    let niveau_avant = crete_5215(&avant[avant.len() - 1200..]);
+    sortie.replace_eq_live(activer.then(egaliseur_compensable_5227));
+    // La bascule traverse l'anneau, puis la rampe finit.
+    let pendant = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 60);
+    let niveau_final = crete_5215(&pendant[pendant.len() - 1200..]);
+    (niveau_avant, crete_5215(&pendant), niveau_final)
+}
+
+#[tokio::test]
+async fn activer_l_egaliseur_compense_ne_fait_aucune_bouffee_5227() {
+    let (avant, pire, fin) = bascule_compensee_5227(true).await;
+    eprintln!("activation : avant {avant}, pire {pire}, final {fin}");
+    assert!(
+        (fin - 0.05).abs() < 0.005,
+        "compensé, à −20 dB, le niveau final est celui d'avant l'EQ : {fin}"
+    );
+    assert!(
+        pire <= avant.max(fin) * 1.05,
+        "bouffée à l'activation : crête {pire} pendant la bascule, \
+         régimes {avant} → {fin}"
+    );
+}
+
+#[tokio::test]
+async fn couper_l_egaliseur_compense_ne_fait_aucune_bouffee_5227() {
+    let (avant, pire, fin) = bascule_compensee_5227(false).await;
+    eprintln!("coupure : avant {avant}, pire {pire}, final {fin}");
+    assert!((fin - 0.05).abs() < 0.005, "sans EQ, −20 dB : {fin}");
+    assert!(
+        pire <= avant.max(fin) * 1.05,
+        "bouffée à la coupure : crête {pire} pendant la bascule, \
+         régimes {avant} → {fin}"
+    );
+}
+
+/// L'interrupteur de compensation basculé EQ en place ne touche que le
+/// volume : ce qui est déjà dans l'anneau garde son niveau, pas de bouffée.
+#[tokio::test]
+async fn l_interrupteur_de_compensation_ne_fait_aucune_bouffee_5227() {
+    use crate::outputs::traits::OutputTarget;
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_volume(0.1).await.expect("set_volume");
+    sortie.set_eq(Some(egaliseur_compensable_5227()));
+    let mut anneau = std::collections::VecDeque::new();
+    let mut trame = 0;
+    let avant = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 30);
+    let niveau_avant = crete_5215(&avant[avant.len() - 1200..]);
+    sortie.set_compensation_de_niveau(false);
+    let pendant = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 60);
+    let pire = crete_5215(&pendant);
+    let fin = crete_5215(&pendant[pendant.len() - 1200..]);
+    assert!(
+        fin < niveau_avant * 0.5,
+        "compensation retirée, le préampli s'entend : {fin}"
+    );
+    assert!(
+        pire <= niveau_avant * 1.05,
+        "bouffée à l'interrupteur : {pire} > {niveau_avant}"
     );
 }

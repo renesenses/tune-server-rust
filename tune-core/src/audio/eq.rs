@@ -43,6 +43,10 @@ pub struct EqProcessor {
     sample_rate: u32,
     channels: u16,
     fondu: Option<Fondu>,
+    /// #5227 — gain linéaire appliqué APRÈS le filtre : la compensation de
+    /// niveau, portée par l'égaliseur au lieu du volume. Voir
+    /// [`Self::porter_la_compensation`].
+    compensation: f32,
     /// #4685 — niveau moyen du filtre, réserve comprise, calculé UNE fois à
     /// la construction (voir [`Self::gain_moyen_db`]).
     gain_moyen_db: f64,
@@ -96,6 +100,7 @@ impl EqProcessor {
             sample_rate,
             channels,
             fondu: None,
+            compensation: 1.0,
             gain_moyen_db,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
@@ -108,6 +113,7 @@ impl EqProcessor {
             sample_rate,
             channels,
             fondu: None,
+            compensation: 1.0,
             gain_moyen_db: 0.0,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
@@ -181,6 +187,31 @@ impl EqProcessor {
         preamp.max((self.gain_moyen_db - autre.gain_moyen_db).abs())
     }
 
+    /// #5227 — faire porter la compensation de niveau par CET égaliseur.
+    ///
+    /// Rendue par le volume, la compensation changeait au paquet suivant du
+    /// RAPPEL, alors que l'égaliseur s'applique avant l'anneau : à
+    /// l'activation, le volume remontait ~2 s avant que le préampli ne soit
+    /// entendu — une bouffée de +12 dB. Multipliée ici, dans le même
+    /// échantillon que le filtre, elle traverse l'anneau AVEC lui, et chaque
+    /// côté du fondu de [`Self::prendre_la_releve`] porte la sienne. Le
+    /// volume n'en garde que le rabot à l'unité (`LocalOutput`).
+    ///
+    /// `facteur` est linéaire, borné à ≥ 1 : ne sert qu'à rendre ce que la
+    /// réserve retire.
+    pub fn porter_la_compensation(&mut self, facteur: f64) {
+        self.compensation = if facteur.is_finite() {
+            facteur.clamp(1.0, 64.0) as f32
+        } else {
+            1.0
+        };
+    }
+
+    /// #5227 — la compensation que porte cet égaliseur (1,0 = aucune).
+    pub fn compensation_portee(&self) -> f64 {
+        f64::from(self.compensation)
+    }
+
     /// #5215 — un fondu de bascule est-il en cours ?
     pub fn en_fondu(&self) -> bool {
         self.fondu.is_some()
@@ -240,11 +271,19 @@ impl EqProcessor {
         stats
     }
     fn traiter_sans_fondu(&mut self, samples: &mut [f32]) -> EqProcessStats {
-        match &mut self.engine {
+        let stats = match &mut self.engine {
             Engine::Bundled(p) => p.process_interleaved(samples),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
             Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
+        };
+        // #5227 — après le filtre, donc après ses compteurs d'écrêtage : le
+        // rendu flottant dépasse l'unité ici, le volume le ramène au rappel.
+        if self.compensation != 1.0 {
+            for s in samples.iter_mut() {
+                *s *= self.compensation;
+            }
         }
+        stats
     }
     pub fn is_enabled(&self) -> bool {
         match &self.engine {
