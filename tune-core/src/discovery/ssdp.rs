@@ -415,6 +415,24 @@ fn recenser_si_l_heure_est_venue(st: &mut ScannerState) -> bool {
     true
 }
 
+/// #5226 — la relance rapide du démarrage nomme les DEUX registres.
+///
+/// Elle se déclenche tant qu'aucun RENDERER n'a été vu (`devices` ne contient
+/// que les renderers ; les serveurs multimédia vivent dans `media_servers`).
+/// Son texte, « no devices yet », laissait donc croire qu'aucun appareil —
+/// serveur compris — n'avait répondu : l'instruction de #3575 en a conclu
+/// « aucun serveur multimédia découvert » sur des journaux où les serveurs
+/// n'étaient simplement pas comptés. Le compte des serveurs est désormais
+/// écrit sur la ligne, à côté de celui des renderers.
+fn journaliser_relance_rapide(st: &ScannerState, next_s: u64) {
+    info!(
+        next_s,
+        devices = st.devices.len(),
+        serveurs = st.media_servers.len(),
+        "ssdp_startup_fast_retry: no renderer yet"
+    );
+}
+
 async fn scan_loop(
     state: Arc<Mutex<ScannerState>>,
     targets: Vec<String>,
@@ -444,7 +462,7 @@ async fn scan_loop(
         } else if !ever_found && fast_retry < STARTUP_FAST_RETRIES.len() {
             let d = STARTUP_FAST_RETRIES[fast_retry];
             fast_retry += 1;
-            info!(next_s = d, "ssdp_startup_fast_retry: no devices yet");
+            journaliser_relance_rapide(&*state.lock().await, d);
             Duration::from_secs(d)
         } else {
             SCAN_INTERVAL
@@ -3159,6 +3177,59 @@ mod tests {
             "le compte des renderers doit rester lisible, et rester DISTINCT \
              de celui des serveurs : ici 0 renderer pour 1 serveur.\n\
              ligne : {ligne}"
+        );
+    }
+
+    /// #5226 — la relance rapide du démarrage doit compter les serveurs.
+    ///
+    /// Un état qui ne contient qu'UN serveur multimédia et aucun renderer : la
+    /// relance rapide se déclenche (aucun renderer), et sa ligne doit dire
+    /// `serveurs=1` — sinon on relit « aucun serveur découvert », comme
+    /// l'instruction de #3575.
+    #[test]
+    fn la_relance_rapide_nomme_les_serveurs_multimedia() {
+        let mut st = ScannerState::new();
+        st.media_servers.insert(
+            "uuid:freebox".into(),
+            MediaServerInfo {
+                id: "uuid:freebox".into(),
+                name: "Freebox Server".into(),
+                manufacturer: "Freebox SA".into(),
+                model: "Freebox Server".into(),
+                location: "http://192.168.0.254:52424/device.xml".into(),
+                content_directory_url: "http://192.168.0.254:52424/cd".into(),
+                host: "192.168.0.254".into(),
+                port: 52424,
+                last_seen: Instant::now(),
+                max_age: MEDIA_SERVER_MIN_MAX_AGE,
+            },
+        );
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(abonne, || journaliser_relance_rapide(&st, 5));
+
+        let texte = journal.texte();
+        let ligne = texte
+            .lines()
+            .find(|l| l.contains("ssdp_startup_fast_retry"))
+            .unwrap_or_else(|| {
+                panic!("aucune trace ssdp_startup_fast_retry dans le journal :\n{texte}")
+            });
+        assert!(
+            ligne.contains("serveurs=1"),
+            "la relance rapide ne dit pas combien de SERVEURS MULTIMÉDIA sont \
+             connus : c'est ce silence qui a fait conclure « aucun serveur » \
+             dans #3575.\nattendu : serveurs=1\nligne : {ligne}"
+        );
+        assert!(
+            ligne.contains("devices=0"),
+            "le compte des renderers doit rester lisible et DISTINCT de celui \
+             des serveurs : ici 0 renderer pour 1 serveur.\nligne : {ligne}"
         );
     }
 
