@@ -123,19 +123,10 @@ async fn la_couverture_compte_juste_et_le_rattrapage_force_traite_les_candidates
     assert_eq!(rien["traitees"], 0);
     assert_eq!(rien["restantes"], 1);
 
-    // Sans mode ReplayGain actif, le rattrapage forcé respecte la même garde
-    // que le fond : rien n'est traité, et la réponse le dit.
-    let (_, inactif) = appel(
-        app.clone(),
-        Method::POST,
-        "/api/v1/library/duplicates/empreintes?max=2",
-    )
-    .await;
-    assert_eq!(inactif["traitees"], 0, "{inactif}");
-    assert_eq!(inactif["analyse_active"], false, "{inactif}");
-    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
-        .set(tune_core::audio::replaygain::MODE_KEY, "track")
-        .unwrap();
+    // #5246 — AUCUN mode ReplayGain n'est armé ici (`replaygain_mode` absent,
+    // qui vaut « Désactivé ») : le rattrapage forcé empreinte QUAND MÊME. Il
+    // rendait `traitees = 0` / `analyse_active = false` (#2496) ; décision de
+    // Bertrand du 27/09/2026 : les empreintes se calculent même ReplayGain coupé.
 
     // Deux lots au plus : le premier traite la candidate, le second rend 0 et arrête.
     let (statut, fait) = appel(
@@ -148,6 +139,7 @@ async fn la_couverture_compte_juste_et_le_rattrapage_force_traite_les_candidates
     assert_eq!(fait["traitees"], 1, "{fait}");
     assert_eq!(fait["restantes"], 0, "{fait}");
     assert_eq!(fait["lots"], 2, "{fait}");
+    assert_eq!(fait["analyse_active"], true, "{fait}");
 
     let (_, apres) = appel(app, Method::GET, "/api/v1/library/duplicates/empreintes").await;
     assert_eq!(apres["avec_empreinte"], 2, "{apres}");

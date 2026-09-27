@@ -202,6 +202,12 @@ path = "tests/ordre_des_passes_5169.rs"
 name = "rattrapage_foo_dr_5168"
 path = "tests/rattrapage_foo_dr_5168.rs"
 
+# #5246 — plage dynamique et empreintes MEME ReplayGain coupe. Binaire a lui
+# seul : pause, ordre des passes et verrou d analyse sont des etats de PROCESSUS.
+[[test]]
+name = "dr_sans_replaygain_5246"
+path = "tests/dr_sans_replaygain_5246.rs"
+
 # `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
 # tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
 # que tune_core, déjà construit (#2213).
