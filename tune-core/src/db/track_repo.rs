@@ -1227,21 +1227,49 @@ pub mod sql {
     }
 
     /// La branche PLEIN TEXTE du prédicat, restreinte à ce qui identifie la
-    /// piste (#4367).
+    /// piste (#4367), sur l'emplacement `n`.
     ///
     /// Le ET est posé ICI, sur la seule branche plein texte, et non autour du
     /// OU tout entier : les quatre autres branches (artiste, genre,
     /// compositeur, ANNÉE) ne passent pas par l'index plein texte, et
     /// l'année, en particulier, n'est dans aucun `tsvector`. Les rattacher à
     /// la restriction les aurait toutes éteintes sous Postgres.
-    fn plein_texte_de_la_piste<D: SqlDialect>(d: &D) -> String {
-        let indexe = d.fts_where("tracks", "t", &d.placeholder(1));
-        let hors_album = d.fts_piste_hors_album("t", "ar", &d.placeholder(1));
+    ///
+    /// Depuis #5192, elle ne SÉLECTIONNE plus : elle CLASSE (voir
+    /// [`search`]).
+    fn plein_texte_de_la_piste<D: SqlDialect>(d: &D, n: usize) -> String {
+        let indexe = d.fts_where("tracks", "t", &d.placeholder(n));
+        let hors_album = d.fts_piste_hors_album("t", "ar", &d.placeholder(n));
         if hors_album.is_empty() {
             indexe
         } else {
             format!("({indexe} AND {hors_album})")
         }
+    }
+
+    /// La branche PLEIN TEXTE qui sélectionne : la piste par elle-même, OU
+    /// par les termes de son chemin (#5192) — sans rouvrir #4367, voir
+    /// [`crate::db::engine::format_fts_query_piste_ou_chemin`].
+    fn plein_texte_piste_ou_chemin<D: SqlDialect>(d: &D, n: usize) -> String {
+        let indexe = d.fts_where("tracks", "t", &d.placeholder(n));
+        let restriction = d.fts_piste_ou_chemin_hors_album("t", "ar", "al", &d.placeholder(n));
+        if restriction.is_empty() {
+            indexe
+        } else {
+            format!("({indexe} AND {restriction})")
+        }
+    }
+
+    /// Le OU des critères, la branche plein texte `plein_texte` en tête, puis
+    /// trois `LIKE` et l'année sur les emplacements `n + 1` à `n + 4`.
+    fn criteres<D: SqlDialect>(d: &D, plein_texte: String, n: usize) -> String {
+        format!(
+            "({plein_texte} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {})",
+            d.placeholder(n + 1),
+            d.placeholder(n + 2),
+            d.placeholder(n + 3),
+            d.placeholder(n + 4),
+        )
     }
 
     /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
@@ -1258,37 +1286,49 @@ pub mod sql {
     /// (#4146) : le prédicat est celui de `GET /library/tracks`, pris à
     /// `facet_filter` — une seconde rédaction divergerait au premier correctif.
     ///
-    /// Emplacements 1..=5 : requête FTS, puis trois `LIKE`, puis l'année.
+    /// Emplacements 1..=5 : requête FTS « piste ou chemin »
+    /// ([`crate::db::engine::format_fts_query_piste_ou_chemin`]), puis trois
+    /// `LIKE`, puis l'année.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} AND {}",
-            plein_texte_de_la_piste(d),
-            d.placeholder(2),
-            d.placeholder(3),
-            d.placeholder(4),
-            d.placeholder(5),
+            "{} AND {} AND {}",
+            criteres(d, plein_texte_piste_ou_chemin(d, 1), 1),
             crate::db::facet_filter::hidden_tracks_excluded(),
             crate::db::facet_filter::pistes_album_distant_double_exclu(d.engine()),
         )
     }
 
+    /// Le RANG d'une piste trouvée : 0 quand elle répond par elle-même —
+    /// titre, artiste, genre, compositeur, année —, 1 quand seuls les termes
+    /// de son chemin la font venir (#5192). Même OU que [`search_where`], la
+    /// branche plein texte restreinte à l'identité (#4367).
+    ///
+    /// Emplacements 6..=10 : requête FTS d'identité
+    /// ([`crate::db::engine::format_fts_query_piste`]), trois `LIKE`, l'année.
+    pub fn search_rang<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "CASE WHEN {} THEN 0 ELSE 1 END",
+            criteres(d, plein_texte_de_la_piste(d, 6), 6)
+        )
+    }
+
     /// Engine-agnostic search, PAGINÉE.
     ///
-    /// `ORDER BY t.id` est un ordre TOTAL — `tracks.id` est la clé primaire.
-    /// Sans lui, aucun des deux moteurs ne promet un ordre stable d'un appel
-    /// à l'autre : une même ligne pourrait revenir page 2 après être passée
-    /// page 1, et une autre ne jamais paraître. La requête n'en portait AUCUN
-    /// avant #3189 — ce qui était sans conséquence tant qu'il n'existait
-    /// qu'une seule page.
+    /// L'ordre est TOTAL : le rang d'abord ([`search_rang`] — « par la
+    /// piste » avant « par le chemin seul », #5192), puis `t.id`, la clé
+    /// primaire. Sans ordre total, aucun des deux moteurs ne promet un ordre
+    /// stable d'un appel à l'autre : une même ligne pourrait revenir page 2
+    /// après être passée page 1, et une autre ne jamais paraître (#3189).
     ///
-    /// Emplacements 6 et 7 : `LIMIT` et `OFFSET`.
+    /// Emplacements 11 et 12 : `LIMIT` et `OFFSET`.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} ORDER BY t.id LIMIT {} OFFSET {}",
+            "{} WHERE {} ORDER BY {}, t.id LIMIT {} OFFSET {}",
             select_track(),
             search_where(d),
-            d.placeholder(6),
-            d.placeholder(7),
+            search_rang(d),
+            d.placeholder(11),
+            d.placeholder(12),
         )
     }
 
@@ -2445,14 +2485,10 @@ impl TrackRepo {
             // aujourd'hui (Oxygen filtre sa fenêtre côté navigateur, la
             // recherche passe par `/library/search`), ce qui explique que
             // personne ne l'ait signalé.
-            let like = crate::db::engine::motif_like(query);
-            let p = ph.take();
-            let p2 = ph.take();
-            conditions.push(format!(
-                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
-            ));
-            owned_params.push(SqlValue::Text(like.clone()));
-            owned_params.push(SqlValue::Text(like));
+            // #5192 — la rédaction PARTAGÉE du texte libre d'Oxygen.
+            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(&mut ph, query);
+            conditions.push(c);
+            owned_params.extend(valeurs);
         }
 
         // Albums masqués (#1391) : leurs pistes sortent de la vue filtrée,
@@ -2684,19 +2720,34 @@ impl TrackRepo {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Track>, TuneError> {
-        // #4367 : la variante PISTE restreint le MATCH aux colonnes
-        // d'identité (`album_title` exclu) ; elle enveloppe
-        // `format_fts_query`, donc la phrase exacte entre doubles
-        // guillemets (point 8) la traverse sans rien perdre.
-        let fts_query = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
+        // #4367 puis #5192 : identité de la piste OU termes de son chemin,
+        // jamais le seul titre de l'album. Les deux variantes enveloppent
+        // `format_fts_query`, donc la phrase exacte entre doubles guillemets
+        // (point 8) les traverse sans rien perdre.
+        let fts_query =
+            crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
+        // #5192 : la requête d'IDENTITÉ ne sélectionne plus, elle classe.
+        let fts_identite = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
         // Les guillemets doivent disparaître du motif LIKE : `%"kind of
         // blue"%` ne correspondrait à aucun titre.
         let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 7] =
-            [&fts_query, &like, &like, &like, &trimmed, &limit, &offset];
+        let params: [&dyn ToSqlValue; 12] = [
+            &fts_query,
+            &like,
+            &like,
+            &like,
+            &trimmed,
+            &fts_identite,
+            &like,
+            &like,
+            &like,
+            &trimmed,
+            &limit,
+            &offset,
+        ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
@@ -2708,11 +2759,10 @@ impl TrackRepo {
     /// même prédicat, indépendant de `limit`. Un résultat égal à `plafond`
     /// signifie « au moins `plafond` », jamais « exactement ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
-        // #4367 : la variante PISTE restreint le MATCH aux colonnes
-        // d'identité (`album_title` exclu) ; elle enveloppe
-        // `format_fts_query`, donc la phrase exacte entre doubles
-        // guillemets (point 8) la traverse sans rien perdre.
-        let fts_query = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
+        // #4367 puis #5192 : la même requête que la liste — identité de la
+        // piste OU termes de son chemin, jamais le seul titre de l'album.
+        let fts_query =
+            crate::db::engine::format_fts_query_piste_ou_chemin(self.db.engine(), query);
         // Les guillemets doivent disparaître du motif LIKE : `%"kind of
         // blue"%` ne correspondrait à aucun titre.
         let like = crate::db::engine::motif_like(query);
@@ -2910,14 +2960,10 @@ impl TrackRepo {
         // Jumeau du prédicat `q` de `list_filtered` — deux marqueurs, deux
         // valeurs liées.
         if let Some(query) = terme.filter(|s| !s.is_empty()) {
-            let like = crate::db::engine::motif_like(query);
-            let p = ph.take();
-            let p2 = ph.take();
-            conditions.push(format!(
-                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})))"
-            ));
-            owned_params.push(SqlValue::Text(like.clone()));
-            owned_params.push(SqlValue::Text(like));
+            // #5192 — la rédaction PARTAGÉE du texte libre d'Oxygen.
+            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(&mut ph, query);
+            conditions.push(c);
+            owned_params.extend(valeurs);
         }
 
         // Jumeau du socle de la vue filtrée : les albums masqués n'en sont pas.
@@ -3853,6 +3899,135 @@ mod tests {
         );
     }
 
+    /// #5192 — le jeu commun des épreuves « termes de chemin » : un dossier
+    /// « Mahler_Kondrashin » dont aucune balise ne porte « Kondrashin », une
+    /// piste dont le TITRE porte les deux mots (elle doit passer devant), et
+    /// un album de Pink Floyd rangé dans un dossier à son nom (#4367 ne doit
+    /// pas rouvrir par le chemin).
+    pub(crate) fn jeu_5192(db: &SqliteDb) -> (i64, i64, i64) {
+        let artistes = ArtistRepo::new(db.clone());
+        let albums = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db.clone());
+        let mahler = artistes
+            .create(&Artist::new("Gustav Mahler".into()))
+            .unwrap();
+        let symphonie = albums
+            .get_or_create("Symphonie n°1", mahler, None)
+            .unwrap()
+            .id
+            .unwrap();
+        // Créée EN PREMIER : sans classement, `ORDER BY t.id` la mettrait
+        // devant la piste qui répond par son titre.
+        let mut par_dossier = Track::new("Langsam, schleppend".into());
+        par_dossier.album_id = Some(symphonie);
+        par_dossier.artist_id = Some(mahler);
+        par_dossier.file_path = Some("/music/Classique/Mahler_Kondrashin/01-Langsam.flac".into());
+        let par_dossier = repo.create(&par_dossier).unwrap();
+        let mut par_titre = Track::new("Mahler Kondrashin, l'entretien".into());
+        par_titre.file_path = Some("/music/Radio/entretien.flac".into());
+        let par_titre = repo.create(&par_titre).unwrap();
+
+        let floyd = artistes.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let wywh = albums
+            .get_or_create("Wish You Were Here", floyd, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let mut cigare = Track::new("Have A Cigar".into());
+        cigare.album_id = Some(wywh);
+        cigare.artist_id = Some(floyd);
+        cigare.file_path =
+            Some("/music/Pink Floyd - Wish You Were Here/03 - Have A Cigar.flac".into());
+        let cigare = repo.create(&cigare).unwrap();
+        (par_dossier, par_titre, cigare)
+    }
+
+    /// #5192 — la recherche trouve une piste par le nom de son dernier
+    /// dossier et par celui de son fichier, APRÈS celles qui répondent par
+    /// elles-mêmes ; et un dossier nommé d'après l'album ne rouvre pas #4367.
+    #[test]
+    fn la_recherche_trouve_une_piste_par_son_dossier_et_la_classe_apres_5192() {
+        let db = test_db();
+        let (par_dossier, par_titre, cigare) = jeu_5192(&db);
+        let repo = TrackRepo::new(db);
+        let ids = |q: &str| -> Vec<i64> {
+            repo.search(q, 50)
+                .unwrap()
+                .into_iter()
+                .filter_map(|t| t.id)
+                .collect()
+        };
+
+        assert_eq!(
+            ids("Mahler Kondrashin"),
+            vec![par_titre, par_dossier],
+            "par le titre d'abord, par le seul dossier ensuite"
+        );
+        assert_eq!(repo.search_count("Mahler Kondrashin", 1_000).unwrap(), 2);
+        // Les mots se répartissent : « Mahler » dans l'artiste, « Kondrashin »
+        // et « Langsam » dans le chemin.
+        assert_eq!(
+            ids("Kondrashin Langsam"),
+            vec![par_dossier],
+            "dossier + fichier"
+        );
+        assert_eq!(ids("Kondrashin"), vec![par_titre, par_dossier]);
+        // La page 2 continue le MÊME ordre.
+        let page2: Vec<i64> = repo
+            .search_page("Mahler Kondrashin", 1, 1)
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| t.id)
+            .collect();
+        assert_eq!(page2, vec![par_dossier]);
+
+        // #4367 : « Wish You Were Here » est le nom du DOSSIER et celui de
+        // l'album — pas celui de la piste.
+        assert!(
+            !ids("Wish You Were Here").contains(&cigare),
+            "un dossier nommé d'après l'album ne doit pas rendre ses pistes"
+        );
+        // Mais le nom du fichier, lui, reste une porte : « 03 » n'est que
+        // dans « 03 - Have A Cigar.flac ».
+        assert_eq!(ids("03"), vec![cigare]);
+    }
+
+    /// #5192 — le texte libre d'Oxygen (`GET /library/tracks?q=`) et le tirage
+    /// par répertoire comparent aussi les termes de chemin, l'album et le
+    /// label — les champs du navigateur.
+    #[test]
+    fn le_texte_libre_d_oxygen_compare_les_termes_de_chemin_5192() {
+        let db = test_db();
+        let (par_dossier, par_titre, cigare) = jeu_5192(&db);
+        let repo = TrackRepo::new(db.clone());
+        let liste = |q: &str| -> (Vec<i64>, i64) {
+            let f = TrackFilter {
+                q: Some(q.into()),
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            let mut ids: Vec<i64> = pistes.into_iter().filter_map(|t| t.id).collect();
+            ids.sort_unstable();
+            (ids, total)
+        };
+        let mut attendus = vec![par_dossier, par_titre];
+        attendus.sort_unstable();
+        assert_eq!(
+            liste("mahler kondrashin"),
+            (attendus, 2),
+            "dossier « Mahler_Kondrashin »"
+        );
+        assert_eq!(liste("Langsam"), (vec![par_dossier], 1), "nom du fichier");
+        assert_eq!(liste("wish you were"), (vec![cigare], 1), "titre d'album");
+        // Saisie littérale : `_` n'est pas un joker.
+        assert_eq!(liste("mahler_kondrashin").1, 0);
+
+        let (tires, total) = repo
+            .random_ids_in_folder(1, "/music/Classique", Some("kondrashin"), 10)
+            .unwrap();
+        assert_eq!((tires, total), (vec![par_dossier], 1));
+    }
+
     /// #4367, moitié PostgreSQL — Shrek n'a aucun PostgreSQL, la porte PG est
     /// celle de la CI. Ce qui se vérifie ici est donc la FORME du prédicat :
     /// le vecteur recalculé porte les quatre colonnes d'identité, pas le
@@ -3892,9 +4067,17 @@ mod tests {
                 "{colonne} manque au vecteur recalculé : {pg}"
             );
         }
+        // #5192 : `al.title` n'entre que dans le `AND NOT` qui écarte les
+        // pistes trouvées par un dossier nommé d'après leur album — jamais
+        // dans un vecteur qui SÉLECTIONNE.
+        assert_eq!(
+            pg.matches("al.title").count(),
+            1,
+            "le titre de l'album n'apparaît que dans l'exclusion : {pg}"
+        );
         assert!(
-            !pg.contains("al.title"),
-            "le titre de l'album ne doit PAS entrer dans le vecteur des pistes : {pg}"
+            pg.contains("AND NOT (to_tsvector('simple', unaccent(COALESCE(al.title, ''))) @@"),
+            "{pg}"
         );
         // L'ANNÉE ne passe par aucun vecteur : sa branche doit rester hors de
         // la restriction, sinon elle s'éteint sous Postgres.
@@ -4473,8 +4656,10 @@ mod tests {
     #[test]
     fn la_recherche_paginee_porte_un_ordre_total_et_le_compte_le_meme_predicat() {
         for sql in [sql::search(&SqliteDialect), sql::search(&PostgresDialect)] {
+            // #5192 : le rang d'abord, puis la clé primaire — toujours un
+            // ordre TOTAL.
             assert!(
-                sql.contains("ORDER BY t.id"),
+                sql.contains("ORDER BY CASE WHEN") && sql.contains(" END, t.id LIMIT"),
                 "sans ordre total, une page peut redonner ce que la précédente \
                  a déjà rendu : {sql}"
             );
