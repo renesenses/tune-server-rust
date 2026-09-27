@@ -626,3 +626,10 @@ path = "tests/sonde_lpcm_hors_dlna_4894.rs"
 [[test]]
 name = "ecrire_balises_edition_tranche4"
 path = "tests/ecrire_balises_edition_tranche4.rs"
+
+# #5138 — la passe acoustique hors de l'exécuteur tokio. `autotests = false` :
+# sans cette cible, ces témoins ne seraient jamais compilés.
+[[test]]
+name = "clap_hors_async_5138"
+path = "tests/clap_hors_async_5138.rs"
+required-features = ["audio-embedding"]
