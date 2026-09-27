@@ -306,7 +306,7 @@ impl PrefetchEngine {
                 }
             };
             let mut svc = svc.write().await;
-            match svc.get_track_url(&source_id, None).await {
+            let mut flux = match svc.get_track_url(&source_id, None).await {
                 Ok(data) => data,
                 Err(e) => {
                     // Try refresh once on auth errors
@@ -329,7 +329,18 @@ impl PrefetchEngine {
                         return;
                     }
                 }
+            };
+            // #5283 — même règle que la lecture : une cadence annoncée nulle
+            // est complétée, ou la piste n'est pas préchargée.
+            crate::streaming::cadence_du_flux::completer_la_cadence(
+                &mut flux, &**svc, &source, &source_id,
+            )
+            .await;
+            if flux.quality.sample_rate == 0 {
+                warn!(source = %source, source_id = %source_id, "prefetch_sample_rate_unknown_skipped");
+                return;
             }
+            flux
         };
 
         // Fetch track metadata if not provided
