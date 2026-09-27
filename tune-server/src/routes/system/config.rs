@@ -1653,11 +1653,17 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
         state.config.spotify_redirect_uri.as_deref(),
         state.port,
     );
+    // #2680, fil 221 — une URI explicite que Spotify refusera (« Insecure »)
+    // est conservee, mais NOMMEE : l'ecran le dit au lieu de laisser
+    // l'utilisateur la recopier dans son tableau de bord.
+    let spotify_redirect_uri_refus =
+        tune_core::streaming::spotify::refus_redirection(&spotify_redirect_uri).map(|r| r.code());
     Json(json!({
         "TUNE_PORT": state.port.to_string(),
         "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
         "engine": engine,
         "spotify_redirect_uri": spotify_redirect_uri,
+        "spotify_redirect_uri_refus": spotify_redirect_uri_refus,
     }))
 }
 
