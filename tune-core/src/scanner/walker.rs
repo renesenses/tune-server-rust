@@ -1489,6 +1489,26 @@ pub fn list_audio_files_avec_progression(
                                         dir_error_count += 1;
                                     }
                                 }
+                            } else if let Some(contenu) =
+                                crate::audio::iso9660::contenu_pour_le_parcours(path)
+                            {
+                                // #5299 — image de données qui porte de
+                                // l'audio : ses fichiers entrent comme ceux
+                                // d'un dossier, sous leur chemin virtuel.
+                                dir_file_count += contenu.pistes.len();
+                                files.extend(contenu.pistes);
+                                for chemin in contenu.ecartes {
+                                    let cle = crate::audio::iso9660::CLE_RAPPORT_FORMAT_DANS_IMAGE;
+                                    let motif = crate::audio::iso9660::MOTIF_FORMAT_DANS_IMAGE;
+                                    *skipped_by_ext.entry(cle.to_string()).or_insert(0) += 1;
+                                    pousser_chemin_ecarte(
+                                        &mut skipped_paths,
+                                        format!("{chemin} ({motif})"),
+                                    );
+                                    skipped_reasons
+                                        .entry(cle.to_string())
+                                        .or_insert_with(|| motif.to_string());
+                                }
                             } else {
                                 // `.iso` sans zone SACD : une image de données.
                                 // Elle ne devient pas une piste — la pousser
@@ -1656,14 +1676,11 @@ pub fn scan_files_parallel(
             let path_str: String = path.to_string_lossy().nfc().collect();
             warn_unsafe_path_text(&path_str);
 
-            let file_meta = path.metadata().ok();
+            // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
+            // `metadata()` : sa taille propre, la date de l'image.
+            let file_meta = crate::audio::iso9660::taille_et_mtime(path);
             let stat_ok = file_meta.is_some();
-            let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = file_meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
+            let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
             // Zero-byte "audio" files are aborted copies/downloads, not
             // tracks: don't index a tagless duration-0 ghost, surface them in
@@ -2020,14 +2037,11 @@ pub fn scan_files_batched_avec_arret(
                     let path_str: String = path.to_string_lossy().nfc().collect();
                     warn_unsafe_path_text(&path_str);
 
-                    let file_meta = path.metadata().ok();
+                    // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
+                    // `metadata()` : sa taille propre, la date de l'image.
+                    let file_meta = crate::audio::iso9660::taille_et_mtime(path);
                     let stat_ok = file_meta.is_some();
-                    let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                    let mtime = file_meta
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0);
+                    let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
                     // Zero-byte "audio" files are aborted copies/downloads, not
                     // tracks: don't index a tagless duration-0 ghost, surface

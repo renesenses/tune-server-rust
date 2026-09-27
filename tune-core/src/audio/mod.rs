@@ -55,6 +55,8 @@ pub mod flac_vendeur;
 pub mod fondu_enchaine;
 pub mod formats;
 pub mod http_range;
+/// #5299 — les fichiers audio d'une image ISO de données, lus sans la monter.
+pub mod iso9660;
 pub mod iso_sacd;
 pub mod levels;
 pub mod limiteur;

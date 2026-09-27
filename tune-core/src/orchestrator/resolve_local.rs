@@ -325,6 +325,9 @@ fn assembler_la_decision(
         // le passthrough enverrait le FLAC 5.1 intact et `channels` mentirait
         // dans le DIDL. Seul le décodage sait replier.
         reduction_de_canaux: canaux_reduits.is_some(),
+        // #5299 — le passthrough servirait le fichier par son chemin, que le
+        // serveur HTTP ne sait pas ouvrir dans une image.
+        dans_une_image_iso: crate::audio::iso9660::est_chemin_virtuel(&file_path),
     });
     if flac_ffmpeg_vers_le_reseau && needs_transcode {
         // Le conteneur neuf n'a pas pu être préparé, ou un autre motif
