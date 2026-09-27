@@ -368,6 +368,11 @@ pub(super) struct AdoptionHorloge {
     /// (#4173) en vaut huit ; une consigne `Next` sur un tampon déjà rempli
     /// n'en vaut que trois. Voir [`super::BASCULE_DELAI_SECS`].
     pub(super) delai_secs: u64,
+    /// #4382 — octets du flux adopté déjà servis au renderer à l'adoption.
+    /// Pendant la surveillance, ce qu'il en tire DEPUIS dit s'il consomme ce
+    /// flux (≈ le débit de lecture) ou s'il ne fait que le garder en tampon
+    /// (≈ rien) — la position gelée ne le dit pas.
+    pub(super) octets_a_l_adoption: Option<u64>,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

@@ -346,6 +346,45 @@ async fn la_bascule_envoie_l_action_next_et_rien_d_autre() {
     );
 }
 
+/// #4382 — la lecture du transport pour la fenêtre de surveillance :
+/// `GetMediaInfo`, et rien d'autre. `CurrentURI` et `NextURI` rendus tels
+/// quels — ici la signature du DMP-A6 du 27/09 : il joue encore la piste
+/// finie et tient toujours la suivante.
+#[tokio::test]
+async fn le_transport_se_lit_par_get_media_info_seul() {
+    let r = renderer(Conduite::default()).await;
+    r.output.set_next_media(&media()).await.unwrap();
+    let avant = r.actions().len();
+
+    let media = r.output.media_du_transport().await;
+
+    assert_eq!(&r.actions()[avant..], ["GetMediaInfo"]);
+    assert_eq!(
+        media,
+        Some(super::traits::MediaDuTransport {
+            courante: Some("http://tune/stream/finie.wav".to_string()),
+            suivante: Some(URL.to_string()),
+        })
+    );
+}
+
+/// Un appareil qui ne publie pas `NextURI` : la suivante est `None`, jamais
+/// une chaîne vide qui passerait pour une réponse.
+#[tokio::test]
+async fn le_transport_sans_nexturi_rend_une_suivante_absente() {
+    let r = renderer(Conduite {
+        publie_nexturi: false,
+        ..Conduite::default()
+    })
+    .await;
+    let media = r.output.media_du_transport().await.unwrap();
+    assert_eq!(
+        media.courante.as_deref(),
+        Some("http://tune/stream/finie.wav")
+    );
+    assert_eq!(media.suivante, None);
+}
+
 /// Un `Next` refusé par une faute SOAP rend une erreur : l'appelant reprend
 /// le repli, sans avoir rien cassé.
 #[tokio::test]
