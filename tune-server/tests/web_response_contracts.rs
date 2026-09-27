@@ -5,6 +5,8 @@
 //! ils chargent `docs/contrat-web.json`, appellent le vrai routeur Axum et
 //! confrontent la réponse à la carte commitée.
 
+#[path = "web_contracts/history_1897.rs"]
+mod history_1897;
 #[path = "web_contracts/library_1897.rs"]
 mod library_1897;
 
