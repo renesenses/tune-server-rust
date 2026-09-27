@@ -13,6 +13,10 @@
 //! jamais mettre la machine en danger**, et être en retard d'une heure ne coûte
 //! rien.
 
+// Hors Linux, la lecture sysfs et ses sélecteurs ne servent qu'aux tests : les
+// deux fonctions publiques y rendent `None` sans toucher au disque.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use tracing::{info, warn};
 
 /// Au-dessus de cette température, les analyses s'arrêtent.
@@ -130,40 +134,176 @@ impl ThermalGate {
     }
 }
 
-/// Température CPU la plus élevée exposée par le système, en °C.
+/// Un relevé de température lu dans sysfs : la puce ou la zone qui l'expose,
+/// l'étiquette du capteur quand il en a une, et la valeur en °C.
 ///
-/// Lit `/sys/class/hwmon/*/temp*_input` (millidegrés). On prend le **maximum**
-/// des capteurs plutôt qu'un capteur nommé : les noms varient d'une plateforme
-/// à l'autre (`coretemp` sur Intel, `k10temp` sur AMD, `cpu_thermal` sur
-/// Raspberry Pi, `soc_thermal` sur bien des SBC) et un serveur audio tourne sur
-/// tout ça. Le maximum est aussi la grandeur qui décide : c'est le point le
-/// plus chaud qui éteint une machine, pas la moyenne.
-#[cfg(target_os = "linux")]
-fn cpu_temp_celsius() -> Option<f64> {
-    let mut hottest: Option<f64> = None;
-    let entries = std::fs::read_dir("/sys/class/hwmon").ok()?;
-    for hwmon in entries.flatten() {
-        let Ok(sensors) = std::fs::read_dir(hwmon.path()) else {
-            continue;
-        };
-        for sensor in sensors.flatten() {
-            let name = sensor.file_name();
-            let name = name.to_string_lossy();
-            if !(name.starts_with("temp") && name.ends_with("_input")) {
+/// La lecture est UNE (`lire_capteurs`) ; ce sont les deux consommateurs qui
+/// choisissent différemment dans les mêmes relevés : le garde prend le point le
+/// plus chaud des `hwmon`, l'écran « État du serveur » veut le paquet CPU
+/// (#5189).
+#[derive(Debug, Clone, PartialEq)]
+struct Releve {
+    /// Nom de la puce `hwmon` (`coretemp`, `k10temp`, `nvme`…) ou type de la
+    /// zone thermique (`x86_pkg_temp`, `acpitz`…).
+    capteur: String,
+    /// `temp*_label` quand la puce en fournit un (`Package id 0`, `Tctl`…).
+    etiquette: Option<String>,
+    /// Vrai pour `/sys/class/hwmon`, faux pour `/sys/class/thermal`.
+    hwmon: bool,
+    celsius: f64,
+}
+
+/// Lit tous les capteurs de température exposés sous `racine` (`/sys` en
+/// production, une arborescence simulée dans les tests) :
+/// `class/hwmon/*/temp*_input` (+ `name`, `temp*_label`) et
+/// `class/thermal/thermal_zone*/temp` (+ `type`). Que des lectures de petits
+/// fichiers sysfs ; tout ce qui manque ou ne se lit pas est ignoré.
+fn lire_capteurs(racine: &std::path::Path) -> Vec<Releve> {
+    let lire = |p: std::path::PathBuf| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let mut releves = Vec::new();
+    if let Ok(puces) = std::fs::read_dir(racine.join("class/hwmon")) {
+        for puce in puces.flatten() {
+            let dossier = puce.path();
+            let capteur = lire(dossier.join("name")).unwrap_or_default();
+            let Ok(fichiers) = std::fs::read_dir(&dossier) else {
                 continue;
-            }
-            if let Ok(raw) = std::fs::read_to_string(sensor.path())
-                && let Some(c) = parse_millidegrees(&raw)
-            {
-                hottest = Some(hottest.map_or(c, |h: f64| h.max(c)));
+            };
+            for f in fichiers.flatten() {
+                let nom = f.file_name();
+                let nom = nom.to_string_lossy();
+                let Some(base) = nom
+                    .strip_prefix("temp")
+                    .and_then(|r| r.strip_suffix("_input"))
+                else {
+                    continue;
+                };
+                if let Some(celsius) = lire(f.path()).as_deref().and_then(parse_millidegrees) {
+                    releves.push(Releve {
+                        capteur: capteur.clone(),
+                        etiquette: lire(dossier.join(format!("temp{base}_label"))),
+                        hwmon: true,
+                        celsius,
+                    });
+                }
             }
         }
     }
-    hottest
+    if let Ok(zones) = std::fs::read_dir(racine.join("class/thermal")) {
+        for zone in zones.flatten() {
+            if !zone
+                .file_name()
+                .to_string_lossy()
+                .starts_with("thermal_zone")
+            {
+                continue;
+            }
+            let dossier = zone.path();
+            if let Some(celsius) = lire(dossier.join("temp"))
+                .as_deref()
+                .and_then(parse_millidegrees)
+            {
+                releves.push(Releve {
+                    capteur: lire(dossier.join("type")).unwrap_or_default(),
+                    etiquette: None,
+                    hwmon: false,
+                    celsius,
+                });
+            }
+        }
+    }
+    releves
+}
+
+fn maximum<'a>(releves: impl Iterator<Item = &'a Releve>) -> Option<f64> {
+    releves.map(|r| r.celsius).reduce(f64::max)
+}
+
+/// Le choix du GARDE : le point le plus chaud des `hwmon`.
+///
+/// On prend le **maximum** des capteurs plutôt qu'un capteur nommé : les noms
+/// varient d'une plateforme à l'autre (`coretemp` sur Intel, `k10temp` sur
+/// AMD, `cpu_thermal` sur Raspberry Pi, `soc_thermal` sur bien des SBC) et un
+/// serveur audio tourne sur tout ça. Le maximum est aussi la grandeur qui
+/// décide : c'est le point le plus chaud qui éteint une machine, pas la
+/// moyenne.
+fn plus_chaud_hwmon(releves: &[Releve]) -> Option<f64> {
+    maximum(releves.iter().filter(|r| r.hwmon))
+}
+
+/// Capteurs qui mesurent le paquet CPU, par ordre de préférence (#5189).
+/// `x86_pkg_temp` est une zone thermique (Intel) ; `coretemp` et `k10temp`
+/// sont des puces `hwmon` ; le Raspberry Pi expose `cpu-thermal` comme zone et
+/// `cpu_thermal` comme `hwmon`.
+const CAPTEURS_PAQUET_CPU: &[&str] = &[
+    "x86_pkg_temp",
+    "coretemp",
+    "k10temp",
+    "cpu_thermal",
+    "cpu-thermal",
+];
+
+/// Rang d'une étiquette dans une puce CPU : `Package id N` (Intel) et `Tdie`
+/// (AMD, température réelle) d'abord, puis `Tctl` (AMD, peut porter un
+/// décalage), puis le reste (cœurs, CCD).
+fn rang_etiquette(etiquette: Option<&str>) -> u8 {
+    match etiquette {
+        Some(e) if e.starts_with("Package id") || e == "Tdie" => 0,
+        Some("Tctl") => 1,
+        _ => 2,
+    }
+}
+
+/// Le choix de l'ÉCRAN : le paquet CPU quand un capteur le désigne, sinon le
+/// maximum de toutes les zones lues. `None` sans aucun capteur.
+fn choisir_temperature_processeur(releves: &[Releve]) -> Option<f64> {
+    for nom in CAPTEURS_PAQUET_CPU {
+        let puce: Vec<&Releve> = releves.iter().filter(|r| r.capteur == *nom).collect();
+        let Some(meilleur) = puce
+            .iter()
+            .map(|r| rang_etiquette(r.etiquette.as_deref()))
+            .min()
+        else {
+            continue;
+        };
+        return maximum(
+            puce.into_iter()
+                .filter(|r| rang_etiquette(r.etiquette.as_deref()) == meilleur),
+        );
+    }
+    maximum(releves.iter())
+}
+
+/// Température CPU la plus élevée exposée par le système, en °C (garde).
+#[cfg(target_os = "linux")]
+fn cpu_temp_celsius() -> Option<f64> {
+    plus_chaud_hwmon(&lire_capteurs(std::path::Path::new("/sys")))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn cpu_temp_celsius() -> Option<f64> {
+    None
+}
+
+/// Température du processeur à AFFICHER (#5189, écran « État du serveur »).
+///
+/// Même lecture sysfs que le garde, autre choix : le capteur du paquet CPU
+/// quand il est identifiable, sinon le maximum des zones. `None` sans capteur
+/// (macOS, Windows, conteneur ou machine virtuelle sans `/sys` peuplé).
+///
+/// Lecture synchrone de fichiers sysfs : l'appelant asynchrone la passe par
+/// `spawn_blocking` avec un délai, certains pilotes `hwmon` (disques) pouvant
+/// être lents à répondre.
+#[cfg(target_os = "linux")]
+pub fn cpu_package_temp_celsius() -> Option<f64> {
+    choisir_temperature_processeur(&lire_capteurs(std::path::Path::new("/sys")))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cpu_package_temp_celsius() -> Option<f64> {
     None
 }
 
@@ -172,7 +312,6 @@ fn cpu_temp_celsius() -> Option<f64> {
 /// sentinelles (0, valeurs négatives absurdes) dans le même format, et les
 /// prendre pour des degrés ferait taire la passe pour rien — ou, pire, la
 /// laisserait tourner sur un capteur muet.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_millidegrees(raw: &str) -> Option<f64> {
     let milli: f64 = raw.trim().parse().ok()?;
     let c = milli / 1000.0;
@@ -262,5 +401,114 @@ mod tests {
                 leaving: true
             }
         );
+    }
+
+    // ── #5189 : le capteur affiché, sur une arborescence sysfs simulée ─────
+
+    /// Construit `class/hwmon/hwmonN` : `(name, [(index, millidegrés, étiquette)])`.
+    fn puce(racine: &std::path::Path, n: usize, name: &str, temps: &[(u8, &str, Option<&str>)]) {
+        let d = racine.join(format!("class/hwmon/hwmon{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
+        for (i, milli, label) in temps {
+            std::fs::write(d.join(format!("temp{i}_input")), format!("{milli}\n")).unwrap();
+            if let Some(l) = label {
+                std::fs::write(d.join(format!("temp{i}_label")), format!("{l}\n")).unwrap();
+            }
+        }
+    }
+
+    fn zone(racine: &std::path::Path, n: usize, kind: &str, milli: &str) {
+        let d = racine.join(format!("class/thermal/thermal_zone{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("type"), format!("{kind}\n")).unwrap();
+        std::fs::write(d.join("temp"), format!("{milli}\n")).unwrap();
+    }
+
+    fn affichee(racine: &std::path::Path) -> Option<f64> {
+        choisir_temperature_processeur(&lire_capteurs(racine))
+    }
+
+    /// Machine Intel typique : un NVMe et la zone ACPI plus chauds que le
+    /// paquet. L'écran doit montrer le PAQUET, pas le maximum — et le garde,
+    /// lui, garde son maximum des `hwmon`, inchangé.
+    #[test]
+    fn intel_affiche_le_paquet_et_pas_le_nvme() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "acpitz", &[(1, "27800", None)]);
+        puce(
+            r,
+            1,
+            "coretemp",
+            &[
+                (1, "52000", Some("Package id 0")),
+                (2, "58000", Some("Core 0")),
+            ],
+        );
+        puce(r, 2, "nvme", &[(1, "71850", Some("Composite"))]);
+        zone(r, 0, "acpitz", "27800");
+        assert_eq!(affichee(r), Some(52.0));
+        assert_eq!(plus_chaud_hwmon(&lire_capteurs(r)), Some(71.85));
+    }
+
+    /// Contre-épreuve : sans puce CPU reconnaissable (machine virtuelle,
+    /// carte exotique), on retombe sur le maximum de TOUTES les zones, zones
+    /// thermiques comprises.
+    #[test]
+    fn sans_capteur_cpu_identifiable_on_prend_le_maximum_des_zones() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "nvme", &[(1, "41000", None)]);
+        zone(r, 0, "acpitz", "47500");
+        assert_eq!(affichee(r), Some(47.5));
+        // Et la zone ne fait PAS bouger le garde : il ne lit que les hwmon.
+        assert_eq!(plus_chaud_hwmon(&lire_capteurs(r)), Some(41.0));
+    }
+
+    #[test]
+    fn la_zone_x86_pkg_temp_prime_sur_coretemp() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "coretemp", &[(2, "60000", Some("Core 0"))]);
+        zone(r, 3, "x86_pkg_temp", "49000");
+        assert_eq!(affichee(r), Some(49.0));
+    }
+
+    #[test]
+    fn amd_prefere_tdie_puis_tctl_aux_ccd() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(
+            r,
+            0,
+            "k10temp",
+            &[(1, "66000", Some("Tctl")), (3, "70000", Some("Tccd1"))],
+        );
+        assert_eq!(affichee(r), Some(66.0));
+        std::fs::write(r.join("class/hwmon/hwmon0/temp2_input"), "56000\n").unwrap();
+        std::fs::write(r.join("class/hwmon/hwmon0/temp2_label"), "Tdie\n").unwrap();
+        assert_eq!(affichee(r), Some(56.0));
+    }
+
+    #[test]
+    fn raspberry_pi_cpu_thermal() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        puce(r, 0, "rpi_volt", &[]);
+        puce(r, 1, "cpu_thermal", &[(1, "48312", None)]);
+        puce(r, 2, "drivetemp", &[(1, "51000", None)]);
+        assert_eq!(affichee(r), Some(48.312));
+    }
+
+    /// Conteneur, VM ou autre OS : rien sous `/sys` → `None`, jamais 0 °C.
+    #[test]
+    fn aucune_arborescence_aucune_valeur() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(affichee(t.path()), None);
+        assert_eq!(affichee(&t.path().join("absent")), None);
+        // Un capteur muet (sentinelle 0) ne vaut pas une mesure.
+        puce(t.path(), 0, "coretemp", &[(1, "0", Some("Package id 0"))]);
+        assert_eq!(affichee(t.path()), None);
     }
 }
