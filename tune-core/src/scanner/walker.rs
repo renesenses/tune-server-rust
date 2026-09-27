@@ -487,7 +487,8 @@ pub struct ScannedFile {
     pub unsupported: Option<UnsupportedLibraryAudio>,
     pub audio_hash: Option<String>,
     pub file_size: u64,
-    pub mtime: u64,
+    /// Secondes depuis Epoch, fraction comprise (#5223).
+    pub mtime: f64,
 }
 
 /// Combien de chemins écartés une liste du rapport de scan retient au plus.
@@ -1661,8 +1662,8 @@ pub fn scan_files_parallel(
             let mtime = file_meta
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
 
             // Zero-byte "audio" files are aborted copies/downloads, not
             // tracks: don't index a tagless duration-0 ghost, surface them in
@@ -2025,8 +2026,8 @@ pub fn scan_files_batched_avec_arret(
                     let mtime = file_meta
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
 
                     // Zero-byte "audio" files are aborted copies/downloads, not
                     // tracks: don't index a tagless duration-0 ghost, surface

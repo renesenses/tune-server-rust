@@ -243,7 +243,7 @@ pub fn build_track_row(
     track.bit_depth = meta.bit_depth.map(|b| b as i32);
     track.channels = meta.channels.unwrap_or(2) as i32;
     track.file_size = Some(sf.file_size as i64);
-    track.file_mtime = Some(sf.mtime as f64);
+    track.file_mtime = Some(sf.mtime);
     track.audio_hash = sf.audio_hash.clone();
     track.genre = meta.genre.clone();
     track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
@@ -1456,7 +1456,7 @@ mod tests {
             unsupported: None,
             audio_hash: Some("hash-1".into()),
             file_size: 4096,
-            mtime: 1_700_000_000,
+            mtime: 1_700_000_000.0,
         }
     }
 
@@ -3023,7 +3023,7 @@ mod tests_edition_manuelle {
                 unsupported: None,
                 audio_hash: Some(format!("hash-{dossier}-{disque}-{n}")),
                 file_size: 4096,
-                mtime: 1_700_000_000,
+                mtime: 1_700_000_000.0,
             });
         }
         v
