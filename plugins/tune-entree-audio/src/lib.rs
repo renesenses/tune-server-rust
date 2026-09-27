@@ -46,6 +46,7 @@ pub mod lecteur;
 pub mod peripheriques;
 pub mod routes;
 pub mod simule;
+pub mod source;
 #[cfg(feature = "capture")]
 pub mod systeme;
 
@@ -74,6 +75,8 @@ pub struct HostServices {
 pub struct EntreeAudioPlugin {
     services: HostServices,
     controleur: Option<Arc<Controleur>>,
+    /// La tâche qui tient les sources `entree:*` du registre à jour (#5065).
+    publication: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EntreeAudioPlugin {
@@ -81,6 +84,7 @@ impl EntreeAudioPlugin {
         Self {
             services,
             controleur: None,
+            publication: None,
         }
     }
 }
@@ -123,16 +127,34 @@ impl TunePlugin for EntreeAudioPlugin {
                 controleur: controleur.clone(),
             }),
         );
-        ctx.register_router(routes::router(routes::EtatRoutes {
+        let etat_routes = routes::EtatRoutes {
             controleur: controleur.clone(),
             autorisation: autorisation::du_systeme,
-        }));
+        };
+        // #5065, étape 3 — chaque entrée du système dans le registre commun
+        // des sources physiques, rafraîchie en tâche de fond. Sans la
+        // capture compilée, l'énumération échoue et rien n'est inscrit.
+        let publication = source::PublicationEntrees::new(
+            self.services.orchestrator.sources_physiques().clone(),
+            etat_routes.clone(),
+        );
+        self.publication = Some(tokio::spawn(publication.tourner()));
+        ctx.register_router(routes::router(etat_routes));
         self.controleur = Some(controleur);
         Ok(())
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
         self.services.orchestrator.sources_pcm().retirer(SOURCE);
+        if let Some(h) = self.publication.take() {
+            h.abort();
+            // Attendue : un tour en vol ne republie pas après le retrait.
+            let _ = h.await;
+        }
+        self.services
+            .orchestrator
+            .sources_physiques()
+            .retirer_greffon(source::GREFFON);
         if let Some(c) = self.controleur.take() {
             c.arreter_capture();
         }

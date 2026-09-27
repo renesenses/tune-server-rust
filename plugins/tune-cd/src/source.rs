@@ -7,7 +7,10 @@
 //!   artiste, nombre de pistes audio, pochette) ;
 //! * `vide` — le lecteur est là, sans disque ;
 //! * `non_pris_en_charge` — la plateforme n'a pas d'implémentation ;
-//! * absente — pas de lecteur, ou greffon arrêté (`teardown`).
+//! * `indisponible` — la plateforme sait lire un CD, mais aucun lecteur n'est
+//!   branché (détail `{"raison": "aucun_lecteur"}`) : la source reste LISTÉE,
+//!   grisée par les clients (#5065, étape 3) ;
+//! * absente — greffon arrêté (`teardown`).
 //!
 //! « Jouer » délègue à `POST /jouer` du greffon (`routes::jouer_disque`).
 
@@ -48,12 +51,18 @@ impl PublicationSource {
 
     /// Sans lecteur, la surveillance ne tourne pas : la source se déclare
     /// ici, une fois. `non_pris_en_charge` si la plateforme n'a pas
-    /// d'implémentation ; rien si elle en a une mais qu'aucun lecteur n'est
-    /// branché (seules les sources présentes sont listées). Avec un lecteur,
-    /// c'est le premier tour de la surveillance qui publie — jamais `setup`,
-    /// qui ne doit pas attendre MusicBrainz au démarrage du serveur.
+    /// d'implémentation ; `indisponible` si elle en a une mais qu'aucun
+    /// lecteur n'est branché — la source reste listée, grisée (#5065,
+    /// étape 3). Avec un lecteur, c'est le premier tour de la surveillance
+    /// qui publie — jamais `setup`, qui ne doit pas attendre MusicBrainz au
+    /// démarrage du serveur.
     pub fn publier_sans_lecteur(&self) {
-        if self.lecteur.is_none() && !plateforme_prise_en_charge() {
+        if self.lecteur.is_some() {
+            return;
+        }
+        if plateforme_prise_en_charge() {
+            self.publier_aucun_lecteur();
+        } else {
             self.inscrire(
                 EtatSource::NonPrisEnCharge,
                 "Lecteur CD".into(),
@@ -63,12 +72,20 @@ impl PublicationSource {
         }
     }
 
+    /// Aucun lecteur branché : la source reste, `indisponible`, sans joueur.
+    fn publier_aucun_lecteur(&self) {
+        self.inscrire(
+            EtatSource::Indisponible,
+            "Lecteur CD".into(),
+            json!({ "raison": "aucun_lecteur" }),
+            false,
+        );
+    }
+
     /// Met la source à jour d'après la présence vue au lecteur.
     pub async fn publier(&self, presence: Presence) {
         match presence {
-            Presence::AucunLecteur => {
-                self.registre.retirer(ID, ID);
-            }
+            Presence::AucunLecteur => self.publier_aucun_lecteur(),
             Presence::Vide => self.inscrire(EtatSource::Vide, "Lecteur CD".into(), json!({}), true),
             Presence::Disque => {
                 let Some(l) = self.lecteur.clone() else {
@@ -296,10 +313,11 @@ mod tests {
         assert_eq!(changements(&mut rx), 1);
     }
 
-    /// Sans lecteur : `non_pris_en_charge` si la plateforme n'a pas
-    /// d'implémentation, rien du tout sinon (seules les sources présentes).
+    /// Sans lecteur, la source est TOUJOURS listée (#5065, étape 3) :
+    /// `non_pris_en_charge` si la plateforme n'a pas d'implémentation,
+    /// `indisponible` sinon — jamais absente, et jamais jouable.
     #[tokio::test]
-    async fn sans_lecteur() {
+    async fn sans_lecteur_la_source_cd_reste_listee_indisponible() {
         let registre = Arc::new(RegistreSources::new());
         let routes = EtatRoutes {
             lecteur: None,
@@ -308,23 +326,27 @@ mod tests {
             zones: Arc::default(),
         };
         PublicationSource::new(registre.clone(), &routes).publier_sans_lecteur();
+        let l = registre.lister();
+        assert_eq!(l.len(), 1, "la source cd doit être listée sans lecteur");
+        assert_eq!(l[0].id, ID);
+        assert_eq!(l[0].genre, TypeSource::Cd);
         if plateforme_prise_en_charge() {
-            assert!(registre.lister().is_empty());
+            assert_eq!(l[0].etat, EtatSource::Indisponible);
+            assert_eq!(l[0].detail, json!({ "raison": "aucun_lecteur" }));
         } else {
-            let l = registre.lister();
             assert_eq!(l[0].etat, EtatSource::NonPrisEnCharge);
-            assert!(matches!(
-                registre
-                    .jouer(
-                        ID,
-                        DemandeJouer {
-                            zone_id: 1,
-                            piste: None
-                        }
-                    )
-                    .await,
-                Err(ErreurJouer::NonJouable { .. })
-            ));
         }
+        assert!(matches!(
+            registre
+                .jouer(
+                    ID,
+                    DemandeJouer {
+                        zone_id: 1,
+                        piste: None
+                    }
+                )
+                .await,
+            Err(ErreurJouer::NonJouable { .. })
+        ));
     }
 }

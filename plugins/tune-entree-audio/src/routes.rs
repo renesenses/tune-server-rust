@@ -25,6 +25,7 @@ use crate::controleur::Controleur;
 use crate::format::dbfs;
 use crate::hote::titre;
 use crate::peripheriques::CAPTURE_NON_COMPILEE;
+use tune_core::sources_physiques::{EtatSource, TypeSource};
 
 /// Tune ne capte que du PCM : un flux compressé encapsulé (IEC 61937) n'est
 /// pas décodé.
@@ -53,14 +54,43 @@ fn non_compilee(etat: &EtatRoutes) -> bool {
     etat.controleur.peripheriques().pile() == "aucune"
 }
 
-/// `type` du contrat des sources (#5065) : `entree`, `virtuelle` ou `hdmi`.
-pub fn type_de_source(nom: &str, virtuelle: Option<bool>) -> &'static str {
-    if virtuelle == Some(true) {
-        "virtuelle"
-    } else if nom.to_lowercase().contains("hdmi") {
-        "hdmi"
+/// Ce que le NOM d'un périphérique dit d'une entrée VIRTUELLE, quand le
+/// système ne donne pas son transport (hors CoreAudio) ou le donne faux :
+/// BlackHole, Loopback, Soundflower (macOS), « Monitor of … » (PulseAudio,
+/// PipeWire), VB-Cable, VoiceMeeter (Windows).
+const MARQUES_VIRTUELLES: [&str; 8] = [
+    "blackhole",
+    "loopback",
+    "soundflower",
+    "monitor of",
+    "vb-cable",
+    "vb-audio",
+    "cable output",
+    "voicemeeter",
+];
+
+/// `type` du contrat des sources (#5065) : `virtuelle` si le transport
+/// (`virtuelle == Some(true)`) ou le nom le dit, `hdmi` si le nom le dit,
+/// sinon `entree`. Le virtuel passe d'abord : le « Monitor of » d'une sortie
+/// HDMI est une boucle, pas une capture HDMI.
+pub fn genre_de_source(nom: &str, virtuelle: Option<bool>) -> TypeSource {
+    let n = nom.to_lowercase();
+    if virtuelle == Some(true) || MARQUES_VIRTUELLES.iter().any(|m| n.contains(m)) {
+        TypeSource::Virtuelle
+    } else if n.contains("hdmi") {
+        TypeSource::Hdmi
     } else {
-        "entree"
+        TypeSource::Entree
+    }
+}
+
+/// [`genre_de_source`], en toutes lettres.
+pub fn type_de_source(nom: &str, virtuelle: Option<bool>) -> &'static str {
+    match genre_de_source(nom, virtuelle) {
+        TypeSource::Virtuelle => "virtuelle",
+        TypeSource::Hdmi => "hdmi",
+        TypeSource::Cd => "cd",
+        TypeSource::Entree => "entree",
     }
 }
 
@@ -81,17 +111,20 @@ pub fn id_de_source(nom: &str) -> String {
 }
 
 /// `etat` du contrat des sources (#5065) pour l'entrée ÉCOUTÉE.
-fn etat_de_source(i: &crate::controleur::Instantane, autorisation: Autorisation) -> &'static str {
+pub(crate) fn etat_de_source(
+    i: &crate::controleur::Instantane,
+    autorisation: Autorisation,
+) -> EtatSource {
     use crate::autorisation::SILENCE_SUSPECT_S;
     if matches!(i.fin, Some(crate::anneau::Fin::Erreur(_))) {
-        return "indisponible";
+        return EtatSource::Indisponible;
     }
     let silence = i.silence_numerique_s >= SILENCE_SUSPECT_S;
     match autorisation {
-        Autorisation::Refusee => "autorisation_refusee",
-        Autorisation::NonDemandee if silence => "autorisation_refusee",
-        _ if silence || i.crete == 0.0 => "silence",
-        _ => "signal",
+        Autorisation::Refusee => EtatSource::AutorisationRefusee,
+        Autorisation::NonDemandee if silence => EtatSource::AutorisationRefusee,
+        _ if silence || i.crete == 0.0 => EtatSource::Silence,
+        _ => EtatSource::Signal,
     }
 }
 
@@ -163,13 +196,6 @@ struct DemandeJouer {
 }
 
 async fn jouer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeJouer>) -> Response {
-    if non_compilee(&etat) {
-        return refus(
-            StatusCode::NOT_IMPLEMENTED,
-            "capture_non_compilee",
-            CAPTURE_NON_COMPILEE.into(),
-        );
-    }
     if let Some(ms) = d.amorce_ms {
         *etat
             .controleur
@@ -177,8 +203,29 @@ async fn jouer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeJouer>) -> R
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Duration::from_millis(ms.clamp(100, 10_000));
     }
+    match jouer_entree(&etat, &d.entree, d.zone_id).await {
+        Ok(v) => Json(v).into_response(),
+        Err((code, motif, message)) => refus(code, motif, message),
+    }
+}
+
+/// Capte `entree` (son nom, son id système, ou `entree:<slug>` du contrat des
+/// sources) et la joue sur la zone. Partagé par `POST /jouer` et par
+/// `POST /api/v1/sources/{id}/jouer` (#5065), qui y délègue.
+pub async fn jouer_entree(
+    etat: &EtatRoutes,
+    entree: &str,
+    zone_id: i64,
+) -> Result<Value, (StatusCode, &'static str, String)> {
+    if non_compilee(etat) {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "capture_non_compilee",
+            CAPTURE_NON_COMPILEE.into(),
+        ));
+    }
     // `entree:<slug>` (contrat des sources, #5065) : retrouver le nom.
-    let mut entree = d.entree.clone();
+    let mut entree = entree.to_string();
     if entree.starts_with("entree:") {
         let c = etat.controleur.clone();
         if let Ok(Ok(liste)) = tokio::task::spawn_blocking(move || c.peripheriques().lister()).await
@@ -189,24 +236,27 @@ async fn jouer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeJouer>) -> R
         }
     }
     let joue =
-        tokio::time::timeout(SYSTEME_MUET * 2, etat.controleur.jouer(&entree, d.zone_id)).await;
+        tokio::time::timeout(SYSTEME_MUET * 2, etat.controleur.jouer(&entree, zone_id)).await;
     let Ok(joue) = joue else {
-        return systeme_muet();
+        return Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "systeme_audio_sans_reponse",
+            "Le système audio ne répond pas (CoreAudio) : voir `diagnostic` dans /etat.".into(),
+        ));
     };
     match joue {
-        Ok((nom, format)) => Json(json!({
-            "zone_id": d.zone_id,
+        Ok((nom, format)) => Ok(json!({
+            "zone_id": zone_id,
             "entree": nom,
             "titre": titre(&nom),
             "frequence": format.frequence,
             "bits": format.bits,
             "canaux": format.canaux,
-        }))
-        .into_response(),
+        })),
         Err(e) if e.starts_with("aucune entrée audio") => {
-            refus(StatusCode::NOT_FOUND, "entree_inconnue", e)
+            Err((StatusCode::NOT_FOUND, "entree_inconnue", e))
         }
-        Err(e) => refus(StatusCode::BAD_GATEWAY, "lecture", e),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, "lecture", e)),
     }
 }
 
@@ -400,6 +450,36 @@ mod tests {
         assert_eq!(type_de_source("Loopback Audio", Some(true)), "virtuelle");
         assert_eq!(type_de_source("USB3 HDMI Capture", Some(false)), "hdmi");
         assert_eq!(type_de_source("Yeti X", None), "entree");
+    }
+
+    /// #5065, étape 3 — le classement sur des noms de périphériques
+    /// simulés, quand le système ne dit rien du transport (Linux, Windows)
+    /// ou le dit faux : le NOM suffit à reconnaître une boucle virtuelle.
+    #[test]
+    fn le_classement_suit_le_nom_quand_le_transport_se_tait() {
+        for (nom, attendu) in [
+            ("BlackHole 2ch", "virtuelle"),
+            ("BlackHole 16ch", "virtuelle"),
+            ("Loopback Audio", "virtuelle"),
+            ("Soundflower (2ch)", "virtuelle"),
+            ("Monitor of Built-in Audio Analog Stereo", "virtuelle"),
+            ("Monitor of HDMI / DisplayPort 1 Output", "virtuelle"),
+            ("CABLE Output (VB-Audio Virtual Cable)", "virtuelle"),
+            (
+                "VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)",
+                "virtuelle",
+            ),
+            ("USB3 HDMI Capture", "hdmi"),
+            ("Elgato HD60 S+ (HDMI)", "hdmi"),
+            ("Yeti X", "entree"),
+            ("Scarlett 2i2 USB", "entree"),
+            ("MacBook Pro Microphone", "entree"),
+        ] {
+            assert_eq!(type_de_source(nom, None), attendu, "{nom}");
+            assert_eq!(type_de_source(nom, Some(false)), attendu, "{nom}");
+        }
+        // Le transport CoreAudio `Virtual` prime sur un nom muet.
+        assert_eq!(type_de_source("Mon agrégat", Some(true)), "virtuelle");
     }
 
     #[tokio::test]
