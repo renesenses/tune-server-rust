@@ -548,6 +548,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    // Un écrivain (favori, édition, enrichissement…) attend que
+                    // ce lot ferme sa transaction : lui céder la place entre deux
+                    // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
+                    db.ceder_aux_ecrivains();
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -748,6 +752,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         let Some(track_id) = ids.get(chemin).copied() else {
                             continue;
                         };
+                        // Relire les balises coûte une E/S par fichier : céder ici aussi.
+                        db.ceder_aux_ecrivains();
                         let ext = tune_core::metadata::read_extended_metadata(
                             std::path::Path::new(chemin),
                         );
