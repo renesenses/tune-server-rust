@@ -118,9 +118,17 @@ fn banc_5138() {
     let pistes: usize = env_ou("BANC_PISTES", 300);
     let secondes: u64 = env_ou("BANC_SECONDES", 90);
     let debit: String = env_ou("BANC_DEBIT", "equilibre".to_string());
-    let racine: std::path::PathBuf = std::env::var("BANC_CLAP_DIR")
-        .map(Into::into)
-        .unwrap_or_else(|_| std::env::temp_dir().join("banc-clap-5138"));
+    let racine_persistante = std::env::var_os("BANC_CLAP_DIR").map(std::path::PathBuf::from);
+    let racine_ephemere = racine_persistante
+        .is_none()
+        .then(|| crate::test_scratch::scratch_dir("banc-clap-5138"));
+    let racine = racine_persistante.unwrap_or_else(|| {
+        racine_ephemere
+            .as_ref()
+            .expect("dossier temporaire du banc")
+            .path()
+            .to_path_buf()
+    });
     std::fs::create_dir_all(racine.join("pistes")).unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
