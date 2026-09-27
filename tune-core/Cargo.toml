@@ -190,6 +190,18 @@ path = "tests/pause_taches_de_fond.rs"
 name = "priorite_lecture_taches_de_fond"
 path = "tests/priorite_lecture_taches_de_fond.rs"
 
+# #5169 — l'ordre de la cascade selon le reglage de priorite de la plage
+# dynamique. Binaire a lui seul : reglage, pauses et verrou d'analyse sont des
+# etats de PROCESSUS (`autotests = false` : sans cette entree, jamais compile).
+[[test]]
+name = "ordre_des_passes_5169"
+path = "tests/ordre_des_passes_5169.rs"
+
+# #5168 — le rattrapage des `foo_dr.txt` sans decodage ni rescan.
+[[test]]
+name = "rattrapage_foo_dr_5168"
+path = "tests/rattrapage_foo_dr_5168.rs"
+
 # `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
 # tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
 # que tune_core, déjà construit (#2213).
