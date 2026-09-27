@@ -48,7 +48,11 @@ pub const KNOWN_UNREAD_AUDIO_EXTENSIONS: &[&str] = &[
     "wma", "asf", // aucun décodeur WMA/ASF livré (#2078, #2242)
     "dst", // flux DST autonome sans décodeur (#2242)
     "mpc", "mp+", "mpp", // Musepack (Rhorn, #1763)
-    "cue", // feuille de découpe, jamais interprétée
+    // `cue` n'est PLUS ici (#5285) : une feuille CUE n'est pas un fichier
+    // audio, c'est la description d'un album, découpée par l'étape CUE du scan
+    // (#1763, #3631). La ranger ici la faisait compter « format audio reconnu
+    // mais non pris en charge » — 798 feuilles chez Belkadi (fil 2003), dont
+    // l'étape suivante lisait 427 albums. Le parcours la retient à part.
     "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
     "m4b", "m4p", // livres audio, achats protégés
     "dts", "ac3", "eac3", // conteneurs plutôt vidéo/multicanal
