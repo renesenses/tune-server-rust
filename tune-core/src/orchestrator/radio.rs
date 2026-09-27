@@ -250,6 +250,10 @@ struct EtatRadio {
     // travers les reconnexions compatibles : réinitialiser les biquads à chaque
     // coupure amont créerait un transitoire audible (#2063).
     radio_eq: Option<crate::audio::eq::EqProcessor>,
+    // #4407 — le profil de départ n'est posé qu'UNE fois : après une relève
+    // en vol qui a coupé l'égaliseur, une reconnexion ne doit pas remonter
+    // l'ancien.
+    eq_de_depart_pose: bool,
 }
 
 /// Les canaux et le contexte du décodeur, relevés une fois par
@@ -259,6 +263,9 @@ struct CanauxRadio<'a> {
     data_ready: &'a std::sync::Arc<tokio::sync::Notify>,
     session: &'a std::sync::Arc<crate::http::streamer::StreamSession>,
     eq_profile: &'a Option<crate::audio::eq::EqProfile>,
+    /// #4407 — le poste où la route dépose un nouvel égaliseur, relevé au
+    /// paquet suivant, sans refaire la session.
+    en_vol: &'a Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     levels_tx: &'a Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
     rt: &'a tokio::runtime::Handle,
     /// #3973 — « bit-perfect strict » de la zone : une cadence que le décodeur
@@ -330,6 +337,9 @@ pub(super) fn decode_radio_stream_to_pcm(
     // #3973 — « bit-perfect strict » de la zone qui écoute (faux hors zone :
     // serveur de médias).
     strict_bitperfect: bool,
+    // #4407 — le poste de relève de l'égaliseur de CE flux. `None` : le
+    // profil de départ reste celui du flux entier (sortie locale, Bandcamp).
+    en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
 ) -> Result<(), String> {
     // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
     // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
@@ -355,12 +365,14 @@ pub(super) fn decode_radio_stream_to_pcm(
         dropped_at: None,
         expected_format: None,
         radio_eq: None,
+        eq_de_depart_pose: false,
     };
     let canaux = CanauxRadio {
         tx: &tx,
         data_ready: &data_ready,
         session: &session,
         eq_profile: &eq_profile,
+        en_vol: &en_vol,
         levels_tx: &levels_tx,
         rt: &rt,
         strict_bitperfect,
@@ -630,7 +642,8 @@ fn preparer_la_sortie(
         return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
     }
     let needs_resample = output_sample_rate != source_sample_rate;
-    if etat.radio_eq.is_none() {
+    if !etat.eq_de_depart_pose {
+        etat.eq_de_depart_pose = true;
         etat.radio_eq = canaux.eq_profile.as_ref().and_then(|profile| {
             let eq =
                 crate::audio::eq::EqProcessor::new(profile, output_sample_rate, source_channels);
@@ -746,6 +759,15 @@ fn decoder_un_paquet(
     // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
     // le profil de zone. Le traitement se fait en f32 avant i16, comme
     // les autres chemins DSP, et les VU observent ainsi le signal final.
+    // #4407 — un égaliseur déposé en vol prend la relève à CE paquet :
+    // même session, même en-tête WAV, aucun nouveau `SetAVTransportURI`.
+    if let Some(poste) = canaux.en_vol.as_ref() {
+        poste.relever(
+            &mut etat.radio_eq,
+            sortie.output_sample_rate,
+            channels as u16,
+        );
+    }
     apply_radio_eq(&mut etat.radio_eq, &mut interleaved);
 
     let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);

@@ -237,11 +237,49 @@ impl EqProcessor {
         self.gain_moyen_db
     }
     pub fn process_pcm(&mut self, pcm: &mut [u8], depth: u16) -> EqProcessStats {
+        // #4407 — une relève en vol sur un porteur d'OCTETS (relais DSP
+        // progressif d'un flux réseau) : le fondu de `prendre_la_releve` ne
+        // vit que dans le chemin flottant. Le temps du fondu (200 ms), le
+        // bloc y passe ; ensuite, retour au chemin entier habituel.
+        if self.fondu.is_some() {
+            return self.process_pcm_en_fondu(pcm, depth);
+        }
         match &mut self.engine {
             Engine::Bundled(p) => p.process_pcm(pcm, depth),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_pcm(pcm, depth)),
             Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
         }
+    }
+    /// #4407 — [`Self::process_pcm`] pendant un fondu de relève : PCM entier
+    /// petit-boutiste (16, 24 ou 32 bits) → flottant → fondu → entier. Un bloc
+    /// qui n'est pas un nombre entier de trames, ou une profondeur inconnue,
+    /// abandonne le fondu plutôt que de décaler les états par canal.
+    fn process_pcm_en_fondu(&mut self, pcm: &mut [u8], depth: u16) -> EqProcessStats {
+        let octets = usize::from(depth / 8);
+        let trame = octets * usize::from(self.channels.max(1));
+        if !(2..=4).contains(&octets) || pcm.is_empty() || !pcm.len().is_multiple_of(trame) {
+            self.fondu = None;
+            return self.process_pcm(pcm, depth);
+        }
+        let echelle = (1i64 << (depth - 1)) as f64;
+        let mut flottants: Vec<f32> = pcm
+            .chunks_exact(octets)
+            .map(|s| {
+                let mut b = [0u8; 4];
+                b[4 - octets..].copy_from_slice(s);
+                // Aligné en haut d'un i32 puis ramené : l'extension de signe
+                // est faite par le décalage arithmétique.
+                (f64::from(i32::from_le_bytes(b) >> (32 - 8 * octets)) / echelle) as f32
+            })
+            .collect();
+        let stats = self.process_interleaved(&mut flottants);
+        for (s, v) in pcm.chunks_exact_mut(octets).zip(flottants) {
+            let entier = (f64::from(v) * echelle)
+                .round()
+                .clamp(-echelle, echelle - 1.0) as i32;
+            s.copy_from_slice(&entier.to_le_bytes()[..octets]);
+        }
+        stats
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
         let Some(mut fondu) = self.fondu.take() else {

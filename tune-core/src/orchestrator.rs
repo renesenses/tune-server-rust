@@ -1017,6 +1017,12 @@ pub struct PlaybackOrchestrator {
     /// pas son empreinte ; un flux adopté en gapless apporte la sienne.
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     traitement_des_flux: std::sync::Mutex<std::collections::HashMap<i64, Vec<(String, String)>>>,
+    /// #4407 — les postes de relève d'égaliseur des flux que Tune fabrique
+    /// au fil de l'eau (radio décodée, relais DSP progressif), par zone et
+    /// par `stream_id`. Bornés comme `traitement_des_flux`. Verrou std.
+    eq_en_vol_des_flux: std::sync::Mutex<
+        std::collections::HashMap<i64, Vec<(String, std::sync::Arc<eq_en_vol::EqEnVol>)>>,
+    >,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
@@ -1270,6 +1276,12 @@ struct StreamingDsp {
     /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
     /// sans égaliseur ni crossfeed.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
+    /// égaliseur relevé en vol aux bons coefficients.
+    sample_rate: u32,
+    /// #4407 — le poste où la route dépose un nouvel égaliseur, relevé au
+    /// bloc suivant (voir [`eq_en_vol::EqEnVol`]). `None` : aucun.
+    en_vol: Option<std::sync::Arc<eq_en_vol::EqEnVol>>,
 }
 
 impl StreamingDsp {
@@ -1312,6 +1324,10 @@ impl StreamingDsp {
     /// anti-régression de l'immense majorité des zones, qui doivent continuer à
     /// entendre exactement les mêmes échantillons qu'avant ce correctif.
     fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        // #4407 — l'égaliseur déposé en vol prend la relève à CE bloc.
+        if let Some(poste) = self.en_vol.as_ref() {
+            poste.relever(&mut self.eq, self.sample_rate, self.channels);
+        }
         if let Some(factor) = self.replaygain {
             crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
         }
@@ -1404,6 +1420,7 @@ impl PlaybackOrchestrator {
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
+            eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "local-audio")]
@@ -1496,6 +1513,10 @@ mod service_wav_progressif_5080;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
+mod eq_en_vol;
+#[cfg(test)]
+mod eq_en_vol_4407_tests;
 // Greffons natifs tiers : l'étage casque de la chaîne, avec une vraie
 // bibliothèque native de test.
 #[cfg(test)]
