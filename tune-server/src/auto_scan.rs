@@ -469,6 +469,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
         info!(cache_dir = %cache_dir.display(), "artwork_cache_dir_resolved");
+        bilan_cue.reevaluer_pochettes(&db, &cache_dir, false);
         let quality_split = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
             .get("quality_split")
             .ok()
@@ -2357,6 +2358,11 @@ fn relire_les_feuilles_cue_du_lot(
     let _porte = porte_du_scan(db);
     for dossier in dossiers {
         let relecture = tune_core::scanner::cue_bibliotheque::relire_le_dossier(db, &dossier);
+        relecture.bilan.reevaluer_pochettes(
+            db,
+            &crate::routes::library::artwork_cache_dir(),
+            false,
+        );
         info!(
             dossier = %dossier.display(),
             images_decoupees = relecture.images_decoupees.len(),
@@ -2929,3 +2935,7 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "pochettes_cue_tests_5222.rs"]
+mod pochettes_cue_tests_5222;

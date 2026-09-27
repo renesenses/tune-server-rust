@@ -1870,6 +1870,7 @@ async fn spawn_library_scan_avec_lecteur(
         // each batch commits, not only when the entire scan finishes.
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
+        bilan_cue.reevaluer_pochettes(&db, &cache_dir, force);
         let mut inserted = 0i64;
         let mut updated = 0i64;
         // `db_insert_failed` / `db_update_failed` ne sont plus tenus ici : le
