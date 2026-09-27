@@ -88,6 +88,11 @@ pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Lecture native des images SACD : sommaires, textes, DSD lu dans l'ISO (#5297).
+pub mod sacd;
+/// #5297 — une piste d'ISO SACD emprunte le chemin DSD existant (PCM, DoP).
+#[cfg(test)]
+mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
 pub mod staged_growth;
