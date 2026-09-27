@@ -1114,20 +1114,29 @@ impl LocalOutput {
     pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
         {
             let mut emplacement = self.eq.lock().unwrap();
-            match (eq, emplacement.as_ref()) {
-                (Some(mut neuf), Some(precedent)) => {
-                    neuf.inherit_state_from(precedent);
-                    *emplacement = Some(neuf);
-                }
-                (suivant, _) => *emplacement = suivant,
-            }
+            let precedent = emplacement.take();
+            *emplacement = if self.pure_bypass.load(Ordering::Relaxed) {
+                // PURE : la chaîne est contournée, rien à fondre — et rien ne
+                // doit rester monté qui ferait croire à un DSP actif.
+                eq
+            } else {
+                // #5215 — héritage des filtres ET, si le niveau bouge
+                // (coupure, activation, préampli déplacé), fondu enchaîné de
+                // `RAMPE_DE_BASCULE_MS` au lieu d'une marche instantanée.
+                super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent)
+            };
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
     }
 
     pub fn has_eq(&self) -> bool {
-        self.eq.lock().unwrap().is_some()
+        // #5215 — un égaliseur coupé qui finit son fondu n'est plus « monté ».
+        self.eq
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| !p.est_neutre())
     }
 
     /// Format du flux en cours, `(taux, canaux)`, ou `None` si rien ne joue.
@@ -3108,6 +3117,11 @@ fn apply_local_dsp(
     if let Ok(mut e) = eq.lock() {
         if let Some(ref mut p) = *e {
             p.process_interleaved(samples);
+            // #5215 — l'égaliseur coupé a fini de fondre vers le sec : on le
+            // retire, la chaîne redevient exactement celle d'un EQ absent.
+            if p.est_neutre_au_repos() {
+                *e = None;
+            }
         }
     }
     if let Ok(mut conv) = convolver.lock() {
@@ -3267,7 +3281,9 @@ fn local_dsp_is_identity(
     // « octets source conservés » et le repli ne serait jamais appliqué — le
     // réglage serait accepté et resterait sans effet.
     !mono_downmix.load(Ordering::Relaxed)
-        && eq.lock().is_ok_and(|guard| guard.is_none())
+        && eq
+            .lock()
+            .is_ok_and(|guard| guard.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
         && convolver.lock().is_ok_and(|guard| guard.is_none())
         && crossfeed.lock().is_ok_and(|guard| guard.is_none())
 }

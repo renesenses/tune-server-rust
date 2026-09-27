@@ -3964,3 +3964,170 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
         "{rendu} ‰"
     );
 }
+
+// -----------------------------------------------------------------------
+// #5215 — couper ou réactiver l'égaliseur en vol : une rampe, pas une marche
+//
+// Levente Toth, fil 1974, au casque : couper l'EQ retirait d'un coup un
+// préampli de −12,56 dB. `replace_eq_live` remplaçait le processeur derrière
+// le mutex relu à chaque paquet : le paquet suivant sortait 12 dB plus fort,
+// en UN échantillon. Ces témoins font traverser la chaîne locale RÉELLE
+// (`apply_local_dsp`) à un sinus continu, paquet par paquet, et mesurent la
+// plus grande marche entre deux échantillons autour de la bascule.
+// -----------------------------------------------------------------------
+
+const TAUX_5215: u32 = 48_000;
+const TRAMES_PAR_PAQUET_5215: usize = 480;
+/// 40 Hz : une période fait 1 200 trames, donc les frontières de paquet ne
+/// tombent PAS sur un passage à zéro — une marche de gain y est visible.
+const FREQ_5215: f64 = 40.0;
+const AMPLITUDE_5215: f64 = 0.5;
+/// Plus grande marche tolérée entre deux échantillons. Le sinus nu en fait
+/// au plus 0,5 × 2π × 40 / 48 000 ≈ 0,0026 ; une marche de 12 dB au milieu
+/// d'une alternance en fait une centaine de fois plus.
+const MARCHE_MAX_5215: f32 = 0.01;
+
+/// Égaliseur à fort préampli négatif : +12 dB en crête à 8 kHz, donc une
+/// réserve automatique d'environ −12 dB — à 40 Hz, seul le préampli agit.
+fn egaliseur_a_preampli_negatif_5215() -> crate::audio::eq::EqProcessor {
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 8000.0,
+            gain: 12.0,
+            q: 1.0,
+            band_type: "peak".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::audio::eq::EqProcessor::new(&profil, TAUX_5215, 2)
+}
+
+/// Fait passer `paquets` paquets de sinus stéréo par la chaîne locale, à la
+/// suite de `*trame`, et rend la voie gauche traitée.
+fn jouer_5215(sortie: &LocalOutput, trame: &mut usize, paquets: usize) -> Vec<f32> {
+    let mut gauche = Vec::new();
+    for _ in 0..paquets {
+        let mut pcm = Vec::with_capacity(TRAMES_PAR_PAQUET_5215 * 2);
+        for _ in 0..TRAMES_PAR_PAQUET_5215 {
+            let t = *trame as f64 / TAUX_5215 as f64;
+            let s = (AMPLITUDE_5215 * (2.0 * std::f64::consts::PI * FREQ_5215 * t).sin()) as f32;
+            pcm.push(s);
+            pcm.push(s);
+            *trame += 1;
+        }
+        apply_local_dsp(
+            &mut pcm,
+            &sortie.eq,
+            &sortie.convolver,
+            &sortie.crossfeed,
+            &sortie.pure_bypass,
+            &sortie.mono_downmix,
+            2,
+            false,
+        );
+        gauche.extend(pcm.chunks(2).map(|f| f[0]));
+    }
+    gauche
+}
+
+fn plus_grande_marche_5215(signal: &[f32]) -> f32 {
+    signal
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max)
+}
+
+fn crete_5215(signal: &[f32]) -> f32 {
+    signal.iter().map(|s| s.abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -10.0,
+        "le témoin veut une grosse réserve : {preampli} dB"
+    );
+    sortie.set_eq(Some(eq));
+
+    let mut trame = 0;
+    // 51 paquets : 20,4 périodes, la bascule tombe en pleine alternance.
+    let mut signal = jouer_5215(&sortie, &mut trame, 51);
+    sortie.replace_eq_live(None);
+    signal.extend(jouer_5215(&sortie, &mut trame, 60));
+
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "couper l'EQ fait une marche de {marche} entre deux échantillons \
+         (seuil {MARCHE_MAX_5215}) : le préampli de {preampli:.2} dB saute d'un coup"
+    );
+    // PROGRESSIF, pas seulement sans clic : 50 à 100 ms après la bascule, le
+    // niveau est encore en chemin (une rampe de 1 ms passerait le seuil de
+    // marche mais laisserait le sursaut entier).
+    let bascule = 51 * TRAMES_PAR_PAQUET_5215;
+    let en_chemin = crete_5215(&signal[bascule + 2400..bascule + 4800]);
+    assert!(
+        en_chemin < 0.9 * AMPLITUDE_5215 as f32,
+        "50 à 100 ms après la coupure, le niveau est déjà plein ({en_chemin}) : pas de rampe"
+    );
+    // Niveau final : le signal SEC, exactement.
+    let fin = &signal[signal.len() - 1200..];
+    let crete = crete_5215(fin);
+    assert!(
+        (crete - AMPLITUDE_5215 as f32).abs() < 0.01,
+        "après la rampe, le niveau doit être celui sans EQ : crête {crete}"
+    );
+    // Et la chaîne redevient celle d'un EQ absent.
+    assert!(!sortie.has_eq());
+    assert!(
+        sortie.eq.lock().unwrap().is_none(),
+        "la rampe finie, plus rien ne doit rester monté"
+    );
+}
+
+#[test]
+fn reactiver_l_egaliseur_en_vol_descend_au_niveau_du_preampli_par_une_rampe_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    let mut trame = 0;
+    let mut signal = jouer_5215(&sortie, &mut trame, 51);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    sortie.replace_eq_live(Some(eq));
+    signal.extend(jouer_5215(&sortie, &mut trame, 60));
+
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "réactiver l'EQ fait une marche de {marche} (seuil {MARCHE_MAX_5215})"
+    );
+    let attendu = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32;
+    let bascule = 51 * TRAMES_PAR_PAQUET_5215;
+    let en_chemin = crete_5215(&signal[bascule + 2400..bascule + 4800]);
+    assert!(
+        en_chemin > 1.5 * attendu,
+        "50 à 100 ms après la réactivation, le niveau est déjà au préampli ({en_chemin}) : pas de rampe"
+    );
+    let crete = crete_5215(&signal[signal.len() - 1200..]);
+    assert!(
+        (crete - attendu).abs() < 0.005,
+        "après la rampe, le niveau doit être celui du préampli : crête {crete}, attendu {attendu}"
+    );
+    assert!(sortie.has_eq());
+}
+
+#[test]
+fn en_pure_la_coupure_ne_laisse_rien_de_monte_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_eq(Some(egaliseur_a_preampli_negatif_5215()));
+    sortie.set_pure_bypass(true);
+    sortie.replace_eq_live(None);
+    assert!(
+        sortie.eq.lock().unwrap().is_none(),
+        "PURE : aucune rampe, aucun égaliseur neutre resté monté"
+    );
+}
