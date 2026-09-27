@@ -873,10 +873,10 @@ impl PositionPoller {
                 };
                 if let Some(output_arc) = output_arc {
                     let output = output_arc.lock().await;
-                    // Exclusive-mode local outputs (ASIO / WASAPI exclusive) take
-                    // a dedicated playback loop that returns at EOF without
-                    // consuming the staged next_media — they cannot chain
-                    // internally. Arming gapless for them orphans the staged
+                    // Exclusive-mode local outputs whose playback loop returns at
+                    // EOF without consuming the staged next_media (ASIO and
+                    // CoreAudio exclusive — WASAPI exclusive chains since #5204)
+                    // cannot chain internally. Arming gapless for them orphans the staged
                     // track AND arms the poller guard, which suppresses the
                     // natural-end advance: a single-track Repeat queue never
                     // loops, and multi-track albums stall after each track
