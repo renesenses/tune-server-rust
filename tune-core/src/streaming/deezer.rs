@@ -311,7 +311,9 @@ impl DeezerService {
             }
             items.extend(page.iter().take(500 - items.len()).cloned());
             let total = response.pointer(pointer).and_then(|value| {
-                value["total"].as_u64().or_else(|| value["total"].as_str()?.parse().ok())
+                value["total"]
+                    .as_u64()
+                    .or_else(|| value["total"].as_str()?.parse().ok())
             });
             if total.is_some_and(|total| items.len() as u64 >= total) {
                 break;
@@ -322,7 +324,10 @@ impl DeezerService {
 
     async fn arl_profile(&self, tab: &str) -> Result<Vec<serde_json::Value>, TuneError> {
         self.arl.as_ref().ok_or("deezer: not authenticated")?;
-        let user_id = self.user_id.filter(|id| *id != 0).ok_or("deezer: no user_id")?;
+        let user_id = self
+            .user_id
+            .filter(|id| *id != 0)
+            .ok_or("deezer: no user_id")?;
         self.gateway_list(
             "deezer.pageProfile",
             serde_json::json!({"user_id": user_id, "tab": tab}),
@@ -345,10 +350,12 @@ impl DeezerService {
     }
 
     fn gateway_image(item: &serde_json::Value, key: &str, kind: &str) -> Option<String> {
-        let hash = item[key].as_str().filter(|hash| {
-            hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })?;
-        Some(format!("https://cdn-images.dzcdn.net/images/{kind}/{hash}/500x500-000000-80-0-0.jpg"))
+        let hash = item[key]
+            .as_str()
+            .filter(|hash| hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))?;
+        Some(format!(
+            "https://cdn-images.dzcdn.net/images/{kind}/{hash}/500x500-000000-80-0-0.jpg"
+        ))
     }
 
     fn map_gateway_album(item: &serde_json::Value) -> Result<StreamAlbum, TuneError> {
@@ -358,12 +365,14 @@ impl DeezerService {
             artist: item["ART_NAME"].as_str().unwrap_or_default().into(),
             artist_id: Self::gateway_id(item, "ART_ID").ok(),
             cover_path: Self::gateway_image(item, "ALB_PICTURE", "cover"),
-            year: item["PHYSICAL_RELEASE_DATE"].as_str()
+            year: item["PHYSICAL_RELEASE_DATE"]
+                .as_str()
                 .or_else(|| item["DIGITAL_RELEASE_DATE"].as_str())
                 .and_then(|date| date.get(..4)?.parse().ok()),
             track_count: Self::gateway_number(&item["NUMBER_TRACK"])
                 .or_else(|| Self::gateway_number(&item["NB_SONG"]))
-                .and_then(|count| u32::try_from(count).ok()).unwrap_or(0),
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or(0),
             quality: None,
             released_at: None,
             release_type: None,
@@ -386,7 +395,8 @@ impl DeezerService {
             description: item["DESCRIPTION"].as_str().map(Into::into),
             cover_path: Self::gateway_image(item, "PLAYLIST_PICTURE", "playlist"),
             track_count: Self::gateway_number(&item["NB_SONG"])
-                .and_then(|count| u32::try_from(count).ok()).unwrap_or(0),
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or(0),
             owner: item["PARENT_USERNAME"].as_str().map(Into::into),
             covers: Vec::new(),
         })
@@ -401,15 +411,16 @@ impl DeezerService {
             album_id: Self::gateway_id(item, "ALB_ID").ok(),
             artist_id: Self::gateway_id(item, "ART_ID").ok(),
             duration_ms: Self::gateway_number(&item["DURATION"])
-                .unwrap_or(0).saturating_mul(1000),
+                .unwrap_or(0)
+                .saturating_mul(1000),
             cover_path: Self::gateway_image(item, "ALB_PICTURE", "cover"),
             track_number: Self::gateway_number(&item["TRACK_NUMBER"])
                 .and_then(|number| u32::try_from(number).ok()),
             disc_number: Self::gateway_number(&item["DISK_NUMBER"])
                 .and_then(|number| u32::try_from(number).ok()),
-            explicit: item["EXPLICIT_LYRICS"].as_bool().unwrap_or_else(|| {
-                Self::gateway_number(&item["EXPLICIT_LYRICS"]) == Some(1)
-            }),
+            explicit: item["EXPLICIT_LYRICS"]
+                .as_bool()
+                .unwrap_or_else(|| Self::gateway_number(&item["EXPLICIT_LYRICS"]) == Some(1)),
             quality: None,
             isrc: item["ISRC"].as_str().map(Into::into),
             disponible: None,
@@ -1037,10 +1048,15 @@ impl StreamingService for DeezerService {
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         if self.access_token.is_none() && self.arl.is_some() {
-            let response = self.gw_api_call("deezer.pagePlaylist", Some(serde_json::json!({
-                "playlist_id": playlist_id, "start": 0, "nb": 0,
-                "tab": 0, "header": true,
-            }))).await?;
+            let response = self
+                .gw_api_call(
+                    "deezer.pagePlaylist",
+                    Some(serde_json::json!({
+                        "playlist_id": playlist_id, "start": 0, "nb": 0,
+                        "tab": 0, "header": true,
+                    })),
+                )
+                .await?;
             return Self::map_gateway_playlist(&response["DATA"]);
         }
         let data = self.api_get(&format!("/playlist/{playlist_id}")).await?;
@@ -1049,9 +1065,16 @@ impl StreamingService for DeezerService {
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         if self.access_token.is_none() && self.arl.is_some() {
-            return self.gateway_list(
-                "playlist.getSongs", serde_json::json!({"playlist_id": playlist_id}), "",
-            ).await?.iter().map(Self::map_gateway_track).collect();
+            return self
+                .gateway_list(
+                    "playlist.getSongs",
+                    serde_json::json!({"playlist_id": playlist_id}),
+                    "",
+                )
+                .await?
+                .iter()
+                .map(Self::map_gateway_track)
+                .collect();
         }
         let data = self
             .api_get(&format!("/playlist/{playlist_id}/tracks?limit=500"))
@@ -1063,8 +1086,12 @@ impl StreamingService for DeezerService {
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         if self.access_token.is_none() {
-            return self.arl_profile("playlists").await?
-                .iter().map(Self::map_gateway_playlist).collect();
+            return self
+                .arl_profile("playlists")
+                .await?
+                .iter()
+                .map(Self::map_gateway_playlist)
+                .collect();
         }
         self.access_token
             .as_ref()
@@ -1131,8 +1158,12 @@ impl StreamingService for DeezerService {
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         if self.access_token.is_none() {
-            return self.arl_profile("albums").await?
-                .iter().map(Self::map_gateway_album).collect();
+            return self
+                .arl_profile("albums")
+                .await?
+                .iter()
+                .map(Self::map_gateway_album)
+                .collect();
         }
         self.access_token
             .as_ref()
@@ -1143,8 +1174,12 @@ impl StreamingService for DeezerService {
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         if self.access_token.is_none() {
-            return self.arl_profile("artists").await?
-                .iter().map(Self::map_gateway_artist).collect();
+            return self
+                .arl_profile("artists")
+                .await?
+                .iter()
+                .map(Self::map_gateway_artist)
+                .collect();
         }
         self.access_token
             .as_ref()
@@ -1156,10 +1191,20 @@ impl StreamingService for DeezerService {
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         if self.access_token.is_none() {
             self.arl.as_ref().ok_or("deezer: not authenticated")?;
-            let user_id = self.user_id.filter(|id| *id != 0).ok_or("deezer: no user_id")?;
-            return self.gateway_list(
-                "favorite_song.getList", serde_json::json!({"user_id": user_id}), "",
-            ).await?.iter().map(Self::map_gateway_track).collect();
+            let user_id = self
+                .user_id
+                .filter(|id| *id != 0)
+                .ok_or("deezer: no user_id")?;
+            return self
+                .gateway_list(
+                    "favorite_song.getList",
+                    serde_json::json!({"user_id": user_id}),
+                    "",
+                )
+                .await?
+                .iter()
+                .map(Self::map_gateway_track)
+                .collect();
         }
         self.access_token
             .as_ref()
@@ -2107,7 +2152,11 @@ mod tests {
             json!({"results":{"data":[{"SNG_ID":"10","SNG_TITLE":"Song"}],"total":1}}),
         ];
         let server = tokio::spawn(fausse_passerelle(
-            listener, responses.into_iter().map(|value| value.to_string()).collect(),
+            listener,
+            responses
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect(),
         ));
         let mut svc = DeezerService::new();
         svc.set_gw_url(format!("http://{address}/gateway"));
@@ -2120,17 +2169,26 @@ mod tests {
         let tracks = svc.get_user_tracks().await.unwrap();
         assert_eq!(tracks[0].id, "10");
         assert_eq!(tracks[0].duration_ms, 123_000);
-        assert_eq!(svc.get_playlist("8").await.unwrap().name, "Private playlist");
+        assert_eq!(
+            svc.get_playlist("8").await.unwrap().name,
+            "Private playlist"
+        );
         assert_eq!(svc.get_playlist_tracks("8").await.unwrap()[0].id, "10");
         let requests = tokio::time::timeout(Duration::from_secs(2), server)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         for request in &requests[1..] {
             assert!(request.contains("api_token=CF"));
             assert!(entete(request, "Cookie").contains("sid=fr-SESSION-1"));
         }
         for (request, method) in requests[1..].iter().zip([
-            "deezer.pageProfile", "deezer.pageProfile", "deezer.pageProfile",
-            "favorite_song.getList", "deezer.pagePlaylist", "playlist.getSongs",
+            "deezer.pageProfile",
+            "deezer.pageProfile",
+            "deezer.pageProfile",
+            "favorite_song.getList",
+            "deezer.pagePlaylist",
+            "playlist.getSongs",
         ]) {
             assert!(request.contains(&format!("method={method}&")));
         }
@@ -2140,20 +2198,38 @@ mod tests {
     async fn arl_library_keeps_empty_results_distinct_from_errors() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(fausse_passerelle(listener, vec![
-            json!({"results":{"TAB":{"albums":{"data":[],"total":0}}}}).to_string(),
-            json!({"results":{"TAB":{"albums":{}}}}).to_string(),
-            json!({"error":{"VALID_TOKEN_REQUIRED":"Invalid CSRF token"}}).to_string(),
-        ]));
+        let server = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![
+                json!({"results":{"TAB":{"albums":{"data":[],"total":0}}}}).to_string(),
+                json!({"results":{"TAB":{"albums":{}}}}).to_string(),
+                json!({"error":{"VALID_TOKEN_REQUIRED":"Invalid CSRF token"}}).to_string(),
+            ],
+        ));
         let mut svc = DeezerService::new();
         svc.set_gw_url(format!("http://{address}/gateway"));
         svc.arl = Some("a".repeat(192));
         svc.user_id = Some(42);
         assert!(svc.get_user_albums().await.unwrap().is_empty());
-        assert!(svc.get_user_albums().await.unwrap_err().to_string().contains("malformed"));
-        assert!(svc.get_user_albums().await.unwrap_err().to_string().contains("VALID_TOKEN_REQUIRED"));
+        assert!(
+            svc.get_user_albums()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("malformed")
+        );
+        assert!(
+            svc.get_user_albums()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("VALID_TOKEN_REQUIRED")
+        );
         assert!(svc.arl.is_some());
-        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2168,5 +2244,4 @@ mod tests {
             assert!(error.to_string().contains("deezer: not authenticated"));
         }
     }
-
 }
