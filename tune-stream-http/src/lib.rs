@@ -711,8 +711,8 @@ pub async fn handle_stream(
             let hdr = if is_radio {
                 // Wait until the decoder has probed the upstream so the header
                 // advertises the TRUE sample rate/channels (FIP is 48000, not
-                // the placeholder 44100). Fall back to the StreamInfo values if
-                // the decoder hasn't populated them within a short window.
+                // the placeholder 44100). A guessed header cannot precede PCM
+                // whose width is still unknown (#5217).
                 if session.detected_output_format().is_none() {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
@@ -720,11 +720,16 @@ pub async fn handle_stream(
                     )
                     .await;
                 }
-                let (real_sr, real_ch) = session.detected_output_format().unwrap_or((sr, ch));
+                let Some((real_sr, real_ch)) = session.detected_output_format() else {
+                    yield Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                        "radio: format PCM non détecté, aucun en-tête WAV ne peut être servi"));
+                    return;
+                };
+                let real_bd = session.output_bit_depth();
                 if bounded_live {
-                    build_wav_header_bounded_live(real_ch, real_sr, bd)
+                    build_wav_header_bounded_live(real_ch, real_sr, real_bd)
                 } else {
-                    build_wav_header_streaming(real_ch, real_sr, bd)
+                    build_wav_header_streaming(real_ch, real_sr, real_bd)
                 }
             } else {
                 build_wav_header(ch, sr, bd, dur_ms)
@@ -3464,6 +3469,99 @@ mod tests {
             octets.extend_from_slice(&b);
         }
         (entetes, octets)
+    }
+
+    #[tokio::test]
+    async fn radio_http_annonce_la_profondeur_detectee_5217() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        for agent in ["Lavf/60.0", "Tune-local"] {
+            let mut session = StreamSession::new(
+                "radio-5217".into(),
+                StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44_100,
+                    channels: 2,
+                    bit_depth: 16,
+                    ..Default::default()
+                },
+                false,
+                8,
+            );
+            session.is_radio = true;
+            session.publish_detected_pcm_format(96_000, 2, 24);
+            let session = std::sync::Arc::new(session);
+            let tx = session.tx.lock().await.clone().unwrap();
+            tx.send(vec![1, 0, 0, 255, 255, 255]).await.unwrap();
+            drop(tx);
+            session.close_sender().await;
+            let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+                [("radio-5217".into(), session)].into_iter().collect(),
+            ));
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("User-Agent", agent.parse().unwrap());
+            let response =
+                super::handle_stream(Path("radio-5217.wav".into()), State(sessions), headers).await;
+            let mut body = response.into_body().into_data_stream();
+            let entete = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(&entete[..4], b"RIFF");
+            assert_eq!(
+                u16::from_le_bytes(entete[34..36].try_into().unwrap()),
+                24,
+                "#5217 : l'en-tête HTTP annonce encore 16 bits pour du PCM 24 bits ({agent})"
+            );
+            assert_eq!(u16::from_le_bytes(entete[32..34].try_into().unwrap()), 6);
+            assert_eq!(
+                u32::from_le_bytes(entete[28..32].try_into().unwrap()),
+                96_000 * 6
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn radio_http_ne_devine_pas_la_profondeur_5217() {
+        use axum::extract::{Path, State};
+        use futures_util::StreamExt;
+        let mut session = StreamSession::new(
+            "radio-inconnue-5217".into(),
+            StreamInfo {
+                format: "wav".into(),
+                bit_depth: 16,
+                sample_rate: 44_100,
+                channels: 2,
+                ..Default::default()
+            },
+            false,
+            8,
+        );
+        session.is_radio = true;
+        // Réveillé sans format : aucun en-tête fondé sur le format provisoire
+        // ne doit être émis. Même branche qu'après expiration de l'attente.
+        session.data_ready.notify_one();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            [("radio-inconnue-5217".into(), std::sync::Arc::new(session))]
+                .into_iter()
+                .collect(),
+        ));
+        let response = super::handle_stream(
+            Path("radio-inconnue-5217.wav".into()),
+            State(sessions),
+            Default::default(),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let premier = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(premier, Some(Err(_))),
+            "#5217 : un en-tête 16 bits est servi avant de connaître le PCM"
+        );
     }
 
     /// Le canal ICY doit s'ouvrir pour un DIRECT, alors même que la session n'a
