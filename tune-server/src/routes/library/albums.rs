@@ -1758,6 +1758,10 @@ fn numeros_de_piste_de_l_album(state: &AppState, album_id: i64) -> std::collecti
 /// marqueurs, collections, champs repris) ; `404` album inconnu ; `400` même
 /// album des deux côtés ; `409 dossiers_differents`, `409 titres_differents`,
 /// `409 source_non_locale`, `409 paire_declaree_distincte`.
+///
+/// 🔴 `source_non_locale` n'est plus rendu par cette route seule : la garde est
+/// partagée avec `composer_coffret` et `merge_albums` depuis l'arbitrage de
+/// Bertrand du 27/09/2026 ([`super::albums_non_locaux`]).
 pub(super) async fn absorber_album(
     State(state): State<AppState>,
     Path((cible, doublon)): Path<(i64, i64)>,
@@ -1778,33 +1782,12 @@ pub(super) async fn absorber_album(
             format!("albums {cible} / {doublon}"),
         );
     };
-    let non_locales = {
-        let (p1, p2) = match state.backend.engine() {
-            Engine::Postgres => (
-                PostgresDialect.placeholder(1),
-                PostgresDialect.placeholder(2),
-            ),
-            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
-        };
-        state
-            .backend
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM albums WHERE id IN ({p1}, {p2}) AND COALESCE(source, 'local') <> 'local'"
-                ),
-                &[&cible as &dyn ToSqlValue, &doublon],
-            )
-            .ok()
-            .flatten()
-            .and_then(|r| r.first().and_then(|v| v.as_i64()))
-            .unwrap_or(0)
-    };
-    if non_locales > 0 {
-        return refus(
-            StatusCode::CONFLICT,
-            "source_non_locale",
-            "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
-        );
+    // 🔴 LA garde de source, partagée avec `composer_coffret` et `merge_albums`
+    // (arbitrage de Bertrand du 27/09/2026). Elle vivait ici, en un seul
+    // exemplaire pour un seul des trois gestes ; elle est sortie dans
+    // `super::albums_non_locaux` pour que les trois rendent le même refus.
+    if super::albums_non_locaux(&state.backend, &[cible, doublon]) > 0 {
+        return super::refus_source_non_locale();
     }
     // Le SECOND indice de la phase 0 (#3396) : même pochette à l'octet près et
     // numéros de piste complémentaires. Il traverse volontairement les dossiers
@@ -3608,8 +3591,14 @@ pub(super) struct CoffretManuel {
 ///    dossier, ou des dossiers qui ne se ressemblent pas — lui échappe, quel
 ///    que soit son marqueur.
 ///
-/// Ce geste-ci ne suppose RIEN : c'est l'utilisateur qui désigne les albums,
-/// et l'ordre de sa liste est l'ordre des disques.
+/// Ce geste-ci ne suppose RIEN du RANGEMENT : c'est l'utilisateur qui désigne
+/// les albums, et l'ordre de sa liste est l'ordre des disques.
+///
+/// 🔴 Il suppose en revanche qu'ils sont **LOCAUX** (arbitrage de Bertrand du
+/// 27/09/2026) : `409 source_non_locale`, la garde même
+/// qu'[`absorber_album`] — composer un coffret finit par
+/// [`AlbumRepo::absorber`], et fusionner un album distant n'a pas de sens, le
+/// prochain rafraîchissement de sa source le défait.
 ///
 /// # Ce qu'il écrit
 ///
@@ -3661,6 +3650,18 @@ pub(super) async fn composer_coffret(
                     .into_response();
             }
         }
+    }
+    // 🔴 La bibliothèque LOCALE seulement — arbitrage de Bertrand du
+    // 27/09/2026. Composer un coffret, c'est fusionner des albums
+    // (`repo.absorber`, plus bas) après avoir réécrit leurs numéros de disque :
+    // le même geste qu'`absorber_album`, qui refusait déjà le distant. Les
+    // trois gestes rendent le même `409 source_non_locale`.
+    //
+    // APRÈS la boucle de lecture, donc après le 404 : un identifiant inconnu
+    // reste un identifiant inconnu, on ne le requalifie pas en refus de source.
+    // Et AVANT la première écriture, comme tout le reste de cette route.
+    if super::albums_non_locaux(&state.backend, &ids) > 0 {
+        return super::refus_source_non_locale();
     }
     let cible = ids[0];
 
@@ -3998,6 +3999,214 @@ mod tests_source_locale_20260927 {
         assert!(
             vus.contains(&1),
             "l'album LOCAL 1 doit rester examiné — vus {vus:?}"
+        );
+    }
+}
+
+/// Témoins de LA garde de source des trois gestes de fusion manuelle —
+/// arbitrage de Bertrand du 27/09/2026.
+///
+/// Les trois — `absorber_album`, `composer_coffret` et `merge_albums` —
+/// fusionnent des albums que l'utilisateur désigne à la main. Une seule refusait
+/// le distant, et **sans aucun témoin** : `source_non_locale` n'était assuré par
+/// rien avant ce module. `merge_albums` vit dans `routes::metadata`, son témoin
+/// est là-bas.
+#[cfg(test)]
+mod tests_garde_source_fusion_20260927 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état")
+    }
+
+    /// Deux albums de même titre, dans le MÊME dossier, aux numéros de piste
+    /// complémentaires : tout ce qu'`absorber_album` exige, la source mise à
+    /// part. Sans cela, un refus pourrait venir de `dossiers_differents` ou de
+    /// `titres_differents` et le témoin ne dirait rien de la source.
+    fn deux_albums(s: &AppState, source_du_second: &str) {
+        let b = &s.backend;
+        for (id, src, piste) in [(1i64, "local", 1i64), (2, source_du_second, 2)] {
+            let source = src.to_string();
+            b.execute(
+                "INSERT INTO albums (id, title, source) VALUES (?1, 'Kind of Blue', ?2)",
+                &[&id as &dyn ToSqlValue, &source],
+            )
+            .expect("album");
+            let chemin = format!("/m/kob/{piste:02}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number, disc_number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                &[
+                    &format!("p{id}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &source,
+                    &piste,
+                ],
+            )
+            .expect("piste");
+        }
+    }
+
+    async fn lire(r: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let code = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (
+            code,
+            serde_json::from_slice(&octets).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn albums_restants(s: &AppState) -> i64 {
+        s.backend
+            .query_one("SELECT COUNT(*) FROM albums", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1)
+    }
+
+    // -- `absorber_album` : la garde qui existait, désormais gardée ----------
+
+    #[tokio::test]
+    async fn absorber_refuse_un_album_non_local() {
+        let s = etat();
+        deux_albums(&s, "upnp");
+        let (code, v) = lire(absorber_album(State(s.clone()), Path((1, 2))).await).await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "l'album 2 est `source = upnp` : 409 attendu — rendu {v}"
+        );
+        assert_eq!(v["error"], "source_non_locale", "code du refus : {v}");
+        assert_eq!(
+            albums_restants(&s),
+            2,
+            "refusée, la fusion ne doit avoir supprimé aucun album"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, une garde qui refuse tout serait verte.
+    #[tokio::test]
+    async fn absorber_accepte_deux_albums_locaux() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let (code, v) = lire(absorber_album(State(s.clone()), Path((1, 2))).await).await;
+        assert_ne!(
+            v["error"], "source_non_locale",
+            "deux albums LOCAUX ne doivent jamais buter sur la garde de source — {v}"
+        );
+        assert_eq!(code, StatusCode::OK, "la fusion locale doit passer — {v}");
+    }
+
+    // -- `composer_coffret` : la garde ajoutée -------------------------------
+
+    #[tokio::test]
+    async fn composer_un_coffret_refuse_un_album_non_local() {
+        let s = etat();
+        deux_albums(&s, "upnp");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 2],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "l'album 2 est `source = upnp` : 409 attendu — rendu {v}"
+        );
+        assert_eq!(v["error"], "source_non_locale", "code du refus : {v}");
+        assert_eq!(
+            albums_restants(&s),
+            2,
+            "refusé, le geste ne doit avoir composé aucun coffret"
+        );
+        // 🔴 Et il ne doit RIEN avoir écrit : la garde est posée avant la
+        // renumérotation des disques, pas après.
+        let disques_touches = s
+            .backend
+            .query_one("SELECT COUNT(*) FROM tracks WHERE disc_number <> 1", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1);
+        assert_eq!(
+            disques_touches, 0,
+            "aucun numéro de disque ne doit avoir été réécrit avant le refus"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, une garde qui refuse tout serait verte.
+    #[tokio::test]
+    async fn composer_un_coffret_accepte_des_albums_locaux() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 2],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_ne!(
+            v["error"], "source_non_locale",
+            "deux albums LOCAUX ne doivent jamais buter sur la garde de source — {v}"
+        );
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "le coffret local doit se composer — {v}"
+        );
+        assert_eq!(v["absorbes"], 1, "le disque 2 doit avoir été absorbé — {v}");
+    }
+
+    /// 🔴 Un identifiant inconnu reste un 404, il n'est pas requalifié en refus
+    /// de source : la garde est posée APRÈS la lecture des albums.
+    #[tokio::test]
+    async fn un_album_inconnu_reste_un_404() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 99],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "rendu {v}");
+        assert_eq!(v["error"], "album_inconnu", "code du refus : {v}");
+    }
+
+    /// La garde elle-même, sur plus de deux identifiants — `composer_coffret` et
+    /// `merge_albums` en acceptent N, là où `absorber_album` n'en prend que deux.
+    #[test]
+    fn la_garde_compte_les_non_locaux_quel_qu_en_soit_le_nombre() {
+        let s = etat();
+        let b = &s.backend;
+        for (id, src) in [(1i64, "local"), (2, "local"), (3, "upnp"), (4, "qobuz")] {
+            let source = src.to_string();
+            b.execute(
+                "INSERT INTO albums (id, title, source) VALUES (?1, 'x', ?2)",
+                &[&id as &dyn ToSqlValue, &source],
+            )
+            .expect("album");
+        }
+        // Et une ligne ANCIENNE à `source` NULL : elle est LOCALE.
+        b.execute(
+            "INSERT INTO albums (id, title, source) VALUES (5, 'x', NULL)",
+            &[],
+        )
+        .expect("album hérité");
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[1, 2, 5]),
+            0,
+            "trois albums locaux, dont un à `source` NULL"
+        );
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[1, 2, 3, 4, 5]),
+            2,
+            "`upnp` et `qobuz` comptent, la ligne NULL non"
+        );
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[]),
+            0,
+            "aucun identifiant : rien à refuser"
         );
     }
 }
