@@ -563,6 +563,67 @@ impl PositionPoller {
         }
     }
 
+    /// #4382 — un échantillon de la surveillance d'une adoption, à CHAQUE
+    /// sondage de la fenêtre (trois pour une bascule `Next`, huit au plus
+    /// pour une adoption constatée), au niveau INFO : c'est le seul niveau
+    /// que porte un rapport de terrain.
+    ///
+    /// Le journal du DMP-A6 du 27/09 (0.9.166) s'arrête à « `Next` acquitté,
+    /// trois secondes plus tard position toujours gelée, relance » : il ne
+    /// dit pas si l'appareil avait changé de piste sans le rapporter dans
+    /// `GetPositionInfo`, ou s'il n'avait rien fait. Trois témoins le disent,
+    /// sondage par sondage :
+    /// - l'état et la position rapportés (ce que la décision lit déjà) ;
+    /// - les octets tirés du flux adopté DEPUIS l'adoption : un renderer qui
+    ///   joue ce flux le consomme au débit de lecture, un renderer qui ne
+    ///   fait que le garder en tampon n'en tire presque rien ;
+    /// - `GetMediaInfo` (`CurrentURI`, `NextURI`) : le transport a-t-il
+    ///   pris la suivante ?
+    ///
+    /// Lecture seule : rien ici ne change la décision.
+    pub(super) async fn echantillonner_la_surveillance(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        adoption: &AdoptionHorloge,
+        status: &OutputStatus,
+    ) {
+        let octets_tires = self.orchestrator.streamer_bytes_sent(&adoption.flux).await;
+        let octets_depuis_adoption =
+            decisions::octets_depuis_adoption(octets_tires, adoption.octets_a_l_adoption);
+        let output_arc = {
+            let outputs = self.outputs.lock().await;
+            outputs.get(device_id)
+        };
+        let media = match output_arc {
+            Some(arc) => {
+                let output = arc.lock().await;
+                output.media_du_transport().await
+            }
+            None => None,
+        };
+        let (media_courante, media_suivante) = match media {
+            Some(m) => (m.courante, m.suivante),
+            None => (None, None),
+        };
+        info!(
+            zone_id,
+            age_ms = adoption.depuis.elapsed().as_millis() as u64,
+            delai_secs = adoption.delai_secs,
+            preuve = ?adoption.preuve,
+            etat = ?status.state,
+            position_ms = status.position_ms,
+            position_figee_ms = adoption.position_figee_ms,
+            uri = ?status.current_uri,
+            stream_id = %adoption.flux,
+            octets_tires = ?octets_tires,
+            octets_depuis_adoption = ?octets_depuis_adoption,
+            media_courante = ?media_courante,
+            media_suivante = ?media_suivante,
+            "gapless_surveillance_echantillon"
+        );
+    }
+
     /// #4173 — la fin à l'horloge ADOPTE l'enchaînement du renderer.
     ///
     /// Même avance que `gapless_transition_detected` (`advance_queue_metadata`,
@@ -645,6 +706,7 @@ impl PositionPoller {
                     } else {
                         ADOPTION_HORLOGE_DELAI_SECS
                     },
+                    octets_a_l_adoption: octets_tires,
                 });
             }
             None => {
