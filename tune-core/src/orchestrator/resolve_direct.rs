@@ -950,6 +950,13 @@ impl PlaybackOrchestrator {
 
         let (session_id, tx, data_ready, session) =
             self.streamer.create_radio_session(wav_info, 256).await;
+        // #4407 — OAAT consomme le WAV égalisé par Tune : un changement
+        // d'égaliseur s'y relève en vol. La sortie locale égalise elle-même.
+        let en_vol = (!is_local_output).then(|| {
+            let poste = super::eq_en_vol::EqEnVol::pour_la_radio();
+            self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
+            poste
+        });
 
         info!(
             source = "radio",
@@ -1005,6 +1012,7 @@ impl PlaybackOrchestrator {
                     },
                     radio_levels_tx,
                     radio_strict,
+                    en_vol,
                 )
             })
             .await;
@@ -1133,6 +1141,7 @@ impl PlaybackOrchestrator {
                     None,
                     bc_levels_tx,
                     bc_strict,
+                    None,
                 )
             })
             .await;
@@ -1331,11 +1340,15 @@ impl PlaybackOrchestrator {
             ..info
         };
         let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        let mut dsp = dsp;
         let tx = if dsp.is_active() {
             info!(
                 zone_id = req.zone_id,
                 "dsd_upnp_wav_channel_dsp_relay_inserted"
             );
+            let poste = super::eq_en_vol::EqEnVol::pour_le_relais(dsp.compensation.is_some());
+            self.noter_eq_en_vol(req.zone_id, &session_id, poste.clone());
+            dsp.en_vol = Some(poste);
             spawn_streaming_dsp_relay(dsp, bd, true, tx)
         } else {
             tx
@@ -1652,6 +1665,10 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready, session) =
                 self.streamer.create_radio_session(wav_info, 256).await;
             info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
+            // #4407 — le poste de relève : un changement d'égaliseur est posé
+            // dans CE flux au paquet suivant, sans nouvelle session UPnP.
+            let en_vol = super::eq_en_vol::EqEnVol::pour_la_radio();
+            self.noter_eq_en_vol(req.zone_id, &session_id, en_vol.clone());
             let radio_url = audio_url.to_string();
             // VU-mètres sur radio (DLNA) : forwarder de niveaux alimenté
             // par le PCM décodé. Observateur pur, n'affecte pas le flux.
@@ -1693,6 +1710,7 @@ impl PlaybackOrchestrator {
                         radio_eq_profile.clone(),
                         radio_levels_tx,
                         radio_strict,
+                        Some(en_vol),
                     )
                 })
                 .await;

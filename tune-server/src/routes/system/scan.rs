@@ -15,6 +15,10 @@ use crate::state::AppState;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "scan_import_progress.rs"]
+mod import_progress;
+use import_progress::{LecteurMetadonnees, lire_metadonnees_du_lot};
+
 const SCAN_ACTIVE: u64 = 1;
 const SCAN_CANCELLED: u64 = 2;
 const SCAN_FLAGS: u64 = SCAN_ACTIVE | SCAN_CANCELLED;
@@ -693,6 +697,11 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// Returns `true` if the file is new, or its mtime/size differ from what the DB
 /// last recorded for it; `false` if it's unchanged (skip — don't re-read tags).
 ///
+/// #5223 : conserver la fraction de seconde ET la comparer sans tolérance.
+/// Une copie préallouée ou une retouche en place peut changer les balises
+/// à taille égale dans la même seconde. Les anciennes dates tronquées sont
+/// relues une fois si la date précise diffère, puis le raccourci s'applique.
+///
 /// The lookup key is NFC-normalized because the stored `file_path`s (and the
 /// `discovered_paths` set) are NFC, while a filename on disk may be NFD (a FR
 /// library ripped on macOS, copied to a Synology, read back over SMB). Skipping
@@ -712,10 +721,10 @@ pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-            && info.taille.is_some_and(|s| s == file_meta.len() as i64);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let unchanged =
+            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == file_meta.len() as i64);
         return !unchanged;
     }
     true
@@ -772,7 +781,7 @@ pub enum VerdictEcriture {
 /// re-résolus.
 pub fn verdict_ecriture(
     chemin: &str,
-    mtime: u64,
+    mtime: f64,
     taille: u64,
     force: bool,
     carte: &CarteDesChemins,
@@ -781,8 +790,7 @@ pub fn verdict_ecriture(
         return VerdictEcriture::Inserer;
     };
     if !force {
-        let a_change = info.mtime.is_none_or(|m| (m - mtime as f64).abs() > 0.5)
-            || info.taille != Some(taille as i64);
+        let a_change = info.mtime != Some(mtime) || info.taille != Some(taille as i64);
         if !a_change {
             return VerdictEcriture::Inchange;
         }
@@ -892,6 +900,8 @@ pub(crate) enum SuiteDuScan {
     EteinteParReglage,
     /// Offre gratuite : `Feature::AutoEnrichment` n'est pas accordée.
     ReserveeAuPremium,
+    /// L'utilisateur a arrêté le scan : aucune passe ne doit partir après lui.
+    Annulee,
 }
 
 impl SuiteDuScan {
@@ -922,6 +932,7 @@ impl SuiteDuScan {
             Self::Demarree => None,
             Self::EteinteParReglage => Some("disabled_by_setting"),
             Self::ReserveeAuPremium => Some("premium_required"),
+            Self::Annulee => Some("scan_cancelled"),
         }
     }
 
@@ -942,7 +953,7 @@ impl SuiteDuScan {
             Self::ReserveeAuPremium => {
                 Some(refus_enrichissement(MOTIF_PREMIUM_REQUIS, quota_gratuit))
             }
-            Self::Demarree | Self::EteinteParReglage => None,
+            Self::Demarree | Self::EteinteParReglage | Self::Annulee => None,
         };
         json!({
             "started": self.demarree(),
@@ -1422,6 +1433,23 @@ pub(crate) async fn spawn_library_scan_confirmee(
     purge_confirmee: Option<u64>,
     targeted_req: Option<String>,
 ) -> bool {
+    spawn_library_scan_avec_lecteur(
+        state,
+        force,
+        purge_confirmee,
+        targeted_req,
+        std::sync::Arc::new(tune_core::metadata::read_extended_metadata),
+    )
+    .await
+}
+
+async fn spawn_library_scan_avec_lecteur(
+    state: AppState,
+    force: bool,
+    purge_confirmee: Option<u64>,
+    targeted_req: Option<String>,
+    lecteur_metadonnees: LecteurMetadonnees,
+) -> bool {
     let Some(scan_lease) = try_begin_scan() else {
         tracing::warn!("scan_start_rejected_already_running");
         return false;
@@ -1846,6 +1874,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // each batch commits, not only when the entire scan finishes.
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
+        bilan_cue.reevaluer_pochettes(&db, &cache_dir, force);
         let mut inserted = 0i64;
         let mut updated = 0i64;
         // `db_insert_failed` / `db_update_failed` ne sont plus tenus ici : le
@@ -1899,17 +1928,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // #4896 — les balises lues, par album : voir
         // `auto_scan::BalisesVuesParAlbum`.
         let mut balises_vues = crate::auto_scan::BalisesVuesParAlbum::default();
-        let scan_stats = tune_core::scanner::walker::scan_files_batched(
+        let scan_stats = tune_core::scanner::walker::scan_files_batched_avec_arret(
             &files_to_scan,
             true,
             batch_size,
+            scan_cancel_requested,
             |batch, batch_idx, _total_files| {
-                // Cooperative cancellation: once "Stop scan" was pressed, skip
-                // all remaining batches so the loop drains quickly and the scan
-                // stops (bug #1129 — the old cancel only flipped scan_status but
-                // the batch loop kept inserting). Files for the remaining
-                // batches were already read by the walker, but no DB work is
-                // done for them.
+                // Le parcours s'arrête entre les lectures et les lots. Cette
+                // garde couvre aussi un arrêt arrivé juste avant l'import (#5202).
                 if scan_cancel_requested() {
                     // Rien n'a été présenté à la base : rien n'a pu être
                     // refusé. Un scan arrêté n'est pas un scan qui perd.
@@ -1924,6 +1950,59 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
                 let mut exemplaires_du_lot = ExemplairesDuLot::default();
+
+                // Collect extended metadata for tracks in this batch.
+                //
+                // #5043 — un fichier NEUF ou MODIFIÉ se relit toujours : ses
+                // balises viennent de changer, ses crédits avec. Un fichier
+                // INCHANGÉ n'est dans ce lot que parce qu'un scan COMPLET a
+                // désactivé le raccourci ; on ne le rouvre alors que s'il n'a
+                // encore AUCUNE métadonnée étendue. Sans cette borne, chaque
+                // scan complet repaierait le second passage sur toute la
+                // bibliothèque, pour n'y rien changer.
+                //
+                // Le critère ne compte PAS les lignes de `track_metadata` : les
+                // clés `rg_*` / `dr_*` / `upnp_*` ont leurs propres écrivains,
+                // qui n'ouvrent jamais le fichier pour ses crédits. Les compter
+                // sauterait à vie les 15 151 pistes du .18 qui n'ont qu'elles
+                // (voir `rattrapage_metadonnees_5043`).
+                let mut extended_meta_paths: Vec<String> = Vec::new();
+                for sf in &batch {
+                    if sf.metadata.is_none() {
+                        continue;
+                    }
+                    // `false` et non `force` : la question est « ce fichier
+                    // a-t-il bougé ? », pas « le scan est-il complet ? ».
+                    let inchange = verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_tracks,
+                    ) == VerdictEcriture::Inchange;
+                    if inchange
+                        && existing_tracks
+                            .get(sf.path.as_str())
+                            .is_some_and(|info| deja_pourvues.contains(&info.id))
+                    {
+                        continue;
+                    }
+                    extended_meta_paths.push(sf.path.clone());
+                }
+
+                // La relecture des crédits ne tient plus la transaction SQLite (#5202).
+                // Les identifiants des pistes neuves seront résolus après l'écriture.
+                let Some(mut metadonnees_lues) = lire_metadonnees_du_lot(
+                    &extended_meta_paths,
+                    &*lecteur_metadonnees,
+                    scan_cancel_requested,
+                    &event_bus,
+                    batch_idx,
+                    inserted + updated + skipped,
+                    total,
+                ) else {
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
+                };
 
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
@@ -1956,6 +2035,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    // Un écrivain (favori, édition, enrichissement…) attend que
+                    // ce lot ferme sa transaction : lui céder la place entre deux
+                    // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
+                    db.ceder_aux_ecrivains();
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -2045,45 +2128,6 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
 
-                // Collect extended metadata for tracks in this batch.
-                //
-                // #5043 — un fichier NEUF ou MODIFIÉ se relit toujours : ses
-                // balises viennent de changer, ses crédits avec. Un fichier
-                // INCHANGÉ n'est dans ce lot que parce qu'un scan COMPLET a
-                // désactivé le raccourci ; on ne le rouvre alors que s'il n'a
-                // encore AUCUNE métadonnée étendue. Sans cette borne, chaque
-                // scan complet repaierait le second passage sur toute la
-                // bibliothèque, pour n'y rien changer.
-                //
-                // Le critère ne compte PAS les lignes de `track_metadata` : les
-                // clés `rg_*` / `dr_*` / `upnp_*` ont leurs propres écrivains,
-                // qui n'ouvrent jamais le fichier pour ses crédits. Les compter
-                // sauterait à vie les 15 151 pistes du .18 qui n'ont qu'elles
-                // (voir `rattrapage_metadonnees_5043`).
-                let mut extended_meta_paths: Vec<String> = Vec::new();
-                for sf in &batch {
-                    if sf.metadata.is_none() {
-                        continue;
-                    }
-                    // `false` et non `force` : la question est « ce fichier
-                    // a-t-il bougé ? », pas « le scan est-il complet ? ».
-                    let inchange = verdict_ecriture(
-                        &sf.path,
-                        sf.mtime,
-                        sf.file_size,
-                        false,
-                        &existing_tracks,
-                    ) == VerdictEcriture::Inchange;
-                    if inchange
-                        && existing_tracks
-                            .get(sf.path.as_str())
-                            .is_some_and(|info| deja_pourvues.contains(&info.id))
-                    {
-                        continue;
-                    }
-                    extended_meta_paths.push(sf.path.clone());
-                }
-
                 // Batch insert + update using prepared statements. Per-row
                 // failures inside create_batch/update_batch are logged there
                 // and swallowed — count the shortfall so the report shows
@@ -2143,8 +2187,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 inserted += batch_inserted;
                 updated += batch_updated;
 
-                // Store extended metadata (composer, conductor, ReplayGain, MusicBrainz, etc.)
-                // in the track_metadata table. Read extended tags and batch-insert.
+                // Store the extended tags read before the transaction, using
+                // the newly inserted track IDs from the writer connection.
                 {
                     let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
                     let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
@@ -2169,11 +2213,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         std::collections::HashMap::new()
                     });
                     for path_str in &extended_meta_paths {
-                        let path = std::path::Path::new(path_str);
                         let Some(track_id) = ids.get(path_str).copied() else {
                             continue;
                         };
-                        let ext_meta = tune_core::metadata::read_extended_metadata(path);
+                        let ext_meta = metadonnees_lues.remove(path_str).unwrap_or_default();
                         if !ext_meta.is_empty() {
                             meta_entries.push((track_id, ext_meta));
                         }
@@ -2521,6 +2564,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
             ) {
                 tracing::warn!(error = %e, "post_scan_track_genres_backfill_failed");
             }
+            // Entre deux passes, céder la place à un écrivain qui attend la
+            // fin de cette transaction (transaction_du_lot.rs).
+            db.ceder_aux_ecrivains();
             if let Err(e) = db.execute(
                 "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
@@ -2528,6 +2574,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             ) {
                 tracing::warn!(error = %e, "post_scan_album_genres_backfill_failed");
             }
+            db.ceder_aux_ecrivains();
             if let Err(e) = db.execute(
                 &format!(
                     "UPDATE albums SET track_count = {}",
@@ -2537,6 +2584,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             ) {
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
+            db.ceder_aux_ecrivains();
             if let Err(e) = db.execute(
                 &format!("UPDATE albums SET \
                  format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
@@ -2564,6 +2612,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             // tracks; incremental scans keep the fill-only behaviour so values
             // persist between full scans. The EXISTS guard avoids nulling an
             // album genre when no track carries one.
+            db.ceder_aux_ecrivains();
             if force {
                 // Pick the album genre by MAJORITY VOTE across its tracks, with a
                 // deterministic tie-break, instead of an arbitrary `LIMIT 1` track.
@@ -2599,6 +2648,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
                 }
             }
+            db.ceder_aux_ecrivains();
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
             let orphan_albums = db.execute(
                 "DELETE FROM albums WHERE id IN (\
@@ -2630,12 +2680,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
-        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
-            &db,
-            &cache_dir,
-            &portee_pochettes,
-            force,
-        );
+        if !scan_cancel_requested() {
+            tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                &db,
+                &cache_dir,
+                &portee_pochettes,
+                force,
+            );
+        }
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
@@ -2820,18 +2872,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // A full rebuild after scan guarantees consistency.
         // FTS rebuild + WAL checkpoint are SQLite-specific operations
         if db.engine() == tune_core::db::engine::Engine::Sqlite {
-            db.execute_batch(
+            // #5192 — le remplissage de `tracks_fts` est celui de
+            // `full_text_search` : une seule liste de colonnes, termes de
+            // chemin compris.
+            db.execute_batch(&format!(
                 "INSERT INTO tracks_fts(tracks_fts) VALUES('delete-all');\
-                 INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) \
-                 SELECT t.id, t.title, ar.name, al.title, t.genre, t.composer \
-                 FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN albums al ON t.album_id = al.id;\
+                 {};\
                  INSERT INTO albums_fts(albums_fts) VALUES('delete-all');\
                  INSERT INTO albums_fts(rowid, title, artist_name, genre) \
                  SELECT a.id, a.title, ar.name, a.genre FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id;\
                  INSERT INTO artists_fts(artists_fts) VALUES('delete-all');\
                  INSERT INTO artists_fts(rowid, name, sort_name) SELECT id, name, sort_name FROM artists;\
                  PRAGMA wal_checkpoint(PASSIVE);",
-            ).ok();
+                tune_core::library::full_text_search::sql_remplir_tracks_fts()
+            )).ok();
             tracing::info!("post_scan_fts_rebuilt");
 
         }
@@ -2842,18 +2896,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // Turn any .m3u/.m3u8/.pls files found in the scanned dirs into local
         // playlists (Bertrand). Runs after import so every track is in the DB to
         // match against; idempotent by playlist name so a re-scan never dupes.
-        let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
-        if pl.playlists_created > 0 {
-            event_bus.emit(
-                "library.playlists.imported",
-                json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
-            );
-        }
+        if !scan_cancel_requested() {
+            let pl = tune_core::library::playlist_scan::import_local_playlists(&db, &scan_dirs);
+            if pl.playlists_created > 0 {
+                event_bus.emit(
+                    "library.playlists.imported",
+                    json!({ "playlists": pl.playlists_created, "tracks": pl.tracks_added }),
+                );
+            }
 
-        // Mirror hand-made compilation folders (tracks spanning several albums)
-        // into local playlists — opt-in via scan_folder_playlists (Frédéric).
-        if tune_core::library::folder_playlists::folder_playlists_enabled(&db) {
-            tune_core::library::folder_playlists::sync_folder_playlists(&db);
+            // Mirror hand-made compilation folders (tracks spanning several albums)
+            // into local playlists — opt-in via scan_folder_playlists (Frédéric).
+            if tune_core::library::folder_playlists::folder_playlists_enabled(&db) {
+                tune_core::library::folder_playlists::sync_folder_playlists(&db);
+            }
         }
 
         let settings = SettingsRepo::with_backend(db.clone());
@@ -2893,6 +2949,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // Premium n'a pas de quota : `None`.
         let quota_gratuit = (!enrichissement_sous_licence)
             .then(|| QuotaDuJour::lire(&SettingsRepo::with_backend(db.clone())));
+        let suite_du_scan = if scan_cancel_requested() {
+            SuiteDuScan::Annulee
+        } else {
+            suite_du_scan
+        };
         let chiffres = ChiffresDeFinDeScan {
             total_discovered,
             missing_dirs: &missing_dirs,
@@ -2924,7 +2985,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_duplicate_paths: &skipped_duplicate_paths,
             cue: &inventaire_cue,
         };
-        let rapport_scan = chiffres.rapport();
+        let mut rapport_scan = chiffres.rapport();
+        if scan_cancel_requested() {
+            rapport_scan["cancelled"] = json!(true);
+        }
 
         settings
             .set("scan_result", &rapport_scan.to_string())
@@ -2936,7 +3000,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
         // Write scan report JSON for the /scan/report endpoint
-        let report = chiffres.rapport_du_fichier();
+        let mut report = chiffres.rapport_du_fichier();
+        if scan_cancel_requested() {
+            report["cancelled"] = json!(true);
+        }
         let report_path = std::env::var("TUNE_DB_PATH")
             .unwrap_or_else(|_| "tune.db".into())
             .replace(".db", "-scan-report.json");
@@ -2945,7 +3012,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         }
 
         // Auto enrichment after scan: Premium only
-        if suite_du_scan.demarree() {
+        if suite_du_scan.demarree() && !scan_cancel_requested() {
             let enrich_db = db.clone();
             let artist_cache_dir = cache_dir.clone();
             let artist_mbid_db = db.clone();
@@ -5421,3 +5488,7 @@ mod fin_de_scan_interrompu {
 #[cfg(test)]
 #[path = "scan_delete_tests_2147.rs"]
 mod scan_delete_tests_2147;
+
+#[cfg(test)]
+#[path = "scan_import_progress_tests.rs"]
+mod import_progress_tests;

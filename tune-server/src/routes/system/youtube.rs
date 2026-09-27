@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 
 const STATUS_KEY: &str = "ytdlp_download_status";
-const VERSION_KEY: &str = "ytdlp_version";
+const VERSION_KEY: &str = tune_core::ytdlp::CLE_VERSION;
 
 /// GET /system/youtube/status — is YouTube playback enabled (yt-dlp present)?
 pub(super) async fn youtube_status(State(state): State<AppState>) -> Json<Value> {

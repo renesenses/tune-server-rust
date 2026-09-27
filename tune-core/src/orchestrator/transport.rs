@@ -1654,6 +1654,10 @@ impl PlaybackOrchestrator {
                             anneau,
                         },
                     );
+                    // #4384 — et les crêtes qu'elle relève APRÈS son DSP : la
+                    // crête publiée est celle des échantillons envoyés au DAC.
+                    self.playback
+                        .brancher_les_cretes_de_sortie(zone_id, local_output.cretes_de_sortie());
                     return;
                 }
             }

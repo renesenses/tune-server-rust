@@ -471,12 +471,27 @@ CREATE TABLE IF NOT EXISTS queue_items (
     disc_number TEXT
 );
 
--- One-time copy of the split tables into queue_items. Idempotent: the guard
--- runs only while queue_items is empty. IDs are prefixed to avoid collisions
--- between the two source tables.
+-- One-time copy of the split tables into queue_items. IDs are prefixed to
+-- avoid collisions between the two source tables, so the copy only makes
+-- sense while `queue_items.id` is still the TEXT column declared above.
+--
+-- 🔴 Deux gardes, pas une. « queue_items est vide » ne suffisait pas : une
+-- bascule REJOUEE sur une base deja basculee trouve `queue_items` vide (la
+-- file SQLite l'etait) mais son `id` deja converti en BIGINT par la
+-- migration 012 (`run_pg_migrations`, en fin de bascule). L'INSERT de
+-- `'lq_' || id` y echouait — « column "id" is of type bigint but expression
+-- is of type text » — et avec lui TOUTE la creation du schema : la bascule
+-- ne se relancait plus (#5199, releve par #5139). Une base native (001, BIGSERIAL)
+-- est dans le meme cas. Le type se lit dans le catalogue ; tant qu'il n'est
+-- pas TEXT, l'INSERT n'est meme pas planifie (PL/pgSQL planifie a la
+-- premiere execution).
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM queue_items LIMIT 1) THEN
+    IF (SELECT data_type FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'queue_items' AND column_name = 'id')
+           IN ('text', 'character varying')
+       AND NOT EXISTS (SELECT 1 FROM queue_items LIMIT 1) THEN
         INSERT INTO queue_items (id, zone_id, position, is_current, track_id, source, duration_ms)
             SELECT 'lq_' || id, zone_id, position, is_current, track_id, 'local', '0' FROM play_queue;
         INSERT INTO queue_items (id, zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
@@ -1309,9 +1324,10 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let mut copied = 0;
 
     let conflict_clause = conflict_clause(table);
+    let casts = column_casts(pool, table, &columns).await?;
 
     for chunk in rows.chunks(batch_size) {
-        insert_batch(pool, table, &columns, chunk, conflict_clause).await?;
+        insert_batch(pool, table, &columns, &casts, chunk, conflict_clause).await?;
         copied += chunk.len();
         if total > 5000 && copied % 5000 == 0 {
             info!(table, copied, total, "pg_migrate_batch_progress");
@@ -1373,10 +1389,56 @@ fn conflict_clause(table: &str) -> &'static str {
 }
 
 /// Insert a batch of rows into PG using a single multi-row INSERT.
+/// Le type PostgreSQL vers lequel convertir chaque parametre de la copie,
+/// colonne par colonne — `None` pour une colonne texte, qui recoit le texte
+/// tel quel.
+///
+/// 🔴 La copie lie TOUT en texte (voir [`bind_migration_value`]). Sur la
+/// base toute neuve que monte `PG_FULL_SCHEMA`, les colonnes sont TEXT et le
+/// texte y entre. Mais `run_pg_migrations`, en fin de bascule, convertit les
+/// `id`, `profile_id`, etc. en BIGINT : une bascule REJOUEE sur cette base
+/// voyait chaque INSERT refuse — « column "id" is of type bigint but
+/// expression is of type text » — et `profiles`, `radio_stations`,
+/// `hidden_items`… partaient en `pg_migrate_table_skipped` (#5199, releve par #5139).
+/// Un parametre texte n'a pas de conversion implicite vers BIGINT ; un
+/// `$n::int8` explicite, si. Le type se lit dans le catalogue de la base
+/// visee, jamais dans une liste tenue a la main.
+///
+/// Une colonne TEXT (premiere bascule) ne recoit aucune conversion : la
+/// requete y reste celle d'avant, a l'octet pres.
+async fn column_casts(
+    pool: &PgPool,
+    table: &str,
+    columns: &[String],
+) -> Result<Vec<Option<String>>, String> {
+    let types: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name::text, udt_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("types des colonnes de {table} : {e}"))?;
+    let types: std::collections::HashMap<String, String> = types.into_iter().collect();
+    Ok(columns
+        .iter()
+        .map(|c| {
+            types.get(c).and_then(|t| {
+                let sans_conversion = matches!(t.as_str(), "text" | "varchar" | "bpchar" | "bytea")
+                    || t.starts_with('_');
+                let nom_sur =
+                    !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                (!sans_conversion && nom_sur).then(|| t.clone())
+            })
+        })
+        .collect())
+}
+
 async fn insert_batch(
     pool: &PgPool,
     table: &str,
     columns: &[String],
+    casts: &[Option<String>],
     rows: &[Vec<SqlValue>],
     conflict_clause: &str,
 ) -> Result<(), String> {
@@ -1403,6 +1465,10 @@ async fn insert_batch(
             }
             sql.push('$');
             sql.push_str(&param_idx.to_string());
+            if let Some(Some(cast)) = casts.get(col_idx) {
+                sql.push_str("::");
+                sql.push_str(cast);
+            }
             param_idx += 1;
         }
         sql.push(')');
@@ -1692,6 +1758,80 @@ mod tests {
             "reprise de la copie :\n{}",
             echecs.join("\n")
         );
+    }
+
+    /// Le type d'une colonne, lu dans le catalogue de la base `url`.
+    async fn type_de_colonne(url: &str, table: &str, colonne: &str) -> Option<String> {
+        let mut c = PgConnection::connect(url).await.unwrap();
+        let t: Option<String> = sqlx::query_scalar(
+            "SELECT data_type::text FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(colonne)
+        .fetch_optional(&mut c)
+        .await
+        .unwrap();
+        c.close().await.ok();
+        t
+    }
+
+    /// Bascule REJOUEE : la seconde bascule complete, sur une base deja
+    /// basculee, doit passer — sans nouvelle erreur, sans rien perdre.
+    ///
+    /// #5199, releve par #5139 : la seconde passe echouait a la creation du schema,
+    /// « column "id" is of type bigint but expression is of type text ». Le
+    /// bloc de copie `'lq_' || id` de `PG_FULL_SCHEMA` ne se gardait que sur
+    /// « `queue_items` est vide » — vrai ici, la file SQLite l'etant — alors
+    /// que la premiere bascule avait converti son `id` en BIGINT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_rejeu_bascule_deux_fois() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_rejeu";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+
+        let premiere = migrate_sqlite_to_pg(&sqlite, &cible).await;
+        // La condition du defaut : apres une bascule, `queue_items` est vide
+        // et son `id` n'est plus TEXT. Sans elle, ce temoin ne garderait rien.
+        let type_id = type_de_colonne(&cible, "queue_items", "id").await;
+        let file = compte(&cible, "queue_items").await;
+        let seconde = migrate_sqlite_to_pg(&sqlite, &cible).await;
+        let mut restes = Vec::new();
+        for table in TABLES_SANS_ID {
+            restes.push((table, compte(&cible, table).await));
+        }
+        supprimer_base(&url, BASE).await;
+
+        let premiere = premiere.unwrap_or_else(|e| panic!("premiere bascule : {e}"));
+        assert_eq!(
+            type_id.as_deref(),
+            Some("bigint"),
+            "apres la premiere bascule, queue_items.id devait etre BIGINT (migration 012)"
+        );
+        assert_eq!(
+            file, 0,
+            "queue_items devait etre vide apres la premiere bascule"
+        );
+
+        let seconde = seconde.unwrap_or_else(|e| {
+            panic!("la bascule ne se rejoue pas sur une base deja basculee (#5199) : {e}")
+        });
+        let nouvelles: Vec<&String> = seconde
+            .errors
+            .iter()
+            .filter(|e| !premiere.errors.contains(e))
+            .collect();
+        assert!(
+            nouvelles.is_empty(),
+            "le rejeu de la bascule ajoute des erreurs :\n{nouvelles:#?}"
+        );
+        for (table, n) in restes {
+            assert_eq!(n, 2, "{table} : {n} ligne(s) apres le rejeu au lieu de 2");
+        }
     }
 
     /// Chaque clause de `conflict_clause` doit nommer EXACTEMENT les colonnes

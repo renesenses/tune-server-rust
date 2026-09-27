@@ -63,7 +63,9 @@ fn strip_suffixes(text: &str) -> String {
         "(stereo)",
     ];
     for pat in patterns {
-        if let Some(pos) = result.to_lowercase().find(pat) {
+        // #5236 — `to_ascii_lowercase` garde la taille en octets : `pos` reste
+        // une frontière de caractère de `result` (motifs ASCII).
+        if let Some(pos) = result.to_ascii_lowercase().find(pat) {
             result.truncate(pos);
         }
     }
@@ -241,6 +243,14 @@ impl SyncLinkRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5236 — la position lue dans la minuscule doit rester une frontière de
+    /// caractère de la chaîne coupée, même quand « İ » grandit en minuscule.
+    #[test]
+    fn strip_suffixes_ne_panique_pas_sur_une_minuscule_de_taille_changeante() {
+        assert_eq!(strip_suffixes("İİİİİİİ (live)é"), "İİİİİİİ");
+        assert_eq!(strip_suffixes("ẞong (Remastered 2011)"), "ẞong");
+    }
 
     fn snap(title: &str, artist: &str) -> TrackSnapshot {
         TrackSnapshot {

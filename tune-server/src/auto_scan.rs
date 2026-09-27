@@ -469,6 +469,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
         info!(cache_dir = %cache_dir.display(), "artwork_cache_dir_resolved");
+        bilan_cue.reevaluer_pochettes(&db, &cache_dir, false);
         let quality_split = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
             .get("quality_split")
             .ok()
@@ -548,6 +549,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 importer.begin_batch(&batch);
 
                 for sf in &batch {
+                    // Un écrivain (favori, édition, enrichissement…) attend que
+                    // ce lot ferme sa transaction : lui céder la place entre deux
+                    // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
+                    db.ceder_aux_ecrivains();
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -748,6 +753,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         let Some(track_id) = ids.get(chemin).copied() else {
                             continue;
                         };
+                        // Relire les balises coûte une E/S par fichier : céder ici aussi.
+                        db.ceder_aux_ecrivains();
                         let ext = tune_core::metadata::read_extended_metadata(
                             std::path::Path::new(chemin),
                         );
@@ -1370,6 +1377,10 @@ fn settle_partition(
 }
 
 #[cfg(test)]
+#[path = "copie_albums_tests_5223.rs"]
+mod copie_albums_tests_5223;
+
+#[cfg(test)]
 mod registre_du_scan_tests {
     /// Le scan de demarrage inscrit son execution au registre (#2080) sur
     /// TOUTES ses sorties. Les deux sorties anticipees comptent autant que la
@@ -1728,6 +1739,8 @@ pub(crate) fn reimporter_fichier_surveillant(
     // crucially WITHOUT reading the content (scan_files_
     // parallel), since the read is what re-triggers it.
     // Même garde pour un « ajout » sur un chemin connu (#4896).
+    // #5223 : comparer toute la date enregistrée, sans l'arrondir ni tolérer
+    // 500 ms ; une copie préallouée peut finir à taille égale dans cet intervalle.
     if let Some(existing) = existante
         && let Ok(fs_meta) = std::fs::metadata(&change.path)
     {
@@ -1736,10 +1749,10 @@ pub(crate) fn reimporter_fichier_surveillant(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as f64);
+            .map(|d| d.as_secs_f64());
         let unchanged = existing.file_size == Some(fs_size)
             && match (existing.file_mtime, fs_mtime) {
-                (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                (Some(a), Some(b)) => a == b,
                 _ => false,
             };
         if unchanged {
@@ -2357,6 +2370,11 @@ fn relire_les_feuilles_cue_du_lot(
     let _porte = porte_du_scan(db);
     for dossier in dossiers {
         let relecture = tune_core::scanner::cue_bibliotheque::relire_le_dossier(db, &dossier);
+        relecture.bilan.reevaluer_pochettes(
+            db,
+            &crate::routes::library::artwork_cache_dir(),
+            false,
+        );
         info!(
             dossier = %dossier.display(),
             images_decoupees = relecture.images_decoupees.len(),
@@ -2929,3 +2947,7 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "pochettes_cue_tests_5222.rs"]
+mod pochettes_cue_tests_5222;

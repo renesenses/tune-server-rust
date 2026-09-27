@@ -855,7 +855,18 @@ fn rang_du_nom_etabli(nom_minuscule: &str) -> Option<u8> {
 /// d'ouvrir et de décoder les tags du fichier audio, c'est sans commune
 /// mesure — et aucune lecture de contenu s'il n'y a pas de `.txt`.
 pub fn rapport_voisin(fichier_audio: &Path) -> Option<RapportDr> {
-    let dossier = fichier_audio.parent()?;
+    rapport_du_dossier(fichier_audio.parent()?).map(|(_, rapport)| rapport)
+}
+
+/// Le rapport d'un DOSSIER d'album, et le fichier qui l'a fourni.
+///
+/// Même recherche, même ordre, mêmes bornes que [`rapport_voisin`] — qui
+/// n'est plus qu'un appel à celle-ci. Le chemin rendu sert au rattrapage de
+/// fond (#5168, `taches_de_fond::rapports_dr`) : il mémorise la date de
+/// modification de CE fichier-là, et ne relit le dossier que lorsqu'elle
+/// change. Un `read_dir` par dossier et par passe, sur 40 000 dossiers
+/// d'album, n'aurait pas été un rattrapage « bon marché ».
+pub fn rapport_du_dossier(dossier: &Path) -> Option<(PathBuf, RapportDr)> {
     let mut etablis: Vec<(u8, PathBuf)> = Vec::new();
     let mut candidats: Vec<PathBuf> = Vec::new();
     for entree in std::fs::read_dir(dossier).ok()?.flatten() {
@@ -879,21 +890,35 @@ pub fn rapport_voisin(fichier_audio: &Path) -> Option<RapportDr> {
     etablis.sort();
     candidats.sort();
 
-    for (_, chemin) in &etablis {
-        if let Some(rapport) = lire_le_rapport(chemin)
+    for (_, chemin) in etablis {
+        if let Some(rapport) = lire_le_rapport(&chemin)
             && !rapport.lignes.is_empty()
         {
-            return Some(rapport);
+            return Some((chemin, rapport));
         }
     }
-    for chemin in candidats.iter().take(CANDIDATS_MAX) {
-        if let Some(rapport) = lire_le_rapport(chemin)
+    for chemin in candidats.into_iter().take(CANDIDATS_MAX) {
+        if let Some(rapport) = lire_le_rapport(&chemin)
             && rapport.est_signe()
         {
-            return Some(rapport);
+            return Some((chemin, rapport));
         }
     }
     None
+}
+
+/// Ce chemin PEUT-il être un rapport de DR ? Tout `.txt`, la casse ne
+/// comptant pas — exactement les fichiers que [`rapport_du_dossier`] ouvre.
+///
+/// C'est le filtre du surveillant de fichiers (#5168) : un `foo_dr.txt` posé
+/// ou réécrit dans un dossier d'album doit faire relire CE dossier. Pas plus
+/// étroit que la recherche elle-même : le journal de DeaDBeeF n'a pas de nom
+/// fixe, et un filtre sur les seuls noms établis le laisserait muet.
+pub fn peut_etre_un_rapport(chemin: &Path) -> bool {
+    chemin
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".txt"))
 }
 
 /// Lit et analyse un fichier. `None` si la lecture échoue — un fichier

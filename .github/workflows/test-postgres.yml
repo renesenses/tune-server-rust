@@ -251,6 +251,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_bascule_ -- --nocapture
 
+      # Bascule SQLite -> PostgreSQL REJOUEE (#5199, releve par #5139) : la seconde
+      # bascule complete sur une base deja basculee echouait a la creation du
+      # schema (`'lq_' || id` dans `queue_items.id` devenu BIGINT). Le temoin
+      # joue la bascule deux fois sur une base jetable, puis la supprime.
+      - name: Bascule SQLite -> PostgreSQL rejouee deux fois (#5199)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_rejeu_bascule -- --nocapture
+
       # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
       # chemin qui masque, le démasquage et la réparation sûre, joués sur la
       # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
@@ -259,6 +268,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5077 -- --nocapture --test-threads=1
+
+      # #5263 — une base issue de SQLite garde plusieurs réglages de zones en
+      # TEXT ; leur report précède la suppression des doublons au démarrage.
+      - name: Réglages des zones en double sur PostgreSQL (#5263)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5263_ -- --nocapture
 
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
@@ -611,3 +627,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
+
+      # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
+      # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE
+      # base : l'expression SQL des termes égale la fonction Rust, le rang
+      # « par la piste » précède « par le chemin », et la passe du démarrage
+      # réindexe une base restée à l'ancienne fonction (contre-épreuve
+      # comprise). Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Termes de chemin dans la recherche sur PostgreSQL (#5192)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5192 -- --nocapture --test-threads=1

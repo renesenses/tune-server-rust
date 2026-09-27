@@ -574,7 +574,10 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
     // 2. `, Disc 1` / ` - CD 2` / `, Disque 3` en fin de titre. Le découpage
     //    par disque est une propriété de NOTRE arborescence, pas du pressage :
     //    MusicBrainz décrit le coffret entier sous un seul titre.
-    let bas = t.to_lowercase();
+    // #5236 — `to_ascii_lowercase` garde la taille en octets : les positions
+    // trouvées dans `bas` restent valables dans `t` (motifs ASCII).
+    // `to_lowercase` la change (« İ » → « i̇ ») et faisait paniquer.
+    let bas = t.to_ascii_lowercase();
     for mot in MOTS_DE_DISQUE {
         // Chercher la dernière occurrence du mot, puis vérifier que tout ce qui
         // suit est un nombre, et que ce qui précède est un séparateur.
@@ -943,6 +946,22 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #5236 — une minuscule qui change de taille en octets (« İ » → « i̇ »)
+    /// décalait la position du mot « disc » et le découpage tombait au milieu
+    /// d'un caractère : panique.
+    #[test]
+    fn titre_de_requete_ne_panique_pas_sur_une_minuscule_de_taille_changeante() {
+        assert_eq!(titre_de_requete("İ Discé"), None);
+        assert_eq!(
+            titre_de_requete("İstanbul Senfoni, Disc 2").as_deref(),
+            Some("İstanbul Senfoni")
+        );
+        assert_eq!(
+            titre_de_requete("GROẞE Werke - CD 3").as_deref(),
+            Some("GROẞE Werke")
+        );
+    }
 
     #[test]
     fn normalize_text() {

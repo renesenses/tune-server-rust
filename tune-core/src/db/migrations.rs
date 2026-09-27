@@ -2975,6 +2975,27 @@ fn combler_les_labels_d_album_sqlite(db: &SqliteDb) {
         Err(e) => warn!(error = %e, "albums_labels_repris_des_pistes_failed"),
     }
 }
+/// Index de la CLÉ DE COPIE (#5138) : album, disque, numéro et titre replié,
+/// écrits EXACTEMENT comme le côté `mieux` de
+/// [`super::facet_filter::copie_de_moindre_qualite_exclue`].
+///
+/// Sans lui, ce `NOT EXISTS` corrélé ne trouvait que `idx_tracks_album_id` :
+/// pour CHAQUE piste il relisait toutes les pistes de son album dans la
+/// table et y évaluait trois expressions — n × (pistes par album). Mesuré
+/// sur un banc de 34 091 pistes : 0,9 à 1,1 s pour le seul prédicat, et le
+/// compteur comme la liste le paient à chaque page. Chez JeromeQ (0.9.165,
+/// 34 091 pistes) : 7 à 9,7 s par requête, deux requêtes par page, dix-huit
+/// pages pour la vue Oxygen. Avec l'index, la sous-requête cherche la clé
+/// entière et ne trouve, hors vrai doublon, que la piste elle-même.
+///
+/// SQLite seulement : un index d'EXPRESSION ne sert que si le texte de
+/// l'expression est celui de la requête, ce que le plan vérifie
+/// (`lenteur_pistes_5138_tests`). PostgreSQL n'a pas été mesuré ici : son
+/// planificateur peut changer ce `NOT EXISTS` en anti-jointure, et un index
+/// d'expression y exige une autre écriture — hors de ce correctif. Posé dans la passe
+/// rejouée à chaque démarrage, comme [`TRACKS_SOURCE_ID_INDEX`], pour ne pas
+/// prendre de numéro de migration.
+pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_cle_de_copie ON tracks(album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), LOWER(TRIM(COALESCE(title, ''))))";
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
@@ -3684,6 +3705,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(TRACKS_SOURCE_ID_INDEX) {
         warn!(error = %e, "sqlite_tracks_source_id_index_failed");
     }
+    // Clé de copie (#5138) : même passe, même raison — voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_CLE_DE_COPIE_INDEX) {
+        warn!(error = %e, "sqlite_tracks_cle_de_copie_index_failed");
+    }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
     db.execute_batch(include_str!("../../migrations/upnp_catalog_revision.sql"))?;
@@ -3694,6 +3719,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     migrate_to_unified_queue(db);
 
     combler_les_labels_d_album_sqlite(db);
+
+    // #5192 — les termes de chemin dans `tracks_fts`. Passe rejouée à chaque
+    // démarrage, sans numéro : elle lit `sqlite_master` et ne recrée l'index
+    // qu'une fois. Un échec laisse l'ancien index, qui sert encore.
+    {
+        let conn = db.connection().lock().unwrap();
+        if let Err(e) = crate::library::full_text_search::assurer_termes_de_chemin(&conn) {
+            warn!(error = %e, "tracks_fts_termes_de_chemin_echec");
+        }
+    }
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
@@ -4333,6 +4368,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "zones_motif_masquage",
         include_str!("../../migrations/postgres/075_zones_motif_masquage.sql"),
     ),
+    // #5192 : les termes de chemin d'une piste en colonne calculée et
+    // stockée, lue par le texte libre d'Oxygen et la recherche de pistes.
+    // PostgreSQL SEUL : sous SQLite, la fonction Rust enregistrée
+    // (`tune_termes_de_chemin`) tient ce rôle sans changer le schéma — aucune
+    // jumelle SQLite, le 113 reste libre.
+    (
+        76,
+        "tracks_path_terms",
+        include_str!("../../migrations/postgres/076_tracks_path_terms.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4342,6 +4387,45 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
 /// that wrap their body in `BEGIN; … COMMIT;` are executed as-is;
 /// the runner does not add an outer transaction so that each script
 /// controls its own transactional boundaries.
+#[cfg(feature = "postgres")]
+/// #5192 — pose la fonction `tracks_search_tsv_refresh` avec les termes de
+/// chemin et recalcule les vecteurs, UNE fois. Rend `Ok(None)` quand c'était
+/// déjà fait, `Ok(Some(n))` avec le nombre de pistes recalculées sinon.
+///
+/// Une seule transaction : la fonction, le déclencheur et les vecteurs
+/// changent ensemble, ou rien ne change.
+pub async fn assurer_termes_de_chemin_pg(pool: &sqlx::PgPool) -> Result<Option<u64>, String> {
+    use crate::library::full_text_search as fts;
+    let deja: i64 = sqlx::query_scalar(fts::SQL_PG_A_LES_TERMES_DE_CHEMIN)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("lecture de pg_proc : {e}"))?;
+    if deja > 0 {
+        return Ok(None);
+    }
+    let debut = std::time::Instant::now();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("transaction : {e}"))?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(fts::sql_pg_fonction_tsv_des_pistes()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("fonction tracks_search_tsv_refresh : {e}"))?;
+    let n = sqlx::query(fts::SQL_PG_RECALCULER_TSV_DES_PISTES)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("recalcul des vecteurs : {e}"))?
+        .rows_affected();
+    tx.commit().await.map_err(|e| format!("validation : {e}"))?;
+    info!(
+        pistes = n,
+        ms = debut.elapsed().as_millis() as u64,
+        "pg_tracks_termes_de_chemin_poses"
+    );
+    Ok(Some(n))
+}
+
 #[cfg(feature = "postgres")]
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // Ensure the tracking table exists.  The 001 script creates
@@ -4513,6 +4597,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             "pg_albums_labels_repris_des_pistes"
         ),
         Err(e) => warn!(error = %e, "pg_albums_labels_repris_des_pistes_failed"),
+    }
+
+    // #5192 — les termes de chemin dans `search_tsv`, même passe que SQLite :
+    // rejouée à chaque démarrage, sans numéro, et ne réécrivant les vecteurs
+    // qu'une fois — le marqueur dans le corps de la fonction le dit.
+    if let Err(e) = assurer_termes_de_chemin_pg(pool).await {
+        warn!(error = %e, "pg_tracks_termes_de_chemin_echec");
     }
 
     // Run ANALYZE on key tables for the query planner.
@@ -6881,7 +6972,10 @@ mod tests {
         // 75 : `zones_motif_masquage` (#5077), jumelle de la SQLite 112. Pose
         // `zones.motif_masquage` et `zones.masquee_le`, que chaque masquage
         // et chaque demasquage NOMMENT.
-        assert_eq!(pg_latest_version(), 75, "latest PG migration must be 75");
+        // 76 : `tracks_path_terms` (#5192), SANS jumelle SQLite : la colonne
+        // calculée des termes de chemin, que lisent le texte libre d'Oxygen et
+        // la recherche de pistes sous PostgreSQL.
+        assert_eq!(pg_latest_version(), 76, "latest PG migration must be 76");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

@@ -314,6 +314,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
             None,
             None,
             false,
+            None,
         )
     })
     .await
@@ -8936,6 +8937,72 @@ async fn plafond_de_zone_du_bras_https_4759_convertit_puis_strict_refuse() {
         orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(192_000)),
         Err("bitperfect_strict_refused:192000:96000".to_string()),
         "bit-perfect strict doit tenir sa promesse sur le bras des services aussi"
+    );
+}
+
+/// #5194 — un Sonos DÉCOUVERT (aucun modèle choisi à la main) reçoit le
+/// plafond de 48 kHz de sa marque : le FLAC Qobuz 96 kHz est servi en 48 kHz,
+/// pour un Era 100, un Ray, et un modèle Sonos que le catalogue ne connaît pas.
+///
+/// Le magasin `known_renderers` est celui que la découverte SSDP écrit, avec
+/// le `<manufacturer>` et le `<modelName>` tels que Sonos les annonce.
+///
+/// Sabotage qui rend ce témoin ROUGE : rendre `DeviceQuirks::default()` dans
+/// la branche « sans override » de `resolve_zone_quirks` (l'état d'avant).
+#[tokio::test]
+async fn un_sonos_decouvert_recoit_le_plafond_48k_de_sa_marque_5194() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    let appareils = [
+        ("uuid:RINCON_ERA100", "Sonos, Inc.", "Sonos Era 100"),
+        ("uuid:RINCON_RAY", "Sonos, Inc.", "Sonos Ray"),
+        ("uuid:RINCON_FUTUR", "Sonos, Inc.", "Sonos Zzz 2031"),
+        ("uuid:eversolo-a8", "Eversolo", "DMP-A8"),
+    ];
+    let magasin: Vec<serde_json::Value> = appareils
+        .iter()
+        .map(|(id, marque, modele)| {
+            serde_json::json!({
+                "device_id": id, "location": format!("http://{id}/desc.xml"),
+                "name": modele, "mac": "", "manufacturer": marque, "model": modele,
+            })
+        })
+        .collect();
+    settings
+        .set(
+            crate::device_catalog::KNOWN_RENDERERS_KEY,
+            &serde_json::to_string(&magasin).unwrap(),
+        )
+        .unwrap();
+
+    for (id, _, modele) in &appareils[..3] {
+        let zone_id = zones.create(modele, Some("dlna"), Some(id)).unwrap();
+        let req = requete_locale_3234(zone_id, 1);
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(96_000)),
+            Ok(Some(48_000)),
+            "{modele} : le FLAC 96 kHz doit être servi en 48 kHz"
+        );
+        // Un 44,1 kHz passe tel quel : le plafond ne fait que BAISSER.
+        assert_eq!(
+            orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(44_100)),
+            Ok(None),
+            "{modele} : un 44,1 kHz ne doit rien déclencher"
+        );
+    }
+
+    // Contre-épreuve : un appareil d'une autre marque, sans plafond au
+    // catalogue, garde ses 96 kHz.
+    let (id, _, modele) = appareils[3];
+    let zone_id = zones.create(modele, Some("dlna"), Some(id)).unwrap();
+    assert_eq!(
+        orch.cadence_servie_pour_un_service(
+            &requete_locale_3234(zone_id, 1),
+            &flux_de_service_4759(96_000)
+        ),
+        Ok(None),
+        "un renderer hors Sonos ne doit pas être plafonné"
     );
 }
 

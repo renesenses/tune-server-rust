@@ -48,7 +48,7 @@ const TASK_ID: &str = "dynamic_range";
 ///   (machine trop chaude, #1576), `"analysis_slot"` (une autre passe décode,
 ///   on attend son lot) ou `null` ;
 /// - `last_outcome` : comment le dernier passage s'est fini — `"completed"`,
-///   `"analysis_disabled"` (réglage coupé en cours de route, #2496),
+///   `"analysis_disabled"` (plus rendu depuis #5246 ; gardé au contrat),
 ///   `"stalled"` (les lots ne rendent plus rien) — ou `null`.
 fn releve_json(r: &Releve) -> Value {
     json!({
@@ -67,21 +67,21 @@ fn releve_json(r: &Releve) -> Value {
 /// GET /api/v1/system/dynamic-range/progress
 ///
 /// Le relevé ([`releve_json`]) plus :
-/// - `enabled` : l'analyse est armée (`replaygain_mode` ≠ off ET coche non
-///   décochée). Un passage ne s'ouvrira pas sans elle, et la carte doit le
-///   dire plutôt que d'afficher un bouton qui rend 409 ;
+/// - `enabled` : un passage peut s'ouvrir. Toujours `true` depuis #5246 : la
+///   plage dynamique ne dépend plus du réglage ReplayGain. Le champ reste au
+///   contrat, le client le lit pour afficher le bouton ;
 /// - `candidates` : combien de pistes un passage prendrait MAINTENANT.
-///   Compté seulement au repos et l'analyse armée — c'est un `COUNT(*)` à
+///   Compté seulement au repos — c'est un `COUNT(*)` à
 ///   cinq `NOT EXISTS`, et l'écran sonde en boucle ; pendant un passage, la
 ///   jauge le dit déjà (`remaining`). `null` quand il n'est pas compté.
 pub(crate) async fn dynamic_range_progress(State(state): State<AppState>) -> Json<Value> {
     let releve = state.passe_dr.releve();
-    let enabled = tune_core::audio::replaygain::analysis_enabled(&state.backend);
-    let candidates = (!releve.actif && enabled)
+    let candidates = (!releve.actif)
         .then(|| tune_core::audio::replaygain::compter_les_candidats_dr(&state.backend));
     let mut body = releve_json(&releve);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("enabled".into(), json!(enabled));
+        // #5246 — la plage dynamique ne dépend plus du réglage ReplayGain.
+        obj.insert("enabled".into(), json!(true));
         obj.insert("candidates".into(), json!(candidates));
     }
     Json(body)
@@ -99,17 +99,13 @@ pub(crate) async fn dynamic_range_progress(State(state): State<AppState>) -> Jso
 /// Réponses :
 /// - **202** `{"status":"started", …relevé}` — le passage est ouvert ;
 ///   `total` dit combien de pistes il va prendre ;
-/// - **200** `{"status":"nothing_to_do","candidates":0, …relevé}` — l'analyse
-///   est armée mais aucune piste n'est candidate : rien n'est ouvert. C'est
-///   la réponse d'une bibliothèque déjà mesurée, ou dont les pistes ont
+/// - **200** `{"status":"nothing_to_do","candidates":0, …relevé}` — aucune
+///   piste n'est candidate : rien n'est ouvert. C'est la réponse d'une bibliothèque déjà mesurée, ou dont les pistes ont
 ///   toutes été écartées (`dr_indisponible`) ou reportées (#1865) ;
 /// - **409** `{"status":"already_running", …relevé}` — un passage court
 ///   déjà ; le relevé dit où il en est. Pas de second passage ;
-/// - **409** `{"status":"refused","reason":"analysis_disabled","detail":…,
-///   "setting":"replaygain_source"}` — l'analyse est coupée (#2496). Le DR se
-///   mesure sur le même décodage que le ReplayGain : « Désactivé » désactive,
-///   y compris à la demande. `detail` nomme le réglage en cause ; `setting`
-///   est le champ de `PATCH /system/config` qui l'arme.
+/// - (#5246) plus de 409 `refused` / `analysis_disabled` : la plage dynamique
+///   se mesure même ReplayGain coupé. Le cas reste dans le `match` du contrat.
 ///
 /// L'avancement se lit sur `GET /system/dynamic-range/progress` et sur le
 /// registre `GET /system/background-tasks` (tâche `dynamic_range`).
@@ -124,17 +120,8 @@ pub(crate) async fn dynamic_range_analyze(State(state): State<AppState>) -> impl
             Json(avec_statut("already_running", &state.passe_dr.releve())),
         );
     }
-    if let Some(detail) = tune_core::audio::replaygain::motif_d_inaction(&state.backend) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "status": "refused",
-                "reason": "analysis_disabled",
-                "detail": detail,
-                "setting": "replaygain_source",
-            })),
-        );
-    }
+    // #5246 — plus de refus sur le réglage ReplayGain : la plage dynamique
+    // se mesure même ReplayGain coupé (décision de Bertrand, 27/09/2026).
     if tune_core::audio::replaygain::compter_les_candidats_dr(&state.backend) <= 0 {
         let mut body = avec_statut("nothing_to_do", &state.passe_dr.releve());
         if let Some(obj) = body.as_object_mut() {
@@ -275,38 +262,41 @@ mod tests_4185 {
         panic!("le passage n'a pas fini : {:?}", state.passe_dr.releve());
     }
 
-    /// Le refus quand l'analyse n'est pas armée : 409, et le réglage nommé.
-    /// Sur une base NEUVE, `replaygain_mode` est absent — c'est le cas de
-    /// l'installation qui n'a jamais rien réglé (#2496).
+    /// #5246 — ReplayGain jamais réglé (`replaygain_mode` ABSENT, base NEUVE,
+    /// l'état qui vaut « Désactivé ») : la route LANCE quand même le passage,
+    /// et la carte dit que le bouton marche. Elle rendait 409
+    /// `analysis_disabled` (#2496) ; décision de Bertrand du 27/09/2026 : la
+    /// plage dynamique se mesure même ReplayGain coupé.
     #[tokio::test]
-    async fn analyse_coupee_409_qui_nomme_le_reglage() {
+    async fn replaygain_coupe_la_route_lance_quand_meme() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state.passe_dr.cadence_pour_les_essais(Cadence {
+            report_lecture: Duration::from_millis(20),
+            report_chaleur: Duration::from_millis(20),
+            report_pause: Duration::from_millis(20),
+            entre_lots: Duration::from_millis(5),
+            garde_thermique: false,
+        });
         piste_candidate(&state, 42, "/nulle/part.flac");
+
+        let Json(p) = dynamic_range_progress(State(state.clone())).await;
+        assert_eq!(p["enabled"], true, "{p}");
+        assert_eq!(p["candidates"], 1, "{p}");
+
         let (statut, body) = corps(
             dynamic_range_analyze(State(state.clone()))
                 .await
                 .into_response(),
         )
         .await;
-        assert_eq!(statut, StatusCode::CONFLICT, "{body}");
-        assert_eq!(body["status"], "refused");
-        assert_eq!(body["reason"], "analysis_disabled");
-        assert_eq!(body["setting"], "replaygain_source");
-        assert!(
-            body["detail"].as_str().unwrap_or("").contains("ABSENT"),
-            "le détail doit dire que le mode n'a jamais été réglé : {body}"
-        );
-        assert!(!state.passe_dr.releve().actif, "un refus n'ouvre rien");
-
-        let Json(p) = dynamic_range_progress(State(state)).await;
-        assert_eq!(p["enabled"], false);
-        assert_eq!(p["active"], false);
-        assert_eq!(p["reported"], false);
         assert_eq!(
-            p["candidates"],
-            Value::Null,
-            "pas compté quand l'analyse est coupée"
+            statut,
+            StatusCode::ACCEPTED,
+            "ReplayGain coupé ne doit plus refuser la plage dynamique (#5246) : {body}"
         );
+        assert_eq!(body["status"], "started");
+        let fin = attendre_la_fin(&state).await;
+        assert_eq!(fin["last_outcome"], "completed", "{fin}");
     }
 
     /// Rien à mesurer : 200 `nothing_to_do`, aucun passage ouvert.

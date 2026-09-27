@@ -389,6 +389,25 @@ impl PositionPoller {
                     let ps = poll_states
                         .entry(zone_id)
                         .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
+                    if let Some(np) = zone_state.now_playing.as_ref()
+                        && np.source == "radio"
+                    {
+                        let source = match np.stream_id.as_deref() {
+                            Some(id) => self
+                                .orchestrator
+                                .streamer
+                                .stream_output_wire(id)
+                                .await
+                                .and_then(|wire| wire.radio_source),
+                            None => None,
+                        };
+                        if ps.codec_radio_a_change(np.stream_id.as_deref(), source)
+                            && let Some(ref bus) = self.event_bus
+                        {
+                            info!(zone_id, "codec_radio_publie_annonce");
+                            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                        }
+                    }
                     // Meme etranglement que la zone avec peripherique : le tick
                     // est a la seconde, l'API de la station non.
                     if decisions::deviceless_radio_refresh_due(
@@ -571,11 +590,6 @@ impl PositionPoller {
                 }
             }
 
-            if ps.backoff_remaining > 0 {
-                ps.backoff_remaining -= 1;
-                continue;
-            }
-
             // Radio zones: throttle polling to every RADIO_POLL_INTERVAL_SECS.
             // Polling a DLNA renderer (especially DMP-A8) every second with 4
             // SOAP calls while it plays an infinite radio stream causes buffer
@@ -587,6 +601,35 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.source == "radio")
                 .unwrap_or(false);
+            // Lire la session locale même quand les sondes du renderer radio
+            // sont espacées : le décodeur peut connaître le codec entre deux
+            // appels SOAP, et le verdict de GET /zones change alors (#4346).
+            if is_radio {
+                let stream_id = zone_state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.as_deref());
+                let source = match stream_id {
+                    Some(id) => self
+                        .orchestrator
+                        .streamer
+                        .stream_output_wire(id)
+                        .await
+                        .and_then(|wire| wire.radio_source),
+                    None => None,
+                };
+                if ps.codec_radio_a_change(stream_id, source)
+                    && let Some(ref bus) = self.event_bus
+                {
+                    info!(zone_id, device = %device_id, "codec_radio_publie_annonce");
+                    bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                }
+            }
+
+            if ps.backoff_remaining > 0 {
+                ps.backoff_remaining -= 1;
+                continue;
+            }
             if is_radio
                 && !decisions::radio_poll_due(
                     ps.last_radio_poll.elapsed(),
@@ -1412,6 +1455,10 @@ impl PositionPoller {
                     debug!(zone_id, etat = ?zone_state.state, "gapless_adoption_horloge_levee");
                     ps.adoption_horloge = None;
                 } else {
+                    // #4382 — ce que le renderer fait pendant la fenêtre, au
+                    // journal de terrain. Lecture seule, avant la décision.
+                    self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
+                        .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
                     match decisions::suite_de_l_adoption(
                         status.position_ms,

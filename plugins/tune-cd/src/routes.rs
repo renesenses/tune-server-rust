@@ -46,17 +46,31 @@ fn refus(code: StatusCode, motif: &str, message: String) -> Response {
 /// Un refus : statut, motif stable, message lisible.
 pub(crate) type Refus = (StatusCode, &'static str, String);
 
+fn aucun_lecteur() -> Refus {
+    (
+        StatusCode::NOT_FOUND,
+        "aucun_lecteur",
+        "Aucun lecteur de CD sur la machine qui fait tourner Tune.".into(),
+    )
+}
+
 /// La TOC du disque inséré, ou le refus qui dit pourquoi il n'y en a pas.
 async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
     let Some(lecteur) = etat.lecteur.clone() else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "aucun_lecteur",
-            "Aucun lecteur de CD sur la machine qui fait tourner Tune.".into(),
-        ));
+        return Err(aucun_lecteur());
     };
-    match tokio::task::spawn_blocking(move || lecteur.lire_toc()).await {
+    let l = lecteur.clone();
+    match tokio::task::spawn_blocking(move || l.lire_toc()).await {
         Ok(Ok(toc)) => Ok(toc),
+        // #5161 — le lecteur se branche à chaud : tant qu'il n'est pas là,
+        // c'est « aucun lecteur », pas « lecteur vide ».
+        Ok(Err(ErreurCd::AucunDisque))
+            if tokio::task::spawn_blocking(move || lecteur.presence())
+                .await
+                .is_ok_and(|p| p == Presence::AucunLecteur) =>
+        {
+            Err(aucun_lecteur())
+        }
         Ok(Err(ErreurCd::AucunDisque)) => Err((
             StatusCode::CONFLICT,
             "aucun_disque",
@@ -343,6 +357,15 @@ mod tests {
     #[tokio::test]
     async fn les_refus_disent_pourquoi() {
         let (e, _) = etat(None, Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "GET", "/disque", None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "aucun_lecteur");
+
+        // #5161 — un lecteur à chaud pas encore branché : « aucun lecteur »,
+        // pas « lecteur vide ».
+        let l = LecteurSimule::new(toc_du_vecteur());
+        l.debrancher();
+        let (e, _) = etat(Some(Arc::new(l)), Arc::new(SansReseau));
         let (code, v) = appel(router(e), "GET", "/disque", None).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
         assert_eq!(v["error"], "aucun_lecteur");

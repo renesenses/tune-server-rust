@@ -1465,6 +1465,20 @@ pub fn suite_de_l_adoption(
     }
 }
 
+/// #4382 — ce que le renderer a tiré du flux adopté DEPUIS l'adoption.
+///
+/// Pendant la fenêtre de surveillance, un renderer qui JOUE le flux adopté le
+/// consomme au débit de lecture ; un renderer qui ne fait que le garder en
+/// tampon n'en tire presque rien. La position gelée, elle, ne départage pas
+/// les deux. `None` si l'une des deux mesures manque ; une session recréée
+/// (compteur plus petit) rend 0, jamais un nombre négatif.
+pub fn octets_depuis_adoption(maintenant: Option<u64>, a_l_adoption: Option<u64>) -> Option<u64> {
+    match (maintenant, a_l_adoption) {
+        (Some(m), Some(a)) => Some(m.saturating_sub(a)),
+        _ => None,
+    }
+}
+
 /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
 /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
 /// `get_status` returns `Err` and Tune gets NO transport state, position, or

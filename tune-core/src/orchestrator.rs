@@ -374,13 +374,31 @@ fn spawn_paced_levels_forwarder(
             // mesure inchangée.
             let gain_units = playback.gain_de_sortie_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
-            let lvl = crate::audio::levels::compute_levels_avec_gain(
+            let mut lvl = crate::audio::levels::compute_levels_avec_gain(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
                 gain,
             );
+            // #4384 — la CRÊTE, elle, se lit sur les échantillons tels qu'ils
+            // partent vers le DAC quand la sortie locale les a relevés : après
+            // égaliseur, convolveur, crossfeed et repli mono, qu'aucun gain
+            // scalaire ne résume (une bande à −12 dB sur la fréquence de la
+            // crête la baisse de 12 dB, le gain moyen de la courbe à peine).
+            // Seul reste à appliquer le gain de rendu — PAS le gain moyen du
+            // DSP, déjà dans les échantillons. Bornée à la pleine échelle :
+            // c'est tout ce que le DAC peut recevoir.
+            let debut_ms = position.as_secs_f64() * 1000.0;
+            if let Some((gauche, droite)) = playback.crete_de_sortie(
+                zone_id,
+                debut_ms,
+                debut_ms + window.as_secs_f64() * 1000.0,
+            ) {
+                let rendu = f64::from(playback.gain_de_rendu_units(zone_id)) / 1000.0;
+                lvl.peak_left = (gauche * rendu).min(1.0);
+                lvl.peak_right = (droite * rendu).min(1.0);
+            }
             let (peak_hold_left_db, peak_hold_right_db) =
                 peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
             bus.emit(
@@ -407,8 +425,9 @@ fn spawn_paced_levels_forwarder(
                     // (#1694) : un client ancien l'ignore, un client neuf y
                     // lit le transitoire même s'il a raté la trame qui le
                     // portait. Sample peak, sur la même échelle que
-                    // `peak_*_db` : gain de sortie compris (#4384), traitements
-                    // non scalaires de `apply_local_dsp` exclus.
+                    // `peak_*_db` : gain de sortie compris (#4384), et sur une
+                    // sortie locale qui les relève, les traitements non
+                    // scalaires d'`apply_local_dsp` aussi.
                     "peak_hold_left_db": peak_hold_left_db,
                     "peak_hold_right_db": peak_hold_right_db,
                     // Gain DÉJÀ compris dans tous les champs ci-dessus, en dB
@@ -1017,6 +1036,12 @@ pub struct PlaybackOrchestrator {
     /// pas son empreinte ; un flux adopté en gapless apporte la sienne.
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     traitement_des_flux: std::sync::Mutex<std::collections::HashMap<i64, Vec<(String, String)>>>,
+    /// #4407 — les postes de relève d'égaliseur des flux que Tune fabrique
+    /// au fil de l'eau (radio décodée, relais DSP progressif), par zone et
+    /// par `stream_id`. Bornés comme `traitement_des_flux`. Verrou std.
+    eq_en_vol_des_flux: std::sync::Mutex<
+        std::collections::HashMap<i64, Vec<(String, std::sync::Arc<eq_en_vol::EqEnVol>)>>,
+    >,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
@@ -1270,6 +1295,12 @@ struct StreamingDsp {
     /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
     /// sans égaliseur ni crossfeed.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    /// #4407 — la cadence du PCM que ce porteur voit : de quoi rebâtir un
+    /// égaliseur relevé en vol aux bons coefficients.
+    sample_rate: u32,
+    /// #4407 — le poste où la route dépose un nouvel égaliseur, relevé au
+    /// bloc suivant (voir [`eq_en_vol::EqEnVol`]). `None` : aucun.
+    en_vol: Option<std::sync::Arc<eq_en_vol::EqEnVol>>,
 }
 
 impl StreamingDsp {
@@ -1312,6 +1343,10 @@ impl StreamingDsp {
     /// anti-régression de l'immense majorité des zones, qui doivent continuer à
     /// entendre exactement les mêmes échantillons qu'avant ce correctif.
     fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        // #4407 — l'égaliseur déposé en vol prend la relève à CE bloc.
+        if let Some(poste) = self.en_vol.as_ref() {
+            poste.relever(&mut self.eq, self.sample_rate, self.channels);
+        }
         if let Some(factor) = self.replaygain {
             crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
         }
@@ -1404,6 +1439,7 @@ impl PlaybackOrchestrator {
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
+            eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "local-audio")]
@@ -1481,6 +1517,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
+mod relance_ytdlp_4366;
 
 mod resolve_local;
 
@@ -1496,6 +1534,10 @@ mod service_wav_progressif_5080;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
+mod eq_en_vol;
+#[cfg(test)]
+mod eq_en_vol_4407_tests;
 // Greffons natifs tiers : l'étage casque de la chaîne, avec une vraie
 // bibliothèque native de test.
 #[cfg(test)]
@@ -1666,6 +1708,9 @@ mod double_dsp_dsf_aac_sortie_locale_tests;
 #[cfg(test)]
 mod mesure_saut_cd_5079;
 
+/// #4384 — la crête d'une zone locale se lit après son DSP.
+#[cfg(test)]
+mod crete_apres_dsp_4384;
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]

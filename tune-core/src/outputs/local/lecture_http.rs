@@ -224,13 +224,31 @@ mod tests {
     #[test]
     fn i4220_les_deux_ouvertures_de_production_sont_annulables() {
         let source = include_str!("../local.rs");
+        // #5204 : l'ouverture de la piste enchaînée vit dans
+        // `enchainement_exclusif.rs` (`ouvrir_la_piste_suivante`), partagée
+        // par le chemin cpal et le bras WASAPI exclusif.
+        let enchainement = include_str!("enchainement_exclusif.rs");
         assert_eq!(
             source.matches("LecteurHttpAnnulable::ouvrir(").count(),
-            2,
-            "piste initiale ET gapless doivent utiliser le lecteur annulable"
+            1,
+            "piste initiale : lecteur annulable"
+        );
+        assert_eq!(
+            enchainement
+                .matches("LecteurHttpAnnulable::ouvrir(")
+                .count(),
+            1,
+            "piste enchaînée : lecteur annulable"
+        );
+        assert_eq!(
+            source
+                .matches("enchainement_exclusif::ouvrir_la_piste_suivante(")
+                .count(),
+            1,
+            "le gapless du chemin partagé ouvre la suivante par le lecteur annulable"
         );
         assert!(
-            !source.contains("blocking_builder()"),
+            !source.contains("blocking_builder()") && !enchainement.contains("blocking_builder()"),
             "aucun acces HTTP bloquant divergent"
         );
     }
@@ -410,6 +428,7 @@ mod tests {
                 open_failure: &erreur,
                 debut_du_flux: std::time::Instant::now(),
                 duree_de_la_piste_ms: &crate::outputs::local::DUREE_DE_PISTE_INCONNUE,
+                cretes_de_sortie: None,
             };
             let dsp = DspAuRepos::neuf();
             let mut conversion = etage(&dsp, Vec::new(), 44100, 2, 16, 44100, 2);

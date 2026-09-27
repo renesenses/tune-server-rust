@@ -58,6 +58,7 @@ async fn preparer_contre_la_station(
             dropped_at: None,
             expected_format: None,
             radio_eq: None,
+            eq_de_depart_pose: false,
         };
         let rt = tokio::runtime::Handle::current();
         let canaux = CanauxRadio {
@@ -65,6 +66,7 @@ async fn preparer_contre_la_station(
             data_ready: &data_ready,
             session: &session,
             eq_profile: &None,
+            en_vol: &None,
             levels_tx: &None,
             rt: &rt,
             strict_bitperfect,

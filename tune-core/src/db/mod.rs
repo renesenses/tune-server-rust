@@ -58,6 +58,9 @@ pub mod tag_repo;
 pub mod task_run_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
+/// Qui tient la transaction ouverte sur la connexion d'écriture, et qui
+/// attend qu'elle se ferme.
+pub(crate) mod transaction_du_lot;
 pub mod tx_holder;
 /// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub mod verrou_ecriture;
@@ -67,7 +70,11 @@ pub mod zone_repo;
 #[cfg(test)]
 mod album_dr_provenance_tests;
 #[cfg(test)]
+mod ecrivains_pendant_un_lot_de_scan_tests;
+#[cfg(test)]
 mod lenteur_albums_4800_tests;
+#[cfg(test)]
+mod lenteur_pistes_5138_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
 pub mod upnp_revision;

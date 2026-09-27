@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "106d5f4c7baa9a82fb950567f0c140aa201c1c43",
+    "web_sha": "bed6b2d27c4243d3c5a8d3622206fc158902e363",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -989,6 +989,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -1200,6 +1201,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -1693,6 +1695,7 @@
         "with_dynamic_range",
         "dynamic_range_from_analysis",
         "dynamic_range_from_tag",
+        "dynamic_range_from_sidecar_file",
         "dynamic_range_unavailable",
         "dynamic_range_deferred",
         "dynamic_range_pct"
@@ -1736,6 +1739,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -2312,6 +2316,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -2987,6 +2992,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3095,6 +3101,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3199,6 +3206,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3230,6 +3238,7 @@
         "authenticated"
       ],
       "champs_optionnels": [
+        "username",
         "verification_url",
         "user_code",
         "error"
@@ -3516,6 +3525,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3606,6 +3616,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3653,6 +3664,7 @@
         "cue_media_path",
         "cue_start_ms",
         "cue_end_ms",
+        "path_terms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3807,7 +3819,10 @@
       "champs_optionnels": [
         "pausable",
         "all_paused",
-        "scan_pausable"
+        "scan_pausable",
+        "dynamic_range_priority",
+        "dynamic_range_priority_choices",
+        "dynamic_range_sidecar"
       ]
     },
     {
@@ -3950,6 +3965,7 @@
         "scan_status"
       ],
       "champs_optionnels": [
+        "cpu_temp_c",
         "asio_warm_scan",
         "output_providers"
       ]
@@ -4026,6 +4042,18 @@
       "champs_optionnels": [
         "candidats",
         "premium"
+      ]
+    },
+    {
+      "route": "/system/env",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "TUNE_PORT",
+        "spotify_redirect_uri",
+        "spotify_redirect_uri_refus"
       ]
     },
     {
@@ -4897,7 +4925,9 @@
         "bands",
         "enabled"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "headroom_mode"
+      ]
     },
     {
       "route": "/zones/{}/image",
@@ -5691,6 +5721,11 @@
       "raison": "type introuvable dans les sources"
     },
     {
+      "route": "/zones/{}/eq",
+      "type": "EqSetResult",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/system/stats/listening",
       "type": "any",
       "raison": "type non structurel"
@@ -6232,7 +6267,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 311,
-    "appels_non_resolus": 156
+    "routes_cartographiees": 312,
+    "appels_non_resolus": 157
   }
 }

@@ -7,7 +7,10 @@
 //!   artiste, nombre de pistes audio, pochette) ;
 //! * `vide` — le lecteur est là, sans disque ;
 //! * `non_pris_en_charge` — la plateforme n'a pas d'implémentation ;
-//! * absente — pas de lecteur, ou greffon arrêté (`teardown`).
+//! * `indisponible` — la plateforme sait lire un CD, mais aucun lecteur n'est
+//!   branché (détail `{"raison": "aucun_lecteur"}`) : la source reste LISTÉE,
+//!   grisée par les clients (#5065, étape 3) ;
+//! * absente — greffon arrêté (`teardown`).
 //!
 //! « Jouer » délègue à `POST /jouer` du greffon (`routes::jouer_disque`).
 
@@ -48,12 +51,18 @@ impl PublicationSource {
 
     /// Sans lecteur, la surveillance ne tourne pas : la source se déclare
     /// ici, une fois. `non_pris_en_charge` si la plateforme n'a pas
-    /// d'implémentation ; rien si elle en a une mais qu'aucun lecteur n'est
-    /// branché (seules les sources présentes sont listées). Avec un lecteur,
-    /// c'est le premier tour de la surveillance qui publie — jamais `setup`,
-    /// qui ne doit pas attendre MusicBrainz au démarrage du serveur.
+    /// d'implémentation ; `indisponible` si elle en a une mais qu'aucun
+    /// lecteur n'est branché — la source reste listée, grisée (#5065,
+    /// étape 3). Avec un lecteur, c'est le premier tour de la surveillance
+    /// qui publie — jamais `setup`, qui ne doit pas attendre MusicBrainz au
+    /// démarrage du serveur.
     pub fn publier_sans_lecteur(&self) {
-        if self.lecteur.is_none() && !plateforme_prise_en_charge() {
+        if self.lecteur.is_some() {
+            return;
+        }
+        if plateforme_prise_en_charge() {
+            self.publier_aucun_lecteur();
+        } else {
             self.inscrire(
                 EtatSource::NonPrisEnCharge,
                 "Lecteur CD".into(),
@@ -63,12 +72,20 @@ impl PublicationSource {
         }
     }
 
+    /// Aucun lecteur branché : la source reste, `indisponible`, sans joueur.
+    fn publier_aucun_lecteur(&self) {
+        self.inscrire(
+            EtatSource::Indisponible,
+            "Lecteur CD".into(),
+            json!({ "raison": "aucun_lecteur" }),
+            false,
+        );
+    }
+
     /// Met la source à jour d'après la présence vue au lecteur.
     pub async fn publier(&self, presence: Presence) {
         match presence {
-            Presence::AucunLecteur => {
-                self.registre.retirer(ID, ID);
-            }
+            Presence::AucunLecteur => self.publier_aucun_lecteur(),
             Presence::Vide => self.inscrire(EtatSource::Vide, "Lecteur CD".into(), json!({}), true),
             Presence::Disque => {
                 let Some(l) = self.lecteur.clone() else {
@@ -296,10 +313,77 @@ mod tests {
         assert_eq!(changements(&mut rx), 1);
     }
 
-    /// Sans lecteur : `non_pris_en_charge` si la plateforme n'a pas
-    /// d'implémentation, rien du tout sinon (seules les sources présentes).
+    /// #5161 — le lecteur est branché APRÈS le démarrage du greffon : tant
+    /// qu'il n'est pas là, la source `cd` est listée `indisponible` (#5065,
+    /// étape 3) ; branché, la surveillance le voit, la source passe à
+    /// `disque` et `sources.changed` part. Débranché, elle redevient
+    /// `indisponible` ; rebranché, elle revient à `disque`.
     #[tokio::test]
-    async fn sans_lecteur() {
+    async fn la_source_cd_apparait_quand_le_lecteur_est_branche_apres_coup() {
+        use crate::lecteur::tests::SystemeFactice;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        let registre = Arc::new(RegistreSources::new());
+        registre.brancher_bus(bus);
+        let systeme = Arc::new(SystemeFactice::default());
+        let lecteur: Arc<dyn LecteurDisque> = Arc::new(systeme.lecteur(Duration::ZERO));
+        let hote = Arc::new(HoteTemoin::default());
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+        };
+        let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
+        publication.publier_sans_lecteur();
+        let mut s =
+            Surveillant::new(lecteur, hote, routes.zones.clone()).avec_publication(publication);
+
+        s.un_tour().await;
+        s.un_tour().await;
+        let cd = registre
+            .source(ID)
+            .expect("la source cd, listée sans lecteur");
+        assert_eq!(cd.etat, EtatSource::Indisponible, "rien de branché");
+        assert_eq!(changements(&mut rx), 1);
+
+        systeme.branche.store(true, Ordering::SeqCst);
+        s.un_tour().await;
+        let cd = registre.source(ID).expect("la source cd, lecteur branché");
+        assert_eq!(cd.etat, EtatSource::Disque);
+        assert_eq!(cd.detail["pistes"], 10);
+        assert_eq!(changements(&mut rx), 1);
+
+        systeme.branche.store(false, Ordering::SeqCst);
+        systeme
+            .dernier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .debrancher();
+        s.un_tour().await;
+        assert_eq!(
+            registre.source(ID).unwrap().etat,
+            EtatSource::Indisponible,
+            "débranché"
+        );
+        assert_eq!(changements(&mut rx), 1);
+
+        systeme.branche.store(true, Ordering::SeqCst);
+        s.un_tour().await;
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Disque);
+        assert_eq!(changements(&mut rx), 1);
+    }
+
+    /// Sans lecteur, la source est TOUJOURS listée (#5065, étape 3) :
+    /// `non_pris_en_charge` si la plateforme n'a pas d'implémentation,
+    /// `indisponible` sinon — jamais absente, et jamais jouable.
+    #[tokio::test]
+    async fn sans_lecteur_la_source_cd_reste_listee_indisponible() {
         let registre = Arc::new(RegistreSources::new());
         let routes = EtatRoutes {
             lecteur: None,
@@ -308,23 +392,27 @@ mod tests {
             zones: Arc::default(),
         };
         PublicationSource::new(registre.clone(), &routes).publier_sans_lecteur();
+        let l = registre.lister();
+        assert_eq!(l.len(), 1, "la source cd doit être listée sans lecteur");
+        assert_eq!(l[0].id, ID);
+        assert_eq!(l[0].genre, TypeSource::Cd);
         if plateforme_prise_en_charge() {
-            assert!(registre.lister().is_empty());
+            assert_eq!(l[0].etat, EtatSource::Indisponible);
+            assert_eq!(l[0].detail, json!({ "raison": "aucun_lecteur" }));
         } else {
-            let l = registre.lister();
             assert_eq!(l[0].etat, EtatSource::NonPrisEnCharge);
-            assert!(matches!(
-                registre
-                    .jouer(
-                        ID,
-                        DemandeJouer {
-                            zone_id: 1,
-                            piste: None
-                        }
-                    )
-                    .await,
-                Err(ErreurJouer::NonJouable { .. })
-            ));
         }
+        assert!(matches!(
+            registre
+                .jouer(
+                    ID,
+                    DemandeJouer {
+                        zone_id: 1,
+                        piste: None
+                    }
+                )
+                .await,
+            Err(ErreurJouer::NonJouable { .. })
+        ));
     }
 }

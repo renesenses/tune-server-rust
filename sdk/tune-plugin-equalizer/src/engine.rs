@@ -42,6 +42,73 @@ pub struct EqProfile {
     /// before this field deserializing unchanged.
     #[serde(default)]
     pub bands: Vec<EqBandSpec>,
+    /// Réserve anti-saturation de l'égaliseur (#5171).
+    ///
+    /// `safe` (défaut, norme L1, aucune saturation possible) ou `realistic`
+    /// (maximum réel de la réponse en fréquence, plus un limiteur de sécurité
+    /// doux). Voir [`HeadroomMode`].
+    ///
+    /// Absent du JSON quand il vaut `safe` : un profil enregistré avant ce
+    /// champ se relit à l'identique, et un profil « Sûr » s'écrit octet pour
+    /// octet comme avant — y compris les réglages passés au greffon natif.
+    #[serde(
+        default,
+        skip_serializing_if = "HeadroomMode::is_safe",
+        deserialize_with = "HeadroomMode::lire"
+    )]
+    pub headroom_mode: HeadroomMode,
+}
+
+/// Réserve anti-saturation de l'égaliseur, au choix de l'utilisateur (#5171).
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadroomMode {
+    /// Norme L1 de la cascade ([`EqProfile::automatic_headroom_db_at`]) :
+    /// aucune saturation possible, quelle que soit l'entrée. Le comportement
+    /// d'avant #5171, au bit près.
+    #[default]
+    Safe,
+    /// Maximum réel de la réponse en fréquence plus [`MARGE_REALISTE_DB`]
+    /// ([`EqProfile::reserve_realiste_db_at`]), suivi du limiteur de sécurité
+    /// (`tune_plugin_audio_support::limiteur`) qui n'agit que sur les crêtes
+    /// transitoires que ce maximum ne voit pas.
+    Realistic,
+}
+
+impl HeadroomMode {
+    /// Le mode par défaut ?
+    pub fn is_safe(&self) -> bool {
+        *self == Self::Safe
+    }
+
+    /// Le code publié par l'API (`safe` / `realistic`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Realistic => "realistic",
+        }
+    }
+
+    /// Lit un code ; `None` pour une valeur inconnue.
+    pub fn depuis_code(code: &str) -> Option<Self> {
+        match code {
+            "safe" => Some(Self::Safe),
+            "realistic" => Some(Self::Realistic),
+            _ => None,
+        }
+    }
+
+    /// Désérialisation TOLÉRANTE : une valeur inconnue (un client plus récent,
+    /// une faute de frappe) retombe sur `safe` au lieu de rendre tout le
+    /// profil illisible — ce qui éteindrait l'égaliseur de la zone.
+    fn lire<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Option::<serde_json::Value>::deserialize(d)?;
+        Ok(v.as_ref()
+            .and_then(|v| v.as_str())
+            .and_then(Self::depuis_code)
+            .unwrap_or_default())
+    }
 }
 
 /// One expert-mode filter band (RBJ biquad).
@@ -173,6 +240,31 @@ const Q_SANS_RESONANCE: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// 1,000000 et un over sans cette marge.
 const MARGE_DE_TRONCATURE_DB: f64 = 0.01;
 
+/// #5171 — ce que la réserve « Réaliste » ajoute au maximum de la réponse en
+/// fréquence, en dB.
+///
+/// **0,2 dB** : l'écart entre la pleine échelle et le seuil du limiteur
+/// (`limiteur::SEUIL_DBFS`, −0,2 dBFS). C'est ce qui garantit que le
+/// limiteur ne se réveille JAMAIS sur un signal stationnaire : un sinus à
+/// 0 dBFS placé à la fréquence où la courbe pousse le plus ressort à
+/// −0,2 dBFS, pile au seuil, gain 1. Seuls les transitoires — la sonnerie
+/// d'une cloche sur un front, que le maximum fréquentiel ne voit pas — le
+/// franchissent.
+///
+/// **+ 0,05 dB de garde** : la précision de la recherche du maximum
+/// ([`EqProfile::max_reponse_db_at`] l'affine à mieux que 10⁻⁶ dB) et le
+/// dither TPDF (±1 LSB, 0,000 27 dB à 16 bits) sont mille fois plus petits ;
+/// les 0,05 dB couvrent l'arrondi flottant de la cascade elle-même sur un
+/// sinus qui s'établit, sans rien coûter d'audible (le pas de volume le plus
+/// fin de l'interface vaut 0,5 dB).
+pub const MARGE_REALISTE_DB: f64 = 0.25;
+
+/// Points de la grille de recherche du maximum de la réponse en fréquence,
+/// log-uniforme de 1 Hz à Nyquist : un pas relatif de 0,1 % à 44,1 kHz,
+/// soit ~30 points dans la bande passante de la cloche la plus étroite
+/// (Q = 30).
+const POINTS_MAX_REPONSE: usize = 8_192;
+
 /// Bornes de la réponse impulsionnelle sommée par [`norme_l1`].
 const LONGUEUR_L1_MIN: usize = 4_096;
 const LONGUEUR_L1_MAX: usize = 1 << 19;
@@ -219,6 +311,7 @@ impl Default for EqProfile {
             mid_gain_db: 0.0,
             treble_gain_db: 0.0,
             bands: Vec::new(),
+            headroom_mode: HeadroomMode::Safe,
         }
     }
 }
@@ -380,6 +473,137 @@ impl EqProfile {
         -(l1_db + resonance_db)
     }
 
+    /// #5171 — la réserve RÉELLEMENT appliquée à ce canal, en dB (≤ 0),
+    /// selon [`Self::headroom_mode`] : c'est le pré-gain de [`EqProcessor`] et
+    /// ce que [`Self::gain_moyen_db_at`] — donc la compensation de niveau —
+    /// compte.
+    ///
+    /// En mode `safe`, c'est [`Self::automatic_headroom_db_at`], appelée telle
+    /// quelle : rien d'autre n'est calculé, le résultat est le même au bit
+    /// près qu'avant #5171.
+    pub fn reserve_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        match self.headroom_mode {
+            HeadroomMode::Safe => self.automatic_headroom_db_at(channel, sample_rate),
+            HeadroomMode::Realistic => self.reserve_realiste_db_at(channel, sample_rate),
+        }
+    }
+
+    /// #5171 — la réserve « Réaliste » d'un canal, en dB (≤ 0) :
+    /// `−(maximum de la réponse en fréquence + MARGE_REALISTE_DB)` quand la
+    /// courbe pousse quelque part, 0 sinon.
+    ///
+    /// Le maximum est celui de la cascade ENTIÈRE qui joue sur ce canal — les
+    /// `pass` et les `notch` compris, résonance d'un passe-bas pointu comprise :
+    /// c'est la réponse que le signal traverse, pas une borne par étage.
+    ///
+    /// Jamais plus prudente que la réserve « Sûre » : la norme L1 majore
+    /// toujours le maximum fréquentiel, donc sur les courbes réelles la
+    /// réserve réaliste est la plus petite des deux ; le `max` ci-dessous ne
+    /// fait que le garantir sur un profil dégénéré (résonance comptée par la
+    /// formule de la réserve sûre sous le maximum exact plus la marge).
+    ///
+    /// Un profil qui ne pousse nulle part (maximum ≤ 0 dB) ne réserve rien,
+    /// comme en mode sûr.
+    pub fn reserve_realiste_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        let max_db = self.max_reponse_db_at(channel, sample_rate);
+        let realiste = if max_db > 0.0 {
+            -(max_db + MARGE_REALISTE_DB)
+        } else {
+            0.0
+        };
+        realiste.max(self.automatic_headroom_db_at(channel, sample_rate))
+    }
+
+    /// #5171 — le maximum de la réponse en fréquence de la cascade de ce
+    /// canal, en dB (0 pour une cascade vide ou un débit invalide).
+    ///
+    /// Échantillonnage fin puis affinage : une grille log-uniforme de
+    /// [`POINTS_MAX_REPONSE`] points de 1 Hz à Nyquist, plus le continu
+    /// (w = 0, où un plateau grave culmine), Nyquist (w = π, où culmine un
+    /// plateau aigu) et la fréquence centrale de chaque bande ; puis les
+    /// quatre plus hauts maximums locaux de la grille sont affinés par
+    /// section dorée entre leurs voisins, à 10⁻¹² en pulsation près.
+    pub fn max_reponse_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return 0.0;
+        }
+        let cascades = self.cascades(sample_rate, channel.saturating_add(1));
+        let Some(cascade) = cascades.get(channel as usize) else {
+            return 0.0;
+        };
+        if cascade.is_empty() {
+            return 0.0;
+        }
+        let module2 = |w: f64| -> f64 { cascade.iter().map(|c| c.module_a(w).powi(2)).product() };
+
+        let nyquist = sample_rate / 2.0;
+        let mut ws: Vec<f64> = Vec::with_capacity(POINTS_MAX_REPONSE + 2 + self.bands.len());
+        ws.push(0.0);
+        for i in 0..POINTS_MAX_REPONSE {
+            let f = nyquist.powf(i as f64 / (POINTS_MAX_REPONSE - 1) as f64);
+            ws.push(2.0 * PI * f / sample_rate);
+        }
+        for b in &self.bands {
+            if b.freq.is_finite() && b.freq > 0.0 && b.freq < nyquist {
+                ws.push(2.0 * PI * b.freq / sample_rate);
+            }
+        }
+        ws.push(PI);
+        ws.sort_by(f64::total_cmp);
+        ws.dedup();
+
+        let valeurs: Vec<f64> = ws.iter().map(|&w| module2(w)).collect();
+        let mut meilleur = valeurs
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max);
+
+        // Les maximums locaux de la grille, du plus haut au plus bas.
+        let mut locaux: Vec<usize> = (0..valeurs.len())
+            .filter(|&i| {
+                let v = valeurs[i];
+                v.is_finite()
+                    && (i == 0 || v >= valeurs[i - 1])
+                    && (i + 1 == valeurs.len() || v >= valeurs[i + 1])
+            })
+            .collect();
+        locaux.sort_by(|&a, &b| valeurs[b].total_cmp(&valeurs[a]));
+        for &i in locaux.iter().take(4) {
+            let mut a = ws[i.saturating_sub(1)];
+            let mut b = ws[(i + 1).min(ws.len() - 1)];
+            const OR: f64 = 0.618_033_988_749_894_9;
+            let mut c = b - OR * (b - a);
+            let mut d = a + OR * (b - a);
+            let (mut fc, mut fd) = (module2(c), module2(d));
+            while b - a > 1e-12 {
+                if fc > fd {
+                    b = d;
+                    d = c;
+                    fd = fc;
+                    c = b - OR * (b - a);
+                    fc = module2(c);
+                } else {
+                    a = c;
+                    c = d;
+                    fc = fd;
+                    d = a + OR * (b - a);
+                    fd = module2(d);
+                }
+            }
+            for v in [fc, fd] {
+                if v.is_finite() && v > meilleur {
+                    meilleur = v;
+                }
+            }
+        }
+        if meilleur > 0.0 {
+            10.0 * meilleur.log10()
+        } else {
+            0.0
+        }
+    }
+
     /// Au moins une bande POUSSE-t-elle, et la cascade des bandes à GAIN
     /// (`peak` / `low_shelf` / `high_shelf`, et tout type inconnu — que
     /// [`EqBandSpec::coeffs`] traite en `peaking_eq`), exactement celle que
@@ -453,6 +677,12 @@ impl EqProfile {
     /// se lit ici, et que l'hôte peut rendre par le volume, là où aucun
     /// écrêtage n'est possible.
     ///
+    /// #5171 — la réserve comptée est celle RÉELLEMENT appliquée
+    /// ([`Self::reserve_db_at`]) : en mode « Réaliste », la perte est plus
+    /// petite et la compensation de niveau demandée l'est d'autant — sans quoi
+    /// elle rendrait par le volume des décibels que l'égaliseur n'a pas
+    /// retirés.
+    ///
     /// Moyenne de puissance sur les canaux : une courbe gauche/droite
     /// dissymétrique compte pour moitié chacune. 0,0 pour un profil éteint ou
     /// qui ne filtre rien — c'est-à-dire exactement quand [`EqProcessor`]
@@ -466,7 +696,7 @@ impl EqProfile {
             return 0.0;
         }
         let reserves: Vec<f64> = (0..cascades.len() as u16)
-            .map(|ch| 10.0_f64.powf(self.automatic_headroom_db_at(ch, sample_rate) / 10.0))
+            .map(|ch| 10.0_f64.powf(self.reserve_db_at(ch, sample_rate) / 10.0))
             .collect();
         let n = cascades.len() as f64;
         tune_plugin_audio_support::niveau_moyen::gain_moyen_rose_db(sample_rate, |f| {
@@ -936,6 +1166,16 @@ pub struct EqProcessor {
     ecretage_fin_dite: std::sync::atomic::AtomicBool,
     channels: u16,
     enabled: bool,
+    /// #5171 — la réserve choisie, et le limiteur de sécurité qui va avec :
+    /// `Some` en mode « Réaliste » seulement. En mode « Sûr », `None`, et les
+    /// boucles d'échantillons sont celles d'avant, inchangées.
+    headroom_mode: HeadroomMode,
+    limiteur: Option<tune_plugin_audio_support::limiteur::Limiteur>,
+    /// La trame en cours de traitement, un `f64` par canal : le limiteur est
+    /// LIÉ (un gain pour toute la trame), il faut donc la cascade de tous les
+    /// canaux avant d'écrire le premier. Allouée ici, jamais dans la boucle.
+    trame: Vec<f64>,
+    limiteur_premier_dit: bool,
 }
 
 /// Diagnostics for one processed audio buffer.
@@ -960,7 +1200,7 @@ impl EqProcessor {
         // Au débit RÉEL : la norme L1 d'un plateau et la place d'un aigu sous
         // Nyquist ne sont pas les mêmes à 44,1 et à 192 kHz.
         let preamp_db: Vec<f64> = (0..channels.max(1))
-            .map(|ch| profile.automatic_headroom_db_at(ch, sr))
+            .map(|ch| profile.reserve_db_at(ch, sr))
             .collect();
         let preamp_gains = preamp_db
             .iter()
@@ -988,6 +1228,11 @@ impl EqProcessor {
             ecretage_fin_dite: std::sync::atomic::AtomicBool::new(false),
             channels,
             enabled,
+            headroom_mode: profile.headroom_mode,
+            limiteur: (enabled && profile.headroom_mode == HeadroomMode::Realistic)
+                .then(|| tune_plugin_audio_support::limiteur::Limiteur::new(sample_rate)),
+            trame: vec![0.0; usize::from(channels.max(1))],
+            limiteur_premier_dit: false,
         }
     }
 
@@ -1008,6 +1253,11 @@ impl EqProcessor {
         self.ecretage_premier_dit = false;
         self.ecretage_fin_dite
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(limiteur) = &mut self.limiteur {
+            limiteur.oublier();
+            limiteur.remettre_les_compteurs();
+        }
+        self.limiteur_premier_dit = false;
     }
 
     /// #2218 — le compteur d'écrêtage de la piste : `echantillons_ecretes`
@@ -1046,6 +1296,9 @@ impl EqProcessor {
         let mut stats = EqProcessStats::default();
         if !self.enabled || pcm.is_empty() || self.channels == 0 {
             return stats;
+        }
+        if self.limiteur.is_some() {
+            return self.process_pcm_limite(pcm, bit_depth);
         }
 
         let bytes_per_sample = (bit_depth / 8) as usize;
@@ -1121,6 +1374,9 @@ impl EqProcessor {
         if !samples.len().is_multiple_of(ch_count) {
             return stats;
         }
+        if self.limiteur.is_some() {
+            return self.process_interleaved_limite(samples);
+        }
 
         // #2218 — ce chemin ne sature PAS (T9 : crête ×3,95 laissée passer) ;
         // il compte les overs comme `process_pcm`, avec un LSB de référence à
@@ -1164,6 +1420,155 @@ impl EqProcessor {
             .saturating_add(stats.non_finite_samples);
         self.apres_le_bloc(&avant);
         stats
+    }
+
+    /// #5171 — la cascade d'une trame, dans `self.trame`, puis le gain du
+    /// limiteur pour cette trame. Les valeurs non finies sont rangées à zéro
+    /// ET comptées ici, comme dans les boucles du mode sûr.
+    #[inline]
+    fn cascade_de_la_trame(&mut self, stats: &mut EqProcessStats) -> f64 {
+        let mut crete = 0.0_f64;
+        for ch in 0..self.channels as usize {
+            let mut s = self.trame[ch];
+            for (stage, coeffs) in self.states[ch].iter_mut().zip(self.filters[ch].iter()) {
+                s = stage.process(coeffs, s);
+            }
+            if !s.is_finite() {
+                stats.non_finite_samples += 1;
+                s = 0.0;
+            }
+            crete = crete.max(s.abs());
+            self.trame[ch] = s;
+        }
+        match &mut self.limiteur {
+            Some(limiteur) => limiteur.gain(crete),
+            None => 1.0,
+        }
+    }
+
+    /// [`Self::process_pcm`] en mode « Réaliste » : pré-gain, cascade, puis
+    /// le limiteur LIÉ, puis — inchangés — le compteur d'écrêtage, le dither
+    /// et l'écriture. Un gain de 1 n'est pas appliqué : sous le seuil, la
+    /// sortie est celle de la cascade, au bit près.
+    fn process_pcm_limite(&mut self, pcm: &mut [u8], bit_depth: u16) -> EqProcessStats {
+        let mut stats = EqProcessStats::default();
+        let bytes_per_sample = (bit_depth / 8) as usize;
+        let frame_size = bytes_per_sample * self.channels as usize;
+        let max_val = (1i64 << (bit_depth - 1)) as f64;
+        let avant = self.ecretage;
+        let avant_limiteur = self.limiteur.map(|l| l.compteur()).unwrap_or_default();
+        let base = avant.echantillons_vus;
+        let canaux = self.channels as u64;
+
+        for (fi, frame) in pcm.chunks_exact_mut(frame_size).enumerate() {
+            for ch in 0..self.channels as usize {
+                let offset = ch * bytes_per_sample;
+                self.trame[ch] = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth)
+                    * self.preamp_gains[ch];
+            }
+            let gain = self.cascade_de_la_trame(&mut stats);
+            for ch in 0..self.channels as usize {
+                let offset = ch * bytes_per_sample;
+                let mut s = self.trame[ch];
+                if gain != 1.0 {
+                    s *= gain;
+                }
+                if !(-1.0..1.0).contains(&s) {
+                    stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + fi as u64 * canaux + ch as u64,
+                        (s.abs() - 1.0) * max_val,
+                        s.abs(),
+                    );
+                }
+                let dither = self.dither_states[ch].tirer();
+                write_sample_f64(&mut frame[offset..], s, bytes_per_sample, bit_depth, dither);
+            }
+        }
+        self.ecretage
+            .noter_vus((pcm.len() / frame_size) as u64 * canaux);
+        self.cumuler_les_stats(&stats);
+        self.apres_le_bloc(&avant);
+        self.apres_le_bloc_du_limiteur(&avant_limiteur);
+        stats
+    }
+
+    /// [`Self::process_interleaved`] en mode « Réaliste ».
+    fn process_interleaved_limite(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        const LSB_REFERENCE: f64 = 8_388_608.0;
+        let mut stats = EqProcessStats::default();
+        let ch_count = self.channels as usize;
+        let avant = self.ecretage;
+        let avant_limiteur = self.limiteur.map(|l| l.compteur()).unwrap_or_default();
+        let base = avant.echantillons_vus;
+
+        for (fi, frame) in samples.chunks_exact_mut(ch_count).enumerate() {
+            for (ch, sample) in frame.iter().enumerate() {
+                let mut s = *sample as f64 * self.preamp_gains[ch];
+                if !s.is_finite() {
+                    stats.non_finite_samples += 1;
+                    s = 0.0;
+                }
+                self.trame[ch] = s;
+            }
+            let gain = self.cascade_de_la_trame(&mut stats);
+            for (ch, sample) in frame.iter_mut().enumerate() {
+                let mut s = self.trame[ch];
+                if gain != 1.0 {
+                    s *= gain;
+                }
+                if !(-1.0..1.0).contains(&s) {
+                    stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + (fi * ch_count + ch) as u64,
+                        (s.abs() - 1.0) * LSB_REFERENCE,
+                        s.abs(),
+                    );
+                }
+                *sample = s as f32;
+            }
+        }
+        self.ecretage.noter_vus(samples.len() as u64);
+        self.cumuler_les_stats(&stats);
+        self.apres_le_bloc(&avant);
+        self.apres_le_bloc_du_limiteur(&avant_limiteur);
+        stats
+    }
+
+    fn cumuler_les_stats(&mut self, stats: &EqProcessStats) {
+        self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
+        self.process_stats.non_finite_samples = self
+            .process_stats
+            .non_finite_samples
+            .saturating_add(stats.non_finite_samples);
+    }
+
+    /// #5171 — après un bloc : le delta du limiteur au registre du processus,
+    /// et la ligne `dsp_limiteur` au premier bloc de la piste qui a limité.
+    fn apres_le_bloc_du_limiteur(
+        &mut self,
+        avant: &tune_plugin_audio_support::limiteur::CompteurDuLimiteur,
+    ) {
+        let Some(limiteur) = &self.limiteur else {
+            return;
+        };
+        let apres = limiteur.compteur();
+        tune_plugin_audio_support::limiteur::REGISTRE.absorber(avant, &apres);
+        if !self.limiteur_premier_dit && apres.trames_limitees > 0 {
+            self.limiteur_premier_dit = true;
+            tune_plugin_audio_support::limiteur::dire_premier(&apres);
+        }
+    }
+
+    /// #5171 — la réserve de ce processeur (`safe` / `realistic`).
+    pub fn headroom_mode(&self) -> HeadroomMode {
+        self.headroom_mode
+    }
+
+    /// #5171 — ce que le limiteur de sécurité a fait sur la piste ; `None`
+    /// en mode « Sûr » (pas de limiteur) ou quand l'égaliseur ne filtre rien.
+    pub fn limiteur(&self) -> Option<tune_plugin_audio_support::limiteur::CompteurDuLimiteur> {
+        self.limiteur.map(|l| l.compteur())
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -1280,6 +1685,12 @@ impl EqProcessor {
         // ne redit pas un premier écrêtage déjà dit.
         self.ecretage = previous.ecretage;
         self.ecretage_premier_dit = previous.ecretage_premier_dit;
+        // #5171 — l'enveloppe du limiteur suit l'historique : un curseur
+        // bougé pendant une crête ne doit pas relâcher le gain d'un coup.
+        if let (Some(neuf), Some(ancien)) = (&mut self.limiteur, &previous.limiteur) {
+            neuf.heriter(ancien);
+            self.limiteur_premier_dit = previous.limiteur_premier_dit;
+        }
         previous
             .ecretage_fin_dite
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1311,6 +1722,13 @@ impl EqProcessor {
             tune_plugin_audio_support::ecretage::Portee::Piste,
             &self.ecretage,
         );
+        if let Some(limiteur) = &self.limiteur {
+            let c = limiteur.compteur();
+            if c.trames_limitees > 0 {
+                tune_plugin_audio_support::limiteur::REGISTRE.piste_close();
+            }
+            tune_plugin_audio_support::limiteur::dire_fin(&c);
+        }
     }
 }
 
@@ -2696,6 +3114,505 @@ mod banc_denormal_4755 {
             assert_eq!(
                 avec, sans,
                 "{nom} : le plancher #4755 a modifié un échantillon musical"
+            );
+        }
+    }
+}
+
+/// #5171 — réserve « Réaliste » et limiteur de sécurité.
+#[cfg(test)]
+mod reserve_realiste_5171 {
+    use super::*;
+
+    /// La courbe de Thierry (#5069) — même définition que
+    /// `tests/reserve_5171.rs`, recopiée parce qu'un test unitaire ne voit
+    /// pas les tests d'intégration.
+    fn thierry_5171(mode: HeadroomMode) -> EqProfile {
+        const GRILLE: [f64; 31] = [
+            20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0,
+            400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0, 2000.0, 2500.0, 3150.0, 4000.0,
+            5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0, 20000.0,
+        ];
+        let gain = |f: f64| match f as u32 {
+            20 | 25 => 3.5,
+            31 => 3.0,
+            40 => 2.5,
+            50 => 1.5,
+            63 => 1.0,
+            80 => 0.5,
+            250 => -1.0,
+            315 => -1.5,
+            400 => -1.0,
+            1000 | 1250 => 1.0,
+            1600 | 2000 => 2.5,
+            2500 => 1.0,
+            4000 => -0.5,
+            5000 => -1.5,
+            8000 | 10000 | 12500 | 16000 => 1.5,
+            _ => 0.0,
+        };
+        EqProfile {
+            enabled: true,
+            bands: GRILLE
+                .iter()
+                .map(|&freq| EqBandSpec {
+                    freq,
+                    gain: gain(freq),
+                    q: 4.32,
+                    ..Default::default()
+                })
+                .collect(),
+            headroom_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn profils_5171(mode: HeadroomMode) -> Vec<(&'static str, EqProfile)> {
+        let bande = |freq, gain, q, band_type: &str| EqBandSpec {
+            freq,
+            gain,
+            q,
+            band_type: band_type.into(),
+            ..Default::default()
+        };
+        let avec = |bands: Vec<EqBandSpec>| EqProfile {
+            enabled: true,
+            bands,
+            headroom_mode: mode,
+            ..Default::default()
+        };
+        vec![
+            ("thierry", thierry_5171(mode)),
+            (
+                "tilt +6/−2/+4",
+                EqProfile {
+                    enabled: true,
+                    bass_gain_db: 6.0,
+                    mid_gain_db: -2.0,
+                    treble_gain_db: 4.0,
+                    headroom_mode: mode,
+                    ..Default::default()
+                },
+            ),
+            (
+                "plateau aigu +8",
+                avec(vec![bande(6000.0, 8.0, 1.0, "high_shelf")]),
+            ),
+            (
+                "cloche 20 Hz Q=30 +6",
+                avec(vec![bande(20.0, 6.0, 30.0, "peak")]),
+            ),
+            (
+                "passe-bas Q=4 + cloche",
+                avec(vec![
+                    bande(8000.0, 0.0, 4.0, "low_pass"),
+                    bande(1000.0, 3.0, 1.0, "peak"),
+                ]),
+            ),
+        ]
+    }
+
+    /// Le maximum de |H|, en dB, par un balayage BRUT de 2 × 2 000 000
+    /// points — linéaire sur [0, π] et logarithmique de 1 Hz à Nyquist (pas
+    /// relatif de 5·10⁻⁶ : une cloche Q = 30 à 20 Hz y tient) —, sans
+    /// affinage, indépendant de la grille de `max_reponse_db_at`.
+    fn max_brut_db(profil: &EqProfile, sr: f64) -> f64 {
+        let cascade = &profil.cascades(sr, 1)[0];
+        let n = 2_000_000;
+        let module2 = |w: f64| {
+            cascade
+                .iter()
+                .map(|c| c.module_a(w).powi(2))
+                .product::<f64>()
+        };
+        let lineaire = (0..=n).map(|i| module2(PI * i as f64 / n as f64));
+        let log = (0..=n).map(|i| {
+            let f = (sr / 2.0).powf(i as f64 / n as f64);
+            module2(2.0 * PI * f / sr)
+        });
+        lineaire.chain(log).fold(0.0_f64, f64::max).log10() * 10.0
+    }
+
+    #[test]
+    fn la_reserve_realiste_egale_le_maximum_mesure_de_la_reponse_5171() {
+        for sr in [44_100.0, 96_000.0] {
+            for (nom, profil) in profils_5171(HeadroomMode::Realistic) {
+                let brut = max_brut_db(&profil, sr);
+                let reserve = profil.reserve_db_at(0, sr);
+                let attendue = -(brut + MARGE_REALISTE_DB);
+                assert!(
+                    (reserve - attendue).abs() < 1e-4,
+                    "{nom} à {sr} Hz : réserve réaliste {reserve:.4} dB, alors que le maximum \
+                     mesuré de la réponse vaut {brut:.4} dB (attendu {attendue:.4} dB)"
+                );
+                // Et le maximum affiné n'est jamais SOUS le balayage brut.
+                let trouve = profil.max_reponse_db_at(0, sr);
+                assert!(
+                    trouve >= brut - 1e-9,
+                    "{nom} à {sr} Hz : la recherche du maximum rate le pic — {trouve:.6} dB \
+                     trouvés, {brut:.6} dB au balayage brut"
+                );
+                // Jamais plus prudente que la réserve sûre.
+                let mut sure = profil.clone();
+                sure.headroom_mode = HeadroomMode::Safe;
+                assert!(reserve >= sure.reserve_db_at(0, sr) - 1e-12, "{nom}");
+                // Le pré-gain du processeur EST cette réserve.
+                let eq = EqProcessor::new(&profil, sr as u32, 2);
+                assert_eq!(eq.preamp_db(0), Some(reserve), "{nom}");
+            }
+        }
+    }
+
+    #[test]
+    fn la_compensation_suit_la_reserve_reellement_appliquee_5171() {
+        let sr = 44_100.0;
+        let sure = thierry_5171(HeadroomMode::Safe);
+        let realiste = thierry_5171(HeadroomMode::Realistic);
+        let ecart_reserve = realiste.reserve_db_at(0, sr) - sure.reserve_db_at(0, sr);
+        let ecart_moyen = realiste.gain_moyen_db_at(2, sr) - sure.gain_moyen_db_at(2, sr);
+        assert!(
+            ecart_reserve > 3.0,
+            "la réserve réaliste doit rendre du niveau"
+        );
+        assert!(
+            (ecart_moyen - ecart_reserve).abs() < 1e-9,
+            "le niveau moyen (donc la compensation) ne suit pas la réserve appliquée : \
+             la réserve rend {ecart_reserve:.4} dB, le niveau moyen {ecart_moyen:.4} dB"
+        );
+    }
+
+    /// Un sinus établi en douceur (fondu d'une demi-seconde), placé à la
+    /// fréquence où la courbe pousse le plus.
+    fn sinus_au_maximum(profil: &EqProfile, sr: f64, amplitude: f64, trames: usize) -> Vec<f32> {
+        let cascade = &profil.cascades(sr, 1)[0];
+        let (mut w_max, mut m_max) = (0.0, 0.0);
+        for i in 1..200_000 {
+            let w = PI * i as f64 / 200_000.0;
+            let m = cascade.iter().map(|c| c.module_a(w)).product::<f64>();
+            if m > m_max {
+                (w_max, m_max) = (w, m);
+            }
+        }
+        let fondu = (0.5 * sr) as usize;
+        (0..trames)
+            .flat_map(|i| {
+                let enveloppe = if i < fondu {
+                    0.5 - 0.5 * (PI * i as f64 / fondu as f64).cos()
+                } else {
+                    1.0
+                };
+                let x = (amplitude * enveloppe * (w_max * i as f64).sin()) as f32;
+                [x, x]
+            })
+            .collect()
+    }
+
+    /// Bruit rose (filtre de Paul Kellet sur un bruit blanc congruentiel),
+    /// normalisé pour culminer à `crete`.
+    fn bruit_rose(trames: usize, crete: f64) -> Vec<f32> {
+        let mut graine = 0x1234_5678_u32;
+        let mut b = [0.0_f64; 7];
+        let mut v: Vec<f64> = (0..trames)
+            .map(|_| {
+                graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let blanc = graine as f64 / u32::MAX as f64 * 2.0 - 1.0;
+                b[0] = 0.99886 * b[0] + blanc * 0.0555179;
+                b[1] = 0.99332 * b[1] + blanc * 0.0750759;
+                b[2] = 0.96900 * b[2] + blanc * 0.1538520;
+                b[3] = 0.86650 * b[3] + blanc * 0.3104856;
+                b[4] = 0.55000 * b[4] + blanc * 0.5329522;
+                b[5] = -0.7616 * b[5] - blanc * 0.0168980;
+                let rose = b[..6].iter().sum::<f64>() + b[6] + blanc * 0.5362;
+                b[6] = blanc * 0.115926;
+                rose
+            })
+            .collect();
+        let pic = v.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        for x in &mut v {
+            *x *= crete / pic;
+        }
+        v.iter()
+            .flat_map(|&x| [x as f32, (0.9 * x) as f32])
+            .collect()
+    }
+
+    /// `x[n] = signe(h[L−1−n])` sur la cascade du canal 0, répété, pleine
+    /// échelle ; le canal droit en opposition à 60 % — deux canaux qui ne
+    /// culminent pas ensemble, pour qu'un écrêtage dur (qui frappe chaque
+    /// canal pour son compte) se distingue d'un gain lié. Puis une seconde de
+    /// silence.
+    fn signal_adverse(profil: &EqProfile, sr: f64, trames: usize) -> Vec<f32> {
+        let cascade = &profil.cascades(sr, 1)[0];
+        let longueur = 8_192;
+        let mut etats = vec![BiquadState::default(); cascade.len()];
+        let h: Vec<f64> = (0..longueur)
+            .map(|n| {
+                let mut v = if n == 0 { 1.0 } else { 0.0 };
+                for (c, e) in cascade.iter().zip(etats.iter_mut()) {
+                    v = e.process(c, v);
+                }
+                v
+            })
+            .collect();
+        (0..trames)
+            .flat_map(|i| {
+                let x: f32 = if i + sr as usize >= trames {
+                    0.0
+                } else if h[longueur - 1 - i % longueur] >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                [x, -0.6 * x]
+            })
+            .collect()
+    }
+
+    /// Le même processeur réaliste, limiteur retiré : la sortie de la
+    /// cascade seule, pour comparer.
+    fn sans_limiteur(profil: &EqProfile, sr: u32) -> EqProcessor {
+        let mut p = EqProcessor::new(profil, sr, 2);
+        p.limiteur = None;
+        p
+    }
+
+    #[test]
+    fn le_limiteur_est_inactif_sous_le_seuil_5171() {
+        let sr = 44_100;
+        let profil = thierry_5171(HeadroomMode::Realistic);
+        for (nom, entree) in [
+            // Le pire signal STATIONNAIRE : 0 dBFS là où la courbe pousse le
+            // plus. La marge réaliste le laisse à −0,25 dBFS, sous le seuil.
+            (
+                "sinus 0 dBFS au maximum de la courbe",
+                sinus_au_maximum(&profil, sr as f64, 1.0, 3 * sr as usize),
+            ),
+            (
+                "bruit rose à −6 dBFS crête",
+                bruit_rose(3 * sr as usize, 0.5),
+            ),
+        ] {
+            let mut avec = entree.clone();
+            let mut p = EqProcessor::new(&profil, sr, 2);
+            assert!(p.limiteur.is_some());
+            for bloc in avec.chunks_mut(2048) {
+                p.process_interleaved(bloc);
+            }
+            let mut sans = entree.clone();
+            let mut r = sans_limiteur(&profil, sr);
+            for bloc in sans.chunks_mut(2048) {
+                r.process_interleaved(bloc);
+            }
+            let limitees = p.limiteur().unwrap().trames_limitees;
+            let differents = avec
+                .iter()
+                .zip(&sans)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert!(
+                limitees == 0 && differents == 0,
+                "{nom} : sous le seuil, le limiteur a touché au signal \
+                 ({limitees} trames limitées, {differents} échantillons différents)"
+            );
+        }
+    }
+
+    #[test]
+    fn au_dessus_du_seuil_le_limiteur_n_ecrete_pas_dur_5171() {
+        let sr = 44_100_u32;
+        let profil = thierry_5171(HeadroomMode::Realistic);
+        // Le signal ADVERSE, `x[n] = signe(h[−n])`, pleine échelle : c'est
+        // celui qui atteint la norme L1 — la sonnerie des cloches que le
+        // maximum fréquentiel ne voit pas, exactement ce que la réserve
+        // réaliste laisse au limiteur. Répété, puis un silence pour le
+        // relâchement.
+        let entree: Vec<f32> = signal_adverse(&profil, sr as f64, 2 * sr as usize);
+        let mut sortie = entree.clone();
+        let mut p = EqProcessor::new(&profil, sr, 2);
+        for bloc in sortie.chunks_mut(1024) {
+            p.process_interleaved(bloc);
+        }
+        let mut cascade = entree.clone();
+        let mut r = sans_limiteur(&profil, sr);
+        for bloc in cascade.chunks_mut(1024) {
+            r.process_interleaved(bloc);
+        }
+        let c = p.limiteur().unwrap();
+        assert!(
+            c.trames_limitees > 0,
+            "le témoin ne vaut rien si le limiteur n'a pas agi"
+        );
+        assert!(
+            cascade.iter().any(|x| x.abs() >= 1.0),
+            "sans limiteur, ce signal dépasse le rail"
+        );
+        assert_eq!(
+            p.process_stats().overs,
+            0,
+            "un échantillon a touché le rail"
+        );
+        let crete = sortie.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+        assert!(
+            f64::from(crete) <= tune_plugin_audio_support::limiteur::PLAFOND + 1e-7,
+            "crête {crete} au-delà du plafond"
+        );
+        // Un GAIN, pas un écrêtage : la sortie est la cascade multipliée par
+        // un gain ≤ 1, LE MÊME sur les deux canaux de la trame. Un écrêtage
+        // dur ramènerait chaque canal au plafond pour son compte.
+        let mut gain_precedent = (0_usize, 1.0_f64);
+        for (n, (s, y)) in sortie
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(cascade.as_chunks::<2>().0.iter())
+            .enumerate()
+        {
+            if y[0].abs() < 1e-2 || y[1].abs() < 1e-2 {
+                continue;
+            }
+            let g0 = f64::from(s[0]) / f64::from(y[0]);
+            let g1 = f64::from(s[1]) / f64::from(y[1]);
+            assert!(
+                (g0 - g1).abs() < 1e-5 && g0 <= 1.0 + 1e-6 && g0 > 0.0,
+                "écrêtage dur à la trame {n} : gauche ×{g0:.6}, droite ×{g1:.6} \
+                 (cascade {} / {}, sortie {} / {})",
+                y[0],
+                y[1],
+                s[0],
+                s[1]
+            );
+            // Relâchement LENT : le gain remonte au plus au rythme de la
+            // constante de 150 ms (≈ 1,5·10⁻⁴ par trame à 44,1 kHz ; borne
+            // à 3·10⁻⁴ par trame écoulée, plus le bruit d'arrondi f32).
+            let (n_avant, g_avant) = gain_precedent;
+            let permis = 3e-4 * (n - n_avant) as f64 + 1e-5;
+            assert!(
+                g0 - g_avant < permis,
+                "le gain remonte de {:.5} en {} trame(s) (trame {n}) : relâchement brusque",
+                g0 - g_avant,
+                n - n_avant
+            );
+            gain_precedent = (n, g0);
+        }
+    }
+
+    /// Les mesures publiées dans la PR et `docs/mesures/5171-reserve-realiste.md`.
+    /// `cargo test -p tune-plugin-equalizer mesures_5171 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mesures_5171() {
+        println!(
+            "| débit | réserve sûre (L1) | maximum de la réponse | réserve réaliste | niveau moyen sûr | niveau moyen réaliste |"
+        );
+        for sr in [44_100.0, 48_000.0, 96_000.0] {
+            let s = thierry_5171(HeadroomMode::Safe);
+            let r = thierry_5171(HeadroomMode::Realistic);
+            println!(
+                "| {sr} | {:.2} dB | {:+.2} dB | {:.2} dB | {:+.2} dB | {:+.2} dB |",
+                s.reserve_db_at(0, sr),
+                r.max_reponse_db_at(0, sr),
+                r.reserve_db_at(0, sr),
+                s.gain_moyen_db_at(2, sr),
+                r.gain_moyen_db_at(2, sr),
+            );
+        }
+        let sr = 44_100_u32;
+        let n = 10 * sr as usize;
+        let balayage: Vec<f32> = {
+            let (f0, f1, duree) = (20.0_f64, 20_000.0_f64, n as f64 / f64::from(sr));
+            let k = (f1 / f0).ln();
+            (0..n)
+                .flat_map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let phase = 2.0 * PI * f0 * duree / k * ((t / duree * k).exp() - 1.0);
+                    let x = phase.sin() as f32;
+                    [x, x]
+                })
+                .collect()
+        };
+        let carre = |periode: usize| -> Vec<f32> {
+            (0..n)
+                .flat_map(|i| {
+                    let x = if (i / periode).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    [x, x]
+                })
+                .collect()
+        };
+        let signaux: Vec<(&str, Vec<f32>)> = vec![
+            ("bruit rose, crête 0 dBFS", bruit_rose(n, 1.0)),
+            ("bruit rose, crête −3 dBFS", bruit_rose(n, 0.708)),
+            ("sinus balayé 20 Hz–20 kHz, 0 dBFS", balayage),
+            ("carré 20 Hz pleine échelle", carre(1102)),
+            ("carré 50 Hz pleine échelle", carre(441)),
+            (
+                "grosse caisse 45 Hz pleine échelle, 2 coups/s",
+                (0..n)
+                    .flat_map(|i| {
+                        let t = (i % (sr as usize / 2)) as f64 / f64::from(sr);
+                        let x = ((2.0 * PI * 45.0 * t).sin() * (-t / 0.08).exp()) as f32;
+                        [x, x]
+                    })
+                    .collect(),
+            ),
+            (
+                "master « guerre du volume » (rose ×4 écrêté à 0 dBFS)",
+                bruit_rose(n, 4.0)
+                    .iter()
+                    .map(|x| x.clamp(-1.0, 1.0))
+                    .collect(),
+            ),
+            ("carré 1 kHz pleine échelle", carre(22)),
+            (
+                "signal adverse signe(h[−n]), pleine échelle",
+                signal_adverse(&thierry_5171(HeadroomMode::Realistic), f64::from(sr), n),
+            ),
+            (
+                "sinus 0 dBFS au maximum de la courbe",
+                sinus_au_maximum(
+                    &thierry_5171(HeadroomMode::Realistic),
+                    f64::from(sr),
+                    1.0,
+                    n,
+                ),
+            ),
+        ];
+        println!(
+            "\n| signal (10 s, 44,1 kHz) | sûre : crête / overs | réaliste sans limiteur : crête / overs | réaliste : trames limitées | réduction max | crête de sortie | overs |"
+        );
+        for (nom, entree) in signaux {
+            let crete =
+                |v: &[f32]| 20.0 * f64::from(v.iter().fold(0.0_f32, |m, x| m.max(x.abs()))).log10();
+            let mut a = entree.clone();
+            let mut ps = EqProcessor::new(&thierry_5171(HeadroomMode::Safe), sr, 2);
+            for b in a.chunks_mut(4096) {
+                ps.process_interleaved(b);
+            }
+            let mut b2 = entree.clone();
+            let mut pn = sans_limiteur(&thierry_5171(HeadroomMode::Realistic), sr);
+            for b in b2.chunks_mut(4096) {
+                pn.process_interleaved(b);
+            }
+            let mut c = entree.clone();
+            let mut pr = EqProcessor::new(&thierry_5171(HeadroomMode::Realistic), sr, 2);
+            for b in c.chunks_mut(4096) {
+                pr.process_interleaved(b);
+            }
+            let l = pr.limiteur().unwrap();
+            println!(
+                "| {nom} | {:+.2} dBFS / {} | {:+.2} dBFS / {} | {} ({:.3} %) | {:.2} dB | {:+.2} dBFS | {} |",
+                crete(&a),
+                ps.process_stats().overs,
+                crete(&b2),
+                pn.process_stats().overs,
+                l.trames_limitees,
+                l.pourcentage(),
+                l.reduction_max_db,
+                crete(&c),
+                pr.process_stats().overs,
             );
         }
     }

@@ -147,12 +147,15 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
     } else {
         "?"
     };
+    // `ar.image_path` : l'image de l'artiste de BIBLIOTHÈQUE, quand la fiche
+    // en a une. Elle dépend de `ar.id` seul, le regroupement ne change donc
+    // pas (#5165).
     let sql = format!(
-        "SELECT lh.artist_name, COUNT(*) as plays, ar.id as artist_id \
+        "SELECT lh.artist_name, COUNT(*) as plays, ar.id as artist_id, ar.image_path \
          FROM listen_history lh \
          LEFT JOIN artists ar ON LOWER(lh.artist_name) = LOWER(ar.name) \
          WHERE lh.artist_name IS NOT NULL \
-         GROUP BY lh.artist_name, ar.id \
+         GROUP BY lh.artist_name, ar.id, ar.image_path \
          ORDER BY plays DESC \
          LIMIT {p1}"
     );
@@ -161,19 +164,228 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
         .backend
         .query_many(&sql, &[&limit as &dyn ToSqlValue])
         .ou_defaut_journalise();
+
+    // 🔴 #5165 — un artiste écouté SEULEMENT sur un service (Qobuz…) n'a pas
+    // de fiche dans `artists` : `artist_id` nul, et aucune image. Son image se
+    // demande au service, par une écoute de lui qu'on a déjà.
+    let sans_image: Vec<String> = rows
+        .iter()
+        .filter(|cols| {
+            cols.get(3)
+                .and_then(|v| v.as_string())
+                .is_none_or(|i| i.trim().is_empty())
+        })
+        .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+        .collect();
+    let images_service = images_d_artistes_de_service::resoudre(&state, &sans_image).await;
+
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {
+            let nom = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+            let image_path = cols
+                .get(3)
+                .and_then(|v| v.as_string())
+                .filter(|i| !i.trim().is_empty())
+                .or_else(|| images_service.get(&nom.to_lowercase()).cloned());
             json!({
-                "name": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
-                "artist_name": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "name": nom,
+                "artist_name": nom,
                 "plays": cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 "artist_id": cols.get(2).and_then(|v| v.as_i64()),
                 "id": cols.get(2).and_then(|v| v.as_i64()),
+                "image_path": image_path,
             })
         })
         .collect();
     Json(json!(items))
+}
+
+/// L'image d'un artiste chez le service qui l'a fait écouter (#5165).
+///
+/// Alex Campbell, 26/09/2026 : sur l'accueil de l'app iPad, AUCUN des huit
+/// « Top Artistes » n'avait de photo, dont plusieurs écoutés sur Qobuz
+/// seulement. `top_artists` ne rendait pas d'`image_path`, et un artiste
+/// absent de la table `artists` n'y a ni fiche ni image.
+///
+/// L'historique garde, pour chaque écoute de service, `source` et
+/// `source_id` (l'identifiant de la PISTE). La piste donne l'identifiant de
+/// l'artiste chez ce service (`StreamTrack::artist_id`), l'artiste donne son
+/// image (`StreamArtist::image_path`, la forme que rendent déjà la recherche
+/// et les fiches artiste de service). Rien n'est deviné par le nom : une
+/// piste dont l'artiste ne porte pas le nom affiché ne donne aucune image.
+///
+/// Deux appels réseau par artiste : le résultat est mémorisé (un jour s'il
+/// a été trouvé, une heure sinon), et la route n'attend pas plus de
+/// [`BUDGET`] — ce qui n'est pas prêt arrive à l'appel suivant.
+mod images_d_artistes_de_service {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use futures_util::StreamExt;
+    use tune_core::db::backend::{DbBackend, ToSqlValue};
+    use tune_core::streaming::ServiceRegistry;
+
+    use crate::state::AppState;
+
+    /// Ce que la route accepte d'attendre du réseau.
+    pub(super) const BUDGET: Duration = Duration::from_secs(3);
+    const DUREE_TROUVEE: Duration = Duration::from_secs(24 * 3600);
+    const DUREE_ABSENTE: Duration = Duration::from_secs(3600);
+    const EN_PARALLELE: usize = 6;
+
+    /// Le moment du constat, et l'image — ou son absence constatée.
+    type Constat = (Instant, Option<String>);
+
+    /// Nom d'artiste en minuscules → constat.
+    static MEMOIRE: LazyLock<Mutex<HashMap<String, Constat>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn memorisee(cle: &str) -> Option<Option<String>> {
+        let memoire = MEMOIRE.lock().ok()?;
+        let (quand, image) = memoire.get(cle)?;
+        let duree = if image.is_some() {
+            DUREE_TROUVEE
+        } else {
+            DUREE_ABSENTE
+        };
+        (quand.elapsed() < duree).then(|| image.clone())
+    }
+
+    fn memoriser(cle: &str, image: Option<String>) {
+        if let Ok(mut memoire) = MEMOIRE.lock() {
+            memoire.insert(cle.to_string(), (Instant::now(), image));
+        }
+    }
+
+    /// Pour chaque nom (en minuscules), les écoutes de service qui peuvent
+    /// le rattacher à une fiche : `(service, identifiant de piste)`.
+    fn ancres(db: &Arc<dyn DbBackend>, cles: &[String]) -> HashMap<String, Vec<(String, String)>> {
+        let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        if cles.is_empty() {
+            return out;
+        }
+        let params: Vec<Box<dyn ToSqlValue>> = cles
+            .iter()
+            .map(|n| Box::new(n.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let dans = vec!["?"; cles.len()].join(", ");
+        let sql = format!(
+            "SELECT LOWER(artist_name), source, MAX(source_id) FROM listen_history \
+             WHERE source_id IS NOT NULL AND source NOT IN ('local', 'radio', 'upnp') \
+             AND LOWER(artist_name) IN ({dans}) \
+             GROUP BY LOWER(artist_name), source"
+        );
+        match db.query_many(&sql, &refs) {
+            Ok(rows) => {
+                for r in rows {
+                    if let (Some(n), Some(src), Some(id)) = (
+                        r.first().and_then(|v| v.as_string()),
+                        r.get(1).and_then(|v| v.as_string()),
+                        r.get(2).and_then(|v| v.as_string()),
+                    ) {
+                        out.entry(n).or_default().push((src, id));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "top_artistes_ancres_de_service_illisibles");
+            }
+        }
+        out
+    }
+
+    /// L'image de l'artiste `cle` chez `service`, par la piste `piste`.
+    async fn chez_le_service(
+        services: &tokio::sync::Mutex<ServiceRegistry>,
+        cle: &str,
+        service: &str,
+        piste: &str,
+    ) -> Option<String> {
+        let svc = services.lock().await.get(service)?;
+        let svc = svc.read().await;
+        if !svc.utilisable().await {
+            return None;
+        }
+        let t = match svc.get_track(piste).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(service, piste, error = %e, "top_artistes_piste_de_service_injoignable");
+                return None;
+            }
+        };
+        // L'identifiant ne vaut que pour l'artiste que la piste NOMME.
+        if t.artist.trim().to_lowercase() != cle.trim() {
+            return None;
+        }
+        let artiste = t.artist_id.filter(|a| !a.trim().is_empty())?;
+        match svc.get_artist(&artiste).await {
+            Ok(a) => a.image_path.filter(|i| !i.trim().is_empty()),
+            Err(e) => {
+                tracing::debug!(service, artiste, error = %e, "top_artistes_artiste_de_service_injoignable");
+                None
+            }
+        }
+    }
+
+    /// Les images trouvées pour `noms`, par nom en minuscules.
+    pub(super) async fn resoudre(state: &AppState, noms: &[String]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        let mut a_resoudre: Vec<String> = Vec::new();
+        for nom in noms {
+            let cle = nom.to_lowercase();
+            match memorisee(&cle) {
+                Some(Some(image)) => {
+                    out.insert(cle, image);
+                }
+                Some(None) => {}
+                None if !a_resoudre.contains(&cle) => a_resoudre.push(cle),
+                None => {}
+            }
+        }
+        if a_resoudre.is_empty() {
+            return out;
+        }
+        let ancres = ancres(&state.backend, &a_resoudre);
+        if ancres.is_empty() {
+            return out;
+        }
+
+        // Tâche détachée : ce qui dépasse le budget continue et remplit la
+        // mémoire pour l'appel suivant, au lieu d'être jeté.
+        let services = state.services.clone();
+        let tache = tokio::spawn(async move {
+            futures_util::stream::iter(ancres)
+                .for_each_concurrent(EN_PARALLELE, |(cle, ecoutes)| {
+                    let services = services.clone();
+                    async move {
+                        let mut image = None;
+                        for (service, piste) in &ecoutes {
+                            image = chez_le_service(&services, &cle, service, piste).await;
+                            if image.is_some() {
+                                break;
+                            }
+                        }
+                        memoriser(&cle, image);
+                    }
+                })
+                .await;
+        });
+        if tokio::time::timeout(BUDGET, tache).await.is_err() {
+            tracing::info!(
+                artistes = a_resoudre.len(),
+                "top_artistes_images_de_service_hors_budget — la suite servira l'appel suivant"
+            );
+        }
+        for cle in a_resoudre {
+            if let Some(Some(image)) = memorisee(&cle) {
+                out.insert(cle, image);
+            }
+        }
+        out
+    }
 }
 
 // View scope, NOT action identity: this handler reads the profile from the
@@ -242,6 +454,10 @@ async fn export_csv(
         csv,
     )
 }
+
+#[cfg(test)]
+#[path = "top_artistes_image_i5165_tests.rs"]
+mod top_artistes_image_i5165_tests;
 
 #[cfg(test)]
 mod historique_4041_tests {

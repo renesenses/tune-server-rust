@@ -74,7 +74,7 @@ const DR_SOURCE_ANALYSIS: &str = "analysis";
 /// Fonction à part, et non un `if` dans la boucle : une garde écrite contre la
 /// boucle devrait monter une base, des fichiers et un décodeur pour juger deux
 /// lignes de condition. Ici elle APPELLE la décision.
-fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
+pub(crate) fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
     !existant.is_some_and(|v| !v.trim().is_empty())
 }
 
@@ -437,6 +437,29 @@ impl EtatAnalyse {
             }
         }
     }
+
+    /// La phrase du registre quand la cascade n'a plus rien à faire (#5246).
+    ///
+    /// ReplayGain coupé, la cascade tourne quand même pour les empreintes et
+    /// la plage dynamique : son repos doit dire QUE ces deux-là sont finies,
+    /// et POURQUOI le ReplayGain, lui, n'a pas été tenté.
+    pub(crate) fn motif_de_repos(self) -> &'static str {
+        match self {
+            Self::Active => "aucune piste ni album sans ReplayGain, empreinte ni plage dynamique",
+            Self::CocheDecochee => {
+                "aucune piste sans empreinte ni plage dynamique ; ReplayGain non tente : \
+                 replaygain_analysis_enabled = false"
+            }
+            Self::ModeDesactive => {
+                "aucune piste sans empreinte ni plage dynamique ; ReplayGain non tente : \
+                 replaygain_mode = off"
+            }
+            Self::ModeAbsent => {
+                "aucune piste sans empreinte ni plage dynamique ; ReplayGain non tente : \
+                 replaygain_mode ABSENT (vaut off) — jamais regle"
+            }
+        }
+    }
 }
 
 pub(crate) fn etat_de_l_analyse(backend: &Arc<dyn DbBackend>) -> EtatAnalyse {
@@ -533,7 +556,10 @@ pub enum TourDeCascade {
 }
 
 /// Un tour de la cascade de fond : ReplayGain, puis les empreintes, puis la
-/// plage dynamique.
+/// plage dynamique — dans l'ordre par défaut. #5169 : l'utilisateur peut
+/// faire passer la plage dynamique avant les empreintes, ou avant tout
+/// (`taches_de_fond::ordre`) ; la règle de descente ci-dessous vaut pour
+/// chaque ordre.
 ///
 /// Une passe à la fois (#1576) : le verrou d'analyse est pris ici, pour tout le
 /// tour — si le sweep acoustique décode, on attend notre tour plutôt que
@@ -570,35 +596,66 @@ pub enum TourDeCascade {
 /// EXTERNE, et un test qui recopierait la cascade la répliquerait au lieu de la
 /// garder.
 pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
+    use crate::taches_de_fond::ordre::{Rang, noter_travail_dr, ordre_de_la_cascade, priorite_dr};
     use crate::taches_de_fond::{Tache, est_en_pause};
 
     let _slot = ANALYSIS_SLOT.lock().await;
 
-    // Rang 1 — ReplayGain, la passe nominale.
-    if est_en_pause(Tache::ReplayGain) {
-        return TourDeCascade::Suspendue(Tache::ReplayGain);
+    // #5169 — l'ORDRE des rangs vient du réglage (défaut : ReplayGain, puis
+    // les empreintes, puis la plage dynamique — l'ordre d'avant). La règle de
+    // descente, elle, ne change pas pour le ReplayGain et les empreintes : on
+    // s'arrête au premier d'entre eux qui est SUSPENDU.
+    //
+    // La plage dynamique suspendue est SAUTÉE, pas bloquante. Dans l'ordre par
+    // défaut elle est dernière, et cela revient exactement à l'ancien
+    // comportement. Avancée par l'utilisateur, elle ne doit pas prendre les
+    // autres rangs en otage : « suspendre la seule plage dynamique laisse le
+    // ReplayGain travailler » vaut dans tous les ordres
+    // (`suspendre_la_plage_dynamique_laisse_le_replaygain_travailler`).
+    let mut dr_suspendue = false;
+    // #5246 — ReplayGain coupé (mode « Désactivé », absent, ou coche
+    // décochée), le rang ReplayGain est SAUTÉ, pas bloquant : les empreintes
+    // et la plage dynamique se calculent quand même (décision de Bertrand,
+    // 27/09/2026). Sauté AVANT sa pause : une pause posée sur une passe
+    // coupée ne doit pas non plus prendre les autres rangs en otage.
+    let rg_armee = analysis_enabled(backend);
+    for rang in ordre_de_la_cascade(priorite_dr()) {
+        if rang == Rang::ReplayGain && !rg_armee {
+            continue;
+        }
+        let tache = match rang {
+            Rang::ReplayGain => Tache::ReplayGain,
+            Rang::Empreintes => Tache::Empreintes,
+            Rang::PlageDynamique => Tache::PlageDynamique,
+        };
+        if est_en_pause(tache) {
+            if rang == Rang::PlageDynamique {
+                noter_travail_dr(false);
+                dr_suspendue = true;
+                continue;
+            }
+            return TourDeCascade::Suspendue(tache);
+        }
+        let n = match rang {
+            Rang::ReplayGain => analyze_track_batch(backend).await,
+            Rang::Empreintes => empreinter_un_lot(backend).await,
+            Rang::PlageDynamique => {
+                let n = rattraper_un_lot_de_dr(backend).await;
+                // Le signal que lit le CLAP pour céder son tour (#5169).
+                noter_travail_dr(n > 0);
+                n
+            }
+        };
+        if n > 0 {
+            return TourDeCascade::Travail(n);
+        }
     }
-    let n = analyze_track_batch(backend).await;
-    if n > 0 {
-        return TourDeCascade::Travail(n);
-    }
-
-    // Rang 2 — les empreintes (BIB-B2).
-    if est_en_pause(Tache::Empreintes) {
-        return TourDeCascade::Suspendue(Tache::Empreintes);
-    }
-    let n = empreinter_un_lot(backend).await;
-    if n > 0 {
-        return TourDeCascade::Travail(n);
-    }
-
-    // Rang 3 — la plage dynamique.
-    if est_en_pause(Tache::PlageDynamique) {
-        return TourDeCascade::Suspendue(Tache::PlageDynamique);
-    }
-    match rattraper_un_lot_de_dr(backend).await {
-        0 => TourDeCascade::Repos,
-        n => TourDeCascade::Travail(n),
+    // Une plage dynamique suspendue n'est pas au repos : le travail est
+    // toujours devant elle, la campagne ne doit pas se clore.
+    if dr_suspendue {
+        TourDeCascade::Suspendue(Tache::PlageDynamique)
+    } else {
+        TourDeCascade::Repos
     }
 }
 
@@ -642,97 +699,93 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
 
         loop {
             let etat = etat_de_l_analyse(&backend);
-            if etat == EtatAnalyse::Active {
-                if thermal.should_hold("replaygain") {
-                    tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
-                    continue;
-                }
-                // Yield the decode-heavy track pass to playback (#1310). The
-                // album pass yields too since #4681 — see `passe_d_album`.
-                let playing = any_zone_playing(&backend);
-                let mut suspendue: Option<crate::taches_de_fond::Tache> = None;
-                let did = if playing {
-                    0
-                } else {
-                    match un_tour_de_cascade(&backend).await {
-                        TourDeCascade::Travail(n) => n,
-                        TourDeCascade::Suspendue(tache) => {
-                            suspendue = Some(tache);
-                            0
-                        }
-                        TourDeCascade::Repos => 0,
-                    }
-                };
-                // La lecture peut avoir démarré PENDANT le lot, qui a alors
-                // cédé et rendu 0 sans avoir fini son travail (#2495). Relire
-                // l'état ici : sinon ce 0 se lirait « plus rien à analyser »,
-                // la boucle inscrirait au registre un « rien à faire » faux et
-                // dormirait 15 minutes au lieu des 30 s de report lecture.
-                let playing = playing || any_zone_playing(&backend);
-                let albums = passe_d_album(&backend, playing).await;
-
-                if did > 0 || albums > 0 {
-                    // Du travail : ouvrir la campagne si elle ne l'est pas déjà.
-                    if campagne.is_none() {
-                        campagne =
-                            Some(registre.ouvrir(crate::db::task_run_repo::TACHE_REPLAYGAIN));
-                        analysees = 0;
-                    }
-                    analysees += did as i64 + albums as i64;
-                    dernier_repos = None;
-                }
-
-                if playing {
-                    // #4681 — céder, oui, mais le dire : le relevé de
-                    // `/system/background-tasks` doit pouvoir nommer la passe
-                    // qui s'est effacée devant la lecture.
-                    crate::taches_de_fond::priorite::noter_cedee(
-                        crate::taches_de_fond::Tache::ReplayGain.id(),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(PLAYBACK_BACKOFF_SECS)).await;
-                } else if let Some(tache) = suspendue {
-                    // ⚠️ NE PAS clore la campagne, et NE PAS inscrire « rien à
-                    // faire ». Une passe suspendue n'est pas une passe finie :
-                    // le travail est toujours devant elle, la jauge doit rester
-                    // là où la pause l'a laissée, et la reprise doit repartir du
-                    // même point. Inscrire un repos ici mentirait au registre et
-                    // remettrait la carte à zéro sous les yeux de l'utilisateur.
-                    debug!(tache = tache.id(), "cascade_suspendue");
-                    tokio::time::sleep(std::time::Duration::from_secs(SIESTE_EN_PAUSE_SECS)).await;
-                } else if did == 0 && albums == 0 {
-                    clore_campagne(
-                        &registre,
-                        &mut campagne,
-                        &mut analysees,
-                        &mut dernier_repos,
-                        "aucune piste ni album sans ReplayGain, empreinte ni plage dynamique",
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
-                } else {
-                    // More to do — loop again promptly (the per-file pauses
-                    // already throttle the actual work).
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            } else {
-                // Passe désactivée en cours de route : la campagne ouverte est
-                // terminée, pas suspendue. La laisser ouverte la ferait
-                // apparaître « en cours » jusqu'au prochain redémarrage.
-                //
-                // #4144 — même raisonnement pour l'écran : `analyze_track_batch`
-                // n'est plus appelé du tout dans cette branche, personne ne
-                // viendrait donc fermer l'avancement, et la carte afficherait
-                // « en cours » sur une passe qu'on vient d'éteindre.
+            // #5246 — le réglage ReplayGain ne commande PLUS la boucle entière,
+            // seulement le rang ReplayGain et la passe d'albums. Avant, la
+            // boucle ne lançait la cascade que ReplayGain armé : sur « Off »,
+            // ni les empreintes ni la plage dynamique ne tournaient jamais,
+            // alors que la carte promettait la plage dynamique « quand le
+            // ReplayGain n'a plus rien à faire » (Levente Toth, 0.9.166).
+            // Décision de Bertrand du 27/09/2026 : découpler.
+            let rg_armee = etat == EtatAnalyse::Active;
+            if !rg_armee {
+                // #4144 — `analyze_track_batch` n'est plus appelé : personne
+                // ne viendrait fermer l'avancement du ReplayGain, et la carte
+                // afficherait « en cours » sur une passe éteinte.
                 progression::au_repos();
+            }
+            if thermal.should_hold("replaygain") {
+                tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
+                continue;
+            }
+            // Yield the decode-heavy track pass to playback (#1310). The
+            // album pass yields too since #4681 — see `passe_d_album`.
+            let playing = any_zone_playing(&backend);
+            let mut suspendue: Option<crate::taches_de_fond::Tache> = None;
+            let did = if playing {
+                0
+            } else {
+                match un_tour_de_cascade(&backend).await {
+                    TourDeCascade::Travail(n) => n,
+                    TourDeCascade::Suspendue(tache) => {
+                        suspendue = Some(tache);
+                        0
+                    }
+                    TourDeCascade::Repos => 0,
+                }
+            };
+            // La lecture peut avoir démarré PENDANT le lot, qui a alors
+            // cédé et rendu 0 sans avoir fini son travail (#2495). Relire
+            // l'état ici : sinon ce 0 se lirait « plus rien à analyser »,
+            // la boucle inscrirait au registre un « rien à faire » faux et
+            // dormirait 15 minutes au lieu des 30 s de report lecture.
+            let playing = playing || any_zone_playing(&backend);
+            // Le gain d'album EST du ReplayGain : il reste coupé avec lui.
+            let albums = if rg_armee {
+                passe_d_album(&backend, playing).await
+            } else {
+                0
+            };
+
+            if did > 0 || albums > 0 {
+                // Du travail : ouvrir la campagne si elle ne l'est pas déjà.
+                if campagne.is_none() {
+                    campagne = Some(registre.ouvrir(crate::db::task_run_repo::TACHE_REPLAYGAIN));
+                    analysees = 0;
+                }
+                analysees += did as i64 + albums as i64;
+                dernier_repos = None;
+            }
+
+            if playing {
+                // #4681 — céder, oui, mais le dire : le relevé de
+                // `/system/background-tasks` doit pouvoir nommer la passe
+                // qui s'est effacée devant la lecture.
+                crate::taches_de_fond::priorite::noter_cedee(
+                    crate::taches_de_fond::Tache::ReplayGain.id(),
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(PLAYBACK_BACKOFF_SECS)).await;
+            } else if let Some(tache) = suspendue {
+                // ⚠️ NE PAS clore la campagne, et NE PAS inscrire « rien à
+                // faire ». Une passe suspendue n'est pas une passe finie :
+                // le travail est toujours devant elle, la jauge doit rester
+                // là où la pause l'a laissée, et la reprise doit repartir du
+                // même point. Inscrire un repos ici mentirait au registre et
+                // remettrait la carte à zéro sous les yeux de l'utilisateur.
+                debug!(tache = tache.id(), "cascade_suspendue");
+                tokio::time::sleep(std::time::Duration::from_secs(SIESTE_EN_PAUSE_SECS)).await;
+            } else if did == 0 && albums == 0 {
                 clore_campagne(
                     &registre,
                     &mut campagne,
                     &mut analysees,
                     &mut dernier_repos,
-                    // `motif()` ne rend `None` que sur `Active`, cas exclu par
-                    // la branche ; le repli n'est là que pour ne pas paniquer.
-                    etat.motif().unwrap_or("analyse desactivee"),
+                    etat.motif_de_repos(),
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+            } else {
+                // More to do — loop again promptly (the per-file pauses
+                // already throttle the actual work).
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     });
@@ -1246,23 +1299,47 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 /// justement sur l'empreinte : les quinze pistes seraient proposées à la
 /// suppression les unes contre les autres. Voir le commentaire de
 /// [`analyze_track_batch`].
+///
+/// #5246 — le témoin `rg_analyzed` n'est exigé que lorsque l'analyse
+/// ReplayGain est ARMÉE : c'est alors elle qui décode la piste et pose
+/// l'empreinte au passage, et le rattrapage ne doit pas décoder deux fois.
+/// ReplayGain coupé, personne ne poserait jamais ce témoin : exiger le témoin
+/// revenait à ne jamais empreinter. Voir [`candidats_empreinte_where`].
 const CANDIDATS_EMPREINTE_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
            AND (t.audio_fingerprint IS NULL OR t.audio_fingerprint NOT LIKE ?) \
-           AND EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?) \
            AND LOWER(COALESCE(t.format, '')) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff')";
+
+/// Le témoin de la passe ReplayGain, exigé par le rattrapage des empreintes
+/// quand cette passe est armée (#5246). Sans paramètre : l'ajouter ou non ne
+/// décale pas les `?` de [`CANDIDATS_EMPREINTE_WHERE`].
+const TEMOIN_RG_EMPREINTE: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed')";
+
+/// Le prédicat du rattrapage des empreintes, selon l'état du ReplayGain
+/// (#5246). Décision de Bertrand du 27/09/2026 : les empreintes et la plage
+/// dynamique se calculent MÊME ReplayGain coupé ; seuls le calcul et
+/// l'application du gain restent désactivés.
+fn candidats_empreinte_where(backend: &Arc<dyn DbBackend>) -> String {
+    let temoin = if analysis_enabled(backend) {
+        TEMOIN_RG_EMPREINTE
+    } else {
+        ""
+    };
+    format!("{CANDIDATS_EMPREINTE_WHERE}{temoin}")
+}
 
 /// Combien de pistes le rattrapage traiterait encore. `None` : base
 /// antérieure à la colonne `audio_fingerprint` (rien à compter).
 pub fn compter_les_candidats_a_empreinter(backend: &Arc<dyn DbBackend>) -> Option<i64> {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    let predicat = candidats_empreinte_where(backend);
     backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE}"),
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {predicat}"),
             &[&motif as &dyn ToSqlValue, &seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -1273,10 +1350,9 @@ pub fn compter_les_candidats_a_empreinter(backend: &Arc<dyn DbBackend>) -> Optio
 pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let motif = format!("{}:%", crate::audio::empreinte::VERSION);
+    let predicat = candidats_empreinte_where(backend);
     let rows = match backend.query_many(
-        &format!(
-            "SELECT t.id, t.file_path FROM tracks t WHERE {CANDIDATS_EMPREINTE_WHERE} LIMIT ?"
-        ),
+        &format!("SELECT t.id, t.file_path FROM tracks t WHERE {predicat} LIMIT ?"),
         &[
             &motif as &dyn ToSqlValue,
             &seuil_report as &dyn ToSqlValue,
@@ -1298,7 +1374,10 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     for r in &rows {
-        if !analysis_enabled(backend) || any_zone_playing(backend) {
+        // #5246 : plus de garde sur le réglage ReplayGain ici. Les empreintes
+        // se calculent même ReplayGain coupé ; leur propre pause (ci-dessous)
+        // est le geste qui les arrête.
+        if any_zone_playing(backend) {
             break;
         }
         // Même frontière que la passe nominale : entre deux pistes.
@@ -1378,9 +1457,13 @@ const DR_INDISPONIBLE_KEY: &str = "dr_indisponible";
 /// 🔴 Les pistes CUE sont hors de ce prédicat, à dessein : il exige
 /// `rg_analyzed` ou `rg_track_gain`, et la plage dynamique se mesure sur le
 /// MÊME décodage non borné que le ReplayGain. Voir [`analyze_track_batch`].
+///
+/// #5246 — le témoin (`rg_analyzed` ou `rg_track_gain`) n'est exigé que
+/// ReplayGain ARMÉ, pour la même raison que [`TEMOIN_RG_EMPREINTE`] : armée,
+/// la passe nominale mesure elle-même la plage dynamique des pistes qu'elle
+/// n'a pas encore vues ; coupée, elle ne les verra jamais. Voir
+/// [`candidats_dr_where`].
 const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
-           AND EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
@@ -1391,6 +1474,22 @@ const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
 
+/// Le témoin de la passe nominale exigé par le rattrapage de la plage
+/// dynamique quand le ReplayGain est armé (#5246). Sans paramètre.
+const TEMOIN_RG_DR: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain'))";
+
+/// Le prédicat du rattrapage de la plage dynamique, selon l'état du
+/// ReplayGain (#5246) — même règle que [`candidats_empreinte_where`].
+fn candidats_dr_where(backend: &Arc<dyn DbBackend>) -> String {
+    let temoin = if analysis_enabled(backend) {
+        TEMOIN_RG_DR
+    } else {
+        ""
+    };
+    format!("{CANDIDATS_DR_WHERE}{temoin}")
+}
+
 /// Combien de pistes le rattrapage de la plage dynamique prendrait MAINTENANT.
 ///
 /// Même texte que la sélection de [`rattraper_un_lot_de_dr`] — c'est le
@@ -1400,8 +1499,9 @@ const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
 /// rend 0, journalisée : la route ne doit pas tomber pour une jauge.
 pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let predicat = candidats_dr_where(backend);
     match backend.query_one(
-        &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_DR_WHERE}"),
+        &format!("SELECT COUNT(*) FROM tracks t WHERE {predicat}"),
         &[&seuil_report as &dyn ToSqlValue],
     ) {
         Ok(row) => row
@@ -1426,10 +1526,11 @@ pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
 /// 171 ×RT sur 24 pistes réelles, dont ~4,6 % imputables au DR lui-même.
 pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let predicat = candidats_dr_where(backend);
     let rows = match backend.query_many(
         &format!(
             "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels \
-             FROM tracks t WHERE {CANDIDATS_DR_WHERE} LIMIT ?"
+             FROM tracks t WHERE {predicat} LIMIT ?"
         ),
         &[
             &seuil_report as &dyn ToSqlValue,
@@ -1451,14 +1552,13 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
     let mut done = 0usize;
     let mut deferred = 0usize;
     for r in &rows {
-        // Mêmes deux gardes que la passe nominale, relues AVANT CHAQUE fichier
-        // et pas seulement entre deux lots : 25 fichiers à 180 s, c'est plus
-        // d'une heure de décodage après un « Désactivé » ou un appui sur
-        // « Lecture » (#2496, #1310).
-        if !analysis_enabled(backend) {
-            info!("dr_rattrapage_desactive_mid_lot — reglage coupe, arret");
-            break;
-        }
+        // Gardes relues AVANT CHAQUE fichier et pas seulement entre deux lots :
+        // 25 fichiers à 180 s, c'est plus d'une heure de décodage après un
+        // appui sur « Pause » ou sur « Lecture » (#1310).
+        //
+        // #5246 : le réglage ReplayGain ne coupe PLUS ce rattrapage. La plage
+        // dynamique se mesure même ReplayGain coupé (décision de Bertrand,
+        // 27/09/2026) ; la pause de la plage dynamique est le geste qui l'arrête.
         // Même frontière que les deux rangs précédents : entre deux pistes.
         if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique) {
             info!("dr_rattrapage_pause_utilisateur_mid_lot — arret a la frontiere de piste");
