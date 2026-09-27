@@ -714,17 +714,14 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// received the NFC fix.
 pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
     let path_str: String = path.to_string_lossy().nfc().collect();
+    // #5299 — même mesure que le parcours (`ScannedFile`), chemins virtuels
+    // `image.iso!/…` compris : sans elle, chaque piste d'une image serait
+    // relue à chaque scan.
     if let Some(info) = existing_tracks.get(path_str.as_str())
-        && let Ok(file_meta) = path.metadata()
+        && let Some((taille, mtime)) = tune_core::audio::iso9660::taille_et_mtime(path)
     {
-        let mtime = file_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
         let unchanged =
-            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == file_meta.len() as i64);
+            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == taille as i64);
         return !unchanged;
     }
     true
