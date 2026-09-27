@@ -410,6 +410,7 @@ mod tests {
                 open_failure: &erreur,
                 debut_du_flux: std::time::Instant::now(),
                 duree_de_la_piste_ms: &crate::outputs::local::DUREE_DE_PISTE_INCONNUE,
+                cretes_de_sortie: None,
             };
             let dsp = DspAuRepos::neuf();
             let mut conversion = etage(&dsp, Vec::new(), 44100, 2, 16, 44100, 2);

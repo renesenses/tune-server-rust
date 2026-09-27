@@ -732,6 +732,11 @@ pub struct LocalOutput {
     /// replis (rate de repli, cascade entière) parce qu'il appartient à la
     /// sortie, pas au flux.
     starvation: Arc<RingStarvation>,
+    /// #4384 — les crêtes des échantillons APRÈS `apply_local_dsp`, relevées
+    /// par la boucle producteur et lues par le forwarder de niveaux. Comme
+    /// `starvation`, il appartient à la sortie et survit aux flux. Voir
+    /// [`crate::audio::crete_de_sortie`].
+    cretes_de_sortie: Arc<crate::audio::crete_de_sortie::CretesDeSortie>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -938,6 +943,13 @@ impl LocalOutput {
         (self.position_ms.clone(), self.starvation.clone())
     }
 
+    /// #4384 — le registre des crêtes APRÈS le DSP de cette sortie, partagé
+    /// (pas copié) avec le forwarder de niveaux. Voir
+    /// `PlaybackManager::brancher_les_cretes_de_sortie`.
+    pub fn cretes_de_sortie(&self) -> Arc<crate::audio::crete_de_sortie::CretesDeSortie> {
+        self.cretes_de_sortie.clone()
+    }
+
     fn recompute_effective_volume(&self) {
         let user = self.user_volume.load(Ordering::SeqCst);
         let rg = self.rg_factor.load(Ordering::SeqCst);
@@ -1080,6 +1092,7 @@ impl LocalOutput {
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
             starvation: Arc::new(RingStarvation::new()),
+            cretes_de_sortie: Arc::new(crate::audio::crete_de_sortie::CretesDeSortie::new()),
         }
     }
 
@@ -3814,6 +3827,13 @@ impl Etage for EtageDeConversion<'_> {
 pub(super) trait BlocDecode {
     fn nb_echantillons(&self) -> usize;
     fn contient_un_echantillon_non_nul(&self) -> bool;
+    /// #4384 — les échantillons entrelacés APRÈS le DSP de la sortie, et le
+    /// nombre de trames SOURCE qu'ils couvrent : ce que le crête-mètre doit
+    /// mesurer. `None` quand le bloc ne les porte pas sous cette forme (mots
+    /// natifs, DoP) — le crête-mètre garde alors son estimation.
+    fn apres_dsp(&self) -> Option<(&[f32], u64)> {
+        None
+    }
 }
 
 impl BlocDecode for ProcessedLocalPcm {
@@ -3823,6 +3843,14 @@ impl BlocDecode for ProcessedLocalPcm {
 
     fn contient_un_echantillon_non_nul(&self) -> bool {
         self.samples.iter().any(|&s| s != 0.0)
+    }
+
+    /// Sortis de `process_pcm_chunk`, donc d'`apply_local_dsp` : égaliseur,
+    /// convolveur, crossfeed et repli mono compris. Ne reste en aval que
+    /// l'adaptation de canaux, le rééchantillonnage et le gain de rendu. Un
+    /// porteur DoP n'est pas un signal : pas de crête.
+    fn apres_dsp(&self) -> Option<(&[f32], u64)> {
+        (!self.dop).then_some((self.samples.as_slice(), self.source_frames))
     }
 }
 
@@ -3984,6 +4012,10 @@ struct BoucleProducteur<'a> {
     /// Sert à distinguer une erreur de fin de corps (#1254 : la piste est au
     /// bout, c'est une fin) d'une coupure du flux en cours de piste.
     duree_de_la_piste_ms: &'a AtomicU64,
+    /// #4384 — où relever la crête de chaque bloc APRÈS le DSP, datée dans la
+    /// piste. `None` pour les bras exclusifs ASIO et CoreAudio et les bancs :
+    /// le crête-mètre y garde son estimation d'avant.
+    cretes_de_sortie: Option<&'a crate::audio::crete_de_sortie::CretesDeSortie>,
 }
 
 /// Durée inconnue pour [`BoucleProducteur::duree_de_la_piste_ms`] : une erreur
@@ -4197,7 +4229,25 @@ impl BoucleProducteur<'_> {
 
             let premiere_donnee = compteurs.premiere_donnee_journalisee;
             let trames_deja_servies = compteurs.total_frames_fed;
+            // #4384 — début du bloc dans la piste, au même référentiel que la
+            // position publiée (`CompteursDePiste::position_ms`) et que les
+            // fenêtres du forwarder de niveaux.
+            let cadence = etage.cadence_source();
+            let debut_du_bloc_ms = if cadence == 0 {
+                f64::NAN
+            } else {
+                trames_deja_servies as f64 * 1000.0 / f64::from(cadence)
+                    + compteurs.seek_offset as f64
+            };
             let pousse = etage.pousser(puits, refuser_le_porteur_dop, &mut |bloc| {
+                // #4384 — la crête de ce qui part vers le DAC, relevée ICI,
+                // après le DSP : le forwarder de niveaux la lira quand la
+                // fenêtre correspondante sortira.
+                if let Some(cretes) = self.cretes_de_sortie
+                    && let Some((echantillons, trames)) = bloc.apres_dsp()
+                {
+                    cretes.relever(echantillons, trames, cadence, debut_du_bloc_ms);
+                }
                 // Silence total au démarrage : le signe d'un décodage qui a
                 // échoué. Diagnostic de la piste initiale seule, comme avant.
                 if initiale && (!premiere_donnee || trames_deja_servies == 0) {
@@ -4541,6 +4591,10 @@ impl OutputTarget for LocalOutput {
         // #3205 : le compteur de famine suit le flux dans le fil de lecture et
         // sera confié à l'anneau de la branche effectivement retenue.
         let starvation = self.starvation.clone();
+        // #4384 — un flux neuf : les crêtes de la lecture précédente ne
+        // décrivent plus rien.
+        self.cretes_de_sortie.oublier();
+        let cretes_de_sortie = self.cretes_de_sortie.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -5717,6 +5771,7 @@ impl OutputTarget for LocalOutput {
                 // Relue au moment de l'erreur : `play_media` ne la pose
                 // qu'APRÈS le retour de `play_url`, fil déjà lancé.
                 duree_de_la_piste_ms: duration_ms_arc.as_ref(),
+                cretes_de_sortie: Some(cretes_de_sortie.as_ref()),
             };
             let mut compteurs = CompteursDePiste {
                 total_bytes_read,
@@ -6074,6 +6129,7 @@ impl OutputTarget for LocalOutput {
                     // La durée de CETTE piste, pas celle de la précédente que
                     // `duration_ms_arc` garde quand la suivante n'en a pas.
                     duree_de_la_piste_ms: &duree_enchainee_ms,
+                    cretes_de_sortie: Some(cretes_de_sortie.as_ref()),
                 };
                 let mut gapless_read_buf = vec![0u8; 65536];
                 let mut compteurs_enchaines = CompteursDePiste {
@@ -7073,6 +7129,10 @@ mod empreinte_du_puits_r1;
 /// Fil 1915 — une erreur de lecture loin de la fin n'est pas une fin de piste.
 #[cfg(test)]
 mod piste_tronquee_1915;
+
+/// #4384 — la crête d'une sortie locale est relevée APRÈS le DSP.
+#[cfg(test)]
+mod crete_apres_dsp_4384;
 
 /// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
 /// étage → boucle commune → puits, relevée sur la route directe d'avant.
