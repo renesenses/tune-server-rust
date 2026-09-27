@@ -1613,6 +1613,29 @@ pub(crate) fn grouper_les_albums_eclates(
     groupes
 }
 
+/// La sélection de la phase 0, sortie de la fonction pour être
+/// **exécutable** par un témoin : c'est une requête, pas un texte, et une
+/// garde qui n'en comparerait que la chaîne serait satisfaite par sa propre
+/// cible.
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, sur la SOURCE de la piste ET de
+/// l'album. Le chemin de fichier ne répondait pas à cette question : une
+/// source distante peut en porter un — et ce que cet écran propose,
+/// l'utilisateur le déclenche, comme le dit [`albums_eclates`].
+fn sql_albums_eclates() -> String {
+    format!(
+        "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
+                COALESCE(al.cover_path, '') \
+         FROM tracks t \
+         JOIN albums al ON al.id = t.album_id \
+         LEFT JOIN artists ar ON ar.id = al.artist_id \
+         WHERE {piste_locale} AND {album_local} \
+           AND t.file_path IS NOT NULL AND t.file_path <> ''",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+        album_local = tune_core::db::track_repo::sql::est_local("al"),
+    )
+}
+
 /// `GET /library/albums/eclates` — les albums éclatés présumés (BIB-A2, phase 0).
 /// Lecture seule ; la bibliothèque entière est lue une fois (une requête).
 ///
@@ -1635,15 +1658,9 @@ pub(crate) fn grouper_les_albums_eclates(
 /// l'IMAGE (`cue_media_path`) pour les pistes qui en ont une. C'est un
 /// chantier de la phase 0, pas un `COALESCE`.
 pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
-                      COALESCE(al.cover_path, '') \
-               FROM tracks t \
-               JOIN albums al ON al.id = t.album_id \
-               LEFT JOIN artists ar ON ar.id = al.artist_id \
-               WHERE t.file_path IS NOT NULL AND t.file_path <> ''";
     let pistes: Vec<PisteVue> = state
         .backend
-        .query_many(sql, &[])
+        .query_many(&sql_albums_eclates(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
@@ -3417,20 +3434,34 @@ mod tests_tri_added_at {
 /// à plusieurs dossiers de disque » ferait relire une bibliothèque entière
 /// pour, dans l'immense majorité des cas, ne rien trouver : un coffret bien
 /// tagué a lui aussi des dossiers `CD1/`, `CD2/`, et n'a rien à réparer.
-const SQL_PISTES_ABIMEES: &str = "\
-    SELECT t.id, t.album_id, t.file_path, t.disc_number, t.track_number \
-    FROM tracks t \
-    WHERE t.album_id IN ( \
-        SELECT album_id FROM tracks \
-        WHERE album_id IS NOT NULL AND track_number IS NOT NULL \
-        GROUP BY album_id, COALESCE(disc_number, 1), track_number \
-        HAVING COUNT(*) > 1 \
-    ) AND t.file_path IS NOT NULL AND t.file_path <> ''";
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, dans la sous-requête comme au
+/// dehors. Le prédicat était `t.file_path IS NOT NULL AND t.file_path <> ''`
+/// seul, ce qui prenait le chemin pour un substitut de « local » ; la
+/// sous-requête, elle, ne filtrait rien du tout, si bien qu'un album distant
+/// aux numéros en collision faisait entrer l'album entier dans le lot examiné.
+/// Les deux endroits portent donc le prédicat, et pour deux raisons : la
+/// justesse dehors, le coût dedans.
+fn sql_pistes_abimees() -> String {
+    let piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE;
+    format!(
+        "SELECT t.id, t.album_id, t.file_path, t.disc_number, t.track_number \
+         FROM tracks t \
+         WHERE t.album_id IN ( \
+             SELECT t2.album_id FROM tracks t2 \
+             WHERE t2.album_id IS NOT NULL AND t2.track_number IS NOT NULL \
+               AND {piste_locale_2} \
+             GROUP BY t2.album_id, COALESCE(t2.disc_number, 1), t2.track_number \
+             HAVING COUNT(*) > 1 \
+         ) AND {piste_locale} AND t.file_path IS NOT NULL AND t.file_path <> ''",
+        piste_locale_2 = tune_core::db::track_repo::sql::est_local("t2"),
+    )
+}
 
 fn pistes_abimees(state: &AppState) -> Vec<PisteAExaminer> {
     state
         .backend
-        .query_many(SQL_PISTES_ABIMEES, &[])
+        .query_many(&sql_pistes_abimees(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
@@ -3831,5 +3862,142 @@ pub(super) async fn defaire_coffret(
         Err(coffrets_auto::RefusDefaire::Base(e)) => {
             AppError::internal(format!("défaire le coffret {id} : {e}")).into_response()
         }
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+///
+/// Les deux sélections de l'écran métadonnées qui vivent dans ce fichier
+/// (`/albums/eclates` et `/albums/disques-abimes`) filtraient sur le CHEMIN DE
+/// FICHIER, pris pour un substitut de « local ». Les témoins exécutent la
+/// requête : une garde qui n'en comparerait que la chaîne serait satisfaite par
+/// sa propre définition.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état")
+    }
+
+    /// Un album et deux pistes, avec de vrais chemins et une source choisie.
+    ///
+    /// 🔴 C'est le cas ABSENT de la base de Bertrand : sur le .18, aucune des
+    /// 49 440 pistes `source = 'upnp'` ne porte de chemin. Sans le fabriquer
+    /// ici, le filtre par chemin et le filtre par source rendraient le même
+    /// résultat et le témoin ne prouverait rien.
+    fn album_de_source(s: &AppState, id: i64, titre: &str, dossier: &str, source: &str) {
+        let b = &s.backend;
+        let src = source.to_string();
+        let t = titre.to_string();
+        b.execute(
+            "INSERT INTO albums (id, title, source, year) VALUES (?1, ?2, ?3, 1990)",
+            &[&id as &dyn ToSqlValue, &t, &src],
+        )
+        .expect("album");
+        for n in 1..=2i64 {
+            let chemin = format!("{dossier}/{n:02}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number, disc_number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                &[
+                    &format!("p{id}-{n}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &src,
+                    &n,
+                ],
+            )
+            .expect("piste");
+        }
+    }
+
+    fn albums_rendus(s: &AppState, sql: &str) -> Vec<i64> {
+        s.backend
+            .query_many(sql, &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect()
+    }
+
+    /// 🔴 `/albums/eclates` : une piste non locale QUI PORTE UN CHEMIN n'entre
+    /// pas dans la sélection.
+    #[test]
+    fn eclates_ecarte_le_non_local_qui_porte_un_chemin() {
+        let s = etat();
+        album_de_source(&s, 1, "Kind of Blue", "/m/kob", "local");
+        album_de_source(&s, 2, "Kind of Blue", "/u/kob", "upnp");
+        let vus = albums_rendus(&s, &sql_albums_eclates());
+        assert!(
+            !vus.contains(&2),
+            "l'album 2 est `source = upnp` avec des chemins : il ne doit PAS \
+             entrer dans la sélection des albums éclatés — vus {vus:?}"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn eclates_garde_le_local() {
+        let s = etat();
+        album_de_source(&s, 1, "Kind of Blue", "/m/kob", "local");
+        album_de_source(&s, 2, "Kind of Blue", "/u/kob", "upnp");
+        let vus = albums_rendus(&s, &sql_albums_eclates());
+        assert!(
+            vus.contains(&1),
+            "l'album LOCAL 1 doit entrer dans la sélection — vus {vus:?}"
+        );
+    }
+
+    /// Les mêmes deux sens pour `/albums/disques-abimes`, qui ÉCRIT
+    /// `tracks.disc_number` : deux pistes en collision de chaque côté.
+    fn banc_abime(s: &AppState) {
+        for (id, dossier, source) in [(1i64, "/m/box", "local"), (2, "/u/box", "upnp")] {
+            album_de_source(s, id, "Box", dossier, source);
+            // Collision : les deux pistes se déclarent piste 1, disque 1.
+            let src = source.to_string();
+            s.backend
+                .execute(
+                    "UPDATE tracks SET track_number = 1 WHERE album_id = ?1 AND source = ?2",
+                    &[&id as &dyn ToSqlValue, &src],
+                )
+                .expect("collision");
+        }
+    }
+
+    #[test]
+    fn disques_abimes_ecarte_le_non_local_qui_porte_un_chemin() {
+        let s = etat();
+        banc_abime(&s);
+        let vus: Vec<i64> = s
+            .backend
+            .query_many(&sql_pistes_abimees(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            !vus.contains(&2),
+            "l'album 2 est `source = upnp` : ses pistes ne doivent PAS entrer \
+             dans le lot que la réparation va RÉÉCRIRE — vus {vus:?}"
+        );
+    }
+
+    #[test]
+    fn disques_abimes_garde_le_local() {
+        let s = etat();
+        banc_abime(&s);
+        let vus: Vec<i64> = s
+            .backend
+            .query_many(&sql_pistes_abimees(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            vus.contains(&1),
+            "l'album LOCAL 1 doit rester examiné — vus {vus:?}"
+        );
     }
 }
