@@ -1144,7 +1144,7 @@ fn stager_pour_decodage(
         let ext = src_path
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("bin");
+            .unwrap_or("tmp");
         let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
         let growth = crate::audio::staged_growth::StageGrowth::new(m.len());
         crate::audio::staged_growth::register(&dst.to_string_lossy(), growth.clone());
@@ -1209,7 +1209,9 @@ fn stager_pour_decodage(
     let ext = src_path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("bin");
+        // `tmp`, pas `bin` : `.bin` désigne une image de CD brute (#5298), et
+        // un fichier sans extension mis en scène ne doit pas en devenir une.
+        .unwrap_or("tmp");
     let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
     let resultat = match std::fs::copy(src_path, &dst) {
         Ok(bytes) => {
@@ -1326,7 +1328,15 @@ pub fn decode_to_pcm(
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
     // whole decode; the temp is removed when it drops.
-    let _staged = stage_locally_for_decode(file_path, seek_s, max_duration_s);
+    //
+    // #5298 — jamais pour une image de CD brute : elle se lit par fenêtre,
+    // au décalage exact de la tranche, et la copier entière (700 Mo) pour
+    // quelques minutes d'analyse coûterait plus que la lecture elle-même.
+    let _staged = if super::image_cdda::est_image_cdda(Path::new(file_path)) {
+        None
+    } else {
+        stage_locally_for_decode(file_path, seek_s, max_duration_s)
+    };
     let file_path: &str = _staged
         .as_ref()
         .and_then(|s| s.path.to_str())
@@ -1816,6 +1826,27 @@ pub fn decode_to_pcm_streaming_tranche(
     seek_s: f64,
     duree_s: Option<f64>,
 ) -> Result<(u16, u32), String> {
+    // #5298 — une image de CD brute : la tranche EST la fenêtre, bornée au
+    // secteur près des deux côtés. Aucun relais de fin : la fenêtre s'arrête
+    // d'elle-même sur la dernière trame de la piste, que les millisecondes de
+    // la base ne sauraient pas désigner exactement.
+    if super::image_cdda::est_image_cdda(Path::new(file_path)) {
+        let fenetre =
+            super::image_cdda::SourceWavCdda::ouvrir(Path::new(file_path), seek_s, duree_s)
+                .map_err(|e| format!("open (image CD): {e}"))?;
+        return decode_to_pcm_streaming_inner(
+            file_path,
+            target_sample_rate,
+            target_channels,
+            target_bit_depth,
+            tx,
+            chunk_size,
+            Some(data_ready),
+            Some(levels_tx),
+            0.0,
+            Some(Box::new(fenetre)),
+        );
+    }
     let tx = borner_la_fin(
         tx,
         duree_s,
@@ -2009,6 +2040,20 @@ fn decode_to_pcm_streaming_inner(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    // #5298 — une image de CD brute passe par le chemin symphonia ci-dessous,
+    // sous la forme d'une fenêtre WAV qui commence à `seek_s`. La fenêtre
+    // bornée d'une tranche est ouverte par `decode_to_pcm_streaming_tranche`,
+    // qui la transmet par `source_override`.
+    let image_cdda = super::image_cdda::est_image_cdda(Path::new(file_path));
+    let (source_override, seek_s) = match source_override {
+        None if image_cdda => {
+            let fenetre =
+                super::image_cdda::SourceWavCdda::ouvrir(Path::new(file_path), seek_s, None)
+                    .map_err(|e| format!("open (image CD): {e}"))?;
+            (Some(Box::new(fenetre) as Box<dyn MediaSource>), 0.0)
+        }
+        autre => (autre, seek_s),
+    };
 
     let mut first_chunk_sent = false;
     // DSD files (DSF/DFF): streaming decode using chunk-based DSD→PCM converter.
@@ -2285,7 +2330,9 @@ fn decode_to_pcm_streaming_inner(
     };
 
     let mut hint = Hint::new();
-    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+    if image_cdda {
+        hint.with_extension("wav");
+    } else if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
 
@@ -3526,7 +3573,31 @@ fn decode_symphonia(
     // instead of a plain File (which would EOF-truncate at the write frontier).
     // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
     // this is byte-identical to the File path.
-    let mss = if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+    //
+    // #5298 — une image de CD brute se lit par sa FENÊTRE, présentée comme un
+    // WAV : le début et la durée demandés deviennent les bornes exactes de la
+    // fenêtre, et le décodage part de zéro dans celle-ci.
+    let image_cdda = super::image_cdda::est_image_cdda(Path::new(file_path));
+    let fenetre_cdda = if image_cdda {
+        Some(
+            super::image_cdda::SourceWavCdda::ouvrir(
+                Path::new(file_path),
+                seek_s,
+                (max_duration_s > 0.0).then_some(max_duration_s),
+            )
+            .map_err(|e| format!("open (image CD): {e}"))?,
+        )
+    } else {
+        None
+    };
+    let (seek_s, max_duration_s) = if image_cdda {
+        (0.0, 0.0)
+    } else {
+        (seek_s, max_duration_s)
+    };
+    let mss = if let Some(fenetre) = fenetre_cdda {
+        MediaSourceStream::new(Box::new(fenetre), Default::default())
+    } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
         // Staging pipeliné (lenteurs Yves, phase 2) : le fichier réseau est
         // copié en fond ; on décode au fur et à mesure via une source SEEKABLE
         // (l'ALAC moov-at-end peut chercher la fin). Registre vide sauf
@@ -3544,7 +3615,9 @@ fn decode_symphonia(
     };
 
     let mut hint = Hint::new();
-    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+    if image_cdda {
+        hint.with_extension("wav");
+    } else if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
 
