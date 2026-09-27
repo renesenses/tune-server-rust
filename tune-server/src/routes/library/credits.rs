@@ -75,6 +75,14 @@ fn ajouter_credits_des_balises(
                     && item["artist_name"]
                         .as_str()
                         .is_some_and(|n| n.trim().to_lowercase() == nom.to_lowercase())
+                    && match (item["instrument"].as_str(), instrument.as_deref()) {
+                        (Some(deja), Some(nouveau)) => {
+                            deja.trim().to_lowercase() == nouveau.to_lowercase()
+                        }
+                        // Une ligne structurée sans instrument peut être
+                        // précisée par la première balise correspondante.
+                        (None, _) | (Some(_), None) => true,
+                    }
             }) {
                 if existant["instrument"].is_null() && instrument.is_some() {
                     existant["instrument"] = json!(instrument);
@@ -1353,10 +1361,14 @@ mod tests_balises_5160 {
                     VALUES (73, 'Christian McBride', 'performer', 0);
                  INSERT INTO track_credits (track_id, artist_name, role, position)
                     VALUES (74, 'Crédit Roon', 'producer', 0);
+                 INSERT INTO track_credits (track_id, artist_name, role, instrument, position)
+                    VALUES (74, 'Alice', 'performer', 'guitar', 1);
                  INSERT INTO track_metadata (track_id, key, value)
                     VALUES (73, 'performer', 'Christian McBride (bass); Nasheet Waits (drums)');
                  INSERT INTO track_metadata (track_id, key, value)
                     VALUES (73, 'producer', 'Christian McBride; Todd Whitelock');
+                 INSERT INTO track_metadata (track_id, key, value)
+                    VALUES (74, 'performer', 'Alice (guitar); Alice (vocals)');
                  INSERT INTO track_metadata (track_id, key, value)
                     VALUES (75, 'performer', 'Ne doit pas fuir');",
             )
@@ -1388,7 +1400,7 @@ mod tests_balises_5160 {
             .await
             .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
         let album = album.as_array().unwrap();
-        assert_eq!(album.len(), 5, "crédits des deux pistes, sans autre album");
+        assert_eq!(album.len(), 7, "crédits des deux pistes, sans autre album");
         assert!(album.iter().any(|c| {
             c["artist_name"] == "Crédit Roon" && c["track_id"] == 74 && c["id"].as_i64().is_some()
         }));
@@ -1398,6 +1410,25 @@ mod tests_balises_5160 {
                 && c["track_number"] == 1
                 && c["disc_number"] == 1
         }));
+        let alice: Vec<_> = album
+            .iter()
+            .filter(|c| c["track_id"] == 74 && c["artist_name"] == "Alice")
+            .collect();
+        assert_eq!(
+            alice.len(),
+            2,
+            "deux instruments distincts restent visibles"
+        );
+        assert!(
+            alice
+                .iter()
+                .any(|c| c["instrument"] == "guitar" && c["id"].as_i64().is_some())
+        );
+        assert!(
+            alice
+                .iter()
+                .any(|c| c["instrument"] == "vocals" && c["id"].is_null())
+        );
         assert!(!album.iter().any(|c| c["artist_name"] == "Ne doit pas fuir"));
     }
 }
