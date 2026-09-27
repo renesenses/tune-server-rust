@@ -84,6 +84,105 @@ pub fn resolve_redirect_uri(
         .unwrap_or_else(|| default_redirect_uri(api_port))
 }
 
+/// Pourquoi Spotify refusera une URI de redirection — #2680, fil 221.
+///
+/// fne mcnp revient le 25/09/2026 avec le libelle exact : « redirect_uri:
+/// Insecure ». La regle Spotify (« Redirect URIs », en vigueur depuis le
+/// 9 avril 2025) : HTTPS obligatoire, SAUF un litteral de boucle locale
+/// explicite `http://127.0.0.1:<port>` ou `http://[::1]:<port>` ; `localhost`
+/// est refuse. Le defaut de Tune y est conforme, mais une URI EXPLICITE
+/// (configuration, `TUNE_SPOTIFY_REDIRECT_URI`, `SPOTIFY_REDIRECT_URI`) etait
+/// prise telle quelle sans rien dire — or le conseil publie sur ce meme fil
+/// le 19/05 etait precisement `http://VOTRE_IP:8888/...`, que Spotify refuse.
+///
+/// La valeur de l'exploitant est CONSERVEE (Tune ne reecrit jamais une URI
+/// declaree a l'identique dans un tableau de bord tiers) ; elle est seulement
+/// NOMMEE comme refusee, dans le journal et dans `GET /system/env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusRedirection {
+    /// `http://localhost...` : Spotify n'accepte plus l'alias.
+    Localhost,
+    /// `http://` vers un hote qui n'est pas un litteral de boucle locale
+    /// (IP du reseau local, nom d'hote) : « Insecure ».
+    HttpHorsBouclage,
+}
+
+impl RefusRedirection {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Localhost => "localhost",
+            Self::HttpHorsBouclage => "http_hors_bouclage",
+        }
+    }
+}
+
+/// Classe une URI de redirection selon la regle Spotify. `None` : acceptable.
+///
+/// HTTPS passe toujours ; un schema propre a une application (`monappli://`)
+/// n'est pas du ressort de cette regle et passe aussi.
+pub fn refus_redirection(uri: &str) -> Option<RefusRedirection> {
+    let uri = uri.trim();
+    let (schema, reste) = uri.split_once("://")?;
+    if !schema.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let autorite = reste.split(['/', '?', '#']).next().unwrap_or("");
+    let autorite = autorite.rsplit('@').next().unwrap_or(autorite);
+    let hote = if autorite.starts_with('[') {
+        match autorite.find(']') {
+            Some(fin) => &autorite[..=fin],
+            None => autorite,
+        }
+    } else {
+        autorite.split(':').next().unwrap_or(autorite)
+    }
+    .to_ascii_lowercase();
+    match hote.as_str() {
+        "127.0.0.1" | "[::1]" => None,
+        "localhost" => Some(RefusRedirection::Localhost),
+        h if h.ends_with(".localhost") => Some(RefusRedirection::Localhost),
+        _ => Some(RefusRedirection::HttpHorsBouclage),
+    }
+}
+
+/// Le `code` d'autorisation contenu dans l'adresse de rappel COLLEE par
+/// l'utilisateur — #2680.
+///
+/// Le rappel vise `127.0.0.1` : il n'aboutit que dans le navigateur de la
+/// machine du serveur. Depuis un autre poste, Spotify renvoie ce navigateur
+/// vers une page qui ne s'ouvre pas — mais l'adresse, dans la barre, porte le
+/// `code`. La coller dans Tune termine l'echange (meme verificateur PKCE, meme
+/// `redirect_uri`). Un code nu est accepte tel quel.
+pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
+    let colle = colle.trim();
+    if colle.is_empty() {
+        return Err("spotify: adresse de rappel vide".into());
+    }
+    let Some((_, requete)) = colle.split_once('?') else {
+        if colle.contains("://") || colle.contains('/') {
+            return Err("spotify: l'adresse collee ne contient pas de code".into());
+        }
+        return Ok(colle.to_owned());
+    };
+    let requete = requete.split('#').next().unwrap_or(requete);
+    let mut erreur = None;
+    for paire in requete.split('&') {
+        let (cle, valeur) = paire.split_once('=').unwrap_or((paire, ""));
+        let valeur = urlencoding::decode(valeur)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| valeur.to_owned());
+        match cle {
+            "code" if !valeur.is_empty() => return Ok(valeur),
+            "error" => erreur = Some(valeur),
+            _ => {}
+        }
+    }
+    Err(match erreur {
+        Some(e) => format!("spotify: {e}"),
+        None => "spotify: l'adresse collee ne contient pas de code".into(),
+    })
+}
+
 /// L'URI que Tune enverra REELLEMENT a Spotify, lue depuis l'environnement du
 /// processus — la meme resolution que celle appliquee a la construction du
 /// service, au meme endroit, pour qu'une page de support ne puisse pas en
@@ -115,6 +214,14 @@ impl SpotifyService {
                     .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into())
             });
         let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
+        if let Some(refus) = refus_redirection(&redirect_uri) {
+            warn!(
+                redirect_uri = %redirect_uri,
+                refus = refus.code(),
+                "spotify_redirect_uri_refusee: Spotify n'accepte en http:// que \
+                 http://127.0.0.1:<port> ou http://[::1]:<port> ; sinon HTTPS"
+            );
+        }
         Self {
             client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -393,7 +500,16 @@ impl StreamingService for SpotifyService {
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
-        if let Some(code) = credentials.get("code").and_then(|v| v.as_str()) {
+        // #2680 — `callback_url` : l'adresse de rappel collee depuis un autre
+        // poste, ou le rappel `127.0.0.1` ne peut pas aboutir.
+        let code = match credentials.get("callback_url").and_then(|v| v.as_str()) {
+            Some(colle) => Some(code_depuis_rappel(colle)?),
+            None => credentials
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+        };
+        if let Some(code) = code.as_deref() {
             let verifier = self.code_verifier.take().ok_or("no code verifier")?;
             let resp = self
                 .client
@@ -411,7 +527,17 @@ impl StreamingService for SpotifyService {
 
             let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
             if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
-                return Err(format!("spotify: {err}").into());
+                // #2680 — nommer l'URI envoyee : c'est elle qui doit figurer
+                // A L'IDENTIQUE dans le tableau de bord Spotify.
+                let detail = data
+                    .get("error_description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                return Err(format!(
+                    "spotify: {err} {detail} (redirect_uri envoyee : {})",
+                    self.redirect_uri
+                )
+                .into());
             }
 
             self.access_token = data["access_token"].as_str().map(Into::into);
@@ -965,6 +1091,113 @@ mod tests {
             ),
             "https://config.example/callback"
         );
+    }
+
+    /// #2680, fil 221 — « redirect_uri: Insecure ».
+    ///
+    /// Regle Spotify : HTTPS, sauf `http://127.0.0.1:<port>` ou
+    /// `http://[::1]:<port>` ; `localhost` refuse. Le defaut n'est jamais
+    /// refuse, a aucun port ; les deux URI conseillees le 19/05 sur le fil le
+    /// sont toutes les deux.
+    #[test]
+    fn spotify_redirect_rule_accepts_only_https_or_explicit_loopback() {
+        for port in [80u16, 8085, 8888, 9000, 65535] {
+            let defaut = default_redirect_uri(port);
+            assert_eq!(refus_redirection(&defaut), None, "{defaut}");
+            assert_eq!(
+                refus_redirection(&resolve_redirect_uri(None, None, None, port)),
+                None
+            );
+        }
+        for ok in [
+            "http://127.0.0.1:8888/api/v1/streaming/spotify/callback",
+            "http://[::1]:8888/api/v1/streaming/spotify/callback",
+            "HTTP://127.0.0.1/api/v1/streaming/spotify/callback",
+            "https://tune.example/api/v1/streaming/spotify/callback",
+            "https://192.168.1.20:8443/api/v1/streaming/spotify/callback",
+        ] {
+            assert_eq!(refus_redirection(ok), None, "{ok}");
+        }
+        for (uri, refus) in [
+            (
+                "http://localhost:8888/api/v1/streaming/spotify/callback",
+                RefusRedirection::Localhost,
+            ),
+            (
+                "http://localhost:8085/api/v1/streaming/spotify/callback",
+                RefusRedirection::Localhost,
+            ),
+            ("http://tune.localhost:8888/cb", RefusRedirection::Localhost),
+            (
+                "http://192.168.1.20:8888/callback/spotify",
+                RefusRedirection::HttpHorsBouclage,
+            ),
+            (
+                "http://10.0.0.5:8888/api/v1/streaming/spotify/callback",
+                RefusRedirection::HttpHorsBouclage,
+            ),
+            (
+                "http://nas.local:8888/api/v1/streaming/spotify/callback",
+                RefusRedirection::HttpHorsBouclage,
+            ),
+            (
+                "http://127.0.0.1.nip.io:8888/cb",
+                RefusRedirection::HttpHorsBouclage,
+            ),
+        ] {
+            assert_eq!(refus_redirection(uri), Some(refus), "{uri}");
+        }
+    }
+
+    /// Une URI explicite refusee est CONSERVEE, pas reecrite : elle doit
+    /// rester celle que l'exploitant a declaree.
+    #[test]
+    fn spotify_insecure_explicit_redirect_is_kept_as_is() {
+        let lan = "http://192.168.1.20:8888/callback/spotify";
+        assert_eq!(resolve_redirect_uri(Some(lan), None, None, 8888), lan);
+        let svc = SpotifyService::with_config(Some("c"), Some(lan), 8888);
+        assert_eq!(svc.redirect_uri, lan);
+    }
+
+    /// Depuis un autre poste, le rappel `127.0.0.1` ne s'ouvre pas, mais son
+    /// adresse porte le `code` : Tune doit savoir l'en extraire.
+    #[test]
+    fn spotify_code_is_extracted_from_a_pasted_callback_url() {
+        assert_eq!(
+            code_depuis_rappel(
+                "http://127.0.0.1:8888/api/v1/streaming/spotify/callback?code=AQB%2Dx_9&state=s"
+            ),
+            Ok("AQB-x_9".to_owned())
+        );
+        assert_eq!(
+            code_depuis_rappel("  http://127.0.0.1:8888/cb?state=s&code=abc#frag "),
+            Ok("abc".to_owned())
+        );
+        assert_eq!(code_depuis_rappel("AQBcodenu"), Ok("AQBcodenu".to_owned()));
+        assert_eq!(
+            code_depuis_rappel("http://127.0.0.1:8888/cb?error=access_denied"),
+            Err("spotify: access_denied".to_owned())
+        );
+        assert!(code_depuis_rappel("http://127.0.0.1:8888/cb").is_err());
+        assert!(code_depuis_rappel("").is_err());
+    }
+
+    /// Le chemin `callback_url` passe bien par l'echange de code : sans
+    /// verificateur PKCE (aucune autorisation lancee), il echoue sur CE motif,
+    /// et non comme un simple sondage qui rendrait une nouvelle URL.
+    #[tokio::test]
+    async fn spotify_callback_url_credential_reaches_the_code_exchange() {
+        let mut svc = SpotifyService::with_config(Some("c"), None, 8888);
+        let err = svc
+            .authenticate(&json!({"callback_url": "http://127.0.0.1:8888/cb?code=abc"}))
+            .await
+            .expect_err("sans verificateur, l'echange doit echouer");
+        assert!(err.to_string().contains("no code verifier"), "{err}");
+        let err = svc
+            .authenticate(&json!({"callback_url": "http://127.0.0.1:8888/cb?error=access_denied"}))
+            .await
+            .expect_err("un refus colle doit etre rendu");
+        assert!(err.to_string().contains("access_denied"), "{err}");
     }
 
     #[test]

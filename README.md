@@ -174,9 +174,21 @@ April 2025 and accepts plain HTTP only for an explicit loopback literal.
 `GET /api/v1/system/env` reports the exact string under
 `spotify_redirect_uri`; copy it from there rather than retyping it.
 
-A Tune reached from another machine (NAS, mini-PC) cannot use a loopback
-address: register an HTTPS URI in the dashboard and give Tune the same one
-through `spotify_redirect_uri` in `tune.toml` or `TUNE_SPOTIFY_REDIRECT_URI`.
+**Never declare `http://<LAN IP>:8888/...` or `http://localhost:...`**:
+Spotify rejects both as `redirect_uri: Insecure`. If such a value is
+configured explicitly, Tune keeps it but logs `spotify_redirect_uri_refusee`
+and reports the reason under `spotify_redirect_uri_refus` in
+`GET /api/v1/system/env` (`localhost` or `http_hors_bouclage`).
+
+A Tune reached from another machine (NAS, mini-PC) keeps the loopback URI.
+After you authorize, Spotify sends *that* browser to `127.0.0.1`, where
+nothing answers: the page fails to open, but its address carries the
+authorization `code`. Copy the whole address from the address bar and paste
+it into Tune (`POST /api/v1/streaming/spotify/auth` with
+`{"callback_url": "<pasted address>"}` — the web settings screen has a field
+for it). Alternatively, register an HTTPS URI in the dashboard and give Tune
+the same one through `spotify_redirect_uri` in `tune.toml` or
+`TUNE_SPOTIFY_REDIRECT_URI`.
 
 ## License
 
