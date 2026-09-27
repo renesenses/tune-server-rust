@@ -2190,6 +2190,8 @@ impl AlbumRepo {
             artistes_de_piste: std::collections::BTreeSet<(i64, String)>,
             pistes_sans_artiste: bool,
             balises_d_album: std::collections::BTreeMap<String, String>,
+            /// #5236 — la règle a paniqué sur une donnée de cet album.
+            illisible: bool,
         }
 
         let rows = self
@@ -2208,13 +2210,33 @@ impl AlbumRepo {
                     artistes_de_piste: Default::default(),
                     pistes_sans_artiste: false,
                     balises_d_album: Default::default(),
+                    illisible: false,
                 });
             }
             let Some(a) = albums.last_mut() else { continue };
+            if a.illisible {
+                continue;
+            }
             let balise = r.get(2).and_then(|v| v.as_string());
             let artiste = r.get(4).and_then(|v| v.as_string());
-            a.indices
-                .ajouter_piste(balise.as_deref(), artiste.as_deref());
+            // #5236 — cette passe est jouée à CHAQUE démarrage : une panique
+            // sur UN nom d'artiste (v0.9.166, `replace_ci`) faisait tomber le
+            // serveur en boucle. La règle est pure (aucune écriture) : on
+            // écarte l'album, on le journalise, et la passe continue.
+            let versee = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                a.indices
+                    .ajouter_piste(balise.as_deref(), artiste.as_deref())
+            }));
+            if versee.is_err() {
+                a.illisible = true;
+                tracing::warn!(
+                    album_id = id,
+                    album_artist = ?balise,
+                    artiste = ?artiste,
+                    "compilation_recalcul_donnee_illisible"
+                );
+                continue;
+            }
             match (r.get(3).and_then(|v| v.as_i64()), artiste) {
                 (Some(aid), Some(nom)) => {
                     a.artistes_de_piste.insert((aid, nom));
@@ -2236,7 +2258,17 @@ impl AlbumRepo {
             ..Default::default()
         };
         for a in &albums {
-            let jugement = a.indices.juger();
+            if a.illisible {
+                bilan.erreurs += 1;
+                continue;
+            }
+            let Ok(jugement) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.indices.juger()))
+            else {
+                bilan.erreurs += 1;
+                tracing::warn!(album_id = a.id, "compilation_recalcul_donnee_illisible");
+                continue;
+            };
             if jugement.compilation {
                 continue;
             }
@@ -4427,6 +4459,47 @@ mod tests {
         // Idempotente.
         let bilan = repo.recalculer_les_compilations().unwrap();
         assert_eq!(bilan.baisses, 0, "{bilan:?}");
+    }
+
+    /// #5236 — la passe de DÉMARRAGE (v0.9.166) sur un artiste dont la
+    /// minuscule change de taille en octets (« İ » → « i̇ »). Elle paniquait
+    /// dans `replace_ci` et le serveur de Kimon (PostgreSQL) redémarrait en
+    /// boucle. Attendu : aucune panique, et le jugement normal de l'album.
+    #[test]
+    fn le_recalcul_ne_panique_pas_sur_un_artiste_a_minuscule_de_taille_changeante() {
+        let db = test_db();
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS album_metadata (
+                     album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY (album_id, key)
+                 );",
+            )
+            .unwrap();
+        let artistes = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+        let ilhan = artistes
+            .create(&Artist::new("İlhan and Ömer".into()))
+            .unwrap();
+        let mut a = Album::new("İstanbul".into());
+        a.artist_id = Some(ilhan);
+        a.is_compilation = true;
+        let album = repo.create(&a).unwrap();
+        for (n, chemin) in [(1, "/m/ist/01.flac"), (2, "/m/ist/02.flac")] {
+            seed_track_with_album_artist(&db, album, ilhan, n, chemin, Some("İlhan and Ömer"));
+        }
+
+        let bilan = repo.recalculer_les_compilations().unwrap();
+        assert_eq!(
+            (bilan.examines, bilan.baisses, bilan.erreurs),
+            (1, 1, 0),
+            "{bilan:?}"
+        );
+        assert!(!repo.get(album).unwrap().unwrap().is_compilation);
     }
 
     /// Phase 5 UPnP : la mention réciproque, et ses deux contre-épreuves
