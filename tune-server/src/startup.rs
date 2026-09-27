@@ -1479,7 +1479,8 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
 
 /// Resolve the managed `yt-dlp` binary at boot (from the `yt_dlp_path` setting,
 /// the auto-download location, or PATH) so YouTube playback works if it was
-/// previously enabled. Does not download anything — that's the opt-in button.
+/// previously enabled. The first download is the opt-in button; afterwards a
+/// managed binary older than 14 days is refreshed in the background (#4366).
 async fn resolve_ytdlp(state: &AppState) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let configured = settings.get("yt_dlp_path").ok().flatten();
@@ -1490,12 +1491,27 @@ async fn resolve_ytdlp(state: &AppState) {
             // binaire n'est téléchargé qu'une fois, jamais rafraîchi, et sa
             // version manquait à chaque journal de testeur. `--version` coûte
             // une à deux secondes (binaire autoextractible) : hors séquence.
+            let backend = state.backend.clone();
             tokio::spawn(async move {
                 let version = tune_core::ytdlp::version_of(&path).await;
                 info!(
                     version = version.as_deref().unwrap_or("inconnue"),
                     "youtube_ytdlp_version"
                 );
+                // #4366 — un binaire géré de plus de 14 jours est rafraîchi,
+                // en tâche de fond : le démarrage n'attend pas GitHub. Un
+                // `yt_dlp_path` de l'utilisateur n'est jamais touché, et un
+                // échec garde l'ancien binaire (voir `ytdlp::rafraichir`).
+                if let tune_core::ytdlp::Rafraichissement::Fait { nouvelle, .. } =
+                    tune_core::ytdlp::rafraichir(
+                        tune_core::ytdlp::RaisonRafraichissement::Demarrage,
+                    )
+                    .await
+                {
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend)
+                        .set(tune_core::ytdlp::CLE_VERSION, &nouvelle)
+                        .ok();
+                }
             });
         }
         None => info!("youtube_ytdlp_absent — YouTube playback not enabled"),

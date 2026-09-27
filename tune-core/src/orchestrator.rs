@@ -1481,6 +1481,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
+mod relance_ytdlp_4366;
 
 mod resolve_local;
 
