@@ -331,7 +331,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // virtuelles. `inventorier` construisait les `PisteCue` puis les
         // jetait ; `inventorier_et_ecrire` les range, sans relire une seule
         // feuille de plus, et rend l'inventaire à l'identique.
-        let (inventaire_cue, bilan_cue, images_cue) =
+        let (inventaire_cue, mut bilan_cue, images_cue) =
             tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
@@ -348,6 +348,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     trop_massive: &crate::routes::system::scan::purge_trop_massive,
                 },
             );
+        // #5297 — les images SACD que le parcours a lues NATIVEMENT : même
+        // écrivain que les albums CUE (pistes = tranches de l'image), même
+        // bilan, donc même réévaluation des pochettes en fin de scan.
+        tune_core::scanner::cue_bibliotheque::ecrire_les_iso_sacd(
+            &db,
+            &list_result.isos_sacd_natifs,
+            &mut bilan_cue,
+        );
         if inventaire_cue.dossiers > 0 {
             info!(
                 dossiers = inventaire_cue.dossiers,
