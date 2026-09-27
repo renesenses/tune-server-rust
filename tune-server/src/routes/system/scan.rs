@@ -693,6 +693,11 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// Returns `true` if the file is new, or its mtime/size differ from what the DB
 /// last recorded for it; `false` if it's unchanged (skip — don't re-read tags).
 ///
+/// #5223 : conserver la fraction de seconde ET la comparer sans tolérance.
+/// Une copie préallouée ou une retouche en place peut changer les balises
+/// à taille égale dans la même seconde. Les anciennes dates tronquées sont
+/// relues une fois si la date précise diffère, puis le raccourci s'applique.
+///
 /// The lookup key is NFC-normalized because the stored `file_path`s (and the
 /// `discovered_paths` set) are NFC, while a filename on disk may be NFD (a FR
 /// library ripped on macOS, copied to a Synology, read back over SMB). Skipping
@@ -712,10 +717,10 @@ pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-            && info.taille.is_some_and(|s| s == file_meta.len() as i64);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let unchanged =
+            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == file_meta.len() as i64);
         return !unchanged;
     }
     true
@@ -772,7 +777,7 @@ pub enum VerdictEcriture {
 /// re-résolus.
 pub fn verdict_ecriture(
     chemin: &str,
-    mtime: u64,
+    mtime: f64,
     taille: u64,
     force: bool,
     carte: &CarteDesChemins,
@@ -781,8 +786,7 @@ pub fn verdict_ecriture(
         return VerdictEcriture::Inserer;
     };
     if !force {
-        let a_change = info.mtime.is_none_or(|m| (m - mtime as f64).abs() > 0.5)
-            || info.taille != Some(taille as i64);
+        let a_change = info.mtime != Some(mtime) || info.taille != Some(taille as i64);
         if !a_change {
             return VerdictEcriture::Inchange;
         }

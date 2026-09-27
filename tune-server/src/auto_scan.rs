@@ -1728,6 +1728,8 @@ pub(crate) fn reimporter_fichier_surveillant(
     // crucially WITHOUT reading the content (scan_files_
     // parallel), since the read is what re-triggers it.
     // Même garde pour un « ajout » sur un chemin connu (#4896).
+    // #5223 : comparer toute la date enregistrée, sans l'arrondir ni tolérer
+    // 500 ms ; une copie préallouée peut finir à taille égale dans cet intervalle.
     if let Some(existing) = existante
         && let Ok(fs_meta) = std::fs::metadata(&change.path)
     {
@@ -1736,10 +1738,10 @@ pub(crate) fn reimporter_fichier_surveillant(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as f64);
+            .map(|d| d.as_secs_f64());
         let unchanged = existing.file_size == Some(fs_size)
             && match (existing.file_mtime, fs_mtime) {
-                (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                (Some(a), Some(b)) => a == b,
                 _ => false,
             };
         if unchanged {
@@ -2929,3 +2931,7 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "copie_albums_tests_5223.rs"]
+mod copie_albums_tests_5223;
