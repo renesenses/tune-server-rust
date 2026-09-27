@@ -131,9 +131,12 @@ impl TunePlugin for CdPlugin {
             &etat_routes,
         ));
         publication.publier_sans_lecteur();
+        // #5161 — sous Linux et macOS, `lecteur` est toujours là : un lecteur
+        // absent au démarrage se branche plus tard, et c'est la surveillance
+        // qui le voit arriver. `None` ne reste que sans implémentation.
         match &lecteur {
             Some(l) => {
-                tracing::info!(lecteur = %l.chemin(), "cd_lecteur_detecte");
+                tracing::info!(lecteur = %l.chemin(), "cd_lecteur_surveille");
                 self.services
                     .orchestrator
                     .sources_pcm()

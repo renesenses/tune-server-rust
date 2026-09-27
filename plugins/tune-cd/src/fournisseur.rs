@@ -42,7 +42,12 @@ impl FournisseurPcm for FournisseurCd {
     fn ouvrir(&self, source_id: &str, depuis_ms: u64) -> Result<FluxPcm, String> {
         let (disc_demande, numero) = lire_source_id(source_id)
             .ok_or_else(|| format!("piste de CD illisible : {source_id}"))?;
+        self.lecteur.presence();
+        let generation = self.lecteur.generation_lecteur();
         let toc = self.lecteur.lire_toc().map_err(|e| e.to_string())?;
+        if self.lecteur.generation_lecteur() != generation {
+            return Err("le lecteur a changé pendant l'ouverture de la piste".into());
+        }
         if disc_id(&toc) != disc_demande {
             return Err("le disque a changé depuis la mise en file".into());
         }
@@ -63,7 +68,12 @@ impl FournisseurPcm for FournisseurCd {
             format: FormatPcm::CD,
             octets: (fin - debut) as u64 * OCTETS_PAR_SECTEUR as u64,
             duree_ms: duree_ms_de_secteurs(secteurs),
-            lecteur: Box::new(FluxPiste::new(self.lecteur.clone(), debut, fin)),
+            lecteur: Box::new(FluxPiste::new_avec_generation(
+                self.lecteur.clone(),
+                debut,
+                fin,
+                generation,
+            )),
         })
     }
 }
