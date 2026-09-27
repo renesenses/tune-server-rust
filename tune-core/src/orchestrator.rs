@@ -1708,6 +1708,11 @@ mod double_dsp_dsf_aac_sortie_locale_tests;
 #[cfg(test)]
 mod mesure_saut_cd_5079;
 
+/// #5283 — une cadence Qobuz annoncée nulle est remplacée par l'en-tête du
+/// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
+#[cfg(test)]
+mod qobuz_cadence_nulle_5283_tests;
+
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
 mod crete_apres_dsp_4384;
