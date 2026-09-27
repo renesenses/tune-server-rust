@@ -202,7 +202,8 @@ impl PlaybackOrchestrator {
             if let Some(fournisseur) = self.sources_pcm.fournisseur(source) {
                 return self.resolve_source_pcm(source, fournisseur, req).await;
             }
-            return self.resolve_streaming_url(source, req).await;
+            // #4366 — un 403 YouTube rafraîchit yt-dlp et relance une fois.
+            return self.resolve_streaming_url_avec_relance(source, req).await;
         }
 
         // Phase 3 du chantier `unifier-serveurs-upnp-et-bibliotheque` : une
