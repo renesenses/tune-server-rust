@@ -4,7 +4,7 @@
 //! pistes. Il MESURE et imprime ; il n'affirme rien.
 //!
 //! ```text
-//! TUNE_BANC_CLAP_DIR=/chemin/persistant BANC_PISTES=300 BANC_OUVRIERS=4 \
+//! BANC_CLAP_DIR=/chemin/persistant BANC_PISTES=300 BANC_OUVRIERS=4 \
 //! BANC_DEBIT=equilibre BANC_SECONDES=90 \
 //!   cargo test --release -p tune-core --features audio-embedding --lib \
 //!     banc_5138 -- --ignored --nocapture
@@ -118,7 +118,7 @@ fn banc_5138() {
     let pistes: usize = env_ou("BANC_PISTES", 300);
     let secondes: u64 = env_ou("BANC_SECONDES", 90);
     let debit: String = env_ou("BANC_DEBIT", "equilibre".to_string());
-    let racine: std::path::PathBuf = std::env::var("TUNE_BANC_CLAP_DIR")
+    let racine: std::path::PathBuf = std::env::var("BANC_CLAP_DIR")
         .map(Into::into)
         .unwrap_or_else(|_| std::env::temp_dir().join("banc-clap-5138"));
     std::fs::create_dir_all(racine.join("pistes")).unwrap();
