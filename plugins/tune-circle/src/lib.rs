@@ -30,6 +30,7 @@
 //!   (les invitations envoyées portent l'adresse saisie par l'auteur).
 
 pub mod battement;
+pub mod ecoute;
 pub mod ensembles;
 pub mod lecture;
 pub mod playlists;
@@ -69,7 +70,12 @@ pub struct HostServices {
     pub license: Arc<LicenseManager>,
     pub hote: Arc<dyn ensembles::Hote>,
     pub services: Arc<tokio::sync::Mutex<ServiceRegistry>>,
+    /// T4 (#5327) : pour poser la file d'une écoute de contact et inscrire la
+    /// source `circle`, dont chaque piste reçoit son billet au moment d'être
+    /// jouée (`tune_core::source_url`).
     pub orchestrator: Arc<PlaybackOrchestrator>,
+    /// T4 (#5327) : l'état des zones, pour savoir si une zone joue encore le
+    /// flux d'un contact quand elle tombe en erreur.
     pub playback: Arc<PlaybackManager>,
 }
 
@@ -77,6 +83,8 @@ pub struct CirclePlugin {
     services: HostServices,
     pousseur: Option<Arc<battement::Pousseur>>,
     tache: Option<tokio::task::JoinHandle<()>>,
+    /// Construite au `setup` (il faut le bus).
+    ecoute: Option<Arc<ecoute::Ecoute>>,
 }
 
 impl CirclePlugin {
@@ -85,6 +93,7 @@ impl CirclePlugin {
             services,
             pousseur: None,
             tache: None,
+            ecoute: None,
         }
     }
 }
@@ -98,7 +107,7 @@ impl TunePlugin for CirclePlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance sera Premium."
+        "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance est Premium."
     }
     /// Opt-in, comme `cd` : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -107,8 +116,9 @@ impl TunePlugin for CirclePlugin {
     /// Au catalogue (#5018, décision de Bertrand du 25/09), comme `cd`
     /// (#4863) : le gestionnaire propose « Installer », puis
     /// `POST /api/v1/plugins/circle/install` et un redémarrage.
-    /// Gratuit : absent de `premium_plugins`, aucun contrôle de droit. Seule
-    /// l'écoute à distance (étape T4, à venir) sera Premium.
+    /// Gratuit : absent de `premium_plugins`, aucun contrôle de droit local.
+    /// Seule l'écoute à distance (T4, #5327) est Premium, et c'est le cloud
+    /// qui en juge, pour l'auditeur comme pour le propriétaire.
     fn catalogued(&self) -> bool {
         true
     }
@@ -131,10 +141,30 @@ impl TunePlugin for CirclePlugin {
                 playback: self.services.playback.clone(),
             }),
         });
+        // T4 (#5327) : l'écoute chez un contact. Le droit (Premium des deux
+        // côtés compris) est jugé par le cloud à la délivrance du billet.
+        let hote: Option<Arc<dyn ecoute::HoteLecture>> =
+            Some(Arc::new(ecoute::HoteOrchestrateur {
+                backend: self.services.backend.clone(),
+                orchestrator: self.services.orchestrator.clone(),
+                playback: self.services.playback.clone(),
+            }));
+        let ecoute = Arc::new(ecoute::Ecoute::new(
+            relais.clone(),
+            ctx.event_bus.clone(),
+            Some(self.services.playback.clone()),
+            hote,
+        ));
+        self.services
+            .orchestrator
+            .sources_url()
+            .inscrire(ecoute::SOURCE, ecoute.clone());
+        self.ecoute = Some(ecoute.clone());
         ctx.register_router(
             routes::router(relais, self.services.license.clone())
                 .merge(rayons::router(pousseur.clone()))
-                .merge(playlists::router(collaboratif)),
+                .merge(playlists::router(collaboratif))
+                .merge(ecoute::router(ecoute)),
         );
         // T3 (#5326) : tenir à jour les rayons cochés.
         self.tache = Some(tokio::spawn(pousseur.clone().tourner()));
@@ -147,16 +177,26 @@ impl TunePlugin for CirclePlugin {
             t.abort();
         }
         self.pousseur = None;
+        self.services
+            .orchestrator
+            .sources_url()
+            .retirer(ecoute::SOURCE);
         Ok(())
     }
 
     /// T3 (#5326) : la bibliothèque a changé, une collection partagée peut
     /// avoir gagné ou perdu un album. Réveille le pousseur, sans attendre.
+    ///
+    /// T4 (#5327) : les erreurs de lecture d'une zone qui joue le flux d'un
+    /// contact (voir [`ecoute::Ecoute::sur_evenement`]).
     async fn on_event(&mut self, event: &TuneEvent) {
         if battement::EVENEMENTS_QUI_REVEILLENT.contains(&event.event_type.as_str())
             && let Some(p) = &self.pousseur
         {
             p.reveiller();
+        }
+        if let Some(ecoute) = &self.ecoute {
+            ecoute.sur_evenement(event).await;
         }
     }
 }

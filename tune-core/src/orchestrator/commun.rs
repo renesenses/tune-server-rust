@@ -202,6 +202,11 @@ impl PlaybackOrchestrator {
             if let Some(fournisseur) = self.sources_pcm.fournisseur(source) {
                 return self.resolve_source_pcm(source, fournisseur, req).await;
             }
+            // #5327 — une source dont un greffon fournit l'URL au moment de
+            // jouer (Tune Circle : un billet d'écoute par piste).
+            if let Some(fournisseur) = self.sources_url.fournisseur(source) {
+                return self.resolve_source_url(source, fournisseur, req).await;
+            }
             // #4366 — un 403 YouTube rafraîchit yt-dlp et relance une fois.
             return self.resolve_streaming_url_avec_relance(source, req).await;
         }

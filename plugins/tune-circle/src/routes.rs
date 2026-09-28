@@ -43,6 +43,9 @@
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
 //!
+//! T4, l'écoute chez un contact (#5327), Premium : `POST
+//! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
+//!
 //! Le `server_id` partagé est celui de CE serveur (réglage `server_id`, celui
 //! que pousse `library_sync`) : un `server_id` fourni par le client ne part
 //! jamais. Le cloud juge s'il appartient à l'appelant (404 sinon).

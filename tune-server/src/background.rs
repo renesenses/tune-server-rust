@@ -536,8 +536,9 @@ async fn spawn_relay_client(state: &AppState) {
         return;
     }
 
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Some(client) = tune_core::cloud::relay::spawn_relay_client(&settings, state.port) {
+    if let Some(client) =
+        tune_core::cloud::relay::spawn_relay_client(state.backend.clone(), state.port)
+    {
         // Ranger l'Arc : sans cela le client tourne, mais
         // `/cloud/relay/status` lit un emplacement vide et annonce
         // `connected: false` a vie. Garde : `publication_du_relais` dans

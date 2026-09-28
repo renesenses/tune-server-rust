@@ -169,6 +169,7 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // `mozaik_refresh_token`, `mozaik_base_url`) — la même que lisent
     // `library_sync` et les routes `/cloud/*`. T2 (#5325) : la licence, pour
     // que `GET /library-sync` dise Premium avec le même juge que la synchro.
+    // T4 (#5327) : le gestionnaire de lecture, pour l'écoute chez un contact.
     #[cfg(feature = "circle")]
     loader
         .register(Box::new(tune_circle::CirclePlugin::new(

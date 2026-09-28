@@ -29,6 +29,8 @@ chrono = { workspace = true }
 # à jour.
 sha2 = { workspace = true }
 # T5 (#5328) : le parc des services est derrière un `tokio::sync::Mutex`.
+# T4 (#5327) : la sonde du flux de contact part dans sa propre tâche, pour ne
+# pas retenir le répartiteur d'événements des greffons.
 tokio = { workspace = true }
 
 [dev-dependencies]
