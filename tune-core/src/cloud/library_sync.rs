@@ -228,6 +228,68 @@ pub fn tout_repousser_apres_deliaison(backend: &Arc<dyn DbBackend>) {
     populate_changelog_after_scan(backend);
 }
 
+// ---------------------------------------------------------------------------
+// #5358 — version du format de synchro
+// ---------------------------------------------------------------------------
+
+/// Version du format de la copie en ligne que CE binaire pousse.
+///
+/// Le journal des changements ne renvoie une entité que si elle change : un
+/// binaire qui enrichit ce qui part (nouvelle colonne, nouveau lien) laisse
+/// donc la copie déjà poussée dans l'ancien format, indéfiniment. Constaté le
+/// 28/09/2026 (#5358) : la copie du .18, poussée le 23/09 sans `album_id` ni
+/// MBID, montrait aux contacts d'un cercle des albums sans titres ni pochettes.
+///
+/// - 1 : tout ce qui a été poussé avant ce réglage (absent = 1) ;
+/// - 2 : `album_id` des pistes et `musicbrainz_release_group_id` des albums
+///   (Tune Circle T2, #5325).
+///
+/// À INCRÉMENTER à chaque enrichissement de ce qui part vers le cloud : la
+/// bibliothèque entière repart alors une fois, au débit du limiteur.
+pub const FORMAT_SYNCHRO: i64 = 2;
+
+/// Réglage local : version du format dans lequel la bibliothèque a été remise
+/// dans le journal pour la dernière fois.
+pub const CLE_FORMAT_SYNCHRO: &str = "cloud_library_sync_format";
+
+/// Si la copie en ligne a été poussée dans un format plus ancien que
+/// [`FORMAT_SYNCHRO`] (réglage absent, illisible ou inférieur) et que la
+/// synchro est autorisée, remet toute la bibliothèque dans le journal — une
+/// seule fois — puis note le format. Rend `true` quand il a remis.
+///
+/// Rien d'autre n'est forcé : les entrées partent par le cycle ordinaire, au
+/// débit du limiteur. Synchro non autorisée ⇒ rien, et le réglage n'est pas
+/// écrit : la remise se fera le jour où la synchro sera allumée.
+pub fn resynchroniser_si_le_format_a_change(
+    backend: &Arc<dyn DbBackend>,
+    settings: &SettingsRepo,
+    premium: bool,
+) -> bool {
+    if !synchro_autorisee(premium, settings) {
+        return false;
+    }
+    let format_pousse = settings
+        .get(CLE_FORMAT_SYNCHRO)
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(1);
+    if format_pousse >= FORMAT_SYNCHRO {
+        return false;
+    }
+    populate_changelog_after_scan(backend);
+    settings
+        .set(CLE_FORMAT_SYNCHRO, &FORMAT_SYNCHRO.to_string())
+        .ok();
+    info!(
+        ancien = format_pousse,
+        nouveau = FORMAT_SYNCHRO,
+        en_attente = pending_count(backend),
+        "cloud_library_sync_format_upgraded — bibliotheque remise dans le journal"
+    );
+    true
+}
+
 /// Le serveur a-t-il déjà un jeton de liaison ?
 pub fn serveur_lie(settings: &SettingsRepo) -> bool {
     jeton_de_liaison(settings).is_some()
@@ -797,6 +859,11 @@ pub async fn full_sync(
              WHERE id NOT IN (SELECT entity_id FROM sync_changelog WHERE entity_type='artist' AND synced=0);",
         )
         .map_err(|e| format!("full_sync bulk insert: {e}"))?;
+    // #5358 : toute la bibliothèque vient de repartir dans le format courant ;
+    // le cycle suivant n'a pas à la remettre une seconde fois.
+    SettingsRepo::with_backend(backend.clone())
+        .set(CLE_FORMAT_SYNCHRO, &FORMAT_SYNCHRO.to_string())
+        .ok();
 
     let total_pending = pending_count(backend);
     info!(pending = total_pending, "cloud_library_full_sync_queued");
@@ -964,6 +1031,8 @@ pub async fn cycle(
     if !synchro_autorisee(premium, &settings) {
         return None;
     }
+    // #5358 : un format de synchro enrichi remet la bibliothèque une fois.
+    resynchroniser_si_le_format_a_change(backend, &settings, premium);
     let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
     let token = settings
         .get("mozaik_access_token")
@@ -1184,5 +1253,151 @@ mod tests {
         assert!(synchro_autorisee(false, &s), "gratuit qui partage");
         s.set(CLE_PARTAGE_DE_CERCLE, "false").unwrap();
         assert!(!synchro_autorisee(false, &s), "partage coupé");
+    }
+}
+
+/// #5358 : un binaire qui enrichit le format de synchro remet la bibliothèque
+/// dans le journal UNE fois, et seulement si la synchro est autorisée.
+#[cfg(test)]
+mod format_synchro_tests {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+
+    fn ouvrir(chemin: Option<&str>) -> Arc<dyn DbBackend> {
+        let db = match chemin {
+            Some(c) => SqliteDb::open(c).unwrap(),
+            None => SqliteDb::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Une bibliothèque déjà poussée par l'ancien binaire : un artiste, un
+    /// album, deux pistes, et un journal entièrement marqué `synced = 1`.
+    fn bibliotheque_deja_poussee(backend: &Arc<dyn DbBackend>) {
+        backend
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (20, 'Miles Davis');\
+                 INSERT INTO albums (id, title, artist_id) VALUES (10, 'Kind of Blue', 20);\
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, source) \
+                 VALUES (1, 'So What', 10, 20, '/m/01.flac', 'flac', 'local'), \
+                        (2, 'Freddie Freeloader', 10, 20, '/m/02.flac', 'flac', 'local');",
+            )
+            .unwrap();
+        populate_changelog_after_scan(backend);
+        backend
+            .execute_batch("UPDATE sync_changelog SET synced = 1;")
+            .unwrap();
+        assert_eq!(pending_count(backend), 0, "prémisse : rien en attente");
+    }
+
+    fn format_note(backend: &Arc<dyn DbBackend>) -> Option<String> {
+        SettingsRepo::with_backend(backend.clone())
+            .get(CLE_FORMAT_SYNCHRO)
+            .unwrap()
+    }
+
+    #[test]
+    fn le_format_courant_vaut_deux() {
+        // album_id + MBID (#5325) = 2 ; tout ce qui précède vaut 1.
+        assert_eq!(FORMAT_SYNCHRO, 2);
+    }
+
+    #[test]
+    fn format_absent_toute_la_bibliotheque_repart_une_fois() {
+        let backend = ouvrir(None);
+        bibliotheque_deja_poussee(&backend);
+        let s = SettingsRepo::with_backend(backend.clone());
+
+        assert!(resynchroniser_si_le_format_a_change(&backend, &s, true));
+        assert_eq!(pending_by_type(&backend), (1, 1, 2), "tout est remis");
+        assert_eq!(format_note(&backend).as_deref(), Some("2"));
+
+        // Un second passage ne remet rien, pas même en double.
+        assert!(!resynchroniser_si_le_format_a_change(&backend, &s, true));
+        assert_eq!(pending_count(&backend), 4);
+    }
+
+    #[test]
+    fn format_inferieur_ou_illisible_repart_aussi() {
+        for ancien in ["1", "0", "pas-un-nombre"] {
+            let backend = ouvrir(None);
+            bibliotheque_deja_poussee(&backend);
+            let s = SettingsRepo::with_backend(backend.clone());
+            s.set(CLE_FORMAT_SYNCHRO, ancien).unwrap();
+            assert!(
+                resynchroniser_si_le_format_a_change(&backend, &s, true),
+                "format {ancien}"
+            );
+            assert_eq!(pending_count(&backend), 4, "format {ancien}");
+        }
+    }
+
+    #[test]
+    fn format_a_jour_rien_ne_repart() {
+        let backend = ouvrir(None);
+        bibliotheque_deja_poussee(&backend);
+        let s = SettingsRepo::with_backend(backend.clone());
+        s.set(CLE_FORMAT_SYNCHRO, &FORMAT_SYNCHRO.to_string())
+            .unwrap();
+
+        assert!(!resynchroniser_si_le_format_a_change(&backend, &s, true));
+        assert_eq!(pending_count(&backend), 0);
+    }
+
+    #[test]
+    fn synchro_non_autorisee_rien_et_le_reglage_n_est_pas_ecrit() {
+        let backend = ouvrir(None);
+        bibliotheque_deja_poussee(&backend);
+        let s = SettingsRepo::with_backend(backend.clone());
+
+        assert!(!resynchroniser_si_le_format_a_change(&backend, &s, false));
+        assert_eq!(pending_count(&backend), 0);
+        assert_eq!(format_note(&backend), None, "réglage non écrit");
+
+        // Le jour où un partage de cercle s'allume, la remise a bien lieu.
+        s.set(CLE_PARTAGE_DE_CERCLE, "true").unwrap();
+        assert!(resynchroniser_si_le_format_a_change(&backend, &s, false));
+        assert_eq!(pending_count(&backend), 4);
+    }
+
+    /// Le chemin réel : `cycle`, sur une base de FICHIER rouverte comme au
+    /// redémarrage. Sans jeton SSO, `cycle` ne touche pas le réseau.
+    #[tokio::test]
+    async fn le_cycle_remet_une_fois_et_un_second_demarrage_ne_repousse_plus() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune.db");
+        let chemin = chemin.to_str().unwrap();
+        let client = crate::http::client::shared();
+        let api = "http://127.0.0.1:9/api/v1/cloud-library";
+
+        // Premier démarrage du nouveau binaire.
+        {
+            let backend = ouvrir(Some(chemin));
+            bibliotheque_deja_poussee(&backend);
+
+            // Gratuit sans partage : rien, réglage non écrit.
+            assert!(cycle(&backend, client, api, false).await.is_none());
+            assert_eq!(pending_count(&backend), 0);
+            assert_eq!(format_note(&backend), None);
+
+            // Premium : la bibliothèque repart.
+            assert!(cycle(&backend, client, api, true).await.is_none());
+            assert_eq!(pending_by_type(&backend), (1, 1, 2));
+            assert_eq!(format_note(&backend).as_deref(), Some("2"));
+
+            // Le limiteur finit par tout pousser.
+            backend
+                .execute_batch("UPDATE sync_changelog SET synced = 1;")
+                .unwrap();
+        }
+
+        // Second démarrage : plus rien ne repart.
+        let backend = ouvrir(Some(chemin));
+        assert_eq!(format_note(&backend).as_deref(), Some("2"));
+        assert!(cycle(&backend, client, api, true).await.is_none());
+        assert_eq!(pending_count(&backend), 0, "rien ne repart au redémarrage");
     }
 }
