@@ -85,6 +85,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
         tune_core::playback::SILENCE_AVANT_ZONE_FIGEE,
     );
     spawn_mp3_duration_repair(state);
+    spawn_rattrapage_genres_d_album(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -168,6 +169,22 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 /// repassait jamais. Le suffixe la fait repasser une fois, avec le repli de
 /// graphie ; la requête ne rend que les pistes portant la signature de
 /// rognage, donc aucune sur une bibliothèque saine.
+/// #5314 — les albums dont le genre a été posé À LA MAIN avant que la recopie
+/// sur les pistes existe : leurs pistes gardaient les genres des balises, et
+/// Oxygen, qui lit les pistes, ne voyait pas le genre de la Bibliothèque. Une
+/// passe au démarrage, idempotente (`genre_album_pistes::rattraper_les_genres_tenus`
+/// marque chaque album traité) : sur une base déjà rattrapée, une requête.
+fn spawn_rattrapage_genres_d_album(state: &AppState) {
+    let backend = state.backend.clone();
+    tokio::spawn(async move {
+        // Hors du chemin critique du démarrage, comme la réparation des MP3.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if let Err(e) = tune_core::db::genre_album_pistes::rattraper_les_genres_tenus(&backend) {
+            warn!(error = %e, "rattrapage_genres_tenus_5314_echoue");
+        }
+    });
+}
+
 fn spawn_mp3_duration_repair(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {

@@ -672,6 +672,7 @@ async fn edit_album(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let genre_avant = album.genre.clone();
 
     if let Some(ref v) = body.title {
         album.title = v.clone();
@@ -701,7 +702,16 @@ async fn edit_album(
         }
     }
 
-    repo.update(&album).ok();
+    // #5314 — le genre CHANGÉ de l'album vaut pour ses pistes (Oxygen).
+    if repo.update(&album).is_ok()
+        && body.genre.is_some()
+        && tune_core::db::genre_album_pistes::genre_change(
+            genre_avant.as_deref(),
+            album.genre.as_deref(),
+        )
+    {
+        tune_core::db::genre_album_pistes::recopier_ou_journaliser(&state.backend, id, false);
+    }
 
     Json(json!({ "status": "ok", "album_id": id })).into_response()
 }
@@ -1802,6 +1812,12 @@ async fn fix_genres_by_artist(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -1926,6 +1942,12 @@ async fn fix_genres_by_artist_fuzzy(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2087,6 +2109,12 @@ async fn fix_genres_by_family(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2328,6 +2356,12 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
                     ],
                 )
                 .ok();
+            // #5314 — le genre trouvé (Last.fm, Discogs) vaut pour les pistes.
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 100 {
                 details.push(json!({
@@ -3466,6 +3500,56 @@ mod tests_ensemble_5236 {
         assert_eq!(
             normalize_artist_for_grouping("İlhan Ersahin Quartet"),
             normalize_artist_for_grouping("İlhan Ersahin")
+        );
+    }
+}
+
+/// #5314 — une RÉPARATION de genre d'album (ici par artiste, sans réseau) vaut
+/// pour ses pistes : c'est ce que lit la facette Genre d'Oxygen.
+#[cfg(test)]
+mod tests_genre_repare_5314 {
+    use super::*;
+
+    #[tokio::test]
+    async fn le_genre_repare_par_artiste_descend_sur_les_pistes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, genre) VALUES \
+             (1, 'Kind of Blue', 1, 'Jazz'), (2, 'Sketches', 1, '')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, genre) VALUES \
+             (1, 'So What', 1, 1, '/m/1.flac', 'Jazz'), (2, 'Saeta', 2, 1, '/m/2.flac', NULL)",
+            &[],
+        )
+        .unwrap();
+        let _ = fix_genres_by_artist(
+            State(state.clone()),
+            Query(CoherenceParams {
+                min_coherence: None,
+            }),
+        )
+        .await
+        .into_response();
+        let ligne = b
+            .query_one("SELECT genre, genres FROM tracks WHERE id = 2", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                ligne[0].as_string().as_deref(),
+                ligne[1].as_string().as_deref()
+            ),
+            (Some("Jazz"), Some(r#"["Jazz"]"#)),
+            "#5314 : le genre réparé de l'album doit descendre sur sa piste"
         );
     }
 }
