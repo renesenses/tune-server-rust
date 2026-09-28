@@ -11,8 +11,13 @@
 //! la zone qu'il regardait disparaissait, et avec elle la piste courante.
 //!
 //! Le banc : la VRAIE route (`list_zones`), une base neuve, la zone DLNA
-//! masquée par `ZoneRepo::delete` (le masquage que pose aussi l'ignorance
-//! d'un appareil), et l'état de lecture posé dans le vrai `PlaybackManager`.
+//! masquée au motif `appareil_ignore` (celui que pose l'ignorance d'un
+//! appareil, le cas du DMP-A6), et l'état de lecture posé dans le vrai
+//! `PlaybackManager`.
+//!
+//! #5322 : une zone SUPPRIMÉE par l'utilisateur, elle, ne profite pas de
+//! l'exception — voir `zone_supprimee_en_pause_disparait_5322.rs`. Ce banc
+//! masquait par `ZoneRepo::delete` ; il masque désormais au motif du terrain.
 
 use super::*;
 use tune_core::playback::NowPlaying;
@@ -26,7 +31,12 @@ fn etat_avec_zone_masquee() -> (AppState, i64) {
     let zone_id = depot
         .create("DMP-A6", Some("dlna"), Some(APPAREIL))
         .unwrap();
-    depot.delete(zone_id).unwrap();
+    depot
+        .masquer(
+            zone_id,
+            tune_core::db::zone_repo::MotifMasquage::AppareilIgnore,
+        )
+        .unwrap();
     assert!(
         !depot.list().unwrap().iter().any(|z| z.id == Some(zone_id)),
         "prémisse : la zone masquée n'est plus dans `list()`"

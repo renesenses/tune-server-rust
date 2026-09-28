@@ -573,6 +573,8 @@ mod sante_reseau_de_zone_tests;
 mod zone_masquee_en_lecture_affichee_5077;
 #[cfg(test)]
 mod zone_sans_appareil_guard;
+#[cfg(test)]
+mod zone_supprimee_en_pause_disparait_5322;
 
 pub async fn create_zone_handler(
     state: State<AppState>,

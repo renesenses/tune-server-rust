@@ -1235,15 +1235,44 @@ pub(super) async fn delete_zone(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let repo = ZoneRepo::with_backend(state.backend.clone());
+    // #5322 — la suppression ne laissait AUCUNE trace : ni l'identifiant reçu,
+    // ni ce qui avait été masqué. Un journal de testeur couvrant l'instant du
+    // clic ne pouvait donc pas dire si le DELETE était arrivé, ni sur quelle
+    // zone. On relève la zone visée AVANT de la masquer.
+    let visee = repo.get(id).ok().flatten();
+    let lecture = state.playback.get_state(id).await.state;
     match repo.delete(id) {
-        Ok(_) => {
+        Ok(0) => {
+            warn!(zone_id = id, "zone_delete_aucune_zone_de_cet_identifiant");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "zone_introuvable", "id": id})),
+            )
+                .into_response()
+        }
+        Ok(lignes) => {
+            info!(
+                zone_id = id,
+                lignes,
+                name = visee.as_ref().map(|z| z.name.as_str()).unwrap_or(""),
+                output_type = visee.as_ref().and_then(|z| z.output_type.as_deref()).unwrap_or(""),
+                device_id = visee
+                    .as_ref()
+                    .and_then(|z| z.output_device_id.as_deref())
+                    .unwrap_or(""),
+                etat_lecture = ?lecture,
+                "zone_deleted_by_user"
+            );
             state.event_bus.emit_typed(
                 tune_core::event_types::EventType::ZoneDeleted,
                 json!({"id": id}),
             );
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => {
+            warn!(zone_id = id, error = %e, "zone_delete_failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
