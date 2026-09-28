@@ -175,14 +175,15 @@ pub async fn lier_depuis_les_reglages(
 /// AVANT qu'elle efface les deux jetons (décision de Bertrand du 28/09/2026).
 ///
 /// Rien ne part s'il manque le `server_id`, la session ou le jeton de liaison :
-/// il n'y a alors rien à défaire, ou rien pour le prouver. L'erreur rendue ne
-/// porte que le statut ou la nature de la panne — jamais un jeton, jamais
-/// l'adresse.
+/// il n'y a alors rien à défaire, ou rien pour le prouver. `Ok(true)` : le
+/// cloud a délié (2xx) — et il a EFFACÉ la copie en ligne de ce serveur.
+/// `Ok(false)` : rien n'est parti. L'erreur rendue ne porte que le statut ou
+/// la nature de la panne — jamais un jeton, jamais l'adresse.
 pub async fn delier_le_serveur(
     settings: &SettingsRepo,
     http_client: &reqwest::Client,
     api: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let lire = |cle: &str| {
         settings
             .get(cle)
@@ -196,7 +197,7 @@ pub async fn delier_le_serveur(
         lire("mozaik_access_token"),
         jeton_de_liaison(settings),
     ) else {
-        return Ok(());
+        return Ok(false);
     };
     let reponse = http_client
         .delete(format!("{}/{server_id}/link", api.trim_end_matches('/')))
@@ -212,7 +213,19 @@ pub async fn delier_le_serveur(
         return Err(format!("cloud unlink HTTP {}", statut.as_u16()));
     }
     info!("cloud_server_unlinked");
-    Ok(())
+    Ok(true)
+}
+
+/// Après une déliaison RÉUSSIE, le cloud n'a plus rien de ce serveur : la
+/// copie en ligne est effacée avec la liaison. Le journal des changements,
+/// lui, se croit à jour. Oublier la dernière synchro et remettre toute la
+/// bibliothèque dans le journal fait regarnir la copie dès la reconnexion,
+/// au lieu d'une copie vide que seuls les changements futurs rempliraient.
+pub fn tout_repousser_apres_deliaison(backend: &Arc<dyn DbBackend>) {
+    SettingsRepo::with_backend(backend.clone())
+        .delete("cloud_library_last_sync")
+        .ok();
+    populate_changelog_after_scan(backend);
 }
 
 /// Le serveur a-t-il déjà un jeton de liaison ?

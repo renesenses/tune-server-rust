@@ -1271,3 +1271,10 @@ path = "tests/temperature_cpu_5189.rs"
 [[test]]
 name = "sso_deconnexion_efface_la_liaison_5326"
 path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
+
+# #2138 — la connexion SSO applique le palier ET les modules du compte. Le
+# fichier existait sans cible : `autotests = false` ne l'avait jamais compilé
+# (relevé pendant #5326, qui touche la déconnexion SSO).
+[[test]]
+name = "sso_modules_du_compte"
+path = "tests/sso_modules_du_compte.rs"

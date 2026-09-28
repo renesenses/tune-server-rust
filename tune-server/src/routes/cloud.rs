@@ -471,10 +471,14 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
     // locale : l'utilisateur qui se déconnecte doit l'être, cloud joignable ou
     // non.
     let api = format!("{}/api/v1/cloud-library", mozaik_base(&settings));
-    if let Err(e) =
-        tune_core::cloud::library_sync::delier_le_serveur(&settings, &state.http_client, &api).await
+    match tune_core::cloud::library_sync::delier_le_serveur(&settings, &state.http_client, &api)
+        .await
     {
-        warn!(error = %e, "cloud_server_unlink_failed");
+        // Le cloud a effacé la copie en ligne avec la liaison : tout repartira
+        // à la reconnexion. Sur un échec, rien n'est touché.
+        Ok(true) => tune_core::cloud::library_sync::tout_repousser_apres_deliaison(&state.backend),
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "cloud_server_unlink_failed"),
     }
     for key in [
         "mozaik_access_token",
@@ -485,6 +489,10 @@ async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
         // qu'avec la session du compte qui l'a obtenu. La prochaine connexion
         // refait la liaison.
         tune_core::cloud::library_sync::CLE_JETON_DE_LIAISON,
+        // « Ce serveur partage sa bibliothèque avec un cercle » : la déliaison
+        // coupe ces partages chez le cloud, et sans session rien ne se pousse.
+        // La prochaine lecture de `GET /` du cercle le reposera s'il y a lieu.
+        tune_core::cloud::library_sync::CLE_PARTAGE_DE_CERCLE,
     ] {
         settings.delete(key).ok();
     }
