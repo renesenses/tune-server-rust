@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
 use tune_core::license::LicenseManager;
+use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::playback::PlaybackManager;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
@@ -51,11 +52,15 @@ pub struct HostServices {
     /// n'en fournit pas : l'événement `circle.stream_revoked` part alors sur
     /// toute erreur d'une zone suivie.
     pub playback: Option<Arc<PlaybackManager>>,
+    /// T4 (#5327) : pour poser la file d'une écoute de contact et inscrire la
+    /// source `circle`, dont chaque piste reçoit son billet au moment d'être
+    /// jouée (`tune_core::source_url`). `None` : l'écoute est indisponible.
+    pub orchestrator: Option<Arc<PlaybackOrchestrator>>,
 }
 
 pub struct CirclePlugin {
     services: HostServices,
-    /// Construite au `setup` (il faut l'adresse de l'API locale et le bus).
+    /// Construite au `setup` (il faut le bus).
     ecoute: Option<Arc<ecoute::Ecoute>>,
 }
 
@@ -97,12 +102,26 @@ impl TunePlugin for CirclePlugin {
         let relais = Arc::new(relais::Relais::new(self.services.backend.clone()));
         // T4 (#5327) : l'écoute chez un contact. Le droit (Premium des deux
         // côtés compris) est jugé par le cloud à la délivrance du billet.
+        let hote: Option<Arc<dyn ecoute::HoteLecture>> =
+            match (&self.services.orchestrator, &self.services.playback) {
+                (Some(orchestrator), Some(playback)) => Some(Arc::new(ecoute::HoteOrchestrateur {
+                    backend: self.services.backend.clone(),
+                    orchestrator: orchestrator.clone(),
+                    playback: playback.clone(),
+                })),
+                _ => None,
+            };
         let ecoute = Arc::new(ecoute::Ecoute::new(
             relais.clone(),
-            &ctx.api_base_url,
             ctx.event_bus.clone(),
             self.services.playback.clone(),
+            hote,
         ));
+        if let Some(orchestrator) = &self.services.orchestrator {
+            orchestrator
+                .sources_url()
+                .inscrire(ecoute::SOURCE, ecoute.clone());
+        }
         self.ecoute = Some(ecoute.clone());
         ctx.register_router(
             routes::router(relais, self.services.license.clone()).merge(ecoute::router(ecoute)),
@@ -111,6 +130,9 @@ impl TunePlugin for CirclePlugin {
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
+        if let Some(orchestrator) = &self.services.orchestrator {
+            orchestrator.sources_url().retirer(ecoute::SOURCE);
+        }
         Ok(())
     }
 

@@ -179,6 +179,9 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 // T4 (#5327) : savoir si une zone joue encore le flux d'un
                 // contact quand elle tombe en erreur.
                 playback: Some(state.playback.clone()),
+                // T4 (#5327) : la file d'une écoute de contact, et la source
+                // `circle` dont chaque piste reçoit son billet à la lecture.
+                orchestrator: Some(state.orchestrator.clone()),
             },
         )))
         .await;
