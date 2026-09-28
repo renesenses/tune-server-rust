@@ -32,15 +32,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
+use tune_core::license::LicenseManager;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 /// Ce que l'hôte passe au greffon, explicitement, à sa construction.
 ///
-/// La base seule suffit : le jeton SSO, son jeton de rafraîchissement et
-/// l'adresse du cloud y vivent déjà, sous les clés que lisent toutes les
-/// fonctions cloud du serveur. L'interface hôte n'a pas eu à grandir.
+/// La base : le jeton SSO, son jeton de rafraîchissement et l'adresse du
+/// cloud y vivent déjà, sous les clés que lisent toutes les fonctions cloud du
+/// serveur. La licence (T2, #5325) : `GET /library-sync` dit au propriétaire
+/// si son serveur est Premium, avec le même juge que la synchro elle-même.
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
+    pub license: Arc<LicenseManager>,
 }
 
 pub struct CirclePlugin {
@@ -78,9 +81,10 @@ impl TunePlugin for CirclePlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(routes::router(Arc::new(relais::Relais::new(
-            self.services.backend.clone(),
-        ))));
+        ctx.register_router(routes::router(
+            Arc::new(relais::Relais::new(self.services.backend.clone())),
+            self.services.license.clone(),
+        ));
         Ok(())
     }
 

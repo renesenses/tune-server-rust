@@ -2112,6 +2112,17 @@ async fn refresh_account_premium(
             )
             .ok();
 
+        // Liaison du serveur au compte (#5325), si elle manque : un serveur
+        // connecté avant la version qui la demande à la connexion SSO.
+        if !tune_core::cloud::library_sync::serveur_lie(&settings) {
+            tune_core::cloud::library_sync::lier_depuis_les_reglages(
+                backend,
+                tune_core::http::client::shared(),
+            )
+            .await
+            .ok();
+        }
+
         // 🔴 C'est ICI que le défaut devenait permanent.
         //
         // Ce battement relit le jeton GLOBAL. Une fois celui-ci écrasé par un
