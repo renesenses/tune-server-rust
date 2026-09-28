@@ -8,6 +8,9 @@ use crate::event_bus::EventBus;
 use crate::outputs::mock::MockOutput;
 use std::sync::Arc;
 
+#[path = "radio_profondeur_tests.rs"]
+mod radio_profondeur_tests;
+
 #[tokio::test]
 async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};

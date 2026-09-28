@@ -70,6 +70,7 @@ async fn preparer_contre_la_station(
             levels_tx: &None,
             rt: &rt,
             strict_bitperfect,
+            sortie_locale: false,
         };
         match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
             Ok(_) => Ok(()),

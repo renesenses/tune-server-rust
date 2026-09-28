@@ -46,6 +46,11 @@ pub(super) fn emit_radio_playback_error(
     error: &str,
 ) {
     let Some(bus) = bus else { return };
+    if let Some(refus) = crate::audio::bitperfect_strict::RefusProfondeur::depuis_sentinelle(error)
+    {
+        bus.emit("zone.playback_error", refus.charge_utile(zone_id));
+        return;
+    }
     // Le flux répond, mais ce n'est pas de l'audio : on dit ce qui est arrivé
     // en clair plutôt que de recopier une erreur de décodeur.
     // #3973 — un refus « bit-perfect strict » porte son code et ses deux
@@ -209,7 +214,7 @@ pub(crate) fn is_hls_manifest(url: &str, content_type: &str) -> bool {
         .eq_ignore_ascii_case("application/vnd.apple.mpegurl")
 }
 
-/// Applique l'EQ au PCM radio déjà décodé, avant sa quantification en i16.
+/// Applique l'EQ au PCM radio déjà décodé, avant sa quantification au format de sortie.
 /// `None` est une identité stricte : les chemins sans EQ conservent exactement
 /// les mêmes échantillons et ne paient aucun traitement supplémentaire.
 pub(super) fn apply_radio_eq(
@@ -245,7 +250,7 @@ struct EtatRadio {
     // Format of the first successful connection. A reconnect that returns a
     // different rate/channel layout would feed PCM that doesn't match the WAV
     // header already sent to the renderer, so we bail to a fresh session instead.
-    expected_format: Option<(u16, u32)>,
+    expected_format: Option<(u16, u32, u16)>,
     // Construit une seule fois au format réellement détecté, puis conservé à
     // travers les reconnexions compatibles : réinitialiser les biquads à chaque
     // coupure amont créerait un transitoire audible (#2063).
@@ -271,6 +276,7 @@ struct CanauxRadio<'a> {
     /// #3973 — « bit-perfect strict » de la zone : une cadence que le décodeur
     /// devrait relever (`renderer_safe_wav_rate`) est refusée, pas convertie.
     strict_bitperfect: bool,
+    sortie_locale: bool,
 }
 
 /// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
@@ -287,6 +293,7 @@ struct Sonde {
 /// Le format de sortie décidé pour une connexion (voir `renderer_safe_wav_rate`).
 struct SortieRadio {
     output_sample_rate: u32,
+    output_bit_depth: u16,
     needs_resample: bool,
 }
 
@@ -341,6 +348,33 @@ pub(super) fn decode_radio_stream_to_pcm(
     // profil de départ reste celui du flux entier (sortie locale, Bandcamp).
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
 ) -> Result<(), String> {
+    decode_radio_stream_to_pcm_avec_profondeur(
+        url,
+        tx,
+        data_ready,
+        session,
+        eq_profile,
+        levels_tx,
+        strict_bitperfect,
+        en_vol,
+        false,
+    )
+}
+
+/// Seule la sortie locale relève le PCM à 24 bits quand la source le demande.
+/// Les autres appelants conservent leur contrat réseau 16 bits (#1654).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
+    url: String,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    session: std::sync::Arc<crate::http::streamer::StreamSession>,
+    eq_profile: Option<crate::audio::eq::EqProfile>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
+    strict_bitperfect: bool,
+    en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
+    sortie_locale: bool,
+) -> Result<(), String> {
     // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
     // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
     // rafraîchissement de playlist, rien de ce qu'un direct HLS exige. Sans
@@ -376,6 +410,7 @@ pub(super) fn decode_radio_stream_to_pcm(
         levels_tx: &levels_tx,
         rt: &rt,
         strict_bitperfect,
+        sortie_locale,
     };
 
     'reconnect: loop {
@@ -603,16 +638,27 @@ fn preparer_la_sortie(
 
     let source_channels = sonde.source_channels;
     let source_sample_rate = sonde.source_sample_rate;
+    let output_bit_depth =
+        if canaux.sortie_locale && sonde.source_info.bit_depth.is_some_and(|bits| bits > 16) {
+            24
+        } else {
+            16
+        };
 
     // Guard against a reconnect changing the audio format underneath the
     // WAV header already advertised to the renderer.
     match etat.expected_format {
-        None => etat.expected_format = Some((source_channels, source_sample_rate)),
-        Some((ch, sr)) if (ch, sr) != (source_channels, source_sample_rate) => {
+        None => {
+            etat.expected_format = Some((source_channels, source_sample_rate, output_bit_depth))
+        }
+        Some((ch, sr, bd))
+            if (ch, sr, bd) != (source_channels, source_sample_rate, output_bit_depth) =>
+        {
             warn!(
                 url = %url,
                 expected_ch = ch, expected_sr = sr,
                 got_ch = source_channels, got_sr = source_sample_rate,
+                expected_bits = bd, got_bits = output_bit_depth,
                 "radio_reconnect_format_changed_bailing"
             );
             return Err(SuiteRadio::Rendre(Ok(())));
@@ -642,6 +688,17 @@ fn preparer_la_sortie(
         return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
     }
     let needs_resample = output_sample_rate != source_sample_rate;
+    if let Some(refus) = crate::audio::bitperfect_strict::refus_reduction_profondeur(
+        sonde.source_info.bit_depth,
+        output_bit_depth,
+        canaux.strict_bitperfect,
+    ) {
+        return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
+    }
+    // Un morceau se termine sur une trame entière : 32 768 n'est pas
+    // divisible par les six octets d'une trame stéréo 24 bits.
+    let frame_bytes = usize::from(source_channels) * usize::from(output_bit_depth / 8);
+    etat.chunk_size = (32768 / frame_bytes).max(1) * frame_bytes;
     if !etat.eq_de_depart_pose {
         etat.eq_de_depart_pose = true;
         etat.radio_eq = canaux.eq_profile.as_ref().and_then(|profile| {
@@ -657,9 +714,11 @@ fn preparer_la_sortie(
     // that matches the PCM we actually feed (FIP is 48000 → advertised as
     // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
     // BEFORE first_chunk so the header, emitted after data_ready, is right.
-    canaux
-        .session
-        .publish_detected_output_format(output_sample_rate, source_channels);
+    canaux.session.publish_detected_pcm_format(
+        output_sample_rate,
+        source_channels,
+        output_bit_depth,
+    );
 
     // Measure the reconnect gap: how long the session went without fresh
     // PCM. A long gap can starve the renderer's HTTP read.
@@ -668,6 +727,8 @@ fn preparer_la_sortie(
         channels = source_channels,
         sample_rate = source_sample_rate,
         output_sample_rate = output_sample_rate,
+        source_bit_depth = ?sonde.source_info.bit_depth,
+        output_bit_depth,
         resampled = needs_resample,
         reconnect = etat.reconnects,
         gap_ms = ?gap_ms,
@@ -685,12 +746,13 @@ fn preparer_la_sortie(
 
     Ok(SortieRadio {
         output_sample_rate,
+        output_bit_depth,
         needs_resample,
     })
 }
 
 /// Troisième temps, le corps d'UNE itération de la boucle de décodage : un
-/// paquet lu, décodé, rééchantillonné, égalisé, quantifié en i16, puis servi
+/// paquet lu, décodé, rééchantillonné, égalisé, quantifié en PCM 16 ou 24 bits, puis servi
 /// par morceaux de `chunk_size` octets. `pcm_buf` traverse les itérations et
 /// les reconnexions.
 fn decoder_un_paquet(
@@ -737,7 +799,7 @@ fn decoder_un_paquet(
         }
     };
 
-    // Convert decoded audio buffer to interleaved 16-bit PCM bytes
+    // Convert decoded audio buffer to interleaved samples before output quantization
     let channels = decoded.spec().channels().count();
     let frames = decoded.frames();
 
@@ -745,7 +807,7 @@ fn decoder_un_paquet(
     decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
 
     // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
-    // before packing to i16, so the bytes match the advertised WAV
+    // before packing the output PCM, so the bytes match the advertised WAV
     // header. No-op (single move) when the stream is already 44.1/48.
     if sortie.needs_resample {
         interleaved = crate::audio::simple_resample(
@@ -757,7 +819,7 @@ fn decoder_un_paquet(
     }
 
     // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
-    // le profil de zone. Le traitement se fait en f32 avant i16, comme
+    // le profil de zone. Le traitement se fait en f32 avant quantification, comme
     // les autres chemins DSP, et les VU observent ainsi le signal final.
     // #4407 — un égaliseur déposé en vol prend la relève à CE paquet :
     // même session, même en-tête WAV, aucun nouveau `SetAVTransportURI`.
@@ -770,23 +832,31 @@ fn decoder_un_paquet(
     }
     apply_radio_eq(&mut etat.radio_eq, &mut interleaved);
 
-    let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
-    for sample in &interleaved {
-        let s16: i16 = (*sample).into_sample();
-        packet_buf.extend_from_slice(&s16.to_le_bytes());
+    let mut packet_buf: Vec<u8> =
+        Vec::with_capacity(interleaved.len() * usize::from(sortie.output_bit_depth / 8));
+    if sortie.output_bit_depth == 24 {
+        for sample in &interleaved {
+            let s32: i32 = (*sample).into_sample();
+            packet_buf.extend_from_slice(&s32.to_le_bytes()[1..]);
+        }
+    } else {
+        for sample in &interleaved {
+            let s16: i16 = (*sample).into_sample();
+            packet_buf.extend_from_slice(&s16.to_le_bytes());
+        }
     }
 
     etat.pcm_buf.extend_from_slice(&packet_buf);
 
     while etat.pcm_buf.len() >= etat.chunk_size {
         let chunk: Vec<u8> = etat.pcm_buf.drain(..etat.chunk_size).collect();
-        // VU-mètres : tappe le PCM 16-bit avant de le servir (canal
+        // VU-mètres : tappe le PCM au format de sortie avant de le servir (canal
         // séparé, non bloquant — n'affecte pas le flux du renderer).
         if let Some(ltx) = canaux.levels_tx {
             crate::audio::tap::send_windowed_pcm(
                 ltx,
                 &chunk,
-                16,
+                sortie.output_bit_depth,
                 channels as u16,
                 sortie.output_sample_rate,
             );
