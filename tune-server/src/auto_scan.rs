@@ -2207,6 +2207,15 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         .into_iter()
         .filter(|c| !ecarte_du_surveillant(&c.path, reglages.exclusions))
         .collect();
+    // #4896 — un fichier renommé sur place garde sa ligne, avant que son
+    // ancien nom ne soit traité comme une disparition.
+    if fichiers
+        .iter()
+        .any(|c| c.change_type == ChangeType::Deleted)
+    {
+        let _porte = porte_du_scan(db);
+        apparier_les_fichiers_renommes(db, &mut fichiers);
+    }
     // #5073 — les dossiers dont une feuille CUE ou un fichier audio a changé
     // sont relus par le découpage du scan, AVANT d'importer quoi que ce soit :
     // un FLAC que sa feuille découpe n'est pas une piste à lui seul.
@@ -2305,6 +2314,124 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         suivre_les_images_de_pochette(db, &images, reglages.exclusions);
     }
     a_relire
+}
+
+/// #4896 — un fichier audio RENOMMÉ dans son dossier garde sa ligne.
+///
+/// Le lot porte l'ancien nom en `Deleted` (il n'existe plus) et le nouveau en
+/// `Added` ou `Modified`. Traités chacun de leur côté, ils retiraient la piste
+/// puis en importaient une neuve : identifiant, favoris, écoutes et étiquettes
+/// perdus, comme pour un dossier renommé avant #4896.
+///
+/// Un couple n'est apparié que s'il n'y a aucun doute : même dossier, un
+/// nouveau nom que la base ne connaît pas, même taille que la ligne, même
+/// empreinte audio (version courante), et un seul candidat de chaque côté.
+/// L'ancien fichier n'existant plus, la comparaison octet par octet est
+/// impossible ; l'empreinte (taille comprise) en tient lieu, et le doute
+/// retombe sur le chemin d'avant (retrait puis import). Un fichier déplacé
+/// dans un AUTRE dossier n'est pas apparié : il change d'album.
+///
+/// L'ancien nom quitte le lot ; le nouveau y reste, et sa relecture le saute
+/// si sa taille et sa date n'ont pas bougé.
+fn apparier_les_fichiers_renommes(
+    db: &Arc<dyn DbBackend>,
+    fichiers: &mut Vec<tune_core::scanner::watcher::FileChange>,
+) {
+    use tune_core::scanner::hasher::{compute_audio_hash, is_current_audio_hash};
+    use tune_core::scanner::watcher::ChangeType;
+    let track_repo = TrackRepo::with_backend(db.clone());
+    // (chemin, dossier, taille, empreinte) des nouveaux noms inconnus.
+    let mut arrivees: Vec<(String, std::path::PathBuf, i64, Option<String>)> = Vec::new();
+    for c in fichiers.iter() {
+        if !matches!(c.change_type, ChangeType::Added | ChangeType::Modified) {
+            continue;
+        }
+        let chemin = std::path::Path::new(&c.path);
+        let (Some(dossier), Ok(meta)) = (chemin.parent(), std::fs::metadata(chemin)) else {
+            continue;
+        };
+        if !meta.is_file()
+            || !matches!(track_repo.get_by_path(&c.path), Ok(None))
+            || tune_core::library::exemplaires::est_un_exemplaire(&**db, &c.path)
+        {
+            continue;
+        }
+        arrivees.push((
+            c.path.clone(),
+            dossier.to_path_buf(),
+            meta.len() as i64,
+            None,
+        ));
+    }
+    if arrivees.is_empty() {
+        return;
+    }
+    let mut couples: Vec<(String, String)> = Vec::new();
+    for c in fichiers.iter() {
+        if c.change_type != ChangeType::Deleted || std::fs::symlink_metadata(&c.path).is_ok() {
+            continue;
+        }
+        let Ok(Some(piste)) = track_repo.get_by_path(&c.path) else {
+            continue;
+        };
+        let (Some(taille), Some(empreinte)) = (piste.file_size, piste.audio_hash.as_deref()) else {
+            continue;
+        };
+        if !is_current_audio_hash(empreinte) {
+            continue;
+        }
+        let Some(dossier) = std::path::Path::new(&c.path).parent() else {
+            continue;
+        };
+        let mut candidats = Vec::new();
+        for arrivee in arrivees.iter_mut() {
+            if arrivee.1 != dossier || arrivee.2 != taille {
+                continue;
+            }
+            if arrivee.3.is_none() {
+                arrivee.3 = compute_audio_hash(std::path::Path::new(&arrivee.0));
+            }
+            if arrivee.3.as_deref() == Some(empreinte) {
+                candidats.push(arrivee.0.clone());
+            }
+        }
+        if let [nouveau] = candidats.as_slice() {
+            couples.push((c.path.clone(), nouveau.clone()));
+        }
+    }
+    // Un nouveau nom réclamé par deux anciens : on ne choisit pas.
+    let mut vus = std::collections::HashMap::<&str, usize>::new();
+    for (_, nouveau) in &couples {
+        *vus.entry(nouveau.as_str()).or_default() += 1;
+    }
+    let couples: Vec<(String, String)> = couples
+        .iter()
+        .filter(|(_, nouveau)| vus.get(nouveau.as_str()) == Some(&1))
+        .cloned()
+        .collect();
+    if couples.is_empty() {
+        return;
+    }
+    match track_repo.deplacer_fichiers(&couples) {
+        Ok(n) => {
+            let exemplaires =
+                tune_core::library::exemplaires::deplacer_les_exemplaires(&**db, &couples);
+            info!(
+                fichiers = n,
+                exemplaires, "watcher_fichier_renomme — la piste garde sa ligne (#4896)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "watcher_fichier_renomme_echoue");
+            return;
+        }
+    }
+    // Seuls les anciens noms effectivement déplacés quittent le lot.
+    fichiers.retain(|c| {
+        c.change_type != ChangeType::Deleted
+            || !couples.iter().any(|(ancien, _)| *ancien == c.path)
+            || matches!(track_repo.get_by_path(&c.path), Ok(Some(_)))
+    });
 }
 
 /// Un chemin que le surveillant ignore : exclu des scans, ou fichier
@@ -2923,6 +3050,10 @@ mod surveillant_retouche_tests_4896;
 #[cfg(test)]
 #[path = "surveillant_dossiers_tests_4896.rs"]
 mod surveillant_dossiers_tests_4896;
+
+#[cfg(test)]
+#[path = "surveillant_fichier_renomme_tests_4896.rs"]
+mod surveillant_fichier_renomme_tests_4896;
 
 #[cfg(test)]
 #[path = "scan_realigne_tests_4896.rs"]
