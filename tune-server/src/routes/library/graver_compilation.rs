@@ -77,10 +77,25 @@ pub(crate) fn conteneur_relu(chemin: &str) -> bool {
 }
 
 /// Les pistes locales d'un album, avec la valeur du drapeau à graver.
-const SQL_PISTES: &str = "SELECT COALESCE(al.is_compilation, 0), t.file_path \
-     FROM albums al JOIN tracks t ON t.album_id = al.id \
-     WHERE al.id = ?1 AND t.file_path IS NOT NULL AND t.file_path != '' \
-     ORDER BY t.id";
+///
+/// 🔴 « Locales » se lit sur la SOURCE, pas sur le chemin de fichier. Le
+/// prédicat a longtemps été `t.file_path IS NOT NULL AND t.file_path != ''`
+/// seul, ce qui prenait le chemin pour un substitut de « local » : rien
+/// n'interdit à une source distante d'en porter un, et cette route **écrit
+/// dans les fichiers de l'utilisateur**. Les deux conditions restent, elles ne
+/// répondent pas à la même question — « la ligne est locale » et « le fichier
+/// est ouvrable ». Forme retenue :
+/// [`tune_core::db::track_repo::sql::est_local`].
+fn sql_pistes() -> String {
+    format!(
+        "SELECT COALESCE(al.is_compilation, 0), t.file_path \
+         FROM albums al JOIN tracks t ON t.album_id = al.id \
+         WHERE al.id = ?1 AND {piste_locale} \
+           AND t.file_path IS NOT NULL AND t.file_path != '' \
+         ORDER BY t.id",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+    )
+}
 
 /// POST /library/albums/compilation/graver
 pub(crate) async fn graver_compilation(
@@ -96,7 +111,7 @@ pub(crate) async fn graver_compilation(
         // `?1` tel quel : le dos PostgreSQL traduit les jetons lui-même
         // (`translate_placeholders`), comme pour tous les dépôts.
         let params: [&dyn ToSqlValue; 1] = [id];
-        let rows = match state.backend.query_many(SQL_PISTES, &params) {
+        let rows = match state.backend.query_many(&sql_pistes(), &params) {
             Ok(r) => r,
             Err(e) => {
                 warn!(album_id = id, erreur = %e, "graver_compilation_sql");
@@ -236,5 +251,73 @@ mod tests {
         assert!(!conteneur_relu("/musique/piste.wav"));
         assert!(!conteneur_relu("/musique/piste.dsf"));
         assert!(!conteneur_relu("/musique/piste.dff"));
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use crate::state::AppState;
+
+    fn banc() -> AppState {
+        let s = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &s.backend;
+        b.execute(
+            "INSERT INTO albums (id, title, is_compilation) VALUES (1, 'Anthologie', 1)",
+            &[],
+        )
+        .expect("album");
+        // 🔴 La piste distante PORTE un chemin : c'est le cas que la base de
+        // Bertrand ne contient pas (0 des 49 440 pistes `upnp` du .18 en a un),
+        // et sans lui le filtre par chemin rendrait le même résultat.
+        for (id, chemin, source) in [
+            (10i64, "/m/anthologie/01.flac", "local"),
+            (11, "/u/anthologie/01.flac", "upnp"),
+        ] {
+            let c = chemin.to_string();
+            let s2 = source.to_string();
+            b.execute(
+                "INSERT INTO tracks (id, title, album_id, file_path, source) \
+                 VALUES (?1, ?2, 1, ?3, ?4)",
+                &[&id as &dyn ToSqlValue, &format!("p{id}"), &c, &s2],
+            )
+            .expect("piste");
+        }
+        s
+    }
+
+    fn pistes_retenues(s: &AppState) -> Vec<String> {
+        let id = 1i64;
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        s.backend
+            .query_many(&sql_pistes(), &params)
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+            .collect()
+    }
+
+    /// 🔴 Cette route ÉCRIT DANS LES FICHIERS DE L'UTILISATEUR. Une piste non
+    /// locale qui porte un chemin ne doit pas y entrer.
+    #[test]
+    fn la_gravure_ecarte_une_piste_non_locale_qui_porte_un_chemin() {
+        let s = banc();
+        let vus = pistes_retenues(&s);
+        assert!(
+            !vus.iter().any(|c| c.starts_with("/u/")),
+            "la piste `source = upnp` ne doit PAS être gravée — retenues {vus:?}"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn la_gravure_garde_la_piste_locale() {
+        let s = banc();
+        let vus = pistes_retenues(&s);
+        assert!(
+            vus.iter().any(|c| c == "/m/anthologie/01.flac"),
+            "la piste LOCALE doit rester gravée — retenues {vus:?}"
+        );
     }
 }

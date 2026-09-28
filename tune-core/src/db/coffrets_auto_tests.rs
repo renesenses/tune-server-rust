@@ -393,3 +393,131 @@ fn sans_la_garde_le_disque_3_serait_absorbe() {
     passe(&db).unwrap();
     assert!(!existe(&db, b.box3), "la garde n'était pas la seule raison");
 }
+
+// ---------------------------------------------------------------------------
+// « Bibliothèque LOCALE » — Bertrand, 27/09/2026
+// ---------------------------------------------------------------------------
+
+/// Un disque dont les pistes ET l'album portent une source donnée, avec de
+/// vrais chemins de fichier.
+///
+/// 🔴 C'est le cas que la base de Bertrand ne contient PAS aujourd'hui — sur
+/// le .18, aucune des 49 440 pistes `source = 'upnp'` ne porte de chemin. Il
+/// faut donc le fabriquer ici, sinon on ne prouve rien : le filtre par chemin
+/// de fichier et le filtre par source rendraient le même résultat.
+fn disque_de_source(
+    db: &Arc<dyn DbBackend>,
+    titre: &str,
+    artiste: i64,
+    dossier: &str,
+    n: i32,
+    disque_tague: i32,
+    source: &str,
+) -> i64 {
+    let id = disque(db, titre, artiste, dossier, n, disque_tague);
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET source = {p1} WHERE album_id = {p2}"),
+        &[&source.to_string() as &dyn ToSqlValue, &id],
+    )
+    .unwrap();
+    db.execute(
+        &format!("UPDATE albums SET source = {p1} WHERE id = {p2}"),
+        &[&source.to_string() as &dyn ToSqlValue, &id],
+    )
+    .unwrap();
+    id
+}
+
+/// Deux coffrets éclatés de la même forme, l'un LOCAL, l'autre `upnp`, tous
+/// deux avec des chemins de fichier.
+struct BancDeuxSources {
+    local_1: i64,
+    local_2: i64,
+    distant_1: i64,
+    distant_2: i64,
+}
+
+fn poser_deux_sources(db: &Arc<dyn DbBackend>) -> BancDeuxSources {
+    let ar = artiste(db, "Depeche Mode");
+    BancDeuxSources {
+        local_1: disque_de_source(db, "101, Disc 1", ar, "/m/101/Disc 1", 3, 1, "local"),
+        local_2: disque_de_source(db, "101, Disc 2", ar, "/m/101/Disc 2", 3, 1, "local"),
+        distant_1: disque_de_source(db, "Violator, Disc 1", ar, "/u/V/Disc 1", 3, 1, "upnp"),
+        distant_2: disque_de_source(db, "Violator, Disc 2", ar, "/u/V/Disc 2", 3, 1, "upnp"),
+    }
+}
+
+/// 🔴 L'inventaire — celui que lit l'écran des coffrets éclatés, le geste de
+/// regroupement ET la passe automatique — ne voit que la bibliothèque LOCALE.
+#[test]
+fn l_inventaire_ecarte_un_album_non_local_qui_porte_des_chemins() {
+    let db = sqlite();
+    let b = poser_deux_sources(&db);
+    let inv = inventaire(&db).unwrap();
+    let vus: Vec<i64> = inv.albums.iter().map(|a| a.id).collect();
+    for id in [b.distant_1, b.distant_2] {
+        assert!(
+            !vus.contains(&id),
+            "l'album {id} est `source = upnp` : il ne doit PAS entrer dans \
+             l'inventaire, même avec des chemins de fichier — vus {vus:?}"
+        );
+    }
+}
+
+/// L'AUTRE sens, sans quoi un filtre qui rejette tout serait vert.
+#[test]
+fn l_inventaire_garde_les_albums_locaux() {
+    let db = sqlite();
+    let b = poser_deux_sources(&db);
+    let inv = inventaire(&db).unwrap();
+    let vus: Vec<i64> = inv.albums.iter().map(|a| a.id).collect();
+    for id in [b.local_1, b.local_2] {
+        assert!(
+            vus.contains(&id),
+            "l'album LOCAL {id} doit entrer dans l'inventaire — vus {vus:?}"
+        );
+    }
+    // Et le coffret local est bien DÉTECTÉ : la sélection n'a pas seulement
+    // laissé passer les lignes, elle laisse la passe faire son travail.
+    let trouves = coffrets(&inv.albums);
+    assert_eq!(
+        trouves.len(),
+        1,
+        "un seul coffret éclaté, le local — trouvés {:?}",
+        trouves.iter().map(|c| &c.titre).collect::<Vec<_>>()
+    );
+}
+
+/// 🔴 La liste de l'onglet « Coffrets » (`GET /library/coffrets`) : même règle.
+#[test]
+fn lister_ecarte_un_coffret_non_local_qui_porte_des_chemins() {
+    let db = sqlite();
+    let ar = artiste(&db, "Depeche Mode");
+    // Un coffret RÉUNI : un seul album, deux numéros de disque, deux dossiers.
+    let local = disque_de_source(&db, "Box locale", ar, "/m/Box/CD1", 2, 1, "local");
+    let distant = disque_de_source(&db, "Box distante", ar, "/u/Box/CD1", 2, 1, "upnp");
+    for (id, dossier) in [(local, "/m/Box/CD2"), (distant, "/u/Box/CD2")] {
+        let (p1, p2) = placeholders(&db);
+        db.execute(
+            &format!(
+                "UPDATE tracks SET disc_number = 2, file_path = {p1} WHERE album_id = {p2} AND track_number = 2"
+            ),
+            &[&format!("{dossier}/02.flac") as &dyn ToSqlValue, &id],
+        )
+        .unwrap();
+    }
+    let vus: Vec<i64> = lister(&db)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.album_id)
+        .collect();
+    assert!(
+        !vus.contains(&distant),
+        "le coffret {distant} est `source = upnp` : il ne doit PAS être listé — vus {vus:?}"
+    );
+    assert!(
+        vus.contains(&local),
+        "le coffret LOCAL {local} doit être listé — vus {vus:?}"
+    );
+}
