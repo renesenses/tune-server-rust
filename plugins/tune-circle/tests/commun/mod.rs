@@ -136,6 +136,20 @@ pub struct Faux {
     pub premium_requis: bool,
     /// L'en-tête `X-Tune-Server-Token` de chaque tentative de `sync`.
     pub entetes_de_synchro: Vec<Option<String>>,
+    // T3 (#5326) ------------------------------------------------------------
+    /// Les ensembles partagés du détenteur, forme « propriétaire » du
+    /// contrat : `{ id, circle_id, kind, source_id, name, server_id,
+    /// profile_id, digest, count }`.
+    pub ensembles: Vec<Value>,
+    pub prochain_ensemble_id: i64,
+    /// Chaque corps reçu par `PUT …/sets/{kind}/{source_id}`, dans l'ordre.
+    pub corps_des_ensembles: Vec<Value>,
+    /// `DELETE …/sets/{kind}/{source_id}` reçus : (circle_id, kind, source_id).
+    pub ensembles_retires: Vec<(String, String, String)>,
+    /// Appels reçus par `GET /sets` (le battement).
+    pub lectures_des_ensembles: usize,
+    /// Ce qu'un contact lit sous `/contacts/{user_id}/sets…`.
+    pub rayons_partages: Vec<Value>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -197,6 +211,14 @@ impl Faux {
             jeton_toujours_refuse: false,
             premium_requis: false,
             entetes_de_synchro: Vec::new(),
+            ensembles: Vec::new(),
+            prochain_ensemble_id: 500,
+            corps_des_ensembles: Vec::new(),
+            ensembles_retires: Vec::new(),
+            lectures_des_ensembles: 0,
+            rayons_partages: vec![json!({ "id": 900, "kind": "tag", "name": "Jazz ECM",
+                                          "count": 1, "counts": { "albums": 1, "tracks": 0,
+                                          "artists": 0, "streaming": 0 } })],
         }
     }
 
@@ -779,6 +801,177 @@ async fn lier(
         .into_response()
 }
 
+// T3 (#5326) ---------------------------------------------------------------
+
+/// `GET /circles/{id}/sets` : les ensembles de CE cercle du détenteur.
+async fn ensembles_du_cercle(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let f = e.lock().unwrap();
+    if position(&f.circles, "id", &id).is_none() {
+        return introuvable();
+    }
+    let liste: Vec<Value> = f
+        .ensembles
+        .iter()
+        .filter(|s| meme_id(&s["circle_id"], &id))
+        .cloned()
+        .collect();
+    Json(json!(liste)).into_response()
+}
+
+/// `GET /sets` : tous les ensembles du détenteur (le battement).
+async fn tous_les_ensembles(State(e): State<Partage>, h: HeaderMap) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.lectures_des_ensembles += 1;
+    Json(json!(f.ensembles)).into_response()
+}
+
+/// `PUT /circles/{id}/sets/{kind}/{source_id}` : crée ou remplace.
+async fn partager_un_ensemble(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((id, kind, source)): Path<(String, String, String)>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    f.corps_des_ensembles.push(v.clone());
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    let circle_id = f.circles[k]["id"].as_i64().unwrap();
+    let Some((_, partage)) = f.partages.iter().find(|(c, _)| *c == circle_id).cloned() else {
+        return refus(StatusCode::CONFLICT, "library_not_shared");
+    };
+    if v["server_id"].as_str() != Some(partage.as_str()) {
+        return introuvable();
+    }
+    let source_id: i64 = source.parse().unwrap();
+    let compte = ["albums", "tracks", "artists", "streaming"]
+        .iter()
+        .map(|c| v[*c].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    let existant = f.ensembles.iter().position(|s| {
+        s["circle_id"] == circle_id && s["kind"] == kind.as_str() && s["source_id"] == source_id
+    });
+    let set_id = match existant {
+        Some(i) => f.ensembles.remove(i)["id"].as_i64().unwrap(),
+        None => {
+            f.prochain_ensemble_id += 1;
+            f.prochain_ensemble_id
+        }
+    };
+    let ensemble = json!({
+        "id": set_id, "circle_id": circle_id, "kind": kind, "source_id": source_id,
+        "name": v["name"], "server_id": v["server_id"], "profile_id": v["profile_id"],
+        "digest": v["digest"], "count": compte,
+    });
+    f.ensembles.push(ensemble.clone());
+    Json(ensemble).into_response()
+}
+
+async fn retirer_un_ensemble(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((id, kind, source)): Path<(String, String, String)>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    if position(&f.circles, "id", &id).is_none() {
+        return introuvable();
+    }
+    f.ensembles_retires
+        .push((id.clone(), kind.clone(), source.clone()));
+    f.ensembles.retain(|s| {
+        !(meme_id(&s["circle_id"], &id)
+            && s["kind"] == kind.as_str()
+            && meme_id(&s["source_id"], &source))
+    });
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// Les lectures d'un contact : le même 404 pour un non-contact, un contact
+/// révoqué ou retiré, et un `set_id` inconnu.
+async fn rayons_de(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(uid): Path<String>,
+    RawQuery(requete): RawQuery,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.derniere_requete = requete;
+    if !f.contacts_qui_partagent.iter().any(|c| c == &uid) {
+        return introuvable();
+    }
+    Json(json!(f.rayons_partages)).into_response()
+}
+
+async fn un_rayon_de(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((uid, set_id)): Path<(String, String)>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let f = e.lock().unwrap();
+    if !f.contacts_qui_partagent.iter().any(|c| c == &uid) {
+        return introuvable();
+    }
+    match f
+        .rayons_partages
+        .iter()
+        .find(|r| meme_id(&r["id"], &set_id))
+    {
+        Some(r) => Json(r.clone()).into_response(),
+        None => introuvable(),
+    }
+}
+
+async fn membres_d_un_rayon_de(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((uid, set_id, quoi)): Path<(String, String, String)>,
+    RawQuery(requete): RawQuery,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.derniere_requete = requete;
+    if !f.contacts_qui_partagent.iter().any(|c| c == &uid)
+        || !f.rayons_partages.iter().any(|r| meme_id(&r["id"], &set_id))
+    {
+        return introuvable();
+    }
+    match quoi.as_str() {
+        "streaming" => Json(json!({ "data": [
+            { "type": "album", "title": "A Love Supreme", "artist_name": "John Coltrane",
+              "qobuz_id": "q-123" }
+        ], "current_page": 1, "last_page": 1, "total": 1 }))
+        .into_response(),
+        "albums" | "tracks" | "artists" => Json(catalogue(&quoi)).into_response(),
+        _ => introuvable(),
+    }
+}
+
 pub const MESSAGE_SERVER_ID: &str = "The server id field must be a string.";
 
 /// `POST /oauth/token`, `grant_type=refresh_token` : fait tourner la paire.
@@ -834,6 +1027,21 @@ pub async fn demarrer() -> Serveur {
             "/api/v1/circle/contacts/{user_id}/library/albums/{album_id}/tracks",
             get(pistes_de_l_album),
         )
+        .route("/api/v1/circle/sets", get(tous_les_ensembles))
+        .route("/api/v1/circle/circles/{id}/sets", get(ensembles_du_cercle))
+        .route(
+            "/api/v1/circle/circles/{id}/sets/{kind}/{source_id}",
+            put(partager_un_ensemble).delete(retirer_un_ensemble),
+        )
+        .route("/api/v1/circle/contacts/{user_id}/sets", get(rayons_de))
+        .route(
+            "/api/v1/circle/contacts/{user_id}/sets/{set_id}",
+            get(un_rayon_de),
+        )
+        .route(
+            "/api/v1/circle/contacts/{user_id}/sets/{set_id}/{quoi}",
+            get(membres_d_un_rayon_de),
+        )
         .route("/api/v1/cloud-library/{server_id}/sync", post(synchro))
         .route("/api/v1/cloud-library/{server_id}/link", post(lier))
         .route("/oauth/token", post(jeton))
@@ -877,6 +1085,62 @@ pub fn app(backend: Arc<dyn DbBackend>) -> Router {
     tune_circle::routes::router(Arc::new(tune_circle::relais::Relais::new(backend)), license)
 }
 
+/// L'hôte des rayons, pour les bancs : le profil vient de `X-Profile-Id`
+/// (1 sinon), et une collection intelligente rend ce que le banc a rangé
+/// dans [`FauxHote::collections`] pour (id, profil).
+#[derive(Default)]
+pub struct FauxHote {
+    pub collections: Mutex<Vec<((i64, i64), tune_circle::ensembles::Membres)>>,
+    /// Chaque résolution demandée : (id, profil).
+    pub resolutions: Mutex<Vec<(i64, i64)>>,
+}
+
+impl FauxHote {
+    pub fn ranger(&self, id: i64, profil: i64, m: tune_circle::ensembles::Membres) {
+        let mut c = self.collections.lock().unwrap();
+        c.retain(|(k, _)| *k != (id, profil));
+        c.push(((id, profil), m));
+    }
+}
+
+#[async_trait::async_trait]
+impl tune_circle::ensembles::Hote for FauxHote {
+    async fn profil_actif(&self, parts: &mut axum::http::request::Parts) -> i64 {
+        parts
+            .headers
+            .get("x-profile-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    }
+
+    async fn collection_intelligente(
+        &self,
+        id: i64,
+        profile_id: i64,
+    ) -> Result<Option<tune_circle::ensembles::Membres>, String> {
+        self.resolutions.lock().unwrap().push((id, profile_id));
+        Ok(self
+            .collections
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| *k == (id, profile_id))
+            .map(|(_, m)| m.clone()))
+    }
+}
+
+/// Les routes T1-T3, avec un pousseur que le banc fait tourner à la main.
+pub fn app_avec_rayons(
+    backend: Arc<dyn DbBackend>,
+    hote: Arc<FauxHote>,
+) -> (Router, Arc<tune_circle::battement::Pousseur>) {
+    let relais = Arc::new(tune_circle::relais::Relais::new(backend.clone()));
+    let pousseur = Arc::new(tune_circle::battement::Pousseur::new(relais, hote));
+    let app = app(backend).merge(tune_circle::rayons::router(pousseur.clone()));
+    (app, pousseur)
+}
+
 pub struct Rendu {
     pub statut: StatusCode,
     pub entetes: HeaderMap,
@@ -890,8 +1154,21 @@ impl Rendu {
 }
 
 pub async fn appel(app: &Router, methode: &str, chemin: &str, corps: Option<Value>) -> Rendu {
+    appel_avec_entetes(app, methode, chemin, corps, &[]).await
+}
+
+pub async fn appel_avec_entetes(
+    app: &Router,
+    methode: &str,
+    chemin: &str,
+    corps: Option<Value>,
+    entetes: &[(&str, &str)],
+) -> Rendu {
     use tower::ServiceExt;
     let mut req = axum::http::Request::builder().method(methode).uri(chemin);
+    for (n, v) in entetes {
+        req = req.header(*n, *v);
+    }
     let body = match corps {
         Some(c) => {
             req = req.header(header::CONTENT_TYPE, "application/json");

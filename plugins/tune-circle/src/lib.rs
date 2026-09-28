@@ -21,9 +21,17 @@
 //! * **Aucun stockage local du cercle.** Le cloud porte le droit : chaque
 //!   lecture repart vers lui. Une révocation faite par l'autre membre est donc
 //!   vraie au prochain `GET /`, sans cache à invalider.
+//! * **T3, les rayons (#5326)** : le greffon RÉSOUT les étiquettes et les
+//!   collections intelligentes cochées pour un cercle et en pousse les membres
+//!   ([`ensembles`], [`rayons`]) ; un pousseur de fond ([`battement`]) les
+//!   tient à jour. Il ne garde en mémoire que la liste des ensembles de CE
+//!   serveur, jamais servie à personne.
 //! * **Journal** : route, statut, durée. Jamais le jeton, jamais un corps
 //!   (les invitations envoyées portent l'adresse saisie par l'auteur).
 
+pub mod battement;
+pub mod ensembles;
+pub mod rayons;
 pub mod relais;
 pub mod routes;
 
@@ -41,18 +49,27 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 /// cloud y vivent déjà, sous les clés que lisent toutes les fonctions cloud du
 /// serveur. La licence (T2, #5325) : `GET /library-sync` dit au propriétaire
 /// si son serveur est Premium, avec le même juge que la synchro elle-même.
+/// L'hôte des rayons (T3, #5326) : le profil actif d'une requête et la
+/// résolution d'une collection intelligente, par le moteur de la vue.
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
     pub license: Arc<LicenseManager>,
+    pub hote: Arc<dyn ensembles::Hote>,
 }
 
 pub struct CirclePlugin {
     services: HostServices,
+    pousseur: Option<Arc<battement::Pousseur>>,
+    tache: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CirclePlugin {
     pub fn new(services: HostServices) -> Self {
-        Self { services }
+        Self {
+            services,
+            pousseur: None,
+            tache: None,
+        }
     }
 }
 
@@ -81,17 +98,36 @@ impl TunePlugin for CirclePlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(routes::router(
-            Arc::new(relais::Relais::new(self.services.backend.clone())),
-            self.services.license.clone(),
+        let relais = Arc::new(relais::Relais::new(self.services.backend.clone()));
+        let pousseur = Arc::new(battement::Pousseur::new(
+            relais.clone(),
+            self.services.hote.clone(),
         ));
+        ctx.register_router(
+            routes::router(relais, self.services.license.clone())
+                .merge(rayons::router(pousseur.clone())),
+        );
+        // T3 (#5326) : tenir à jour les rayons cochés.
+        self.tache = Some(tokio::spawn(pousseur.clone().tourner()));
+        self.pousseur = Some(pousseur);
         Ok(())
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
+        if let Some(t) = self.tache.take() {
+            t.abort();
+        }
+        self.pousseur = None;
         Ok(())
     }
 
-    /// Le greffon n'observe pas le bus : il n'a rien à tenir à jour.
-    async fn on_event(&mut self, _event: &TuneEvent) {}
+    /// T3 (#5326) : la bibliothèque a changé, une collection partagée peut
+    /// avoir gagné ou perdu un album. Réveille le pousseur, sans attendre.
+    async fn on_event(&mut self, event: &TuneEvent) {
+        if battement::EVENEMENTS_QUI_REVEILLENT.contains(&event.event_type.as_str())
+            && let Some(p) = &self.pousseur
+        {
+            p.reveiller();
+        }
+    }
 }
