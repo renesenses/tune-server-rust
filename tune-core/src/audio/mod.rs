@@ -55,6 +55,7 @@ pub mod flac_vendeur;
 pub mod fondu_enchaine;
 pub mod formats;
 pub mod http_range;
+pub mod image_cdda;
 pub mod iso_sacd;
 pub mod levels;
 pub mod limiteur;

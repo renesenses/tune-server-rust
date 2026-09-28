@@ -345,6 +345,14 @@ name = "cue_gapless_un_fichier_par_piste"
 path = "tests/cue_gapless_un_fichier_par_piste.rs"
 
 # `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# #5298 — images de CD audio BIN/CUE : deux pistes, pregap, CD-Text, CD mixte
+# et CD Extra (piste de donnees ignoree), un BIN par piste ; bornes et
+# deplacement a l'echantillon pres par le chemin de lecture.
+[[test]]
+name = "cue_image_cd_bin_5298"
+path = "tests/cue_image_cd_bin_5298.rs"
+
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
 # #2569 / #2775 — l'instantane de file d'attente ne doit pas etre ecrase par une
 # base momentanement illisible, et DOIT l'etre quand l'utilisateur vide sa file.
 [[test]]
