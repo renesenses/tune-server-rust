@@ -39,7 +39,9 @@
 //!   aucun service.
 //! * **Récupérer** (décisions 3 et 5 du 28/09) : la copie locale n'existe
 //!   qu'à partir d'une playlist RÉCUPÉRABLE, c'est-à-dire d'un cercle
-//!   supprimé. Aucune route ne copie une playlist vivante.
+//!   supprimé. Aucune route ne copie une playlist vivante. L'archive n'est
+//!   libérée qu'une fois tout copié ; une copie partielle se complète par
+//!   un nouvel appel ([`PREFIXE_COPIE_EN_COURS`]).
 
 use std::sync::Arc;
 
@@ -554,14 +556,50 @@ fn en_ligne_de_playlist(trouvee: &Trouvee) -> Option<EntryContent> {
     }
 }
 
-/// `POST /recoverable-playlists/{id}/copy` : la playlist d'un cercle
-/// supprimé devient une playlist LOCALE de l'appelant — un instantané, sans
-/// lien retour. Chaque morceau est résolu chez lui comme pour `play` ; ceux
-/// qu'il ne peut pas jouer sont nommés dans `missing`.
+/// Préfixe du réglage qui relie une playlist récupérable du cloud à la copie
+/// locale déjà commencée : `circle_copie_recuperable:{id de l'archive}` →
+/// identifiant de la playlist locale.
 ///
-/// Puis, comme le contrat de site-mozaiklabs#236 le prescrit, le droit de
-/// récupération est rendu au cloud (`DELETE`). Il ne l'est QUE si la copie
-/// locale a été écrite : un échec d'écriture garde la récupération possible.
+/// C'est le SEUL état que T5 garde ici, et il ne dit rien du cercle : deux
+/// identifiants, pour qu'une seconde copie complète la même playlist au lieu
+/// d'en créer une autre. Il vit dans `settings`, comme le stockage des
+/// greffons WASM, et disparaît quand l'archive est libérée. Il ne sert rien
+/// à lui seul : la copie relit toujours l'archive au cloud (404 si le droit
+/// est perdu), et l'échéance de 30 jours reste celle du cloud.
+pub const PREFIXE_COPIE_EN_COURS: &str = "circle_copie_recuperable:";
+
+fn cle_de_copie(archive: &str) -> String {
+    format!("{PREFIXE_COPIE_EN_COURS}{archive}")
+}
+
+/// La copie locale déjà commencée pour cette archive, si elle existe encore
+/// dans le profil (l'utilisateur a pu la supprimer entre-temps).
+fn copie_en_cours(e: &Collaboratif, archive: &str, profil: i64) -> Option<i64> {
+    let id = SettingsRepo::with_backend(e.resolveur.backend().clone())
+        .get(&cle_de_copie(archive))
+        .ok()
+        .flatten()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    PlaylistRepo::with_backend(e.resolveur.backend().clone())
+        .get_for_profile(id, profil)
+        .ok()
+        .flatten()
+        .map(|_| id)
+}
+
+/// `POST /recoverable-playlists/{id}/copy` : la playlist d'un cercle
+/// supprimé devient une playlist LOCALE de l'appelant, sans lien retour.
+/// Chaque morceau est résolu chez lui comme pour `play`.
+///
+/// Décision de Bertrand (28/09) : l'archive n'est PAS libérée tant qu'un
+/// morceau reste introuvable. Une copie partielle garde l'archive
+/// (`released: false`, la liste dans `not_copied`) ; une copie suivante — par
+/// exemple après avoir branché un service — COMPLÈTE la même playlist locale
+/// (ajout sans doublon, en fin de liste) et libère l'archive (`DELETE` du
+/// cloud) quand plus rien ne manque. Le droit n'est jamais rendu si
+/// l'écriture locale a échoué.
 async fn copier(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) -> Response {
     if !identifiant_valide(&id) {
         return introuvable();
@@ -581,8 +619,15 @@ async fn copier(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) -> R
         .filter_map(|(_, t)| t.as_ref().and_then(en_ligne_de_playlist))
         .collect();
     let profil = profil_actif(&e);
-    let ecrite = PlaylistRepo::with_backend(e.resolveur.backend().clone())
-        .create_with_entries(&nom, None, profil, &lignes);
+    let repo = PlaylistRepo::with_backend(e.resolveur.backend().clone());
+    let reglages = SettingsRepo::with_backend(e.resolveur.backend().clone());
+    let existante = copie_en_cours(&e, &id, profil);
+    let ecrite = match existante {
+        Some(pid) => repo
+            .add_entries_deduped(pid, &lignes, None)
+            .map(|ajoutees| (pid, ajoutees)),
+        None => repo.create_with_entries(&nom, None, profil, &lignes),
+    };
     let (playlist_id, ecrites) = match ecrite {
         Ok(v) => v,
         Err(erreur) => {
@@ -593,12 +638,6 @@ async fn copier(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) -> R
             );
         }
     };
-    let rendu = renoncer_au_cloud(&e.relais, &id).await;
-    let rendu_au_cloud =
-        matches!(&rendu, Issue::Reponse { statut, .. } if (200..300).contains(statut));
-    if !rendu_au_cloud {
-        tracing::warn!(playlist_id, "circle_droit_de_recuperation_non_rendu");
-    }
     // Ce qui n'a pas pu entrer dans la copie : une playlist locale ne porte
     // que des pistes de la bibliothèque ou des titres de service.
     let non_copies: Vec<Value> = resolus
@@ -613,22 +652,42 @@ async fn copier(State(e): State<Arc<Collaboratif>>, Path(id): Path<String>) -> R
             })
         })
         .collect();
-    let creee = PlaylistRepo::with_backend(e.resolveur.backend().clone())
-        .get(playlist_id)
-        .ok()
-        .flatten();
+    let rendu_au_cloud = if non_copies.is_empty() {
+        let rendu = renoncer_au_cloud(&e.relais, &id).await;
+        let ok = matches!(&rendu, Issue::Reponse { statut, .. } if (200..300).contains(statut));
+        if ok {
+            reglages.delete(&cle_de_copie(&id)).ok();
+        } else {
+            tracing::warn!(playlist_id, "circle_droit_de_recuperation_non_rendu");
+            reglages
+                .set(&cle_de_copie(&id), &playlist_id.to_string())
+                .ok();
+        }
+        ok
+    } else {
+        // Archive gardée : le lien vers la copie permet de la compléter.
+        reglages
+            .set(&cle_de_copie(&id), &playlist_id.to_string())
+            .ok();
+        false
+    };
+    let creee = repo.get(playlist_id).ok().flatten();
     Json(json!({
         "ok": true,
-        // La playlist locale créée, à la forme des routes `/playlists`.
+        // La playlist locale, à la forme des routes `/playlists`.
         "playlist": creee,
         "playlist_id": playlist_id,
         "name": nom,
+        // `true` : cet appel a complété une copie commencée plus tôt.
+        "completed_existing": existante.is_some(),
+        // Lignes écrites par CET appel.
         "copied": ecrites.len(),
         "missing": manquants(&resolus),
         "not_copied": non_copies,
         "resolution": bilan(&resolus),
-        // `false` : la copie locale existe, mais le cloud garde encore la
-        // récupérable (panne) ; l'écran peut la retirer par `DELETE`.
+        // `false` : l'archive est gardée au cloud — des morceaux restent
+        // introuvables (`not_copied`), ou le cloud n'a pas répondu. Une
+        // nouvelle copie complétera la même playlist.
         "released": rendu_au_cloud,
     }))
     .into_response()

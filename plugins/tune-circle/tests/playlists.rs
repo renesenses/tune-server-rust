@@ -223,6 +223,34 @@ async fn banc(services: Vec<(&'static str, bool, Vec<StreamTrack>)>) -> Banc {
     }
 }
 
+/// Le même banc (même base, même faux cloud), avec le service `nom` désormais
+/// connecté : l'utilisateur l'a branché entre deux appels.
+async fn rebrancher(b: Banc, nom: &'static str) -> Banc {
+    let mut registre = ServiceRegistry::new();
+    registre.register(Box::new(FauxService {
+        nom,
+        connecte: true,
+        pistes: vec![piste(
+            "q-bleu",
+            "Blue in Green",
+            "Miles Davis",
+            337_000,
+            None,
+        )],
+        ecritures: b.ecritures.clone(),
+        lus: b.lus.clone(),
+    }));
+    let app = playlists::router(Arc::new(Collaboratif {
+        relais: Arc::new(Relais::new(b.backend.clone())),
+        resolveur: Resolveur::new(
+            b.backend.clone(),
+            Arc::new(tokio::sync::Mutex::new(registre)),
+        ),
+        lecture: b.lecture.clone(),
+    }));
+    Banc { app, ..b }
+}
+
 /// Une piste LOCALE dont `file_path` ET `source_id` portent un chemin connu,
 /// liée à Qobuz par `track_source_links`.
 fn semer_une_piste_locale(backend: &Arc<dyn DbBackend>) -> i64 {
@@ -865,11 +893,11 @@ async fn les_recuperables_sont_relayees() {
     assert_eq!(r.statut, StatusCode::NOT_FOUND);
 }
 
-/// La copie : une playlist LOCALE, chaque morceau rejoué chez l'appelant
-/// (sa bibliothèque par l'ISRC, Qobuz par l'identifiant), l'introuvable
-/// nommé ; puis le droit de récupération rendu au cloud.
+/// Tout est trouvé : une playlist LOCALE, chaque morceau rejoué chez
+/// l'appelant (sa bibliothèque par l'ISRC, Qobuz par l'identifiant), puis
+/// l'archive libérée au cloud et le lien local effacé.
 #[tokio::test]
-async fn copier_une_recuperable_ecrit_une_playlist_locale_puis_rend_le_droit() {
+async fn copier_une_recuperable_entierement_trouvee_libere_l_archive() {
     let b = banc(vec![(
         "qobuz",
         true,
@@ -883,36 +911,28 @@ async fn copier_une_recuperable_ecrit_une_playlist_locale_puis_rend_le_droit() {
     )])
     .await;
     let tid = semer_une_piste_locale(&b.backend);
+    // Le troisième morceau n'existe nulle part : on le retire de l'archive.
+    b.faux.etat.lock().unwrap().recuperables[0]["items"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
     let r = appel(&b.app, "POST", "/recoverable-playlists/8/copy", None).await;
     assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
     let j = r.json();
     assert_eq!(j["copied"], 2);
-    assert_eq!(j["missing"], json!([83]));
+    assert_eq!(j["not_copied"], json!([]));
     assert_eq!(j["released"], true);
-    assert_eq!(j["name"], "Jazz du samedi");
+    assert_eq!(j["completed_existing"], false);
     assert_eq!(j["playlist"]["name"], "Jazz du samedi");
-    assert_eq!(j["playlist"]["id"], j["playlist_id"]);
-    assert_eq!(
-        j["not_copied"],
-        json!([{ "item_id": 83, "title": "Un titre que personne n'a", "artist_name": "Inconnu" }])
-    );
     assert_eq!(
         b.faux.etat.lock().unwrap().renonciations,
         vec!["8".to_string()]
     );
+    assert_eq!(lien_de_copie(&b), None, "le lien disparaît avec l'archive");
 
     let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(b.backend.clone());
     let pid = j["playlist_id"].as_i64().unwrap();
-    assert_eq!(
-        repo.get_for_profile(pid, 1).unwrap().unwrap().name,
-        "Jazz du samedi"
-    );
-    let lignes: Vec<_> = repo
-        .get_entries(pid)
-        .unwrap()
-        .into_iter()
-        .map(|l| l.content)
-        .collect();
+    let lignes = contenu(&repo, pid);
     assert_eq!(lignes.len(), 2);
     assert_eq!(
         lignes[0],
@@ -928,6 +948,114 @@ async fn copier_une_recuperable_ecrit_une_playlist_locale_puis_rend_le_droit() {
         autre => panic!("un titre Qobuz était attendu : {autre:?}"),
     }
     assert_eq!(b.ecritures.load(Ordering::SeqCst), 0);
+}
+
+fn lien_de_copie(b: &Banc) -> Option<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(b.backend.clone())
+        .get(&format!("{}8", playlists::PREFIXE_COPIE_EN_COURS))
+        .unwrap()
+}
+
+fn contenu(
+    repo: &tune_core::db::playlist_repo::PlaylistRepo,
+    pid: i64,
+) -> Vec<tune_core::db::playlist_repo::EntryContent> {
+    repo.get_entries(pid)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.content)
+        .collect()
+}
+
+/// Décision de Bertrand (28/09) : une copie PARTIELLE garde l'archive au
+/// cloud. Branché plus tard, le service manquant permet une seconde copie
+/// qui complète la MÊME playlist locale, puis libère l'archive.
+#[tokio::test]
+async fn une_copie_partielle_garde_l_archive_puis_la_seconde_complete_la_meme_playlist() {
+    // Qobuz existe, mais l'utilisateur ne l'a pas encore connecté.
+    let b = banc(vec![(
+        "qobuz",
+        false,
+        vec![piste(
+            "q-bleu",
+            "Blue in Green",
+            "Miles Davis",
+            337_000,
+            None,
+        )],
+    )])
+    .await;
+    let tid = semer_une_piste_locale(&b.backend);
+    b.faux.etat.lock().unwrap().recuperables[0]["items"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(2);
+
+    let r = appel(&b.app, "POST", "/recoverable-playlists/8/copy", None).await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    let j = r.json();
+    assert_eq!(j["released"], false, "{j}");
+    assert_eq!(j["copied"], 1);
+    assert_eq!(
+        j["not_copied"],
+        json!([{ "item_id": 82, "title": "Blue in Green", "artist_name": "Miles Davis" }])
+    );
+    assert!(
+        b.faux.etat.lock().unwrap().renonciations.is_empty(),
+        "l'archive doit rester au cloud"
+    );
+    let pid = j["playlist_id"].as_i64().unwrap();
+    assert_eq!(lien_de_copie(&b), Some(pid.to_string()));
+
+    // L'utilisateur branche Qobuz, puis recommence.
+    let b = rebrancher(b, "qobuz").await;
+    let r = appel(&b.app, "POST", "/recoverable-playlists/8/copy", None).await;
+    assert_eq!(r.statut, StatusCode::OK, "{:?}", r.json());
+    let j = r.json();
+    assert_eq!(
+        j["playlist_id"], pid,
+        "la MÊME playlist locale est complétée"
+    );
+    assert_eq!(j["completed_existing"], true);
+    assert_eq!(j["copied"], 1, "seul le morceau manquant est ajouté");
+    assert_eq!(j["not_copied"], json!([]));
+    assert_eq!(j["released"], true);
+    assert_eq!(
+        b.faux.etat.lock().unwrap().renonciations,
+        vec!["8".to_string()]
+    );
+    assert_eq!(lien_de_copie(&b), None);
+
+    let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(b.backend.clone());
+    assert_eq!(
+        repo.list(1, 100, 0).unwrap().len(),
+        1,
+        "une seule playlist locale"
+    );
+    let lignes = contenu(&repo, pid);
+    assert_eq!(lignes.len(), 2, "{lignes:?}");
+    assert_eq!(
+        lignes[0],
+        tune_core::db::playlist_repo::EntryContent::Local(tid)
+    );
+}
+
+/// La copie commencée a été supprimée par l'utilisateur : la suivante en
+/// crée une neuve au lieu d'écrire dans une playlist disparue.
+#[tokio::test]
+async fn une_copie_commencee_puis_supprimee_est_recreee() {
+    let b = banc(vec![]).await;
+    semer_une_piste_locale(&b.backend);
+    let r = appel(&b.app, "POST", "/recoverable-playlists/8/copy", None).await;
+    let premiere = r.json()["playlist_id"].as_i64().unwrap();
+    assert_eq!(r.json()["released"], false);
+    let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(b.backend.clone());
+    repo.delete(premiere).unwrap();
+    let r = appel(&b.app, "POST", "/recoverable-playlists/8/copy", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json()["completed_existing"], false);
+    assert_ne!(r.json()["playlist_id"].as_i64().unwrap(), premiere);
+    assert_eq!(repo.list(1, 100, 0).unwrap().len(), 1);
 }
 
 /// Un droit perdu (révocation après la suppression du cercle, ou déjà
