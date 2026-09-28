@@ -1628,7 +1628,7 @@ async fn spawn_library_scan_avec_lecteur(
         // #3631 (lot 2b) : cette relecture ÉCRIT désormais les pistes
         // virtuelles, au même endroit et sans relire une feuille de plus. Le
         // rapport garde exactement les mêmes clés — c'est le même inventaire.
-        let (inventaire_cue, bilan_cue, images_cue) =
+        let (inventaire_cue, mut bilan_cue, images_cue) =
             tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
@@ -1645,6 +1645,14 @@ async fn spawn_library_scan_avec_lecteur(
                     trop_massive: &crate::routes::system::scan::purge_trop_massive,
                 },
             );
+        // #5297 — les images SACD que le parcours a lues NATIVEMENT : même
+        // écrivain que les albums CUE (pistes = tranches de l'image), même
+        // bilan, donc même réévaluation des pochettes en fin de scan.
+        tune_core::scanner::cue_bibliotheque::ecrire_les_iso_sacd(
+            &db,
+            &list_result.isos_sacd_natifs,
+            &mut bilan_cue,
+        );
         if inventaire_cue.dossiers > 0 {
             tracing::info!(
                 dossiers = inventaire_cue.dossiers,

@@ -21,6 +21,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 lofty = { workspace = true }
+# #5297 — textes d'un disque SACD en Shift-JIS, KS C 5601, GB 2312 ou Big5.
+# Déjà dans l'arbre (tiré par reqwest), aucune caisse nouvelle.
+encoding_rs = "0.8"
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }

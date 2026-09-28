@@ -22,7 +22,9 @@ pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
 ];
 
 /// Extensions admises par le catalogue. `iso` est l'unique exception au
-/// contrat de décodage direct : le walker l'extrait d'abord en pistes DSF.
+/// contrat de décodage direct : le walker en fait des pistes virtuelles lues
+/// dans l'image (#5297, [`super::sacd`]), ou, pour un disque DST, l'extrait en
+/// pistes DSF par `sacd_extract` s'il est installé.
 ///
 /// `oga` est l'extension normalisée d'un flux audio Ogg (Vorbis, FLAC-in-Ogg
 /// ou Opus). Elle manquait ici seule, alors que tout le reste de la chaîne la
@@ -124,6 +126,17 @@ pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
             })
         }
         ext_mkv if super::matroska::est_extension_matroska(ext_mkv) => refus_matroska(&ext, path),
+        // #5297 — une image SACD en DSD brut se lit dans l'ISO ; une image
+        // DST, une image de données ou une structure abîmée se refusent, et
+        // se NOMMENT, avant toute promesse de décodage.
+        "iso" => super::sacd::refus_de_decodage(path).map(|motif| UnsupportedLibraryAudio {
+            report_key: if motif == super::sacd::MOTIF_ISO_SACD_DST {
+                super::sacd::CLE_RAPPORT_ISO_SACD_DST.into()
+            } else {
+                super::iso_sacd::CLE_RAPPORT_ISO_SACD.into()
+            },
+            reason: motif.into(),
+        }),
         _ => None,
     }
 }

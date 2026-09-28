@@ -1459,7 +1459,14 @@ impl PlaybackOrchestrator {
         .map_err(|e| format!("Téléchargement du DSD impossible : {e}"))?;
         let strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let resultat = self
-            .anticiper_le_dop(&track, fichier.clone(), zone_max_sample_rate, false, strict)
+            .anticiper_le_dop(
+                &track,
+                fichier.clone(),
+                zone_max_sample_rate,
+                false,
+                strict,
+                None,
+            )
             .await;
         match resultat {
             Ok(Some(mut resolu)) => {
