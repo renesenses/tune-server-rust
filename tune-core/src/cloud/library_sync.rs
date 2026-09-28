@@ -1370,7 +1370,7 @@ mod format_synchro_tests {
         let dossier = tempfile::tempdir().unwrap();
         let chemin = dossier.path().join("tune.db");
         let chemin = chemin.to_str().unwrap();
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let api = "http://127.0.0.1:9/api/v1/cloud-library";
 
         // Premier démarrage du nouveau binaire.
@@ -1379,12 +1379,12 @@ mod format_synchro_tests {
             bibliotheque_deja_poussee(&backend);
 
             // Gratuit sans partage : rien, réglage non écrit.
-            assert!(cycle(&backend, &client, api, false).await.is_none());
+            assert!(cycle(&backend, client, api, false).await.is_none());
             assert_eq!(pending_count(&backend), 0);
             assert_eq!(format_note(&backend), None);
 
             // Premium : la bibliothèque repart.
-            assert!(cycle(&backend, &client, api, true).await.is_none());
+            assert!(cycle(&backend, client, api, true).await.is_none());
             assert_eq!(pending_by_type(&backend), (1, 1, 2));
             assert_eq!(format_note(&backend).as_deref(), Some("2"));
 
@@ -1397,7 +1397,7 @@ mod format_synchro_tests {
         // Second démarrage : plus rien ne repart.
         let backend = ouvrir(Some(chemin));
         assert_eq!(format_note(&backend).as_deref(), Some("2"));
-        assert!(cycle(&backend, &client, api, true).await.is_none());
+        assert!(cycle(&backend, client, api, true).await.is_none());
         assert_eq!(pending_count(&backend), 0, "rien ne repart au redémarrage");
     }
 }
