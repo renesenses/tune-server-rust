@@ -462,13 +462,30 @@ impl PlaybackOrchestrator {
     /// le chemin local, ou parce qu'il n'y avait rien à changer. Un
     /// redémarrage programmé rend `false` : il n'a pas encore eu lieu.
     pub async fn apply_audiophile_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        self.apply_audiophile_change_portee(zone_id).await == PorteeDuReglage::Immediate
+    }
+
+    /// [`Self::apply_audiophile_change`], mais qui dit QUAND la bascule
+    /// atteindra le son, au lieu d'un booléen à plusieurs sens (#4680).
+    ///
+    /// `applied_live: false` confondait « relance du flux programmée » (zone
+    /// DLNA dont le flux porte un traitement que PURE gouverne), « rien ne
+    /// joue » et « position inconnue, rien ne partira avant la piste
+    /// suivante » (#2595). La barre de transport traduisait tout « prendra
+    /// effet à la piste suivante » — faux dans le premier cas, où la relance
+    /// à la position courante s'entend dans l'instant. Même contrat que
+    /// [`Self::apply_eq_change_portee`].
+    pub async fn apply_audiophile_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
         if self.refresh_zone_pure_dsp(zone_id).await {
-            return true;
+            return PorteeDuReglage::Immediate;
         }
         // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
         // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
         let Some(np) = self.playback.get_state(zone_id).await.now_playing else {
-            return false;
+            return PorteeDuReglage::RienNeJoue;
         };
         let pure = self.zone_audiophile(zone_id);
         match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
@@ -477,8 +494,13 @@ impl PlaybackOrchestrator {
                     zone_id,
                     pure, traitement, "pure_bascule_change_le_signal_flux_refabrique"
                 );
-                self.schedule_eq_replay(zone_id);
-                false
+                // `schedule_eq_replay` refuse quand la position est inconnue
+                // (#2595) : rien ne partira alors avant la piste suivante.
+                if self.schedule_eq_replay(zone_id) {
+                    PorteeDuReglage::Relance
+                } else {
+                    PorteeDuReglage::PisteSuivante
+                }
             }
             None => {
                 info!(
@@ -488,7 +510,7 @@ impl PlaybackOrchestrator {
                 if let Some(ref bus) = self.event_bus {
                     bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                 }
-                true
+                PorteeDuReglage::Immediate
             }
         }
     }
