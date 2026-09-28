@@ -122,7 +122,17 @@ pub fn detect_format(file_path: &str) -> TagFormat {
 ///
 /// Le message d'erreur reste `file not found`, mot pour mot : les routes le
 /// remontent tel quel et un client peut le comparer.
+/// Motif du refus d'écrire dans un fichier rangé dans une image ISO (#5299).
+pub const MOTIF_IMAGE_ISO_LECTURE_SEULE: &str =
+    "fichier dans une image ISO : l'image est en lecture seule";
+
 fn graphie_sur_disque(file_path: &str) -> Result<String, String> {
+    // #5299 — une image ISO est en lecture seule : un fichier qu'elle contient
+    // ne se réécrit pas. Le dire, plutôt que d'échouer plus loin sur un chemin
+    // que lofty ne sait pas ouvrir.
+    if crate::audio::iso9660::est_chemin_virtuel(file_path) {
+        return Err(MOTIF_IMAGE_ISO_LECTURE_SEULE.into());
+    }
     match resolve_local_path(file_path) {
         LocalPath::Found(reel) => Ok(reel),
         LocalPath::Missing => Err("file not found".into()),
@@ -640,7 +650,9 @@ pub(crate) fn is_unsupported_format(file_path: &str) -> bool {
         .unwrap_or("")
         .to_lowercase();
     // DFF has no standard tag support
-    matches!(ext.as_str(), "dff")
+    // #5299 — un fichier rangé dans une image ISO : l'image est en lecture
+    // seule, quel que soit le format.
+    matches!(ext.as_str(), "dff") || crate::audio::iso9660::est_chemin_virtuel(file_path)
 }
 
 /// Write extended metadata fields to an audio file's tags.

@@ -1091,6 +1091,11 @@ fn stage_locally_for_decode(
     if super::sacd::est_extension_iso(Path::new(src)) {
         return None;
     }
+    // #5299 — un fichier rangé dans une image ISO n'est jamais recopié : il se
+    // lit par étendues, dans l'image, là où elle est.
+    if super::iso9660::est_chemin_virtuel(src) {
+        return None;
+    }
     stager_pour_decodage(
         src,
         chemin_sur_montage_reseau(Path::new(src)),
@@ -2334,6 +2339,10 @@ fn decode_to_pcm_streaming_inner(
         let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(source), Default::default())
+    } else if let Some(source) = super::iso9660::source_symphonia(file_path) {
+        // #5299 — un fichier rangé dans une image ISO : lecture ciblée de ses
+        // étendues, jamais l'image entière.
+        MediaSourceStream::new(source?, Default::default())
     } else {
         let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
         MediaSourceStream::new(Box::new(file), Default::default())
@@ -3619,6 +3628,10 @@ fn decode_symphonia(
         let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(src), Default::default())
+    } else if let Some(source) = super::iso9660::source_symphonia(file_path) {
+        // #5299 — un fichier rangé dans une image ISO : lecture ciblée de ses
+        // étendues, jamais l'image entière.
+        MediaSourceStream::new(source?, Default::default())
     } else {
         let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
         MediaSourceStream::new(Box::new(file), Default::default())

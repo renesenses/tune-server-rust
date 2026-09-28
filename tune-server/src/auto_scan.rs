@@ -2957,5 +2957,9 @@ mod scan_feuille_cue_tests_5108;
 mod pochettes_disque_tests_5034;
 
 #[cfg(test)]
+#[path = "iso_donnees_tests_5299.rs"]
+mod iso_donnees_tests_5299;
+
+#[cfg(test)]
 #[path = "pochettes_cue_tests_5222.rs"]
 mod pochettes_cue_tests_5222;
