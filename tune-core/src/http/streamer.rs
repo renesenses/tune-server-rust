@@ -244,6 +244,7 @@ pub struct StreamSession {
     /// reported as the 44.1 kHz bootstrap value. `0` means "not yet detected".
     pub detected_sample_rate: std::sync::atomic::AtomicU32,
     pub detected_channels: std::sync::atomic::AtomicU16,
+    detected_bit_depth: std::sync::atomic::AtomicU16,
     pub wav_header_included: std::sync::atomic::AtomicBool,
     /// L'en-tête WAV tel que le décodeur l'a émis — pour le REJOUER.
     ///
@@ -408,11 +409,18 @@ impl StreamSession {
     /// Readers that acquire a non-zero sample rate therefore never observe a
     /// new rate paired with the old channel count.
     pub fn publish_detected_output_format(&self, sample_rate: u32, channels: u16) {
+        self.publish_detected_pcm_format(sample_rate, channels, self.info.bit_depth);
+    }
+
+    /// Publie aussi la profondeur du PCM, avant le premier octet audio (#5217).
+    pub fn publish_detected_pcm_format(&self, sample_rate: u32, channels: u16, bit_depth: u16) {
         if sample_rate == 0 || channels == 0 {
             return;
         }
         self.detected_channels
             .store(channels, std::sync::atomic::Ordering::Relaxed);
+        self.detected_bit_depth
+            .store(bit_depth, std::sync::atomic::Ordering::Relaxed);
         self.detected_sample_rate
             .store(sample_rate, std::sync::atomic::Ordering::Release);
     }
@@ -429,6 +437,19 @@ impl StreamSession {
             .detected_channels
             .load(std::sync::atomic::Ordering::Relaxed);
         (channels != 0).then_some((sample_rate, channels))
+    }
+
+    /// Profondeur réellement servie, ou format d'amorçage avant la sonde.
+    pub fn output_bit_depth(&self) -> u16 {
+        if self.detected_output_format().is_some() {
+            let bits = self
+                .detected_bit_depth
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if bits != 0 {
+                return bits;
+            }
+        }
+        self.info.bit_depth
     }
 
     /// Publish the upstream codec separately from the PCM format we serve.
@@ -449,6 +470,7 @@ impl StreamSession {
             if let Some((sample_rate, channels)) = self.detected_output_format() {
                 info.sample_rate = sample_rate;
                 info.channels = channels;
+                info.bit_depth = self.output_bit_depth();
             }
         }
         info
@@ -476,6 +498,7 @@ impl StreamSession {
             is_radio: false,
             detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
             detected_channels: std::sync::atomic::AtomicU16::new(0),
+            detected_bit_depth: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
             octets_du_canal: std::sync::atomic::AtomicU64::new(0),
@@ -1184,6 +1207,29 @@ impl AudioStreamer {
         target_bytes: u64,
         timeout: std::time::Duration,
     ) -> bool {
+        self.wait_prefill_inner(stream_id, target_bytes, None, timeout)
+            .await
+    }
+
+    /// Le format radio est connu après la sonde : une réserve en secondes
+    /// doit suivre sa vraie cadence et sa profondeur, pas le 44,1/16 initial.
+    pub async fn wait_radio_prefill_ready(
+        &self,
+        stream_id: &str,
+        seconds: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        self.wait_prefill_inner(stream_id, 1, Some(seconds), timeout)
+            .await
+    }
+
+    async fn wait_prefill_inner(
+        &self,
+        stream_id: &str,
+        target_bytes: u64,
+        radio_seconds: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> bool {
         let session = { self.sessions.lock().await.get(stream_id).cloned() };
         let Some(session) = session else {
             return true;
@@ -1204,9 +1250,22 @@ impl AudioStreamer {
         // prebuffer. Only used to translate the byte target into channel
         // messages, the unit tokio's mpsc exposes.
         const ASSUMED_CHUNK_BYTES: u64 = 32768;
-        let mut target_chunks = (target_bytes / ASSUMED_CHUNK_BYTES).max(1);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let mut target_chunks = if let Some(seconds) = radio_seconds {
+                if session.detected_output_format().is_some() {
+                    let info = session.effective_output_info();
+                    let frame = u64::from(info.channels) * u64::from(info.bit_depth / 8);
+                    let chunk = (ASSUMED_CHUNK_BYTES / frame.max(1)).max(1) * frame.max(1);
+                    (u64::from(info.sample_rate) * frame * seconds)
+                        .div_ceil(chunk)
+                        .max(1)
+                } else {
+                    u64::MAX
+                }
+            } else {
+                (target_bytes / ASSUMED_CHUNK_BYTES).max(1)
+            };
             match session.channel_fill().await {
                 // Channel closed (producer done / gone): nothing more will be
                 // buffered, so stop waiting rather than burn the whole timeout.
@@ -1807,6 +1866,41 @@ mod tests {
         let wire = streamer.stream_output_wire(&id).await.unwrap();
         assert_eq!(wire.sample_rate, 48_000);
         assert_eq!(wire.channels, 1);
+    }
+
+    #[tokio::test]
+    async fn radio_prefill_compte_les_secondes_au_format_24_bits_5217() {
+        let streamer = AudioStreamer::new(0);
+        let (id, tx, _, session) = streamer
+            .create_radio_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    sample_rate: 44_100,
+                    channels: 2,
+                    bit_depth: 16,
+                    ..Default::default()
+                },
+                16,
+            )
+            .await;
+        session.publish_detected_pcm_format(48_000, 2, 24);
+        for _ in 0..6 {
+            tx.send(vec![0; 32766]).await.unwrap();
+        }
+        assert!(
+            !streamer
+                .wait_radio_prefill_ready(&id, 1, std::time::Duration::from_millis(30))
+                .await,
+            "#5217 : six blocs 24 bits ne sont pas une seconde à 48 kHz stéréo"
+        );
+        for _ in 0..3 {
+            tx.send(vec![0; 32766]).await.unwrap();
+        }
+        assert!(
+            streamer
+                .wait_radio_prefill_ready(&id, 1, std::time::Duration::from_millis(30))
+                .await
+        );
     }
 
     #[tokio::test]

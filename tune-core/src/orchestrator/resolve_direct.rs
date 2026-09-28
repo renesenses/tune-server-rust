@@ -1000,7 +1000,7 @@ impl PlaybackOrchestrator {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm(
+                decode_radio_stream_to_pcm_avec_profondeur(
                     radio_url,
                     tx,
                     data_ready,
@@ -1013,6 +1013,7 @@ impl PlaybackOrchestrator {
                     radio_levels_tx,
                     radio_strict,
                     en_vol,
+                    is_local_output,
                 )
             })
             .await;
