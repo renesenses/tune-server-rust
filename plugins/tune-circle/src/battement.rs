@@ -13,8 +13,9 @@
 //!   un tour complet, après 10 s de calme pour grouper une rafale ;
 //! * **la définition** : toutes les 30 s, sans réseau, chaque ensemble connu
 //!   est relu localement — une étiquette résolue (quelques lignes), une
-//!   collection seulement par son nom et ses règles. Ce qui a changé est
-//!   résolu et repoussé. Aucun évènement du bus ne dit « étiquette posée » ni
+//!   collection seulement par son nom et ses règles. Si l'un a changé, un
+//!   tour complet part (et relit `GET /sets` : rien n'est poussé de mémoire).
+//!   Aucun évènement du bus ne dit « étiquette posée » ni
 //!   « règle modifiée » : c'est ce tour qui tient la promesse « à chaque
 //!   changement » pour eux.
 //!
@@ -302,28 +303,33 @@ impl Pousseur {
     }
 
     /// Le tour des définitions, sans réseau tant que rien n'a changé : une
-    /// étiquette est résolue (et comparée à l'empreinte envoyée) ; une
-    /// collection n'est résolue que si son nom ou ses règles ont changé.
+    /// étiquette est résolue et comparée à l'empreinte envoyée ; une
+    /// collection n'est comparée que par son nom et ses règles.
+    ///
+    /// Il ne POUSSE rien lui-même. Dès qu'un ensemble connu a changé, il passe
+    /// la main au tour complet, qui relit `GET /sets` d'abord : c'est la seule
+    /// vérité sur ce qui est coché. Couper le partage d'un cercle, le déplacer
+    /// ou délier le serveur y SUPPRIME ses ensembles ; un envoi fait de
+    /// mémoire les recréerait (le `PUT` crée ce qu'il ne trouve pas) et
+    /// recocherait, au rallumage, des cases que personne n'a cochées.
     pub async fn tour_des_definitions(&self) -> Bilan {
-        let mut bilan = Bilan::default();
         let backend = self.relais.backend().clone();
-        for e in self.connus() {
-            let a_revoir = match e.kind.as_str() {
-                GENRE_ETIQUETTE => true,
-                GENRE_COLLECTION => {
-                    ensembles::definition_de_collection(&backend, e.source_id) != e.definition
-                }
-                _ => false,
-            };
-            if !a_revoir {
-                continue;
+        let a_change = |e: &EnsembleConnu| match e.kind.as_str() {
+            GENRE_ETIQUETTE => match ensembles::resoudre_etiquette(&backend, e.source_id) {
+                Ok(Some(m)) => Some(ensembles::empreinte(&ensembles::contenu(&m))) != e.digest,
+                Ok(None) => true,
+                Err(_) => false,
+            },
+            GENRE_COLLECTION => {
+                ensembles::definition_de_collection(&backend, e.source_id) != e.definition
             }
-            match self.repousser(&e, &mut bilan).await {
-                Some(k) => self.noter(k),
-                None => self.oublier(e.circle_id, &e.kind, e.source_id),
-            }
+            _ => false,
+        };
+        if self.connus().iter().any(a_change) {
+            self.tour_complet().await
+        } else {
+            Bilan::default()
         }
-        bilan
     }
 
     /// La boucle de fond. Premier tour complet une minute après le départ.

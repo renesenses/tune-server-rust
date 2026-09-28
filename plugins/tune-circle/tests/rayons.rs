@@ -290,8 +290,8 @@ async fn une_regle_modifiee_est_repoussee_au_tour_des_definitions() {
     assert_eq!(corps_recus(&faux)[1]["albums"], json!([]));
     assert_eq!(
         faux.etat.lock().unwrap().lectures_des_ensembles,
-        lectures,
-        "le tour des définitions ne relit pas la liste chez le cloud"
+        lectures + 1,
+        "le changement passe par `GET /sets`, la seule vérité sur ce qui est coché"
     );
 }
 
@@ -307,6 +307,38 @@ async fn une_etiquette_posee_est_repoussee_au_tour_des_definitions() {
         .unwrap();
     assert_eq!(pousseur.tour_des_definitions().await.envoyes, 1);
     assert_eq!(corps_recus(&faux)[1]["albums"], json!([10]));
+}
+
+/// Couper le partage d'un cercle (ou le déplacer, ou délier le serveur)
+/// SUPPRIME ses ensembles côté cloud. Le greffon ne les recrée jamais de
+/// lui-même : ni au tour des définitions, ni au battement, même si
+/// l'étiquette change ensuite et que le partage est rallumé.
+#[tokio::test]
+async fn un_ensemble_supprime_cote_cloud_n_est_jamais_repousse() {
+    let (faux, backend, _h, app, pousseur) = monde().await;
+    appel(&app, "PUT", "/circles/1/sets/tag/4", None).await;
+    assert_eq!(corps_recus(&faux).len(), 1);
+    assert_eq!(pousseur.connus().len(), 1, "témoin : l'ensemble est connu");
+
+    // Le cloud supprime l'ensemble (partage coupé puis rallumé, par exemple).
+    faux.etat.lock().unwrap().ensembles.clear();
+    // L'étiquette change ensuite en local.
+    backend
+        .execute_batch("INSERT INTO item_tags (tag_id, item_type, item_id) VALUES (4, 'album', 10)")
+        .unwrap();
+
+    let b = pousseur.tour_des_definitions().await;
+    assert_eq!(b.envoyes, 0, "{b:?}");
+    let b = pousseur.tour_complet().await;
+    assert_eq!(b.envoyes, 0, "{b:?}");
+    assert_eq!(
+        corps_recus(&faux).len(),
+        1,
+        "un ensemble absent de `GET /sets` a été repoussé de mémoire : il serait \
+         recoché sans que personne l'ait coché"
+    );
+    assert!(faux.etat.lock().unwrap().ensembles.is_empty());
+    assert!(pousseur.connus().is_empty(), "la mémoire suit `GET /sets`");
 }
 
 #[tokio::test]
