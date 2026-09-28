@@ -24,6 +24,7 @@
 //! * **Journal** : route, statut, durée. Jamais le jeton, jamais un corps
 //!   (les invitations envoyées portent l'adresse saisie par l'auteur).
 
+pub mod ecoute;
 pub mod relais;
 pub mod routes;
 
@@ -33,6 +34,7 @@ use async_trait::async_trait;
 use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
 use tune_core::license::LicenseManager;
+use tune_core::playback::PlaybackManager;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 /// Ce que l'hôte passe au greffon, explicitement, à sa construction.
@@ -44,15 +46,25 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
     pub license: Arc<LicenseManager>,
+    /// T4 (#5327) : l'état des zones, pour savoir si une zone joue encore le
+    /// flux d'un contact quand elle tombe en erreur. `None` chez un hôte qui
+    /// n'en fournit pas : l'événement `circle.stream_revoked` part alors sur
+    /// toute erreur d'une zone suivie.
+    pub playback: Option<Arc<PlaybackManager>>,
 }
 
 pub struct CirclePlugin {
     services: HostServices,
+    /// Construite au `setup` (il faut l'adresse de l'API locale et le bus).
+    ecoute: Option<Arc<ecoute::Ecoute>>,
 }
 
 impl CirclePlugin {
     pub fn new(services: HostServices) -> Self {
-        Self { services }
+        Self {
+            services,
+            ecoute: None,
+        }
     }
 }
 
@@ -65,7 +77,7 @@ impl TunePlugin for CirclePlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance sera Premium."
+        "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance est Premium."
     }
     /// Opt-in, comme `cd` : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -74,17 +86,27 @@ impl TunePlugin for CirclePlugin {
     /// Au catalogue (#5018, décision de Bertrand du 25/09), comme `cd`
     /// (#4863) : le gestionnaire propose « Installer », puis
     /// `POST /api/v1/plugins/circle/install` et un redémarrage.
-    /// Gratuit : absent de `premium_plugins`, aucun contrôle de droit. Seule
-    /// l'écoute à distance (étape T4, à venir) sera Premium.
+    /// Gratuit : absent de `premium_plugins`, aucun contrôle de droit local.
+    /// Seule l'écoute à distance (T4, #5327) est Premium, et c'est le cloud
+    /// qui en juge, pour l'auditeur comme pour le propriétaire.
     fn catalogued(&self) -> bool {
         true
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(routes::router(
-            Arc::new(relais::Relais::new(self.services.backend.clone())),
-            self.services.license.clone(),
+        let relais = Arc::new(relais::Relais::new(self.services.backend.clone()));
+        // T4 (#5327) : l'écoute chez un contact. Le droit (Premium des deux
+        // côtés compris) est jugé par le cloud à la délivrance du billet.
+        let ecoute = Arc::new(ecoute::Ecoute::new(
+            relais.clone(),
+            &ctx.api_base_url,
+            ctx.event_bus.clone(),
+            self.services.playback.clone(),
         ));
+        self.ecoute = Some(ecoute.clone());
+        ctx.register_router(
+            routes::router(relais, self.services.license.clone()).merge(ecoute::router(ecoute)),
+        );
         Ok(())
     }
 
@@ -92,6 +114,11 @@ impl TunePlugin for CirclePlugin {
         Ok(())
     }
 
-    /// Le greffon n'observe pas le bus : il n'a rien à tenir à jour.
-    async fn on_event(&mut self, _event: &TuneEvent) {}
+    /// T4 (#5327) : les erreurs de lecture d'une zone qui joue le flux d'un
+    /// contact (voir [`ecoute::Ecoute::sur_evenement`]). Rien d'autre.
+    async fn on_event(&mut self, event: &TuneEvent) {
+        if let Some(ecoute) = &self.ecoute {
+            ecoute.sur_evenement(event).await;
+        }
+    }
 }

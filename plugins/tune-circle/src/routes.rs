@@ -43,6 +43,9 @@
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
 //!
+//! T4, l'écoute chez un contact (#5327), Premium : `POST
+//! /contacts/{user_id}/listen`, dans [`crate::ecoute`].
+//!
 //! Le `server_id` partagé est celui de CE serveur (réglage `server_id`, celui
 //! que pousse `library_sync`) : un `server_id` fourni par le client ne part
 //! jamais. Le cloud juge s'il appartient à l'appelant (404 sinon).
@@ -143,12 +146,12 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .merge(etat_de_la_copie)
 }
 
-fn refus(statut: StatusCode, corps: Value) -> Response {
+pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
     (statut, Json(corps)).into_response()
 }
 
 /// La forme HTTP d'une [`Issue`].
-fn en_reponse(issue: Issue) -> Response {
+pub(crate) fn en_reponse(issue: Issue) -> Response {
     match issue {
         Issue::NonConnecte => refus(
             StatusCode::PRECONDITION_FAILED,
@@ -193,11 +196,11 @@ fn en_reponse(issue: Issue) -> Response {
 }
 
 /// Un identifiant de chemin qui désigne bien UNE ressource.
-fn identifiant_valide(id: &str) -> bool {
+pub(crate) fn identifiant_valide(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && id.len() <= 200
 }
 
-fn introuvable() -> Response {
+pub(crate) fn introuvable() -> Response {
     refus(StatusCode::NOT_FOUND, json!({ "code": CODE_INTROUVABLE }))
 }
 
