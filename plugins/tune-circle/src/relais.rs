@@ -50,6 +50,15 @@ impl Relais {
         Self { backend }
     }
 
+    /// Les réglages du serveur — la même base que celle où vit la session SSO.
+    pub fn reglages(&self) -> SettingsRepo {
+        SettingsRepo::with_backend(self.backend.clone())
+    }
+
+    pub fn backend(&self) -> &Arc<dyn DbBackend> {
+        &self.backend
+    }
+
     /// Appelle `/api/v1/circle/{segments…}` avec le jeton SSO du serveur.
     ///
     /// `route` est le gabarit journalisé (`"DELETE /members/{user_id}"`) :
@@ -61,17 +70,35 @@ impl Relais {
         segments: &[&str],
         corps: Option<&Value>,
     ) -> Issue {
+        self.appeler_avec_requete(route, methode, segments, None, corps)
+            .await
+    }
+
+    /// [`Self::appeler`], la chaîne de requête du client comprise (T2, #5325 :
+    /// `page`, `search`, `sort`, `artist` des lectures de bibliothèque). Elle
+    /// part telle quelle — c'est le cloud qui la juge — et ne peut rien
+    /// changer au chemin, fixé segment par segment. Jamais journalisée : une
+    /// recherche est une saisie de l'utilisateur.
+    pub async fn appeler_avec_requete(
+        &self,
+        route: &'static str,
+        methode: Method,
+        segments: &[&str],
+        requete: Option<&str>,
+        corps: Option<&Value>,
+    ) -> Issue {
         let debut = Instant::now();
-        let settings = SettingsRepo::with_backend(self.backend.clone());
+        let settings = self.reglages();
         let Some(jeton) = lire(&settings, "mozaik_access_token") else {
             debug!(route, "circle_non_connecte");
             return Issue::NonConnecte;
         };
         let base = lire(&settings, "mozaik_base_url").unwrap_or_else(|| BASE_PAR_DEFAUT.into());
-        let Some(url) = url_du_cercle(&base, segments) else {
+        let Some(mut url) = url_du_cercle(&base, segments) else {
             warn!(route, "circle_adresse_cloud_invalide");
             return Issue::Indisponible { statut_amont: None };
         };
+        url.set_query(requete.filter(|q| !q.is_empty()));
 
         let mut envoi = envoyer(&url, &methode, &jeton, corps).await;
         // Un 401 peut n'être qu'un jeton d'accès expiré : un seul

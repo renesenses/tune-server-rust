@@ -27,12 +27,24 @@
 //! validation, celui d'un autre = 404 sans invitation ; sinon il est gardé
 //! pour [`Faux::acceptee_par_l_invite`].
 
+//!
+//! T2, le catalogue d'un contact (#5325), selon le contrat de l'issue : sous
+//! [`Faux::t2`], chaque cercle de `GET /` porte `"sharing": { "library",
+//! "server_id" }`. `PUT /circles/{id}/sharing/library` `{ "server_id" }` : un
+//! `server_id` qui n'est pas une chaîne = 422 de validation, qui n'est pas un
+//! serveur du compte ([`Faux::serveurs_du_compte`]) = 404, cercle d'un autre
+//! = 404, sinon 200 et le cercle ; `DELETE` = 200 `{ "ok": true }`.
+//! `GET /shared-with-me` rend [`Faux::partagent_avec_moi`] ; les lectures
+//! `/contacts/{user_id}/library/…` rendent 404 pour tout identifiant absent de
+//! [`Faux::contacts_qui_partagent`], et notent la chaîne de requête reçue.
+//! `POST /api/v1/cloud-library/{server_id}/sync` note chaque corps reçu, brut.
+
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -60,6 +72,12 @@ pub const COURRIEL_DEJA_INVITE: &str = "bob.envoye@exemple.fr";
 pub const CERCLES_MAX: usize = 50;
 /// Un cercle qui existe chez mozaiklabs, mais appartient à un AUTRE compte.
 pub const CERCLE_D_UN_AUTRE: i64 = 77;
+/// Le `server_id` de CE serveur Tune, inscrit au compte (T2).
+pub const SERVEUR_DU_COMPTE: &str = "srv-moi-5325";
+/// Un autre serveur du même compte (`cloud_servers.user_id` non unique).
+pub const AUTRE_SERVEUR_DU_COMPTE: &str = "srv-salon-5325";
+/// Le serveur d'un AUTRE compte.
+pub const SERVEUR_D_UN_AUTRE: &str = "srv-etranger-5325";
 
 pub struct Faux {
     pub jeton_valide: String,
@@ -80,6 +98,44 @@ pub struct Faux {
     pub prochain_cercle_id: i64,
     /// Le `circle_id` porté par chaque invitation envoyée (id → circle_id).
     pub rangement_des_invitations: Vec<(i64, Value)>,
+    // T2 (#5325) ------------------------------------------------------------
+    /// `GET /` porte la clé `sharing` de chaque cercle (cloud T2 déployé).
+    pub t2: bool,
+    /// Les `cloud_servers` du détenteur du jeton.
+    pub serveurs_du_compte: Vec<String>,
+    /// Partages actifs : (circle_id, server_id).
+    pub partages: Vec<(i64, String)>,
+    /// Le dernier corps reçu par `PUT …/sharing/library`.
+    pub dernier_corps_partage: Option<Value>,
+    /// Ce que rend `GET /shared-with-me`.
+    pub partagent_avec_moi: Vec<Value>,
+    /// Les `user_id` dont la bibliothèque est lisible par le détenteur.
+    pub contacts_qui_partagent: Vec<String>,
+    /// La chaîne de requête de la dernière lecture de bibliothèque.
+    pub derniere_requete: Option<String>,
+    /// Lectures de bibliothèque encore permises avant le 429.
+    pub lectures_permises: u32,
+    /// `POST /api/v1/cloud-library/{server_id}/sync` : (server_id, corps brut).
+    pub synchros: Vec<(String, String)>,
+    /// Liaison du serveur au compte (site-mozaiklabs#233) : le jeton en cours,
+    /// `None` tant qu'aucun lien n'a été fait.
+    pub jeton_de_liaison: Option<String>,
+    /// Appels reçus par `POST …/{server_id}/link`.
+    pub liaisons: usize,
+    /// Le corps brut du dernier `POST …/link` (le contrat : aucun).
+    pub dernier_corps_liaison: Option<Vec<u8>>,
+    /// `…/link` rend ce statut au lieu du jeton.
+    pub liaison_refusee: Option<u16>,
+    /// `sync` exige le jeton de liaison (401 `server_token_invalid`, 403
+    /// `server_not_linked`).
+    pub sync_exige_liaison: bool,
+    /// `sync` refuse tout jeton (401 `server_token_invalid`), même neuf.
+    pub jeton_toujours_refuse: bool,
+    /// `sync` rend 403 `premium_required` (gratuit dont aucun cercle ne
+    /// partage ce serveur).
+    pub premium_requis: bool,
+    /// L'en-tête `X-Tune-Server-Token` de chaque tentative de `sync`.
+    pub entetes_de_synchro: Vec<Option<String>>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -124,6 +180,23 @@ impl Faux {
             circles: c["circles"].as_array().unwrap().clone(),
             prochain_cercle_id: 3,
             rangement_des_invitations: Vec::new(),
+            t2: false,
+            serveurs_du_compte: vec![SERVEUR_DU_COMPTE.into(), AUTRE_SERVEUR_DU_COMPTE.into()],
+            partages: Vec::new(),
+            dernier_corps_partage: None,
+            partagent_avec_moi: vec![json!({ "user_id": 7, "name": "Alice", "library": true })],
+            contacts_qui_partagent: vec!["7".into()],
+            derniere_requete: None,
+            lectures_permises: 1000,
+            synchros: Vec::new(),
+            jeton_de_liaison: None,
+            liaisons: 0,
+            dernier_corps_liaison: None,
+            liaison_refusee: None,
+            sync_exige_liaison: false,
+            jeton_toujours_refuse: false,
+            premium_requis: false,
+            entetes_de_synchro: Vec::new(),
         }
     }
 
@@ -133,9 +206,23 @@ impl Faux {
         });
         // Comme site-mozaiklabs#224 : la clé n'existe que s'il y a un cercle.
         if !self.circles.is_empty() {
-            c["circles"] = json!(self.circles);
+            let mut cercles = self.circles.clone();
+            if self.t2 {
+                for cercle in &mut cercles {
+                    cercle["sharing"] = self.partage_du_cercle(&cercle["id"]);
+                }
+            }
+            c["circles"] = json!(cercles);
         }
         c
+    }
+
+    /// `{ "library", "server_id" }` du cercle `id` (contrat T2).
+    pub fn partage_du_cercle(&self, id: &Value) -> Value {
+        match self.partages.iter().find(|(c, _)| Some(*c) == id.as_i64()) {
+            Some((_, server_id)) => json!({ "library": true, "server_id": server_id }),
+            None => json!({ "library": false, "server_id": null }),
+        }
     }
 
     /// Ce que fait le cloud quand l'invité accepte, de SON côté, une
@@ -501,6 +588,199 @@ async fn deranger(
     Json(json!({ "ok": true })).into_response()
 }
 
+// T2 (#5325) ---------------------------------------------------------------
+
+async fn partager(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    f.dernier_corps_partage = Some(v.clone());
+    let Some(server_id) = v["server_id"].as_str().map(str::to_string) else {
+        return validation("server_id", MESSAGE_SERVER_ID);
+    };
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    // Un serveur que ce compte n'a pas lié (site-mozaiklabs#233).
+    if !f.serveurs_du_compte.contains(&server_id) {
+        return refus(StatusCode::NOT_FOUND, "server_not_linked");
+    }
+    let circle_id = f.circles[k]["id"].as_i64().unwrap();
+    f.partages.retain(|(c, _)| *c != circle_id);
+    f.partages.push((circle_id, server_id));
+    let mut cercle = f.circles[k].clone();
+    cercle["sharing"] = f.partage_du_cercle(&json!(circle_id));
+    Json(cercle).into_response()
+}
+
+async fn ne_plus_partager(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    let circle_id = f.circles[k]["id"].as_i64().unwrap();
+    f.partages.retain(|(c, _)| *c != circle_id);
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn partagent_avec_moi(State(e): State<Partage>, h: HeaderMap) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    Json(json!(e.lock().unwrap().partagent_avec_moi)).into_response()
+}
+
+/// Le catalogue d'Alice, projeté (liste blanche du contrat).
+pub fn catalogue(quoi: &str) -> Value {
+    match quoi {
+        "stats" => json!({ "tracks": 2, "albums": 1, "artists": 1,
+                           "last_sync": "2026-09-28T08:00:00Z" }),
+        "artists" => json!({ "data": [ { "id": 20, "name": "Miles Davis" } ],
+                             "current_page": 1, "last_page": 1, "total": 1 }),
+        "albums" => json!({ "data": [ { "id": 10, "title": "Kind of Blue",
+                            "artist_name": "Miles Davis", "genre": "Jazz",
+                            "track_count": 2, "year": 1959 } ],
+                            "current_page": 1, "last_page": 1, "total": 1 }),
+        _ => json!({ "data": [
+            { "id": 1, "title": "So What", "artist_name": "Miles Davis",
+              "album_title": "Kind of Blue", "album_id": 10, "format": "flac",
+              "sample_rate": 96000, "bit_depth": 24, "duration_ms": 562000,
+              "genre": "Jazz", "track_number": 1, "disc_number": 1 }
+        ], "current_page": 1, "last_page": 1, "total": 1 }),
+    }
+}
+
+fn lire_catalogue(
+    e: &Partage,
+    h: &HeaderMap,
+    uid: &str,
+    requete: Option<String>,
+    quoi: &str,
+) -> Response {
+    if let Some(r) = garde(e, h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.derniere_requete = requete;
+    if f.lectures_permises == 0 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "17")],
+            Json(json!({ "message": "Too Many Attempts." })),
+        )
+            .into_response();
+    }
+    f.lectures_permises -= 1;
+    // Non-contact, révoqué, non rangé, partage coupé : le même 404.
+    if !f.contacts_qui_partagent.iter().any(|c| c == uid) {
+        return introuvable();
+    }
+    Json(catalogue(quoi)).into_response()
+}
+
+async fn catalogue_de(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((uid, quoi)): Path<(String, String)>,
+    RawQuery(requete): RawQuery,
+) -> Response {
+    if !["stats", "artists", "albums", "tracks"].contains(&quoi.as_str()) {
+        return introuvable();
+    }
+    lire_catalogue(&e, &h, &uid, requete, &quoi)
+}
+
+async fn pistes_de_l_album(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((uid, _album)): Path<(String, String)>,
+    RawQuery(requete): RawQuery,
+) -> Response {
+    lire_catalogue(&e, &h, &uid, requete, "tracks")
+}
+
+/// `POST /api/v1/cloud-library/{server_id}/sync` : note l'en-tête de liaison
+/// de chaque tentative, et le corps BRUT de chaque synchro acceptée.
+async fn synchro(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(server_id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let presente = h
+        .get("x-tune-server-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    f.entetes_de_synchro.push(presente.clone());
+    if f.jeton_toujours_refuse {
+        return refus(StatusCode::UNAUTHORIZED, "server_token_invalid");
+    }
+    if f.sync_exige_liaison {
+        let Some(attendu) = f.jeton_de_liaison.clone() else {
+            return refus(StatusCode::FORBIDDEN, "server_not_linked");
+        };
+        if presente.as_deref() != Some(attendu.as_str()) {
+            return refus(StatusCode::UNAUTHORIZED, "server_token_invalid");
+        }
+    }
+    if f.premium_requis {
+        return refus(StatusCode::FORBIDDEN, "premium_required");
+    }
+    f.synchros
+        .push((server_id, String::from_utf8_lossy(&corps).into_owned()));
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// Préfixe des jetons de liaison du faux cloud (64 caractères en tout).
+pub const PREFIXE_JETON_DE_LIAISON: &str = "jeton-liaison-SECRET-5325-";
+
+/// `POST /api/v1/cloud-library/{server_id}/link` : chaque appel renouvelle le
+/// jeton, le précédent cesse de valoir.
+async fn lier(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(server_id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.liaisons += 1;
+    f.dernier_corps_liaison = Some(corps.to_vec());
+    if let Some(statut) = f.liaison_refusee {
+        return refus(StatusCode::from_u16(statut).unwrap(), "not_found");
+    }
+    let jeton = format!("{PREFIXE_JETON_DE_LIAISON}{:0>38}", f.liaisons);
+    assert_eq!(jeton.len(), 64);
+    f.jeton_de_liaison = Some(jeton.clone());
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "server_id": server_id, "token": jeton })),
+    )
+        .into_response()
+}
+
+pub const MESSAGE_SERVER_ID: &str = "The server id field must be a string.";
+
 /// `POST /oauth/token`, `grant_type=refresh_token` : fait tourner la paire.
 async fn jeton(State(e): State<Partage>, corps: Bytes) -> Response {
     let texte = String::from_utf8_lossy(&corps).to_string();
@@ -541,6 +821,21 @@ pub async fn demarrer() -> Serveur {
             "/api/v1/circle/circles/{id}/members/{user_id}",
             put(ranger).delete(deranger),
         )
+        .route(
+            "/api/v1/circle/circles/{id}/sharing/library",
+            put(partager).delete(ne_plus_partager),
+        )
+        .route("/api/v1/circle/shared-with-me", get(partagent_avec_moi))
+        .route(
+            "/api/v1/circle/contacts/{user_id}/library/{quoi}",
+            get(catalogue_de),
+        )
+        .route(
+            "/api/v1/circle/contacts/{user_id}/library/albums/{album_id}/tracks",
+            get(pistes_de_l_album),
+        )
+        .route("/api/v1/cloud-library/{server_id}/sync", post(synchro))
+        .route("/api/v1/cloud-library/{server_id}/link", post(lier))
         .route("/oauth/token", post(jeton))
         .with_state(etat.clone());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -578,7 +873,8 @@ pub fn base(url_cloud: &str, jeton: Option<&str>) -> Arc<dyn DbBackend> {
 }
 
 pub fn app(backend: Arc<dyn DbBackend>) -> Router {
-    tune_circle::routes::router(Arc::new(tune_circle::relais::Relais::new(backend)))
+    let license = Arc::new(tune_core::license::LicenseManager::new(backend.clone()));
+    tune_circle::routes::router(Arc::new(tune_circle::relais::Relais::new(backend)), license)
 }
 
 pub struct Rendu {
