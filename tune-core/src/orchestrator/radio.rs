@@ -604,6 +604,11 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         _ => None,
     };
     let source_info = crate::http::streamer::RadioSourceInfo {
+        channels: audio_params
+            .channels
+            .as_ref()
+            .and_then(|c| u16::try_from(c.count()).ok())
+            .filter(|n| *n > 0),
         format: source_format,
         sample_rate: audio_params.sample_rate.filter(|rate| *rate > 0),
         // Lossy codecs do not have a source PCM bit depth. The 16-bit WAV
