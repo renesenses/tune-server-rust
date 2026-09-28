@@ -24,7 +24,11 @@
 //! * **Journal** : route, statut, durée. Jamais le jeton, jamais un corps
 //!   (les invitations envoyées portent l'adresse saisie par l'auteur).
 
+pub mod lecture;
+pub mod playlists;
+pub mod references;
 pub mod relais;
+pub mod resolution;
 pub mod routes;
 
 use std::sync::Arc;
@@ -33,7 +37,10 @@ use async_trait::async_trait;
 use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
 use tune_core::license::LicenseManager;
+use tune_core::orchestrator::PlaybackOrchestrator;
+use tune_core::playback::PlaybackManager;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
+use tune_core::streaming::ServiceRegistry;
 
 /// Ce que l'hôte passe au greffon, explicitement, à sa construction.
 ///
@@ -41,9 +48,18 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 /// cloud y vivent déjà, sous les clés que lisent toutes les fonctions cloud du
 /// serveur. La licence (T2, #5325) : `GET /library-sync` dit au propriétaire
 /// si son serveur est Premium, avec le même juge que la synchro elle-même.
+///
+/// T5 (#5328), les playlists collaboratives : le parc des services, pour
+/// rejouer une référence chez l'utilisateur (lecture seule : `get_track` et
+/// la recherche du moteur de transfert, jamais une écriture chez un service) ;
+/// l'orchestrateur et le gestionnaire de lecture, pour jouer la playlist
+/// résolue sur une zone.
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
     pub license: Arc<LicenseManager>,
+    pub services: Arc<tokio::sync::Mutex<ServiceRegistry>>,
+    pub orchestrator: Arc<PlaybackOrchestrator>,
+    pub playback: Arc<PlaybackManager>,
 }
 
 pub struct CirclePlugin {
@@ -81,10 +97,23 @@ impl TunePlugin for CirclePlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(routes::router(
-            Arc::new(relais::Relais::new(self.services.backend.clone())),
-            self.services.license.clone(),
-        ));
+        let relais = Arc::new(relais::Relais::new(self.services.backend.clone()));
+        let collaboratif = Arc::new(playlists::Collaboratif {
+            relais: relais.clone(),
+            resolveur: resolution::Resolveur::new(
+                self.services.backend.clone(),
+                self.services.services.clone(),
+            ),
+            lecture: Arc::new(lecture::LectureOrchestrateur {
+                backend: self.services.backend.clone(),
+                orchestrator: self.services.orchestrator.clone(),
+                playback: self.services.playback.clone(),
+            }),
+        });
+        ctx.register_router(
+            routes::router(relais, self.services.license.clone())
+                .merge(playlists::router(collaboratif)),
+        );
         Ok(())
     }
 

@@ -136,6 +136,24 @@ pub struct Faux {
     pub premium_requis: bool,
     /// L'en-tête `X-Tune-Server-Token` de chaque tentative de `sync`.
     pub entetes_de_synchro: Vec<Option<String>>,
+    // T5 (#5328) ------------------------------------------------------------
+    /// Les playlists de cercle visibles par le détenteur du jeton.
+    pub playlists: Vec<Value>,
+    /// Révocation, retrait du cercle ou suppression : toute route de playlist
+    /// rend 404, comme pour une playlist inexistante.
+    pub playlists_coupees: bool,
+    /// (route, corps reçu) de chaque écriture sur une playlist.
+    pub ecritures_de_playlist: Vec<(String, Value)>,
+    /// La chaîne de requête du dernier `DELETE …/items/{item_id}`.
+    pub requete_de_retrait: Option<String>,
+    /// Lectures `GET /playlists/{id}` reçues.
+    pub lectures_de_playlist: usize,
+    /// L'en-tête `If-Match` de chaque écriture reçue.
+    pub if_match_recus: Vec<Option<String>>,
+    /// Les playlists récupérables (cercle supprimé) du détenteur.
+    pub recuperables: Vec<Value>,
+    /// Les `DELETE /recoverable-playlists/{id}` reçus.
+    pub renonciations: Vec<String>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -197,6 +215,14 @@ impl Faux {
             jeton_toujours_refuse: false,
             premium_requis: false,
             entetes_de_synchro: Vec::new(),
+            playlists: vec![playlist_initiale()],
+            playlists_coupees: false,
+            ecritures_de_playlist: Vec::new(),
+            requete_de_retrait: None,
+            lectures_de_playlist: 0,
+            if_match_recus: Vec::new(),
+            recuperables: vec![recuperable_initiale()],
+            renonciations: Vec::new(),
         }
     }
 
@@ -779,6 +805,371 @@ async fn lier(
         .into_response()
 }
 
+// T5 (#5328) : les playlists collaboratives ---------------------------------
+
+/// Les clés qu'une référence peut porter (contrat de #5328, décision 4).
+pub const CLES_DE_REFERENCE: [&str; 11] = [
+    "title",
+    "artist_name",
+    "album_title",
+    "duration_ms",
+    "isrc",
+    "musicbrainz_recording_id",
+    "qobuz_id",
+    "tidal_id",
+    "spotify_id",
+    "deezer_id",
+    "youtube_id",
+];
+
+/// La playlist 5, du cercle 1 : trois morceaux, par références seulement.
+pub fn playlist_initiale() -> Value {
+    json!({
+        "id": 5, "name": "Dimanche", "version": 3,
+        "owner": { "user_id": 1, "name": "Moi" }, "mine": true,
+        "items": [
+            { "item_id": 51, "title": "So What", "artist_name": "Miles Davis",
+              "album_title": "Kind of Blue", "duration_ms": 562000,
+              "isrc": "USSM15900113", "qobuz_id": "q-so-what", "tidal_id": "t-so-what",
+              "added_by": { "user_id": 7, "name": "Alice" }, "added_at": "2026-09-28T09:00:00Z" },
+            { "item_id": 52, "title": "Blue in Green", "artist_name": "Miles Davis",
+              "album_title": "Kind of Blue", "duration_ms": 337000,
+              "isrc": "USSM15900115",
+              "added_by": null, "added_at": "2026-09-28T09:01:00Z" },
+            { "item_id": 53, "title": "Un titre que personne n'a", "artist_name": "Inconnu",
+              "duration_ms": 200000,
+              "added_by": null, "added_at": "2026-09-28T09:02:00Z" }
+        ]
+    })
+}
+
+/// La playlist 8, d'un cercle supprimé : récupérable par le détenteur.
+pub fn recuperable_initiale() -> Value {
+    json!({
+        "id": 8, "name": "Jazz du samedi", "owner": { "user_id": 7, "name": "Alice" },
+        "mine": false, "archived_at": "2026-09-28T11:00:00Z",
+        "items": [
+            { "item_id": 81, "title": "So What", "artist_name": "Miles Davis",
+              "album_title": "Kind of Blue", "duration_ms": 562000, "isrc": "USSM15900113",
+              "musicbrainz_recording_id": null, "qobuz_id": null, "tidal_id": null,
+              "spotify_id": null, "deezer_id": null, "youtube_id": null,
+              "added_by": null, "mine": false, "added_at": "2026-09-28T09:00:00Z" },
+            { "item_id": 82, "title": "Blue in Green", "artist_name": "Miles Davis",
+              "album_title": "Kind of Blue", "duration_ms": 337000, "isrc": null,
+              "musicbrainz_recording_id": null, "qobuz_id": "q-bleu", "tidal_id": null,
+              "spotify_id": null, "deezer_id": null, "youtube_id": null,
+              "added_by": null, "mine": false, "added_at": "2026-09-28T09:01:00Z" },
+            { "item_id": 83, "title": "Un titre que personne n'a", "artist_name": "Inconnu",
+              "album_title": null, "duration_ms": 200000, "isrc": null,
+              "musicbrainz_recording_id": null, "qobuz_id": null, "tidal_id": null,
+              "spotify_id": null, "deezer_id": null, "youtube_id": null,
+              "added_by": null, "mine": false, "added_at": "2026-09-28T09:02:00Z" }
+        ]
+    })
+}
+
+async fn lister_recuperables(State(e): State<Partage>, h: HeaderMap) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let f = e.lock().unwrap();
+    let liste: Vec<Value> = f
+        .recuperables
+        .iter()
+        .map(|p| {
+            json!({ "id": p["id"], "name": p["name"], "owner": p["owner"], "mine": p["mine"],
+                         "count": p["items"].as_array().map_or(0, Vec::len),
+                         "archived_at": p["archived_at"] })
+        })
+        .collect();
+    Json(json!(liste)).into_response()
+}
+
+async fn lire_recuperable(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let f = e.lock().unwrap();
+    match f.recuperables.iter().find(|p| meme_id(&p["id"], &id)) {
+        Some(p) => Json(p.clone()).into_response(),
+        None => introuvable(),
+    }
+}
+
+async fn renoncer_a_la_recuperable(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.renonciations.push(id.clone());
+    let avant = f.recuperables.len();
+    f.recuperables.retain(|p| !meme_id(&p["id"], &id));
+    if f.recuperables.len() == avant {
+        return introuvable();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+fn resume(p: &Value) -> Value {
+    json!({
+        "id": p["id"], "name": p["name"], "owner": p["owner"],
+        "count": p["items"].as_array().map_or(0, Vec::len),
+        "version": p["version"], "updated_at": "2026-09-28T09:02:00Z", "mine": p["mine"],
+    })
+}
+
+/// La playlist `id`, sous la garde du faux : `None` = 404.
+fn playlist_de<'a>(f: &'a mut Faux, id: &str) -> Option<&'a mut Value> {
+    if f.playlists_coupees {
+        return None;
+    }
+    f.playlists.iter_mut().find(|p| meme_id(&p["id"], id))
+}
+
+fn etag(p: &Value) -> String {
+    format!("\"{}\"", p["version"])
+}
+
+/// Une `Playlist`, avec son `ETag` (site-mozaiklabs#236).
+fn avec_etag(p: &Value) -> Response {
+    ([(header::ETAG, etag(p))], Json(p.clone())).into_response()
+}
+
+fn conflit(p: &Value) -> Response {
+    (
+        StatusCode::CONFLICT,
+        [(header::ETAG, etag(p))],
+        Json(json!({ "error": "version_conflict", "playlist": p })),
+    )
+        .into_response()
+}
+
+/// La version envoyée : le corps, sinon `If-Match: "<n>"`.
+fn version_recue(f: &mut Faux, v: &Value, h: &HeaderMap) -> Value {
+    let if_match = h
+        .get(header::IF_MATCH)
+        .and_then(|x| x.to_str().ok())
+        .map(str::to_string);
+    f.if_match_recus.push(if_match.clone());
+    if !v["version"].is_null() {
+        return v["version"].clone();
+    }
+    if_match
+        .and_then(|m| m.trim_matches('"').parse::<i64>().ok())
+        .map_or(Value::Null, Value::from)
+}
+
+async fn lister_playlists(State(e): State<Partage>, h: HeaderMap) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let f = e.lock().unwrap();
+    if f.playlists_coupees {
+        return Json(json!([])).into_response();
+    }
+    Json(json!(f.playlists.iter().map(resume).collect::<Vec<_>>())).into_response()
+}
+
+async fn creer_playlist(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    let mut f = e.lock().unwrap();
+    f.ecritures_de_playlist
+        .push(("POST /playlists".into(), v.clone()));
+    if !f.circles.iter().any(|c| c["id"] == v["circle_id"]) {
+        return introuvable();
+    }
+    let p = json!({ "id": 6, "name": v["name"], "version": 1,
+                    "owner": { "user_id": 1, "name": "Moi" }, "mine": true, "items": [] });
+    f.playlists.push(p.clone());
+    (StatusCode::CREATED, Json(p)).into_response()
+}
+
+async fn lire_playlist(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.lectures_de_playlist += 1;
+    match playlist_de(&mut f, &id) {
+        Some(p) => avec_etag(p),
+        None => introuvable(),
+    }
+}
+
+async fn renommer_playlist(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    let mut f = e.lock().unwrap();
+    f.ecritures_de_playlist
+        .push(("PATCH /playlists/{id}".into(), v.clone()));
+    let version = version_recue(&mut f, &v, &h);
+    let Some(p) = playlist_de(&mut f, &id) else {
+        return introuvable();
+    };
+    if p["version"] != version {
+        return conflit(p);
+    }
+    p["name"] = v["name"].clone();
+    p["version"] = json!(p["version"].as_i64().unwrap() + 1);
+    avec_etag(p)
+}
+
+async fn supprimer_playlist(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    if playlist_de(&mut f, &id).is_none() {
+        return introuvable();
+    }
+    f.playlists.retain(|p| !meme_id(&p["id"], &id));
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn ajouter_a_la_playlist(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    let mut f = e.lock().unwrap();
+    f.ecritures_de_playlist
+        .push(("POST /playlists/{id}/items".into(), v.clone()));
+    let version = version_recue(&mut f, &v, &h);
+    let Some(p) = playlist_de(&mut f, &id) else {
+        return introuvable();
+    };
+    if p["version"] != version {
+        return conflit(p);
+    }
+    let Some(items) = v["items"].as_array().filter(|i| !i.is_empty()) else {
+        return validation("items", "The items field is required.");
+    };
+    // Liste blanche : une clé inconnue (chemin, URL, source_id…) = 422, rien
+    // n'est écrit.
+    for item in items {
+        let ok = item.as_object().is_some_and(|o| {
+            o.keys().all(|k| CLES_DE_REFERENCE.contains(&k.as_str()))
+                && o.get("title")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+        });
+        if !ok {
+            return validation("items", "The items field is invalid.");
+        }
+    }
+    let premier = 100 + p["items"].as_array().unwrap().len() as i64;
+    for (k, item) in items.iter().enumerate() {
+        let mut ligne = item.clone();
+        ligne["item_id"] = json!(premier + k as i64);
+        ligne["added_by"] = json!({ "user_id": 1, "name": "Moi" });
+        ligne["added_at"] = json!("2026-09-28T10:00:00Z");
+        p["items"].as_array_mut().unwrap().push(ligne);
+    }
+    p["version"] = json!(p["version"].as_i64().unwrap() + 1);
+    avec_etag(p)
+}
+
+async fn retirer_de_la_playlist(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((id, item_id)): Path<(String, String)>,
+    RawQuery(requete): RawQuery,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.requete_de_retrait = requete.clone();
+    let version = requete
+        .as_deref()
+        .and_then(|q| q.strip_prefix("version="))
+        .and_then(|v| v.parse::<i64>().ok());
+    let Some(p) = playlist_de(&mut f, &id) else {
+        return introuvable();
+    };
+    if p["version"].as_i64() != version {
+        return conflit(p);
+    }
+    let items = p["items"].as_array_mut().unwrap();
+    let Some(i) = position(items, "item_id", &item_id) else {
+        return introuvable();
+    };
+    items.remove(i);
+    p["version"] = json!(p["version"].as_i64().unwrap() + 1);
+    avec_etag(p)
+}
+
+async fn ordonner_la_playlist(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    let mut f = e.lock().unwrap();
+    f.ecritures_de_playlist
+        .push(("PUT /playlists/{id}/order".into(), v.clone()));
+    let version = version_recue(&mut f, &v, &h);
+    let Some(p) = playlist_de(&mut f, &id) else {
+        return introuvable();
+    };
+    if p["version"] != version {
+        return conflit(p);
+    }
+    let actuels: Vec<Value> = p["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["item_id"].clone())
+        .collect();
+    let demandes = v["item_ids"].as_array().cloned().unwrap_or_default();
+    let mut a = actuels.iter().map(Value::to_string).collect::<Vec<_>>();
+    let mut b = demandes.iter().map(Value::to_string).collect::<Vec<_>>();
+    a.sort();
+    b.sort();
+    if a != b {
+        return validation("item_ids", "The item ids must be an exact permutation.");
+    }
+    let anciens = p["items"].as_array().unwrap().clone();
+    let neufs: Vec<Value> = demandes
+        .iter()
+        .map(|d| anciens.iter().find(|i| i["item_id"] == *d).unwrap().clone())
+        .collect();
+    p["items"] = json!(neufs);
+    p["version"] = json!(p["version"].as_i64().unwrap() + 1);
+    avec_etag(p)
+}
+
 pub const MESSAGE_SERVER_ID: &str = "The server id field must be a string.";
 
 /// `POST /oauth/token`, `grant_type=refresh_token` : fait tourner la paire.
@@ -833,6 +1224,36 @@ pub async fn demarrer() -> Serveur {
         .route(
             "/api/v1/circle/contacts/{user_id}/library/albums/{album_id}/tracks",
             get(pistes_de_l_album),
+        )
+        .route(
+            "/api/v1/circle/playlists",
+            get(lister_playlists).post(creer_playlist),
+        )
+        .route(
+            "/api/v1/circle/playlists/{id}",
+            get(lire_playlist)
+                .patch(renommer_playlist)
+                .delete(supprimer_playlist),
+        )
+        .route(
+            "/api/v1/circle/playlists/{id}/items",
+            post(ajouter_a_la_playlist),
+        )
+        .route(
+            "/api/v1/circle/playlists/{id}/items/{item_id}",
+            delete(retirer_de_la_playlist),
+        )
+        .route(
+            "/api/v1/circle/playlists/{id}/order",
+            put(ordonner_la_playlist),
+        )
+        .route(
+            "/api/v1/circle/recoverable-playlists",
+            get(lister_recuperables),
+        )
+        .route(
+            "/api/v1/circle/recoverable-playlists/{id}",
+            get(lire_recuperable).delete(renoncer_a_la_recuperable),
         )
         .route("/api/v1/cloud-library/{server_id}/sync", post(synchro))
         .route("/api/v1/cloud-library/{server_id}/link", post(lier))

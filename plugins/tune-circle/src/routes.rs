@@ -143,12 +143,12 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .merge(etat_de_la_copie)
 }
 
-fn refus(statut: StatusCode, corps: Value) -> Response {
+pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
     (statut, Json(corps)).into_response()
 }
 
 /// La forme HTTP d'une [`Issue`].
-fn en_reponse(issue: Issue) -> Response {
+pub(crate) fn en_reponse(issue: Issue) -> Response {
     match issue {
         Issue::NonConnecte => refus(
             StatusCode::PRECONDITION_FAILED,
@@ -166,6 +166,7 @@ fn en_reponse(issue: Issue) -> Response {
             statut,
             corps,
             retry_after,
+            etag,
         } => {
             let statut = StatusCode::from_u16(statut).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut reponse = if corps.is_empty() {
@@ -187,17 +188,20 @@ fn en_reponse(issue: Issue) -> Response {
             if let Some(v) = retry_after {
                 reponse.headers_mut().insert(header::RETRY_AFTER, v);
             }
+            if let Some(v) = etag {
+                reponse.headers_mut().insert(header::ETAG, v);
+            }
             reponse
         }
     }
 }
 
 /// Un identifiant de chemin qui désigne bien UNE ressource.
-fn identifiant_valide(id: &str) -> bool {
+pub(crate) fn identifiant_valide(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && id.len() <= 200
 }
 
-fn introuvable() -> Response {
+pub(crate) fn introuvable() -> Response {
     refus(StatusCode::NOT_FOUND, json!({ "code": CODE_INTROUVABLE }))
 }
 
