@@ -2190,6 +2190,11 @@ pub(super) struct AlbumUpdate {
     /// Absent = « je n'y touche pas », et non « faux » : c'est ce qui permet à
     /// l'écran d'éditer le titre d'un album sans lui reprendre son drapeau.
     is_compilation: Option<bool>,
+    /// #5314 — « appliquer aussi aux pistes » : lève l'exception des
+    /// compilations aux genres différents
+    /// (`tune_core::db::genre_album_pistes`).
+    #[serde(default)]
+    apply_genre_to_tracks: bool,
 }
 
 pub(super) async fn update_album(
@@ -2202,6 +2207,7 @@ pub(super) async fn update_album(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let genre_avant = album.genre.clone();
 
     if let Some(ref v) = body.title {
         album.title = v.clone();
@@ -2259,6 +2265,20 @@ pub(super) async fn update_album(
             .marquer_edition_manuelle(id, &champs)
         {
             tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+        }
+        // #5314 — le genre CHANGÉ de l'album vaut pour ses pistes (Oxygen).
+        if body.apply_genre_to_tracks
+            || (body.genre.is_some()
+                && tune_core::db::genre_album_pistes::genre_change(
+                    genre_avant.as_deref(),
+                    album.genre.as_deref(),
+                ))
+        {
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                id,
+                body.apply_genre_to_tracks,
+            );
         }
     }
 
@@ -2351,6 +2371,8 @@ pub(super) async fn album_metadata_put(
     // l'utilisateur a tenu, il n'est pas une valeur qu'il tient.
     let mut body = body;
     body.remove(tune_core::db::album_metadata_repo::CLE_EDITION_MANUELLE);
+    // #5314 — pas plus que le marqueur de recopie du genre sur les pistes.
+    body.remove(tune_core::db::genre_album_pistes::CLE_GENRE_PISTES);
     if let Err(e) = repo.set_batch(id, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -2377,6 +2399,9 @@ pub(super) struct BatchAlbumUpdate {
     /// Métadonnées emploie : on coche les douze vignettes d'une compilation
     /// éclatée, et un seul appel les marque toutes.
     is_compilation: Option<bool>,
+    /// #5314 — voir [`AlbumUpdate::apply_genre_to_tracks`].
+    #[serde(default)]
+    apply_genre_to_tracks: bool,
 }
 
 pub(super) async fn batch_update_albums(
@@ -2412,6 +2437,7 @@ pub(super) async fn batch_update_albums(
             Ok(Some(a)) => a,
             _ => continue,
         };
+        let genre_avant = album.genre.clone();
         if let Some(ref g) = body.genre {
             album.genre = Some(g.clone());
         }
@@ -2461,6 +2487,20 @@ pub(super) async fn batch_update_albums(
                 && let Err(e) = meta_repo.marquer_edition_manuelle(id, &champs)
             {
                 tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+            }
+            // #5314 — même règle qu'à `update_album`, album par album.
+            if body.apply_genre_to_tracks
+                || (body.genre.is_some()
+                    && tune_core::db::genre_album_pistes::genre_change(
+                        genre_avant.as_deref(),
+                        album.genre.as_deref(),
+                    ))
+            {
+                tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                    &state.backend,
+                    id,
+                    body.apply_genre_to_tracks,
+                );
             }
         }
     }
@@ -2604,6 +2644,7 @@ mod tests_editions {
                 year: None,
                 label: None,
                 is_compilation: None,
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2638,6 +2679,7 @@ mod tests_editions {
                 artist_name: None,
                 label: None,
                 is_compilation: None,
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2678,6 +2720,7 @@ mod tests_editions {
                 artist_name: None,
                 label: None,
                 is_compilation: Some(true),
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2712,6 +2755,7 @@ mod tests_editions {
                 year: None,
                 label: None,
                 is_compilation: Some(false),
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -3850,5 +3894,134 @@ pub(super) async fn defaire_coffret(
         Err(coffrets_auto::RefusDefaire::Base(e)) => {
             AppError::internal(format!("défaire le coffret {id} : {e}")).into_response()
         }
+    }
+}
+
+/// #5314 (Cyrille Moutia, fil « Filtres cumulatifs ») — un genre posé sur un
+/// album par l'une des routes d'écriture d'album doit être CE QUE la facette
+/// Genre d'Oxygen propose pour ses pistes. Joué par les routes elles-mêmes,
+/// comme le client : `PUT /library/albums/{id}`, `POST …/batch-update`,
+/// `PUT …/{id}/edition`, puis `GET /library/facets?fields=genre`.
+#[cfg(test)]
+mod tests_genre_pistes_5314 {
+    use super::*;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let app = Router::new()
+            .nest("/library", crate::routes::library::router())
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Les valeurs de la facette Genre, triées.
+    async fn facette(state: &AppState) -> Vec<String> {
+        let (status, v) = request(
+            state,
+            "GET",
+            "/library/facets?fields=genre&limit=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let mut out: Vec<String> = v["genre"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|x| x["value"].as_str().map(str::to_string))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn banc() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'X', 1), (2, 'Y', 1), (3, 'Z', 1)",
+            &[],
+        )
+        .unwrap();
+        // Les genres des BALISES : ce qu'Oxygen montrait, quel que soit le
+        // genre posé à la Bibliothèque.
+        for (id, album, g, gs) in [
+            (1, 1, "Rock", r#"["Rock","Pop"]"#),
+            (2, 1, "Blues", r#"["Blues"]"#),
+            (3, 2, "Rock", r#"["Rock"]"#),
+            (4, 3, "Rock", r#"["Rock"]"#),
+        ] {
+            b.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, genre, genres) \
+                     VALUES ({id}, 'T{id}', {album}, 1, '/m/{id}.flac', '{g}', '{gs}')"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn chaque_route_d_ecriture_d_album_atteint_la_facette_d_oxygen() {
+        let state = banc();
+        assert_eq!(facette(&state).await, ["Blues", "Pop", "Rock"]);
+
+        let (s, _) = request(
+            &state,
+            "PUT",
+            "/library/albums/1",
+            json!({ "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = request(
+            &state,
+            "POST",
+            "/library/albums/batch-update",
+            json!({ "album_ids": [2], "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = request(
+            &state,
+            "PUT",
+            "/library/albums/3/edition",
+            json!({ "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+
+        assert_eq!(
+            facette(&state).await,
+            ["Jazz"],
+            "#5314 : la facette Genre d'Oxygen doit proposer le genre posé sur les albums, et lui seul"
+        );
     }
 }

@@ -304,6 +304,10 @@ pub struct Tenue {
 pub struct Tenues {
     par_chemin: HashMap<String, Tenue>,
     albums_disposes: HashSet<i64>,
+    /// #5314 — `(tracks.genre, tracks.genres)` recopiés du genre de l'album,
+    /// par album (marqueur `genre_pistes`, voir
+    /// [`super::genre_album_pistes`]).
+    genres_par_album: HashMap<i64, (String, String)>,
 }
 
 impl Tenues {
@@ -361,6 +365,26 @@ impl Tenues {
             }
         }
         let mut t = Self::default();
+        let sql_genres = format!(
+            "SELECT m.album_id, m.value FROM album_metadata m \
+             JOIN albums a ON a.id = m.album_id WHERE m.key = {}",
+            marque(db.engine(), 1)
+        );
+        for r in db.query_many_strong(
+            &sql_genres,
+            &[&super::genre_album_pistes::CLE_GENRE_PISTES as &dyn ToSqlValue],
+        )? {
+            let (Some(id), Some(v)) = (
+                r.first().and_then(|v| v.as_i64()),
+                r.get(1).and_then(|v| v.as_string()),
+            ) else {
+                continue;
+            };
+            // Valeur vide : pistes épargnées (compilation), rien à reposer.
+            if let Some(colonnes) = super::genre_album_pistes::colonnes_de_piste(&v) {
+                t.genres_par_album.insert(id, colonnes);
+            }
+        }
         for (album_id, e) in editions {
             if e.disposition {
                 t.albums_disposes.insert(album_id);
@@ -384,7 +408,7 @@ impl Tenues {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.par_chemin.is_empty()
+        self.par_chemin.is_empty() && self.genres_par_album.is_empty()
     }
 
     pub fn get(&self, chemin: &str) -> Option<&Tenue> {
@@ -399,13 +423,25 @@ impl Tenues {
     /// Pose sur une ligne piste — construite depuis les balises, pas encore
     /// écrite — ce que l'utilisateur a tenu. Rend vrai si la ligne a changé.
     pub fn appliquer(&self, track: &mut Track) -> bool {
-        let Some(t) = track
+        let tenue = track
             .file_path
             .as_deref()
-            .and_then(|c| self.par_chemin.get(c))
-        else {
-            return false;
-        };
+            .and_then(|c| self.par_chemin.get(c));
+        let change = tenue.is_some();
+        if let Some(t) = tenue {
+            self.appliquer_tenue(t, track);
+        }
+        // #5314 — APRÈS la disposition : c'est l'album où la piste est tenue
+        // qui donne son genre.
+        if let Some((genre, genres)) = track.album_id.and_then(|a| self.genres_par_album.get(&a)) {
+            track.genre = Some(genre.clone());
+            track.genres = Some(genres.clone());
+            return true;
+        }
+        change
+    }
+
+    fn appliquer_tenue(&self, t: &Tenue, track: &mut Track) {
         if let Some((disque, numero, nom)) = &t.disposition {
             track.album_id = Some(t.album_id);
             track.disc_number = *disque;
@@ -418,7 +454,6 @@ impl Tenues {
         if let Some(a) = t.artiste_id {
             track.artist_id = Some(a);
         }
-        true
     }
 }
 
@@ -630,6 +665,11 @@ pub struct Modification {
     pub discs: Option<Vec<DisqueModifie>>,
     #[serde(default)]
     pub tracks: Option<Vec<PisteModifiee>>,
+    /// #5314 — « appliquer aussi aux pistes » : recopie le genre de l'album
+    /// sur ses pistes même quand c'est une compilation aux genres différents
+    /// (que la recopie épargne sinon), et même si le genre ne change pas.
+    #[serde(default)]
+    pub apply_genre_to_tracks: bool,
 }
 
 /// Pourquoi une édition est refusée.
@@ -704,10 +744,20 @@ pub fn appliquer(
     m: &Modification,
 ) -> Result<(), RefusEdition> {
     let repo = AlbumRepo::with_backend(db.clone());
-    if repo.get(album_id)?.is_none() {
+    let Some(avant) = repo.get(album_id)? else {
         return Err(RefusEdition::AlbumInconnu(album_id));
-    }
+    };
     let engine = db.engine();
+    // #5314 — CHANGER le genre de l'album le recopie sur ses pistes ; un
+    // formulaire renvoyé avec le même genre ne réécrit rien, sauf demande.
+    let recopier_genre = m.apply_genre_to_tracks
+        || m.genre.as_ref().is_some_and(|g| {
+            super::genre_album_pistes::genre_change(
+                avant.genre.as_deref(),
+                texte_libre(g).as_deref(),
+            )
+        });
+    let mut recopie = None;
     let lignes =
         lignes_de(db.query_many_strong(&sql_lignes(engine), &[&album_id as &dyn ToSqlValue])?);
     let ids_album: HashSet<i64> = lignes.iter().map(|l| l.id).collect();
@@ -967,6 +1017,16 @@ pub fn appliquer(
             }
             None => {}
         }
+        // #5314 — APRÈS le genre et le mode de compilation : l'exception des
+        // compilations juge l'album tel que cette édition vient de le poser.
+        if recopier_genre {
+            recopie = Some(super::genre_album_pistes::recopier_dans(
+                tx,
+                engine,
+                album_id,
+                m.apply_genre_to_tracks,
+            )?);
+        }
         if tenus != tenus_avant {
             tx.execute(
                 &sql_upsert,
@@ -998,6 +1058,7 @@ pub fn appliquer(
         champs = ?tenus.difference(&tenus_avant).collect::<Vec<_>>(),
         disques = nb_disques,
         pistes_renommees = titres_pistes.len() + artistes_pistes.len(),
+        genre_recopie = ?recopie,
         "album_edite_a_la_main"
     );
     Ok(())
