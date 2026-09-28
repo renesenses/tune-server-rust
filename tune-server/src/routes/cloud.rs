@@ -465,11 +465,26 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 /// untouched (a keyed premium survives).
 async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Tune Circle (décision du 28/09/2026, #5326) : défaire la liaison chez le
+    // cloud AVANT d'effacer les jetons qui la prouvent. Un échec (réseau, 404,
+    // 401) est journalisé par son statut seul et n'empêche PAS la déconnexion
+    // locale : l'utilisateur qui se déconnecte doit l'être, cloud joignable ou
+    // non.
+    let api = format!("{}/api/v1/cloud-library", mozaik_base(&settings));
+    if let Err(e) =
+        tune_core::cloud::library_sync::delier_le_serveur(&settings, &state.http_client, &api).await
+    {
+        warn!(error = %e, "cloud_server_unlink_failed");
+    }
     for key in [
         "mozaik_access_token",
         "mozaik_refresh_token",
         "mozaik_user",
         "mozaik_pkce_pending",
+        // Le jeton de liaison du serveur au compte (T2, #5325) : il ne vaut
+        // qu'avec la session du compte qui l'a obtenu. La prochaine connexion
+        // refait la liaison.
+        tune_core::cloud::library_sync::CLE_JETON_DE_LIAISON,
     ] {
         settings.delete(key).ok();
     }
@@ -1093,13 +1108,18 @@ async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
 /// rendait l'activation de licence intestable autrement qu'en appelant le
 /// serveur de licences de production.
 pub(crate) fn license_validate_url(settings: &SettingsRepo) -> String {
+    format!("{}/api/v1/license/validate", mozaik_base(settings))
+}
+
+/// La racine de mozaiklabs, redirigée par `mozaik_base_url`, sans barre finale.
+fn mozaik_base(settings: &SettingsRepo) -> String {
     let base = settings
         .get("mozaik_base_url")
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
-    format!("{}/api/v1/license/validate", base.trim_end_matches('/'))
+    base.trim_end_matches('/').to_string()
 }
 
 /// Validate the currently-stored license key against mozaiklabs.fr and apply

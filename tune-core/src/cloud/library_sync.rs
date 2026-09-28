@@ -169,6 +169,52 @@ pub async fn lier_depuis_les_reglages(
     lier_le_serveur(backend, http_client, CLOUD_LIBRARY_API, &server_id, &jeton).await
 }
 
+/// Défait la liaison du serveur au compte, chez le cloud :
+/// `DELETE {api}/{server_id}/link`, jeton OAuth de l'utilisateur ET jeton de
+/// liaison (`X-Tune-Server-Token`), sans corps. Appelé par la déconnexion SSO
+/// AVANT qu'elle efface les deux jetons (décision de Bertrand du 28/09/2026).
+///
+/// Rien ne part s'il manque le `server_id`, la session ou le jeton de liaison :
+/// il n'y a alors rien à défaire, ou rien pour le prouver. L'erreur rendue ne
+/// porte que le statut ou la nature de la panne — jamais un jeton, jamais
+/// l'adresse.
+pub async fn delier_le_serveur(
+    settings: &SettingsRepo,
+    http_client: &reqwest::Client,
+    api: &str,
+) -> Result<(), String> {
+    let lire = |cle: &str| {
+        settings
+            .get(cle)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(server_id), Some(acces), Some(jeton)) = (
+        lire("server_id"),
+        lire("mozaik_access_token"),
+        jeton_de_liaison(settings),
+    ) else {
+        return Ok(());
+    };
+    let reponse = http_client
+        .delete(format!("{}/{server_id}/link", api.trim_end_matches('/')))
+        .bearer_auth(acces)
+        .header(EN_TETE_JETON_DE_SERVEUR, jeton)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("cloud unlink request: {}", e.without_url()))?;
+    let statut = reponse.status();
+    if !statut.is_success() {
+        return Err(format!("cloud unlink HTTP {}", statut.as_u16()));
+    }
+    info!("cloud_server_unlinked");
+    Ok(())
+}
+
 /// Le serveur a-t-il déjà un jeton de liaison ?
 pub fn serveur_lie(settings: &SettingsRepo) -> bool {
     jeton_de_liaison(settings).is_some()

@@ -25,6 +25,10 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 # `GET /library-sync` rend `last_sync` sous une seule forme (T2, #5325).
 chrono = { workspace = true }
+# T3 (#5326) : l'empreinte d'un ensemble poussé, et la boucle qui les tient
+# à jour.
+sha2 = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
