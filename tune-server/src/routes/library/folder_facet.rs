@@ -231,6 +231,29 @@ fn split_child(fp: &str, plen: usize, sep: char) -> Option<(&str, bool)> {
     Some((child, deeper))
 }
 
+/// Le préfixe sous LA FORME QUE PORTE LA BASE, et sa longueur en caractères.
+///
+/// 🔴 Les deux vont ensemble, et c'est leur désaccord qui a produit #5354.
+///
+/// macOS rend ses chemins DÉCOMPOSÉS (NFD) : dans « CDThèque », le `è` s'écrit
+/// `e` + U+0300, soit neuf scalaires au lieu de huit. Le motif `LIKE` est bâti
+/// en NFC par [`folder_like_pattern`](tune_core::db::track_repo::folder_like_pattern),
+/// donc la recherche trouvait les bonnes lignes ; mais la longueur était
+/// comptée sur la chaîne BRUTE, et [`split_child`] sautait un caractère de trop
+/// PAR lettre accentuée. Yves Corbat voyait « arillion » au lieu de Marillion.
+///
+/// Normaliser ici aligne les QUATRE usages de `base` : la longueur du découpage,
+/// le motif SQL, le `path` rendu au client, et l'ancrage du fil d'Ariane —
+/// `build_crumbs` compare par `starts_with`, et échouait entre deux formes,
+/// d'où un fil d'Ariane réduit à une seule miette.
+fn prefixe_pour_decoupe(prefix: &str, sep: char) -> (String, String, usize) {
+    use unicode_normalization::UnicodeNormalization as _;
+    let base: String = prefix.trim_end_matches(['/', '\\']).nfc().collect();
+    let prefix_with_sep = format!("{base}{sep}");
+    let plen = prefix_with_sep.chars().count();
+    (base, prefix_with_sep, plen)
+}
+
 fn folder_children(
     state: &AppState,
     engine: Engine,
@@ -240,9 +263,7 @@ fn folder_children(
     limit: Option<i64>,
 ) -> Value {
     let sep = std::path::MAIN_SEPARATOR;
-    let base = prefix.trim_end_matches(['/', '\\']).to_string();
-    let prefix_with_sep = format!("{base}{sep}");
-    let plen = prefix_with_sep.chars().count();
+    let (base, prefix_with_sep, plen) = prefixe_pour_decoupe(prefix, sep);
 
     // Fetch only the file paths in this subtree, narrowed by the active facets.
     let (where_sql, all) = where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
@@ -289,7 +310,7 @@ fn folder_children(
 
 #[cfg(test)]
 mod tests {
-    use super::split_child;
+    use super::{prefixe_pour_decoupe, split_child};
 
     // plen = number of characters in "<folder><sep>".
     const SEP: char = '/';
@@ -314,6 +335,51 @@ mod tests {
     fn direct_file_is_not_a_child() {
         // prefix "/music/Jazz/Miles/" (18 chars) → the file itself, no sub-folder.
         assert!(split_child("/music/Jazz/Miles/kind.flac", 18, SEP).is_none());
+    }
+
+    /// 🔴 #5354 — LE PRÉFIXE DEMANDÉ N'EST PAS FORCÉMENT SOUS LA FORME DE LA BASE.
+    ///
+    /// Le témoin voisin (`respects_multibyte_prefix_length`) garde le découpage
+    /// par CARACTÈRES et non par octets — c'était déjà juste. Il ne dit rien du
+    /// cas où la requête arrive DÉCOMPOSÉE, qui est celui de tout client macOS.
+    #[test]
+    fn un_prefixe_nfd_decoupe_comme_un_prefixe_nfc() {
+        // « /musiqué/ » sous ses deux formes : composée (9 caractères) et
+        // décomposée (10 — le « é » y occupe deux scalaires).
+        let nfc = "/musiqu\u{e9}/";
+        let nfd = "/musique\u{301}/";
+        assert_eq!(nfc.chars().count(), 9);
+        assert_eq!(nfd.chars().count(), 10, "le NFD doit bien être plus long");
+
+        // La base stocke du NFC — c'est la forme que `folder_like_pattern` cherche.
+        let stocke = "/musiqu\u{e9}/\u{c9}l\u{e9}a/track.flac";
+
+        let (_, _, plen_nfd) = prefixe_pour_decoupe(nfd.trim_end_matches('/'), SEP);
+        let (child, _) = split_child(stocke, plen_nfd, SEP).expect("aucun enfant découpé");
+        assert_eq!(
+            child, "\u{c9}l\u{e9}a",
+            "une requête NFD perd une lettre par accent : c'est le défaut d'Yves (#5354)"
+        );
+
+        // Et la forme composée donne exactement le même résultat.
+        let (_, _, plen_nfc) = prefixe_pour_decoupe(nfc.trim_end_matches('/'), SEP);
+        assert_eq!(
+            plen_nfc, plen_nfd,
+            "les deux formes doivent donner la MÊME longueur"
+        );
+    }
+
+    /// Le `path` rendu au client et le motif SQL doivent parler la même langue :
+    /// un chemin composite (préfixe NFD + nom NFC) ne se retrouve nulle part au
+    /// forage suivant.
+    #[test]
+    fn le_prefixe_rendu_est_normalise() {
+        let (base, avec_sep, _) = prefixe_pour_decoupe("/musique\u{301}", SEP);
+        assert_eq!(
+            base, "/musiqu\u{e9}",
+            "le chemin rendu au client reste décomposé"
+        );
+        assert_eq!(avec_sep, "/musiqu\u{e9}/");
     }
 
     #[test]
