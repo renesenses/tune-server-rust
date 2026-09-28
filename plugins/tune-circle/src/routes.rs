@@ -89,6 +89,9 @@ pub const CODE_NON_CONNECTE: &str = "circle.not_connected";
 pub const CODE_CLOUD_INDISPONIBLE: &str = "circle.cloud_unavailable";
 pub const CODE_INTROUVABLE: &str = "circle.not_found";
 pub const CODE_REPONSE_ILLISIBLE: &str = "circle.unreadable_response";
+/// T2 (#5325) : ce serveur n'est pas encore lié au compte — le cloud refuse de
+/// partager sa bibliothèque tant que la liaison n'est pas faite.
+pub const CODE_SERVEUR_NON_LIE: &str = "circle.server_not_linked";
 
 pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
     let etat_de_la_copie = Router::new()
@@ -467,6 +470,8 @@ async fn relire_le_partage(relais: &Relais) {
 /// `PUT /circles/{id}/sharing/library`, sans corps : le greffon joint SON
 /// `server_id`. Ce que le client enverrait est ignoré — il ne choisit pas le
 /// serveur partagé. Sans `server_id` local, `null` part et le cloud répond 422.
+/// Les 404 du cloud deviennent `circle.server_not_linked` (serveur pas encore
+/// lié au compte) ou `circle.not_found` (cercle d'un autre).
 async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
     if !identifiant_valide(&id) {
         return introuvable();
@@ -492,6 +497,26 @@ async fn partager(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> 
             .is_none_or(|v| v.trim().is_empty());
         if jamais_poussee {
             library_sync::populate_changelog_after_scan(relais.backend());
+        }
+    }
+    // Contrat de site-mozaiklabs#233 : les deux 404 du PUT deviennent des
+    // codes nommés, que l'écran lit (le statut, lui, ne les distingue pas).
+    if let Issue::Reponse {
+        statut: 404, corps, ..
+    } = &issue
+    {
+        let motif = serde_json::from_slice::<Value>(corps)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string));
+        match motif.as_deref() {
+            Some("server_not_linked") => {
+                return refus(
+                    StatusCode::NOT_FOUND,
+                    json!({ "code": CODE_SERVEUR_NON_LIE }),
+                );
+            }
+            Some("not_found") => return introuvable(),
+            _ => {}
         }
     }
     en_reponse(issue)

@@ -125,20 +125,22 @@ async fn le_refus_du_cloud_est_relaye_et_ne_note_aucun_partage() {
     let faux = demarrer().await;
     faux.etat.lock().unwrap().t2 = true;
 
-    // Un server_id local qui n'est pas un serveur du compte : 404 du cloud.
+    // Un server_id local que ce compte n'a pas lié : le 404 du cloud devient
+    // le code nommé `circle.server_not_linked` (contrat de site-mozaiklabs#233).
     let backend = base_du_serveur(&faux.base, Some(SERVEUR_D_UN_AUTRE));
     let app = commun::app(backend.clone());
     let r = appel(&app, "PUT", "/circles/1/sharing/library", None).await;
     assert_eq!(r.statut, StatusCode::NOT_FOUND);
-    assert_eq!(r.json(), json!({ "error": "not_found" }));
+    assert_eq!(r.json(), json!({ "code": "circle.server_not_linked" }));
     assert!(!partage_note(&backend));
 
-    // Le cercle d'un autre : 404.
+    // Le cercle d'un autre : 404 `circle.not_found`.
     let backend = base_du_serveur(&faux.base, Some(SERVEUR_DU_COMPTE));
     let app = commun::app(backend.clone());
     let chemin = format!("/circles/{CERCLE_D_UN_AUTRE}/sharing/library");
     let r = appel(&app, "PUT", &chemin, None).await;
     assert_eq!(r.statut, StatusCode::NOT_FOUND);
+    assert_eq!(r.json(), json!({ "code": "circle.not_found" }));
     assert!(!partage_note(&backend));
 
     // Aucun server_id local : `null` part, le cloud juge (422).
@@ -156,24 +158,6 @@ async fn le_refus_du_cloud_est_relaye_et_ne_note_aucun_partage() {
     );
     assert!(!partage_note(&backend));
     assert!(faux.etat.lock().unwrap().partages.is_empty());
-}
-
-/// Le cloud refuse un serveur qu'il ne tient pas pour relié au compte, avec un
-/// `code` qui finit par `not_linked` : le greffon le relaie tel quel, statut et
-/// octets, sans l'interpréter — l'écran y lit le motif — et ne note rien.
-#[tokio::test]
-async fn le_refus_serveur_non_relie_est_relaye_tel_quel() {
-    let faux = demarrer().await;
-    let backend = base_du_serveur(&faux.base, Some(SERVEUR_DU_COMPTE));
-    let app = commun::app(backend.clone());
-    for statut in [403u16, 404, 409, 422] {
-        let corps = json!({ "code": "circle.server_not_linked", "message": "Server not linked." });
-        faux.etat.lock().unwrap().refus_du_partage = Some((statut, corps.clone()));
-        let r = appel(&app, "PUT", "/circles/1/sharing/library", None).await;
-        assert_eq!(r.statut.as_u16(), statut);
-        assert_eq!(r.octets, serde_json::to_vec(&corps).unwrap(), "{statut}");
-        assert!(!partage_note(&backend), "{statut}");
-    }
 }
 
 // 3. Couper : effet immédiat, et le booléen suit la vérité du cloud ----------

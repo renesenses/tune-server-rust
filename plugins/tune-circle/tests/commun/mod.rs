@@ -117,8 +117,25 @@ pub struct Faux {
     pub lectures_permises: u32,
     /// `POST /api/v1/cloud-library/{server_id}/sync` : (server_id, corps brut).
     pub synchros: Vec<(String, String)>,
-    /// Un refus que `PUT …/sharing/library` rend tel quel (statut, corps).
-    pub refus_du_partage: Option<(u16, Value)>,
+    /// Liaison du serveur au compte (site-mozaiklabs#233) : le jeton en cours,
+    /// `None` tant qu'aucun lien n'a été fait.
+    pub jeton_de_liaison: Option<String>,
+    /// Appels reçus par `POST …/{server_id}/link`.
+    pub liaisons: usize,
+    /// Le corps brut du dernier `POST …/link` (le contrat : aucun).
+    pub dernier_corps_liaison: Option<Vec<u8>>,
+    /// `…/link` rend ce statut au lieu du jeton.
+    pub liaison_refusee: Option<u16>,
+    /// `sync` exige le jeton de liaison (401 `server_token_invalid`, 403
+    /// `server_not_linked`).
+    pub sync_exige_liaison: bool,
+    /// `sync` refuse tout jeton (401 `server_token_invalid`), même neuf.
+    pub jeton_toujours_refuse: bool,
+    /// `sync` rend 403 `premium_required` (gratuit dont aucun cercle ne
+    /// partage ce serveur).
+    pub premium_requis: bool,
+    /// L'en-tête `X-Tune-Server-Token` de chaque tentative de `sync`.
+    pub entetes_de_synchro: Vec<Option<String>>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -172,7 +189,14 @@ impl Faux {
             derniere_requete: None,
             lectures_permises: 1000,
             synchros: Vec::new(),
-            refus_du_partage: None,
+            jeton_de_liaison: None,
+            liaisons: 0,
+            dernier_corps_liaison: None,
+            liaison_refusee: None,
+            sync_exige_liaison: false,
+            jeton_toujours_refuse: false,
+            premium_requis: false,
+            entetes_de_synchro: Vec::new(),
         }
     }
 
@@ -578,18 +602,15 @@ async fn partager(
     let mut f = e.lock().unwrap();
     let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
     f.dernier_corps_partage = Some(v.clone());
-    if let Some((statut, corps)) = f.refus_du_partage.clone() {
-        return (StatusCode::from_u16(statut).unwrap(), Json(corps)).into_response();
-    }
     let Some(server_id) = v["server_id"].as_str().map(str::to_string) else {
         return validation("server_id", MESSAGE_SERVER_ID);
     };
     let Some(k) = position(&f.circles, "id", &id) else {
         return introuvable();
     };
-    // Le serveur d'un autre compte : 404 → le cercle, comme le contrat.
+    // Un serveur que ce compte n'a pas lié (site-mozaiklabs#233).
     if !f.serveurs_du_compte.contains(&server_id) {
-        return introuvable();
+        return refus(StatusCode::NOT_FOUND, "server_not_linked");
     }
     let circle_id = f.circles[k]["id"].as_i64().unwrap();
     f.partages.retain(|(c, _)| *c != circle_id);
@@ -692,7 +713,8 @@ async fn pistes_de_l_album(
     lire_catalogue(&e, &h, &uid, requete, "tracks")
 }
 
-/// `POST /api/v1/cloud-library/{server_id}/sync` : note le corps BRUT.
+/// `POST /api/v1/cloud-library/{server_id}/sync` : note l'en-tête de liaison
+/// de chaque tentative, et le corps BRUT de chaque synchro acceptée.
 async fn synchro(
     State(e): State<Partage>,
     h: HeaderMap,
@@ -702,11 +724,59 @@ async fn synchro(
     if let Some(r) = garde(&e, &h) {
         return r;
     }
-    e.lock()
-        .unwrap()
-        .synchros
+    let mut f = e.lock().unwrap();
+    let presente = h
+        .get("x-tune-server-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    f.entetes_de_synchro.push(presente.clone());
+    if f.jeton_toujours_refuse {
+        return refus(StatusCode::UNAUTHORIZED, "server_token_invalid");
+    }
+    if f.sync_exige_liaison {
+        let Some(attendu) = f.jeton_de_liaison.clone() else {
+            return refus(StatusCode::FORBIDDEN, "server_not_linked");
+        };
+        if presente.as_deref() != Some(attendu.as_str()) {
+            return refus(StatusCode::UNAUTHORIZED, "server_token_invalid");
+        }
+    }
+    if f.premium_requis {
+        return refus(StatusCode::FORBIDDEN, "premium_required");
+    }
+    f.synchros
         .push((server_id, String::from_utf8_lossy(&corps).into_owned()));
     Json(json!({ "ok": true })).into_response()
+}
+
+/// Préfixe des jetons de liaison du faux cloud (64 caractères en tout).
+pub const PREFIXE_JETON_DE_LIAISON: &str = "jeton-liaison-SECRET-5325-";
+
+/// `POST /api/v1/cloud-library/{server_id}/link` : chaque appel renouvelle le
+/// jeton, le précédent cesse de valoir.
+async fn lier(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(server_id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    f.liaisons += 1;
+    f.dernier_corps_liaison = Some(corps.to_vec());
+    if let Some(statut) = f.liaison_refusee {
+        return refus(StatusCode::from_u16(statut).unwrap(), "not_found");
+    }
+    let jeton = format!("{PREFIXE_JETON_DE_LIAISON}{:0>38}", f.liaisons);
+    assert_eq!(jeton.len(), 64);
+    f.jeton_de_liaison = Some(jeton.clone());
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "server_id": server_id, "token": jeton })),
+    )
+        .into_response()
 }
 
 pub const MESSAGE_SERVER_ID: &str = "The server id field must be a string.";
@@ -765,6 +835,7 @@ pub async fn demarrer() -> Serveur {
             get(pistes_de_l_album),
         )
         .route("/api/v1/cloud-library/{server_id}/sync", post(synchro))
+        .route("/api/v1/cloud-library/{server_id}/link", post(lier))
         .route("/oauth/token", post(jeton))
         .with_state(etat.clone());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

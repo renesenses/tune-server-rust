@@ -69,6 +69,112 @@ fn sans_chemin(valeur: Option<String>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Liaison du serveur au compte (#5325, contrat de site-mozaiklabs#233)
+// ---------------------------------------------------------------------------
+
+/// Réglage où vit le jeton de liaison délivré par le cloud. Un secret : jamais
+/// journalisé, jamais rendu au client web.
+pub const CLE_JETON_DE_LIAISON: &str = "cloud_server_link_token";
+
+/// En-tête qui présente le jeton de liaison sur chaque `sync`.
+pub const EN_TETE_JETON_DE_SERVEUR: &str = "X-Tune-Server-Token";
+
+fn jeton_de_liaison(settings: &SettingsRepo) -> Option<String> {
+    settings
+        .get(CLE_JETON_DE_LIAISON)
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Le motif `{"error": "…"}` d'un refus du cloud.
+fn motif_du_refus(corps: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(corps)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Lie ce serveur au compte connecté : `POST {api}/{server_id}/link`, jeton
+/// OAuth de l'utilisateur, sans corps. Le jeton rendu est rangé dans
+/// [`CLE_JETON_DE_LIAISON`] ; chaque appel le renouvelle, le précédent cesse
+/// de valoir. L'erreur rendue ne porte que le statut, jamais un corps.
+pub async fn lier_le_serveur(
+    backend: &Arc<dyn DbBackend>,
+    http_client: &reqwest::Client,
+    api: &str,
+    server_id: &str,
+    access_token: &str,
+) -> Result<(), String> {
+    let reponse = http_client
+        .post(format!("{api}/{server_id}/link"))
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("cloud link request: {}", e.without_url());
+            warn!(error = %msg, "cloud_server_link_failed");
+            msg
+        })?;
+    let statut = reponse.status();
+    if !statut.is_success() {
+        let msg = format!("cloud link HTTP {}", statut.as_u16());
+        warn!(error = %msg, "cloud_server_link_refused");
+        return Err(msg);
+    }
+    let corps: serde_json::Value = reponse
+        .json()
+        .await
+        .map_err(|_| "cloud link: réponse illisible".to_string())?;
+    let jeton = corps
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let meme_serveur = corps.get("server_id").and_then(|v| v.as_str()) == Some(server_id);
+    let Some(jeton) = jeton.filter(|_| meme_serveur) else {
+        warn!("cloud_server_link_unexpected_response");
+        return Err("cloud link: réponse inattendue".into());
+    };
+    SettingsRepo::with_backend(backend.clone())
+        .set(CLE_JETON_DE_LIAISON, jeton)
+        .map_err(|e| format!("cloud link: réglage non écrit: {e}"))?;
+    info!("cloud_server_linked");
+    Ok(())
+}
+
+/// [`lier_le_serveur`] avec ce que les réglages portent : `server_id` et
+/// session SSO. Rien si l'un manque. Pour la connexion SSO et le battement de
+/// compte, qui n'ont pas à connaître la racine de l'API.
+pub async fn lier_depuis_les_reglages(
+    backend: &Arc<dyn DbBackend>,
+    http_client: &reqwest::Client,
+) -> Result<(), String> {
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let lire = |cle: &str| {
+        settings
+            .get(cle)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(server_id), Some(jeton)) = (lire("server_id"), lire("mozaik_access_token")) else {
+        return Err("cloud link: pas de server_id ou pas de session".into());
+    };
+    lier_le_serveur(backend, http_client, CLOUD_LIBRARY_API, &server_id, &jeton).await
+}
+
+/// Le serveur a-t-il déjà un jeton de liaison ?
+pub fn serveur_lie(settings: &SettingsRepo) -> bool {
+    jeton_de_liaison(settings).is_some()
+}
+
+// ---------------------------------------------------------------------------
 // SyncReport
 // ---------------------------------------------------------------------------
 
@@ -218,6 +324,9 @@ pub async fn push_changes_vers(
         errors: Vec::new(),
         duration_ms: 0,
     };
+    // Une seule liaison par passage : un cloud qui refuse le jeton neuf ne
+    // doit pas faire tourner la synchro en rond.
+    let mut liaison_tentee = false;
 
     loop {
         // 1. Read a batch of unsynced changelog entries
@@ -482,59 +591,102 @@ pub async fn push_changes_vers(
                 "changes": changes,
             });
 
-            // CLD-2 : un seul chemin d'appel borné — la portée retenue ne part
-            // pas, un 429 mémorise son échéance avant d'être lu ici.
-            let appel = rate_limit::appeler(
-                &settings,
-                CloudScope::LibrarySync,
-                http_client
+            // Liaison du serveur au compte (#5325) : le jeton accompagne
+            // chaque `sync`. Absent, il est demandé une fois avant d'envoyer.
+            let mut jeton = jeton_de_liaison(&settings);
+            if jeton.is_none() && !liaison_tentee {
+                liaison_tentee = true;
+                if lier_le_serveur(backend, http_client, api, server_id, access_token)
+                    .await
+                    .is_ok()
+                {
+                    jeton = jeton_de_liaison(&settings);
+                }
+            }
+
+            let mut echec = false;
+            loop {
+                let mut requete = http_client
                     .post(format!("{api}/{server_id}/sync"))
                     .bearer_auth(access_token)
                     .json(&payload)
-                    .timeout(std::time::Duration::from_secs(30)),
-            )
-            .await;
-            match appel {
-                rate_limit::AppelCloud::Retenu(backoff) => {
-                    debug!(
-                        scope = backoff.scope,
-                        until_epoch = backoff.until_epoch,
-                        retry_after_seconds = backoff.retry_after_seconds,
-                        "cloud_library_sync_deferred_rate_limit"
-                    );
-                    break;
+                    .timeout(std::time::Duration::from_secs(30));
+                if let Some(j) = &jeton {
+                    requete = requete.header(EN_TETE_JETON_DE_SERVEUR, j.as_str());
                 }
-                rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
-                    debug!(
-                        batch_size = changes.len(),
-                        "cloud_library_sync_batch_pushed"
-                    );
-                }
-                rate_limit::AppelCloud::Reponse(resp) => {
-                    let status = resp.status();
-                    // 429 (throttled) and 5xx are expected transient conditions
-                    // from the community cloud — not a failure. Stop this batch
-                    // and retry next cycle quietly instead of spamming a scary
-                    // "batch_failed" warning (Jean Valjean saw 429s in his log).
-                    // Mirrors the bio_sync throttle handling. Le 429 est déjà
-                    // mémorisé par `rate_limit::appeler`.
-                    if status.as_u16() == 429 || status.is_server_error() {
-                        debug!(status = %status, "cloud_library_sync_throttled — retry next cycle");
-                        break;
+                // CLD-2 : un seul chemin d'appel borné — la portée retenue ne
+                // part pas, un 429 mémorise son échéance avant d'être lu ici.
+                let appel = rate_limit::appeler(&settings, CloudScope::LibrarySync, requete).await;
+                match appel {
+                    rate_limit::AppelCloud::Retenu(backoff) => {
+                        debug!(
+                            scope = backoff.scope,
+                            until_epoch = backoff.until_epoch,
+                            retry_after_seconds = backoff.retry_after_seconds,
+                            "cloud_library_sync_deferred_rate_limit"
+                        );
+                        echec = true;
                     }
-                    let body = resp.text().await.unwrap_or_default();
-                    let msg = format!("cloud sync HTTP {status}: {body}");
-                    warn!(error = %msg, "cloud_library_sync_batch_failed");
-                    report.errors.push(msg);
-                    // Don't mark as synced on failure — will retry next cycle
-                    break;
+                    rate_limit::AppelCloud::Reponse(resp) if resp.status().is_success() => {
+                        debug!(
+                            batch_size = changes.len(),
+                            "cloud_library_sync_batch_pushed"
+                        );
+                    }
+                    rate_limit::AppelCloud::Reponse(resp) => {
+                        let status = resp.status();
+                        // 429 (throttled) and 5xx are expected transient conditions
+                        // from the community cloud — not a failure. Stop this batch
+                        // and retry next cycle quietly instead of spamming a scary
+                        // "batch_failed" warning (Jean Valjean saw 429s in his log).
+                        // Mirrors the bio_sync throttle handling. Le 429 est déjà
+                        // mémorisé par `rate_limit::appeler`.
+                        if status.as_u16() == 429 || status.is_server_error() {
+                            debug!(status = %status, "cloud_library_sync_throttled — retry next cycle");
+                            echec = true;
+                            break;
+                        }
+                        let body = resp.text().await.unwrap_or_default();
+                        let motif = motif_du_refus(&body);
+                        // Jeton ancien ou faux, ou serveur pas encore lié :
+                        // refaire la liaison, puis réessayer UNE fois.
+                        if matches!(
+                            (status.as_u16(), motif.as_deref()),
+                            (401, Some("server_token_invalid")) | (403, Some("server_not_linked"))
+                        ) && !liaison_tentee
+                        {
+                            liaison_tentee = true;
+                            if lier_le_serveur(backend, http_client, api, server_id, access_token)
+                                .await
+                                .is_ok()
+                            {
+                                jeton = jeton_de_liaison(&settings);
+                                continue;
+                            }
+                        }
+                        let msg = format!("cloud sync HTTP {status}: {body}");
+                        if motif.as_deref() == Some("premium_required") {
+                            // Compte gratuit dont aucun cercle ne partage ce
+                            // serveur : attendu, pas une panne.
+                            debug!(error = %msg, "cloud_library_sync_premium_required");
+                        } else {
+                            warn!(error = %msg, "cloud_library_sync_batch_failed");
+                        }
+                        report.errors.push(msg);
+                        echec = true;
+                    }
+                    rate_limit::AppelCloud::Erreur(e) => {
+                        let msg = format!("cloud sync request: {e}");
+                        warn!(error = %msg, "cloud_library_sync_request_failed");
+                        report.errors.push(msg);
+                        echec = true;
+                    }
                 }
-                rate_limit::AppelCloud::Erreur(e) => {
-                    let msg = format!("cloud sync request: {e}");
-                    warn!(error = %msg, "cloud_library_sync_request_failed");
-                    report.errors.push(msg);
-                    break;
-                }
+                break;
+            }
+            // Don't mark as synced on failure — will retry next cycle
+            if echec {
+                break;
             }
         }
 

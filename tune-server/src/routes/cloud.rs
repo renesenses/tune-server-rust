@@ -286,6 +286,19 @@ async fn sso_callback(
         )
         .ok();
 
+    // Liaison du serveur au compte (#5325), à chaque connexion : le cloud
+    // délivre un jeton que `library_sync` présente sur chaque `sync`. En tâche
+    // de fond — la connexion n'attend pas le cloud une seconde fois.
+    {
+        let backend = state.backend.clone();
+        let http_client = state.http_client.clone();
+        tokio::spawn(async move {
+            tune_core::cloud::library_sync::lier_depuis_les_reglages(&backend, &http_client)
+                .await
+                .ok();
+        });
+    }
+
     // Create or link local profile, then issue a local JWT session
     use tune_core::db::backend::ToSqlValue;
     let existing_id: Option<i64> = state
