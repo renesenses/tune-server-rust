@@ -1771,9 +1771,15 @@ pub(crate) fn reimporter_fichier_surveillant(
             continue;
         }
 
-        if remplace {
-            track_repo.delete_by_path(&sf.path).ok();
-        }
+        // #5341 — la ligne déjà indexée de CE fichier. Elle n'est plus
+        // supprimée avant la relecture : elle sera MISE À JOUR sous son
+        // identifiant (voir `ranger_la_piste_du_surveillant`), comme
+        // `deplacer_fichiers` le fait d'un dossier renommé.
+        let ancienne = if remplace {
+            track_repo.get_by_path(&sf.path).ok().flatten()
+        } else {
+            None
+        };
 
         // Decide compilation over the whole folder from
         // the siblings already in the DB, so re-importing
@@ -1827,6 +1833,11 @@ pub(crate) fn reimporter_fichier_surveillant(
                     if std::path::Path::new(fp).parent() != Some(dir) {
                         continue;
                     }
+                    // #5341 — sa propre ligne, encore en base, porte les
+                    // balises D'AVANT : elle ne vote pas pour le dossier.
+                    if fp == &sf.path {
+                        continue;
+                    }
                     note(aa.as_deref());
                     indices.ajouter_piste(aa.as_deref(), artiste.as_deref());
                 }
@@ -1857,7 +1868,10 @@ pub(crate) fn reimporter_fichier_surveillant(
         // The hash is only a candidate selector. The
         // watcher is allowed to skip solely after a
         // full byte-for-byte comparison.
-        if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
+        // #5341 — seulement pour un fichier NEUF : une piste déjà indexée que
+        // l'on relit reste la piste qu'elle est (sa propre ligne, encore en
+        // base, la ferait passer pour son propre exemplaire).
+        if let (None, Some(hash), Some(aid)) = (&ancienne, &track.audio_hash, album_id) {
             let candidates = track_repo
                 .paths_by_audio_hash_and_album(hash, aid)
                 .unwrap_or_default();
@@ -1911,7 +1925,16 @@ pub(crate) fn reimporter_fichier_surveillant(
             );
         }
 
+        // #5341 — la ligne existante garde son identifiant ; si les balises
+        // l'ont fait changer d'album, l'ancien recompte ses pistes (et, vidé,
+        // part avec les orphelins en fin de lot).
+        let ancien_album = ancienne.as_ref().and_then(|a| a.album_id);
+        track.id = ancienne.as_ref().and_then(|a| a.id);
         if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
+            if let Some(ancien) = ancien_album.filter(|&a| Some(a) != album_id) {
+                album_repo.update_track_count(ancien).ok();
+                album_repo.update_quality_from_tracks(ancien).ok();
+            }
             info!(path = %sf.path, "watcher_track_added");
             // #4896 — les balises relues désavouent-elles la ligne album du
             // dossier ? Un simple lookup ; la relecture du dossier entier
@@ -2744,7 +2767,29 @@ pub(crate) fn ranger_la_piste_du_surveillant(
     track: &Track,
     album_id: Option<i64>,
 ) -> bool {
-    let rangee = track_repo.create(track).is_ok();
+    // #5341 — une piste qui porte déjà son identifiant est une ligne EXISTANTE
+    // relue sur le disque : elle se MET À JOUR, exactement comme le scan le
+    // fait d'un fichier modifié (`update_batch`, puis la pochette propre de la
+    // piste, puis l'adoption d'une ligne d'importateur). La supprimer puis la
+    // recréer lui donnait un identifiant neuf à chaque sauvegarde dans un
+    // éditeur de balises, et emportait par cascade ou laissait orphelin tout
+    // ce qui s'y rattachait.
+    let rangee = match track.id {
+        Some(id) => {
+            let relue = std::slice::from_ref(track);
+            let ecrite = matches!(track_repo.update_batch(relue), Ok(1));
+            if ecrite {
+                if let Err(e) = track_repo.appliquer_pochettes_de_piste(relue) {
+                    tracing::warn!(error = %e, "watcher_pochette_de_piste_echec");
+                }
+                if let Err(e) = track_repo.adopter_en_local(&[id]) {
+                    tracing::warn!(error = %e, "watcher_adoption_locale_echec");
+                }
+            }
+            ecrite
+        }
+        None => track_repo.create(track).is_ok(),
+    };
     if let Some(aid) = album_id {
         album_repo.update_track_count(aid).ok();
         album_repo.update_quality_from_tracks(aid).ok();
@@ -2951,3 +2996,7 @@ mod pochettes_disque_tests_5034;
 #[cfg(test)]
 #[path = "pochettes_cue_tests_5222.rs"]
 mod pochettes_cue_tests_5222;
+
+#[cfg(test)]
+#[path = "surveillant_retouche_garde_l_identifiant_tests_5341.rs"]
+mod surveillant_retouche_garde_l_identifiant_tests_5341;
