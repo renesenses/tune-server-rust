@@ -396,6 +396,7 @@ fn le_greffon_s_appelle_circle_reste_opt_in_et_est_au_catalogue() {
     let g = tune_circle::CirclePlugin::new(tune_circle::HostServices {
         license: std::sync::Arc::new(tune_core::license::LicenseManager::new(backend.clone())),
         backend,
+        playback: None,
     });
     assert_eq!(g.name(), "circle");
     assert!(!g.default_enabled(), "opt-in, comme cd");
