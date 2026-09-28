@@ -117,6 +117,8 @@ pub struct Faux {
     pub lectures_permises: u32,
     /// `POST /api/v1/cloud-library/{server_id}/sync` : (server_id, corps brut).
     pub synchros: Vec<(String, String)>,
+    /// Un refus que `PUT …/sharing/library` rend tel quel (statut, corps).
+    pub refus_du_partage: Option<(u16, Value)>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -170,6 +172,7 @@ impl Faux {
             derniere_requete: None,
             lectures_permises: 1000,
             synchros: Vec::new(),
+            refus_du_partage: None,
         }
     }
 
@@ -575,6 +578,9 @@ async fn partager(
     let mut f = e.lock().unwrap();
     let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
     f.dernier_corps_partage = Some(v.clone());
+    if let Some((statut, corps)) = f.refus_du_partage.clone() {
+        return (StatusCode::from_u16(statut).unwrap(), Json(corps)).into_response();
+    }
     let Some(server_id) = v["server_id"].as_str().map(str::to_string) else {
         return validation("server_id", MESSAGE_SERVER_ID);
     };

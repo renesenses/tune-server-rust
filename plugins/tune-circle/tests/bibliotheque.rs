@@ -158,6 +158,24 @@ async fn le_refus_du_cloud_est_relaye_et_ne_note_aucun_partage() {
     assert!(faux.etat.lock().unwrap().partages.is_empty());
 }
 
+/// Le cloud refuse un serveur qu'il ne tient pas pour relié au compte, avec un
+/// `code` qui finit par `not_linked` : le greffon le relaie tel quel, statut et
+/// octets, sans l'interpréter — l'écran y lit le motif — et ne note rien.
+#[tokio::test]
+async fn le_refus_serveur_non_relie_est_relaye_tel_quel() {
+    let faux = demarrer().await;
+    let backend = base_du_serveur(&faux.base, Some(SERVEUR_DU_COMPTE));
+    let app = commun::app(backend.clone());
+    for statut in [403u16, 404, 409, 422] {
+        let corps = json!({ "code": "circle.server_not_linked", "message": "Server not linked." });
+        faux.etat.lock().unwrap().refus_du_partage = Some((statut, corps.clone()));
+        let r = appel(&app, "PUT", "/circles/1/sharing/library", None).await;
+        assert_eq!(r.statut.as_u16(), statut);
+        assert_eq!(r.octets, serde_json::to_vec(&corps).unwrap(), "{statut}");
+        assert!(!partage_note(&backend), "{statut}");
+    }
+}
+
 // 3. Couper : effet immédiat, et le booléen suit la vérité du cloud ----------
 
 #[tokio::test]
@@ -360,6 +378,8 @@ async fn un_cloud_en_panne_rend_503_sur_une_lecture() {
 
 const CHEMIN_DE_LA_PISTE: &str =
     "/Users/secret-5325/Musique/Miles Davis/Kind of Blue/01 So What.flac";
+/// Un identifiant de release-group MusicBrainz (fictif, forme UUID).
+const RELEASE_GROUP: &str = "8e8a594f-2175-3b2c-a7a9-3a5b7a8b2b8f";
 const DOSSIER_DE_L_ALBUM: &str = "/Users/secret-5325/Musique/Miles Davis/Kind of Blue";
 
 /// Un artiste, un album et une piste LOCALE, dont chaque colonne de chemin
@@ -369,8 +389,9 @@ fn semer_une_bibliotheque(backend: &Arc<dyn DbBackend>) -> (i64, i64) {
         .execute_batch(&format!(
             "INSERT INTO artists (id, name) VALUES (20, 'Miles Davis');\
              INSERT INTO albums (id, title, artist_id, year, genre, cover_path, folder_path, \
-                                 cover_source_path) \
-             VALUES (10, 'Kind of Blue', 20, 1959, 'Jazz', '{d}/cover.jpg', '{d}', '{d}/folder.jpg');\
+                                 cover_source_path, musicbrainz_release_group_id) \
+             VALUES (10, 'Kind of Blue', 20, 1959, 'Jazz', '{d}/cover.jpg', '{d}', '{d}/folder.jpg', \
+                     '{rg}');\
              INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, sample_rate, \
                                  bit_depth, duration_ms, genre, track_number, disc_number, source, \
                                  source_id, isrc, cover_path, cue_media_path) \
@@ -381,6 +402,7 @@ fn semer_une_bibliotheque(backend: &Arc<dyn DbBackend>) -> (i64, i64) {
                      'C:\\Musique\\02.flac');",
             d = DOSSIER_DE_L_ALBUM,
             p = CHEMIN_DE_LA_PISTE,
+            rg = RELEASE_GROUP,
         ))
         .unwrap();
     library_sync::populate_changelog_after_scan(backend);
@@ -504,7 +526,8 @@ async fn aucun_chemin_de_fichier_ne_part_dans_la_copie_en_ligne() {
 }
 
 /// #5325 : une piste porte l'identifiant de son album — l'`id` de l'album
-/// poussé — et les champs décidés le 28/09 (année, nombre de pistes, ISRC).
+/// poussé — et les champs décidés le 28/09 (année, nombre de pistes, ISRC,
+/// release-group MusicBrainz de l'album).
 #[tokio::test]
 async fn la_piste_porte_son_album_id_et_les_champs_decides() {
     let faux = demarrer().await;
@@ -541,6 +564,10 @@ async fn la_piste_porte_son_album_id_et_les_champs_decides() {
     assert_eq!(piste["data"]["isrc"], json!("USSM15900113"));
     assert_eq!(album["data"]["year"], json!(1959));
     assert_eq!(album["data"]["track_count"], json!(2));
+    assert_eq!(
+        album["data"]["musicbrainz_release_group_id"],
+        json!(RELEASE_GROUP)
+    );
     // Le chemin rangé dans `source_id` est tu, la clé reste (le cloud l'attend).
     assert_eq!(piste["data"]["source_id"], Value::Null);
 }

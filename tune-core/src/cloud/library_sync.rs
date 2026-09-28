@@ -372,7 +372,8 @@ pub async fn push_changes_vers(
             let placeholders = album_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT a.id, a.title, ar.name, a.year, a.genre, a.source, \
-                 (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) AS track_count \
+                 (SELECT COUNT(*) FROM tracks t WHERE t.album_id = a.id) AS track_count, \
+                 a.musicbrainz_release_group_id \
                  FROM albums a \
                  LEFT JOIN artists ar ON a.artist_id = ar.id \
                  WHERE a.id IN ({placeholders})"
@@ -398,6 +399,12 @@ pub async fn push_changes_vers(
                             "genre": r.get(4).and_then(|v| v.as_string()),
                             "source": r.get(5).and_then(|v| v.as_string()),
                             "track_count": r.get(6).and_then(|v| v.as_i64()),
+                            // #5325 (décision du 28/09) : la pochette publique
+                            // se retrouve par MusicBrainz, rien d'autre ne part.
+                            "musicbrainz_release_group_id": r
+                                .get(7)
+                                .and_then(|v| v.as_string())
+                                .filter(|v| !v.trim().is_empty()),
                         }
                     }));
                     report.albums_synced += 1;
