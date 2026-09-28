@@ -641,9 +641,9 @@ fn date_de_synchro(brute: Option<String>) -> Option<String> {
 /// `GET /library-sync` : l'état LOCAL de la copie en ligne, pour l'écran du
 /// propriétaire. Sans lui, il croirait partager un catalogue vide ou vieux.
 ///
-/// `active` : la synchronisation périodique pousse pour ce serveur — Premium
-/// ou partage de cercle actif, une session SSO et un `server_id`. Aucun appel
-/// au cloud.
+/// `{ server_id, premium, active, last_sync, pending }`. `active` : la
+/// synchronisation périodique pousse pour ce serveur — Premium ou partage de
+/// cercle actif, une session SSO et un `server_id`. Aucun appel au cloud.
 async fn etat_de_la_copie_en_ligne(State(etat): State<Arc<EtatDeLaCopie>>) -> Response {
     let reglages = etat.relais.reglages();
     let premium = etat.license.is_premium().await;
@@ -652,10 +652,13 @@ async fn etat_de_la_copie_en_ligne(State(etat): State<Arc<EtatDeLaCopie>>) -> Re
         .ok()
         .flatten()
         .is_some_and(|v| !v.trim().is_empty());
-    let active = library_sync::synchro_autorisee(premium, &reglages)
-        && session
-        && server_id_du_serveur(&etat.relais).is_some();
+    let server_id = server_id_du_serveur(&etat.relais);
+    let active =
+        library_sync::synchro_autorisee(premium, &reglages) && session && server_id.is_some();
     Json(json!({
+        // Pour que l'écran sache si le partage d'un cercle (`sharing.server_id`
+        // de `GET /`) vient de CE serveur.
+        "server_id": server_id,
         "premium": premium,
         "active": active,
         "last_sync": date_de_synchro(reglages.get("cloud_library_last_sync").ok().flatten()),

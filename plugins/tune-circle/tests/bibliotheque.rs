@@ -560,7 +560,8 @@ async fn l_etat_de_la_copie_en_ligne_est_local() {
     assert_eq!(r.statut, StatusCode::OK);
     assert_eq!(
         r.json(),
-        json!({ "premium": false, "active": false, "last_sync": null, "pending": pending })
+        json!({ "server_id": SERVEUR_DU_COMPTE, "premium": false, "active": false,
+                "last_sync": null, "pending": pending })
     );
     assert_eq!(faux.etat.lock().unwrap().appels, 0, "aucun appel au cloud");
 
@@ -571,7 +572,7 @@ async fn l_etat_de_la_copie_en_ligne_est_local() {
     let r = appel(&app, "GET", "/library-sync", None).await;
     assert_eq!(
         r.json(),
-        json!({ "premium": false, "active": true,
+        json!({ "server_id": SERVEUR_DU_COMPTE, "premium": false, "active": true,
                 "last_sync": "2026-09-21T14:13:20+00:00", "pending": pending })
     );
 
@@ -580,5 +581,13 @@ async fn l_etat_de_la_copie_en_ligne_est_local() {
     assert_eq!(
         appel(&app, "GET", "/library-sync", None).await.json()["active"],
         json!(false)
+    );
+
+    // Sans `server_id` local : `null`, et l'écran sait qu'aucun partage ne
+    // peut venir de ce serveur.
+    s.set("server_id", "").unwrap();
+    assert_eq!(
+        appel(&app, "GET", "/library-sync", None).await.json()["server_id"],
+        Value::Null
     );
 }
