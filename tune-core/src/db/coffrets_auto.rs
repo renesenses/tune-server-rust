@@ -50,6 +50,7 @@ use super::album_repo::AlbumRepo;
 use super::backend::{DbBackend, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::settings_repo::SettingsRepo;
+use super::track_repo::sql::chemin_ouvrable;
 use crate::TuneError;
 use crate::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
 
@@ -136,15 +137,31 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 
 /// Un album, le PREMIER et le DERNIER chemin de ses pistes.
 ///
-/// 🔴 `MIN(file_path)` : les disques d'un coffret n'ont qu'un dossier chacun,
+/// 🔴 `MIN(chemin)` : les disques d'un coffret n'ont qu'un dossier chacun,
 /// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
 /// l'autre. `MAX` ne sert qu'à savoir si l'album tient dans un seul dossier.
-const SQL_ALBUMS_ET_DOSSIERS: &str = "\
-    SELECT t.album_id, al.title, MIN(t.file_path), MAX(t.file_path), al.artist_id, ar.name \
-    FROM tracks t JOIN albums al ON al.id = t.album_id \
-    LEFT JOIN artists ar ON ar.id = al.artist_id \
-    WHERE t.file_path IS NOT NULL AND t.file_path <> '' \
-    GROUP BY t.album_id, al.title, al.artist_id, ar.name";
+///
+/// 🔴 Le chemin est [`chemin_ouvrable`] — le fichier, ou pour une tranche
+/// découpée par une feuille CUE, l'IMAGE qui la porte (#5317). `t.file_path`
+/// seul NE SUFFIT PAS : une piste CUE a `file_path = NULL` par construction
+/// (`scanner/cue_bibliotheque.rs`, « une piste CUE n'a pas de file_path »).
+/// Filtrer sur lui écartait de la passe TOUT album né d'une feuille : le
+/// *Messiah* de Gardiner en APE+CUE, deux disques sous `…/CD1` et `…/CD2`,
+/// n'était jamais examiné. L'image vit dans le dossier du disque : son
+/// dossier est celui du disque, comme pour un fichier.
+const SQL_ALBUMS_ET_DOSSIERS: &str = concat!(
+    "SELECT t.album_id, al.title, MIN(",
+    chemin_ouvrable!(),
+    "), MAX(",
+    chemin_ouvrable!(),
+    "), al.artist_id, ar.name \
+     FROM tracks t JOIN albums al ON al.id = t.album_id \
+     LEFT JOIN artists ar ON ar.id = al.artist_id \
+     WHERE ",
+    chemin_ouvrable!(),
+    " IS NOT NULL \
+     GROUP BY t.album_id, al.title, al.artist_id, ar.name"
+);
 
 pub fn marqueurs(db: &Arc<dyn DbBackend>) -> Result<HashMap<i64, Marqueur>, TuneError> {
     let (p1, _) = placeholders(db);
@@ -460,7 +477,13 @@ pub fn defaire(db: &Arc<dyn DbBackend>, cible: i64) -> Result<Vec<i64>, RefusDef
     let (p1, _) = placeholders(db);
     let pistes: Vec<(i64, String)> = db
         .query_many(
-            &format!("SELECT id, file_path FROM tracks WHERE album_id = {p1}"),
+            // Le même chemin que l'inventaire : une piste CUE n'a pas de
+            // `file_path`, et la filtrer ici laisserait son disque DANS le
+            // coffret tout en retenant le refus (#5317).
+            &format!(
+                "SELECT t.id, {} FROM tracks t WHERE t.album_id = {p1}",
+                chemin_ouvrable!()
+            ),
             &[&cible as &dyn ToSqlValue],
         )?
         .into_iter()
@@ -533,12 +556,15 @@ pub struct CoffretListe {
 /// dossier (pistes 1-01 à 2-12) : c'est un album, pas un coffret rangé disque
 /// par disque. Les albums masqués (#1391) n'y figurent pas.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
+    // Le chemin de [`chemin_ouvrable`] : un coffret réuni depuis des feuilles
+    // CUE n'a aucune piste à `file_path` (#5317).
     let sql = format!(
-        "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN(t.file_path), MAX(t.file_path) \
+        "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN({c}), MAX({c}) \
          FROM tracks t JOIN albums a ON a.id = t.album_id \
-         WHERE t.file_path IS NOT NULL AND t.file_path <> '' AND {} \
+         WHERE {c} IS NOT NULL AND {} \
          GROUP BY t.album_id",
-        super::facet_filter::hidden_albums_excluded()
+        super::facet_filter::hidden_albums_excluded(),
+        c = chemin_ouvrable!()
     );
     let marques = marqueurs(db)?;
     let mut rendu = Vec::new();

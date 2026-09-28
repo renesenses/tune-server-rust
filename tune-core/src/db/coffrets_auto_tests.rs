@@ -393,3 +393,252 @@ fn sans_la_garde_le_disque_3_serait_absorbe() {
     passe(&db).unwrap();
     assert!(!existe(&db, b.box3), "la garde n'était pas la seule raison");
 }
+
+// ---------------------------------------------------------------------------
+// #5317 — les albums nés d'une feuille CUE ; #5357 — le marqueur EN TÊTE.
+// GO de Bertrand du 28/09/2026 (Marco Polo, fil 2009).
+// ---------------------------------------------------------------------------
+
+/// Vide ce que `postgres_e2e::reset_schema` ne vide pas.
+fn nettoyer_les_magasins(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+}
+
+/// Un vrai WAV court : le plan CUE écarte une image qu'aucun décodeur ne lit.
+fn ecrire_wav(chemin: &std::path::Path, millisecondes: u32) {
+    const TAUX: u32 = 8_000;
+    let trames = TAUX * millisecondes / 1000;
+    let octets = trames * 4;
+    let mut f = Vec::new();
+    f.extend_from_slice(b"RIFF");
+    f.extend_from_slice(&(36 + octets).to_le_bytes());
+    f.extend_from_slice(b"WAVEfmt ");
+    f.extend_from_slice(&16u32.to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&2u16.to_le_bytes());
+    f.extend_from_slice(&TAUX.to_le_bytes());
+    f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+    f.extend_from_slice(&4u16.to_le_bytes());
+    f.extend_from_slice(&16u16.to_le_bytes());
+    f.extend_from_slice(b"data");
+    f.extend_from_slice(&octets.to_le_bytes());
+    for n in 0..trames {
+        let v = ((n as f32 / 40.0).sin() * 8000.0) as i16;
+        f.extend_from_slice(&v.to_le_bytes());
+        f.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(chemin, f).unwrap();
+}
+
+/// Un disque en image + feuille, rangé comme chez le testeur :
+/// `<parent>/CDn/CDImagen.wav` + `CDImagen.cue`, deux pistes.
+fn disque_cue(
+    parent: &std::path::Path,
+    n: u32,
+    interprete: &str,
+    titre: &str,
+) -> std::path::PathBuf {
+    let d = parent.join(format!("CD{n}"));
+    std::fs::create_dir_all(&d).unwrap();
+    ecrire_wav(&d.join(format!("CDImage{n}.wav")), 4_000);
+    std::fs::write(
+        d.join(format!("CDImage{n}.cue")),
+        format!(
+            "PERFORMER \"{interprete}\"\nTITLE \"{titre}\"\nFILE \"CDImage{n}.wav\" WAVE\n  \
+             TRACK 01 AUDIO\n    TITLE \"Piste 1\"\n    INDEX 01 00:00:00\n  \
+             TRACK 02 AUDIO\n    TITLE \"Piste 2\"\n    INDEX 01 00:02:00\n"
+        ),
+    )
+    .unwrap();
+    d
+}
+
+/// Les albums qui portent au moins une piste, et le nombre de leurs pistes.
+fn albums_avec_pistes(db: &Arc<dyn DbBackend>) -> Vec<(i64, i64)> {
+    let mut v: Vec<(i64, i64)> = db
+        .query_many(
+            "SELECT album_id, COUNT(*) FROM tracks WHERE album_id IS NOT NULL GROUP BY album_id",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| Some((r.first()?.as_i64()?, r.get(1)?.as_i64()?)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// 🔴 #5317 — LE *MESSIAH* DE GARDINER, sur une VRAIE arborescence :
+/// `Handel - Messiah, Gardiner (Philips 2CD)/CD1/CDImage1.{wav,cue}` et
+/// `…/CD2/CDImage2.{wav,cue}`, titres de feuille « Messiah - Gardiner - CD1 »
+/// et « … - CD2 », passés par le VRAI écrivain CUE du scan.
+///
+/// À côté, le cas à NE PAS réunir : deux disques CUE frères, même socle,
+/// mais deux interprètes réels différents.
+pub(crate) fn scenario_cue_deux_disques(db: &Arc<dyn DbBackend>) {
+    use crate::scanner::cue_bibliotheque::inventorier_et_ecrire;
+    nettoyer_les_magasins(db);
+    let d = tempfile::TempDir::new().unwrap();
+    let messiah = d.path().join("Handel - Messiah, Gardiner (Philips 2CD)");
+    let cd1 = disque_cue(&messiah, 1, "G. F. Handel", "Messiah - Gardiner - CD1");
+    let cd2 = disque_cue(&messiah, 2, "G. F. Handel", "Messiah - Gardiner - CD2");
+    let autre = d.path().join("Cantates (2CD)");
+    let ca1 = disque_cue(&autre, 1, "J. S. Bach", "Cantates - CD1");
+    let ca2 = disque_cue(&autre, 2, "Gardiner", "Cantates - CD2");
+    let racines = vec![d.path().to_string_lossy().into_owned()];
+    let scanner = || {
+        inventorier_et_ecrire(
+            db.clone(),
+            &[cd1.clone(), cd2.clone(), ca1.clone(), ca2.clone()],
+            &racines,
+        )
+    };
+
+    let (_, bilan, _) = scanner();
+    assert_eq!(bilan.pistes_creees, 8, "{bilan:?}");
+    // Le fait qui cachait ces albums à la passe : AUCUNE piste n'a de
+    // `file_path`, toutes vivent dans `cue_media_path`.
+    assert_eq!(
+        compte(
+            db,
+            "SELECT COUNT(*) FROM tracks WHERE file_path IS NULL AND cue_media_path IS NOT NULL AND id > {p1}",
+            0
+        ),
+        8
+    );
+    assert_eq!(
+        albums_avec_pistes(db).len(),
+        4,
+        "quatre disques, quatre albums"
+    );
+
+    let r = passe(db).unwrap();
+    assert_eq!(r.reunis, 1, "le Messiah, et lui seul : {r:?}");
+    assert_eq!(r.disques_absorbes, 1, "{r:?}");
+    assert_eq!(r.echecs, 0, "{r:?}");
+    let apres = albums_avec_pistes(db);
+    assert_eq!(
+        apres.len(),
+        3,
+        "Messiah réuni, Cantates intactes : {apres:?}"
+    );
+    let coffret = apres
+        .iter()
+        .map(|(id, _)| *id)
+        .find(|id| titre(db, *id) == "Messiah - Gardiner")
+        .expect("un album « Messiah - Gardiner »");
+    assert_eq!(pistes_du_disque(db, coffret, 1), 2);
+    assert_eq!(pistes_du_disque(db, coffret, 2), 2);
+    for t in ["Cantates - CD1", "Cantates - CD2"] {
+        assert!(
+            apres.iter().any(|(id, _)| titre(db, *id) == t),
+            "« {t} » réuni à tort : deux interprètes réels différents"
+        );
+    }
+    assert!(
+        lister(db).unwrap().iter().any(|c| c.album_id == coffret),
+        "le coffret CUE doit figurer dans l'onglet"
+    );
+
+    // RESCAN : l'écrivain CUE réécrit chaque feuille et rend le disque 2 à
+    // un album de son dossier ; la passe qui suit le scan le réunit de nouveau.
+    scanner();
+    passe(db).unwrap();
+    let apres_rescan = albums_avec_pistes(db);
+    assert_eq!(apres_rescan.len(), 3, "{apres_rescan:?}");
+    assert!(apres_rescan.contains(&(coffret, 4)), "{apres_rescan:?}");
+    assert_eq!(titre(db, coffret), "Messiah - Gardiner");
+    assert_eq!(pistes_du_disque(db, coffret, 2), 2);
+
+    // DÉFAIRE : le disque 2 retrouve ses pistes — qui n'ont pas de
+    // `file_path` — et le coffret ne revient pas.
+    let recrees = defaire(db, coffret).unwrap();
+    assert_eq!(recrees.len(), 1, "{recrees:?}");
+    assert_eq!(
+        compte(
+            db,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = {p1}",
+            coffret
+        ),
+        2
+    );
+    assert_eq!(
+        compte(
+            db,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = {p1}",
+            recrees[0]
+        ),
+        2
+    );
+    assert_eq!(titre(db, coffret), "Messiah - Gardiner - CD1");
+    assert_eq!(titre(db, recrees[0]), "Messiah - Gardiner - CD2");
+    let r2 = passe(db).unwrap();
+    assert_eq!(r2.reunis, 0, "{r2:?}");
+    assert_eq!(r2.laisses_refuses, 1, "{r2:?}");
+}
+
+#[test]
+fn cue_deux_disques_sur_sqlite() {
+    scenario_cue_deux_disques(&sqlite());
+}
+
+/// 🔴 #5357 — le marqueur EN TÊTE, en pistes séparées. `CD1 - Messiah` /
+/// `CD2 - Messiah` sont réunis ; la *Philips Original Jackets Collection*
+/// de la capture — un titre DIFFÉRENT par disque, sous un même parent et un
+/// même artiste d'album — ne l'est pas.
+pub(crate) fn scenario_marqueur_de_tete(db: &Arc<dyn DbBackend>) {
+    nettoyer_les_magasins(db);
+    let handel = artiste(db, "G. F. Handel");
+    let philips = artiste(db, "Philips");
+    let m = "/m/Classique/Handel - Messiah (Gardiner)";
+    let cd1 = disque(
+        db,
+        "CD1 - Messiah",
+        handel,
+        &format!("{m}/CD1 - Messiah"),
+        2,
+        1,
+    );
+    let cd2 = disque(
+        db,
+        "CD2 - Messiah",
+        handel,
+        &format!("{m}/CD2 - Messiah"),
+        3,
+        1,
+    );
+    let p = "/m/Coffrets/Philips Original Jackets Collection (55 CDs)";
+    let collection: Vec<i64> = [
+        "CD01 - Bruch Violin Concertos Nos. 1 & 2; Scottish Fantasy",
+        "CD02 - Brahms Wolf Lieder",
+        "CD03 - Brahms - Piano Concerto No.2",
+        "CD09 - Rossini - Stabat Mater",
+    ]
+    .iter()
+    .map(|n| disque(db, n, philips, &format!("{p}/{n}"), 1, 1))
+    .collect();
+
+    let r = passe(db).unwrap();
+    assert_eq!(r.reunis, 1, "{r:?}");
+    assert!(!existe(db, cd2));
+    assert_eq!(titre(db, cd1), "Messiah");
+    assert_eq!(pistes_du_disque(db, cd1, 1), 2);
+    assert_eq!(
+        pistes_du_disque(db, cd1, 2),
+        3,
+        "numéroté d'après le marqueur"
+    );
+    for id in collection {
+        assert!(
+            existe(db, id),
+            "disque {id} de la collection absorbé à tort"
+        );
+    }
+}
+
+#[test]
+fn marqueur_de_tete_sur_sqlite() {
+    scenario_marqueur_de_tete(&sqlite());
+}
