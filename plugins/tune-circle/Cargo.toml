@@ -25,6 +25,8 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 # `GET /library-sync` rend `last_sync` sous une seule forme (T2, #5325).
 chrono = { workspace = true }
+# T5 (#5328) : le parc des services est derrière un `tokio::sync::Mutex`.
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

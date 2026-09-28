@@ -4,6 +4,8 @@
 mod commun;
 
 use axum::http::StatusCode;
+use std::sync::Arc;
+
 use serde_json::json;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -393,9 +395,26 @@ async fn un_401_du_cloud_sans_rafraichissement_rend_non_connecte_jamais_401() {
 fn le_greffon_s_appelle_circle_reste_opt_in_et_est_au_catalogue() {
     use tune_core::plugin_sdk::TunePlugin;
     let backend = base("http://127.0.0.1:9", None);
+    let services = Arc::new(tokio::sync::Mutex::new(
+        tune_core::streaming::ServiceRegistry::new(),
+    ));
+    let playback = Arc::new(tune_core::playback::PlaybackManager::new());
+    let orchestrator = Arc::new(tune_core::orchestrator::PlaybackOrchestrator::new(
+        backend.clone(),
+        playback.clone(),
+        Arc::new(tune_core::http::streamer::AudioStreamer::new(0)),
+        services.clone(),
+        Arc::new(tokio::sync::Mutex::new(
+            tune_core::outputs::registry::OutputRegistry::new(),
+        )),
+        Some("127.0.0.1".into()),
+    ));
     let g = tune_circle::CirclePlugin::new(tune_circle::HostServices {
-        license: std::sync::Arc::new(tune_core::license::LicenseManager::new(backend.clone())),
+        license: Arc::new(tune_core::license::LicenseManager::new(backend.clone())),
         backend,
+        services,
+        orchestrator,
+        playback,
     });
     assert_eq!(g.name(), "circle");
     assert!(!g.default_enabled(), "opt-in, comme cd");

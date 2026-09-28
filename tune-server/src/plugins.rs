@@ -175,6 +175,11 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             tune_circle::HostServices {
                 backend: state.backend.clone(),
                 license: state.license.clone(),
+                // T5 (#5328) : rejouer une playlist de cercle chez
+                // l'utilisateur, puis la jouer sur une zone.
+                services: state.services.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
             },
         )))
         .await;
