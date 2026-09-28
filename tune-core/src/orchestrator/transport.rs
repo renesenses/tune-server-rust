@@ -1123,6 +1123,13 @@ impl PlaybackOrchestrator {
             // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
             // n'en porte pas : sa résolution réelle est lue au scan.
             bitrate_kbps: resolved.bitrate_kbps,
+            // #5336 : resolved.channels décrit la SORTIE (potentiellement
+            // repliée). Seule la ligne source fait autorité ici. Les radios
+            // décodées sont complétées à la lecture de leur observation.
+            channels: track_meta
+                .as_ref()
+                .and_then(|t| u16::try_from(t.channels).ok())
+                .filter(|n| *n > 0),
         }
     }
 
