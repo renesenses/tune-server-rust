@@ -241,14 +241,23 @@ tous = fils.get("threads", [])
 # Un fil de notes est de type `release`... ou `discussion` depuis que l'API du
 # forum REFUSE `release` (HTTP 422 « The selected type is invalid », constate
 # le 27/09/2026) : les fils de la .165 a la .167 existent, epingles, et la
-# sonde les accusait tous. Un `discussion` ne compte que s'il porte le titre
-# de la procedure, « Notes de version » : un fil de bug qui cite la version
-# n'annonce rien, et le compter ferait un vert qui ne garde rien.
+# sonde les accusait tous.
+#
+# Un `discussion` compte s'il OUVRE par « Tune vX.Y.Z », ou s'il porte « Notes
+# de version ». Le titre de la procedure (« Tune v0.9.154 — Notes de version »)
+# n'est plus suivi a la lettre : les vrais fils sont thematiques, « Tune
+# v0.9.167 — l'egaliseur sans saut de volume, … » (fils 1942, 1980, 2007, lus
+# sur l'API le 28/09/2026). L'auteur ne departage rien : « Admin » ou
+# « Bertrand » selon le fil. Un fil de bug est de type `bug` et titre
+# « v0.9.166: … » ; une discussion qui cite la version en cours de phrase
+# n'ouvre pas par « Tune v » : ni l'un ni l'autre n'annonce.
 def fil_de_notes(t):
     if t.get("type") == "release":
         return True
-    return t.get("type") == "discussion" and re.search(
-        r"notes de version", t.get("title") or "", re.IGNORECASE) is not None
+    titre = t.get("title") or ""
+    return t.get("type") == "discussion" and (
+        re.match(r"\s*Tune v\d+\.\d+\.\d+", titre) is not None
+        or re.search(r"notes de version", titre, re.IGNORECASE) is not None)
 
 titres = [t.get("title") or "" for t in tous if fil_de_notes(t)]
 

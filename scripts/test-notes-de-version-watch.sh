@@ -278,10 +278,17 @@ jouer discussion
 verifier "etat de sortie 0 (la v0.9.160 a son fil)" "0" "$ETAT"
 
 echo
+echo "5b. un fil discussion au titre thematique « Tune v0.9.160 — l'egaliseur … » — il annonce"
+printf '%s' "$RELEASES_160" | poser_decor thematique
+ajouter_fil "$RACINE/thematique/fils.json" "Tune v0.9.160 — l'égaliseur sans saut de volume, la recherche par dossier" discussion
+jouer thematique
+verifier "etat de sortie 0 (titre reel des fils .165-.167)" "0" "$ETAT"
+
+echo
 echo "6. un fil de bug et une discussion qui citent la v0.9.160 — ils n'annoncent rien"
 printf '%s' "$RELEASES_160" | poser_decor bavard
 ajouter_fil "$RACINE/bavard/fils.json" "v0.9.160 : plus de son sur le DAC" bug
-ajouter_fil "$RACINE/bavard/fils.json" "Tune v0.9.160 — vos impressions" discussion
+ajouter_fil "$RACINE/bavard/fils.json" "Vos impressions sur la v0.9.160 ?" discussion
 jouer bavard
 verifier "etat de sortie 1 (aucun fil de notes)" "1" "$ETAT"
 N=$(printf '%s' "$SORTIE" | grep -c '^| `v0\.9\.160` |')
