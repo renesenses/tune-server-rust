@@ -627,17 +627,65 @@ pub fn local_exclusive_mode_status(backend: &str, requested: bool) -> ExclusiveM
 /// [`exclusive_mode_status`] : le chemin ASIO ne se compile et ne s'exécute que
 /// sous Windows, et une épreuve entourée du même `cfg!` serait verte contre
 /// rien.
+///
+/// # `arme_par_asio` (#5353)
+///
+/// Choisir ASIO dans les réglages ÉCRIT `local_exclusive_mode = true` (le
+/// client renvoie l'écho du forçage) et pose le témoin
+/// [`REGLAGE_EXCLUSIF_ARME_PAR_ASIO`] (#4184). Ce `true`-là n'est pas une
+/// demande de l'utilisateur, c'est la contrainte ASIO recopiée en base. Lu
+/// comme une demande, il rendait le correctif de #3245 sans effet : une sortie
+/// énumérée par WASAPI sous ASIO recevait l'exclusif quand même, par la
+/// DEMANDE au lieu de la CONTRAINTE. Mesuré chez Jean-François (fil 2018) :
+/// ASIO choisi, case « exclusif » jamais cochée, et une zone « Speakers »
+/// ouverte en WASAPI EXCLUSIF, refusée pour chaque format (`0x88890008`),
+/// sans aucun repli.
+///
+/// Quand ce témoin est posé, le backend configuré est ASIO et CE périphérique
+/// ne s'ouvre PAS en ASIO, la demande ne vaut donc rien pour lui. Un exclusif
+/// armé par l'utilisateur lui-même (avant de choisir ASIO, sans témoin) reste
+/// honoré partout. Voir [`demande_d_exclusif_du_peripherique`].
 pub fn exclusive_mode_du_peripherique(
     configured_backend: &str,
     origin_host: Option<&str>,
     requested: bool,
+    arme_par_asio: bool,
     on_windows: bool,
 ) -> ExclusiveModeStatus {
-    exclusive_mode_status(
-        &openable_local_backend(configured_backend, origin_host),
+    let ouvrable = openable_local_backend(configured_backend, origin_host);
+    let demande =
+        demande_d_exclusif_du_peripherique(configured_backend, &ouvrable, requested, arme_par_asio);
+    ExclusiveModeStatus {
+        // Ce que la base dit, tel quel : l'écran doit pouvoir le montrer.
         requested,
-        on_windows,
-    )
+        ..exclusive_mode_status(&ouvrable, demande, on_windows)
+    }
+}
+
+/// Le témoin posé par `PATCH /system/config` quand c'est le choix d'ASIO, et
+/// non l'utilisateur, qui a armé `local_exclusive_mode` (#4184).
+pub const REGLAGE_EXCLUSIF_ARME_PAR_ASIO: &str = "local_exclusive_mode_arme_par_asio";
+
+/// La demande d'exclusif qui vaut pour UN périphérique — fonction pure (#5353).
+///
+/// `configured_backend` est le réglage `local_audio_backend`, `backend_ouvrable`
+/// celui que rend [`openable_local_backend`] pour ce périphérique.
+///
+/// La demande est retirée dans un seul cas : elle a été armée par ASIO (témoin
+/// posé), ASIO est toujours le réglage, et ce périphérique ne s'ouvre pas en
+/// ASIO. Exiger aussi `configured_backend == "asio"` protège d'un témoin périmé
+/// (un backend changé par le fichier de config, sans passer par la route qui
+/// l'efface) : hors ASIO, la demande passe telle quelle.
+pub fn demande_d_exclusif_du_peripherique(
+    configured_backend: &str,
+    backend_ouvrable: &str,
+    requested: bool,
+    arme_par_asio: bool,
+) -> bool {
+    let echo_d_asio_sur_une_sortie_non_asio = arme_par_asio
+        && configured_backend.trim().eq_ignore_ascii_case("asio")
+        && !backend_ouvrable.trim().eq_ignore_ascii_case("asio");
+    requested && !echo_d_asio_sur_une_sortie_non_asio
 }
 
 /// Même règle, câblée sur la plateforme de ce binaire. C'est celle que les deux
@@ -646,11 +694,13 @@ pub fn local_exclusive_mode_du_peripherique(
     configured_backend: &str,
     origin_host: Option<&str>,
     requested: bool,
+    arme_par_asio: bool,
 ) -> ExclusiveModeStatus {
     exclusive_mode_du_peripherique(
         configured_backend,
         origin_host,
         requested,
+        arme_par_asio,
         cfg!(target_os = "windows"),
     )
 }
@@ -1117,7 +1167,7 @@ mod tests {
     /// le son de toutes les autres applications disparaissait.
     #[test]
     fn asio_n_impose_plus_l_exclusif_a_un_nom_enumere_par_wasapi() {
-        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, true);
+        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, false, true);
         assert!(
             !s.effective,
             "ce périphérique s'ouvrira en WASAPI (openable_local_backend) :              rien n'y impose l'exclusif, et l'utilisateur ne l'a pas demandé"
@@ -1133,7 +1183,7 @@ mod tests {
     /// c'est-à-dire en rendant le pilote ASIO inouvrable.
     #[test]
     fn le_peripherique_asio_garde_sa_contrainte() {
-        let s = exclusive_mode_du_peripherique("asio", Some("ASIO"), false, true);
+        let s = exclusive_mode_du_peripherique("asio", Some("ASIO"), false, false, true);
         assert!(s.effective, "un pilote ASIO ouvert en partagé n'existe pas");
         assert!(s.forced);
         assert_eq!(s.reason, Some(ExclusiveModeConstraint::AsioAlwaysExclusive));
@@ -1145,7 +1195,7 @@ mod tests {
     #[test]
     fn l_exclusif_demande_reste_honore_sur_toute_sortie() {
         for origine in [Some("WASAPI"), Some("ASIO"), None] {
-            let s = exclusive_mode_du_peripherique("asio", origine, true, true);
+            let s = exclusive_mode_du_peripherique("asio", origine, true, false, true);
             assert!(
                 s.effective,
                 "origine {origine:?} : l'utilisateur l'a demandé"
@@ -1163,7 +1213,9 @@ mod tests {
                 for windows in [false, true] {
                     for origine in [None, Some(""), Some("   ")] {
                         assert_eq!(
-                            exclusive_mode_du_peripherique(backend, origine, demande, windows),
+                            exclusive_mode_du_peripherique(
+                                backend, origine, demande, false, windows
+                            ),
                             exclusive_mode_status(backend, demande, windows),
                             "backend {backend}, demande {demande}, windows {windows},                              origine {origine:?}"
                         );
@@ -1181,12 +1233,95 @@ mod tests {
     #[test]
     fn la_regle_par_peripherique_diverge_bien_de_la_regle_machine() {
         let machine = exclusive_mode_status("asio", false, true);
-        let peripherique = exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, true);
+        let peripherique =
+            exclusive_mode_du_peripherique("asio", Some("WASAPI"), false, false, true);
         assert_ne!(
             machine, peripherique,
             "si ces deux valeurs étaient égales, `exclusive_mode_du_peripherique`              ignorerait l'hôte d'origine et #3245 serait toujours vivant"
         );
         assert!(machine.effective && !peripherique.effective);
+    }
+
+    // -----------------------------------------------------------------
+    // #5353 — l'exclusif ARMÉ PAR ASIO n'est pas une demande.
+    // -----------------------------------------------------------------
+
+    /// Le cas de Jean-François (fil 2018), à la lettre : ASIO choisi dans les
+    /// réglages, donc `local_exclusive_mode = true` ÉCRIT par l'écho du
+    /// forçage et témoin #4184 posé ; une sortie « Speakers » énumérée par
+    /// WASAPI. Avant #5353, cette sortie s'ouvrait en WASAPI EXCLUSIF et
+    /// refusait tous les formats (`0x88890008`) sans repli.
+    #[test]
+    fn l_exclusif_arme_par_asio_ne_s_applique_pas_a_une_sortie_wasapi() {
+        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), true, true, true);
+        assert!(
+            !s.effective,
+            "« Speakers » s'ouvre en WASAPI : le `true` en base est l'écho du \
+             forçage ASIO, pas une demande — cette sortie doit rester partagée"
+        );
+        assert!(!s.forced);
+        assert_eq!(s.reason, None);
+        assert!(s.requested, "la valeur en base reste lisible telle quelle");
+    }
+
+    /// TÉMOIN — le vrai pilote ASIO reste exclusif, témoin posé ou non.
+    #[test]
+    fn temoin_le_pilote_asio_reste_exclusif_avec_le_temoin() {
+        for arme in [false, true] {
+            let s = exclusive_mode_du_peripherique("asio", Some("ASIO"), true, arme, true);
+            assert!(
+                s.effective,
+                "arme_par_asio={arme} : ASIO n'a pas de partagé"
+            );
+            assert!(s.forced);
+        }
+    }
+
+    /// TÉMOIN — un exclusif armé par l'utilisateur LUI-MÊME (pas de témoin)
+    /// reste honoré sur la sortie WASAPI : #5353 retire un écho, pas un choix.
+    #[test]
+    fn temoin_l_exclusif_choisi_par_l_utilisateur_reste_honore() {
+        let s = exclusive_mode_du_peripherique("asio", Some("WASAPI"), true, false, true);
+        assert!(s.effective);
+    }
+
+    /// Un témoin PÉRIMÉ (backend quitté sans passer par la route qui l'efface)
+    /// ne désarme rien : hors ASIO, la demande passe telle quelle.
+    #[test]
+    fn un_temoin_perime_hors_asio_ne_desarme_rien() {
+        for backend in ["wasapi", "auto", ""] {
+            let ouvrable = openable_local_backend(backend, Some("WASAPI"));
+            assert!(
+                demande_d_exclusif_du_peripherique(backend, &ouvrable, true, true),
+                "backend {backend:?} : aucun ASIO en jeu, la demande vaut"
+            );
+            let s = exclusive_mode_du_peripherique(backend, Some("WASAPI"), true, true, true);
+            assert!(s.effective, "backend {backend:?}");
+        }
+    }
+
+    /// La table complète de la fonction pure : seule la combinaison
+    /// (demande, témoin, réglage ASIO, sortie non ASIO) retire la demande.
+    #[test]
+    fn demande_d_exclusif_table_complete() {
+        for configure in ["asio", "ASIO", "wasapi"] {
+            for ouvrable in ["asio", "wasapi"] {
+                for demande in [false, true] {
+                    for arme in [false, true] {
+                        let attendu = demande
+                            && !(arme
+                                && configure.eq_ignore_ascii_case("asio")
+                                && ouvrable != "asio");
+                        assert_eq!(
+                            demande_d_exclusif_du_peripherique(configure, ouvrable, demande, arme),
+                            attendu,
+                            "configure {configure}, ouvrable {ouvrable}, demande {demande}, \
+                             arme {arme}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Contre-épreuve permanente : toute contrainte ajoutée doit avoir un code

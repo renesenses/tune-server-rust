@@ -2822,6 +2822,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                 &configured_backend,
                 Some(dev.backend.as_str()),
                 state.requested_exclusive_mode(),
+                // #5353 — le `true` écrit par le choix d'ASIO n'est pas une
+                // demande pour ces noms WASAPI.
+                state.exclusif_arme_par_asio(),
             );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),
@@ -3891,7 +3894,13 @@ mod exclusif_par_peripherique_i3245 {
     /// redevenu la valeur machine. On lit donc exactement la liste
     /// d'arguments, en comptant les parenthèses.
     fn arguments_du_constructeur(source: &str, debut: usize) -> Option<&str> {
-        let ouvre = debut + CONSTRUCTEUR.len() - 1;
+        arguments_d_appel(source, debut, CONSTRUCTEUR)
+    }
+
+    /// Les arguments de l'appel `aiguille` (qui finit par `(`) commençant à
+    /// `debut`, parenthèses comprises.
+    fn arguments_d_appel<'a>(source: &'a str, debut: usize, aiguille: &str) -> Option<&'a str> {
+        let ouvre = debut + aiguille.len() - 1;
         let mut profondeur = 0i32;
         for (i, octet) in source[ouvre..].bytes().enumerate() {
             match octet {
@@ -3971,6 +3980,68 @@ mod exclusif_par_peripherique_i3245 {
              d'une énumération sont `register_local_outputs` (startup.rs) et \
              `rescan_local_audio_devices` (background.rs). Un site de plus ou \
              de moins : reprendre le recensement avant de toucher à ce compte"
+        );
+    }
+
+    /// #5353 — l'appel de la règle par périphérique doit lui passer le témoin
+    /// « exclusif armé par ASIO ». Un site qui passe `false` compile, et
+    /// l'écho du forçage ASIO redevient une demande : une sortie énumérée par
+    /// WASAPI s'ouvre en WASAPI exclusif (Jean-François, fil 2018).
+    const APPEL_DE_REGLE: &str = "local_exclusive_mode_du_peripherique(";
+    const TEMOIN_5353: &str = "exclusif_arme_par_asio";
+
+    /// (nombre d'appels de la règle, lignes de ceux qui ne passent pas le
+    /// témoin), sur le code de production seul.
+    fn appels_de_regle_sans_temoin_5353(source: &str) -> (usize, Vec<usize>) {
+        let production = production(source);
+        let mut manquants = Vec::new();
+        let mut total = 0usize;
+        let mut curseur = 0usize;
+        while let Some(pos) = production[curseur..].find(APPEL_DE_REGLE) {
+            let debut = curseur + pos;
+            total += 1;
+            let conforme = arguments_d_appel(production, debut, APPEL_DE_REGLE)
+                .is_some_and(|args| args.contains(TEMOIN_5353));
+            if !conforme {
+                manquants.push(production[..debut].lines().count());
+            }
+            curseur = debut + APPEL_DE_REGLE.len();
+        }
+        (total, manquants)
+    }
+
+    #[test]
+    fn les_deux_sites_passent_le_temoin_arme_par_asio_i5353() {
+        for (chemin, source) in [
+            (
+                "tune-server/src/background.rs",
+                include_str!("background.rs"),
+            ),
+            ("tune-server/src/startup.rs", include_str!("startup.rs")),
+        ] {
+            let (total, manquants) = appels_de_regle_sans_temoin_5353(source);
+            assert_eq!(total, 1, "{chemin} : un seul appel de la règle attendu");
+            assert!(
+                manquants.is_empty(),
+                "{chemin} appelle la règle par périphérique sans le témoin \
+                 « exclusif armé par ASIO », ligne(s) {manquants:?} : l'écho du \
+                 forçage ASIO y redevient une demande et une sortie WASAPI \
+                 s'ouvre en exclusif (#5353)"
+            );
+        }
+    }
+
+    /// CONTRE-ÉPREUVE du détecteur de #5353 : un appel qui passe `false` à la
+    /// place du témoin est nommé, par sa ligne.
+    #[test]
+    fn la_garde_5353_refuse_un_appel_sans_temoin() {
+        let sain = "let s = tune_core::config::local_exclusive_mode_du_peripherique(\n    b,\n    o,\n    d,\n    state.exclusif_arme_par_asio(),\n);\n";
+        assert_eq!(appels_de_regle_sans_temoin_5353(sain), (1, vec![]));
+        let malade = "let x = 1;\nlet s = tune_core::config::local_exclusive_mode_du_peripherique(b, o, d, false);\nlet t = exclusif_arme_par_asio;\n";
+        assert_eq!(
+            appels_de_regle_sans_temoin_5353(malade),
+            (1, vec![2]),
+            "le témoin nommé HORS des arguments ne doit pas sauver l'appel"
         );
     }
 
