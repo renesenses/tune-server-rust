@@ -180,6 +180,11 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
                 hote: std::sync::Arc::new(HoteDuCercle {
                     state: state.clone(),
                 }),
+                // T5 (#5328) : rejouer une playlist de cercle chez
+                // l'utilisateur, puis la jouer sur une zone.
+                services: state.services.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
             },
         )))
         .await;

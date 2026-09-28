@@ -166,6 +166,7 @@ pub(crate) fn en_reponse(issue: Issue) -> Response {
             statut,
             corps,
             retry_after,
+            etag,
         } => {
             let statut = StatusCode::from_u16(statut).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut reponse = if corps.is_empty() {
@@ -186,6 +187,9 @@ pub(crate) fn en_reponse(issue: Issue) -> Response {
             };
             if let Some(v) = retry_after {
                 reponse.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            if let Some(v) = etag {
+                reponse.headers_mut().insert(header::ETAG, v);
             }
             reponse
         }

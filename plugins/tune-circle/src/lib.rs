@@ -31,8 +31,12 @@
 
 pub mod battement;
 pub mod ensembles;
+pub mod lecture;
+pub mod playlists;
 pub mod rayons;
+pub mod references;
 pub mod relais;
+pub mod resolution;
 pub mod routes;
 
 use std::sync::Arc;
@@ -41,7 +45,10 @@ use async_trait::async_trait;
 use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
 use tune_core::license::LicenseManager;
+use tune_core::orchestrator::PlaybackOrchestrator;
+use tune_core::playback::PlaybackManager;
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
+use tune_core::streaming::ServiceRegistry;
 
 /// Ce que l'hôte passe au greffon, explicitement, à sa construction.
 ///
@@ -51,10 +58,19 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 /// si son serveur est Premium, avec le même juge que la synchro elle-même.
 /// L'hôte des rayons (T3, #5326) : le profil actif d'une requête et la
 /// résolution d'une collection intelligente, par le moteur de la vue.
+///
+/// T5 (#5328), les playlists collaboratives : le parc des services, pour
+/// rejouer une référence chez l'utilisateur (lecture seule : `get_track` et
+/// la recherche du moteur de transfert, jamais une écriture chez un service) ;
+/// l'orchestrateur et le gestionnaire de lecture, pour jouer la playlist
+/// résolue sur une zone.
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
     pub license: Arc<LicenseManager>,
     pub hote: Arc<dyn ensembles::Hote>,
+    pub services: Arc<tokio::sync::Mutex<ServiceRegistry>>,
+    pub orchestrator: Arc<PlaybackOrchestrator>,
+    pub playback: Arc<PlaybackManager>,
 }
 
 pub struct CirclePlugin {
@@ -103,9 +119,22 @@ impl TunePlugin for CirclePlugin {
             relais.clone(),
             self.services.hote.clone(),
         ));
+        let collaboratif = Arc::new(playlists::Collaboratif {
+            relais: relais.clone(),
+            resolveur: resolution::Resolveur::new(
+                self.services.backend.clone(),
+                self.services.services.clone(),
+            ),
+            lecture: Arc::new(lecture::LectureOrchestrateur {
+                backend: self.services.backend.clone(),
+                orchestrator: self.services.orchestrator.clone(),
+                playback: self.services.playback.clone(),
+            }),
+        });
         ctx.register_router(
             routes::router(relais, self.services.license.clone())
-                .merge(rayons::router(pousseur.clone())),
+                .merge(rayons::router(pousseur.clone()))
+                .merge(playlists::router(collaboratif)),
         );
         // T3 (#5326) : tenir à jour les rayons cochés.
         self.tache = Some(tokio::spawn(pousseur.clone().tourner()));

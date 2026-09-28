@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{ACCEPT, HeaderValue, RETRY_AFTER};
+use reqwest::header::{ACCEPT, ETAG, HeaderValue, IF_MATCH, RETRY_AFTER};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -36,6 +36,9 @@ pub enum Issue {
         statut: u16,
         corps: Vec<u8>,
         retry_after: Option<HeaderValue>,
+        /// `ETag: "<version>"` d'une playlist de cercle (T5, #5328) : relayé
+        /// pour que le client puisse répondre par `If-Match`.
+        etag: Option<HeaderValue>,
     },
     /// Le cloud n'a pas pu répondre : injoignable, délai dépassé, ou 5xx.
     Indisponible { statut_amont: Option<u16> },
@@ -87,6 +90,22 @@ impl Relais {
         requete: Option<&str>,
         corps: Option<&Value>,
     ) -> Issue {
+        self.appeler_avec(route, methode, segments, requete, corps, None)
+            .await
+    }
+
+    /// [`Self::appeler_avec_requete`], avec l'en-tête `If-Match` du client
+    /// (T5, #5328 : la version d'une playlist, quand le corps ne la porte
+    /// pas). Il part tel quel ; c'est le cloud qui le juge.
+    pub async fn appeler_avec(
+        &self,
+        route: &'static str,
+        methode: Method,
+        segments: &[&str],
+        requete: Option<&str>,
+        corps: Option<&Value>,
+        if_match: Option<&HeaderValue>,
+    ) -> Issue {
         let debut = Instant::now();
         let settings = self.reglages();
         let Some(jeton) = lire(&settings, "mozaik_access_token") else {
@@ -100,14 +119,14 @@ impl Relais {
         };
         url.set_query(requete.filter(|q| !q.is_empty()));
 
-        let mut envoi = envoyer(&url, &methode, &jeton, corps).await;
+        let mut envoi = envoyer(&url, &methode, &jeton, corps, if_match).await;
         // Un 401 peut n'être qu'un jeton d'accès expiré : un seul
         // rafraîchissement, comme le battement de compte, puis le verdict du
         // cloud est relayé tel quel.
         if matches!(&envoi, Ok(r) if r.status() == StatusCode::UNAUTHORIZED)
             && let Some(nouveau) = rafraichir(&settings, &base).await
         {
-            envoi = envoyer(&url, &methode, &nouveau, corps).await;
+            envoi = envoyer(&url, &methode, &nouveau, corps, if_match).await;
         }
 
         let duree_ms = debut.elapsed().as_millis() as u64;
@@ -141,6 +160,7 @@ impl Relais {
             };
         }
         let retry_after = reponse.headers().get(RETRY_AFTER).cloned();
+        let etag = reponse.headers().get(ETAG).cloned();
         match reponse.bytes().await {
             Ok(corps) => {
                 info!(route, statut = statut.as_u16(), duree_ms, "circle_relai");
@@ -148,6 +168,7 @@ impl Relais {
                     statut: statut.as_u16(),
                     corps: corps.to_vec(),
                     retry_after,
+                    etag,
                 }
             }
             Err(e) => {
@@ -193,12 +214,16 @@ async fn envoyer(
     methode: &Method,
     jeton: &str,
     corps: Option<&Value>,
+    if_match: Option<&HeaderValue>,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut requete = tune_core::http::client::shared()
         .request(methode.clone(), url.clone())
         .bearer_auth(jeton)
         .header(ACCEPT, "application/json")
         .timeout(DELAI);
+    if let Some(v) = if_match {
+        requete = requete.header(IF_MATCH, v.clone());
+    }
     if let Some(c) = corps {
         requete = requete.json(c);
     }

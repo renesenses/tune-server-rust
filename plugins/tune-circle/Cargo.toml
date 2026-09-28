@@ -28,6 +28,7 @@ chrono = { workspace = true }
 # T3 (#5326) : l'empreinte d'un ensemble poussé, et la boucle qui les tient
 # à jour.
 sha2 = { workspace = true }
+# T5 (#5328) : le parc des services est derrière un `tokio::sync::Mutex`.
 tokio = { workspace = true }
 
 [dev-dependencies]
