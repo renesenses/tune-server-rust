@@ -1305,7 +1305,10 @@ pub struct PisteABaliser {
 ///   plusieurs artistes (sans quoi le scan suivant le redécouvrirait d'après
 ///   eux), retrait sinon ; compilation effective d'un SEUL artiste : balise
 ///   laissée telle quelle — on ne pose pas `COMPILATION=1` sur l'album d'un
-///   seul artiste.
+///   seul artiste ;
+/// - `GENRE` (#5314) : `tracks.genres` (tableau JSON) s'il porte au moins un
+///   genre, sinon `tracks.genre` ; rien du tout si la piste n'a pas de genre
+///   en base — la balise du fichier est alors laissée telle quelle.
 pub fn balises_effectives(
     db: &Arc<dyn DbBackend>,
     album_id: i64,
@@ -1317,7 +1320,7 @@ pub fn balises_effectives(
     let rows = db.query_many_strong(
         &format!(
             "SELECT t.id, t.file_path, t.cue_media_path, t.cue_start_ms, t.source, t.title, \
-             ar.name, t.disc_number, t.track_number, t.disc_subtitle \
+             ar.name, t.disc_number, t.track_number, t.disc_subtitle, t.genre, t.genres \
              FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id \
              WHERE t.album_id = {p1} \
              ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0), t.id"
@@ -1334,6 +1337,7 @@ pub fn balises_effectives(
         disque: u32,
         numero: u32,
         nom_disque: Option<String>,
+        genres: Vec<String>,
     }
     let texte = |v: Option<&SqlValue>| {
         v.and_then(|v| v.as_string())
@@ -1353,6 +1357,7 @@ pub fn balises_effectives(
                 disque: r.get(7).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as u32,
                 numero: r.get(8).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
                 nom_disque: texte(r.get(9)),
+                genres: genres_de_piste(texte(r.get(10)), texte(r.get(11))),
             })
         })
         .collect();
@@ -1397,10 +1402,28 @@ pub fn balises_effectives(
                     titre: b.titre,
                     artiste: b.artiste,
                     compilation,
+                    genres: b.genres,
                 },
             })
             .collect(),
     ))
+}
+
+/// Les genres qu'« Écrire dans les fichiers » pose sur une piste (#5314) :
+/// le tableau JSON `tracks.genres` s'il en porte au moins un, sinon la
+/// colonne `tracks.genre`, sinon aucun (la balise du fichier reste).
+fn genres_de_piste(genre: Option<String>, genres_json: Option<String>) -> Vec<String> {
+    let tableau: Vec<String> = genres_json
+        .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if !tableau.is_empty() {
+        return tableau;
+    }
+    genre.into_iter().collect()
 }
 
 #[cfg(test)]

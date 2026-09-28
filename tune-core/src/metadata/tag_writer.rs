@@ -749,6 +749,17 @@ pub struct BalisesEdition {
     /// `Some(true)` : `COMPILATION=1` ; `Some(false)` : pas une compilation
     /// (voir [`DrapeauAEcrire`]) ; `None` : ne pas toucher.
     pub compilation: Option<DrapeauAEcrire>,
+    /// GENRE (#5314, décision de Bertrand du 28/09/2026) : les genres de la
+    /// piste EN BASE (`tracks.genres`, sinon `tracks.genre`), dans l'ordre —
+    /// le premier reste le genre principal. Écrits en VALEURS SÉPARÉES, la
+    /// convention multivaleur que le lecteur du scan relit déjà
+    /// (`metadata::genres_from_tag_values`, #1821) : champ `GENRE` répété en
+    /// Vorbis, atome `©gen` répété en MP4, `TCON` multivalué en ID3v2.4.
+    ///
+    /// Vide : « ne pas toucher » — une piste sans genre en base ne vide
+    /// JAMAIS la balise GENRE que porte son fichier.
+    #[serde(default)]
+    pub genres: Vec<String>,
 }
 
 /// Ce que devient la balise COMPILATION.
@@ -787,6 +798,16 @@ fn texte(v: Option<&str>) -> Option<String> {
     v.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Les clés de genre (`genre_key`) de valeurs brutes, dans l'ordre, après le
+/// même découpage que le scan : « Jazz; Fusion » en une chaîne et deux
+/// valeurs `Jazz` / `Fusion` décrivent la même musique.
+fn cles_de_genres<S: AsRef<str>>(valeurs: &[S]) -> Vec<String> {
+    super::genres_from_tag_values(valeurs)
+        .iter()
+        .map(|g| super::genre_key(g))
+        .collect()
 }
 
 /// Ce qui changerait sur ce `Tag` pour qu'il porte `b`.
@@ -851,11 +872,31 @@ fn changements(tag: &lofty::tag::Tag, b: &BalisesEdition) -> Vec<Changement> {
             apres,
         });
     }
+    // GENRE : seulement si la base en a un (#5314). Comparé par clés de
+    // genre, pour ne pas réécrire un fichier qui dit déjà la même chose
+    // autrement (casse, « ; » au lieu de valeurs séparées).
+    // Une valeur qui ne donne aucun genre une fois découpée (« / ») vaut
+    // « pas de genre » : on ne touche pas.
+    let voulus = cles_de_genres(&b.genres);
+    if !voulus.is_empty() {
+        let bruts: Vec<String> = tag
+            .get_strings(ItemKey::Genre)
+            .filter_map(|s| texte(Some(s)))
+            .collect();
+        if cles_de_genres(&bruts) != voulus {
+            v.push(Changement {
+                champ: "GENRE",
+                avant: (!bruts.is_empty()).then(|| bruts.join("; ")),
+                apres: Some(b.genres.join("; ")),
+            });
+        }
+    }
     v
 }
 
 /// Pose `changements` sur le `Tag`. Rend combien de champs ont été posés.
-fn poser(tag: &mut lofty::tag::Tag, changements: &[Changement]) -> usize {
+/// GENRE prend ses valeurs dans `b.genres`, une par élément du `Tag`.
+fn poser(tag: &mut lofty::tag::Tag, changements: &[Changement], b: &BalisesEdition) -> usize {
     for c in changements {
         let nombre = || c.apres.as_deref().and_then(|s| s.parse::<u32>().ok());
         match (c.champ, c.apres.as_deref()) {
@@ -893,6 +934,15 @@ fn poser(tag: &mut lofty::tag::Tag, changements: &[Changement]) -> usize {
                 tag.insert_text(ItemKey::FlagCompilation, s.to_string());
             }
             ("COMPILATION", None) => tag.remove_key(ItemKey::FlagCompilation),
+            ("GENRE", Some(_)) => {
+                tag.remove_key(ItemKey::Genre);
+                for g in &b.genres {
+                    tag.push(lofty::tag::TagItem::new(
+                        ItemKey::Genre,
+                        lofty::tag::ItemValue::Text(g.clone()),
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -945,6 +995,13 @@ impl BalisesEdition {
                 *v = (!propre.is_empty()).then_some(propre);
             }
         }
+        b.genres = b
+            .genres
+            .iter()
+            .map(|g| super::sanitize_untrusted_single_line_text(g, "genre").0)
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect();
         b
     }
 }
@@ -985,7 +1042,7 @@ pub fn ecrire_balises_edition(
         |tag| {
             // Recalculé sur le `Tag` que l'écrivain édite vraiment.
             ecrits = changements(tag, &b);
-            poser(tag, &ecrits)
+            poser(tag, &ecrits, &b)
         },
         // La copie RELUE doit porter chaque valeur : un conteneur qui en
         // refuse une (un WAV qui n'a que des balises RIFF INFO, sans
