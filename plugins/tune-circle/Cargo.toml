@@ -23,6 +23,8 @@ tracing = { workspace = true }
 # Nommé dans les signatures du relais (`Method`, `Url`). `tune-core` ne le
 # réexporte pas, comme pour `tune-bandcamp` et `tune-karaoke`.
 reqwest = { workspace = true }
+# `GET /library-sync` rend `last_sync` sous une seule forme (T2, #5325).
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
