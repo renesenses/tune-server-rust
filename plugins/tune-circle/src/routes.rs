@@ -143,12 +143,12 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .merge(etat_de_la_copie)
 }
 
-fn refus(statut: StatusCode, corps: Value) -> Response {
+pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
     (statut, Json(corps)).into_response()
 }
 
 /// La forme HTTP d'une [`Issue`].
-fn en_reponse(issue: Issue) -> Response {
+pub(crate) fn en_reponse(issue: Issue) -> Response {
     match issue {
         Issue::NonConnecte => refus(
             StatusCode::PRECONDITION_FAILED,
@@ -193,11 +193,11 @@ fn en_reponse(issue: Issue) -> Response {
 }
 
 /// Un identifiant de chemin qui désigne bien UNE ressource.
-fn identifiant_valide(id: &str) -> bool {
+pub(crate) fn identifiant_valide(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && id.len() <= 200
 }
 
-fn introuvable() -> Response {
+pub(crate) fn introuvable() -> Response {
     refus(StatusCode::NOT_FOUND, json!({ "code": CODE_INTROUVABLE }))
 }
 
@@ -407,12 +407,12 @@ async fn deranger(
 
 // T2 : le catalogue d'un contact, en lecture (#5325) -------------------------
 
-fn reussie(issue: &Issue) -> bool {
+pub(crate) fn reussie(issue: &Issue) -> bool {
     matches!(issue, Issue::Reponse { statut, .. } if (200..300).contains(statut))
 }
 
 /// Le `server_id` de CE serveur, `None` s'il n'en a pas.
-fn server_id_du_serveur(relais: &Relais) -> Option<String> {
+pub(crate) fn server_id_du_serveur(relais: &Relais) -> Option<String> {
     relais
         .reglages()
         .get("server_id")

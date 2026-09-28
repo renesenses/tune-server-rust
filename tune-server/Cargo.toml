@@ -1264,3 +1264,17 @@ path = "tests/rapport_sans_donnees_personnelles_5124.rs"
 [[test]]
 name = "temperature_cpu_5189"
 path = "tests/temperature_cpu_5189.rs"
+
+# Tune Circle (décision du 28/09/2026, #5326) : la déconnexion SSO efface le
+# jeton de liaison du serveur au compte. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "sso_deconnexion_efface_la_liaison_5326"
+path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
+
+# #2138 — la connexion SSO applique le palier ET les modules du compte. Le
+# fichier existait sans cible : `autotests = false` ne l'avait jamais compilé
+# (relevé pendant #5326, qui touche la déconnexion SSO).
+[[test]]
+name = "sso_modules_du_compte"
+path = "tests/sso_modules_du_compte.rs"
