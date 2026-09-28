@@ -1401,6 +1401,26 @@ pub fn list_audio_files_avec_progression(
                         continue;
                     }
                     let path = entry.path();
+                    // #5285 — une feuille CUE n'est pas un fichier audio : ni
+                    // « lu », ni « non pris en charge ». Le parcours retient
+                    // son DOSSIER, relu après coup par l'étape CUE (#1763) —
+                    // voir `dossiers_avec_feuille_cue`. C'est cette étape, et
+                    // elle seule, qui dit ce que la feuille a donné : un album
+                    // découpé (elle n'apparaît alors dans aucune liste
+                    // d'écartés), ou un écart motivé (`cue_sheets_skipped_paths`,
+                    // « feuille CUE sans son fichier audio » pour une
+                    // orpheline). Belkadi (fil 2003) lisait 798 feuilles dans
+                    // « Format non pris en charge » pendant que l'étape CUE en
+                    // découpait 427 albums.
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+                    {
+                        if let Some(parent) = path.parent() {
+                            dossiers_cue.insert(parent.to_path_buf());
+                        }
+                        continue;
+                    }
                     // Classer AVANT d'ajouter le chemin : WMA, DST autonome et
                     // les autres formats audio connus mais non lus restent
                     // visibles dans le rapport, sans devenir des pistes
@@ -1419,15 +1439,6 @@ pub fn list_audio_files_avec_progression(
                                 &mut skipped_paths,
                                 format!("{} ({})", path.display(), unsupported.reason),
                             );
-                            // Une feuille CUE n'est pas un fichier ignoré comme
-                            // un autre : c'est la description d'un album. Le
-                            // dossier est retenu ici et relu après le parcours
-                            // (#1763) — voir `dossiers_avec_feuille_cue`.
-                            if unsupported.report_key == "cue"
-                                && let Some(parent) = path.parent()
-                            {
-                                dossiers_cue.insert(parent.to_path_buf());
-                            }
                             skipped_reasons
                                 .entry(unsupported.report_key)
                                 .or_insert_with(|| unsupported.reason.to_string());
@@ -2547,14 +2558,17 @@ mod tests {
     fn unread_list_targets_audio_only() {
         // Les formats réclamés sur le forum (Rhorn, #1763).
         assert!(KNOWN_UNREAD_AUDIO.contains(&"mpc"));
-        assert!(KNOWN_UNREAD_AUDIO.contains(&"cue"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"wma"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"asf"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"dst"));
         // Le bruit d'une bibliothèque musicale ne doit JAMAIS y figurer :
         // compter les pochettes et les fichiers de log noierait le seul
         // renseignement exploitable.
-        for noise in ["jpg", "png", "nfo", "m3u", "log", "txt", "accurip", "pdf"] {
+        // #5285 — une feuille CUE non plus : elle décrit un album, l'étape
+        // CUE la lit ; la compter « non prise en charge » est un faux rapport.
+        for noise in [
+            "jpg", "png", "nfo", "m3u", "log", "txt", "accurip", "pdf", "cue",
+        ] {
             assert!(
                 !KNOWN_UNREAD_AUDIO.contains(&noise),
                 "{noise} n'est pas de l'audio et polluerait le rapport"
@@ -2855,9 +2869,14 @@ mod tests {
             "c'est le dossier de la feuille qui est retenu, pas la feuille : {:?}",
             result.dossiers_avec_feuille_cue
         );
-        // Témoin anti-régression : le `.cue` reste compté comme non lu — cette
-        // brique AJOUTE une information, elle n'en retire aucune.
-        assert_eq!(result.skipped_by_ext.get("cue"), Some(&2));
+        // #5285 — le `.cue` n'est PLUS compté comme non lu : ce que la feuille
+        // a donné, c'est l'étape CUE qui le dit, pas ce compteur.
+        assert_eq!(result.skipped_by_ext.get("cue"), None);
+        assert!(
+            !result.skipped_paths.iter().any(|p| p.contains(".cue")),
+            "une feuille CUE listée comme non prise en charge : {:?}",
+            result.skipped_paths
+        );
         // Témoin anti-régression : les formats déjà reconnus le restent, et le
         // `.wma` déjà écarté l'est toujours.
         let noms: Vec<String> = result
@@ -2875,6 +2894,115 @@ mod tests {
         );
         assert_eq!(noms.len(), 2, "obtenu : {noms:?}");
         assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+    }
+
+    /// #5285 — Belkadi Yacine, fil 2003 : « Pourquoi autant de fichiers non
+    /// pris en charge ???? ». 798 des 799 lignes de « Format non pris en
+    /// charge » étaient des feuilles `.cue`, pendant que l'étape CUE du MÊME
+    /// scan en découpait 427 albums.
+    ///
+    /// Le contrat, parcours puis étape CUE, sur de vrais fichiers :
+    /// - une feuille DÉCOUPÉE n'apparaît dans aucune liste d'écartés ;
+    /// - une feuille ORPHELINE (son FILE n'existe pas) va dans la rubrique des
+    ///   feuilles CUE, motif « sans son fichier audio » — jamais dans « non
+    ///   pris en charge » ;
+    /// - le témoin `.wma` reste, lui, non pris en charge.
+    #[test]
+    fn une_feuille_cue_n_est_jamais_un_format_non_pris_en_charge_5285() {
+        fn ecrire_wav(chemin: &std::path::Path) {
+            const TAUX: u32 = 44_100;
+            let echantillons = TAUX / 5;
+            let octets = echantillons * 4;
+            let mut f = Vec::new();
+            f.extend_from_slice(b"RIFF");
+            f.extend_from_slice(&(36 + octets).to_le_bytes());
+            f.extend_from_slice(b"WAVEfmt ");
+            f.extend_from_slice(&16u32.to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&2u16.to_le_bytes());
+            f.extend_from_slice(&TAUX.to_le_bytes());
+            f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+            f.extend_from_slice(&4u16.to_le_bytes());
+            f.extend_from_slice(&16u16.to_le_bytes());
+            f.extend_from_slice(b"data");
+            f.extend_from_slice(&octets.to_le_bytes());
+            for n in 0..echantillons {
+                let v = ((n as f32 / 40.0).sin() * 8000.0) as i16;
+                f.extend_from_slice(&v.to_le_bytes());
+                f.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(chemin, f).unwrap();
+        }
+        const FEUILLE: &str = "PERFORMER \"Bob Dylan\"\nTITLE \"Blonde On Blonde\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Rainy Day Women\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Pledging My Time\"\n    INDEX 01 00:00:10\n";
+
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_cue_non_pris_en_charge_5285");
+        let _ = std::fs::remove_dir_all(&base);
+        let lue = base.join("Bob Dylan - Blonde On Blonde");
+        let orpheline = base.join("Tortoise - Beacons of Ancestorship");
+        let temoin = base.join("Divers");
+        for d in [&lue, &orpheline, &temoin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        ecrire_wav(&lue.join("image.wav"));
+        std::fs::write(lue.join("Blonde On Blonde.cue"), FEUILLE).unwrap();
+        // Même feuille, sans son image : orpheline.
+        std::fs::write(orpheline.join("Beacons of Ancestorship.cue"), FEUILLE).unwrap();
+        std::fs::write(temoin.join("album.wma"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let inventaire = crate::scanner::cue_album::inventorier(&result.dossiers_avec_feuille_cue);
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Aucune feuille CUE dans « non pris en charge », ni au compteur ni
+        // dans la liste nominative.
+        assert_eq!(
+            result.skipped_by_ext.get("cue"),
+            None,
+            "feuilles CUE comptées « non prises en charge » : {:?}",
+            result.skipped_by_ext
+        );
+        let cue_non_pris: Vec<&String> = result
+            .skipped_paths
+            .iter()
+            .filter(|p| p.contains(".cue"))
+            .collect();
+        assert!(
+            cue_non_pris.is_empty(),
+            "feuilles CUE listées « format non pris en charge » : {cue_non_pris:?}"
+        );
+        // Le témoin : un vrai format non lu y reste.
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+        assert!(result.skipped_paths.iter().any(|p| p.contains("album.wma")));
+
+        // Les deux dossiers sont bien remis à l'étape CUE.
+        assert_eq!(result.dossiers_avec_feuille_cue.len(), 2);
+        // La feuille lue donne son album, et n'est écartée nulle part.
+        assert_eq!(inventaire.albums, 1, "{inventaire:?}");
+        assert_eq!(inventaire.pistes, 2, "{inventaire:?}");
+        assert!(
+            !inventaire
+                .chemins_ecartes
+                .iter()
+                .any(|p| p.contains("Blonde On Blonde.cue")),
+            "une feuille découpée listée comme écartée : {:?}",
+            inventaire.chemins_ecartes
+        );
+        // L'orpheline va dans SA rubrique, avec son motif.
+        assert_eq!(inventaire.feuilles_ecartees, 1, "{inventaire:?}");
+        assert_eq!(
+            inventaire.ecarts_par_cle.get("cue-image-introuvable"),
+            Some(&1)
+        );
+        assert!(
+            inventaire
+                .chemins_ecartes
+                .iter()
+                .any(|p| p.contains("Beacons of Ancestorship.cue")
+                    && p.contains("feuille CUE sans son fichier audio")),
+            "orpheline absente de la rubrique des feuilles CUE : {:?}",
+            inventaire.chemins_ecartes
+        );
     }
 
     /// Une bibliothèque sans la moindre feuille ne paie rien (#1763).
