@@ -248,6 +248,45 @@ for v in 160 161; do
   verifier "la v0.9.$v est accusee malgre le fil du moissonneur" "1" "$N"
 done
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. L'API du forum refuse `type=release` depuis le 27/09/2026 : un fil de notes
+#    naît `discussion`. Porte-t-il le titre de la procédure, il annonce ; un
+#    fil de bug ou de discussion qui cite seulement la version, non.
+# ─────────────────────────────────────────────────────────────────────────────
+ajouter_fil() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+chemin, titre, genre = sys.argv[1:4]
+with open(chemin, encoding="utf-8") as f:
+    d = json.load(f)
+d["threads"].insert(0, {"title": titre, "type": genre,
+                        "created_at": "2026-09-20T16:00:00+00:00", "is_pinned": False})
+with open(chemin, "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+}
+RELEASES_160='[
+ {"tagName":"v0.9.160","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:40:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]'
+
+echo
+echo "5. un fil discussion « Tune v0.9.160 — Notes de version » — il annonce"
+printf '%s' "$RELEASES_160" | poser_decor discussion
+ajouter_fil "$RACINE/discussion/fils.json" "Tune v0.9.160 — Notes de version" discussion
+jouer discussion
+verifier "etat de sortie 0 (la v0.9.160 a son fil)" "0" "$ETAT"
+
+echo
+echo "6. un fil de bug et une discussion qui citent la v0.9.160 — ils n'annoncent rien"
+printf '%s' "$RELEASES_160" | poser_decor bavard
+ajouter_fil "$RACINE/bavard/fils.json" "v0.9.160 : plus de son sur le DAC" bug
+ajouter_fil "$RACINE/bavard/fils.json" "Tune v0.9.160 — vos impressions" discussion
+jouer bavard
+verifier "etat de sortie 1 (aucun fil de notes)" "1" "$ETAT"
+N=$(printf '%s' "$SORTIE" | grep -c '^| `v0\.9\.160` |')
+verifier "la v0.9.160 est accusee malgre les fils qui la citent" "1" "$N"
+
 echo
 if [ "$rate" -eq 0 ]; then
   echo "Contre-epreuve #4461 : tout est vert."
