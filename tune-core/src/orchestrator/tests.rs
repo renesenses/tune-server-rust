@@ -8824,6 +8824,67 @@ async fn la_portee_du_crossfeed_distingue_rien_ne_joue_de_la_piste_suivante_4680
     assert_eq!(portee, PorteeDuReglage::RienNeJoue);
     assert_eq!(portee.code(), "not_playing", "et surtout pas `next_track`");
 }
+
+/// #4680, moitié PURE — la bascule PURE sur une zone DLNA dont le flux porte
+/// un égaliseur relance le flux à la position courante : elle s'entend dans
+/// l'instant. La route répondait seulement `applied_live: false`, que la barre
+/// de transport traduisait « prendra effet à la piste suivante ».
+#[tokio::test]
+async fn la_portee_de_la_bascule_pure_distingue_la_relance_de_la_piste_suivante_4680() {
+    use crate::orchestrator::PorteeDuReglage;
+
+    // Zone réseau observée, égaliseur gravé dans le flux : relance programmée.
+    let (orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4680-pure")).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    regler_pure(&orch, zone_id, true);
+    let portee = orch.apply_audiophile_change_portee(zone_id).await;
+    assert_eq!(
+        portee,
+        PorteeDuReglage::Relance,
+        "le flux est relancé à la position courante : c'est `restart`, pas `next_track`"
+    );
+    assert_eq!(portee.code(), "restart");
+    assert!(
+        orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+        "la relance annoncée doit être réellement armée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    // Zone navigateur sans périphérique : position inconnue, la relance est
+    // refusée (#2595) — seule la piste suivante portera la bascule.
+    let (orch2, zone2, _dir2) = zone_qui_joue_un_flac(Some("browser"), None).await;
+    let orch2 = Arc::new(orch2);
+    armer_un_egaliseur_audible(&orch2, zone2);
+    regler_pure(&orch2, zone2, true);
+    assert_eq!(
+        orch2.apply_audiophile_change_portee(zone2).await,
+        PorteeDuReglage::PisteSuivante
+    );
+
+    // Zone réseau sans traitement : le flux est déjà conforme (#4004).
+    let (orch3, zone3, _dir3) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4680-pure-nu")).await;
+    let orch3 = Arc::new(orch3);
+    regler_pure(&orch3, zone3, true);
+    assert_eq!(
+        orch3.apply_audiophile_change_portee(zone3).await,
+        PorteeDuReglage::Immediate
+    );
+    // Le booléen historique reste vrai dans ce cas, et faux dans les autres.
+    assert!(orch3.apply_audiophile_change(zone3).await);
+
+    // Rien ne joue : rien à annoncer, surtout pas « piste suivante ».
+    let muette = ZoneRepo::with_backend(orch3.db.clone())
+        .create("Muette", Some("dlna"), Some("dlna:uuid-4680-pure-muette"))
+        .unwrap();
+    regler_pure(&orch3, muette, true);
+    let portee = orch3.apply_audiophile_change_portee(muette).await;
+    assert_eq!(portee, PorteeDuReglage::RienNeJoue);
+    assert_eq!(portee.code(), "not_playing");
+}
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision

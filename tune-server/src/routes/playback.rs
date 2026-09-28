@@ -5642,17 +5642,30 @@ async fn set_audiophile(
     // ReplayGain continuaient de travailler pendant que le badge PURE
     // s'allumait (#1986). Même famille que #1725 (EQ) et #1786 (crossfeed) —
     // et le garde-fou de `routes/mod.rs` couvre désormais cette clé aussi.
-    let applique_a_chaud = if body.enabled.is_some() {
-        state.orchestrator.apply_audiophile_change(zone_id).await
+    //
+    // #4680 — la PORTÉE, et pas seulement le booléen : sur une zone réseau dont
+    // le flux porte un traitement que PURE gouverne, la bascule relance le
+    // flux à la position courante (`restart`) — elle s'entend dans l'instant.
+    // `applied_live: false` seul faisait annoncer « prendra effet à la piste
+    // suivante ». `null` quand la requête ne bascule pas PURE.
+    let portee = if body.enabled.is_some() {
+        Some(
+            state
+                .orchestrator
+                .apply_audiophile_change_portee(zone_id)
+                .await,
+        )
     } else {
-        false
+        None
     };
+    let applique_a_chaud = portee == Some(tune_core::orchestrator::PorteeDuReglage::Immediate);
     info!(
         zone_id,
         enabled = target_enabled,
         lock_volume = ?target_override,
         effective_lock_volume = target_lock,
         applique_a_chaud,
+        portee = portee.map(|p| p.code()),
         "audiophile_mode_set"
     );
 
@@ -5664,6 +5677,9 @@ async fn set_audiophile(
         "lock_volume": target_override,
         "effective_lock_volume": target_lock,
         "applied_live": applique_a_chaud,
+        // #4680 — `immediate` | `restart` | `next_track` | `not_playing`,
+        // même contrat que `portee` de la route d'égaliseur.
+        "portee": portee.map(|p| p.code()),
     }))
     .into_response()
 }
