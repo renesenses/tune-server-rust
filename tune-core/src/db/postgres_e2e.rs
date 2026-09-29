@@ -197,6 +197,26 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
     crate::db::coffrets_auto::tests::scenario_complet(&db);
 }
 
+/// #5317 — un coffret né de deux feuilles CUE (pistes sans `file_path`) :
+/// LE MÊME scénario que `cue_deux_disques_sur_sqlite`, écrivain CUE du scan
+/// compris, sur le VRAI moteur. `COALESCE(NULLIF(…), NULLIF(…))` dans
+/// `MIN`/`MAX`/`WHERE` y passe.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_coffrets_auto_cue_deux_disques() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_cue_deux_disques(&db);
+}
+
+/// #5357 — le marqueur EN TÊTE (« CD1 - Messiah »), et la collection à ne
+/// pas réunir : LE MÊME scénario que `marqueur_de_tete_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_coffrets_auto_marqueur_de_tete() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_marqueur_de_tete(&db);
+}
+
 /// Édition d'album — mode « Modifier » de la fiche (GO du 25/09/2026) : LES
 /// MÊMES scénarios que SQLite (`edition_album_tests.rs`), sur le VRAI moteur.
 /// La transaction unique de `appliquer`, le JSON dans `album_metadata`, les

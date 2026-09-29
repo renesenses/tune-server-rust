@@ -50,6 +50,7 @@ use super::album_repo::AlbumRepo;
 use super::backend::{DbBackend, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::settings_repo::SettingsRepo;
+use super::track_repo::sql::chemin_ouvrable;
 use crate::TuneError;
 use crate::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
 
@@ -136,7 +137,7 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 
 /// Un album, le PREMIER et le DERNIER chemin de ses pistes.
 ///
-/// 🔴 `MIN(file_path)` : les disques d'un coffret n'ont qu'un dossier chacun,
+/// 🔴 `MIN(chemin)` : les disques d'un coffret n'ont qu'un dossier chacun,
 /// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
 /// l'autre. `MAX` ne sert qu'à savoir si l'album tient dans un seul dossier.
 ///
@@ -146,14 +147,24 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 /// l'écran des coffrets éclatés, le geste de regroupement et la passe
 /// automatique ([`passe`]), qui RÉUNIT des albums. Voir
 /// [`tune_core::db::track_repo::sql::est_local`] pour le choix de la forme.
+///
+/// 🔴 Le chemin est [`chemin_ouvrable`] — le fichier, ou pour une tranche
+/// découpée par une feuille CUE, l'IMAGE qui la porte (#5317). `t.file_path`
+/// seul NE SUFFIT PAS : une piste CUE a `file_path = NULL` par construction
+/// (`scanner/cue_bibliotheque.rs`, « une piste CUE n'a pas de file_path »).
+/// Filtrer sur lui écartait de la passe TOUT album né d'une feuille : le
+/// *Messiah* de Gardiner en APE+CUE, deux disques sous `…/CD1` et `…/CD2`,
+/// n'était jamais examiné. L'image vit dans le dossier du disque : son
+/// dossier est celui du disque, comme pour un fichier.
 fn sql_albums_et_dossiers() -> String {
     format!(
-        "SELECT t.album_id, al.title, MIN(t.file_path), MAX(t.file_path), al.artist_id, ar.name \
+        "SELECT t.album_id, al.title, MIN({c}), MAX({c}), al.artist_id, ar.name \
          FROM tracks t JOIN albums al ON al.id = t.album_id \
          LEFT JOIN artists ar ON ar.id = al.artist_id \
-         WHERE {piste_locale} AND t.file_path IS NOT NULL AND t.file_path <> '' \
+         WHERE {piste_locale} AND {c} IS NOT NULL \
          GROUP BY t.album_id, al.title, al.artist_id, ar.name",
         piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        c = chemin_ouvrable!(),
     )
 }
 
@@ -471,7 +482,13 @@ pub fn defaire(db: &Arc<dyn DbBackend>, cible: i64) -> Result<Vec<i64>, RefusDef
     let (p1, _) = placeholders(db);
     let pistes: Vec<(i64, String)> = db
         .query_many(
-            &format!("SELECT id, file_path FROM tracks WHERE album_id = {p1}"),
+            // Le même chemin que l'inventaire : une piste CUE n'a pas de
+            // `file_path`, et la filtrer ici laisserait son disque DANS le
+            // coffret tout en retenant le refus (#5317).
+            &format!(
+                "SELECT t.id, {} FROM tracks t WHERE t.album_id = {p1}",
+                chemin_ouvrable!()
+            ),
             &[&cible as &dyn ToSqlValue],
         )?
         .into_iter()
@@ -548,15 +565,18 @@ pub struct CoffretListe {
 /// deux côtés — la piste ET l'album. Le chemin de fichier ne tenait pas ce
 /// rôle : une source distante peut en porter un.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
+    // Le chemin de [`chemin_ouvrable`] : un coffret réuni depuis des feuilles
+    // CUE n'a aucune piste à `file_path` (#5317).
     let sql = format!(
-        "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN(t.file_path), MAX(t.file_path) \
+        "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN({c}), MAX({c}) \
          FROM tracks t JOIN albums a ON a.id = t.album_id \
          WHERE {piste_locale} AND {album_local} \
-           AND t.file_path IS NOT NULL AND t.file_path <> '' AND {caches} \
+           AND {c} IS NOT NULL AND {caches} \
          GROUP BY t.album_id",
         piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
         album_local = crate::db::track_repo::sql::est_local("a"),
-        caches = super::facet_filter::hidden_albums_excluded()
+        caches = super::facet_filter::hidden_albums_excluded(),
+        c = chemin_ouvrable!()
     );
     let marques = marqueurs(db)?;
     let mut rendu = Vec::new();
