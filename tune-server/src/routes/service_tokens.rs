@@ -251,6 +251,16 @@ pub async fn save(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
+
+    // #5427 — l'ARL Deezer n'est pas un jeton de métadonnées : il authentifie
+    // le SERVICE DE STREAMING. Le bras générique ci-dessous le rangeait dans
+    // `settings.deezer_arl` et dans `streaming_auth`, deux endroits que
+    // `DeezerService` ne lit jamais, et répondait « Pas de validation
+    // disponible. » : l'ARL n'atteignait pas Deezer (fil 2035).
+    if id == "deezer" {
+        return Json(enregistrer_arl_deezer(&state, &lang, &body).await);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Also write fields to settings table for backward compat (lastfm_auth_token etc.)
@@ -304,6 +314,70 @@ pub async fn save(
                 "valid": false,
                 "validation_message": crate::i18n::t(&lang, "svctok.err.generic").replace("{error}", &e.to_string()),
             }))
+        }
+    }
+}
+
+/// #5427 — l'ARL saisi dans « Accès et jetons » est remis au service de
+/// streaming Deezer, qui l'éprouve auprès de la passerelle. Réussi, la
+/// session est persistée (`auth_tokens_deezer`, la ligne que le démarrage
+/// restaure) exactement comme par `POST /streaming/deezer/auth`.
+///
+/// ⛔ La valeur de l'ARL n'est jamais journalisée ni renvoyée.
+async fn enregistrer_arl_deezer(
+    state: &AppState,
+    lang: &str,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    let tr = |k: &str| crate::i18n::t(lang, k);
+    let arl = body
+        .get("arl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if arl.is_empty() {
+        return json!({"valid": false, "validation_message": "Aucune valeur fournie"});
+    }
+
+    let svc = state.services.lock().await.get("deezer");
+    let Some(svc) = svc else {
+        return json!({
+            "valid": false,
+            "validation_message": tr("svctok.err.generic")
+                .replace("{error}", "service Deezer absent de ce serveur"),
+        });
+    };
+
+    let resultat = svc.write().await.authenticate(&json!({ "arl": arl })).await;
+    // Même geste que la route de streaming : ce que le service tient
+    // désormais (ARL éprouvé, ou gardé faute d'avoir pu joindre Deezer)
+    // survit au redémarrage.
+    state.save_tokens().await;
+
+    match resultat {
+        Ok(status) if status.authenticated => {
+            state.event_bus.emit(
+                "streaming.auth.success",
+                json!({ "service": "deezer", "username": &status.username }),
+            );
+            json!({
+                "valid": true,
+                "validation_message": tr("svctok.deezer.connected")
+                    .replace("{user}", status.username.as_deref().unwrap_or("?")),
+            })
+        }
+        Ok(_) => json!({
+            "valid": false,
+            "validation_message": tr("svctok.err.generic")
+                .replace("{error}", "Deezer n'a ouvert aucune session"),
+        }),
+        Err(e) => {
+            let raison = e.to_string();
+            tracing::warn!(error = %raison, "deezer_arl_saisi_refuse");
+            json!({
+                "valid": false,
+                "validation_message": tr("svctok.err.generic").replace("{error}", &raison),
+            })
         }
     }
 }
@@ -389,6 +463,27 @@ pub async fn test(
                 "valid": configured,
                 "validation_message": if configured { tr("svctok.err.tokenConfiguredNoValidation") } else { tr("svctok.err.geniusNotConfigured") },
             }))
+        }
+        // #5427 — l'ARL vit dans le service de streaming : « Tester » dit
+        // ce que ce service en a fait, au lieu de « validation non disponible ».
+        "deezer" => {
+            let svc = state.services.lock().await.get("deezer");
+            let status = match svc {
+                Some(svc) => Some(svc.read().await.auth_status().await),
+                None => None,
+            };
+            match status {
+                Some(s) if s.authenticated => Json(json!({
+                    "valid": true,
+                    "validation_message": tr("svctok.deezer.connected")
+                        .replace("{user}", s.username.as_deref().unwrap_or("?")),
+                })),
+                _ => Json(json!({
+                    "valid": false,
+                    "validation_message": tr("svctok.err.generic")
+                        .replace("{error}", "Deezer non connecté — enregistrez votre ARL"),
+                })),
+            }
         }
         _ => Json(json!({
             "valid": serde_json::Value::Null,
@@ -559,3 +654,7 @@ pub async fn lastfm_disconnect(State(state): State<AppState>) -> impl IntoRespon
     settings.set("lastfm_scrobble_enabled", "false").ok();
     Json(json!({ "ok": true }))
 }
+
+#[cfg(test)]
+#[path = "service_tokens_arl_deezer_i5427_tests.rs"]
+mod tests_arl_deezer_i5427;

@@ -386,6 +386,23 @@ impl DeezerService {
         Ok(true)
     }
 
+    /// #5427 — l'ARL éprouvé auprès de Deezer, et une erreur qui dit
+    /// laquelle des deux choses s'est produite : Deezer a REFUSÉ l'ARL (il
+    /// faut en recoller un), ou Deezer n'a pas pu être interrogé (l'ARL est
+    /// gardé, le rafraîchisseur réessaiera). La valeur de l'ARL n'entre
+    /// jamais dans le message.
+    async fn authentifier_par_arl(&mut self, arl: &str) -> Result<AuthStatus, TuneError> {
+        match self.authenticate_arl_checked(arl).await {
+            Ok(_) => Ok(self.auth_status().await),
+            Err(ArlAuthenticationError::Rejected(raison)) => {
+                Err(format!("deezer: ARL refusé par Deezer ({raison})").into())
+            }
+            Err(ArlAuthenticationError::Unavailable(raison)) => {
+                Err(format!("deezer: ARL non vérifié, Deezer injoignable ({raison})").into())
+            }
+        }
+    }
+
     pub async fn authenticate_arl(&mut self, arl: &str) -> Result<bool, String> {
         self.authenticate_arl_checked(arl)
             .await
@@ -679,9 +696,13 @@ impl StreamingService for DeezerService {
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
         // Path 1: ARL token (full streaming with decrypt proxy)
+        //
+        // #5427 — l'erreur dit laquelle des deux choses s'est produite :
+        // Deezer a REFUSÉ l'ARL (il faut en recoller un), ou Deezer n'a pas
+        // pu être interrogé (l'ARL est gardé, le rafraîchisseur réessaiera).
+        // La valeur de l'ARL n'entre jamais dans le message.
         if let Some(arl) = credentials["arl"].as_str() {
-            self.authenticate_arl(arl).await?;
-            return Ok(self.auth_status().await);
+            return self.authentifier_par_arl(arl.trim()).await;
         }
 
         // Path 2: pre-existing access token (testing / manual setup)
@@ -690,6 +711,30 @@ impl StreamingService for DeezerService {
             self.fetch_user_profile().await?;
             info!(username = ?self.username, "deezer_authenticated_token");
             return Ok(self.auth_status().await);
+        }
+
+        // #5427 — « Se connecter » sur la carte Streaming poste un corps vide
+        // (le serveur y lit `{"device_flow": true}`), et un sondage d'état
+        // poste `{"poll": true}`. Aucun des deux n'est un échange OAuth :
+        // Deezer n'a pas de flot par code d'appareil. On tombait pourtant
+        // dans le chemin 3, qui répondait « deezer: app_id required » — un
+        // message qui parle d'un identifiant que l'utilisateur n'a pas, au
+        // lieu de l'ARL qu'il doit fournir (fil 2035).
+        if credentials.get("app_id").is_none() && credentials.get("code").is_none() {
+            // Un sondage ne fait qu'observer : il rend l'état courant.
+            if credentials.get("poll").is_some()
+                && (self.arl.is_some() || self.access_token.is_some())
+            {
+                return Ok(self.auth_status().await);
+            }
+            // Un ARL est déjà connu (enregistré, restauré) : on le
+            // ré-éprouve, c'est ce que « Se connecter » veut dire.
+            if let Some(arl) = self.arl.clone() {
+                return self.authentifier_par_arl(&arl).await;
+            }
+            return Err("deezer: aucun ARL enregistré — collez votre ARL dans \
+                        Réglages ▸ Accès et jetons ▸ Deezer"
+                .into());
         }
 
         // Path 3: OAuth code exchange (server-side flow)
@@ -1934,5 +1979,87 @@ mod tests {
             "http://192.168.1.10:8888/deezer-proxy/deezer/92720184.flac"
         );
         assert_eq!(stream.mime_type, "audio/flac");
+    }
+
+    // ── #5427 : « Se connecter » sans ARL, et l'ARL déjà connu ─────────
+
+    /// Fil 2035 : « Se connecter » sur la carte Streaming poste un corps vide,
+    /// que la route lit `{"device_flow": true}`. On tombait dans l'échange
+    /// OAuth et l'écran affichait « deezer: app_id required ». L'erreur doit
+    /// dire ce qui manque vraiment : l'ARL, et où le coller.
+    #[tokio::test]
+    async fn se_connecter_sans_arl_nomme_l_arl_et_non_app_id() {
+        let mut svc = DeezerService::new();
+        let erreur = svc
+            .authenticate(&json!({ "device_flow": true }))
+            .await
+            .expect_err("aucun ARL connu : la connexion ne peut pas réussir")
+            .to_string();
+        assert!(
+            !erreur.contains("app_id"),
+            "« Se connecter » sans ARL ne doit plus répondre app_id (#5427) : {erreur}"
+        );
+        assert!(erreur.contains("ARL"), "{erreur}");
+    }
+
+    /// Un ARL déjà connu du service (enregistré, restauré) : « Se connecter »
+    /// le ré-éprouve auprès de la passerelle — ici un faux Deezer local.
+    #[tokio::test]
+    async fn se_connecter_reeprouve_l_arl_deja_connu() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string()],
+        ));
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        svc.arl = Some("a".repeat(192));
+
+        let status = svc
+            .authenticate(&json!({ "device_flow": true }))
+            .await
+            .expect("l'ARL connu doit être éprouvé, pas l'échange OAuth");
+        assert!(status.authenticated);
+        assert_eq!(status.username.as_deref(), Some("testeur"));
+        assert_eq!(svc.license_token.as_deref(), Some("LIC"));
+        let requetes = serveur.await.expect("faux serveur");
+        assert!(
+            requetes[0].contains("deezer.getUserData"),
+            "{}",
+            requetes[0]
+        );
+    }
+
+    /// Un ARL que la passerelle refuse (`USER_ID: 0`) : l'erreur le nomme, et
+    /// la valeur de l'ARL n'y apparaît jamais.
+    #[tokio::test]
+    async fn un_arl_refuse_est_nomme_sans_etre_recopie() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":0},"checkForm":"CF"}}"#.to_string()],
+        ));
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        let arl = "z".repeat(192);
+
+        let erreur = svc
+            .authenticate(&json!({ "arl": arl }))
+            .await
+            .expect_err("USER_ID 0 : ARL refusé")
+            .to_string();
+        serveur.await.expect("faux serveur");
+        assert!(erreur.contains("ARL refusé par Deezer"), "{erreur}");
+        assert!(
+            !erreur.contains(&arl),
+            "l'erreur ne doit pas recopier l'ARL"
+        );
+        assert!(!svc.auth_status().await.authenticated);
     }
 }

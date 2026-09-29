@@ -1427,6 +1427,18 @@
     "ro": "MusicBrainz disponibil (niciun token necesar).",
     "sv": "MusicBrainz tillgängligt (ingen token krävs)."
   },
+  "svctok.deezer.connected": {
+    "fr": "ARL accepté : connecté à Deezer ({user}).",
+    "en": "ARL accepted: connected to Deezer ({user}).",
+    "de": "ARL akzeptiert: mit Deezer verbunden ({user}).",
+    "es": "ARL aceptado: conectado a Deezer ({user}).",
+    "it": "ARL accettato: connesso a Deezer ({user}).",
+    "zh": "ARL 已接受：已连接到 Deezer（{user}）。",
+    "ja": "ARL が承認されました：Deezer に接続しました（{user}）。",
+    "ko": "ARL 승인됨: Deezer에 연결됨 ({user}).",
+    "ro": "ARL acceptat: conectat la Deezer ({user}).",
+    "sv": "ARL godkänd: ansluten till Deezer ({user})."
+  },
   "svctok.test.validationUnavailable": {
     "fr": "Validation non disponible pour ce service.",
     "en": "Validation not available for this service.",
