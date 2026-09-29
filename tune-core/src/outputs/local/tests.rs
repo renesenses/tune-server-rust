@@ -143,25 +143,23 @@ fn seul_le_fil_en_titre_declare_sa_chaine_epuisee() {
 }
 
 /// Une sortie exclusive dont le bras ne consomme jamais le `next_media` mis en
-/// réserve (ASIO, CoreAudio « hog ») ne devient pas enchaînable parce que sa
-/// boucle est vivante. Verrou anti-régression sur le correctif de DEvir (ASIO
+/// réserve (CoreAudio « hog ») ne devient pas enchaînable parce que sa boucle
+/// est vivante. Verrou anti-régression sur le correctif de DEvir (ASIO
 /// Fireface).
 ///
-/// #5204 : WASAPI exclusif, lui, enchaîne désormais à format égal — voir
-/// `gapless_exclusif_5204.rs`. La règle ne se lit donc plus sur
-/// `exclusive_mode` seul, mais sur le bras que `play_url` emprunte.
+/// #5204 : WASAPI exclusif, puis ASIO exclusif (route native), enchaînent
+/// désormais à format égal — voir `gapless_exclusif_5204.rs` et
+/// `gapless_asio_5204.rs`. La règle ne se lit donc plus sur `exclusive_mode`
+/// seul, mais sur le bras que `play_url` emprunte ; et la route traitée
+/// d'ASIO, qui n'enchaîne pas, lève `chain_exhausted` dès l'ouverture.
 #[test]
-fn une_sortie_exclusive_asio_ou_coreaudio_reste_non_enchainable() {
+fn une_sortie_exclusive_coreaudio_reste_non_enchainable() {
     use super::enchainement_exclusif::{bras_de_cette_plateforme, bras_de_lecture};
-    for bras in [
-        bras_de_lecture("windows", true, true, "asio"),
-        bras_de_lecture("macos", false, true, "auto"),
-    ] {
-        assert!(
-            !bras.sait_enchainer(),
-            "{bras:?} : boucle dédiée qui sort à l'EOF sans consommer next_media"
-        );
-    }
+    let bras = bras_de_lecture("macos", false, true, "auto");
+    assert!(
+        !bras.sait_enchainer(),
+        "{bras:?} : boucle dédiée qui sort à l'EOF sans consommer next_media"
+    );
     let sortie = LocalOutput::with_options("Fireface ASIO".to_string(), true, "asio");
     sortie.set_chain_exhausted_for_test(false);
     assert_eq!(
@@ -169,6 +167,10 @@ fn une_sortie_exclusive_asio_ou_coreaudio_reste_non_enchainable() {
         bras_de_cette_plateforme(true, "asio").sait_enchainer(),
         "remettre la sonde à zéro ne doit JAMAIS rendre enchaînable un bras qui ne l'est pas"
     );
+    // Une chaîne déclarée épuisée (route traitée d'ASIO, fin de chaîne) éteint
+    // la sonde, quel que soit le bras.
+    sortie.set_chain_exhausted_for_test(true);
+    assert!(!sortie.supports_internal_gapless());
 }
 
 // -----------------------------------------------------------------------

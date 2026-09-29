@@ -20,7 +20,9 @@
 use std::collections::VecDeque;
 use std::io::Cursor;
 
-use super::chaine_native::{FinDeChaine, HoteDeChaineNative, Suivante, jouer_la_chaine_native};
+use super::chaine_native::{
+    FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, Suivante, jouer_la_chaine_native,
+};
 use super::enchainement_exclusif::{
     BrasDeLecture, EnchainementNatif, RefusDEnchainement, bras_de_lecture,
     decider_l_enchainement_natif, lire_l_entete_enchainee,
@@ -86,9 +88,9 @@ fn le_bras_emprunte_decide_de_la_capacite_5204() {
     );
     assert!(CpalPartage.sait_enchainer());
     assert!(
-        !AsioExclusif.sait_enchainer(),
-        "le bras ASIO sort encore à l'EOF sans consommer la suivante : \
-         l'annoncer enchaînable figerait l'album (DEvir, Fireface)"
+        AsioExclusif.sait_enchainer(),
+        "#5204 (seconde tranche) : ASIO exclusif enchaîne à format égal sur \
+         sa route native — voir `gapless_asio_5204.rs`"
     );
     assert!(!CoreAudioExclusif.sait_enchainer());
 }
@@ -195,20 +197,12 @@ struct HoteFactice {
     enchainements: u32,
 }
 
-impl HoteDeChaineNative for HoteFactice {
+impl ReserveDeLaChaine for HoteFactice {
     type Lecteur = Cursor<Vec<u8>>;
-
-    fn arret_recu(&mut self) -> bool {
-        false
-    }
 
     fn silence_force(&self) -> bool {
         false
     }
-
-    fn publier_le_verdict(&mut self, _dop: bool, _bit_perfect: bool) {}
-
-    fn publier_la_position(&mut self, _position_ms: u64) {}
 
     fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
         let Some(octets) = self.reserve.pop_front() else {
@@ -224,6 +218,16 @@ impl HoteDeChaineNative for HoteFactice {
     fn piste_enchainee(&mut self) {
         self.enchainements += 1;
     }
+}
+
+impl HoteDeChaineNative for HoteFactice {
+    fn arret_recu(&mut self) -> bool {
+        false
+    }
+
+    fn publier_le_verdict(&mut self, _dop: bool, _bit_perfect: bool) {}
+
+    fn publier_la_position(&mut self, _position_ms: u64) {}
 }
 
 /// Ce que `play_url` fait avant le bras : lire l'en-tête de la première
