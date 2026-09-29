@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -436,6 +437,19 @@ pub trait TunePlugin: Send + Sync {
     }
 }
 
+/// Au-delà de cette durée, le chargement d'UN greffon est signalé par
+/// `plugin_setup_slow` (#5370).
+///
+/// Un `setup()` sain ne fait qu'enregistrer des sorties, des routes et des
+/// zones, et lire deux réglages : il se compte en millisecondes. Cinq secondes,
+/// c'est plus de mille fois ce budget — assez large pour qu'un greffon qui
+/// interroge un appareil du réseau local, sur un réseau lent ou une base
+/// occupée par le scan, ne crie pas au loup — et assez court pour que la page
+/// d'attente, qui se rafraîchit toutes les 3 s, ait déjà montré deux fois le
+/// même greffon : c'est le moment où le testeur commence à se demander si Tune
+/// est bloqué, et donc celui où le journal doit pouvoir lui répondre.
+pub const PLUGIN_SETUP_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
+
 pub struct PluginLoader {
     plugins: Arc<tokio::sync::Mutex<Vec<Box<dyn TunePlugin>>>>,
     data_root: PathBuf,
@@ -449,6 +463,8 @@ pub struct PluginLoader {
     /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
     /// disabled), kept so the plugin manager can still surface them.
     unloaded: StdMutex<Vec<AvailablePluginInfo>>,
+    /// Seuil de `plugin_setup_slow` ; [`PLUGIN_SETUP_SLOW_THRESHOLD`] sauf en test.
+    slow_setup_threshold: Duration,
 }
 
 impl PluginLoader {
@@ -462,7 +478,14 @@ impl PluginLoader {
             event_dispatch_handle: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
             unloaded: StdMutex::new(Vec::new()),
+            slow_setup_threshold: PLUGIN_SETUP_SLOW_THRESHOLD,
         }
+    }
+
+    /// Change le seuil de `plugin_setup_slow` (les tests ne dorment pas 5 s).
+    pub fn with_slow_setup_threshold(mut self, threshold: Duration) -> Self {
+        self.slow_setup_threshold = threshold;
+        self
     }
 
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
@@ -486,6 +509,23 @@ impl PluginLoader {
     }
 
     pub async fn setup_all(&self, api_base_url: &str) -> Vec<String> {
+        self.setup_all_observed(api_base_url, &|_| {}).await
+    }
+
+    /// [`setup_all`](Self::setup_all), en annonçant chaque greffon à
+    /// `on_plugin` AVANT de le charger.
+    ///
+    /// #5370 — la page d'attente du démarrage ne disait que « greffons », sans
+    /// dire lequel ; l'hôte s'en sert pour nommer le greffon en cours. Chaque
+    /// greffon laisse en outre une ligne de journal portant sa durée
+    /// (`duration_ms`), et un avertissement `plugin_setup_slow` au-delà de
+    /// [`PLUGIN_SETUP_SLOW_THRESHOLD`] : c'est ce qui manquait pour savoir
+    /// lequel avait pris le temps.
+    pub async fn setup_all_observed(
+        &self,
+        api_base_url: &str,
+        on_plugin: &(dyn Fn(&str) + Send + Sync),
+    ) -> Vec<String> {
         let mut loaded = Vec::new();
         let mut unloaded: Vec<AvailablePluginInfo> = Vec::new();
         std::fs::create_dir_all(&self.data_root).ok();
@@ -493,6 +533,25 @@ impl PluginLoader {
         let mut plugins = self.plugins.lock().await;
         for plugin in plugins.iter_mut() {
             let name = plugin.name().to_string();
+            on_plugin(&name);
+            // Mesuré DEPUIS la lecture des réglages : si la base est occupée
+            // (scan en cours sur une grande bibliothèque), c'est là que le
+            // temps passe, et il doit se voir dans la durée du greffon.
+            let started = Instant::now();
+            let slow_threshold = self.slow_setup_threshold;
+            let warn_if_slow = |outcome: &str| {
+                let elapsed = started.elapsed();
+                if elapsed > slow_threshold {
+                    warn!(
+                        plugin_name = %name,
+                        duration_ms = elapsed.as_millis() as u64,
+                        threshold_ms = slow_threshold.as_millis() as u64,
+                        outcome,
+                        "plugin_setup_slow"
+                    );
+                }
+                elapsed.as_millis() as u64
+            };
 
             // Enable / install gate. A compiled-in plugin can be turned off
             // without recompiling (`plugin_{name}_enabled=false`, review #907).
@@ -516,7 +575,8 @@ impl PluginLoader {
                 let opt_in = !plugin.default_enabled();
                 let dormant = enabled.as_deref() == Some("false") || (opt_in && !installed);
                 if dormant {
-                    info!(plugin_name = %name, opt_in, "plugin_dormant_not_loaded");
+                    let duration_ms = warn_if_slow("dormant");
+                    info!(plugin_name = %name, opt_in, duration_ms, "plugin_dormant_not_loaded");
                     // Hors catalogue : le greffon reste compilé, testé et
                     // chargeable à la main, mais le gestionnaire ne le propose
                     // pas. Proposer d'installer une chose qu'aucun écran ne
@@ -579,6 +639,7 @@ impl PluginLoader {
 
             match plugin.setup(&ctx).await {
                 Ok(()) => {
+                    let duration_ms = warn_if_slow("loaded");
                     let reg = ctx.take_registrations();
                     #[cfg(feature = "plugin-http")]
                     let router_count = reg.routers.len();
@@ -590,6 +651,7 @@ impl PluginLoader {
                         outputs = reg.outputs.len(),
                         routers = router_count,
                         zones = reg.zones.len(),
+                        duration_ms,
                         "plugin_loaded"
                     );
                     if let Ok(mut acc) = self.registrations.lock() {
@@ -601,7 +663,8 @@ impl PluginLoader {
                     // Deliberately not draining ctx here: a plugin that failed
                     // halfway may have registered an output backed by
                     // half-initialised state. Dropping it is the safe move.
-                    warn!(plugin_name = %name, error = %e, "plugin_setup_failed");
+                    let duration_ms = warn_if_slow("failed");
+                    warn!(plugin_name = %name, error = %e, duration_ms, "plugin_setup_failed");
                 }
             }
         }

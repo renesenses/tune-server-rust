@@ -246,7 +246,15 @@ pub async fn init(
         return Vec::new();
     }
 
-    let loaded = loader.setup_all(api_base_url).await;
+    // #5370 — la page d'attente du démarrage nomme le greffon en cours ; le
+    // chargeur, lui, journalise la durée de chacun (`plugin_loaded`,
+    // `plugin_setup_slow`).
+    let loaded = loader
+        .setup_all_observed(api_base_url, &|name| {
+            crate::boot_status::set_current(Some(name))
+        })
+        .await;
+    crate::boot_status::set_current(None);
 
     // Publish the dormant set first, and unconditionally: opt-in plugins
     // (DJ/Karaoke) are the whole reason `loaded` can be empty while there is
