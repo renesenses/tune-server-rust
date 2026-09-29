@@ -4960,9 +4960,11 @@ impl OutputTarget for LocalOutput {
                 #[cfg(target_os = "linux")]
                 let pcm_ouvert = opened_endpoint_id.clone();
 
-                // Prefer device's default rate and resample if needed.
-                // Same rationale as the WAV path: opening at the source
-                // rate in shared mode is unreliable on macOS/Windows.
+                // #5439 — la cadence se décide comme sur le chemin PCM
+                // (`BackendCpal::ouvrir`) : le défaut de cpal n'est pas la
+                // cadence du DAC (sur ALSA il vaut 44 100 Hz dès que la plage
+                // le contient), et le prendre tel quel convertissait un FLAC
+                // 48 kHz en 44,1 kHz sur un `hw:` qui sait ouvrir 48 kHz.
                 let output_config = {
                     let default_cfg = match device.default_output_config() {
                         Ok(c) => Some(c.config()),
@@ -4988,19 +4990,46 @@ impl OutputTarget for LocalOutput {
                         }
                     };
                     let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
-                    if default_sr == Some(dec_sr) {
-                        default_cfg.unwrap()
-                    } else if let Some(cfg) = default_cfg {
-                        info!(
-                            source_sr = dec_sr,
-                            device_sr = cfg.sample_rate,
-                            "local_audio_compressed_rate_mismatch_will_resample"
-                        );
-                        cfg
+                    // Comme le chemin PCM : l'énumération n'est interrogée que
+                    // si le périphérique n'est pas déjà à la bonne cadence.
+                    let enumeree = if default_sr == Some(dec_sr) {
+                        None
                     } else {
                         find_matching_config(&device, dec_ch, dec_sr)
-                            .unwrap_or_else(|| config_de_flux(dec_ch, dec_sr))
+                            .filter(|c| c.sample_rate == dec_sr)
+                    };
+                    let preuve = sample_rate_evidence_for_device(
+                        host.id().name(),
+                        &opened_endpoint_id,
+                        true,
+                    );
+                    let (cfg, decision) =
+                        cadence_du_flux_compresse::choisir_la_config_du_flux_compresse(
+                            dec_sr,
+                            default_cfg,
+                            enumeree,
+                            preuve,
+                            || {
+                                find_matching_config(&device, dec_ch, dec_sr)
+                                    .unwrap_or_else(|| config_de_flux(dec_ch, dec_sr))
+                            },
+                        );
+                    cadence_du_flux_compresse::journaliser_la_cadence_du_flux_compresse(
+                        decision,
+                        dec_sr,
+                        cfg.sample_rate,
+                        host.id().name(),
+                        &opened_endpoint_id,
+                        preuve,
+                    );
+                    #[cfg(target_os = "macos")]
+                    if decision == LocalRateOpening::AtSourceRateMeasured {
+                        cadence_du_flux_compresse::caler_la_cadence_nominale_coreaudio(
+                            &device_name,
+                            cfg.sample_rate,
+                        );
                     }
+                    cfg
                 };
                 // #3632 — même règle que le chemin PCM (`BackendCpal::ouvrir`) :
                 // un flux compressé multicanal (FLAC 5.1 servi tel quel par un
@@ -5260,20 +5289,15 @@ impl OutputTarget for LocalOutput {
                 );
                 samples.extend_from_slice(&queue);
 
-                // Adapt channels and resample if needed (using rubato
-                // sinc resampler for high-quality rate conversion)
-                if dec_ch != output_ch {
-                    samples = adapt_channels(&samples, dec_ch, output_ch);
-                }
-                //
-                // Piste entiere en memoire : `rubato_resample_track` retire le
-                // delai de groupe du sinc et rend exactement
-                // `round(trames × ratio)`. La variante en flux le conservait,
-                // et la duree/position calculees juste en dessous heritaient du
-                // surplus a CHAQUE piste (#2246).
-                if dec_sr != output_sr {
-                    samples = rubato_resample_track(&samples, dec_sr, output_sr, output_ch);
-                }
+                // Adapt channels and resample if needed (rubato sinc, piste
+                // entière : délai de groupe retiré, #2246). #5439 : la même
+                // fonction que joue le témoin, sans carte son.
+                let samples = cadence_du_flux_compresse::conformer_la_piste_decodee(
+                    samples,
+                    dec_sr,
+                    dec_ch,
+                    FormatOuvert::new(output_sr, output_ch),
+                );
 
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
@@ -6947,6 +6971,12 @@ fn drain_deadline_for(
 
 mod resolution;
 pub use resolution::*;
+
+// #5439 — la cadence d'ouverture du chemin compressé (serveur multimédia,
+// radio décodée), décidée comme celle du chemin PCM.
+mod cadence_du_flux_compresse;
+#[cfg(test)]
+mod flux_compresse_a_la_cadence_source_5439;
 
 /// Simple linear-interpolation resampler for rate conversion.
 /// Kept as a fallback — the main path now uses rubato sinc resampling.

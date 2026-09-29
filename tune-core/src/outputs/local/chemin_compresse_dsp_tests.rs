@@ -29,7 +29,11 @@ fn la_branche_compressee_applique_le_dsp_avant_le_reechantillonnage() {
         .expect("le chemin compresse n'applique AUCUN DSP (#1725)");
     // Le chemin compresse appelle `rubato_resample_track` depuis #2246 ;
     // le prefixe couvre les deux noms si la variante venait a changer.
-    let pos_resample = avant_tampon.find("rubato_resample_");
+    // #5439 : l'appel vit dans `conformer_la_piste_decodee`, que la branche
+    // appelle — c'est cet appel qui doit suivre le DSP.
+    let pos_resample = avant_tampon
+        .find("rubato_resample_")
+        .or_else(|| avant_tampon.find("conformer_la_piste_decodee("));
 
     if let Some(pos_resample) = pos_resample {
         assert!(
