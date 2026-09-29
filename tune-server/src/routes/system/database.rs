@@ -867,6 +867,88 @@ pub(super) async fn migrate_database(
     }
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct ReimportFirstSeenRequest {
+    /// Chemin de l'ancienne base SQLite. Par defaut, celle que le serveur
+    /// ouvrirait en SQLite (`TUNE_DB_PATH`, `db_path`).
+    sqlite_path: Option<String>,
+}
+
+/// POST /system/database/reimport-first-seen
+///
+/// Pour une base DEJA basculee vers PostgreSQL avant #5389 : relit le
+/// `file_first_seen` de l'ancienne base SQLite (en lecture seule) et ECRASE
+/// la date d'ajout PostgreSQL de chaque chemin present dans les deux bases.
+/// N'ajoute aucun chemin, ne touche a aucune autre table. Rend le compte :
+/// lignes lues, ecrasees, deja justes, absentes de PostgreSQL, illisibles.
+pub(super) async fn reimport_first_seen(
+    State(state): State<AppState>,
+    body: Option<Json<ReimportFirstSeenRequest>>,
+) -> impl IntoResponse {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let Some(pg_url) = state.config.database_url.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "error": "this server does not run on PostgreSQL — nothing to reimport into",
+            })),
+        )
+            .into_response();
+    };
+    let sqlite_path = body
+        .sqlite_path
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| state.config.db_path.clone());
+
+    #[cfg(feature = "postgres")]
+    {
+        match tune_core::db::pg_reimport_premieres_vues::reimporter_premieres_vues(
+            std::path::Path::new(&sqlite_path),
+            &pg_url,
+        )
+        .await
+        {
+            Ok(compte) => Json(json!({
+                "status": "complete",
+                "sqlite_path": sqlite_path,
+                "read": compte.lues,
+                "overwritten": compte.ecrasees,
+                "already_correct": compte.deja_justes,
+                "missing_in_postgres": compte.absentes_en_pg,
+                "unreadable": compte.illisibles,
+            }))
+            .into_response(),
+            Err(e) => {
+                let (msg, hint) = enrich_pg_error(&e, &pg_url);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "error",
+                        "error": msg,
+                        "hint": hint,
+                        "sqlite_path": sqlite_path,
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (pg_url, sqlite_path);
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "status": "error",
+                "error": "PostgreSQL support not compiled. Rebuild with --features postgres.",
+            })),
+        )
+            .into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests_import {
     use super::*;

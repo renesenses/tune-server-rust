@@ -1566,12 +1566,12 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
 /// Sautes sans `TUNE_TEST_PG_URL` ; l'etape « Bascule SQLite -> PostgreSQL,
 /// clefs de conflit » de `test-postgres.yml` les execute (#5134).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sqlx::{Connection, PgConnection, Row};
 
     /// Remplace le nom de base dans une URL `postgresql://…/nom[?…]`.
-    fn url_vers_base(url: &str, base: &str) -> String {
+    pub(crate) fn url_vers_base(url: &str, base: &str) -> String {
         let (avant, apres) = match url.split_once('?') {
             Some((a, q)) => (a, Some(q)),
             None => (url, None),
@@ -1585,7 +1585,7 @@ mod tests {
 
     /// Detruit puis recree une base jetable, avec `unaccent` comme la CI, et
     /// rend son URL. `nom` est une constante de ce module, jamais une entree.
-    async fn base_jetable(url: &str, nom: &str) -> String {
+    pub(crate) async fn base_jetable(url: &str, nom: &str) -> String {
         let mut maintenance = PgConnection::connect(url)
             .await
             .unwrap_or_else(|e| panic!("connexion a {url} : {e}"));
@@ -1609,7 +1609,7 @@ mod tests {
         cible
     }
 
-    async fn supprimer_base(url: &str, nom: &str) {
+    pub(crate) async fn supprimer_base(url: &str, nom: &str) {
         if let Ok(mut m) = PgConnection::connect(url).await {
             let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS {nom} WITH (FORCE)"

@@ -247,6 +247,12 @@ pub fn router() -> Router<AppState> {
             post(database::test_db_connection),
         )
         .route("/database/migrate", post(database::migrate_database))
+        // Base deja basculee : reprendre les dates d'ajout de l'ancienne base
+        // SQLite (#5389).
+        .route(
+            "/database/reimport-first-seen",
+            post(database::reimport_first_seen),
+        )
         // Remote/proxy mode routes
         .route(
             "/remote/config",

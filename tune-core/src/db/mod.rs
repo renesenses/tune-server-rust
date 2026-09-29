@@ -35,6 +35,8 @@ mod pg_ensure_schema_parity;
 mod pg_gardes_schema_5003;
 #[cfg(feature = "postgres")]
 pub mod pg_migrate;
+#[cfg(feature = "postgres")]
+pub mod pg_reimport_premieres_vues;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_schema_parity;
 #[cfg(all(test, feature = "postgres"))]
