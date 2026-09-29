@@ -202,12 +202,18 @@ pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanRe
 }
 
 pub fn scan_fingerprint_duplicates(db: &Arc<dyn DbBackend>) -> Vec<DuplicateGroup> {
+    // 🔴 `PISTE_LOCALE` : ce faisceau est l'un des quatre de
+    // `GET /library/duplicates`, et il n'avait aucune condition de source.
     let raw_rows = match db.query_many(
-        "SELECT t.id, t.title, ar.name, t.file_path, t.acoustid_fingerprint
-         FROM tracks t
-         LEFT JOIN artists ar ON t.artist_id = ar.id
-         WHERE t.acoustid_fingerprint IS NOT NULL AND t.acoustid_fingerprint != ''
-         ORDER BY t.acoustid_fingerprint, t.id",
+        &format!(
+            "SELECT t.id, t.title, ar.name, t.file_path, t.acoustid_fingerprint
+             FROM tracks t
+             LEFT JOIN artists ar ON t.artist_id = ar.id
+             WHERE {piste_locale}
+               AND t.acoustid_fingerprint IS NOT NULL AND t.acoustid_fingerprint != ''
+             ORDER BY t.acoustid_fingerprint, t.id",
+            piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        ),
         &[],
     ) {
         Ok(r) => r,
@@ -446,6 +452,70 @@ mod tests {
         assert_eq!(
             hash, None,
             "une tranche de CUE ne doit pas hériter du hachage de son image"
+        );
+    }
+}
+
+/// Témoin de la règle « bibliothèque LOCALE » sur le faisceau
+/// `empreinte_identique` de `GET /library/duplicates` — Bertrand, 27/09/2026.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use std::sync::Arc;
+
+    use super::scan_fingerprint_duplicates;
+    use crate::db::backend::{DbBackend, ToSqlValue};
+
+    fn banc() -> Arc<dyn DbBackend> {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+        // Deux copies locales et deux copies distantes, MÊME empreinte de
+        // fichier, toutes avec un chemin : le cas absent de la base du .18.
+        for (id, chemin, source) in [
+            (1i64, "/m/a.flac", "local"),
+            (2, "/m/b.flac", "local"),
+            (3, "/u/a.flac", "upnp"),
+            (4, "/u/b.flac", "upnp"),
+        ] {
+            let c = chemin.to_string();
+            let s = source.to_string();
+            db.execute(
+                "INSERT INTO tracks (id, title, file_path, source, acoustid_fingerprint) \
+                 VALUES (?1, 'So What', ?2, ?3, 'FP-1')",
+                &[&id as &dyn ToSqlValue, &c, &s],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn ids(db: &Arc<dyn DbBackend>) -> Vec<i64> {
+        scan_fingerprint_duplicates(db)
+            .iter()
+            .flat_map(|g| g.tracks.iter().map(|t| t.id))
+            .collect()
+    }
+
+    #[test]
+    fn l_empreinte_de_fichier_ecarte_le_non_local_qui_porte_un_chemin() {
+        let vus = ids(&banc());
+        for distant in [3i64, 4] {
+            assert!(
+                !vus.contains(&distant),
+                "la piste {distant} est `source = upnp` : elle ne doit PAS être \
+                 proposée comme doublon d'empreinte — vues {vus:?}"
+            );
+        }
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn l_empreinte_de_fichier_garde_les_copies_locales() {
+        let vus = ids(&banc());
+        assert!(
+            vus.contains(&1) && vus.contains(&2),
+            "les deux copies LOCALES doivent rester proposées — vues {vus:?}"
         );
     }
 }

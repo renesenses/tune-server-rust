@@ -197,6 +197,26 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
     crate::db::coffrets_auto::tests::scenario_complet(&db);
 }
 
+/// #5317 — un coffret né de deux feuilles CUE (pistes sans `file_path`) :
+/// LE MÊME scénario que `cue_deux_disques_sur_sqlite`, écrivain CUE du scan
+/// compris, sur le VRAI moteur. `COALESCE(NULLIF(…), NULLIF(…))` dans
+/// `MIN`/`MAX`/`WHERE` y passe.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_coffrets_auto_cue_deux_disques() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_cue_deux_disques(&db);
+}
+
+/// #5357 — le marqueur EN TÊTE (« CD1 - Messiah »), et la collection à ne
+/// pas réunir : LE MÊME scénario que `marqueur_de_tete_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_coffrets_auto_marqueur_de_tete() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_marqueur_de_tete(&db);
+}
+
 /// Édition d'album — mode « Modifier » de la fiche (GO du 25/09/2026) : LES
 /// MÊMES scénarios que SQLite (`edition_album_tests.rs`), sur le VRAI moteur.
 /// La transaction unique de `appliquer`, le JSON dans `album_metadata`, les
@@ -221,6 +241,38 @@ async fn pg_edition_album_scenarios() {
     ];
     for (nom, scenario) in scenarios {
         eprintln!("pg_edition_album : {nom}");
+        reset_schema(&db);
+        scenario(&db);
+    }
+    reset_schema(&db);
+}
+
+/// #5314 — le genre posé sur un album vaut pour ses pistes : LES MÊMES
+/// scénarios que SQLite (`genre_album_pistes_tests.rs`), sur le VRAI moteur.
+/// La recopie dans la transaction de l'édition, le drapeau `SMALLINT` de
+/// l'exception des compilations, le marqueur dans `album_metadata`, la tenue
+/// relue par le scan et le rattrapage (`LIKE` sur le JSON d'`edition_manuelle`)
+/// y passent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_genre_album_pistes_5314() {
+    use crate::db::genre_album_pistes::tests as g;
+    type Scenario = fn(&Arc<dyn DbBackend>);
+    let db = pg_or_skip!();
+    let scenarios: [(&str, Scenario); 5] = [
+        (
+            "edition_recopie_et_tient",
+            g::scenario_edition_recopie_et_tient,
+        ),
+        ("genres_multiples", g::scenario_genres_multiples),
+        ("compilation", g::scenario_compilation),
+        (
+            "sans_changement_et_effacement",
+            g::scenario_sans_changement_et_effacement,
+        ),
+        ("rattrapage", g::scenario_rattrapage),
+    ];
+    for (nom, scenario) in scenarios {
+        eprintln!("pg_genre_album_pistes_5314 : {nom}");
         reset_schema(&db);
         scenario(&db);
     }

@@ -365,6 +365,7 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
     assert_eq!(banc.annonces(), 0, "le codec est encore inconnu");
 
     session.publish_radio_source(RadioSourceInfo {
+        channels: Some(2),
         format: Some("mp3"),
         sample_rate: Some(44_100),
         bit_depth: Some(16),
@@ -409,6 +410,7 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
     assert_eq!(banc.annonces(), 0, "un codec stable ne relance pas les GET");
 
     session.publish_radio_source(RadioSourceInfo {
+        channels: Some(2),
         format: Some("flac"),
         sample_rate: Some(48_000),
         bit_depth: Some(16),
@@ -438,6 +440,7 @@ async fn codec_amont_radio_annonce_une_seule_relecture_de_zone() {
 fn un_nouveau_stream_radio_ne_reutilise_pas_le_codec_precedent() {
     let mut ps = ZonePollState::new(1);
     let mp3 = RadioSourceInfo {
+        channels: Some(2),
         format: Some("mp3"),
         sample_rate: Some(44_100),
         bit_depth: Some(16),
