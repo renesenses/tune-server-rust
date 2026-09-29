@@ -950,9 +950,50 @@ fn encode_subframe(bw: &mut BitWriter, samples: &[i32], bit_depth: u32) -> Resul
 
     // Try fixed prediction orders 0-4, pick the one with smallest residual sum
     let best_order = pick_best_fixed_order(samples);
+    let residuals = compute_fixed_residuals(samples, best_order);
+    let rice_param = optimal_rice_parameter(&residuals);
 
-    encode_subframe_fixed(bw, samples, bit_depth, best_order)
+    // #5237 : une sous-trame ne doit JAMAIS dépasser sa taille en VERBATIM.
+    // Les décodeurs dimensionnent leur tampon de trame sur cette borne
+    // (ffmpeg : `ff_flac_get_max_frame_size`, « an encoder should not write a
+    // frame that is larger than if verbatim encoding mode were to be used »),
+    // et libFLAC la respecte toujours. Sur un passage fort en 24 bits, le
+    // paramètre de Rice plafonné à 14 gonflait la trame bien au-delà : le
+    // Sonos Play:1 quittait le flux à l'endroit exact de ce passage (76 s,
+    // puis 77 s après la reprise).
+    let bits_fixe =
+        8 + best_order as u64 * bit_depth as u64 + bits_residus_rice(&residuals, rice_param);
+    let bits_verbatim = 8 + samples.len() as u64 * bit_depth as u64;
+    if bits_fixe >= bits_verbatim {
+        return encode_subframe_verbatim(bw, samples, bit_depth);
+    }
+
+    encode_subframe_fixed(bw, samples, bit_depth, best_order, &residuals, rice_param)
 }
+
+/// Taille exacte, en bits, de la section « résidu » (méthode, ordre de
+/// partition, paramètre, puis chaque code de Rice) pour le paramètre `k`.
+fn bits_residus_rice(residuals: &[i64], k: u8) -> u64 {
+    let entete = 2 + 4 + if k > RICE_PARAM_MAX { 5 } else { 4 };
+    residuals.iter().fold(entete, |acc, &r| {
+        acc.saturating_add((zigzag(r) >> k) + 1 + k as u64)
+    })
+}
+
+/// Correspondance zig-zag du codage de Rice : 0 → 0, -1 → 1, 1 → 2, -2 → 3…
+#[inline]
+fn zigzag(r: i64) -> u64 {
+    if r >= 0 {
+        (r as u64) << 1
+    } else {
+        (((-r) as u64) << 1) - 1
+    }
+}
+
+/// Plus grand paramètre de la méthode RICE (4 bits, 15 = échappement).
+const RICE_PARAM_MAX: u8 = 14;
+/// Plus grand paramètre de la méthode RICE2 (5 bits, 31 = échappement).
+const RICE2_PARAM_MAX: u8 = 30;
 
 /// VERBATIM subframe: stores raw samples without prediction.
 fn encode_subframe_verbatim(
@@ -976,6 +1017,8 @@ fn encode_subframe_fixed(
     samples: &[i32],
     bit_depth: u32,
     order: u8,
+    residuals: &[i64],
+    rice_param: u8,
 ) -> Result<(), String> {
     // Subframe header: 0 (padding) + type bits (6) + 0 (no wasted bits)
     // FIXED type: 001xxx where xxx = order (0-4) => 001000 + order
@@ -988,11 +1031,7 @@ fn encode_subframe_fixed(
         write_signed(bw, samples[i] as i64, bit_depth as u8);
     }
 
-    // Compute residuals
-    let residuals = compute_fixed_residuals(samples, order);
-
-    // Encode residuals with Rice coding
-    encode_rice_residuals(bw, &residuals, order as usize, samples.len());
+    encode_rice_residuals(bw, residuals, rice_param);
 
     Ok(())
 }
@@ -1041,55 +1080,26 @@ fn compute_fixed_residuals(samples: &[i32], order: u8) -> Vec<i64> {
         .collect()
 }
 
-/// Encode residuals using Rice coding (RESIDUAL_CODING_METHOD_PARTITIONED_RICE).
-fn encode_rice_residuals(
-    bw: &mut BitWriter,
-    residuals: &[i64],
-    _predictor_order: usize,
-    _block_size: usize,
-) {
+/// Encode residuals using Rice coding (RESIDUAL_CODING_METHOD_PARTITIONED_RICE,
+/// or PARTITIONED_RICE2 when the parameter exceeds 14).
+///
+/// #5237 : le paramètre était plafonné à 14 (méthode RICE, 4 bits). En 24 bits,
+/// un passage fort réclame 15 à 20 : le quotient unaire s'allongeait alors de
+/// centaines de bits par échantillon. La méthode RICE2 (5 bits, jusqu'à 30)
+/// est celle qu'emploie libFLAC au-delà de 16 bits.
+fn encode_rice_residuals(bw: &mut BitWriter, residuals: &[i64], rice_param: u8) {
     // Use partition order 0 (single partition) for simplicity.
     // This is always valid and produces correct output.
     let partition_order: u32 = 0;
+    let rice2 = rice_param > RICE_PARAM_MAX;
 
-    // Coding method: 00 = RICE (4-bit parameter)
-    bw.write_bits(0b00, 2);
-    // Partition order
+    // Coding method: 00 = RICE (4-bit parameter), 01 = RICE2 (5-bit parameter)
+    bw.write_bits(if rice2 { 0b01 } else { 0b00 }, 2);
     bw.write_bits(partition_order, 4);
+    bw.write_bits(rice_param as u32, if rice2 { 5 } else { 4 });
 
-    // With partition order 0, there's one partition containing all residuals
-    // Find optimal Rice parameter
-    let rice_param = optimal_rice_parameter(residuals);
-
-    if rice_param < 15 {
-        // Normal Rice parameter (4 bits)
-        bw.write_bits(rice_param as u32, 4);
-
-        // Encode each residual
-        for &r in residuals {
-            write_rice_signed(bw, r, rice_param);
-        }
-    } else {
-        // Escape code: parameter = 15 means unencoded (verbatim residuals)
-        // Each residual stored in 5-bit "bits per sample" field
-        bw.write_bits(0b1111, 4); // escape
-        // The spec says: 5 bits for the number of bits per residual sample
-        // We'll use enough bits to represent the max residual
-        let max_abs = residuals
-            .iter()
-            .map(|r| r.unsigned_abs())
-            .max()
-            .unwrap_or(0);
-        let bits_needed = if max_abs == 0 {
-            0u8
-        } else {
-            (64 - max_abs.leading_zeros()) as u8 + 1 // +1 for sign
-        };
-        let bits_needed = bits_needed.min(32);
-        bw.write_bits(bits_needed as u32, 5);
-        for &r in residuals {
-            write_signed(bw, r, bits_needed);
-        }
+    for &r in residuals {
+        write_rice_signed(bw, r, rice_param);
     }
 }
 
@@ -1100,22 +1110,10 @@ fn optimal_rice_parameter(residuals: &[i64]) -> u8 {
         return 0;
     }
 
-    // Map signed residuals to unsigned (zig-zag encoding, same as Rice uses)
     let sum_mapped: u64 = residuals
         .iter()
-        .map(|&r| {
-            if r >= 0 {
-                (2 * r) as u64
-            } else {
-                (2 * (-r) - 1) as u64
-            }
-        })
-        .sum();
-
+        .fold(0u64, |acc, &r| acc.saturating_add(zigzag(r)));
     let n = residuals.len() as u64;
-    if n == 0 {
-        return 0;
-    }
 
     // Optimal k is approximately log2(mean of mapped values)
     let mean = sum_mapped / n;
@@ -1123,7 +1121,8 @@ fn optimal_rice_parameter(residuals: &[i64]) -> u8 {
         return 0;
     }
     let k = (64 - mean.leading_zeros()).saturating_sub(1) as u8;
-    k.min(14) // Rice parameter must be 0-14 (15 = escape)
+    // 0-14 : RICE ; 15-30 : RICE2 (31 = échappement, jamais émis).
+    k.min(RICE2_PARAM_MAX)
 }
 
 /// Write a single Rice-coded signed value.
@@ -1305,6 +1304,117 @@ mod tests {
         for (i, (&e, &g)) in expected.iter().zip(decoded.samples_i32.iter()).enumerate() {
             assert_eq!(e, g, "sample {i} mismatch: {e} != {g}");
         }
+    }
+
+    /// Bruit pseudo-aléatoire déterministe dans [-amp, amp].
+    fn bruit_24(n: usize, amp: i32, graine: u64) -> Vec<i32> {
+        let mut x = graine;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x % (2 * amp as u64 + 1)) as i64 - amp as i64) as i32
+            })
+            .collect()
+    }
+
+    /// Encode deux canaux 24 bits / 48 kHz et rend (flac, max_frame_size de
+    /// STREAMINFO), après avoir vérifié que le décodage est bit à bit exact.
+    fn encode_24_et_relit(gauche: &[i32], droite: &[i32]) -> (Vec<u8>, u32) {
+        let mut pcm = Vec::with_capacity(gauche.len() * 6);
+        for (&g, &d) in gauche.iter().zip(droite) {
+            pcm.extend_from_slice(&g.to_le_bytes()[..3]);
+            pcm.extend_from_slice(&d.to_le_bytes()[..3]);
+        }
+        let mut enc = AudioEncoder::new("flac", 48000, 24, 2);
+        enc.start_sync().expect("start");
+        enc.write_sync(&pcm).expect("write");
+        let flac = enc.finish_sync().expect("finish");
+
+        let tmp = tempfile::Builder::new()
+            .suffix(".flac")
+            .tempfile()
+            .expect("temp flac");
+        std::fs::write(tmp.path(), &flac).expect("write temp flac");
+        let decoded =
+            crate::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
+                .expect("notre FLAC doit se décoder");
+        let attendu: Vec<i32> = gauche
+            .iter()
+            .zip(droite)
+            .flat_map(|(&g, &d)| [g, d])
+            .collect();
+        assert_eq!(decoded.samples_i32, attendu, "décodage bit à bit exact");
+
+        // STREAMINFO commence à l'octet 8 ; max_frame_size occupe 15..18.
+        let max_trame = u32::from_be_bytes([0, flac[15], flac[16], flac[17]]);
+        (flac, max_trame)
+    }
+
+    /// Borne de ffmpeg (`ff_flac_get_max_frame_size`) : la taille d'une trame
+    /// codée en VERBATIM. Les décodeurs y dimensionnent leur tampon de trame.
+    fn borne_trame_verbatim(bloc: usize, canaux: usize, bps: usize) -> u32 {
+        let mut n = 16 + canaux * (bps + 7).div_ceil(8);
+        n += if canaux == 2 {
+            ((2 * bps + 1) * bloc).div_ceil(8)
+        } else {
+            (canaux * bps * bloc).div_ceil(8)
+        };
+        (n + 2) as u32
+    }
+
+    /// #5237 : sur un passage fort en 24 bits (ici, bruit pleine échelle),
+    /// aucune trame ne doit dépasser sa taille en VERBATIM. Avant le
+    /// correctif, le paramètre de Rice plafonné à 14 donnait des trames d'une
+    /// vingtaine de fois cette borne — le Sonos Play:1 quittait le flux à
+    /// l'endroit du passage.
+    #[test]
+    fn flac_24_bits_passage_fort_aucune_trame_au_dela_du_verbatim() {
+        let n = 3 * FLAC_BLOCK_SIZE;
+        let g = bruit_24(n, 8_388_000, 0x5237);
+        let d = bruit_24(n, 8_388_000, 0x1989);
+        let (_, max_trame) = encode_24_et_relit(&g, &d);
+        let borne = borne_trame_verbatim(FLAC_BLOCK_SIZE, 2, 24);
+        assert!(
+            max_trame <= borne,
+            "trame de {max_trame} octets, au-delà de la borne verbatim de {borne}"
+        );
+        // Canaux indépendants : la trame VERBATIM de CET encodeur, en-tête de
+        // 16 octets au plus, deux sous-trames (1 octet d'en-tête + 4096 × 3),
+        // CRC-16. Du bruit pleine échelle ne se comprime pas : il doit y tomber.
+        let verbatim_ici = (16 + 2 * (1 + FLAC_BLOCK_SIZE * 3) + 2) as u32;
+        assert!(
+            max_trame <= verbatim_ici,
+            "trame de {max_trame} octets, plus que les {verbatim_ici} du VERBATIM"
+        );
+    }
+
+    /// #5237 : un passage fort mais prévisible réclame un paramètre de Rice
+    /// de 15 à 20. Il doit rester COMPRESSÉ (méthode RICE2) et sous la borne,
+    /// pas retomber en VERBATIM ni gonfler par un quotient unaire démesuré.
+    #[test]
+    fn flac_24_bits_parametre_de_rice_au_dela_de_14_reste_compresse() {
+        let n = 3 * FLAC_BLOCK_SIZE;
+        let sinus = |i: usize| {
+            (6_000_000.0 * (2.0 * std::f64::consts::PI * 100.0 * i as f64 / 48000.0).sin()) as i32
+        };
+        let bg = bruit_24(n, 65_536, 7);
+        let bd = bruit_24(n, 65_536, 11);
+        let g: Vec<i32> = (0..n).map(|i| sinus(i) + bg[i]).collect();
+        let d: Vec<i32> = (0..n).map(|i| sinus(i) - bd[i]).collect();
+        let (flac, max_trame) = encode_24_et_relit(&g, &d);
+        let borne = borne_trame_verbatim(FLAC_BLOCK_SIZE, 2, 24);
+        assert!(
+            max_trame <= borne,
+            "trame de {max_trame} octets, au-delà de la borne verbatim de {borne}"
+        );
+        let verbatim = n * 2 * 3;
+        assert!(
+            flac.len() * 100 < verbatim * 90,
+            "{} octets pour {verbatim} en verbatim : la compression RICE2 n'a pas joué",
+            flac.len()
+        );
     }
 
     #[test]
