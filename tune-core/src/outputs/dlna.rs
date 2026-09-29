@@ -541,6 +541,9 @@ pub struct DlnaOutput {
     /// Seule valeur disponible en mode silence si le renderer n'a jamais
     /// poussé de `Volume`.
     dernier_volume_pct: AtomicU64,
+    /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
+    /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
+    dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
     /// La position rendue par le dernier `get_status` était-elle extrapolée ?
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
@@ -673,6 +676,7 @@ impl DlnaOutput {
             incoherence_depuis: tokio::sync::Mutex::new(None),
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
+            dernier_diag_701: std::sync::Mutex::new(None),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
@@ -1116,6 +1120,10 @@ impl DlnaOutput {
                 .and_then(|xml| extract_tag(&xml, "CurrentTransportState"));
             let conduite = conduite_apres_refus_pause(etat.as_deref());
             let attente_ms = debut.elapsed().as_millis() as u64;
+            if etat_journalise.is_none() {
+                self.journaliser_position_au_refus_701(etat.as_deref())
+                    .await;
+            }
             // Une ligne par état DIFFÉRENT : une transition de 5 s lue tous
             // les 250 ms ne doit pas écrire vingt fois la même chose.
             if etat_journalise.as_ref() != Some(&etat) {
@@ -1178,6 +1186,50 @@ impl DlnaOutput {
                 None => raison,
             });
         }
+    }
+
+    /// #5050 — au premier relevé d'un refus 701 sur `Pause`, ce que le
+    /// renderer dit de sa POSITION, à côté de l'état du transport.
+    ///
+    /// Les journaux de FabienM (Beosound Stage) ne permettaient de dater la
+    /// position qu'à la reprise suivante : 60 000 ms 88 s après un Seek vers
+    /// 60 871 ms (fil 1943), 54 000 ms 140 s après un Seek vers 54 467 ms
+    /// (fil 2013). Lue au moment du refus, elle dit si le renderer est figé à
+    /// la cible du Seek ou s'il joue. Une ligne par refus, au plus une par
+    /// `DIAG_701_INTERVALLE` et par renderer ; `GetPositionInfo` ne rend que
+    /// des temps (aucune URI n'est écrite).
+    async fn journaliser_position_au_refus_701(&self, etat: Option<&str>) {
+        {
+            let mut dernier = self
+                .dernier_diag_701
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if dernier.is_some_and(|t| t.elapsed() < DIAG_701_INTERVALLE) {
+                return;
+            }
+            *dernier = Some(std::time::Instant::now());
+        }
+        let reponse = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .ok()
+            .filter(|r| !faute_commande_soap(r));
+        let rel_time = reponse.as_deref().and_then(|r| extract_tag(r, "RelTime"));
+        let duree = reponse
+            .as_deref()
+            .and_then(|r| extract_tag(r, "TrackDuration"));
+        let position_ms = rel_time
+            .as_deref()
+            .and_then(crate::upnp_renderer::parse_upnp_time);
+        info!(
+            device = %self.name,
+            etat = etat.unwrap_or("-"),
+            position_ms = ?position_ms,
+            rel_time = rel_time.as_deref().unwrap_or("-"),
+            duree_piste = duree.as_deref().unwrap_or("-"),
+            position_lisible = reponse.is_some(),
+            "dlna_pause_701_position_lue"
+        );
     }
 
     /// L'état poussé contredit-il la position mesurée ?
@@ -3494,6 +3546,10 @@ fn est_701(reponse_play: &str) -> bool {
 const PAUSE_701_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// Intervalle entre deux lectures de l'état pendant cette attente.
 const PAUSE_701_PAS: std::time::Duration = std::time::Duration::from_millis(250);
+/// #5050 — au plus une ligne `dlna_pause_701_position_lue` par renderer et
+/// par intervalle : des clics répétés sur Pause n'écrivent pas une ligne
+/// chacun.
+const DIAG_701_INTERVALLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Que faire d'une `Pause` refusée en 701, selon l'état que le transport
 /// déclare (`CurrentTransportState`) — #5050.
