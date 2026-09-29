@@ -39,12 +39,12 @@ pub mod sql {
         )
     }
 
+    /// Toutes les listes d'un profil, SANS ordre : [`super::PlaylistRepo::list`]
+    /// les trie en Rust dans l'ordre alphabétique du serveur média (#4956).
     pub fn list<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.profile_id = {} ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
-            d.placeholder(1),
-            d.placeholder(2),
-            d.placeholder(3)
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.profile_id = {}",
+            d.placeholder(1)
         )
     }
 
@@ -397,11 +397,19 @@ impl PlaylistRepo {
             .map(row_to_playlist))
     }
 
+    /// Les listes du profil, dans l'ordre alphabétique du serveur média
+    /// (#4956) : signes de tête, casse et accents ignorés ; à nom égal,
+    /// l'identifiant départage. `ORDER BY LOWER(p.name)` mettait « Été »
+    /// après « Zen » sur SQLite et « (Soirée) » en tête. Un profil tient
+    /// quelques dizaines de listes : on les lit toutes, on les trie, on
+    /// découpe la page (`limit` négatif = sans borne, comme SQLite).
     pub fn list(&self, profile_id: i64, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
         let sql = self.dialect_sql(sql::list, sql::list);
-        let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
+        let params: [&dyn ToSqlValue; 1] = [&profile_id];
         let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_playlist).collect())
+        let mut listes: Vec<Playlist> = rows.iter().map(row_to_playlist).collect();
+        listes.sort_by_cached_key(|l| (crate::upnp_server::cle_alphabetique(&l.name), l.id));
+        Ok(super::ordre_alphabetique::tranche(listes, limit, offset))
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -1333,8 +1341,9 @@ mod tests {
         assert!(sql::create(&p).contains("VALUES ($1, $2, $3)"));
         assert!(sql::create(&s).contains("profile_id"));
         assert!(!sql::list(&p).contains("COLLATE"));
-        assert!(sql::list(&p).contains("LOWER(p.name)"));
-        assert!(sql::list(&p).contains("profile_id ="));
+        // #4956 — l'ordre se fait en Rust, pas en SQL.
+        assert!(!sql::list(&p).contains("ORDER BY"));
+        assert!(sql::list(&p).contains("profile_id = $1"));
     }
 
     #[test]

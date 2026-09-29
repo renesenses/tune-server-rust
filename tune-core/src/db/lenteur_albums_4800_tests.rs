@@ -196,16 +196,19 @@ fn la_liste_et_le_total_sont_ceux_de_l_ancienne_clause() {
             backend.as_ref(),
             &format!(
                 "SELECT a.id FROM albums a WHERE {} AND {} \
-                 ORDER BY LOWER(a.title) ASC, a.id ASC LIMIT ? OFFSET ?",
+                 ORDER BY a.id ASC LIMIT ? OFFSET ?",
                 hidden_albums_excluded(),
                 ancienne_exclusion_albums()
             ),
             &[&limit, &offset],
         )
     };
+    // Tri par identifiant des deux côtés : c'est l'EXCLUSION qu'on compare.
+    // Le tri par titre ne suit plus `LOWER(a.title)` depuis #4956 (ordre
+    // alphabétique du serveur média, « Album 9 » avant « Album 10 »).
     let liste_apres = |limit: i64, offset: i64| -> Vec<i64> {
         repo.list_filtered_seeded(
-            limit, offset, "title", "asc", None, None, None, false, None, None,
+            limit, offset, "id", "asc", None, None, None, false, None, None,
         )
         .unwrap()
         .iter()

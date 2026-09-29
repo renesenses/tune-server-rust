@@ -3344,6 +3344,55 @@ impl AlbumRepo {
         )
     }
 
+    /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
+    /// a.year`), dans l'ordre alphabétique du serveur média (#4956) :
+    ///
+    /// - par titre : la clé du titre, puis l'identifiant ;
+    /// - par artiste : la clé du nom de l'artiste, puis l'année (sans année
+    ///   d'abord, comme `ORDER BY a.year ASC` sur SQLite), la clé du titre,
+    ///   l'identifiant.
+    ///
+    /// `desc` ne renverse que la clé principale, comme le `{dir}` du SQL
+    /// qu'elle remplace : les départages restent croissants, et l'ordre reste
+    /// total dans les deux sens.
+    fn ids_en_ordre_alphabetique(
+        &self,
+        sql: &str,
+        valeurs: &[&dyn ToSqlValue],
+        par_artiste: bool,
+        desc: bool,
+    ) -> Result<Vec<i64>, TuneError> {
+        use crate::upnp_server::{CleAlphabetique, cle_alphabetique};
+        let lignes = self.db.query_many(sql, valeurs)?;
+        let mut cles: Vec<(CleAlphabetique, Option<i64>, Option<CleAlphabetique>, i64)> = lignes
+            .iter()
+            .filter_map(|r| {
+                let id = r.first().and_then(|v| v.as_i64())?;
+                let titre = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                Some(if par_artiste {
+                    let artiste = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                    let annee = r.get(3).and_then(|v| v.as_i64());
+                    (
+                        cle_alphabetique(&artiste),
+                        annee,
+                        Some(cle_alphabetique(&titre)),
+                        id,
+                    )
+                } else {
+                    (cle_alphabetique(&titre), None, None, id)
+                })
+            })
+            .collect();
+        cles.sort_by(|a, b| {
+            let principal = a.0.cmp(&b.0);
+            if desc { principal.reverse() } else { principal }
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        Ok(cles.into_iter().map(|(_, _, _, id)| id).collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lister_filtre(
         &self,
@@ -3579,28 +3628,54 @@ impl AlbumRepo {
         } else {
             format!("SELECT a.id{colonne_total} FROM albums a {joins}")
         };
-        let sql = format!(
-            "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
-        );
+        let (ordered_ids, total) = if matches!(sort, "title" | "artist") {
+            // #4956 — les deux tris ALPHABÉTIQUES (les seuls où le client web
+            // offre le rail A–Z) suivent l'ordre du serveur média, calculé en
+            // Rust : `LOWER(a.title)` / `LOWER(ar.name)` ne repliaient que
+            // l'ASCII sur SQLite (« Été indien » après « Zoo ») et suivaient
+            // la collation de la base sur PostgreSQL. Même `WHERE`, mêmes
+            // jointures, mêmes valeurs liées que le 1er temps de #1269 ; on
+            // lit l'ensemble filtré en lignes étroites (id, titre, artiste,
+            // année), on le trie, on découpe. Le total est la taille de
+            // l'ensemble trié : il ne peut pas diverger de la page.
+            let sql = format!(
+                "SELECT a.id, a.title, ar.name, a.year FROM albums a {joins}{where_clause}"
+            );
+            let refs: Vec<&dyn ToSqlValue> =
+                bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
+            let ids =
+                self.ids_en_ordre_alphabetique(&sql, &refs, sort == "artist", dir == "DESC")?;
+            let total = avec_total.then_some(ids.len() as i64);
+            (
+                super::ordre_alphabetique::tranche(ids, limit, offset),
+                total,
+            )
+        } else {
+            let sql = format!(
+                "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
+            );
 
-        bind_values.push(SqlValue::Int(limit));
-        bind_values.push(SqlValue::Int(offset));
+            bind_values.push(SqlValue::Int(limit));
+            bind_values.push(SqlValue::Int(offset));
 
-        let refs: Vec<&dyn ToSqlValue> = bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
-        let rows = self.db.query_many(&sql, &refs)?;
-        let ordered_ids: Vec<i64> = rows
-            .iter()
-            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
-            .collect();
+            let refs: Vec<&dyn ToSqlValue> =
+                bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
+            let rows = self.db.query_many(&sql, &refs)?;
+            let ordered_ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect();
+            // Le total est le même sur toutes les lignes : la première suffit.
+            let total = if avec_total {
+                rows.first().and_then(|r| r.last()).and_then(|v| v.as_i64())
+            } else {
+                None
+            };
+            (ordered_ids, total)
+        };
         if ordered_ids.is_empty() {
             return Ok((Vec::new(), None));
         }
-        // Le total est le même sur toutes les lignes : la première suffit.
-        let total = if avec_total {
-            rows.first().and_then(|r| r.last()).and_then(|v| v.as_i64())
-        } else {
-            None
-        };
 
         // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
         // TOUS les tris. Avant, elle n'était extraite que du 1er temps du tri

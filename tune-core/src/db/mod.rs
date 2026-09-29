@@ -31,6 +31,8 @@ pub mod metadata_report_repo;
 pub mod migration_status;
 pub mod migrations;
 pub mod models;
+/// L'ordre alphabétique des listes paginées (#4956) : tri en Rust, découpe.
+pub(crate) mod ordre_alphabetique;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_ensure_schema_parity;
 #[cfg(all(test, feature = "postgres"))]
