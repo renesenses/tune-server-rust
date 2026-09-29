@@ -364,6 +364,10 @@ pub struct Tenues {
     par_chemin: HashMap<String, Tenue>,
     par_cue: HashMap<(String, i64), Tenue>,
     albums_disposes: HashSet<i64>,
+    /// #5314 — `(tracks.genre, tracks.genres)` recopiés du genre de l'album,
+    /// par album (marqueur `genre_pistes`, voir
+    /// [`super::genre_album_pistes`]).
+    genres_par_album: HashMap<i64, (String, String)>,
 }
 
 impl Tenues {
@@ -421,6 +425,26 @@ impl Tenues {
             }
         }
         let mut t = Self::default();
+        let sql_genres = format!(
+            "SELECT m.album_id, m.value FROM album_metadata m \
+             JOIN albums a ON a.id = m.album_id WHERE m.key = {}",
+            marque(db.engine(), 1)
+        );
+        for r in db.query_many_strong(
+            &sql_genres,
+            &[&super::genre_album_pistes::CLE_GENRE_PISTES as &dyn ToSqlValue],
+        )? {
+            let (Some(id), Some(v)) = (
+                r.first().and_then(|v| v.as_i64()),
+                r.get(1).and_then(|v| v.as_string()),
+            ) else {
+                continue;
+            };
+            // Valeur vide : pistes épargnées (compilation), rien à reposer.
+            if let Some(colonnes) = super::genre_album_pistes::colonnes_de_piste(&v) {
+                t.genres_par_album.insert(id, colonnes);
+            }
+        }
         for (album_id, e) in editions {
             if e.disposition {
                 t.albums_disposes.insert(album_id);
@@ -446,7 +470,7 @@ impl Tenues {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.par_chemin.is_empty() && self.par_cue.is_empty()
+        self.par_chemin.is_empty() && self.par_cue.is_empty() && self.genres_par_album.is_empty()
     }
 
     pub fn get(&self, chemin: &str) -> Option<&Tenue> {
@@ -479,9 +503,23 @@ impl Tenues {
     /// Pose sur une ligne piste — construite depuis les balises, pas encore
     /// écrite — ce que l'utilisateur a tenu. Rend vrai si la ligne a changé.
     pub fn appliquer(&self, track: &mut Track) -> bool {
-        let Some(t) = self.de_la_piste(track) else {
-            return false;
-        };
+        // Par chemin, sinon par identité CUE (#5319).
+        let tenue = self.de_la_piste(track);
+        let change = tenue.is_some();
+        if let Some(t) = tenue {
+            self.appliquer_tenue(t, track);
+        }
+        // #5314 — APRÈS la disposition : c'est l'album où la piste est tenue
+        // qui donne son genre.
+        if let Some((genre, genres)) = track.album_id.and_then(|a| self.genres_par_album.get(&a)) {
+            track.genre = Some(genre.clone());
+            track.genres = Some(genres.clone());
+            return true;
+        }
+        change
+    }
+
+    fn appliquer_tenue(&self, t: &Tenue, track: &mut Track) {
         if let Some((disque, numero, nom)) = &t.disposition {
             track.album_id = Some(t.album_id);
             track.disc_number = *disque;
@@ -494,7 +532,6 @@ impl Tenues {
         if let Some(a) = t.artiste_id {
             track.artist_id = Some(a);
         }
-        true
     }
 }
 
@@ -718,6 +755,11 @@ pub struct Modification {
     pub discs: Option<Vec<DisqueModifie>>,
     #[serde(default)]
     pub tracks: Option<Vec<PisteModifiee>>,
+    /// #5314 — « appliquer aussi aux pistes » : recopie le genre de l'album
+    /// sur ses pistes même quand c'est une compilation aux genres différents
+    /// (que la recopie épargne sinon), et même si le genre ne change pas.
+    #[serde(default)]
+    pub apply_genre_to_tracks: bool,
 }
 
 /// Pourquoi une édition est refusée.
@@ -792,10 +834,20 @@ pub fn appliquer(
     m: &Modification,
 ) -> Result<(), RefusEdition> {
     let repo = AlbumRepo::with_backend(db.clone());
-    if repo.get(album_id)?.is_none() {
+    let Some(avant) = repo.get(album_id)? else {
         return Err(RefusEdition::AlbumInconnu(album_id));
-    }
+    };
     let engine = db.engine();
+    // #5314 — CHANGER le genre de l'album le recopie sur ses pistes ; un
+    // formulaire renvoyé avec le même genre ne réécrit rien, sauf demande.
+    let recopier_genre = m.apply_genre_to_tracks
+        || m.genre.as_ref().is_some_and(|g| {
+            super::genre_album_pistes::genre_change(
+                avant.genre.as_deref(),
+                texte_libre(g).as_deref(),
+            )
+        });
+    let mut recopie = None;
     let lignes =
         lignes_de(db.query_many_strong(&sql_lignes(engine), &[&album_id as &dyn ToSqlValue])?);
     let ids_album: HashSet<i64> = lignes.iter().map(|l| l.id).collect();
@@ -1055,6 +1107,16 @@ pub fn appliquer(
             }
             None => {}
         }
+        // #5314 — APRÈS le genre et le mode de compilation : l'exception des
+        // compilations juge l'album tel que cette édition vient de le poser.
+        if recopier_genre {
+            recopie = Some(super::genre_album_pistes::recopier_dans(
+                tx,
+                engine,
+                album_id,
+                m.apply_genre_to_tracks,
+            )?);
+        }
         if tenus != tenus_avant {
             tx.execute(
                 &sql_upsert,
@@ -1086,6 +1148,7 @@ pub fn appliquer(
         champs = ?tenus.difference(&tenus_avant).collect::<Vec<_>>(),
         disques = nb_disques,
         pistes_renommees = titres_pistes.len() + artistes_pistes.len(),
+        genre_recopie = ?recopie,
         "album_edite_a_la_main"
     );
     Ok(())
@@ -1819,7 +1882,10 @@ pub struct PisteABaliser {
 ///   plusieurs artistes (sans quoi le scan suivant le redécouvrirait d'après
 ///   eux), retrait sinon ; compilation effective d'un SEUL artiste : balise
 ///   laissée telle quelle — on ne pose pas `COMPILATION=1` sur l'album d'un
-///   seul artiste.
+///   seul artiste ;
+/// - `GENRE` (#5314) : `tracks.genres` (tableau JSON) s'il porte au moins un
+///   genre, sinon `tracks.genre` ; rien du tout si la piste n'a pas de genre
+///   en base — la balise du fichier est alors laissée telle quelle.
 pub fn balises_effectives(
     db: &Arc<dyn DbBackend>,
     album_id: i64,
@@ -1831,7 +1897,7 @@ pub fn balises_effectives(
     let rows = db.query_many_strong(
         &format!(
             "SELECT t.id, t.file_path, t.cue_media_path, t.cue_start_ms, t.source, t.title, \
-             ar.name, t.disc_number, t.track_number, t.disc_subtitle \
+             ar.name, t.disc_number, t.track_number, t.disc_subtitle, t.genre, t.genres \
              FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id \
              WHERE t.album_id = {p1} \
              ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0), t.id"
@@ -1848,6 +1914,7 @@ pub fn balises_effectives(
         disque: u32,
         numero: u32,
         nom_disque: Option<String>,
+        genres: Vec<String>,
     }
     let texte = |v: Option<&SqlValue>| {
         v.and_then(|v| v.as_string())
@@ -1867,6 +1934,7 @@ pub fn balises_effectives(
                 disque: r.get(7).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as u32,
                 numero: r.get(8).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
                 nom_disque: texte(r.get(9)),
+                genres: genres_de_piste(texte(r.get(10)), texte(r.get(11))),
             })
         })
         .collect();
@@ -1911,10 +1979,28 @@ pub fn balises_effectives(
                     titre: b.titre,
                     artiste: b.artiste,
                     compilation,
+                    genres: b.genres,
                 },
             })
             .collect(),
     ))
+}
+
+/// Les genres qu'« Écrire dans les fichiers » pose sur une piste (#5314) :
+/// le tableau JSON `tracks.genres` s'il en porte au moins un, sinon la
+/// colonne `tracks.genre`, sinon aucun (la balise du fichier reste).
+fn genres_de_piste(genre: Option<String>, genres_json: Option<String>) -> Vec<String> {
+    let tableau: Vec<String> = genres_json
+        .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if !tableau.is_empty() {
+        return tableau;
+    }
+    genre.into_iter().collect()
 }
 
 #[cfg(test)]

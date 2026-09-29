@@ -173,6 +173,13 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 /// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
 /// l'autre. `MAX` ne sert qu'à savoir si l'album tient dans un seul dossier.
 ///
+/// 🔴 `COALESCE(t.source, 'local') = 'local'` — et pas le chemin de fichier
+/// seul. Le chemin n'est pas un substitut de la source : rien n'interdit à une
+/// source distante d'en porter un, et cet inventaire alimente à la fois
+/// l'écran des coffrets éclatés, le geste de regroupement et la passe
+/// automatique ([`passe`]), qui RÉUNIT des albums. Voir
+/// [`tune_core::db::track_repo::sql::est_local`] pour le choix de la forme.
+///
 /// 🔴 Le chemin est [`chemin_ouvrable`] — le fichier, ou pour une tranche
 /// découpée par une feuille CUE, l'IMAGE qui la porte (#5317). `t.file_path`
 /// seul NE SUFFIT PAS : une piste CUE a `file_path = NULL` par construction
@@ -181,19 +188,17 @@ fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
 /// *Messiah* de Gardiner en APE+CUE, deux disques sous `…/CD1` et `…/CD2`,
 /// n'était jamais examiné. L'image vit dans le dossier du disque : son
 /// dossier est celui du disque, comme pour un fichier.
-const SQL_ALBUMS_ET_DOSSIERS: &str = concat!(
-    "SELECT t.album_id, al.title, MIN(",
-    chemin_ouvrable!(),
-    "), MAX(",
-    chemin_ouvrable!(),
-    "), al.artist_id, ar.name \
-     FROM tracks t JOIN albums al ON al.id = t.album_id \
-     LEFT JOIN artists ar ON ar.id = al.artist_id \
-     WHERE ",
-    chemin_ouvrable!(),
-    " IS NOT NULL \
-     GROUP BY t.album_id, al.title, al.artist_id, ar.name"
-);
+fn sql_albums_et_dossiers() -> String {
+    format!(
+        "SELECT t.album_id, al.title, MIN({c}), MAX({c}), al.artist_id, ar.name \
+         FROM tracks t JOIN albums al ON al.id = t.album_id \
+         LEFT JOIN artists ar ON ar.id = al.artist_id \
+         WHERE {piste_locale} AND {c} IS NOT NULL \
+         GROUP BY t.album_id, al.title, al.artist_id, ar.name",
+        piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        c = chemin_ouvrable!(),
+    )
+}
 
 pub fn marqueurs(db: &Arc<dyn DbBackend>) -> Result<HashMap<i64, Marqueur>, TuneError> {
     let (p1, _) = placeholders(db);
@@ -214,7 +219,7 @@ pub fn marqueurs(db: &Arc<dyn DbBackend>) -> Result<HashMap<i64, Marqueur>, Tune
 pub fn inventaire(db: &Arc<dyn DbBackend>) -> Result<Inventaire, TuneError> {
     let mut albums = Vec::new();
     let mut plusieurs_dossiers = HashSet::new();
-    for r in db.query_many(SQL_ALBUMS_ET_DOSSIERS, &[])? {
+    for r in db.query_many(&sql_albums_et_dossiers(), &[])? {
         let Some(id) = r.first().and_then(|v| v.as_i64()) else {
             continue;
         };
@@ -591,15 +596,22 @@ pub struct CoffretListe {
 /// ⚠️ Le second critère exclut à dessein le double album rangé dans UN
 /// dossier (pistes 1-01 à 2-12) : c'est un album, pas un coffret rangé disque
 /// par disque. Les albums masqués (#1391) n'y figurent pas.
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, et cela se lit sur la SOURCE des
+/// deux côtés — la piste ET l'album. Le chemin de fichier ne tenait pas ce
+/// rôle : une source distante peut en porter un.
 pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
     // Le chemin de [`chemin_ouvrable`] : un coffret réuni depuis des feuilles
     // CUE n'a aucune piste à `file_path` (#5317).
     let sql = format!(
         "SELECT t.album_id, COUNT(DISTINCT t.disc_number), MIN({c}), MAX({c}) \
          FROM tracks t JOIN albums a ON a.id = t.album_id \
-         WHERE {c} IS NOT NULL AND {} \
+         WHERE {piste_locale} AND {album_local} \
+           AND {c} IS NOT NULL AND {caches} \
          GROUP BY t.album_id",
-        super::facet_filter::hidden_albums_excluded(),
+        piste_locale = crate::db::track_repo::sql::PISTE_LOCALE,
+        album_local = crate::db::track_repo::sql::est_local("a"),
+        caches = super::facet_filter::hidden_albums_excluded(),
         c = chemin_ouvrable!()
     );
     let marques = marqueurs(db)?;

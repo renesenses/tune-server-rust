@@ -1616,6 +1616,29 @@ pub(crate) fn grouper_les_albums_eclates(
     groupes
 }
 
+/// La sélection de la phase 0, sortie de la fonction pour être
+/// **exécutable** par un témoin : c'est une requête, pas un texte, et une
+/// garde qui n'en comparerait que la chaîne serait satisfaite par sa propre
+/// cible.
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, sur la SOURCE de la piste ET de
+/// l'album. Le chemin de fichier ne répondait pas à cette question : une
+/// source distante peut en porter un — et ce que cet écran propose,
+/// l'utilisateur le déclenche, comme le dit [`albums_eclates`].
+fn sql_albums_eclates() -> String {
+    format!(
+        "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
+                COALESCE(al.cover_path, '') \
+         FROM tracks t \
+         JOIN albums al ON al.id = t.album_id \
+         LEFT JOIN artists ar ON ar.id = al.artist_id \
+         WHERE {piste_locale} AND {album_local} \
+           AND t.file_path IS NOT NULL AND t.file_path <> ''",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+        album_local = tune_core::db::track_repo::sql::est_local("al"),
+    )
+}
+
 /// `GET /library/albums/eclates` — les albums éclatés présumés (BIB-A2, phase 0).
 /// Lecture seule ; la bibliothèque entière est lue une fois (une requête).
 ///
@@ -1638,15 +1661,9 @@ pub(crate) fn grouper_les_albums_eclates(
 /// l'IMAGE (`cue_media_path`) pour les pistes qui en ont une. C'est un
 /// chantier de la phase 0, pas un `COALESCE`.
 pub(super) async fn albums_eclates(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let sql = "SELECT t.album_id, al.title, ar.name, al.year, t.file_path, t.track_number, \
-                      COALESCE(al.cover_path, '') \
-               FROM tracks t \
-               JOIN albums al ON al.id = t.album_id \
-               LEFT JOIN artists ar ON ar.id = al.artist_id \
-               WHERE t.file_path IS NOT NULL AND t.file_path <> ''";
     let pistes: Vec<PisteVue> = state
         .backend
-        .query_many(sql, &[])
+        .query_many(&sql_albums_eclates(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
@@ -1744,6 +1761,10 @@ fn numeros_de_piste_de_l_album(state: &AppState, album_id: i64) -> std::collecti
 /// marqueurs, collections, champs repris) ; `404` album inconnu ; `400` même
 /// album des deux côtés ; `409 dossiers_differents`, `409 titres_differents`,
 /// `409 source_non_locale`, `409 paire_declaree_distincte`.
+///
+/// 🔴 `source_non_locale` n'est plus rendu par cette route seule : la garde est
+/// partagée avec `composer_coffret` et `merge_albums` depuis l'arbitrage de
+/// Bertrand du 27/09/2026 ([`super::albums_non_locaux`]).
 pub(super) async fn absorber_album(
     State(state): State<AppState>,
     Path((cible, doublon)): Path<(i64, i64)>,
@@ -1764,33 +1785,12 @@ pub(super) async fn absorber_album(
             format!("albums {cible} / {doublon}"),
         );
     };
-    let non_locales = {
-        let (p1, p2) = match state.backend.engine() {
-            Engine::Postgres => (
-                PostgresDialect.placeholder(1),
-                PostgresDialect.placeholder(2),
-            ),
-            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
-        };
-        state
-            .backend
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM albums WHERE id IN ({p1}, {p2}) AND COALESCE(source, 'local') <> 'local'"
-                ),
-                &[&cible as &dyn ToSqlValue, &doublon],
-            )
-            .ok()
-            .flatten()
-            .and_then(|r| r.first().and_then(|v| v.as_i64()))
-            .unwrap_or(0)
-    };
-    if non_locales > 0 {
-        return refus(
-            StatusCode::CONFLICT,
-            "source_non_locale",
-            "seuls deux albums de la bibliothèque locale se regroupent".to_string(),
-        );
+    // 🔴 LA garde de source, partagée avec `composer_coffret` et `merge_albums`
+    // (arbitrage de Bertrand du 27/09/2026). Elle vivait ici, en un seul
+    // exemplaire pour un seul des trois gestes ; elle est sortie dans
+    // `super::albums_non_locaux` pour que les trois rendent le même refus.
+    if super::albums_non_locaux(&state.backend, &[cible, doublon]) > 0 {
+        return super::refus_source_non_locale();
     }
     // Le SECOND indice de la phase 0 (#3396) : même pochette à l'octet près et
     // numéros de piste complémentaires. Il traverse volontairement les dossiers
@@ -2190,6 +2190,11 @@ pub(super) struct AlbumUpdate {
     /// Absent = « je n'y touche pas », et non « faux » : c'est ce qui permet à
     /// l'écran d'éditer le titre d'un album sans lui reprendre son drapeau.
     is_compilation: Option<bool>,
+    /// #5314 — « appliquer aussi aux pistes » : lève l'exception des
+    /// compilations aux genres différents
+    /// (`tune_core::db::genre_album_pistes`).
+    #[serde(default)]
+    apply_genre_to_tracks: bool,
 }
 
 pub(super) async fn update_album(
@@ -2202,6 +2207,7 @@ pub(super) async fn update_album(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let genre_avant = album.genre.clone();
 
     if let Some(ref v) = body.title {
         album.title = v.clone();
@@ -2259,6 +2265,20 @@ pub(super) async fn update_album(
             .marquer_edition_manuelle(id, &champs)
         {
             tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+        }
+        // #5314 — le genre CHANGÉ de l'album vaut pour ses pistes (Oxygen).
+        if body.apply_genre_to_tracks
+            || (body.genre.is_some()
+                && tune_core::db::genre_album_pistes::genre_change(
+                    genre_avant.as_deref(),
+                    album.genre.as_deref(),
+                ))
+        {
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                id,
+                body.apply_genre_to_tracks,
+            );
         }
     }
 
@@ -2351,6 +2371,8 @@ pub(super) async fn album_metadata_put(
     // l'utilisateur a tenu, il n'est pas une valeur qu'il tient.
     let mut body = body;
     body.remove(tune_core::db::album_metadata_repo::CLE_EDITION_MANUELLE);
+    // #5314 — pas plus que le marqueur de recopie du genre sur les pistes.
+    body.remove(tune_core::db::genre_album_pistes::CLE_GENRE_PISTES);
     if let Err(e) = repo.set_batch(id, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -2377,6 +2399,9 @@ pub(super) struct BatchAlbumUpdate {
     /// Métadonnées emploie : on coche les douze vignettes d'une compilation
     /// éclatée, et un seul appel les marque toutes.
     is_compilation: Option<bool>,
+    /// #5314 — voir [`AlbumUpdate::apply_genre_to_tracks`].
+    #[serde(default)]
+    apply_genre_to_tracks: bool,
 }
 
 pub(super) async fn batch_update_albums(
@@ -2412,6 +2437,7 @@ pub(super) async fn batch_update_albums(
             Ok(Some(a)) => a,
             _ => continue,
         };
+        let genre_avant = album.genre.clone();
         if let Some(ref g) = body.genre {
             album.genre = Some(g.clone());
         }
@@ -2461,6 +2487,20 @@ pub(super) async fn batch_update_albums(
                 && let Err(e) = meta_repo.marquer_edition_manuelle(id, &champs)
             {
                 tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+            }
+            // #5314 — même règle qu'à `update_album`, album par album.
+            if body.apply_genre_to_tracks
+                || (body.genre.is_some()
+                    && tune_core::db::genre_album_pistes::genre_change(
+                        genre_avant.as_deref(),
+                        album.genre.as_deref(),
+                    ))
+            {
+                tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                    &state.backend,
+                    id,
+                    body.apply_genre_to_tracks,
+                );
             }
         }
     }
@@ -2604,6 +2644,7 @@ mod tests_editions {
                 year: None,
                 label: None,
                 is_compilation: None,
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2638,6 +2679,7 @@ mod tests_editions {
                 artist_name: None,
                 label: None,
                 is_compilation: None,
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2678,6 +2720,7 @@ mod tests_editions {
                 artist_name: None,
                 label: None,
                 is_compilation: Some(true),
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -2712,6 +2755,7 @@ mod tests_editions {
                 year: None,
                 label: None,
                 is_compilation: Some(false),
+                apply_genre_to_tracks: false,
             }),
         )
         .await;
@@ -3436,20 +3480,34 @@ mod tests_tri_added_at {
 /// à plusieurs dossiers de disque » ferait relire une bibliothèque entière
 /// pour, dans l'immense majorité des cas, ne rien trouver : un coffret bien
 /// tagué a lui aussi des dossiers `CD1/`, `CD2/`, et n'a rien à réparer.
-const SQL_PISTES_ABIMEES: &str = "\
-    SELECT t.id, t.album_id, t.file_path, t.disc_number, t.track_number \
-    FROM tracks t \
-    WHERE t.album_id IN ( \
-        SELECT album_id FROM tracks \
-        WHERE album_id IS NOT NULL AND track_number IS NOT NULL \
-        GROUP BY album_id, COALESCE(disc_number, 1), track_number \
-        HAVING COUNT(*) > 1 \
-    ) AND t.file_path IS NOT NULL AND t.file_path <> ''";
+///
+/// 🔴 La bibliothèque **LOCALE** seulement, dans la sous-requête comme au
+/// dehors. Le prédicat était `t.file_path IS NOT NULL AND t.file_path <> ''`
+/// seul, ce qui prenait le chemin pour un substitut de « local » ; la
+/// sous-requête, elle, ne filtrait rien du tout, si bien qu'un album distant
+/// aux numéros en collision faisait entrer l'album entier dans le lot examiné.
+/// Les deux endroits portent donc le prédicat, et pour deux raisons : la
+/// justesse dehors, le coût dedans.
+fn sql_pistes_abimees() -> String {
+    let piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE;
+    format!(
+        "SELECT t.id, t.album_id, t.file_path, t.disc_number, t.track_number \
+         FROM tracks t \
+         WHERE t.album_id IN ( \
+             SELECT t2.album_id FROM tracks t2 \
+             WHERE t2.album_id IS NOT NULL AND t2.track_number IS NOT NULL \
+               AND {piste_locale_2} \
+             GROUP BY t2.album_id, COALESCE(t2.disc_number, 1), t2.track_number \
+             HAVING COUNT(*) > 1 \
+         ) AND {piste_locale} AND t.file_path IS NOT NULL AND t.file_path <> ''",
+        piste_locale_2 = tune_core::db::track_repo::sql::est_local("t2"),
+    )
+}
 
 fn pistes_abimees(state: &AppState) -> Vec<PisteAExaminer> {
     state
         .backend
-        .query_many(SQL_PISTES_ABIMEES, &[])
+        .query_many(&sql_pistes_abimees(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
@@ -3596,8 +3654,14 @@ pub(super) struct CoffretManuel {
 ///    dossier, ou des dossiers qui ne se ressemblent pas — lui échappe, quel
 ///    que soit son marqueur.
 ///
-/// Ce geste-ci ne suppose RIEN : c'est l'utilisateur qui désigne les albums,
-/// et l'ordre de sa liste est l'ordre des disques.
+/// Ce geste-ci ne suppose RIEN du RANGEMENT : c'est l'utilisateur qui désigne
+/// les albums, et l'ordre de sa liste est l'ordre des disques.
+///
+/// 🔴 Il suppose en revanche qu'ils sont **LOCAUX** (arbitrage de Bertrand du
+/// 27/09/2026) : `409 source_non_locale`, la garde même
+/// qu'[`absorber_album`] — composer un coffret finit par
+/// [`AlbumRepo::absorber`], et fusionner un album distant n'a pas de sens, le
+/// prochain rafraîchissement de sa source le défait.
 ///
 /// # Ce qu'il écrit
 ///
@@ -3662,6 +3726,18 @@ pub(super) async fn composer_coffret(
                     .into_response();
             }
         }
+    }
+    // 🔴 La bibliothèque LOCALE seulement — arbitrage de Bertrand du
+    // 27/09/2026. Composer un coffret, c'est fusionner des albums
+    // (`repo.absorber`, plus bas) après avoir réécrit leurs numéros de disque :
+    // le même geste qu'`absorber_album`, qui refusait déjà le distant. Les
+    // trois gestes rendent le même `409 source_non_locale`.
+    //
+    // APRÈS la boucle de lecture, donc après le 404 : un identifiant inconnu
+    // reste un identifiant inconnu, on ne le requalifie pas en refus de source.
+    // Et AVANT la première écriture, comme tout le reste de cette route.
+    if super::albums_non_locaux(&state.backend, &ids) > 0 {
+        return super::refus_source_non_locale();
     }
     let cible = ids[0];
     // Ce que chaque album tient déjà (renommages de pistes, disposition) : lu
@@ -3906,5 +3982,479 @@ pub(super) async fn defaire_coffret(
         Err(coffrets_auto::RefusDefaire::Base(e)) => {
             AppError::internal(format!("défaire le coffret {id} : {e}")).into_response()
         }
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+///
+/// Les deux sélections de l'écran métadonnées qui vivent dans ce fichier
+/// (`/albums/eclates` et `/albums/disques-abimes`) filtraient sur le CHEMIN DE
+/// FICHIER, pris pour un substitut de « local ». Les témoins exécutent la
+/// requête : une garde qui n'en comparerait que la chaîne serait satisfaite par
+/// sa propre définition.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état")
+    }
+
+    /// Un album et deux pistes, avec de vrais chemins et une source choisie.
+    ///
+    /// 🔴 C'est le cas ABSENT de la base de Bertrand : sur le .18, aucune des
+    /// 49 440 pistes `source = 'upnp'` ne porte de chemin. Sans le fabriquer
+    /// ici, le filtre par chemin et le filtre par source rendraient le même
+    /// résultat et le témoin ne prouverait rien.
+    fn album_de_source(s: &AppState, id: i64, titre: &str, dossier: &str, source: &str) {
+        let b = &s.backend;
+        let src = source.to_string();
+        let t = titre.to_string();
+        b.execute(
+            "INSERT INTO albums (id, title, source, year) VALUES (?1, ?2, ?3, 1990)",
+            &[&id as &dyn ToSqlValue, &t, &src],
+        )
+        .expect("album");
+        for n in 1..=2i64 {
+            let chemin = format!("{dossier}/{n:02}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number, disc_number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                &[
+                    &format!("p{id}-{n}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &src,
+                    &n,
+                ],
+            )
+            .expect("piste");
+        }
+    }
+
+    fn albums_rendus(s: &AppState, sql: &str) -> Vec<i64> {
+        s.backend
+            .query_many(sql, &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect()
+    }
+
+    /// 🔴 `/albums/eclates` : une piste non locale QUI PORTE UN CHEMIN n'entre
+    /// pas dans la sélection.
+    #[test]
+    fn eclates_ecarte_le_non_local_qui_porte_un_chemin() {
+        let s = etat();
+        album_de_source(&s, 1, "Kind of Blue", "/m/kob", "local");
+        album_de_source(&s, 2, "Kind of Blue", "/u/kob", "upnp");
+        let vus = albums_rendus(&s, &sql_albums_eclates());
+        assert!(
+            !vus.contains(&2),
+            "l'album 2 est `source = upnp` avec des chemins : il ne doit PAS \
+             entrer dans la sélection des albums éclatés — vus {vus:?}"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn eclates_garde_le_local() {
+        let s = etat();
+        album_de_source(&s, 1, "Kind of Blue", "/m/kob", "local");
+        album_de_source(&s, 2, "Kind of Blue", "/u/kob", "upnp");
+        let vus = albums_rendus(&s, &sql_albums_eclates());
+        assert!(
+            vus.contains(&1),
+            "l'album LOCAL 1 doit entrer dans la sélection — vus {vus:?}"
+        );
+    }
+
+    /// Les mêmes deux sens pour `/albums/disques-abimes`, qui ÉCRIT
+    /// `tracks.disc_number` : deux pistes en collision de chaque côté.
+    fn banc_abime(s: &AppState) {
+        for (id, dossier, source) in [(1i64, "/m/box", "local"), (2, "/u/box", "upnp")] {
+            album_de_source(s, id, "Box", dossier, source);
+            // Collision : les deux pistes se déclarent piste 1, disque 1.
+            let src = source.to_string();
+            s.backend
+                .execute(
+                    "UPDATE tracks SET track_number = 1 WHERE album_id = ?1 AND source = ?2",
+                    &[&id as &dyn ToSqlValue, &src],
+                )
+                .expect("collision");
+        }
+    }
+
+    #[test]
+    fn disques_abimes_ecarte_le_non_local_qui_porte_un_chemin() {
+        let s = etat();
+        banc_abime(&s);
+        let vus: Vec<i64> = s
+            .backend
+            .query_many(&sql_pistes_abimees(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            !vus.contains(&2),
+            "l'album 2 est `source = upnp` : ses pistes ne doivent PAS entrer \
+             dans le lot que la réparation va RÉÉCRIRE — vus {vus:?}"
+        );
+    }
+
+    #[test]
+    fn disques_abimes_garde_le_local() {
+        let s = etat();
+        banc_abime(&s);
+        let vus: Vec<i64> = s
+            .backend
+            .query_many(&sql_pistes_abimees(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(1).and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            vus.contains(&1),
+            "l'album LOCAL 1 doit rester examiné — vus {vus:?}"
+        );
+    }
+}
+
+/// Témoins de LA garde de source des trois gestes de fusion manuelle —
+/// arbitrage de Bertrand du 27/09/2026.
+///
+/// Les trois — `absorber_album`, `composer_coffret` et `merge_albums` —
+/// fusionnent des albums que l'utilisateur désigne à la main. Une seule refusait
+/// le distant, et **sans aucun témoin** : `source_non_locale` n'était assuré par
+/// rien avant ce module. `merge_albums` vit dans `routes::metadata`, son témoin
+/// est là-bas.
+#[cfg(test)]
+mod tests_garde_source_fusion_20260927 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état")
+    }
+
+    /// Deux albums de même titre, dans le MÊME dossier, aux numéros de piste
+    /// complémentaires : tout ce qu'`absorber_album` exige, la source mise à
+    /// part. Sans cela, un refus pourrait venir de `dossiers_differents` ou de
+    /// `titres_differents` et le témoin ne dirait rien de la source.
+    fn deux_albums(s: &AppState, source_du_second: &str) {
+        let b = &s.backend;
+        for (id, src, piste) in [(1i64, "local", 1i64), (2, source_du_second, 2)] {
+            let source = src.to_string();
+            b.execute(
+                "INSERT INTO albums (id, title, source) VALUES (?1, 'Kind of Blue', ?2)",
+                &[&id as &dyn ToSqlValue, &source],
+            )
+            .expect("album");
+            let chemin = format!("/m/kob/{piste:02}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number, disc_number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                &[
+                    &format!("p{id}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &source,
+                    &piste,
+                ],
+            )
+            .expect("piste");
+        }
+    }
+
+    async fn lire(r: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let code = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (
+            code,
+            serde_json::from_slice(&octets).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn albums_restants(s: &AppState) -> i64 {
+        s.backend
+            .query_one("SELECT COUNT(*) FROM albums", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1)
+    }
+
+    // -- `absorber_album` : la garde qui existait, désormais gardée ----------
+
+    #[tokio::test]
+    async fn absorber_refuse_un_album_non_local() {
+        let s = etat();
+        deux_albums(&s, "upnp");
+        let (code, v) = lire(absorber_album(State(s.clone()), Path((1, 2))).await).await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "l'album 2 est `source = upnp` : 409 attendu — rendu {v}"
+        );
+        assert_eq!(v["error"], "source_non_locale", "code du refus : {v}");
+        assert_eq!(
+            albums_restants(&s),
+            2,
+            "refusée, la fusion ne doit avoir supprimé aucun album"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, une garde qui refuse tout serait verte.
+    #[tokio::test]
+    async fn absorber_accepte_deux_albums_locaux() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let (code, v) = lire(absorber_album(State(s.clone()), Path((1, 2))).await).await;
+        assert_ne!(
+            v["error"], "source_non_locale",
+            "deux albums LOCAUX ne doivent jamais buter sur la garde de source — {v}"
+        );
+        assert_eq!(code, StatusCode::OK, "la fusion locale doit passer — {v}");
+    }
+
+    // -- `composer_coffret` : la garde ajoutée -------------------------------
+
+    #[tokio::test]
+    async fn composer_un_coffret_refuse_un_album_non_local() {
+        let s = etat();
+        deux_albums(&s, "upnp");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 2],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "l'album 2 est `source = upnp` : 409 attendu — rendu {v}"
+        );
+        assert_eq!(v["error"], "source_non_locale", "code du refus : {v}");
+        assert_eq!(
+            albums_restants(&s),
+            2,
+            "refusé, le geste ne doit avoir composé aucun coffret"
+        );
+        // 🔴 Et il ne doit RIEN avoir écrit : la garde est posée avant la
+        // renumérotation des disques, pas après.
+        let disques_touches = s
+            .backend
+            .query_one("SELECT COUNT(*) FROM tracks WHERE disc_number <> 1", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1);
+        assert_eq!(
+            disques_touches, 0,
+            "aucun numéro de disque ne doit avoir été réécrit avant le refus"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, une garde qui refuse tout serait verte.
+    #[tokio::test]
+    async fn composer_un_coffret_accepte_des_albums_locaux() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 2],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_ne!(
+            v["error"], "source_non_locale",
+            "deux albums LOCAUX ne doivent jamais buter sur la garde de source — {v}"
+        );
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "le coffret local doit se composer — {v}"
+        );
+        assert_eq!(v["absorbes"], 1, "le disque 2 doit avoir été absorbé — {v}");
+    }
+
+    /// 🔴 Un identifiant inconnu reste un 404, il n'est pas requalifié en refus
+    /// de source : la garde est posée APRÈS la lecture des albums.
+    #[tokio::test]
+    async fn un_album_inconnu_reste_un_404() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let corps = CoffretManuel {
+            album_ids: vec![1, 99],
+        };
+        let (code, v) = lire(composer_coffret(State(s.clone()), Json(corps)).await).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "rendu {v}");
+        assert_eq!(v["error"], "album_inconnu", "code du refus : {v}");
+    }
+
+    /// La garde elle-même, sur plus de deux identifiants — `composer_coffret` et
+    /// `merge_albums` en acceptent N, là où `absorber_album` n'en prend que deux.
+    #[test]
+    fn la_garde_compte_les_non_locaux_quel_qu_en_soit_le_nombre() {
+        let s = etat();
+        let b = &s.backend;
+        for (id, src) in [(1i64, "local"), (2, "local"), (3, "upnp"), (4, "qobuz")] {
+            let source = src.to_string();
+            b.execute(
+                "INSERT INTO albums (id, title, source) VALUES (?1, 'x', ?2)",
+                &[&id as &dyn ToSqlValue, &source],
+            )
+            .expect("album");
+        }
+        // Et une ligne ANCIENNE à `source` NULL : elle est LOCALE.
+        b.execute(
+            "INSERT INTO albums (id, title, source) VALUES (5, 'x', NULL)",
+            &[],
+        )
+        .expect("album hérité");
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[1, 2, 5]),
+            0,
+            "trois albums locaux, dont un à `source` NULL"
+        );
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[1, 2, 3, 4, 5]),
+            2,
+            "`upnp` et `qobuz` comptent, la ligne NULL non"
+        );
+        assert_eq!(
+            super::super::albums_non_locaux(&s.backend, &[]),
+            0,
+            "aucun identifiant : rien à refuser"
+        );
+    }
+}
+
+/// #5314 (Cyrille Moutia, fil « Filtres cumulatifs ») — un genre posé sur un
+/// album par l'une des routes d'écriture d'album doit être CE QUE la facette
+/// Genre d'Oxygen propose pour ses pistes. Joué par les routes elles-mêmes,
+/// comme le client : `PUT /library/albums/{id}`, `POST …/batch-update`,
+/// `PUT …/{id}/edition`, puis `GET /library/facets?fields=genre`.
+#[cfg(test)]
+mod tests_genre_pistes_5314 {
+    use super::*;
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let app = Router::new()
+            .nest("/library", crate::routes::library::router())
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Les valeurs de la facette Genre, triées.
+    async fn facette(state: &AppState) -> Vec<String> {
+        let (status, v) = request(
+            state,
+            "GET",
+            "/library/facets?fields=genre&limit=0",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let mut out: Vec<String> = v["genre"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|x| x["value"].as_str().map(str::to_string))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn banc() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'X', 1), (2, 'Y', 1), (3, 'Z', 1)",
+            &[],
+        )
+        .unwrap();
+        // Les genres des BALISES : ce qu'Oxygen montrait, quel que soit le
+        // genre posé à la Bibliothèque.
+        for (id, album, g, gs) in [
+            (1, 1, "Rock", r#"["Rock","Pop"]"#),
+            (2, 1, "Blues", r#"["Blues"]"#),
+            (3, 2, "Rock", r#"["Rock"]"#),
+            (4, 3, "Rock", r#"["Rock"]"#),
+        ] {
+            b.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, genre, genres) \
+                     VALUES ({id}, 'T{id}', {album}, 1, '/m/{id}.flac', '{g}', '{gs}')"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn chaque_route_d_ecriture_d_album_atteint_la_facette_d_oxygen() {
+        let state = banc();
+        assert_eq!(facette(&state).await, ["Blues", "Pop", "Rock"]);
+
+        let (s, _) = request(
+            &state,
+            "PUT",
+            "/library/albums/1",
+            json!({ "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = request(
+            &state,
+            "POST",
+            "/library/albums/batch-update",
+            json!({ "album_ids": [2], "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, v) = request(
+            &state,
+            "PUT",
+            "/library/albums/3/edition",
+            json!({ "genre": "Jazz" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+
+        assert_eq!(
+            facette(&state).await,
+            ["Jazz"],
+            "#5314 : la facette Genre d'Oxygen doit proposer le genre posé sur les albums, et lui seul"
+        );
     }
 }

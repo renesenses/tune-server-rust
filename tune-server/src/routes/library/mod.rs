@@ -224,6 +224,63 @@ pub(super) fn refus(
     ))
 }
 
+/// Combien, parmi ces albums, ne sont **pas** de la bibliothèque locale.
+///
+/// 🔴 LE prédicat des trois gestes de fusion manuelle — `absorber_album`
+/// (`POST /library/albums/{c}/absorber/{d}`), `composer_coffret`
+/// (`POST /library/albums/coffret`) et `merge_albums`
+/// (`POST /metadata/albums/merge`). Arbitrage de Bertrand du 27/09/2026 : les
+/// trois font le même geste, fusionner des albums que l'utilisateur désigne à
+/// la main, et une seule le refusait au distant. Les trois rendent désormais le
+/// même `409 source_non_locale`.
+///
+/// Écrit **une fois**, et `absorber_album` passe par ici comme les deux autres :
+/// trois copies divergeraient à la première correction. La forme est celle
+/// qu'`absorber_album` portait déjà — `COALESCE(source, 'local') <> 'local'`,
+/// identifiants **liés** — et sur deux identifiants elle rend exactement la
+/// requête d'avant.
+///
+/// ⚠️ Une panne SQL rend `0`, donc laisse passer. C'est le comportement
+/// qu'`absorber_album` avait déjà (`.ok().flatten()….unwrap_or(0)`) et il est
+/// conservé tel quel : la garde n'est pas un verrou, et un moteur muet ne doit
+/// pas bloquer un geste légitime — d'autant que la lecture des albums, juste
+/// avant, aurait échoué la première.
+pub(super) fn albums_non_locaux(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    ids: &[i64],
+) -> i64 {
+    use tune_core::db::backend::ToSqlValue;
+    if ids.is_empty() {
+        return 0;
+    }
+    let engine = backend.engine();
+    let marqueurs: Vec<String> = (1..=ids.len())
+        .map(|i| crate::routes::versions::marqueur(engine, i))
+        .collect();
+    let params: Vec<&dyn ToSqlValue> = ids.iter().map(|i| i as &dyn ToSqlValue).collect();
+    backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM albums WHERE id IN ({}) AND COALESCE(source, 'local') <> 'local'",
+                marqueurs.join(", ")
+            ),
+            &params,
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// LE refus des trois gestes de fusion manuelle : même code, même message.
+pub(super) fn refus_source_non_locale() -> axum::response::Response {
+    refus(
+        axum::http::StatusCode::CONFLICT,
+        "source_non_locale",
+        "seuls des albums de la bibliothèque locale se regroupent".to_string(),
+    )
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/artists", get(artists::list_artists))
