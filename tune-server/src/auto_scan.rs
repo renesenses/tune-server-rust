@@ -2951,3 +2951,7 @@ mod pochettes_disque_tests_5034;
 #[cfg(test)]
 #[path = "pochettes_cue_tests_5222.rs"]
 mod pochettes_cue_tests_5222;
+
+#[cfg(test)]
+#[path = "coffret_manuel_scan_tests_5319.rs"]
+mod coffret_manuel_scan_tests_5319;
