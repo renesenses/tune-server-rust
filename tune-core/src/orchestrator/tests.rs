@@ -8,6 +8,9 @@ use crate::event_bus::EventBus;
 use crate::outputs::mock::MockOutput;
 use std::sync::Arc;
 
+#[path = "radio_profondeur_tests.rs"]
+mod radio_profondeur_tests;
+
 #[tokio::test]
 async fn local_stream_watch_reports_only_an_unconsumed_live_session_once() {
     use crate::http::streamer::{AudioStreamer, StreamInfo};
@@ -7031,6 +7034,164 @@ async fn un_iso_sacd_demande_en_lecture_rend_un_motif_nomme() {
     );
 }
 
+/// #5297 — la piste d'une image SACD en DSD brut se RÉSOUT : le refus de
+/// #3234 ne vaut plus que pour ce que Tune ne sait pas lire. Une image DST
+/// garde un refus NOMMÉ, avec le motif du rapport de parcours.
+///
+/// Les pistes sont posées par l'écrivain du scan lui-même
+/// (`ecrire_les_iso_sacd`) : l'épreuve suit le chemin réel, de l'image aux
+/// lignes `tracks` puis à la résolution.
+#[tokio::test]
+async fn une_piste_d_iso_sacd_se_resout_et_une_image_dst_se_refuse_nommee() {
+    use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire};
+    let orch = test_orchestrator();
+    let dossier = tempfile::tempdir().unwrap();
+    let iso = dossier.path().join("Kind of Blue.iso");
+    let bornes = ecrire(&iso, &ImageFabriquee::deux_pistes());
+    let mut image_dst = ImageFabriquee::deux_pistes();
+    image_dst.stereo_dst = true;
+    let dst = dossier.path().join("Brothers in Arms.iso");
+    ecrire(&dst, &image_dst);
+
+    let isos = vec![crate::audio::sacd::IsoSacdLu {
+        chemin: iso.clone(),
+        disque: crate::audio::sacd::lire_disque(&iso).unwrap(),
+    }];
+    let mut bilan = crate::scanner::cue_bibliotheque::BilanCue::default();
+    crate::scanner::cue_bibliotheque::ecrire_les_iso_sacd(&orch.db, &isos, &mut bilan);
+    assert_eq!(bilan.pistes_creees, 2);
+
+    let repo = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let debut_ms = crate::audio::sacd::trames_en_ms(bornes[1].0) as i64;
+    let piste = repo
+        .get_by_cue_identity(&iso.to_string_lossy(), debut_ms)
+        .unwrap()
+        .expect("piste 2 écrite par le scan");
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Ce PC", Some("browser"), None)
+        .unwrap();
+
+    match orch
+        .resolve_local_track(&requete_locale_3234(zone_id, piste.id.unwrap()))
+        .await
+    {
+        // La durée annoncée est recalculée sur les octets WAV servis (#1132) :
+        // à la milliseconde près celle de la PISTE — jamais celle de l'image.
+        Ok(resolu) => {
+            let servie = resolu.duration_ms.expect("durée annoncée");
+            assert!(
+                (servie - piste.duration_ms).abs() <= 1,
+                "la durée servie ({servie} ms) doit être celle de la PISTE ({} ms)",
+                piste.duration_ms
+            );
+        }
+        Err(e) => panic!("une piste d'ISO SACD en DSD brut doit se résoudre : {e}"),
+    }
+
+    // Une ligne qui désigne une image DST (base d'avant, ajout à la main) :
+    // refus nommé, jamais un flux.
+    let mut ligne_dst = piste.clone();
+    ligne_dst.id = None;
+    ligne_dst.cue_media_path = Some(dst.to_string_lossy().into_owned());
+    let id_dst = repo.create(&ligne_dst).unwrap();
+    let erreur = match orch
+        .resolve_local_track(&requete_locale_3234(zone_id, id_dst))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("une image DST ne doit pas se résoudre en flux"),
+    };
+    assert_eq!(
+        erreur.strip_prefix("format_not_playable:"),
+        Some(crate::audio::sacd::MOTIF_ISO_SACD_DST),
+        "refus attendu, nommé : {erreur}"
+    );
+}
+
+/// #5297 — le DoP d'une piste d'ISO (sortie locale réglée « dop ») ne sert
+/// QUE la piste, à partir du déplacement demandé : ni le début du disque, ni
+/// la piste suivante. Les octets sont lus dans la session créée par la
+/// résolution, et comparés à l'encodeur DoP appliqué au DSD connu de la piste.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_dop_d_une_piste_iso_ne_sert_que_la_piste_depuis_le_deplacement() {
+    use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire, octets_attendus};
+    let orch = test_orchestrator();
+    let dossier = tempfile::tempdir().unwrap();
+    let iso = dossier.path().join("Kind of Blue.iso");
+    let bornes = ecrire(&iso, &ImageFabriquee::deux_pistes());
+    let isos = vec![crate::audio::sacd::IsoSacdLu {
+        chemin: iso.clone(),
+        disque: crate::audio::sacd::lire_disque(&iso).unwrap(),
+    }];
+    let mut bilan = crate::scanner::cue_bibliotheque::BilanCue::default();
+    crate::scanner::cue_bibliotheque::ecrire_les_iso_sacd(&orch.db, &isos, &mut bilan);
+
+    // La PREMIÈRE piste : sans la tranche, la piste 2 suivrait.
+    let (debut, fin) = bornes[0];
+    let piste = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .get_by_cue_identity(
+            &iso.to_string_lossy(),
+            crate::audio::sacd::trames_en_ms(debut) as i64,
+        )
+        .unwrap()
+        .unwrap();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC DoP", Some("local"), Some("local:dac-5297"))
+        .unwrap();
+    zones.update_dsd_mode(zone_id, "dop").unwrap();
+    let mut req = requete_locale_3234(zone_id, piste.id.unwrap());
+    req.output_device_id = Some("local:dac-5297".into());
+    // Un déplacement d'une trame dans la piste.
+    req.seek_ms = Some(crate::audio::sacd::trames_en_ms(debut + 1) as u64);
+
+    let resolu = match orch.resolve_local_track(&req).await {
+        Ok(r) => r,
+        Err(e) => panic!("le DoP d'une piste d'ISO doit se résoudre : {e}"),
+    };
+    assert_eq!(resolu.mime_type, "audio/wav");
+    assert_eq!(
+        resolu.sample_rate,
+        Some(176_400),
+        "DSD64 en DoP : 176,4 kHz"
+    );
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(resolu.stream_id.as_deref().unwrap())
+        .cloned()
+        .expect("session DoP");
+
+    let attendu =
+        crate::audio::dsd_to_dop::DsdToDoP::new(2, false).feed(&octets_attendus(debut + 1, fin));
+    let mut recu = Vec::new();
+    while recu.len() < 44 + attendu.len() {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), session.recv_chunk()).await {
+            Ok(Some(bloc)) => recu.extend(bloc),
+            _ => break,
+        }
+    }
+    // Rien de plus : la piste finie, le flux s'arrête.
+    let en_trop =
+        tokio::time::timeout(std::time::Duration::from_millis(500), session.recv_chunk()).await;
+    assert!(
+        !matches!(en_trop, Ok(Some(ref b)) if !b.is_empty()),
+        "des octets au-delà de la fin de la piste : la tranche n'est pas respectée"
+    );
+    assert_eq!(&recu[..4], b"RIFF");
+    assert_eq!(
+        recu.len(),
+        44 + attendu.len(),
+        "longueur du DoP de la piste"
+    );
+    assert!(
+        recu[44..] == attendu[..],
+        "le DoP servi n'est pas celui de la piste à partir du déplacement"
+    );
+}
+
 /// Témoin de #3234 : un FLAC de la bibliothèque se résout comme avant.
 ///
 /// Sans ce témoin, un refus trop large rendrait toute la bibliothèque
@@ -8662,6 +8823,67 @@ async fn la_portee_du_crossfeed_distingue_rien_ne_joue_de_la_piste_suivante_4680
     let portee = orch.refresh_zone_crossfeed_portee(muette).await;
     assert_eq!(portee, PorteeDuReglage::RienNeJoue);
     assert_eq!(portee.code(), "not_playing", "et surtout pas `next_track`");
+}
+
+/// #4680, moitié PURE — la bascule PURE sur une zone DLNA dont le flux porte
+/// un égaliseur relance le flux à la position courante : elle s'entend dans
+/// l'instant. La route répondait seulement `applied_live: false`, que la barre
+/// de transport traduisait « prendra effet à la piste suivante ».
+#[tokio::test]
+async fn la_portee_de_la_bascule_pure_distingue_la_relance_de_la_piste_suivante_4680() {
+    use crate::orchestrator::PorteeDuReglage;
+
+    // Zone réseau observée, égaliseur gravé dans le flux : relance programmée.
+    let (orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4680-pure")).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    regler_pure(&orch, zone_id, true);
+    let portee = orch.apply_audiophile_change_portee(zone_id).await;
+    assert_eq!(
+        portee,
+        PorteeDuReglage::Relance,
+        "le flux est relancé à la position courante : c'est `restart`, pas `next_track`"
+    );
+    assert_eq!(portee.code(), "restart");
+    assert!(
+        orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+        "la relance annoncée doit être réellement armée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    // Zone navigateur sans périphérique : position inconnue, la relance est
+    // refusée (#2595) — seule la piste suivante portera la bascule.
+    let (orch2, zone2, _dir2) = zone_qui_joue_un_flac(Some("browser"), None).await;
+    let orch2 = Arc::new(orch2);
+    armer_un_egaliseur_audible(&orch2, zone2);
+    regler_pure(&orch2, zone2, true);
+    assert_eq!(
+        orch2.apply_audiophile_change_portee(zone2).await,
+        PorteeDuReglage::PisteSuivante
+    );
+
+    // Zone réseau sans traitement : le flux est déjà conforme (#4004).
+    let (orch3, zone3, _dir3) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4680-pure-nu")).await;
+    let orch3 = Arc::new(orch3);
+    regler_pure(&orch3, zone3, true);
+    assert_eq!(
+        orch3.apply_audiophile_change_portee(zone3).await,
+        PorteeDuReglage::Immediate
+    );
+    // Le booléen historique reste vrai dans ce cas, et faux dans les autres.
+    assert!(orch3.apply_audiophile_change(zone3).await);
+
+    // Rien ne joue : rien à annoncer, surtout pas « piste suivante ».
+    let muette = ZoneRepo::with_backend(orch3.db.clone())
+        .create("Muette", Some("dlna"), Some("dlna:uuid-4680-pure-muette"))
+        .unwrap();
+    regler_pure(&orch3, muette, true);
+    let portee = orch3.apply_audiophile_change_portee(muette).await;
+    assert_eq!(portee, PorteeDuReglage::RienNeJoue);
+    assert_eq!(portee.code(), "not_playing");
 }
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
