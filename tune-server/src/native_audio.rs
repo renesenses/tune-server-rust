@@ -119,6 +119,10 @@ pub fn router() -> Router<AppState> {
             post(crate::catalogue_greffons_audio::install_from_catalog),
         )
         .route(
+            "/{id}/catalog",
+            get(crate::catalogue_greffons_audio::catalog_status),
+        )
+        .route(
             "/{id}/zones/{zone}",
             get(crate::routes::greffons_natifs_tiers::reglage_de_zone)
                 .put(crate::routes::greffons_natifs_tiers::regler_la_zone),

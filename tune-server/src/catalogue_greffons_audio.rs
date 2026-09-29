@@ -270,7 +270,13 @@ fn verifier_la_signature(octets: &[u8], signature: &str, cles: &[String]) -> Res
     }
 }
 
-async fn installer(state: &AppState, id: &str, tiers: bool, cible: &str) -> Result<Value, Refus> {
+/// La fiche du paquet de cette plateforme, vérifiée : elle décrit bien le
+/// greffon et le triplet demandés.
+async fn fiche_de_la_plateforme(
+    state: &AppState,
+    id: &str,
+    cible: &str,
+) -> Result<FichePaquet, Refus> {
     let identifiants = crate::routes::support::identifiants_mozaiklabs(
         &SettingsRepo::with_backend(state.backend.clone()),
     );
@@ -285,6 +291,92 @@ async fn installer(state: &AppState, id: &str, tiers: bool, cible: &str) -> Resu
             fiche.id, fiche.target
         )));
     }
+    Ok(fiche)
+}
+
+/// `candidate` est-elle PLUS RÉCENTE que `installee` ? Comparaison des
+/// segments numériques (`0.10.0` > `0.9.3`) ; un segment non numérique se
+/// compare comme texte. Deux versions égales ne sont pas une mise à jour.
+fn plus_recente(candidate: &str, installee: &str) -> bool {
+    let segments = |v: &str| -> Vec<String> {
+        v.trim()
+            .trim_start_matches('v')
+            .split(['.', '-', '+'])
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (segments(candidate), segments(installee));
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).map(String::as_str).unwrap_or("0");
+        let y = b.get(i).map(String::as_str).unwrap_or("0");
+        let ordre = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => x.cmp(y),
+        };
+        if ordre != std::cmp::Ordering::Equal {
+            return ordre == std::cmp::Ordering::Greater;
+        }
+    }
+    false
+}
+
+/// `GET /api/v1/audio-plugins/{id}/catalog` (administrateur) : ce que le
+/// catalogue publie pour la plateforme de CE serveur, comparé à ce qui est
+/// installé. Ne télécharge rien, n'installe rien.
+///
+/// `available: false` + `reason: "no_package_for_target"` (200) quand le
+/// greffon existe au catalogue mais pas pour ce triplet : la carte l'affiche
+/// grisée, sans bouton. `update_available` n'est vrai que pour un greffon
+/// installé depuis le catalogue dont la version est plus ancienne ; la mise à
+/// jour passe par `install-from-catalog`, jamais d'elle-même.
+pub async fn catalog_status(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = crate::native_audio::check_slot(&state, &id).await {
+        return response;
+    }
+    let cible = tune_plugin_native::package::host_target();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let installe = settings
+        .get(&format!("plugin_{id}_installed"))
+        .is_ok_and(|v| v.as_deref() == Some("true"));
+    let version_installee = settings.get(&format!("plugin_{id}_version")).ok().flatten();
+    match fiche_de_la_plateforme(&state, &id, cible).await {
+        Ok(fiche) => {
+            let mise_a_jour = installe
+                && version_installee
+                    .as_deref()
+                    .is_some_and(|v| plus_recente(&fiche.version, v));
+            Json(json!({
+                "id": id,
+                "target": cible,
+                "available": true,
+                "latest_version": fiche.version,
+                "installed": installe,
+                "installed_version": version_installee,
+                "update_available": mise_a_jour,
+            }))
+            .into_response()
+        }
+        Err(Refus::PasDePaquetPourLaPlateforme) => Json(json!({
+            "id": id,
+            "target": cible,
+            "available": false,
+            "reason": "no_package_for_target",
+            "latest_version": null,
+            "installed": installe,
+            "installed_version": version_installee,
+            "update_available": false,
+        }))
+        .into_response(),
+        Err(refus) => refus.en_reponse(&id, cible),
+    }
+}
+
+async fn installer(state: &AppState, id: &str, tiers: bool, cible: &str) -> Result<Value, Refus> {
+    let fiche = fiche_de_la_plateforme(state, id, cible).await?;
     let octets = telecharger(&state.http_client, &fiche.url).await?;
     let somme = format!("{:x}", Sha256::digest(&octets));
     if !somme.eq_ignore_ascii_case(fiche.sha256.trim()) {
@@ -422,6 +514,8 @@ mod tests {
         /// Refuse le Bearer (compte SSO sans Premium) et accepte la clé.
         bearer_refuse: bool,
         base: Arc<Mutex<String>>,
+        /// La version que la fiche annonce ; modifiable en cours de test.
+        version: Arc<Mutex<String>>,
     }
 
     async fn site_factice(catalogue: Catalogue, bearer_refuse: bool) -> Site {
@@ -430,6 +524,7 @@ mod tests {
             vus: Arc::default(),
             bearer_refuse,
             base: Arc::default(),
+            version: Arc::new(Mutex::new("0.3.1".to_string())),
         };
         let pour_la_fiche = site.clone();
         let pour_le_paquet = site.clone();
@@ -474,9 +569,10 @@ mod tests {
                                     signature, sha256, ..
                                 } => {
                                     let base = site.base.lock().unwrap().clone();
+                                    let version = site.version.lock().unwrap().clone();
                                     Json(json!({
                                         "id": id,
-                                        "version": "0.3.1",
+                                        "version": version,
                                         "target": q.get("target").cloned().unwrap_or_default(),
                                         "url": format!("{base}/paquets/{id}"),
                                         "sha256": sha256,
@@ -834,5 +930,119 @@ mod tests {
         let (status, corps) = installer_par_la_route(&app, "catalogue-essai-anonyme").await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{corps}");
         assert_eq!(corps["error"], "not_connected", "{corps}");
+    }
+
+    async fn lire_le_catalogue(app: &axum::Router, id: &str) -> (StatusCode, Value) {
+        let reponse = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/audio-plugins/{id}/catalog"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&octets).unwrap_or(Value::Null),
+        )
+    }
+
+    #[test]
+    fn comparaison_des_versions() {
+        assert!(plus_recente("0.4.0", "0.3.1"));
+        assert!(plus_recente("0.10.0", "0.9.3"));
+        assert!(plus_recente("1.0", "0.99.99"));
+        assert!(!plus_recente("0.3.1", "0.3.1"));
+        assert!(!plus_recente("0.3.0", "0.3.1"));
+        assert!(!plus_recente("0.3", "0.3.0"));
+    }
+
+    /// Décision de Bertrand (29/09) : la carte SIGNALE une nouvelle version,
+    /// l'utilisateur met à jour d'un geste ; rien ne s'installe tout seul.
+    #[tokio::test]
+    async fn le_catalogue_signale_une_mise_a_jour_et_la_route_d_installation_la_fait() {
+        let id = "catalogue-essai-maj";
+        let site = site_factice(fiche_signee(id), false).await;
+        let base = site.base.lock().unwrap().clone();
+        let (state, app) = serveur(&base, true, false).await;
+
+        // Pas encore installé : disponible, pas de mise à jour.
+        let (status, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{etat}");
+        assert_eq!(etat["available"], true, "{etat}");
+        assert_eq!(etat["installed"], false, "{etat}");
+        assert_eq!(etat["latest_version"], "0.3.1", "{etat}");
+        assert_eq!(etat["update_available"], false, "{etat}");
+        assert_eq!(etat["target"], tune_plugin_native::package::host_target());
+
+        let (status, corps) = installer_par_la_route(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{corps}");
+        let (_, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(etat["installed_version"], "0.3.1", "{etat}");
+        assert_eq!(etat["update_available"], false, "{etat}");
+
+        // Le catalogue publie 0.4.0 : signalé, PAS installé.
+        *site.version.lock().unwrap() = "0.4.0".to_string();
+        let (_, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(etat["latest_version"], "0.4.0", "{etat}");
+        assert_eq!(etat["update_available"], true, "{etat}");
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert_eq!(
+            settings
+                .get(&format!("plugin_{id}_version"))
+                .unwrap()
+                .as_deref(),
+            Some("0.3.1"),
+            "la lecture du catalogue a installé la mise à jour"
+        );
+
+        // « Mettre à jour » = la même route d'installation.
+        let (status, corps) = installer_par_la_route(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{corps}");
+        assert_eq!(corps["version"], "0.4.0", "{corps}");
+        let (_, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(etat["installed_version"], "0.4.0", "{etat}");
+        assert_eq!(etat["update_available"], false, "{etat}");
+    }
+
+    /// Plateforme sans paquet : un ÉTAT (200, `available: false`), pas une
+    /// panne ; la carte s'affiche grisée avec la raison.
+    #[tokio::test]
+    async fn le_catalogue_dit_la_plateforme_sans_paquet() {
+        let id = "catalogue-essai-etat-plateforme";
+        let site = site_factice(
+            Catalogue::Refus(
+                404,
+                json!({"error": "no_package_for_target", "targets": []}),
+            ),
+            false,
+        )
+        .await;
+        let base = site.base.lock().unwrap().clone();
+        let (_state, app) = serveur(&base, true, false).await;
+        let (status, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{etat}");
+        assert_eq!(etat["available"], false, "{etat}");
+        assert_eq!(etat["reason"], "no_package_for_target", "{etat}");
+        assert_eq!(etat["target"], tune_plugin_native::package::host_target());
+    }
+
+    /// Contre-épreuve : Free, la lecture du catalogue est refusée sans
+    /// appeler le site.
+    #[tokio::test]
+    async fn le_catalogue_refuse_free_sans_appeler_le_site() {
+        let id = "catalogue-essai-etat-free";
+        let site = site_factice(fiche_signee(id), false).await;
+        let base = site.base.lock().unwrap().clone();
+        let (_state, app) = serveur(&base, false, false).await;
+        let (status, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{etat}");
+        assert!(site.vus.lock().unwrap().is_empty(), "le site a été appelé");
     }
 }
