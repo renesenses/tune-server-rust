@@ -724,13 +724,16 @@ pub fn lire_entier(chemin: &str, plafond: u64) -> io::Result<Vec<u8>> {
 
 /// Les extensions qu'une image peut livrer au catalogue.
 ///
-/// Ce sont les formats que `decode.rs` confie à symphonia — donc lisibles
-/// depuis un simple `Read + Seek` — et dont lofty lit les balises de même.
-/// AIFF, DSF, DFF, APE, WavPack, Opus et Matroska ont leurs lecteurs propres,
-/// ouverts PAR CHEMIN : dans une image, ils sont comptés et nommés dans le
-/// rapport, sans devenir des pistes impossibles à jouer.
-pub const EXTENSIONS_AUDIO_DANS_IMAGE: &[&str] =
-    &["flac", "mp3", "m4a", "alac", "ogg", "oga", "wav"];
+/// Ce sont les formats que `decode.rs` sait lire depuis un `Read + Seek` :
+/// ceux qu'il confie à symphonia, et — depuis que leurs lecteurs propres
+/// ouvrent le fichier par [`ouvrir_fichier`] et non plus par `File::open` —
+/// AIFF, DSF, DFF, APE, WavPack, Opus et Matroska. Tout autre format de
+/// `LIBRARY_AUDIO_EXTENSIONS` trouvé dans une image serait compté et nommé
+/// dans le rapport, sans devenir une piste impossible à jouer.
+pub const EXTENSIONS_AUDIO_DANS_IMAGE: &[&str] = &[
+    "flac", "mp3", "m4a", "alac", "ogg", "oga", "wav", "aiff", "aif", "aifc", "dsf", "dff", "ape",
+    "wv", "opus", "mkv", "mka", "webm", "weba",
+];
 
 /// Clé de rapport des fichiers audio d'une image dont le format n'est pas
 /// livrable depuis l'image (voir [`EXTENSIONS_AUDIO_DANS_IMAGE`]).
@@ -862,6 +865,69 @@ pub fn ouvrir_si_virtuel(chemin: &Path) -> Option<io::Result<LecteurInterne>> {
     decouper(&texte).map(|(image, interne)| ouvrir_dans(&image, &interne))
 }
 
+/// Un fichier de piste ouvert, sur le disque ou dans une image : ce que les
+/// lecteurs propres à un format (AIFF, DSF, DFF, APE, WavPack, Opus, Matroska)
+/// ouvrent à la place d'un `File`, pour lire une image comme un dossier.
+#[derive(Debug)]
+pub enum FichierSource {
+    Disque(File),
+    Image(LecteurInterne),
+}
+
+impl FichierSource {
+    /// La longueur du fichier (celle du fichier interne pour une image).
+    pub fn longueur(&self) -> io::Result<u64> {
+        match self {
+            Self::Disque(f) => f.metadata().map(|m| m.len()),
+            Self::Image(l) => Ok(l.taille()),
+        }
+    }
+}
+
+impl Read for FichierSource {
+    fn read(&mut self, tampon: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Disque(f) => f.read(tampon),
+            Self::Image(l) => l.read(tampon),
+        }
+    }
+}
+
+impl Seek for FichierSource {
+    fn seek(&mut self, depuis: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Disque(f) => f.seek(depuis),
+            Self::Image(l) => l.seek(depuis),
+        }
+    }
+}
+
+impl symphonia::core::io::MediaSource for FichierSource {
+    fn is_seekable(&self) -> bool {
+        match self {
+            Self::Disque(f) => symphonia::core::io::MediaSource::is_seekable(f),
+            Self::Image(_) => true,
+        }
+    }
+    fn byte_len(&self) -> Option<u64> {
+        match self {
+            Self::Disque(f) => symphonia::core::io::MediaSource::byte_len(f),
+            Self::Image(l) => Some(l.taille()),
+        }
+    }
+}
+
+/// Ouvre `chemin` : le fichier interne d'une image si le chemin est virtuel,
+/// le fichier du disque sinon — `File::open` inchangé pour tout chemin
+/// ordinaire.
+pub fn ouvrir_fichier<P: AsRef<Path>>(chemin: P) -> io::Result<FichierSource> {
+    let chemin = chemin.as_ref();
+    match ouvrir_si_virtuel(chemin) {
+        Some(lecteur) => lecteur.map(FichierSource::Image),
+        None => File::open(chemin).map(FichierSource::Disque),
+    }
+}
+
 /// Lit en entier (au plus 64 Mio) le fichier interne si `chemin` est
 /// virtuel ; `None` sinon.
 pub fn lire_si_virtuel(chemin: &Path) -> Option<io::Result<Vec<u8>>> {
@@ -922,3 +988,6 @@ mod tests;
 
 #[cfg(test)]
 mod epreuves_5299;
+
+#[cfg(test)]
+mod epreuves_formats_5299;
