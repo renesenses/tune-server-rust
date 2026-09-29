@@ -159,6 +159,13 @@ pub struct AppState {
     /// `POST /plugins/{name}/install` checks a name against, so it can refuse
     /// one that names nothing this binary carries (#2132).
     pub plugin_names: Arc<OnceLock<Vec<String>>>,
+    /// Les `setup()` en erreur (#5403) — un greffon coupé à la borne reste
+    /// listé par le gestionnaire, en erreur « démarrage trop long », et
+    /// `POST /plugins/{name}/retry` le relance. Le même `Arc` que tient le
+    /// chargeur ([`tune_core::plugin_sdk::PluginLoader::setup_report`]),
+    /// pris à la construction : les routes le lisent sans verrouiller
+    /// [`Self::plugins`], qu'un nouvel essai tient jusqu'à la borne.
+    pub plugin_setup_report: Arc<std::sync::Mutex<tune_core::plugin_sdk::PluginSetupReport>>,
     /// Loaded WASM plugins (P2 of the plugin ABI). Published once by
     /// [`crate::plugins_host::load_wasm_plugins`] at startup and read by the
     /// `/api/v1/plugins/{id}/…` route mount. Gated behind `plugins-wasm`, so
@@ -488,11 +495,9 @@ impl AppState {
         ));
         skin_manager.ensure_dirs();
 
-        let plugins = Arc::new(Mutex::new(crate::plugins::build_loader(
-            &event_bus,
-            backend.clone(),
-            license.clone(),
-        )));
+        let loader = crate::plugins::build_loader(&event_bus, backend.clone(), license.clone());
+        let plugin_setup_report = loader.setup_report();
+        let plugins = Arc::new(Mutex::new(loader));
 
         Ok(Self {
             db: sqlite_db,
@@ -535,6 +540,7 @@ impl AppState {
             plugin_info: Arc::new(OnceLock::new()),
             plugin_available: Arc::new(OnceLock::new()),
             plugin_names: Arc::new(OnceLock::new()),
+            plugin_setup_report,
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]

@@ -84,6 +84,9 @@ mod concerts_plugin;
 mod dj_plugin;
 #[path = "plugin_routes.rs"]
 mod plugin_routes;
+// #5403 — le greffon coupé à la borne reste visible, et se réessaie.
+#[path = "greffon_coupe_reessayer_5403.rs"]
+mod greffon_coupe_reessayer_5403;
 // #4863 — le greffon `cd` au catalogue (feature `cd`, dans `default`).
 #[cfg(feature = "cd")]
 #[path = "cd_catalogue_4863.rs"]
