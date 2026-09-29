@@ -142,26 +142,26 @@ fn seul_le_fil_en_titre_declare_sa_chaine_epuisee() {
     assert!(!doit_declarer_chaine_epuisee(true, 8, 7));
 }
 
-/// Une sortie exclusive dont le bras ne consomme jamais le `next_media` mis en
-/// réserve (ASIO, CoreAudio « hog ») ne devient pas enchaînable parce que sa
-/// boucle est vivante. Verrou anti-régression sur le correctif de DEvir (ASIO
-/// Fireface).
+/// La sonde d'une sortie exclusive suit le bras emprunté, et une chaîne
+/// déclarée épuisée l'éteint. Verrou anti-régression sur le correctif de DEvir
+/// (ASIO Fireface) : une boucle vivante ne rend pas enchaînable un bras qui ne
+/// consomme pas le `next_media` mis en réserve.
 ///
-/// #5204 : WASAPI exclusif, lui, enchaîne désormais à format égal — voir
-/// `gapless_exclusif_5204.rs`. La règle ne se lit donc plus sur
-/// `exclusive_mode` seul, mais sur le bras que `play_url` emprunte.
+/// #5204 : WASAPI exclusif, puis ASIO exclusif (route native), enchaînent
+/// désormais à format égal — voir `gapless_exclusif_5204.rs` et
+/// `gapless_asio_5204.rs` ; #5451 : CoreAudio « hog » aussi
+/// (`gapless_coreaudio_5451.rs`). La règle ne se lit donc plus sur
+/// `exclusive_mode` seul, mais sur le bras que `play_url` emprunte ; et la
+/// route traitée d'ASIO, qui n'enchaîne pas, lève `chain_exhausted` dès
+/// l'ouverture.
 #[test]
-fn une_sortie_exclusive_asio_ou_coreaudio_reste_non_enchainable() {
+fn la_sonde_d_une_sortie_exclusive_suit_le_bras_et_sa_chaine() {
     use super::enchainement_exclusif::{bras_de_cette_plateforme, bras_de_lecture};
-    for bras in [
-        bras_de_lecture("windows", true, true, "asio"),
-        bras_de_lecture("macos", false, true, "auto"),
-    ] {
-        assert!(
-            !bras.sait_enchainer(),
-            "{bras:?} : boucle dédiée qui sort à l'EOF sans consommer next_media"
-        );
-    }
+    let bras = bras_de_lecture("macos", false, true, "auto");
+    assert!(
+        bras.sait_enchainer(),
+        "#5451 — {bras:?} : le bras consomme next_media à format égal"
+    );
     let sortie = LocalOutput::with_options("Fireface ASIO".to_string(), true, "asio");
     sortie.set_chain_exhausted_for_test(false);
     assert_eq!(
@@ -169,6 +169,10 @@ fn une_sortie_exclusive_asio_ou_coreaudio_reste_non_enchainable() {
         bras_de_cette_plateforme(true, "asio").sait_enchainer(),
         "remettre la sonde à zéro ne doit JAMAIS rendre enchaînable un bras qui ne l'est pas"
     );
+    // Une chaîne déclarée épuisée (route traitée d'ASIO, fin de chaîne) éteint
+    // la sonde, quel que soit le bras.
+    sortie.set_chain_exhausted_for_test(true);
+    assert!(!sortie.supports_internal_gapless());
 }
 
 // -----------------------------------------------------------------------

@@ -40,12 +40,24 @@
 //! `refus_exclusif_dit_sa_cause_i3108`, `backend_fallback_tests`) le relisent
 //! sur ce qu'il fait maintenant ; l'empreinte du chemin décoder → étage →
 //! puits est tenue par `empreinte_coreaudio_f70496.rs`, sur Shrek.
+//!
+//! #5451 — le bras enchaîne. Jusqu'ici il lisait sa piste jusqu'à l'EOF puis
+//! rendait la main sans consommer le `next_media` préparé : le sondeur
+//! relançait la suivante par `play_url`, qui relâchait le mode « hog » puis
+//! rouvrait le périphérique AU MÊME FORMAT — un blanc entre deux pistes d'un
+//! même album. À la fin de flux, la piste suivante de même format entre
+//! désormais dans le MÊME anneau, lue par la MÊME boucle commune
+//! (`poursuivre_la_chaine_par_la_boucle`, `chaine_par_la_boucle.rs`, jugée
+//! sur Shrek) ; à format différent, la chaîne rend la main et la fin
+//! naturelle rouvre le périphérique au nouveau format, comme avant.
 
 // ------- Exclusive mode path (macOS only) -------
 
 use super::backend::{
     BackendLocal, DemandeDOuverture, Observation, Puits, RefusDOuverture, Vidage,
 };
+use super::chaine_native::{FinDeChaine, ReserveHttp};
+use super::chaine_par_la_boucle::poursuivre_la_chaine_par_la_boucle;
 use super::*;
 use crate::outputs::coreaudio_exclusive::ExclusiveOutput;
 
@@ -90,6 +102,16 @@ pub(super) struct EntreesCoreAudio {
     pub(super) pure_bypass: Arc<AtomicBool>,
     pub(super) mono_downmix: Arc<AtomicBool>,
     pub(super) dop_active: Arc<AtomicBool>,
+    /// #5451 — la réserve de `set_next_media`, que le bras consomme pour
+    /// enchaîner à format égal sans rouvrir le périphérique, et ce qu'il
+    /// publie à la zone quand il enchaîne (mêmes champs que les bras Windows).
+    pub(super) next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    pub(super) chain_exhausted: Arc<AtomicBool>,
+    pub(super) current_uri: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) track_title: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) duration_ms: Arc<AtomicU64>,
+    pub(super) seek_offset_ms: Arc<AtomicU64>,
 }
 
 /// Le puits du bras CoreAudio : l'anneau flottant de l'`ExclusiveOutput`, que
@@ -325,8 +347,9 @@ impl<'a> BackendLocal<'a> for BackendCoreAudio<'a> {
 }
 
 /// Joue la piste sur CoreAudio en mode exclusif (hog), au format source,
-/// jusqu'à la fin du flux ou l'ordre d'arrêt. Terminal : quand il rend, le
-/// fil de lecture n'a plus rien à faire.
+/// jusqu'à la fin du flux ou l'ordre d'arrêt — puis, depuis #5451, les pistes
+/// suivantes de même format, dans le même anneau. Terminal : quand il rend,
+/// le fil de lecture n'a plus rien à faire.
 pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     let EntreesCoreAudio {
         device_name,
@@ -360,6 +383,13 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         pure_bypass,
         mono_downmix,
         dop_active,
+        next_media,
+        chain_exhausted,
+        current_uri,
+        track_title,
+        track_artist,
+        duration_ms,
+        seek_offset_ms,
     } = entrees;
     // `frame_bytes` était la largeur de trame que la boucle propre du bras
     // recalculait à chaque lecture ; l'étage la déduit de `spec`.
@@ -557,14 +587,75 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         }
     }
     total_frames_fed = compteurs.total_frames_fed;
+
+    // #5451 — à la fin de flux, la piste préparée par `set_next_media` entre
+    // dans le MÊME anneau si elle a le même format (cadence, profondeur,
+    // canaux) : le périphérique reste ouvert en mode « hog », aucun blanc.
+    // Son flux est lu par la même boucle commune (rôle `PisteEnchainee`). À
+    // format différent, la chaîne rend la main : la piste se termine et la
+    // fin naturelle rouvre le périphérique au nouveau format, comme avant.
+    // Le geste de fin de flux de chaque piste (la sonde 24 bits incomplète
+    // est rapportée), la dernière comprise, est fait par la poursuite.
+    if http_eof_excl {
+        let producteur_enchaine = BoucleProducteur {
+            role: RoleDeLaBoucle::PisteEnchainee,
+            debut_du_flux: std::time::Instant::now(),
+            ..producteur
+        };
+        let mut reserve = ReserveHttp {
+            force_silent: &force_silent,
+            position_ms: &position_ms,
+            next_media: &next_media,
+            en_cours: None,
+            current_uri: &current_uri,
+            track_title: &track_title,
+            track_artist: &track_artist,
+            duration_ms: &duration_ms,
+            seek_offset_ms: &seek_offset_ms,
+            track_ended_naturally: &track_ended_naturally,
+            track_ended_generation: &track_ended_generation,
+            dop_active: &dop_active,
+            volume: &volume,
+            user_volume: &user_volume_ref,
+            rg_factor: &rg_factor_ref,
+        };
+        let issue = poursuivre_la_chaine_par_la_boucle(
+            &mut reserve,
+            &mut etage,
+            &mut *puits,
+            &producteur_enchaine,
+            &mut read_buf,
+            |lecteur| lecteur,
+            total_frames_fed,
+        );
+        total_frames_fed = issue.trames;
+        http_eof_excl = issue.http_eof;
+        if issue.pistes_enchainees > 0 || issue.fin == FinDeChaine::FormatDifferent {
+            info!(
+                device = %device_name,
+                pistes_enchainees = issue.pistes_enchainees,
+                fin = ?issue.fin,
+                "local_audio_coreaudio_exclusive_chain_ended"
+            );
+        }
+    }
     // La piste n'a PAS fini sur un puits mort : `http_eof_excl` reste
     // faux, donc aucune fin naturelle n'est signalée et la file n'avance
     // pas vers un morceau qui heurterait le même périphérique mort — et
     // rien de plus n'est rendu à un rappel qui ne tire plus.
     let feed_stalled = backend.puits_bloque();
 
-    if http_eof_excl {
-        report_incomplete_local_pcm_probe(etage.pcm_kind, etage.en_attente.len());
+    // La chaîne est finie : ce fil n'enchaînera plus rien. Le DIRE au
+    // sondeur, qui relit la capacité pendant qu'il attend (#1919, même règle
+    // que les bras Windows et le partagé) — sauf si une lecture plus récente
+    // nous a supplantés : la sonde appartient alors déjà au fil suivant.
+    if doit_declarer_chaine_epuisee(
+        force_silent.load(Ordering::Relaxed),
+        play_generation.load(Ordering::SeqCst),
+        my_generation,
+    ) {
+        chain_exhausted.store(true, Ordering::SeqCst);
+        debug!("local_audio_gapless_chain_exhausted");
     }
 
     // Fin de piste : rendre au périphérique ce que le convolveur

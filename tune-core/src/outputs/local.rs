@@ -443,9 +443,20 @@ mod etage_natif;
 // (partagée avec le chemin cpal). Pur, compilé partout.
 mod enchainement_exclusif;
 // #5204 — la boucle d'un bras natif exclusif et son enchaînement, générique
-// sur la source : jugée sur Shrek avec des pistes en mémoire.
-#[cfg(any(target_os = "windows", test))]
+// sur la source : jugée sur Shrek avec des pistes en mémoire. #5451 : sa
+// réserve et sa frontière servent aussi le bras CoreAudio (macOS).
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod chaine_native;
+// #5204 — la route native du bras ASIO et son enchaînement par la boucle
+// commune, sortis de `bras_asio.rs` (que seule l'étape « ASIO » de la CI
+// compile) pour être jugés sur Shrek. #5451 : la même poursuite enchaîne les
+// pistes du bras CoreAudio exclusif (macOS).
+#[cfg(any(
+    all(target_os = "windows", feature = "asio"),
+    target_os = "macos",
+    test
+))]
+mod chaine_par_la_boucle;
 
 // REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
 // partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
@@ -4479,10 +4490,11 @@ impl OutputTarget for LocalOutput {
 
     /// La capacité suit le BRAS que `play_url` emprunte réellement
     /// ([`bras_de_lecture`]) : le chemin cpal partagé et, depuis #5204, WASAPI
-    /// exclusif enchaînent la piste préparée sans refermer le périphérique.
-    /// ASIO et CoreAudio exclusifs sortent encore à l'EOF sans consommer
-    /// `next_media` : ils ne peuvent pas enchaîner, et le sondeur doit
-    /// retomber sur l'avance de fin naturelle. Avant #5204 la réponse était
+    /// et ASIO exclusifs enchaînent la piste préparée sans refermer le
+    /// périphérique (ASIO sur sa route native ; sa route traitée lève
+    /// `chain_exhausted` dès l'ouverture). CoreAudio exclusif aussi depuis
+    /// #5451, à format égal (sinon il rend la main et la fin naturelle
+    /// rouvre le périphérique au nouveau format). Avant #5204 la réponse était
     /// `!exclusive_mode` : WASAPI exclusif perdait le gapless même entre deux
     /// pistes de même format (Jean Valjean, fil 1890).
     ///
@@ -5517,6 +5529,15 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     dop_active,
+                    // #5451 — le bras consomme la réserve et enchaîne à
+                    // format égal, sans rouvrir le périphérique.
+                    next_media: next_media_ref,
+                    chain_exhausted: chain_exhausted_ref,
+                    current_uri: uri_ref,
+                    track_title: title_ref,
+                    track_artist: artist_ref,
+                    duration_ms: duration_ms_arc,
+                    seek_offset_ms: seek_offset_arc,
                 });
                 return;
             }
@@ -5561,6 +5582,15 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     dop_active,
+                    // #5204 — la route native consomme la réserve et enchaîne
+                    // à format égal, sans refermer le pilote.
+                    next_media: next_media_ref,
+                    chain_exhausted: chain_exhausted_ref,
+                    current_uri: uri_ref,
+                    track_title: title_ref,
+                    track_artist: artist_ref,
+                    duration_ms: duration_ms_arc,
+                    seek_offset_ms: seek_offset_arc,
                 });
                 return;
             }
@@ -6990,6 +7020,15 @@ mod gapless_pure_reechantillonne_5416;
 // refermer le flux ; sinon elle rouvre le périphérique.
 #[cfg(test)]
 mod gapless_exclusif_5204;
+
+// #5204, seconde tranche — ASIO exclusif : la route native enchaîne à format
+// égal par la boucle commune, sans refermer le pilote.
+#[cfg(test)]
+mod gapless_asio_5204;
+// #5451 — CoreAudio exclusif (macOS) : à format égal, la piste suivante entre
+// dans l'anneau ouvert par la même boucle, sans rouvrir le périphérique.
+#[cfg(test)]
+mod gapless_coreaudio_5451;
 
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
