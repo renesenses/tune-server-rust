@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "bed6b2d27c4243d3c5a8d3622206fc158902e363",
+    "web_sha": "cfdc755e1d9bfac7de2c074c58687a9cbda990ff",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -8,6 +8,20 @@
     ]
   },
   "routes": [
+    {
+      "route": "/audio-plugins",
+      "methode": "GET",
+      "type": "EtatGreffonsAudioNatifs",
+      "liste": false,
+      "champs_obligatoires": [
+        "plugins"
+      ],
+      "champs_optionnels": [
+        "abi",
+        "target",
+        "trust_configured"
+      ]
+    },
     {
       "route": "/cloud/license/activate",
       "methode": "POST",
@@ -743,6 +757,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -780,6 +795,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -817,6 +833,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -928,6 +945,45 @@
       ]
     },
     {
+      "route": "/library/albums/{}/repertoire-prefere",
+      "methode": "DELETE",
+      "type": "PreferenceRepertoireAlbum",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "racine"
+      ],
+      "champs_optionnels": [
+        "retire"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/repertoire-prefere",
+      "methode": "GET",
+      "type": "PreferenceRepertoireAlbum",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "racine"
+      ],
+      "champs_optionnels": [
+        "retire"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/repertoire-prefere",
+      "methode": "PUT",
+      "type": "PreferenceRepertoireAlbum",
+      "liste": false,
+      "champs_obligatoires": [
+        "album_id",
+        "racine"
+      ],
+      "champs_optionnels": [
+        "retire"
+      ]
+    },
+    {
       "route": "/library/albums/{}/similar",
       "methode": "GET",
       "type": "Album",
@@ -961,6 +1017,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -994,6 +1051,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -1127,6 +1185,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -1206,6 +1265,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -1387,7 +1447,9 @@
         "name",
         "count"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "plays"
+      ]
     },
     {
       "route": "/library/history",
@@ -1452,7 +1514,8 @@
         "artist_name",
         "play_count",
         "artist_id",
-        "id"
+        "id",
+        "image_path"
       ]
     },
     {
@@ -1479,6 +1542,30 @@
       "champs_obligatoires": [
         "track_id",
         "plays"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/repertoires/ordre",
+      "methode": "GET",
+      "type": "MusicDirectoryOrder",
+      "liste": false,
+      "champs_obligatoires": [
+        "ordre",
+        "music_dirs",
+        "regle"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/repertoires/ordre",
+      "methode": "PUT",
+      "type": "MusicDirectoryOrder",
+      "liste": false,
+      "champs_obligatoires": [
+        "ordre",
+        "music_dirs",
+        "regle"
       ],
       "champs_optionnels": []
     },
@@ -1744,6 +1831,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -2321,6 +2409,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -2859,6 +2948,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -2997,6 +3088,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -3073,6 +3165,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -3106,6 +3199,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -3178,6 +3272,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -3211,6 +3306,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -3369,6 +3465,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -3406,6 +3503,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -3457,6 +3555,7 @@
         "catalog_number",
         "dynamic_range",
         "is_compilation",
+        "release_type",
         "dynamic_range_source"
       ]
     },
@@ -3530,6 +3629,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -3621,6 +3721,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -3669,6 +3770,7 @@
         "sample_rate",
         "bit_depth",
         "channels",
+        "channel_badge",
         "cover_path",
         "source",
         "source_id",
@@ -4527,6 +4629,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -4592,6 +4696,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -4723,6 +4829,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -4788,6 +4896,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -4861,7 +4971,8 @@
       "champs_optionnels": [
         "lock_volume",
         "effective_lock_volume",
-        "applied_live"
+        "applied_live",
+        "portee"
       ]
     },
     {
@@ -4875,7 +4986,8 @@
       "champs_optionnels": [
         "lock_volume",
         "effective_lock_volume",
-        "applied_live"
+        "applied_live",
+        "portee"
       ]
     },
     {
@@ -4898,6 +5010,7 @@
         "eq_profile",
         "crossfeed",
         "crossfeed_status",
+        "crossfeed_portee",
         "crossfeed_limits",
         "level_compensation"
       ]
@@ -4912,6 +5025,7 @@
         "eq_profile",
         "crossfeed",
         "crossfeed_status",
+        "crossfeed_portee",
         "crossfeed_limits",
         "level_compensation"
       ]
@@ -4970,6 +5084,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -5047,6 +5163,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -5148,6 +5266,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -5255,6 +5375,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -5367,6 +5489,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -5432,6 +5556,8 @@
         "current_track",
         "position_ms",
         "queue_length",
+        "shuffle",
+        "repeat",
         "queue_position",
         "can_skip_next",
         "signal_path",
@@ -6267,7 +6393,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 312,
+    "routes_cartographiees": 318,
     "appels_non_resolus": 157
   }
 }

@@ -5271,6 +5271,7 @@ dependencies = [
  "tower",
  "tracing",
  "tune-core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5279,8 +5280,10 @@ version = "0.9.167"
 dependencies = [
  "async-trait",
  "axum",
+ "chrono",
  "reqwest",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tower",
  "tracing",
@@ -5339,6 +5342,7 @@ dependencies = [
  "curve25519-elligator2",
  "data-encoding",
  "dst-decoder",
+ "encoding_rs",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
