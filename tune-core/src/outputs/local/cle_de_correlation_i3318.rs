@@ -87,6 +87,7 @@ fn journal_de(emission: impl FnOnce()) -> String {
 /// quoi savoir QUELLE sortie a attendu.
 #[test]
 fn une_lecture_lente_porte_la_cle_du_flux_et_l_appareil() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let log = journal_de(|| {
         journaliser_lecture_lente(
             "DENAFRIPS USB Audio V3.14, USB Audio",
@@ -127,6 +128,7 @@ fn une_lecture_lente_porte_la_cle_du_flux_et_l_appareil() {
 /// clé rendrait la moitié des relevés inutilisables.
 #[test]
 fn une_erreur_de_lecture_porte_la_cle_du_flux_et_l_appareil() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let log = journal_de(|| {
         journaliser_erreur_de_lecture(
             "DENAFRIPS USB Audio V3.14, USB Audio",
@@ -161,6 +163,7 @@ fn une_erreur_de_lecture_porte_la_cle_du_flux_et_l_appareil() {
 /// pas d'identifiant à donner ».
 #[test]
 fn un_flux_sans_identifiant_ecrit_un_tiret_et_non_un_champ_absent() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let log = journal_de(|| journaliser_lecture_lente("Salon", None, 4_096, 7_000, 10_000));
 
     assert!(
