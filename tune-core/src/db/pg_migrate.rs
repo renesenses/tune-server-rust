@@ -698,6 +698,11 @@ CREATE TABLE IF NOT EXISTS item_tags (
     item_id TEXT NOT NULL,
     UNIQUE(tag_id, item_type, item_id)
 );
+-- Date du dépôt dans une étiquette (#5478, PG 077 / SQLite 113). En ALTER et
+-- non dans le CREATE : une base de bascule antérieure a déjà la table, et le
+-- CREATE IF NOT EXISTS ci-dessus ne la corrige pas. Même raison que
+-- `streaming_favorites.first_seen_at` plus haut.
+ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue

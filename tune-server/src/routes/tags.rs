@@ -249,6 +249,9 @@ async fn add_streaming_tag_item(
         artist: body.artist,
         album: body.album,
         cover_url: body.cover_url,
+        // Posée par le dépôt lui-même (« maintenant ») : un corps de requête
+        // n'antidate rien.
+        created_at: None,
     };
     match repo.tag_streaming_item(id, &item) {
         Ok(_) => StatusCode::CREATED.into_response(),
@@ -354,6 +357,19 @@ async fn remove_tag_item(
     }
 }
 
+/// Ajoute `tagged_at` — la date du DÉPÔT dans l'étiquette (#5478) — à la
+/// ligne d'un objet local.
+///
+/// Clé à part, jamais `created_at` : la ligne d'un album porte déjà SA date
+/// d'entrée dans la bibliothèque, qui n'est pas celle du dépôt. `null` pour
+/// une pose antérieure à la colonne : rien n'est inventé.
+fn avec_date_de_depot(mut ligne: Value, quand: Option<String>) -> Value {
+    if let Some(obj) = ligne.as_object_mut() {
+        obj.insert("tagged_at".into(), json!(quand));
+    }
+    ligne
+}
+
 /// Les albums d'une etiquette — LOCAUX **et** de STREAMING (#3699).
 ///
 /// ## Pourquoi la moitie streaming n'est pas hydratee
@@ -377,12 +393,17 @@ async fn remove_tag_item(
 /// il vient.
 async fn list_tag_albums(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let tag_repo = TagRepo::with_backend(state.backend.clone());
-    let album_ids = tag_repo.items_by_tag(id, "album").unwrap_or_default();
+    let album_ids = tag_repo.items_by_tag_dated(id, "album").unwrap_or_default();
     let album_repo = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone());
     let mut albums: Vec<Value> = album_ids
         .into_iter()
-        .filter_map(|aid| album_repo.get(aid).ok().flatten())
-        .map(|a| a.to_json())
+        .filter_map(|(aid, quand)| {
+            album_repo
+                .get(aid)
+                .ok()
+                .flatten()
+                .map(|a| avec_date_de_depot(a.to_json(), quand))
+        })
         .collect();
     for s in tag_repo
         .streaming_items_by_tag(id, "album")
@@ -395,6 +416,7 @@ async fn list_tag_albums(State(state): State<AppState>, Path(id): Path<i64>) -> 
             "cover_path": s.cover_url,
             "source": s.source,
             "source_id": s.source_id,
+            "tagged_at": s.created_at,
         }));
     }
     Json(json!({"tag_id": id, "albums": albums, "count": albums.len()}))
@@ -402,12 +424,17 @@ async fn list_tag_albums(State(state): State<AppState>, Path(id): Path<i64>) -> 
 
 async fn list_tag_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let tag_repo = TagRepo::with_backend(state.backend.clone());
-    let track_ids = tag_repo.items_by_tag(id, "track").unwrap_or_default();
+    let track_ids = tag_repo.items_by_tag_dated(id, "track").unwrap_or_default();
     let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let mut tracks: Vec<Value> = track_ids
         .into_iter()
-        .filter_map(|tid| track_repo.get(tid).ok().flatten())
-        .map(|t| t.to_json())
+        .filter_map(|(tid, quand)| {
+            track_repo
+                .get(tid)
+                .ok()
+                .flatten()
+                .map(|t| avec_date_de_depot(t.to_json(), quand))
+        })
         .collect();
     // Meme regle que pour les albums (#3699) : rendu depuis l'instantane,
     // sans aucun appel au service.
@@ -423,6 +450,7 @@ async fn list_tag_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> 
             "cover_path": s.cover_url,
             "source": s.source,
             "source_id": s.source_id,
+            "tagged_at": s.created_at,
         }));
     }
     Json(json!({"tag_id": id, "tracks": tracks, "count": tracks.len()}))
@@ -481,23 +509,27 @@ async fn list_tag_playlists(
     Path(id): Path<i64>,
 ) -> Json<Value> {
     let tag_repo = TagRepo::with_backend(state.backend.clone());
-    let playlist_ids = tag_repo.items_by_tag(id, "playlist").unwrap_or_default();
+    let playlist_ids = tag_repo
+        .items_by_tag_dated(id, "playlist")
+        .unwrap_or_default();
     let playlist_repo =
         tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let mut playlists: Vec<Value> = playlist_ids
         .into_iter()
-        .filter_map(|pid| {
+        .filter_map(|(pid, quand)| {
             playlist_repo
                 .get_for_profile(pid, profile.id())
                 .ok()
                 .flatten()
+                .map(|p| (p, quand))
         })
-        .map(|p| {
+        .map(|(p, quand)| {
             json!({
                 "id": p.id,
                 "name": p.name,
                 "description": p.description,
                 "track_count": p.track_count,
+                "tagged_at": quand,
             })
         })
         .collect();
@@ -514,8 +546,13 @@ async fn list_tag_playlists(
             "name": s.title.clone().unwrap_or_default(),
             "description": Value::Null,
             "track_count": Value::Null,
+            // L'image de la playlist, posée à l'étiquetage comme celle des
+            // albums et des titres, et jusqu'ici jamais rendue (#5478). Même
+            // clé que ses sœurs.
+            "cover_path": s.cover_url,
             "source": s.source,
             "source_id": s.source_id,
+            "tagged_at": s.created_at,
         }));
     }
     Json(json!({"tag_id": id, "playlists": playlists, "count": playlists.len()}))
@@ -674,3 +711,7 @@ async fn tags_for_item(
     let tags = repo.tags_for_item(&item_type, item_id).unwrap_or_default();
     Json(json!(tags))
 }
+
+#[cfg(test)]
+#[path = "tags_date_de_depot_tests_5478.rs"]
+mod tags_date_de_depot_tests_5478;
