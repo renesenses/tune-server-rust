@@ -647,3 +647,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5192 -- --nocapture --test-threads=1
+
+      # #5341 — une retouche de balises relue par le surveillant MET À JOUR la
+      # ligne de la piste (même identifiant) au lieu de la supprimer puis la
+      # recréer : favori, écoute, playlist, exemplaire, étiquette, signet et
+      # métadonnée étendue restent rattachés. Épreuve de la bibliothèque de
+      # tune-server (`--lib`) ; sans cette étape, elle prendrait son « saut
+      # annoncé ».
+      - name: Retouche de balises par le surveillant sur PostgreSQL (#5341)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_5341 -- --nocapture --test-threads=1

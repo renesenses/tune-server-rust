@@ -273,6 +273,21 @@ impl AppState {
             .unwrap_or(self.config.local_exclusive_mode)
     }
 
+    /// Vrai si c'est le CHOIX D'ASIO, et non l'utilisateur, qui a armé
+    /// `local_exclusive_mode` (témoin posé par `PATCH /system/config`, #4184).
+    ///
+    /// #5353 — les sites d'enregistrement d'une sortie locale le passent à
+    /// `local_exclusive_mode_du_peripherique` : sans lui, l'écho du forçage
+    /// ASIO se lisait comme une demande et une sortie énumérée par WASAPI
+    /// s'ouvrait en WASAPI exclusif.
+    pub fn exclusif_arme_par_asio(&self) -> bool {
+        tune_core::db::settings_repo::SettingsRepo::with_backend(self.backend.clone())
+            .get(tune_core::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    }
+
     /// Ce que le mode exclusif vaut réellement, ce qui a été demandé, et
     /// pourquoi les deux diffèrent quand c'est le cas.
     ///
