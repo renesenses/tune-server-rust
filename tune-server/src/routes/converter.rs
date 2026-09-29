@@ -1462,7 +1462,7 @@ const FREQUENCES_MP3: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000
 fn frequence_mp3(demandee: u32) -> u32 {
     if FREQUENCES_MP3.contains(&demandee) {
         demandee
-    } else if demandee % 11_025 == 0 {
+    } else if demandee.is_multiple_of(11_025) {
         44_100
     } else {
         48_000
@@ -1470,9 +1470,9 @@ fn frequence_mp3(demandee: u32) -> u32 {
 }
 
 /// La fréquence à laquelle écrire le WAV intermédiaire d'un encodeur externe
-/// (#5480) : ramenée à une fréquence MPEG pour le MP3, inchangée sinon.
+/// (#5480) : ramenée à 44,1 ou 48 kHz pour le MP3 et l'AAC, inchangée sinon.
 fn frequence_pour_encodeur_externe(format: &str, target_sr: Option<u32>) -> Option<u32> {
-    if format == "mp3" {
+    if format == "mp3" || format == "aac" {
         target_sr.map(frequence_mp3)
     } else {
         target_sr
@@ -1591,30 +1591,48 @@ async fn encode_aac_external(
     quality: Option<&str>,
     target_sr: Option<u32>,
 ) -> Result<(), String> {
-    let bitrate = quality.unwrap_or("256");
-
     if let Some(ffmpeg) = resolve_tool("ffmpeg") {
-        let mut args = vec![
-            "-hide_banner".to_string(),
-            "-y".into(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{bitrate}k"),
-        ];
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-
-        args.push(output.into());
-        return run_command(&ffmpeg, &args).await;
+        return run_command(
+            &ffmpeg,
+            &arguments_ffmpeg_aac(input, output, quality, target_sr),
+        )
+        .await;
     }
 
     Err("aac encoding requires ffmpeg (bundled with the release or on PATH)".into())
+}
+
+/// Arguments de `ffmpeg … -codec:a aac` (#5480, suite).
+///
+/// Même défaut que le MP3 : `-ar` recevait la fréquence de la source décodée
+/// (176,4 / 352,8 kHz depuis du DSD), que l'encodeur `aac` de ffmpeg refuse
+/// (il plafonne à 96 kHz). Même règle que le MP3 : 44,1 kHz pour la famille
+/// 44,1, 48 kHz pour les autres — les fréquences que lit tout lecteur AAC.
+fn arguments_ffmpeg_aac(
+    input: &str,
+    output: &str,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+) -> Vec<String> {
+    let bitrate = quality.unwrap_or("256");
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".into(),
+        "-i".into(),
+        input.into(),
+        "-codec:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        format!("{bitrate}k"),
+    ];
+
+    if let Some(sr) = target_sr.map(frequence_mp3) {
+        args.push("-ar".into());
+        args.push(sr.to_string());
+    }
+
+    args.push(output.into());
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -2327,9 +2345,48 @@ mod tests {
         );
         assert_eq!(frequence_pour_encodeur_externe("mp3", None), None);
         assert_eq!(
-            frequence_pour_encodeur_externe("aac", Some(96_000)),
-            Some(96_000)
+            frequence_pour_encodeur_externe("aac", Some(176_400)),
+            Some(44_100)
         );
+        assert_eq!(
+            frequence_pour_encodeur_externe("flac", Some(176_400)),
+            Some(176_400)
+        );
+    }
+
+    /// Même règle pour l'AAC externe (Windows, Linux) : aucun préréglage AAC
+    /// n'est servi, on éprouve donc la commande elle-même.
+    #[test]
+    fn la_commande_ffmpeg_aac_porte_44_1_ou_48_khz_selon_la_famille() {
+        for (source, attendue) in [
+            (352_800, "44100"),
+            (176_400, "44100"),
+            (88_200, "44100"),
+            (44_100, "44100"),
+            (192_000, "48000"),
+            (96_000, "48000"),
+            (48_000, "48000"),
+        ] {
+            let args = arguments_ffmpeg_aac("in.wav", "out.m4a", Some("256"), Some(source));
+            let i = args
+                .iter()
+                .position(|a| a == "-ar")
+                .expect("la fréquence est fixée explicitement");
+            assert_eq!(
+                args[i + 1],
+                attendue,
+                "source {source} Hz : `-ar` doit valoir {attendue} — args {args:?}"
+            );
+            assert_eq!(args[0], "-hide_banner");
+            assert!(args.windows(2).any(|w| w == ["-codec:a", "aac"]));
+            assert!(args.windows(2).any(|w| w == ["-b:a", "256k"]));
+        }
+        let sans = arguments_ffmpeg_aac("in.wav", "out.m4a", None, None);
+        assert!(
+            !sans.iter().any(|a| a == "-ar"),
+            "pas de fréquence demandée : pas de -ar"
+        );
+        assert!(sans.windows(2).any(|w| w == ["-b:a", "256k"]));
     }
 
     /// Les arguments réellement passés à ffmpeg pour les trois préréglages MP3
