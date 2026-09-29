@@ -123,6 +123,7 @@ async fn un_lot_porte_environ_vingt_pour_cent_de_l_artiste_de_depart() {
             graine,
         )
         .await;
+        assert_eq!(TAILLE_LOT, 50, "décision du 29/09 : 50 titres par lot");
         assert_eq!(l.candidats.len(), TAILLE_LOT, "graine {graine}");
         let de_la_graine = l
             .candidats
@@ -130,10 +131,10 @@ async fn un_lot_porte_environ_vingt_pour_cent_de_l_artiste_de_depart() {
             .filter(|c| c.artiste() == "Graine")
             .count();
         assert_eq!(
-            de_la_graine, 5,
-            "graine {graine} : 5 titres sur 25 (20 %) doivent venir de l'artiste de départ"
+            de_la_graine, 10,
+            "graine {graine} : 10 titres sur 50 (20 %) doivent venir de l'artiste de départ"
         );
-        assert_eq!(l.titres_graine, 5);
+        assert_eq!(l.titres_graine, 10);
         assert_eq!(
             l.candidats[0].artiste(),
             "Graine",
@@ -151,8 +152,8 @@ async fn le_service_de_la_fiche_passe_d_abord_et_les_autres_ne_font_que_complete
     let v = voisins(30);
     let mut connus = refs(&v);
     connus.push("Graine");
-    let fiche = Factice::new("qobuz", &refs(&v), &connus, 6);
-    let autre = Factice::new("tidal", &["Autre voisin"], &connus, 6);
+    let fiche = Factice::new("qobuz", &refs(&v), &connus, 12);
+    let autre = Factice::new("tidal", &["Autre voisin"], &connus, 12);
     let demandes_autre = autre.demandes_de_voisins.clone();
     let l = lot(vec![Box::new(fiche), Box::new(autre)], 7).await;
     assert_eq!(demandes_autre.load(Ordering::SeqCst), 0);
@@ -357,7 +358,7 @@ fn bibliotheque(db: &Arc<dyn DbBackend>) {
             &[&aid, &nom],
         )
         .unwrap();
-        for n in 0..8 {
+        for n in 0..20 {
             let titre = format!("{nom} {n}");
             db.execute(
                 "INSERT INTO tracks (id, title, artist_id, genre, duration_ms) VALUES (?, ?, ?, ?, 200000)",
@@ -466,6 +467,7 @@ struct ServiceSimule {
     connecte: bool,
     voisins: Vec<StreamArtist>,
     recherches: Arc<AtomicUsize>,
+    albums_ouverts: Arc<AtomicUsize>,
 }
 
 fn artiste(id: &str, nom: &str) -> StreamArtist {
@@ -528,8 +530,38 @@ impl StreamingService for ServiceSimule {
     async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
         Err("hors sujet".into())
     }
-    async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        Err("hors sujet".into())
+    /// Trois titres de Graine par album — y compris sur l'album où il n'est
+    /// qu'invité : c'est l'ALBUM qui doit être écarté.
+    async fn get_album_tracks(&self, album: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        self.albums_ouverts.fetch_add(1, Ordering::SeqCst);
+        Ok((0..3)
+            .map(|n| piste(&format!("{album}-{n}"), "Graine", &format!("{album} {n}")))
+            .collect())
+    }
+    /// 30 albums de Graine, un album d'un autre groupe où il est invité, un
+    /// album sans artiste déclaré.
+    async fn get_artist_albums(&self, id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        if id != "g" {
+            return Ok(Vec::new());
+        }
+        let album = |id: &str, artiste: &str, artiste_id: Option<&str>| StreamAlbum {
+            id: id.into(),
+            title: format!("Titre {id}"),
+            artist: artiste.into(),
+            artist_id: artiste_id.map(str::to_owned),
+            cover_path: None,
+            year: None,
+            track_count: 3,
+            quality: None,
+            released_at: None,
+            release_type: None,
+        };
+        let mut v: Vec<StreamAlbum> = (0..30)
+            .map(|n| album(&format!("al{n}"), "Graine", Some("g")))
+            .collect();
+        v.push(album("invite", "Autre Groupe", Some("autre")));
+        v.push(album("anonyme", "", None));
+        Ok(v)
     }
     async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
         Err("hors sujet".into())
@@ -593,6 +625,7 @@ async fn les_sources_suivent_la_fiche_puis_les_services_connectes_puis_la_biblio
                 connecte,
                 voisins: Vec::new(),
                 recherches: Arc::new(AtomicUsize::new(0)),
+                albums_ouverts: Arc::new(AtomicUsize::new(0)),
             }));
         }
     }
@@ -617,6 +650,7 @@ async fn un_service_resout_l_artiste_au_nom_exact_et_ecarte_bannis_et_indisponib
         connecte: true,
         voisins: vec![artiste("v1", "Voisin Un"), artiste("v2", "Voisin Deux")],
         recherches: recherches.clone(),
+        albums_ouverts: Arc::new(AtomicUsize::new(0)),
     });
     let src = SourceService::new(
         "qobuz",
@@ -646,4 +680,279 @@ async fn un_service_resout_l_artiste_au_nom_exact_et_ecarte_bannis_et_indisponib
     let avant = recherches.load(Ordering::SeqCst);
     assert_eq!(src.titres_de("Voisin Un", 3).await.len(), 3);
     assert_eq!(recherches.load(Ordering::SeqCst), avant);
+}
+
+// ── #5395, fil 2037 point 6 : discographie et diversité par album ────────
+
+/// Une source avec une DISCOGRAPHIE : l'artiste de départ a `albums`
+/// albums de `par_album` titres, et des titres phares (« Phare n ») qui ne
+/// doivent servir qu'en complément. Les voisins ont des titres répartis sur
+/// deux albums, dont une compilation commune à tous.
+struct FacticeDisco {
+    albums: usize,
+    par_album: usize,
+    voisins: Vec<String>,
+    albums_ouverts: Arc<AtomicUsize>,
+}
+
+fn piste_album(source: &str, artiste: &str, album: &str, n: usize) -> Candidat {
+    let mut p = piste(
+        &format!("{source}-{artiste}-{album}-{n}"),
+        artiste,
+        &format!("{artiste} {album} {n}"),
+    );
+    p.album = Some(album.to_string());
+    Candidat::Service {
+        source: source.into(),
+        piste: p,
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceRadio for FacticeDisco {
+    fn nom(&self) -> String {
+        "qobuz".into()
+    }
+    async fn artistes_similaires(&self, _a: &str, _m: usize) -> Vec<String> {
+        self.voisins.clone()
+    }
+    async fn titres_de(&self, artiste: &str, _m: usize) -> Vec<Candidat> {
+        if artiste == "Graine" {
+            return (0..10)
+                .map(|n| piste_album("qobuz", "Graine", "Phares", n))
+                .collect();
+        }
+        (0..6)
+            .map(|n| {
+                let album = if n % 2 == 0 {
+                    "Compilation commune".to_string()
+                } else {
+                    format!("Album de {artiste}")
+                };
+                piste_album("qobuz", artiste, &album, n)
+            })
+            .collect()
+    }
+    async fn albums_de(&self, artiste: &str) -> Vec<AlbumRadio> {
+        if artiste != "Graine" {
+            return Vec::new();
+        }
+        (0..self.albums)
+            .map(|n| AlbumRadio {
+                id: format!("al{n}"),
+                titre: format!("Album {n}"),
+            })
+            .collect()
+    }
+    async fn titres_album(&self, artiste: &str, album: &AlbumRadio) -> Vec<Candidat> {
+        self.albums_ouverts.fetch_add(1, Ordering::SeqCst);
+        (0..self.par_album)
+            .map(|n| piste_album("qobuz", artiste, &album.titre, n))
+            .collect()
+    }
+}
+
+fn disco(albums: usize, par_album: usize) -> (FacticeDisco, Arc<AtomicUsize>) {
+    let ouverts = Arc::new(AtomicUsize::new(0));
+    (
+        FacticeDisco {
+            albums,
+            par_album,
+            voisins: voisins(12),
+            albums_ouverts: ouverts.clone(),
+        },
+        ouverts,
+    )
+}
+
+fn albums_de_la_graine(l: &Lot) -> Vec<String> {
+    l.candidats
+        .iter()
+        .filter(|c| c.artiste() == "Graine")
+        .filter_map(Candidat::album_cle)
+        .collect()
+}
+
+#[tokio::test]
+async fn la_part_de_l_artiste_puise_dans_toute_sa_discographie_un_titre_par_album() {
+    for graine in 1..=10u64 {
+        let (src, ouverts) = disco(20, 8);
+        let l = lot(vec![Box::new(src)], graine).await;
+        assert_eq!(l.candidats.len(), 50);
+        let albums = albums_de_la_graine(&l);
+        assert_eq!(albums.len(), 10, "graine {graine} : 10 titres de l'artiste");
+        let distincts: HashSet<&String> = albums.iter().collect();
+        assert_eq!(
+            distincts.len(),
+            10,
+            "graine {graine} : 20 albums disponibles, un titre par album : {albums:?}"
+        );
+        assert!(
+            albums.iter().all(|a| a != "phares"),
+            "graine {graine} : les titres phares ne servent qu'à compléter"
+        );
+        let n = ouverts.load(Ordering::SeqCst);
+        assert!(
+            n <= MAX_ALBUMS_PAR_LOT,
+            "graine {graine} : {n} albums ouverts, borne {MAX_ALBUMS_PAR_LOT}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn avec_moins_d_albums_que_de_titres_chaque_album_sert_au_moins_une_fois() {
+    let (src, ouverts) = disco(4, 8);
+    let l = lot(vec![Box::new(src)], 5).await;
+    let albums = albums_de_la_graine(&l);
+    assert_eq!(albums.len(), 10);
+    let distincts: HashSet<&String> = albums.iter().collect();
+    assert_eq!(
+        distincts.len(),
+        4,
+        "les 4 albums sont tous représentés : {albums:?}"
+    );
+    assert_eq!(ouverts.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn deux_titres_du_meme_album_ne_se_suivent_pas() {
+    for graine in 1..=30u64 {
+        let (src, _) = disco(20, 8);
+        let l = lot(vec![Box::new(src)], graine).await;
+        for paire in l.candidats.windows(2) {
+            if let (Some(a), Some(b)) = (paire[0].album_cle(), paire[1].album_cle()) {
+                assert_ne!(
+                    a,
+                    b,
+                    "graine {graine} : deux titres de « {a} » d'affilée ({} puis {})",
+                    paire[0].titre(),
+                    paire[1].titre()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn le_deuxieme_titre_d_un_voisin_vient_d_un_autre_album() {
+    let (src, _) = disco(20, 8);
+    let l = lot(vec![Box::new(src)], 3).await;
+    let mut par_voisin: HashMap<String, Vec<String>> = HashMap::new();
+    for c in l.candidats.iter().filter(|c| c.artiste() != "Graine") {
+        par_voisin
+            .entry(c.artiste().to_string())
+            .or_default()
+            .push(c.album_cle().unwrap());
+    }
+    for (v, albums) in par_voisin {
+        if albums.len() == 2 {
+            assert_ne!(albums[0], albums[1], "{v} : deux titres du même album");
+        }
+    }
+}
+
+#[tokio::test]
+async fn la_bibliotheque_ne_prend_que_les_albums_de_l_artiste_pas_ceux_ou_il_est_invite() {
+    let db = base();
+    db.execute_batch(
+        "INSERT INTO artists (id, name) VALUES (1, 'Graine'), (2, 'Various Artists');
+         INSERT INTO albums (id, title, artist_id) VALUES (10, 'A lui', 1), (11, 'Compilation', 2);
+         INSERT INTO tracks (id, title, artist_id, album_id, duration_ms) VALUES
+           (1, 'Sien 1', 1, 10, 1000), (2, 'Sien 2', 1, 10, 1000),
+           (3, 'Invité', 1, 11, 1000), (4, 'Autre', 2, 11, 1000);",
+    )
+    .unwrap();
+    let src = SourceBibliotheque::new(db.clone());
+    let albums = src.albums_de("graine").await;
+    assert_eq!(
+        albums,
+        vec![AlbumRadio {
+            id: "10".into(),
+            titre: "A lui".into()
+        }]
+    );
+    let titres: Vec<String> = src
+        .titres_album("Graine", &albums[0])
+        .await
+        .iter()
+        .map(|c| c.titre().to_string())
+        .collect();
+    assert_eq!(titres.len(), 2);
+    assert!(titres.iter().all(|t| t.starts_with("Sien")));
+}
+
+#[tokio::test]
+async fn la_fiche_ouvre_les_albums_de_l_artiste_pas_ceux_ou_il_est_invite_et_borne_ses_appels() {
+    let ouverts = Arc::new(AtomicUsize::new(0));
+    let svc: Box<dyn StreamingService> = Box::new(ServiceSimule {
+        nom: "qobuz",
+        connecte: true,
+        voisins: (0..12)
+            .map(|n| artiste(&format!("v{}", n % 2 + 1), &format!("Voisin {n}")))
+            .collect(),
+        recherches: Arc::new(AtomicUsize::new(0)),
+        albums_ouverts: ouverts.clone(),
+    });
+    let src = SourceService::new(
+        "qobuz",
+        Arc::new(tokio::sync::RwLock::new(svc)),
+        HashSet::new(),
+        Some(("Graine", "g")),
+    )
+    .avec_discographie();
+    let albums = src.albums_de("Graine").await;
+    assert_eq!(
+        albums.len(),
+        31,
+        "30 albums à lui + l'album sans artiste déclaré"
+    );
+    assert!(
+        albums.iter().all(|a| a.id != "invite"),
+        "l'album où il est invité est écarté"
+    );
+
+    let sources: Vec<Box<dyn SourceRadio>> = vec![Box::new(src)];
+    let l = composer_lot(
+        "Graine",
+        &sources,
+        TAILLE_LOT,
+        &HashSet::new(),
+        None,
+        true,
+        &mut Alea::fixe(4),
+    )
+    .await;
+    let n = ouverts.load(Ordering::SeqCst);
+    assert!(
+        n <= MAX_ALBUMS_PAR_LOT,
+        "{n} appels get_album_tracks pour un lot, borne {MAX_ALBUMS_PAR_LOT}"
+    );
+    let de_la_graine: Vec<&Candidat> = l
+        .candidats
+        .iter()
+        .filter(|c| c.artiste() == "Graine")
+        .collect();
+    // Peu de voisins ici : la part de l'artiste s'élargit, la borne tient.
+    assert!(de_la_graine.len() >= 10);
+    assert!(
+        de_la_graine
+            .iter()
+            .all(|c| !c.titre().starts_with("invite"))
+    );
+
+    // Un service qui n'est PAS la fiche ne fournit pas de discographie.
+    let autre: Box<dyn StreamingService> = Box::new(ServiceSimule {
+        nom: "tidal",
+        connecte: true,
+        voisins: Vec::new(),
+        recherches: Arc::new(AtomicUsize::new(0)),
+        albums_ouverts: Arc::new(AtomicUsize::new(0)),
+    });
+    let autre = SourceService::new(
+        "tidal",
+        Arc::new(tokio::sync::RwLock::new(autre)),
+        HashSet::new(),
+        Some(("Graine", "g")),
+    );
+    assert!(autre.albums_de("Graine").await.is_empty());
 }

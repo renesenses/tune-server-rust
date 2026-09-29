@@ -63,7 +63,7 @@ async fn banc() -> Banc {
             &[&aid, &nom],
         )
         .unwrap();
-        for n in 0..10 {
+        for n in 0..20 {
             let titre = format!("{nom} {n}");
             db.execute(
                 "INSERT INTO tracks (id, title, artist_id, genre, file_path, format, sample_rate, bit_depth, duration_ms) \

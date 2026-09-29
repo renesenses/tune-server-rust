@@ -210,12 +210,12 @@ async fn la_radio_remplit_la_file_et_ecrit_son_contexte() {
     assert_ne!(status, StatusCode::NOT_FOUND, "{corps}");
     assert_ne!(status, StatusCode::BAD_REQUEST, "{corps}");
     let lignes = file(&state);
-    assert_eq!(lignes.len(), 25, "un lot de 25 titres en file");
+    assert_eq!(lignes.len(), 50, "un lot de 50 titres en file");
     let de_la_graine = lignes
         .iter()
         .filter(|l| l.artist_name.as_deref() == Some("Graine"))
         .count();
-    assert_eq!(de_la_graine, 5, "20 % de l'artiste de départ");
+    assert_eq!(de_la_graine, 10, "20 % de l'artiste de départ");
     assert_eq!(lignes[0].artist_name.as_deref(), Some("Graine"));
     assert!(
         lignes
@@ -232,7 +232,7 @@ async fn la_radio_remplit_la_file_et_ecrit_son_contexte() {
         .expect("le contexte de la radio est écrit dans les réglages de la zone");
     assert_eq!(ctx.artiste, "Graine");
     assert_eq!(ctx.service.as_deref(), Some("qobuz-simule"));
-    assert_eq!(ctx.dernier_lot.len(), 25);
+    assert_eq!(ctx.dernier_lot.len(), 50);
     let derniere = lignes.last().unwrap();
     assert!(ctx.continue_sur(&format!(
         "qobuz-simule:{}",
