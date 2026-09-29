@@ -1,4 +1,5 @@
 mod api_proxy;
+mod circle;
 mod licence;
 mod protocol;
 mod state;
@@ -58,7 +59,10 @@ async fn main() {
         .route(
             "/stream/relay/{server_id}/{*stream_path}",
             get(stream_proxy::proxy_stream),
-        );
+        )
+        // Tune Circle T4 (#5327) : l'ecoute chez un contact, par billet
+        // seulement. Voir `circle.rs`.
+        .route("/stream/circle/{ticket}", get(circle::flux_de_cercle));
     // Le client web, s'il est fourni. Monte APRES les routes du relais : axum
     // fait primer les segments statiques (`/api`, `/ws`, `/stream`, `/health`)
     // sur le segment dynamique `{server_id}`, mais l'ordre rend l'intention

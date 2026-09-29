@@ -53,11 +53,16 @@ async fn scenario(state: &AppState) -> Vec<String> {
             .unwrap_or_else(|e| panic!("vidage de {table} : {e}"));
     }
     let maintenant = chrono::Utc::now();
+    // Le MÊME jour il y a deux ans : borner le jour à 28 semait l'écoute la
+    // veille les 29, 30 et 31, et « Ce jour-là » revenait vide ces jours-là.
+    // Un 29 février n'a pas d'homologue deux ans plus tôt : l'épreuve de
+    // « Ce jour-là » est alors sautée.
+    let jour_homologue = maintenant.date_naive().with_year(maintenant.year() - 2);
     let il_y_a_deux_ans = format!(
-        "{:04}-{:02}-{:02}T12:00:00Z",
-        maintenant.year() - 2,
-        maintenant.month(),
-        maintenant.day().min(28)
+        "{}T12:00:00Z",
+        jour_homologue
+            .unwrap_or_else(|| maintenant.date_naive() - chrono::Days::new(730))
+            .format("%Y-%m-%d")
     );
     let recent = maintenant.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let semence = [
@@ -116,7 +121,7 @@ async fn scenario(state: &AppState) -> Vec<String> {
         .iter()
         .filter_map(|e| e["track_title"].as_str())
         .collect();
-    if titres != vec!["Wuthering Heights"] {
+    if jour_homologue.is_some() && titres != vec!["Wuthering Heights"] {
         ecarts.push(format!(
             "dashboard on_this_day : {titres:?} ({})",
             tableau["on_this_day"]

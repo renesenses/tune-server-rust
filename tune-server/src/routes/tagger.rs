@@ -342,12 +342,34 @@ async fn set_album_genre(
         })
         .collect();
 
-    // Update DB for all tracks
+    // Update DB for all tracks.
+    //
+    // #5314 — `tracks.genres` aussi : la facette Genre d'Oxygen fait l'UNION
+    // de la colonne et du tableau, un ancien tableau y montrait encore les
+    // anciens genres à côté du nouveau. Le marqueur de recopie du genre
+    // d'album tombe : les fichiers portent désormais ce genre, c'est lui
+    // qu'un scan doit relire, pas celui de l'album.
+    let genres =
+        tune_core::db::genre_album_pistes::colonnes_de_piste(&body.genre).map(|(_, json)| json);
     state
         .backend
         .execute(
-            "UPDATE tracks SET genre = $1 WHERE album_id = $2",
-            &[&body.genre as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
+            "UPDATE tracks SET genre = $1, genres = $2 WHERE album_id = $3",
+            &[
+                &body.genre as &dyn ToSqlValue,
+                &genres as &dyn ToSqlValue,
+                &album_id as &dyn ToSqlValue,
+            ],
+        )
+        .map_err(AppError::internal)?;
+    state
+        .backend
+        .execute(
+            "DELETE FROM album_metadata WHERE album_id = $1 AND key = $2",
+            &[
+                &album_id as &dyn ToSqlValue,
+                &tune_core::db::genre_album_pistes::CLE_GENRE_PISTES as &dyn ToSqlValue,
+            ],
         )
         .map_err(AppError::internal)?;
 

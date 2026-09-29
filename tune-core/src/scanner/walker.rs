@@ -912,6 +912,12 @@ pub struct ListAudioResult {
     /// ouverture de fichier par feuille — voir
     /// [`super::cue_album::PLAFOND_DOSSIERS_INVENTORIES`].
     pub dossiers_avec_feuille_cue: Vec<PathBuf>,
+    /// Les images SACD lisibles nativement (#5297), sommaires déjà lus.
+    ///
+    /// Elles n'entrent PAS dans `files` : une image n'est pas une piste. Leur
+    /// album s'écrit après le parcours, par
+    /// [`super::cue_bibliotheque::ecrire_les_iso_sacd`], comme les albums CUE.
+    pub isos_sacd_natifs: Vec<crate::audio::sacd::IsoSacdLu>,
 }
 
 impl ListAudioResult {
@@ -1235,6 +1241,7 @@ pub fn list_audio_files_avec_progression(
     // `BTreeSet` et non `HashSet` : le rapport de scan doit être reproductible
     // d'un scan à l'autre, et l'ordre d'un `HashSet` ne l'est pas.
     let mut dossiers_cue: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut isos_sacd_natifs: Vec<crate::audio::sacd::IsoSacdLu> = Vec::new();
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -1401,6 +1408,26 @@ pub fn list_audio_files_avec_progression(
                         continue;
                     }
                     let path = entry.path();
+                    // #5285 — une feuille CUE n'est pas un fichier audio : ni
+                    // « lu », ni « non pris en charge ». Le parcours retient
+                    // son DOSSIER, relu après coup par l'étape CUE (#1763) —
+                    // voir `dossiers_avec_feuille_cue`. C'est cette étape, et
+                    // elle seule, qui dit ce que la feuille a donné : un album
+                    // découpé (elle n'apparaît alors dans aucune liste
+                    // d'écartés), ou un écart motivé (`cue_sheets_skipped_paths`,
+                    // « feuille CUE sans son fichier audio » pour une
+                    // orpheline). Belkadi (fil 2003) lisait 798 feuilles dans
+                    // « Format non pris en charge » pendant que l'étape CUE en
+                    // découpait 427 albums.
+                    if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+                    {
+                        if let Some(parent) = path.parent() {
+                            dossiers_cue.insert(parent.to_path_buf());
+                        }
+                        continue;
+                    }
                     // Classer AVANT d'ajouter le chemin : WMA, DST autonome et
                     // les autres formats audio connus mais non lus restent
                     // visibles dans le rapport, sans devenir des pistes
@@ -1419,15 +1446,6 @@ pub fn list_audio_files_avec_progression(
                                 &mut skipped_paths,
                                 format!("{} ({})", path.display(), unsupported.reason),
                             );
-                            // Une feuille CUE n'est pas un fichier ignoré comme
-                            // un autre : c'est la description d'un album. Le
-                            // dossier est retenu ici et relu après le parcours
-                            // (#1763) — voir `dossiers_avec_feuille_cue`.
-                            if unsupported.report_key == "cue"
-                                && let Some(parent) = path.parent()
-                            {
-                                dossiers_cue.insert(parent.to_path_buf());
-                            }
                             skipped_reasons
                                 .entry(unsupported.report_key)
                                 .or_insert_with(|| unsupported.reason.to_string());
@@ -1438,9 +1456,29 @@ pub fn list_audio_files_avec_progression(
                     }
 
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        // ISO SACD: extract DSF tracks instead of adding the ISO directly
+                        // ISO SACD (#5297) : lue NATIVEMENT quand une zone
+                        // est en DSD brut — l'image devient un album de
+                        // pistes virtuelles, écrit après le parcours
+                        // (`cue_bibliotheque::ecrire_les_iso_sacd`). Le repli
+                        // `sacd_extract` ne sert plus qu'aux disques DST, aux
+                        // structures illisibles, et aux images déjà extraites
+                        // par une version antérieure (leur dossier
+                        // `.sacd_extract` est indexé : les lire nativement en
+                        // plus doublerait l'album).
                         if ext.eq_ignore_ascii_case("iso") {
-                            if crate::audio::iso_sacd::is_sacd_iso(path) {
+                            let verdict = crate::audio::sacd::examiner(path);
+                            let deja_extraite = path.with_extension("sacd_extract").is_dir();
+                            let est_dst = matches!(verdict, crate::audio::sacd::VerdictIso::Dst(_));
+                            if let crate::audio::sacd::VerdictIso::Lisible(disque) = verdict
+                                && !deja_extraite
+                            {
+                                dir_file_count +=
+                                    disque.zone_de_lecture().map_or(0, |z| z.pistes.len());
+                                isos_sacd_natifs.push(crate::audio::sacd::IsoSacdLu {
+                                    chemin: path.to_path_buf(),
+                                    disque,
+                                });
+                            } else if crate::audio::iso_sacd::is_sacd_iso(path) {
                                 match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
                                     Ok(dsf_files) => {
                                         dir_file_count += dsf_files.len();
@@ -1461,33 +1499,67 @@ pub fn list_audio_files_avec_progression(
                                         // récapitulatif : un `warn!` par
                                         // fichier noierait le journal.
                                         if dir_iso_error_count <= MAX_ISO_WARN {
-                                            warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
+                                            warn!(path = %path.display(), error = %e, dst = est_dst, "sacd_iso_extract_failed");
                                         }
-                                        *skipped_by_ext
-                                            .entry(
-                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
-                                                    .to_string(),
+                                        // Un disque DST se nomme pour ce
+                                        // qu'il est (#5297) : la lecture
+                                        // native existe, c'est la compression
+                                        // qu'elle ne décode pas. « Installer
+                                        // sacd_extract » reste le geste, mais
+                                        // le rapport doit dire POURQUOI ce
+                                        // disque-là en a besoin.
+                                        let (cle, motif) = if est_dst {
+                                            (
+                                                crate::audio::sacd::CLE_RAPPORT_ISO_SACD_DST,
+                                                crate::audio::sacd::MOTIF_ISO_SACD_DST,
                                             )
-                                            .or_insert(0) += 1;
+                                        } else {
+                                            (
+                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD,
+                                                crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT,
+                                            )
+                                        };
+                                        *skipped_by_ext.entry(cle.to_string()).or_insert(0) += 1;
                                         // Le motif technique exact accompagne
                                         // le CHEMIN — « sacd_extract not
                                         // found » et « sacd_extract failed »
                                         // ne demandent pas le même geste.
                                         pousser_chemin_ecarte(
                                             &mut skipped_paths,
-                                            format!("{} ({e})", path.display()),
+                                            if est_dst {
+                                                format!(
+                                                    "{} (DST, non pris en charge ; {e})",
+                                                    path.display()
+                                                )
+                                            } else {
+                                                format!("{} ({e})", path.display())
+                                            },
                                         );
                                         skipped_reasons
-                                            .entry(
-                                                crate::audio::iso_sacd::CLE_RAPPORT_ISO_SACD
-                                                    .to_string(),
-                                            )
-                                            .or_insert_with(|| {
-                                                crate::audio::iso_sacd::MOTIF_ISO_SACD_NON_EXTRAIT
-                                                    .to_string()
-                                            });
+                                            .entry(cle.to_string())
+                                            .or_insert_with(|| motif.to_string());
                                         dir_error_count += 1;
                                     }
+                                }
+                            } else if let Some(contenu) =
+                                crate::audio::iso9660::contenu_pour_le_parcours(path)
+                            {
+                                // #5299 — image de données qui porte de
+                                // l'audio : ses fichiers entrent comme ceux
+                                // d'un dossier, sous leur chemin virtuel.
+                                dir_file_count += contenu.pistes.len();
+                                files.extend(contenu.pistes);
+                                for chemin in contenu.ecartes {
+                                    let cle = crate::audio::iso9660::CLE_RAPPORT_FORMAT_DANS_IMAGE;
+                                    let motif = crate::audio::iso9660::MOTIF_FORMAT_DANS_IMAGE;
+                                    *skipped_by_ext.entry(cle.to_string()).or_insert(0) += 1;
+                                    pousser_chemin_ecarte(
+                                        &mut skipped_paths,
+                                        format!("{chemin} ({motif})"),
+                                    );
+                                    skipped_reasons
+                                        .entry(cle.to_string())
+                                        .or_insert_with(|| motif.to_string());
                                 }
                             } else {
                                 // `.iso` sans zone SACD : une image de données.
@@ -1625,6 +1697,7 @@ pub fn list_audio_files_avec_progression(
         skipped_reasons,
         skipped_paths,
         dossiers_avec_feuille_cue: dossiers_cue.into_iter().collect(),
+        isos_sacd_natifs,
     }
 }
 
@@ -1656,14 +1729,11 @@ pub fn scan_files_parallel(
             let path_str: String = path.to_string_lossy().nfc().collect();
             warn_unsafe_path_text(&path_str);
 
-            let file_meta = path.metadata().ok();
+            // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
+            // `metadata()` : sa taille propre, la date de l'image.
+            let file_meta = crate::audio::iso9660::taille_et_mtime(path);
             let stat_ok = file_meta.is_some();
-            let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = file_meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
+            let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
             // Zero-byte "audio" files are aborted copies/downloads, not
             // tracks: don't index a tagless duration-0 ghost, surface them in
@@ -2020,14 +2090,11 @@ pub fn scan_files_batched_avec_arret(
                     let path_str: String = path.to_string_lossy().nfc().collect();
                     warn_unsafe_path_text(&path_str);
 
-                    let file_meta = path.metadata().ok();
+                    // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
+                    // `metadata()` : sa taille propre, la date de l'image.
+                    let file_meta = crate::audio::iso9660::taille_et_mtime(path);
                     let stat_ok = file_meta.is_some();
-                    let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                    let mtime = file_meta
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0);
+                    let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
                     // Zero-byte "audio" files are aborted copies/downloads, not
                     // tracks: don't index a tagless duration-0 ghost, surface
@@ -2547,14 +2614,17 @@ mod tests {
     fn unread_list_targets_audio_only() {
         // Les formats réclamés sur le forum (Rhorn, #1763).
         assert!(KNOWN_UNREAD_AUDIO.contains(&"mpc"));
-        assert!(KNOWN_UNREAD_AUDIO.contains(&"cue"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"wma"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"asf"));
         assert!(KNOWN_UNREAD_AUDIO.contains(&"dst"));
         // Le bruit d'une bibliothèque musicale ne doit JAMAIS y figurer :
         // compter les pochettes et les fichiers de log noierait le seul
         // renseignement exploitable.
-        for noise in ["jpg", "png", "nfo", "m3u", "log", "txt", "accurip", "pdf"] {
+        // #5285 — une feuille CUE non plus : elle décrit un album, l'étape
+        // CUE la lit ; la compter « non prise en charge » est un faux rapport.
+        for noise in [
+            "jpg", "png", "nfo", "m3u", "log", "txt", "accurip", "pdf", "cue",
+        ] {
             assert!(
                 !KNOWN_UNREAD_AUDIO.contains(&noise),
                 "{noise} n'est pas de l'audio et polluerait le rapport"
@@ -2855,9 +2925,14 @@ mod tests {
             "c'est le dossier de la feuille qui est retenu, pas la feuille : {:?}",
             result.dossiers_avec_feuille_cue
         );
-        // Témoin anti-régression : le `.cue` reste compté comme non lu — cette
-        // brique AJOUTE une information, elle n'en retire aucune.
-        assert_eq!(result.skipped_by_ext.get("cue"), Some(&2));
+        // #5285 — le `.cue` n'est PLUS compté comme non lu : ce que la feuille
+        // a donné, c'est l'étape CUE qui le dit, pas ce compteur.
+        assert_eq!(result.skipped_by_ext.get("cue"), None);
+        assert!(
+            !result.skipped_paths.iter().any(|p| p.contains(".cue")),
+            "une feuille CUE listée comme non prise en charge : {:?}",
+            result.skipped_paths
+        );
         // Témoin anti-régression : les formats déjà reconnus le restent, et le
         // `.wma` déjà écarté l'est toujours.
         let noms: Vec<String> = result
@@ -2875,6 +2950,115 @@ mod tests {
         );
         assert_eq!(noms.len(), 2, "obtenu : {noms:?}");
         assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+    }
+
+    /// #5285 — Belkadi Yacine, fil 2003 : « Pourquoi autant de fichiers non
+    /// pris en charge ???? ». 798 des 799 lignes de « Format non pris en
+    /// charge » étaient des feuilles `.cue`, pendant que l'étape CUE du MÊME
+    /// scan en découpait 427 albums.
+    ///
+    /// Le contrat, parcours puis étape CUE, sur de vrais fichiers :
+    /// - une feuille DÉCOUPÉE n'apparaît dans aucune liste d'écartés ;
+    /// - une feuille ORPHELINE (son FILE n'existe pas) va dans la rubrique des
+    ///   feuilles CUE, motif « sans son fichier audio » — jamais dans « non
+    ///   pris en charge » ;
+    /// - le témoin `.wma` reste, lui, non pris en charge.
+    #[test]
+    fn une_feuille_cue_n_est_jamais_un_format_non_pris_en_charge_5285() {
+        fn ecrire_wav(chemin: &std::path::Path) {
+            const TAUX: u32 = 44_100;
+            let echantillons = TAUX / 5;
+            let octets = echantillons * 4;
+            let mut f = Vec::new();
+            f.extend_from_slice(b"RIFF");
+            f.extend_from_slice(&(36 + octets).to_le_bytes());
+            f.extend_from_slice(b"WAVEfmt ");
+            f.extend_from_slice(&16u32.to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&2u16.to_le_bytes());
+            f.extend_from_slice(&TAUX.to_le_bytes());
+            f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+            f.extend_from_slice(&4u16.to_le_bytes());
+            f.extend_from_slice(&16u16.to_le_bytes());
+            f.extend_from_slice(b"data");
+            f.extend_from_slice(&octets.to_le_bytes());
+            for n in 0..echantillons {
+                let v = ((n as f32 / 40.0).sin() * 8000.0) as i16;
+                f.extend_from_slice(&v.to_le_bytes());
+                f.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(chemin, f).unwrap();
+        }
+        const FEUILLE: &str = "PERFORMER \"Bob Dylan\"\nTITLE \"Blonde On Blonde\"\nFILE \"image.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Rainy Day Women\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Pledging My Time\"\n    INDEX 01 00:00:10\n";
+
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_cue_non_pris_en_charge_5285");
+        let _ = std::fs::remove_dir_all(&base);
+        let lue = base.join("Bob Dylan - Blonde On Blonde");
+        let orpheline = base.join("Tortoise - Beacons of Ancestorship");
+        let temoin = base.join("Divers");
+        for d in [&lue, &orpheline, &temoin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        ecrire_wav(&lue.join("image.wav"));
+        std::fs::write(lue.join("Blonde On Blonde.cue"), FEUILLE).unwrap();
+        // Même feuille, sans son image : orpheline.
+        std::fs::write(orpheline.join("Beacons of Ancestorship.cue"), FEUILLE).unwrap();
+        std::fs::write(temoin.join("album.wma"), b"fixture").unwrap();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let inventaire = crate::scanner::cue_album::inventorier(&result.dossiers_avec_feuille_cue);
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Aucune feuille CUE dans « non pris en charge », ni au compteur ni
+        // dans la liste nominative.
+        assert_eq!(
+            result.skipped_by_ext.get("cue"),
+            None,
+            "feuilles CUE comptées « non prises en charge » : {:?}",
+            result.skipped_by_ext
+        );
+        let cue_non_pris: Vec<&String> = result
+            .skipped_paths
+            .iter()
+            .filter(|p| p.contains(".cue"))
+            .collect();
+        assert!(
+            cue_non_pris.is_empty(),
+            "feuilles CUE listées « format non pris en charge » : {cue_non_pris:?}"
+        );
+        // Le témoin : un vrai format non lu y reste.
+        assert_eq!(result.skipped_by_ext.get("wma"), Some(&1));
+        assert!(result.skipped_paths.iter().any(|p| p.contains("album.wma")));
+
+        // Les deux dossiers sont bien remis à l'étape CUE.
+        assert_eq!(result.dossiers_avec_feuille_cue.len(), 2);
+        // La feuille lue donne son album, et n'est écartée nulle part.
+        assert_eq!(inventaire.albums, 1, "{inventaire:?}");
+        assert_eq!(inventaire.pistes, 2, "{inventaire:?}");
+        assert!(
+            !inventaire
+                .chemins_ecartes
+                .iter()
+                .any(|p| p.contains("Blonde On Blonde.cue")),
+            "une feuille découpée listée comme écartée : {:?}",
+            inventaire.chemins_ecartes
+        );
+        // L'orpheline va dans SA rubrique, avec son motif.
+        assert_eq!(inventaire.feuilles_ecartees, 1, "{inventaire:?}");
+        assert_eq!(
+            inventaire.ecarts_par_cle.get("cue-image-introuvable"),
+            Some(&1)
+        );
+        assert!(
+            inventaire
+                .chemins_ecartes
+                .iter()
+                .any(|p| p.contains("Beacons of Ancestorship.cue")
+                    && p.contains("feuille CUE sans son fichier audio")),
+            "orpheline absente de la rubrique des feuilles CUE : {:?}",
+            inventaire.chemins_ecartes
+        );
     }
 
     /// Une bibliothèque sans la moindre feuille ne paie rien (#1763).
@@ -3070,6 +3254,89 @@ mod tests {
         assert!(
             !ecartes.contains("temoin.flac"),
             "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
+        );
+    }
+
+    /// #5297 — une image SACD en DSD brut n'est plus soumise à `sacd_extract` :
+    /// le parcours la lit, et la rend comme un album à écrire. Une image DST
+    /// est NOMMÉE pour ce qu'elle est ; une image de données reste écartée ;
+    /// une image déjà extraite par une version antérieure garde son chemin.
+    #[test]
+    fn une_iso_sacd_dsd_est_lue_nativement_et_une_dst_est_nommee() {
+        use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire};
+        // Sous `target/`, jamais sous `/tmp` (voir le test précédent).
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_iso_natif_5297_b209");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        ecrire(
+            &base.join("Kind of Blue.iso"),
+            &ImageFabriquee::deux_pistes(),
+        );
+        let mut dst = ImageFabriquee::deux_pistes();
+        dst.stereo_dst = true;
+        ecrire(&base.join("Brothers in Arms.iso"), &dst);
+        image_iso_de_test(&base, "ubuntu-26.04-desktop-amd64.iso", false);
+        // Déjà extraite par une version antérieure : son dossier de DSF est
+        // indexé comme n'importe quel dossier, la lire en plus doublerait
+        // l'album.
+        let ancienne = base.join("Ancienne");
+        std::fs::create_dir_all(ancienne.join("Time Out.sacd_extract")).unwrap();
+        ecrire(
+            &ancienne.join("Time Out.iso"),
+            &ImageFabriquee::deux_pistes(),
+        );
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            result.files.is_empty(),
+            "une image n'est pas une piste : {:?}",
+            result.files
+        );
+        assert_eq!(
+            result.isos_sacd_natifs.len(),
+            1,
+            "seule l'image DSD non extraite se lit nativement : {:?}",
+            result
+                .isos_sacd_natifs
+                .iter()
+                .map(|i| &i.chemin)
+                .collect::<Vec<_>>()
+        );
+        let lue = &result.isos_sacd_natifs[0];
+        assert!(lue.chemin.ends_with("Kind of Blue.iso"));
+        assert_eq!(lue.disque.titre(), Some("Kind of Blue"));
+        assert_eq!(
+            lue.disque.zone_de_lecture().map(|z| z.pistes.len()),
+            Some(2)
+        );
+
+        // Le disque DST : nommé, avec sa raison, sous sa clé.
+        let cle_dst = crate::audio::sacd::CLE_RAPPORT_ISO_SACD_DST;
+        assert_eq!(result.skipped_by_ext.get(cle_dst), Some(&1));
+        assert_eq!(
+            result.skipped_reasons.get(cle_dst).map(String::as_str),
+            Some(crate::audio::sacd::MOTIF_ISO_SACD_DST)
+        );
+        let ecartes = result.skipped_paths.join("\n");
+        assert!(
+            ecartes.contains("Brothers in Arms.iso (DST, non pris en charge"),
+            "le chemin du disque DST doit porter sa raison :\n{ecartes}"
+        );
+        // L'image de données reste écartée comme avant.
+        assert_eq!(
+            result
+                .skipped_by_ext
+                .get(crate::audio::iso_sacd::CLE_RAPPORT_ISO_DONNEES),
+            Some(&1)
+        );
+        // Et le disque lu nativement n'apparaît dans AUCUN écart.
+        assert!(
+            !ecartes.contains("Kind of Blue.iso"),
+            "une image lue ne doit pas être déclarée écartée :\n{ecartes}"
         );
     }
 

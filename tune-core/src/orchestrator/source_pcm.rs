@@ -25,6 +25,41 @@ impl PlaybackOrchestrator {
         &self.sources_pcm
     }
 
+    /// Le registre des sources dont un greffon fournit l'URL au moment de
+    /// jouer (#5327). Voir `crate::source_url`.
+    pub fn sources_url(&self) -> &crate::source_url::SourcesUrl {
+        &self.sources_url
+    }
+
+    /// Résout une ligne dont la `source` est fournie en URL par un greffon :
+    /// l'URL est demandée MAINTENANT, jouée comme un flux distant (`upnp`),
+    /// et seule la référence reste dans la demande — donc dans la lecture en
+    /// cours, la file et l'historique.
+    pub(super) async fn resolve_source_url(
+        &self,
+        source: &str,
+        fournisseur: Arc<dyn crate::source_url::FournisseurDUrl>,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
+        let reference = req
+            .source_id
+            .clone()
+            .ok_or_else(|| format!("source « {source} » : source_id requis"))?;
+        let fournie = fournisseur
+            .url(req.zone_id, &reference)
+            .await
+            .map_err(|refus| refus.en_message())?;
+        let mut distante = req.clone();
+        distante.source = Some("upnp".into());
+        distante.source_id = Some(fournie.url);
+        distante.media_format = fournie.media_format.or(distante.media_format);
+        let mut resolu = self.resolve_direct_url(&distante).await?;
+        // La lecture en cours dit d'où vient la piste (`circle`), pas le
+        // chemin technique par lequel elle passe.
+        resolu.source = source.to_string();
+        Ok(resolu)
+    }
+
     /// #5065 — le registre commun des sources physiques, que les greffons
     /// natifs reçoivent par l'orchestrateur de leurs `HostServices`.
     pub fn sources_physiques(&self) -> &Arc<crate::sources_physiques::RegistreSources> {
@@ -262,6 +297,7 @@ impl PlaybackOrchestrator {
         let _ = cellule.set(Arc::downgrade(&session));
         session.publish_detected_output_format(format.frequence, format.canaux);
         session.publish_radio_source(crate::http::streamer::RadioSourceInfo {
+            channels: Some(format.canaux),
             format: Some("wav"),
             sample_rate: Some(format.frequence),
             bit_depth: Some(format.bits),
