@@ -856,7 +856,7 @@ fn enables_volume_lock(body: &serde_json::Map<String, Value>) -> bool {
 
 /// Témoin posé quand c'est le choix d'ASIO qui a armé le mode exclusif —
 /// et non l'utilisateur par le sélecteur « partagé / exclusif ».
-const EXCLUSIF_ARME_PAR_ASIO: &str = "local_exclusive_mode_arme_par_asio";
+const EXCLUSIF_ARME_PAR_ASIO: &str = tune_core::config::REGLAGE_EXCLUSIF_ARME_PAR_ASIO;
 
 /// Ce que devient le mode exclusif quand le backend change (#4184).
 #[derive(Debug, PartialEq, Eq)]
