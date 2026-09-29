@@ -115,6 +115,10 @@ pub fn router() -> Router<AppState> {
         .route("/", get(status))
         .route("/{id}/install", post(install))
         .route(
+            "/{id}/install-from-catalog",
+            post(crate::catalogue_greffons_audio::install_from_catalog),
+        )
+        .route(
             "/{id}/zones/{zone}",
             get(crate::routes::greffons_natifs_tiers::reglage_de_zone)
                 .put(crate::routes::greffons_natifs_tiers::regler_la_zone),
@@ -161,7 +165,8 @@ pub fn is_third_party(id: &str) -> bool {
 fn managed(id: &str) -> bool {
     tune_core::audio::premium_plugins::contains(id) || is_third_party(id)
 }
-async fn status(_admin: RequireAdmin) -> Response {
+async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let integres = tune_core::audio::premium_plugins::IDS
         .into_iter()
         .map(|id| (id.to_string(), false));
@@ -169,7 +174,10 @@ async fn status(_admin: RequireAdmin) -> Response {
     let plugins: Vec<_> = integres
         .chain(tiers)
         .map(|(id, third_party)| {
-            json!({"id":id,"third_party":third_party,"native_loaded":tune_plugin_native::provider(&id).is_some(),"error":tune_plugin_native::failure(&id)})
+            // `version` : celle du catalogue à l'installation, `null` pour un
+            // paquet envoyé à la main (le manifeste du SDK n'en porte pas).
+            let version = settings.get(&format!("plugin_{id}_version")).ok().flatten();
+            json!({"id":id,"third_party":third_party,"native_loaded":tune_plugin_native::provider(&id).is_some(),"error":tune_plugin_native::failure(&id),"version":version})
         })
         .collect();
     Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":plugins})).into_response()
@@ -190,21 +198,10 @@ async fn install(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let tiers = !tune_core::audio::premium_plugins::contains(&id);
-    if tiers {
-        if !tune_core::audio::natifs_tiers::identifiant_admissible(&id) {
-            return refusal("invalid plugin id".into());
-        }
-        // L'identifiant d'un autre greffon (compilé, WASM) partagerait ses
-        // drapeaux `plugin_{id}_*` : refusé.
-        if name_taken_by_another_plugin(&state, &id).await {
-            return refusal("plugin id already used by another plugin".into());
-        }
-    }
-    if let Err(response) = crate::premium_guard::require_premium(&state.license, feature(&id)).await
-    {
-        return response;
-    }
+    let tiers = match check_slot(&state, &id).await {
+        Ok(tiers) => tiers,
+        Err(response) => return response,
+    };
     let signature = match headers
         .get("x-tune-plugin-signature")
         .and_then(|v| v.to_str().ok())
@@ -212,13 +209,52 @@ async fn install(
         Some(s) => s.replace("\\n", "\n"),
         None => return refusal("missing detached signature".into()),
     };
-    let keys = match trusted_keys() {
-        Ok(keys) => keys,
-        Err(e) => return refusal(e),
-    };
+    match install_package(&state, &id, tiers, body.to_vec(), signature, None).await {
+        Ok(package) => {
+            Json(json!({"id":id,"installed":true,"restart_required":true,"target":package.target}))
+                .into_response()
+        }
+        Err(e) => refusal(e),
+    }
+}
+
+/// Les gardes d'un emplacement AVANT tout octet de paquet : identifiant
+/// admissible, nom libre, Premium. Rend `true` pour un greffon natif tiers.
+/// Partagé par l'envoi direct (`install`) et par l'installation depuis le
+/// catalogue (`catalogue_greffons_audio`), qui doit refuser un compte Free
+/// sans rien demander au réseau.
+pub(crate) async fn check_slot(state: &AppState, id: &str) -> Result<bool, Response> {
+    let tiers = !tune_core::audio::premium_plugins::contains(id);
+    if tiers {
+        if !tune_core::audio::natifs_tiers::identifiant_admissible(id) {
+            return Err(refusal("invalid plugin id".into()));
+        }
+        // L'identifiant d'un autre greffon (compilé, WASM) partagerait ses
+        // drapeaux `plugin_{id}_*` : refusé.
+        if name_taken_by_another_plugin(state, id).await {
+            return Err(refusal("plugin id already used by another plugin".into()));
+        }
+    }
+    crate::premium_guard::require_premium(&state.license, feature(id)).await?;
+    Ok(tiers)
+}
+
+/// Vérifie puis installe un paquet signé pour le PROCHAIN démarrage, et pose
+/// les drapeaux `plugin_{id}_installed|enabled`. `version` est la version
+/// annoncée par le catalogue (le manifeste du SDK n'en porte pas) : elle est
+/// retenue sous `plugin_{id}_version` pour l'écran Extensions.
+pub(crate) async fn install_package(
+    state: &AppState,
+    id: &str,
+    tiers: bool,
+    body: Vec<u8>,
+    signature: String,
+    version: Option<&str>,
+) -> Result<tune_plugin_native::package::Package, String> {
+    let keys = trusted_keys()?;
     let root = root();
-    let expected = id.clone();
-    let installed = tokio::task::spawn_blocking(move || {
+    let expected = id.to_string();
+    let package = tokio::task::spawn_blocking(move || {
         // Validate expected slot BEFORE activation, not after writing active.json.
         if tiers {
             let package = tune_plugin_native::package::inspect(&body, &signature, &keys)?;
@@ -228,22 +264,20 @@ async fn install(
         }
         tune_plugin_native::package::install_for(&root, &body, &signature, &keys, &expected)
     })
-    .await;
-    match installed {
-        Ok(Ok(package)) => {
-            let settings =
-                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-            for suffix in ["installed", "enabled"] {
-                if let Err(e) = settings.set(&format!("plugin_{id}_{suffix}"), "true") {
-                    return refusal(e);
-                }
-            }
-            Json(json!({"id":id,"installed":true,"restart_required":true,"target":package.target}))
-                .into_response()
-        }
-        Ok(Err(e)) => refusal(e),
-        Err(e) => refusal(e.to_string()),
+    .await
+    .map_err(|e| e.to_string())??;
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    for suffix in ["installed", "enabled"] {
+        settings.set(&format!("plugin_{id}_{suffix}"), "true")?;
     }
+    let cle_version = format!("plugin_{id}_version");
+    match version {
+        Some(v) => settings.set(&cle_version, v)?,
+        // Un paquet envoyé à la main ne dit pas sa version : ne pas laisser
+        // croire que c'est encore celle du catalogue.
+        None => settings.delete(&cle_version)?,
+    }
+    Ok(package)
 }
 /// Le droit qui ouvre un emplacement. Le droit gratuit (`DspEq`) n'appartient
 /// qu'à l'égaliseur, nommément ; tout autre identifiant, greffon natif tiers

@@ -150,6 +150,12 @@ snow = { version = "0.10", default-features = false, features = [
     "std",
 ] }
 base64 = "0.22"
+# Test-only : signer un paquet de greffon comme minisign (Ed25519 sur un
+# prédigest BLAKE2b-512) pour le catalogue factice de
+# `catalogue_greffons_audio`. Les deux sont déjà dans Cargo.lock (rustls,
+# argon2) : aucune nouvelle dépendance n'entre dans l'arbre.
+ring = "0.17"
+blake2 = "0.10"
 # Test-only : fabriquer des horodatages passés pour rejouer une machine restée
 # hors ligne (tests/licence_grace_visible.rs, #1999).
 chrono = { workspace = true }
