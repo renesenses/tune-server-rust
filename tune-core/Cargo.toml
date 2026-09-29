@@ -177,6 +177,13 @@ path = "tests/sendspin_poignee_s2a.rs"
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
 
+# `autotests = false` : sans cette cible, le témoin ne serait jamais compilé.
+# Binaire à lui seul : le cache d'intérêt de tracing est un état de PROCESSUS
+# (voir l'en-tête du fichier, #5370).
+[[test]]
+name = "journal_par_greffon_5370"
+path = "tests/journal_par_greffon_5370.rs"
+
 # `autotests = false` en tete de ce manifeste : sans cette cible, le temoin de
 # la pause des traitements de fond ne serait JAMAIS compile et la porte rendrait
 # un vert contre rien (#4574). Binaire a lui seul : la pause est un etat de
