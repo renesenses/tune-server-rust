@@ -46,7 +46,17 @@ fn fixture() -> (
 
 async fn lancer(state: &AppState, lecteur: LecteurMetadonnees) -> Vec<Value> {
     let mut rx = state.event_bus.subscribe();
-    assert!(spawn_library_scan_avec_lecteur(state.clone(), false, None, None, lecteur).await);
+    assert!(
+        spawn_library_scan_avec_lecteur(
+            state.clone(),
+            false,
+            None,
+            None,
+            lecteur,
+            DELAI_LECTURE_CREDITS
+        )
+        .await
+    );
     let mut progression = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(90), rx.recv())
@@ -189,4 +199,176 @@ async fn arreter_pendant_les_credits_ne_lit_pas_le_reste_du_lot_et_ne_purge_pas_
             .unwrap()
             .is_autocommit()
     );
+}
+
+/// Un lecteur factice qui ne rend JAMAIS la main tant que le témoin ne le
+/// libère. La libération passe par `Drop` : même un témoin qui rougit relâche
+/// ses fils, et le scan qu'il a lancé finit par rendre le droit de scanner.
+struct Muet(Arc<std::sync::atomic::AtomicBool>);
+
+impl Muet {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    /// Relâché de toute façon au bout de `d` : un témoin unitaire qui rougit
+    /// parce que la lecture n'est plus bornée rend quand même la main.
+    fn liberer_apres(d: Duration) -> Self {
+        let muet = Self::new();
+        let libere = muet.0.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(d);
+            libere.store(true, Ordering::SeqCst);
+        });
+        muet
+    }
+    fn attendre(libere: &std::sync::atomic::AtomicBool) {
+        while !libere.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Muet {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_fichier_dont_la_lecture_ne_rend_jamais_la_main_ne_fige_pas_le_lot_5202() {
+    let _seul = serialiser_les_scans_de_test_sans_bloquer().await;
+    let (_dir, state, _) = fixture();
+    let muet = Muet::new();
+    let libere = muet.0.clone();
+    let lecteur: LecteurMetadonnees = Arc::new(move |p: &std::path::Path| {
+        // Le fichier du milieu : un partage SMB qui ne répond plus sur lui.
+        if p.ends_with("piste-1.wav") {
+            Muet::attendre(&libere);
+        }
+        HashMap::from([("composer".into(), "Temoin 5202".into())])
+    });
+    let mut rx = state.event_bus.subscribe();
+    assert!(
+        spawn_library_scan_avec_lecteur(
+            state.clone(),
+            false,
+            None,
+            None,
+            lecteur,
+            Duration::from_millis(300)
+        )
+        .await
+    );
+    let fin = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event.event_type == "library.scan.completed" {
+                return event.data;
+            }
+        }
+    })
+    .await
+    .expect("#5202 : un fichier dont la lecture ne rend jamais la main fige le lot entier");
+    attendre_que_le_droit_de_scanner_soit_libre().await;
+    assert_eq!(
+        fin["inserted"], 3,
+        "les trois pistes sont importées : {fin}"
+    );
+    let credits = state
+        .backend
+        .query_one(
+            "SELECT COUNT(*) FROM track_metadata WHERE key = 'composer' AND value = 'Temoin 5202'",
+            &[],
+        )
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        credits, 2,
+        "seul le fichier muet est importé sans ses crédits ; les autres gardent les leurs"
+    );
+    assert!(
+        state
+            .db
+            .as_ref()
+            .unwrap()
+            .connection()
+            .lock()
+            .unwrap()
+            .is_autocommit()
+    );
+    drop(muet);
+}
+
+#[test]
+fn un_stockage_muet_n_est_plus_relu_apres_trois_expirations_de_suite_5202() {
+    let muet = Muet::liberer_apres(Duration::from_secs(15));
+    let libere = muet.0.clone();
+    let tentatives = Arc::new(AtomicUsize::new(0));
+    let n = tentatives.clone();
+    let lecteur: LecteurMetadonnees = Arc::new(move |_: &std::path::Path| {
+        n.fetch_add(1, Ordering::SeqCst);
+        Muet::attendre(&libere);
+        HashMap::new()
+    });
+    let chemins: Vec<String> = (0..10).map(|i| format!("/partage/muet/{i}.flac")).collect();
+    let bus = tune_core::event_bus::EventBus::new();
+    let lu = lire_metadonnees_du_lot(
+        &chemins,
+        &lecteur,
+        Duration::from_millis(50),
+        || false,
+        &bus,
+        0,
+        0,
+        10,
+    );
+    assert_eq!(
+        lu.map(|m| m.len()),
+        Some(0),
+        "le lot continue, sans crédits pour les fichiers muets"
+    );
+    assert_eq!(
+        tentatives.load(Ordering::SeqCst),
+        import_progress::EXPIRATIONS_AVANT_ABANDON,
+        "#5202 : un stockage qui ne répond plus doit être abandonné après trois expirations, \
+         pas attendu fichier après fichier"
+    );
+    drop(muet);
+}
+
+#[test]
+fn arreter_pendant_une_lecture_bloquee_rend_la_main_sans_attendre_le_delai_5202() {
+    let muet = Muet::liberer_apres(Duration::from_secs(15));
+    let libere = muet.0.clone();
+    let lecteur: LecteurMetadonnees = Arc::new(move |_: &std::path::Path| {
+        Muet::attendre(&libere);
+        HashMap::new()
+    });
+    let arret = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = arret.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        a.store(true, Ordering::SeqCst);
+    });
+    let bus = tune_core::event_bus::EventBus::new();
+    let debut = std::time::Instant::now();
+    let lu = lire_metadonnees_du_lot(
+        &["/partage/muet/0.flac".to_string()],
+        &lecteur,
+        Duration::from_secs(60),
+        || arret.load(Ordering::SeqCst),
+        &bus,
+        0,
+        0,
+        1,
+    );
+    let ecoule = debut.elapsed();
+    assert!(lu.is_none(), "un lot arrêté n'ouvre pas sa transaction");
+    assert!(
+        ecoule < Duration::from_secs(10),
+        "#5202 : Arrêter doit agir pendant une lecture bloquée, pas après son délai ({ecoule:?})"
+    );
+    drop(muet);
 }
