@@ -64,12 +64,24 @@ const JALON: usize = 50;
 const VARIOUS_ARTISTS: &str = "Various Artists";
 
 /// Les pistes LOCALES de chaque album, avec ce que la base sait déjà.
-const SQL_PISTES: &str = "SELECT al.id, al.title, al.artist_id, COALESCE(ar.name, ''), al.is_compilation, t.file_path \
-     FROM albums al \
-     JOIN tracks t ON t.album_id = al.id \
-     LEFT JOIN artists ar ON ar.id = al.artist_id \
-     WHERE t.source = 'local' AND t.file_path IS NOT NULL AND t.file_path != '' \
-     ORDER BY al.id, t.file_path";
+///
+/// 🔴 `COALESCE(t.source, 'local')` et non plus `t.source = 'local'` nu. Cette
+/// passe était la SEULE de l'écran métadonnées à filtrer sur la source — elle
+/// a servi de modèle aux autres — mais sa forme nue écartait en silence les
+/// lignes anciennes dont la colonne est `NULL`, qui sont locales. Un
+/// élargissement, donc, et dans le bon sens : c'est la forme retenue pour tout
+/// l'écran ([`tune_core::db::track_repo::sql::est_local`]).
+fn sql_pistes() -> String {
+    format!(
+        "SELECT al.id, al.title, al.artist_id, COALESCE(ar.name, ''), al.is_compilation, t.file_path \
+         FROM albums al \
+         JOIN tracks t ON t.album_id = al.id \
+         LEFT JOIN artists ar ON ar.id = al.artist_id \
+         WHERE {piste_locale} AND t.file_path IS NOT NULL AND t.file_path != '' \
+         ORDER BY al.id, t.file_path",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+    )
+}
 
 /// Ce que les FICHIERS d'un album disent, réduit à ce que C1 et C2 lisent.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -238,7 +250,9 @@ pub(crate) fn reparer(state: &AppState, avancement: &dyn Fn(usize, usize)) -> Bi
     let meta_repo = AlbumMetadataRepo::with_backend(backend.clone());
 
     // Regrouper les chemins par album, en gardant l'état de la ligne.
-    let rows = backend.query_many(SQL_PISTES, &[]).ou_defaut_journalise();
+    let rows = backend
+        .query_many(&sql_pistes(), &[])
+        .ou_defaut_journalise();
     let mut albums: Vec<LigneAlbum> = Vec::new();
     for r in &rows {
         let (Some(id), Some(chemin)) = (
@@ -639,5 +653,79 @@ mod tests {
         assert!(en_cours(&s));
         let r2 = lancer(State(s.clone())).await.into_response();
         assert_eq!(r2.status(), StatusCode::CONFLICT);
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+///
+/// Cette passe filtrait déjà sur la source, mais sous la forme NUE
+/// `t.source = 'local'`, qui écarte en silence les lignes anciennes portant
+/// `NULL`. Les deux témoins gardent les deux sens de la forme retenue.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use crate::state::AppState;
+
+    fn banc() -> AppState {
+        let s = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &s.backend;
+        b.execute(
+            "INSERT INTO albums (id, title) VALUES (1, 'Anthologie')",
+            &[],
+        )
+        .expect("album");
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, file_path, source) \
+             VALUES (1, 'p1', 1, '/m/a/01.flac', 'local')",
+            &[],
+        )
+        .expect("piste locale");
+        // Ligne ANCIENNE : `source` NULL, donc locale.
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, file_path, source) \
+             VALUES (2, 'p2', 1, '/m/a/02.flac', NULL)",
+            &[],
+        )
+        .expect("piste héritée");
+        // 🔴 Distante AVEC un chemin — le cas absent de la base de Bertrand.
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, file_path, source) \
+             VALUES (3, 'p3', 1, '/u/a/03.flac', 'upnp')",
+            &[],
+        )
+        .expect("piste distante");
+        s
+    }
+
+    fn chemins(s: &AppState) -> Vec<String> {
+        s.backend
+            .query_many(&sql_pistes(), &[])
+            .expect("requête")
+            .iter()
+            .filter_map(|r| r.get(5).and_then(|v| v.as_string()))
+            .collect()
+    }
+
+    #[test]
+    fn la_passe_ecarte_une_piste_non_locale_qui_porte_un_chemin() {
+        let vus = chemins(&banc());
+        assert!(
+            !vus.iter().any(|c| c.starts_with("/u/")),
+            "la piste `source = upnp` ne doit PAS être relue ni réécrite — {vus:?}"
+        );
+    }
+
+    #[test]
+    fn la_passe_garde_le_local_y_compris_une_source_nulle() {
+        let vus = chemins(&banc());
+        assert!(
+            vus.iter().any(|c| c == "/m/a/01.flac"),
+            "la piste LOCALE doit rester traitée — {vus:?}"
+        );
+        assert!(
+            vus.iter().any(|c| c == "/m/a/02.flac"),
+            "une ligne ANCIENNE à `source` NULL est locale : la forme nue \
+             `t.source = 'local'` l'écartait en silence — {vus:?}"
+        );
     }
 }

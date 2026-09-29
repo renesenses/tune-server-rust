@@ -6,8 +6,11 @@
 //!
 //! Reporte dans les BALISES de chaque fichier local de l'album les valeurs que
 //! le mode « Modifier » a posées EN BASE : ALBUM, ALBUMARTIST, DISCNUMBER,
-//! DISCTOTAL, DISCSUBTITLE, TRACKNUMBER, TRACKTOTAL, TITLE, ARTIST et
-//! COMPILATION (règle : [`edition_album::balises_effectives`]). L'écrivain est
+//! DISCTOTAL, DISCSUBTITLE, TRACKNUMBER, TRACKTOTAL, TITLE, ARTIST,
+//! COMPILATION et GENRE (règle : [`edition_album::balises_effectives`]).
+//! GENRE (#5314, décision du 28/09/2026) : les genres de la piste en base,
+//! en valeurs séparées ; une piste sans genre en base laisse la balise du
+//! fichier telle quelle. L'écrivain est
 //! celui du dépôt (`metadata::tag_writer`), en mode atomique et gardé :
 //! copie, écriture, relecture des champs, empreinte de l'audio, renommage
 //! ([`tag_writer::ecrire_balises_edition`]).

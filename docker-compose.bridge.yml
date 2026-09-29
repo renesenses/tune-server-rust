@@ -17,6 +17,12 @@ services:
       # son absence : un deploiement qui l'oublie mettrait dehors tous les
       # utilisateurs premium, et le symptome ne pointerait pas vers la cause.
       - TUNE_CLOUD_SERVICE_TOKEN=${TUNE_CLOUD_SERVICE_TOKEN:-}
+      # Tune Circle (#5327) : jeton de service PROPRE au relais, pour verifier
+      # les billets d'ecoute de `/stream/circle/{ticket}` aupres du cloud
+      # (`POST /api/v1/circle/listen/verify`). Meme valeur que
+      # TUNE_BRIDGE_SERVICE_TOKEN cote site. AUCUN repli : sans lui, aucune
+      # ecoute de contact n'est servie (503, circle_ecoute_fermee au demarrage).
+      - TUNE_BRIDGE_SERVICE_TOKEN=${TUNE_BRIDGE_SERVICE_TOKEN:-}
       # Surchargeable pour une recette ; par defaut https://mozaiklabs.fr
       - TUNE_CLOUD_BASE_URL=${TUNE_CLOUD_BASE_URL:-}
     ports:

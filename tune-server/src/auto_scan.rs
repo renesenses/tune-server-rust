@@ -331,7 +331,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // virtuelles. `inventorier` construisait les `PisteCue` puis les
         // jetait ; `inventorier_et_ecrire` les range, sans relire une seule
         // feuille de plus, et rend l'inventaire à l'identique.
-        let (inventaire_cue, bilan_cue, images_cue) =
+        let (inventaire_cue, mut bilan_cue, images_cue) =
             tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
@@ -348,6 +348,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     trop_massive: &crate::routes::system::scan::purge_trop_massive,
                 },
             );
+        // #5297 — les images SACD que le parcours a lues NATIVEMENT : même
+        // écrivain que les albums CUE (pistes = tranches de l'image), même
+        // bilan, donc même réévaluation des pochettes en fin de scan.
+        tune_core::scanner::cue_bibliotheque::ecrire_les_iso_sacd(
+            &db,
+            &list_result.isos_sacd_natifs,
+            &mut bilan_cue,
+        );
         if inventaire_cue.dossiers > 0 {
             info!(
                 dossiers = inventaire_cue.dossiers,
@@ -510,7 +518,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
-        let scan_total = files_to_scan.len() as i64;
+        // #5371 — le numérateur (`inserted + updated + skipped`) part de
+        // `pre_skipped` : les fichiers inchangés, écartés avant lecture, y sont
+        // comptés. Le dénominateur doit donc les compter aussi, comme le scan
+        // manuel (`total = total_to_scan + pre_skipped`). Sans eux, Tades a vu
+        // « 438 443 fichiers sur 41 166 — 100 % » pendant un scan en cours.
+        let scan_total = (files_to_scan.len() + pre_skipped) as i64;
         let scan_timer_start = std::time::Instant::now();
         let mut last_progress_emit = scan_timer_start;
 
@@ -1771,9 +1784,15 @@ pub(crate) fn reimporter_fichier_surveillant(
             continue;
         }
 
-        if remplace {
-            track_repo.delete_by_path(&sf.path).ok();
-        }
+        // #5341 — la ligne déjà indexée de CE fichier. Elle n'est plus
+        // supprimée avant la relecture : elle sera MISE À JOUR sous son
+        // identifiant (voir `ranger_la_piste_du_surveillant`), comme
+        // `deplacer_fichiers` le fait d'un dossier renommé.
+        let ancienne = if remplace {
+            track_repo.get_by_path(&sf.path).ok().flatten()
+        } else {
+            None
+        };
 
         // Decide compilation over the whole folder from
         // the siblings already in the DB, so re-importing
@@ -1827,6 +1846,11 @@ pub(crate) fn reimporter_fichier_surveillant(
                     if std::path::Path::new(fp).parent() != Some(dir) {
                         continue;
                     }
+                    // #5341 — sa propre ligne, encore en base, porte les
+                    // balises D'AVANT : elle ne vote pas pour le dossier.
+                    if fp == &sf.path {
+                        continue;
+                    }
                     note(aa.as_deref());
                     indices.ajouter_piste(aa.as_deref(), artiste.as_deref());
                 }
@@ -1857,7 +1881,10 @@ pub(crate) fn reimporter_fichier_surveillant(
         // The hash is only a candidate selector. The
         // watcher is allowed to skip solely after a
         // full byte-for-byte comparison.
-        if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
+        // #5341 — seulement pour un fichier NEUF : une piste déjà indexée que
+        // l'on relit reste la piste qu'elle est (sa propre ligne, encore en
+        // base, la ferait passer pour son propre exemplaire).
+        if let (None, Some(hash), Some(aid)) = (&ancienne, &track.audio_hash, album_id) {
             let candidates = track_repo
                 .paths_by_audio_hash_and_album(hash, aid)
                 .unwrap_or_default();
@@ -1911,7 +1938,36 @@ pub(crate) fn reimporter_fichier_surveillant(
             );
         }
 
+        // #5341 — la ligne existante garde son identifiant ; si les balises
+        // l'ont fait changer d'album, l'ancien recompte ses pistes (et, vidé,
+        // part avec les orphelins en fin de lot).
+        let ancien_album = ancienne.as_ref().and_then(|a| a.album_id);
+        track.id = ancienne.as_ref().and_then(|a| a.id);
         if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
+            // #5346 — comme le scan, relire aussi ReplayGain, crédits, etc.
+            // La lecture forte retrouve également l'identifiant d'une piste
+            // neuve. L'upsert conserve les clés absentes du fichier (mesures
+            // Tune, enrichissement), comme les deux autres chemins de scan.
+            let metadonnees = (|| -> Result<(), String> {
+                let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
+                    db,
+                    std::slice::from_ref(&sf.path),
+                )?;
+                let id = ids.get(&sf.path).copied().ok_or_else(|| {
+                    "piste enregistrée introuvable pour ses métadonnées étendues".to_string()
+                })?;
+                let ext =
+                    tune_core::metadata::read_extended_metadata(std::path::Path::new(&sf.path));
+                tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
+                    .set_batch(id, &ext)
+            })();
+            if let Err(e) = metadonnees {
+                tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
+            }
+            if let Some(ancien) = ancien_album.filter(|&a| Some(a) != album_id) {
+                album_repo.update_track_count(ancien).ok();
+                album_repo.update_quality_from_tracks(ancien).ok();
+            }
             info!(path = %sf.path, "watcher_track_added");
             // #4896 — les balises relues désavouent-elles la ligne album du
             // dossier ? Un simple lookup ; la relecture du dossier entier
@@ -2207,6 +2263,15 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         .into_iter()
         .filter(|c| !ecarte_du_surveillant(&c.path, reglages.exclusions))
         .collect();
+    // #4896 — un fichier renommé sur place garde sa ligne, avant que son
+    // ancien nom ne soit traité comme une disparition.
+    if fichiers
+        .iter()
+        .any(|c| c.change_type == ChangeType::Deleted)
+    {
+        let _porte = porte_du_scan(db);
+        apparier_les_fichiers_renommes(db, &mut fichiers);
+    }
     // #5073 — les dossiers dont une feuille CUE ou un fichier audio a changé
     // sont relus par le découpage du scan, AVANT d'importer quoi que ce soit :
     // un FLAC que sa feuille découpe n'est pas une piste à lui seul.
@@ -2305,6 +2370,124 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         suivre_les_images_de_pochette(db, &images, reglages.exclusions);
     }
     a_relire
+}
+
+/// #4896 — un fichier audio RENOMMÉ dans son dossier garde sa ligne.
+///
+/// Le lot porte l'ancien nom en `Deleted` (il n'existe plus) et le nouveau en
+/// `Added` ou `Modified`. Traités chacun de leur côté, ils retiraient la piste
+/// puis en importaient une neuve : identifiant, favoris, écoutes et étiquettes
+/// perdus, comme pour un dossier renommé avant #4896.
+///
+/// Un couple n'est apparié que s'il n'y a aucun doute : même dossier, un
+/// nouveau nom que la base ne connaît pas, même taille que la ligne, même
+/// empreinte audio (version courante), et un seul candidat de chaque côté.
+/// L'ancien fichier n'existant plus, la comparaison octet par octet est
+/// impossible ; l'empreinte (taille comprise) en tient lieu, et le doute
+/// retombe sur le chemin d'avant (retrait puis import). Un fichier déplacé
+/// dans un AUTRE dossier n'est pas apparié : il change d'album.
+///
+/// L'ancien nom quitte le lot ; le nouveau y reste, et sa relecture le saute
+/// si sa taille et sa date n'ont pas bougé.
+fn apparier_les_fichiers_renommes(
+    db: &Arc<dyn DbBackend>,
+    fichiers: &mut Vec<tune_core::scanner::watcher::FileChange>,
+) {
+    use tune_core::scanner::hasher::{compute_audio_hash, is_current_audio_hash};
+    use tune_core::scanner::watcher::ChangeType;
+    let track_repo = TrackRepo::with_backend(db.clone());
+    // (chemin, dossier, taille, empreinte) des nouveaux noms inconnus.
+    let mut arrivees: Vec<(String, std::path::PathBuf, i64, Option<String>)> = Vec::new();
+    for c in fichiers.iter() {
+        if !matches!(c.change_type, ChangeType::Added | ChangeType::Modified) {
+            continue;
+        }
+        let chemin = std::path::Path::new(&c.path);
+        let (Some(dossier), Ok(meta)) = (chemin.parent(), std::fs::metadata(chemin)) else {
+            continue;
+        };
+        if !meta.is_file()
+            || !matches!(track_repo.get_by_path(&c.path), Ok(None))
+            || tune_core::library::exemplaires::est_un_exemplaire(&**db, &c.path)
+        {
+            continue;
+        }
+        arrivees.push((
+            c.path.clone(),
+            dossier.to_path_buf(),
+            meta.len() as i64,
+            None,
+        ));
+    }
+    if arrivees.is_empty() {
+        return;
+    }
+    let mut couples: Vec<(String, String)> = Vec::new();
+    for c in fichiers.iter() {
+        if c.change_type != ChangeType::Deleted || std::fs::symlink_metadata(&c.path).is_ok() {
+            continue;
+        }
+        let Ok(Some(piste)) = track_repo.get_by_path(&c.path) else {
+            continue;
+        };
+        let (Some(taille), Some(empreinte)) = (piste.file_size, piste.audio_hash.as_deref()) else {
+            continue;
+        };
+        if !is_current_audio_hash(empreinte) {
+            continue;
+        }
+        let Some(dossier) = std::path::Path::new(&c.path).parent() else {
+            continue;
+        };
+        let mut candidats = Vec::new();
+        for arrivee in arrivees.iter_mut() {
+            if arrivee.1 != dossier || arrivee.2 != taille {
+                continue;
+            }
+            if arrivee.3.is_none() {
+                arrivee.3 = compute_audio_hash(std::path::Path::new(&arrivee.0));
+            }
+            if arrivee.3.as_deref() == Some(empreinte) {
+                candidats.push(arrivee.0.clone());
+            }
+        }
+        if let [nouveau] = candidats.as_slice() {
+            couples.push((c.path.clone(), nouveau.clone()));
+        }
+    }
+    // Un nouveau nom réclamé par deux anciens : on ne choisit pas.
+    let mut vus = std::collections::HashMap::<&str, usize>::new();
+    for (_, nouveau) in &couples {
+        *vus.entry(nouveau.as_str()).or_default() += 1;
+    }
+    let couples: Vec<(String, String)> = couples
+        .iter()
+        .filter(|(_, nouveau)| vus.get(nouveau.as_str()) == Some(&1))
+        .cloned()
+        .collect();
+    if couples.is_empty() {
+        return;
+    }
+    match track_repo.deplacer_fichiers(&couples) {
+        Ok(n) => {
+            let exemplaires =
+                tune_core::library::exemplaires::deplacer_les_exemplaires(&**db, &couples);
+            info!(
+                fichiers = n,
+                exemplaires, "watcher_fichier_renomme — la piste garde sa ligne (#4896)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "watcher_fichier_renomme_echoue");
+            return;
+        }
+    }
+    // Seuls les anciens noms effectivement déplacés quittent le lot.
+    fichiers.retain(|c| {
+        c.change_type != ChangeType::Deleted
+            || !couples.iter().any(|(ancien, _)| *ancien == c.path)
+            || matches!(track_repo.get_by_path(&c.path), Ok(Some(_)))
+    });
 }
 
 /// Un chemin que le surveillant ignore : exclu des scans, ou fichier
@@ -2744,7 +2927,29 @@ pub(crate) fn ranger_la_piste_du_surveillant(
     track: &Track,
     album_id: Option<i64>,
 ) -> bool {
-    let rangee = track_repo.create(track).is_ok();
+    // #5341 — une piste qui porte déjà son identifiant est une ligne EXISTANTE
+    // relue sur le disque : elle se MET À JOUR, exactement comme le scan le
+    // fait d'un fichier modifié (`update_batch`, puis la pochette propre de la
+    // piste, puis l'adoption d'une ligne d'importateur). La supprimer puis la
+    // recréer lui donnait un identifiant neuf à chaque sauvegarde dans un
+    // éditeur de balises, et emportait par cascade ou laissait orphelin tout
+    // ce qui s'y rattachait.
+    let rangee = match track.id {
+        Some(id) => {
+            let relue = std::slice::from_ref(track);
+            let ecrite = matches!(track_repo.update_batch(relue), Ok(1));
+            if ecrite {
+                if let Err(e) = track_repo.appliquer_pochettes_de_piste(relue) {
+                    tracing::warn!(error = %e, "watcher_pochette_de_piste_echec");
+                }
+                if let Err(e) = track_repo.adopter_en_local(&[id]) {
+                    tracing::warn!(error = %e, "watcher_adoption_locale_echec");
+                }
+            }
+            ecrite
+        }
+        None => track_repo.create(track).is_ok(),
+    };
     if let Some(aid) = album_id {
         album_repo.update_track_count(aid).ok();
         album_repo.update_quality_from_tracks(aid).ok();
@@ -2925,6 +3130,10 @@ mod surveillant_retouche_tests_4896;
 mod surveillant_dossiers_tests_4896;
 
 #[cfg(test)]
+#[path = "surveillant_fichier_renomme_tests_4896.rs"]
+mod surveillant_fichier_renomme_tests_4896;
+
+#[cfg(test)]
 #[path = "scan_realigne_tests_4896.rs"]
 mod scan_realigne_tests_4896;
 
@@ -2949,5 +3158,21 @@ mod scan_feuille_cue_tests_5108;
 mod pochettes_disque_tests_5034;
 
 #[cfg(test)]
+#[path = "iso_donnees_tests_5299.rs"]
+mod iso_donnees_tests_5299;
+
+#[cfg(test)]
 #[path = "pochettes_cue_tests_5222.rs"]
 mod pochettes_cue_tests_5222;
+
+#[cfg(test)]
+#[path = "surveillant_retouche_garde_l_identifiant_tests_5341.rs"]
+mod surveillant_retouche_garde_l_identifiant_tests_5341;
+
+#[cfg(test)]
+#[path = "surveillant_metadonnees_tests_5346.rs"]
+mod surveillant_metadonnees_tests_5346;
+
+#[cfg(test)]
+#[path = "compteur_demarrage_tests_5371.rs"]
+mod compteur_demarrage_tests_5371;
