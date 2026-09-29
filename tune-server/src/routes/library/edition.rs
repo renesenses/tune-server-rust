@@ -7,6 +7,8 @@
 //!   disque suivant ;
 //! - `POST /library/albums/{id}/discs/{number}/detach` — le disque redevient
 //!   un album séparé.
+//! - `POST /library/coffrets/{id}/defaire-manuel` — un coffret composé à la
+//!   main redevient ses albums (#5319).
 //!
 //! La logique, et ce qui la rend durable face aux analyses, vit dans
 //! [`tune_core::db::edition_album`] ; ces routes ne font que traduire.
@@ -112,6 +114,28 @@ pub(super) async fn detacher(
         }
         Ok(None) => refuser(RefusEdition::AlbumInconnu(id)),
         Err(e) => refuser(RefusEdition::Base(e.to_string())),
+    }
+}
+
+/// `POST /library/coffrets/{id}/defaire-manuel` — DÉFAIRE un coffret composé
+/// à la main (décision de Bertrand du 29/09/2026, #5319). Voir
+/// [`edition_album::defaire_coffret_manuel`]. Rend `{ cible, albums_recrees }`,
+/// comme `POST /library/coffrets/{id}/defaire` pour un coffret automatique,
+/// qui reste inchangé. 409 `pas_un_coffret_manuel` sur tout autre album.
+pub(super) async fn defaire_coffret_manuel(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    match edition_album::defaire_coffret_manuel(&state.backend, id) {
+        Ok(recrees) => {
+            annoncer(&state, "coffret_manuel_defait", id);
+            Json(json!({ "cible": id, "albums_recrees": recrees })).into_response()
+        }
+        Err(RefusEdition::Invalide {
+            code: code @ "pas_un_coffret_manuel",
+            message,
+        }) => refus(StatusCode::CONFLICT, code, message),
+        Err(e) => refuser(e),
     }
 }
 

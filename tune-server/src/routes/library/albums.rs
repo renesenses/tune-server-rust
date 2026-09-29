@@ -3636,9 +3636,20 @@ pub(super) async fn composer_coffret(
     // 🔴 TOUT VÉRIFIER AVANT D'ÉCRIRE. Un identifiant inconnu au milieu de la
     // liste laisserait sinon un coffret à moitié composé, que rien ne défait.
     let mut titres = Vec::with_capacity(ids.len());
-    for &id in &ids {
+    // Les disques tels qu'ils étaient AVANT la réunion : « Défaire le
+    // coffret » les rend (#5319).
+    let mut disques = Vec::with_capacity(ids.len());
+    for (rang, &id) in ids.iter().enumerate() {
         match repo.get(id) {
-            Ok(Some(a)) => titres.push(a.title),
+            Ok(Some(a)) => {
+                disques.push(coffrets_auto::DisqueRetenu {
+                    n: (rang + 1) as u32,
+                    titre: a.title.clone(),
+                    dossier: repo.folder_path_of(id).ok().flatten().unwrap_or_default(),
+                    artiste_id: a.artist_id,
+                });
+                titres.push(a.title);
+            }
             Ok(None) => {
                 return refus(
                     StatusCode::NOT_FOUND,
@@ -3662,6 +3673,16 @@ pub(super) async fn composer_coffret(
                 .into_response();
         }
     };
+
+    // Lu AVANT l'absorption, qui reprend sur la cible les clés qu'elle n'a
+    // pas : ce qui est tenu sur un autre disque ne compte pas ici.
+    let meta =
+        tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(state.backend.clone());
+    let titre_tenu_avant = meta
+        .champs_edites_a_la_main(cible)
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c == "title");
 
     // Le numéro de disque, dans l'ordre reçu — y compris pour la cible, qui
     // devient le disque 1 même si ses pistes se déclaraient autre chose.
@@ -3691,6 +3712,7 @@ pub(super) async fn composer_coffret(
     }
 
     let titre = titre_commun(&titres);
+    let mut titre_compose = None;
     if let Some(t) = titre.as_deref() {
         let (p1, p2) = match state.backend.engine() {
             Engine::Postgres => (
@@ -3704,6 +3726,15 @@ pub(super) async fn composer_coffret(
             &[&t.to_string() as &dyn ToSqlValue, &cible],
         ) {
             tracing::warn!(album = cible, erreur = %e, "coffret_manuel_titre_non_renomme");
+        } else {
+            // Décision de Bertrand du 29/09/2026 (#5319) : le titre calculé
+            // est tenu comme modifié à la main — l'écran « Modifier » le
+            // montre tel, et aucune relecture ne le reprend. « Défaire le
+            // coffret » rend le titre d'origine et retire ce marquage.
+            if let Err(e) = meta.marquer_edition_manuelle(cible, &["title"]) {
+                tracing::warn!(album = cible, erreur = %e, "coffret_manuel_titre_non_tenu");
+            }
+            titre_compose = Some(t.to_string());
         }
     }
     // Le marqueur `manuel` : la passe automatique ne touchera JAMAIS à ce
@@ -3711,11 +3742,14 @@ pub(super) async fn composer_coffret(
     // Sans lui, un coffret manuel ne se distingue d'un coffret réparti sur
     // plusieurs dossiers que par cette absence ; la passe l'épargne aussi,
     // mais par prudence et non par décision.
-    let marqueur = serde_json::to_string(&coffrets_auto::Marqueur::manuel()).unwrap_or_default();
-    if let Err(e) =
-        tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(state.backend.clone())
-            .set(cible, coffrets_auto::CLE_COFFRET, &marqueur)
-    {
+    let marqueur = serde_json::to_string(&coffrets_auto::Marqueur {
+        disques,
+        titre_compose,
+        titre_tenu_avant,
+        ..coffrets_auto::Marqueur::manuel()
+    })
+    .unwrap_or_default();
+    if let Err(e) = meta.set(cible, coffrets_auto::CLE_COFFRET, &marqueur) {
         tracing::warn!(album = cible, erreur = %e, "coffret_manuel_non_marque");
     }
     // 🔴 #5319 — la disposition TENUE, piste par piste. Le marqueur ne protège

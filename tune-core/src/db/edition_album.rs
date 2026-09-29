@@ -547,6 +547,12 @@ pub struct VueEdition {
     /// la SONDE du bouton « Écrire dans les fichiers » — un serveur qui n'a
     /// que les tranches 1 à 3 ne l'envoie pas, et le bouton n'apparaît pas.
     pub ecriture_balises: bool,
+    /// Ce serveur sait DÉFAIRE un coffret composé à la main
+    /// (`POST /library/coffrets/{id}/defaire-manuel`, #5319). Toujours `true`
+    /// ici : c'est la SONDE du bouton « Défaire le coffret » d'un coffret
+    /// manuel — un serveur antérieur ne l'envoie pas, et le bouton n'apparaît
+    /// pas.
+    pub defaire_coffret_manuel: bool,
 }
 
 /// Les noms de `edition_manuelle` rendus sous ceux du contrat de l'écran.
@@ -655,6 +661,7 @@ pub fn lire_vue(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<Option<VueEdit
         discs,
         tracks,
         ecriture_balises: true,
+        defaire_coffret_manuel: true,
     }))
 }
 
@@ -1287,6 +1294,163 @@ pub fn detacher(db: &Arc<dyn DbBackend>, album_id: i64, numero: i32) -> Result<i
         "disque_detache"
     );
     Ok(nouveau)
+}
+
+// ---------------------------------------------------------------------------
+// Défaire un coffret composé à la main — décision de Bertrand du 29/09/2026
+// ---------------------------------------------------------------------------
+
+/// Retire `champ` de `edition_manuelle`, et la clé si plus rien n'y est tenu.
+fn ne_plus_tenir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(), TuneError> {
+    let meta = AlbumMetadataRepo::with_backend(db.clone());
+    let tenus: Vec<String> = meta
+        .champs_edites_a_la_main(album_id)?
+        .into_iter()
+        .filter(|c| c != champ)
+        .collect();
+    if tenus.is_empty() {
+        meta.delete(album_id, CLE_EDITION_MANUELLE)?;
+    } else {
+        let json = serde_json::to_string(&tenus).map_err(|e| TuneError::from(e.to_string()))?;
+        meta.set(album_id, CLE_EDITION_MANUELLE, &json)?;
+    }
+    Ok(())
+}
+
+/// Le dossier d'un chemin stocké, `/` et `\` confondus (#5318).
+fn dossier_stocke(chemin: &str) -> Option<&str> {
+    crate::library::local_path::dossier_et_nom(chemin).map(|(d, _)| d)
+}
+
+/// DÉFAIT un coffret composé à la main (marqueur `manuel` : composition ou
+/// « attacher »). Rend les identifiants des albums recréés.
+///
+/// - Chaque disque autre que le premier redevient un album : titre, artiste
+///   et dossier d'origine quand la composition les a retenus (#5319), sinon
+///   le titre du coffret suivi du nom du disque, comme « détacher ». Son
+///   dossier lui est rendu s'il en a un à lui : c'est l'identité que le scan
+///   retrouvera. Ses pistes gardent leurs identifiants (favoris, écoutes,
+///   étiquettes) et reprennent le disque 1.
+/// - Le coffret redevient le premier disque. Son titre d'origine lui est
+///   rendu s'il porte encore le titre de la composition, et le marquage
+///   « titre modifié à la main » que la composition avait posé est retiré.
+/// - Le marqueur `manuel` et la DISPOSITION tenue (`edition_pistes`) sont
+///   retirés : un scan rend chaque piste à l'album de son dossier. Les
+///   titres et artistes de piste renommés à la main restent tenus, sur
+///   l'album où la piste se trouve désormais.
+///
+/// Refus `pas_un_coffret_manuel` pour tout album sans marqueur `manuel` — un
+/// coffret automatique se défait par sa propre route.
+pub fn defaire_coffret_manuel(
+    db: &Arc<dyn DbBackend>,
+    album_id: i64,
+) -> Result<Vec<i64>, RefusEdition> {
+    let repo = AlbumRepo::with_backend(db.clone());
+    let Some(coffret) = repo.get(album_id)? else {
+        return Err(RefusEdition::AlbumInconnu(album_id));
+    };
+    let Some(marqueur) = marqueur_coffret(db, album_id)?.filter(Marqueur::est_manuel) else {
+        return Err(invalide(
+            "pas_un_coffret_manuel",
+            format!("l'album {album_id} n'est pas un coffret composé à la main"),
+        ));
+    };
+    let lignes =
+        lignes_de(db.query_many_strong(&sql_lignes(db.engine()), &[&album_id as &dyn ToSqlValue])?);
+    let numeros: BTreeSet<i32> = lignes.iter().map(|l| l.disque).collect();
+    let heritage = lire_edition(db, album_id)?;
+    let dossier_du_coffret = repo.folder_path_of(album_id)?;
+    let p = |n| marque(db.engine(), n);
+    let (p1, p2, p3) = (p(1), p(2), p(3));
+
+    let mut recrees = Vec::new();
+    for &numero in numeros.iter().skip(1) {
+        let siennes: Vec<&Ligne> = lignes.iter().filter(|l| l.disque == numero).collect();
+        // Le dossier du disque : celui de ses fichiers, ou de son image CUE.
+        let dossiers: BTreeSet<&str> = siennes
+            .iter()
+            .filter_map(|l| {
+                l.chemin
+                    .as_deref()
+                    .or(l.cue.as_ref().map(|(m, _)| m.as_str()))
+            })
+            .filter_map(dossier_stocke)
+            .collect();
+        let dossier = (dossiers.len() == 1)
+            .then(|| dossiers.iter().next().map(|d| d.to_string()))
+            .flatten();
+        let retenu = marqueur
+            .disques
+            .iter()
+            .find(|d| dossier.as_deref() == Some(d.dossier.as_str()))
+            .or_else(|| marqueur.disques.iter().find(|d| d.n as i32 == numero));
+        let nom = siennes.iter().find_map(|l| l.nom_disque.clone());
+        let mut disque = coffret.clone();
+        disque.id = None;
+        disque.title = match (retenu, &nom) {
+            (Some(r), _) => r.titre.clone(),
+            (None, Some(n)) => format!("{} — {n}", coffret.title),
+            (None, None) => coffret.title.clone(),
+        };
+        disque.artist_id = retenu.and_then(|r| r.artiste_id).or(coffret.artist_id);
+        disque.track_count = Some(0);
+        disque.disc_count = None;
+        disque.musicbrainz_release_id = None;
+        let nouveau = repo.create(&disque)?;
+        if let Some(d) = &dossier
+            && dossier_du_coffret.as_deref() != Some(d.as_str())
+        {
+            repo.set_folder_path(nouveau, d)?;
+        }
+        db.execute(
+            &format!(
+                "UPDATE tracks SET album_id = {p1}, disc_number = 1 \
+                 WHERE album_id = {p2} AND COALESCE(disc_number, 1) = {p3}"
+            ),
+            &[&nouveau as &dyn ToSqlValue, &album_id, &(numero as i64)],
+        )?;
+        repo.update_track_count(nouveau)?;
+        recrees.push(nouveau);
+    }
+    db.execute(
+        &format!("UPDATE tracks SET disc_number = 1 WHERE album_id = {p1}"),
+        &[&album_id as &dyn ToSqlValue],
+    )?;
+    db.execute(
+        &format!("UPDATE albums SET disc_count = 1 WHERE id = {p1}"),
+        &[&album_id as &dyn ToSqlValue],
+    )?;
+    repo.update_track_count(album_id)?;
+
+    // Le titre : rendu seulement s'il est encore celui de la composition.
+    if let (Some(compose), Some(origine)) = (&marqueur.titre_compose, marqueur.disques.first())
+        && *compose == coffret.title
+    {
+        repo.force_update_title(album_id, &origine.titre)?;
+        if !marqueur.titre_tenu_avant {
+            ne_plus_tenir(db, album_id, "title")?;
+        }
+    }
+    AlbumMetadataRepo::with_backend(db.clone()).delete(album_id, CLE_COFFRET)?;
+
+    // Plus de disposition tenue ; les renommages de pistes suivent la piste.
+    for &id in std::iter::once(&album_id).chain(recrees.iter()) {
+        let rows = db.query_many_strong(&sql_lignes(db.engine()), &[&id as &dyn ToSqlValue])?;
+        let e = construire(
+            &lignes_de(rows),
+            false,
+            &[&heritage],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        ecrire_edition(db, id, &e)?;
+    }
+    tracing::info!(
+        coffret = album_id,
+        albums_recrees = ?recrees,
+        "coffret_manuel_defait"
+    );
+    Ok(recrees)
 }
 
 // ---------------------------------------------------------------------------
