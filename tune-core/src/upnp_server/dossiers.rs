@@ -399,11 +399,21 @@ pub(super) fn comparer_naturel(a: &str, b: &str) -> Ordering {
 /// Les dossiers gardent [`comparer_naturel`] : un nom de dossier se lit tel
 /// qu'il est écrit sur le disque.
 pub(super) fn comparer_alphabetique(a: &str, b: &str) -> Ordering {
-    let (ka, kb) = (
-        cle_naturelle(sans_signes_de_tete(a)),
-        cle_naturelle(sans_signes_de_tete(b)),
-    );
-    ka.cmp(&kb).then_with(|| a.cmp(b))
+    cle_alphabetique(a).cmp(&cle_alphabetique(b))
+}
+
+/// La clé de [`comparer_alphabetique`], calculée une fois : deux clés se
+/// comparent EXACTEMENT comme `comparer_alphabetique` compare leurs textes
+/// (ex æquo départagés par le texte brut compris).
+///
+/// C'est ce que les listes paginées de l'API REST de la bibliothèque trient
+/// (#4956, suite) : `sort_by_cached_key` la bâtit une fois par élément, là où
+/// `sort_by(comparer_alphabetique)` la rebâtirait à chaque comparaison.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CleAlphabetique(Vec<Morceau>, String);
+
+pub(crate) fn cle_alphabetique(s: &str) -> CleAlphabetique {
+    CleAlphabetique(cle_naturelle(sans_signes_de_tete(s)), s.to_owned())
 }
 
 fn sans_signes_de_tete(s: &str) -> &str {

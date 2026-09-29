@@ -97,12 +97,18 @@ pub mod sql {
         "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
     }
 
-    pub fn list<D: SqlDialect>(d: &D) -> String {
-        format!(
-            "SELECT {COLS} FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) ORDER BY LOWER(COALESCE(sort_name, name)) LIMIT {} OFFSET {}",
-            d.placeholder(1),
-            d.placeholder(2)
-        )
+    /// Les artistes que liste [`super::ArtistRepo::list`] (ceux qui ont au
+    /// moins un album), réduits à leur identifiant et à leurs deux noms : la
+    /// clé de tri se calcule en Rust (#4956), sur des lignes étroites — jamais
+    /// sur les biographies, qui pèsent plusieurs Ko chacune.
+    pub fn cles_de_tri() -> &'static str {
+        "SELECT id, name, sort_name FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+    }
+
+    /// Les fiches complètes d'une page d'identifiants (entiers issus de la
+    /// base, inscrits sans marqueur).
+    pub fn par_ids(ids: &str) -> String {
+        format!("SELECT {COLS} FROM artists WHERE id IN ({ids})")
     }
 
     /// #5007 — un artiste n'est orphelin que si AUCUNE table ne le désigne.
@@ -835,11 +841,51 @@ impl ArtistRepo {
         })
     }
 
+    /// Les artistes qui ont au moins un album, dans l'ordre alphabétique du
+    /// serveur média (#4956) : celui de `comparer_alphabetique`, sur le nom de
+    /// tri s'il est renseigné (« Beatles, The »), sinon sur le nom. Les signes
+    /// de tête ne comptent pas, ni la casse ni les accents ; à clé égale,
+    /// l'identifiant départage.
+    ///
+    /// Le tri ne se fait plus en SQL : `ORDER BY LOWER(COALESCE(sort_name,
+    /// name))` ne repliait que l'ASCII sur SQLite (« Édith Piaf » après
+    /// « ZZ Top », « (hed) p.e. » en tête) et suivait la collation de la base
+    /// sur PostgreSQL — deux ordres différents, et aucun des deux celui du
+    /// serveur média. On lit donc la rubrique ENTIÈRE en lignes étroites, on
+    /// la trie, on découpe la page, puis on ne lit en entier que la page.
+    /// L'ordre est total : deux pages ne se recouvrent jamais et aucune ne
+    /// perd d'artiste. Mesures et choix : PR du lot `batch/fix-4956-rest`.
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, TuneError> {
-        let sql = self.dialect_sql(sql::list, sql::list);
-        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
-        let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_artist).collect())
+        let mut cles: Vec<(i64, String)> = self
+            .db
+            .query_many(sql::cles_de_tri(), &[])?
+            .iter()
+            .filter_map(|r| {
+                let id = r.first().and_then(|v| v.as_i64())?;
+                let nom = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                let tri = r
+                    .get(2)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.trim().is_empty());
+                Some((id, tri.unwrap_or(nom)))
+            })
+            .collect();
+        cles.sort_by_cached_key(|(id, cle)| (crate::upnp_server::cle_alphabetique(cle), *id));
+        let page: Vec<i64> = super::ordre_alphabetique::tranche(cles, limit, offset)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut par_id: std::collections::HashMap<i64, Artist> =
+            std::collections::HashMap::with_capacity(page.len());
+        for liste in super::ordre_alphabetique::listes_d_ids(&page) {
+            for ligne in self.db.query_many(&sql::par_ids(&liste), &[])? {
+                let artiste = row_to_artist(&ligne);
+                if let Some(id) = artiste.id {
+                    par_id.insert(id, artiste);
+                }
+            }
+        }
+        Ok(page.iter().filter_map(|id| par_id.remove(id)).collect())
     }
 
     /// Delete artists that no track, album or track credit references (#5007).
@@ -1621,8 +1667,8 @@ mod tests {
         let p = PostgresDialect;
         assert!(sql::get_by_name(&s).contains("LOWER(name) = LOWER(?)"));
         assert!(sql::get_by_name(&p).contains("LOWER(name) = LOWER($1)"));
-        assert!(!sql::list(&p).contains("COLLATE"));
-        assert!(sql::list(&p).contains("LOWER(COALESCE(sort_name, name))"));
+        // #4956 — la liste ne trie plus en SQL : la clé se calcule en Rust.
+        assert!(!sql::cles_de_tri().contains("ORDER BY"));
     }
 
     #[test]

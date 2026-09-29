@@ -22,6 +22,11 @@ use crate::discovery::ssdp;
 /// Parcours par dossiers (#4318) — le rayon « Folders ».
 mod dossiers;
 
+/// L'ordre alphabétique du serveur média, partagé avec les listes paginées de
+/// l'API REST de la bibliothèque (#4956) : un même rayon se lit dans le même
+/// ordre sur un lecteur DLNA et dans le client web.
+pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
+
 // ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
