@@ -5964,7 +5964,11 @@ mod changelog_forme_tests {
     #[test]
     fn une_pre_version_de_tune_est_une_version_de_tune() {
         assert!(est_une_version_de_tune("v1.0.0-rc1"));
-        assert!(est_une_version_de_tune("v1.0.0-rc0-test"));
+        assert!(est_une_version_de_tune("v1.0.0-rc0.test"));
+        // Même alphabet que le contrôleur et la promotion
+        // (`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`, 29/09/2026) : un
+        // second tiret n'y entre pas.
+        assert!(!est_une_version_de_tune("v1.0.0-rc0-test"));
         assert!(est_une_version_de_tune("v2.0.0-alpha.3"));
         assert!(!est_une_version_de_tune("moissonneur-v1.0.0-rc1"));
         assert!(!est_une_version_de_tune("tune-os-rpi-v1.0.0-rc1"));
