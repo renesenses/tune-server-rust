@@ -307,8 +307,15 @@ async fn composer_defaire_puis_rescanner(b: &Bibliotheque, cd1: &Path, cd2: &Pat
     scan_force(&b.etat).await;
     let d1 = album_de(&b.db, &cd1.to_string_lossy());
     let d2 = album_de(&b.db, &cd2.to_string_lossy());
-    let avant = albums(&b.db);
-    let titres_avant: Vec<String> = avant.iter().map(|(_, t)| t.clone()).collect();
+    // Triés par TITRE, pas par id : l'ordre des identifiants dépend de l'ordre
+    // dans lequel le scan a rencontré les dossiers (vu rouge en CI, où
+    // « Disc B » passait avant « Disc A »).
+    let titres_tries = |db: &Arc<dyn DbBackend>| {
+        let mut v: Vec<String> = albums(db).into_iter().map(|(_, t)| t).collect();
+        v.sort();
+        v
+    };
+    let titres_avant = titres_tries(&b.db);
     composer(&b.etat, &[d1, d2]).await;
 
     // Une modification à la main SUR UNE PISTE, que « défaire » doit garder.
@@ -361,7 +368,7 @@ async fn composer_defaire_puis_rescanner(b: &Bibliotheque, cd1: &Path, cd2: &Pat
             "{chemin} : chaque disque redevient son album, disque 1 : {defait:?}"
         );
     }
-    let titres: Vec<String> = albums(&b.db).into_iter().map(|(_, t)| t).collect();
+    let titres = titres_tries(&b.db);
     assert_eq!(
         titres, titres_avant,
         "chaque album reprend son titre d'origine"
@@ -397,7 +404,7 @@ async fn composer_defaire_puis_rescanner(b: &Bibliotheque, cd1: &Path, cd2: &Pat
         defait,
         "après le scan forcé, chaque disque est resté l'album de son dossier"
     );
-    let titres: Vec<String> = albums(&b.db).into_iter().map(|(_, t)| t).collect();
+    let titres = titres_tries(&b.db);
     assert_eq!(
         titres, titres_avant,
         "deux albums, sous leurs titres d'origine"
