@@ -47,6 +47,7 @@ const REPONSE: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schema
 
 #[tokio::test]
 async fn un_renderer_qui_cesse_d_ecouter_se_dit_une_fois_au_journal_info() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let journal = Capture::default();
     let _garde = journal.subscribe();
 

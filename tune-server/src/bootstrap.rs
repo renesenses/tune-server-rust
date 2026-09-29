@@ -1011,6 +1011,7 @@ mod tests {
     /// dépendances bavardes doit tenir.
     #[test]
     fn le_niveau_demande_couvre_toutes_les_caisses_du_depot() {
+        tune_core::journal_de_test::fiabiliser_la_capture();
         let journal = JournalCapture::default();
         let abonne = tracing_subscriber::fmt()
             .with_writer(journal.clone())

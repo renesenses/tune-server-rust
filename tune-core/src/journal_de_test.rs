@@ -70,7 +70,7 @@ impl Subscriber for Temoin {
 /// témoins a ainsi fini son enregistrement bien avant que l'abonné du test
 /// n'existe, et la pose de celui-ci recalcule tout. Idempotent : les deux témoins sont créés une fois par
 /// processus et ne meurent jamais.
-pub(crate) fn fiabiliser_la_capture() {
+pub fn fiabiliser_la_capture() {
     static TEMOINS: OnceLock<[Dispatch; 2]> = OnceLock::new();
     TEMOINS.get_or_init(|| [Dispatch::new(Temoin), Dispatch::new(Temoin)]);
 }

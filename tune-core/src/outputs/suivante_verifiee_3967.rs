@@ -485,6 +485,7 @@ async fn verdict_et_journal(conduite: Conduite) -> (SuivantePreparee, String) {
 /// DIRE — c'est la branche la plus probable sur un renderer minimaliste.
 #[tokio::test]
 async fn le_champ_nexturi_non_publie_se_nomme_au_niveau_info() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (verdict, journal) = verdict_et_journal(Conduite {
         publie_nexturi: false,
         ..Default::default()
@@ -509,6 +510,7 @@ async fn le_champ_nexturi_non_publie_se_nomme_au_niveau_info() {
 /// n'écrivait **rien du tout, à aucun niveau**.
 #[tokio::test]
 async fn la_faute_soap_sur_les_actions_se_nomme_au_niveau_info() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (verdict, journal) = verdict_et_journal(Conduite {
         actions: None,
         ..Default::default()
@@ -526,6 +528,7 @@ async fn la_faute_soap_sur_les_actions_se_nomme_au_niveau_info() {
 /// Cette branche-là n'écrivait strictement rien, à aucun niveau.
 #[tokio::test]
 async fn une_reponse_sans_balise_actions_se_nomme_au_niveau_info() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (verdict, journal) = verdict_et_journal(Conduite {
         publie_balise_actions: false,
         ..Default::default()

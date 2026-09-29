@@ -94,6 +94,7 @@ async fn refus_et_journal(url: String, entetes: Vec<(String, String)>) -> (Strin
 /// testeur ne dit pas si le rejeu a eu lieu.
 #[tokio::test(flavor = "multi_thread")]
 async fn un_403_amont_dit_combien_d_entetes_ont_ete_rejoues() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (url, tache) = cdn_qui_refuse().await;
     let entetes = vec![
         ("User-Agent".to_string(), "Mozilla/5.0 (yt-dlp)".to_string()),
@@ -128,6 +129,7 @@ async fn un_403_amont_dit_combien_d_entetes_ont_ete_rejoues() {
 /// rejoué sur la requête refusée. Il doit se lire aussi clairement.
 #[tokio::test(flavor = "multi_thread")]
 async fn un_403_sans_aucun_entete_rejoue_le_dit_aussi() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (url, tache) = cdn_qui_refuse().await;
 
     let (_, journal) = refus_et_journal(url, Vec::new()).await;
@@ -144,6 +146,7 @@ async fn un_403_sans_aucun_entete_rejoue_le_dit_aussi() {
 /// forum public.
 #[tokio::test(flavor = "multi_thread")]
 async fn les_valeurs_des_entetes_ne_sont_jamais_journalisees() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let (url, tache) = cdn_qui_refuse().await;
     let entetes = vec![(
         "Cookie".to_string(),

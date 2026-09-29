@@ -232,6 +232,7 @@ fn temoin_une_base_sans_annexes_se_copie_comme_avant() {
 
 #[test]
 fn cible_deja_presente_rien_n_est_ecrase_et_l_ancienne_est_nommee_au_journal() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let bac = bac("winmig-a7c254-deja");
     let exe_dir = bac.join("Program Files/Tune");
     let localappdata = bac.join("AppData/Local");
@@ -405,6 +406,7 @@ fn une_base_a_cote_et_pas_de_cible_donne_migrer() {
 
 #[test]
 fn la_migration_complete_pose_la_base_et_ses_annexes_et_cree_le_dossier() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let bac = bac("winmig-a7c254-complet");
     let exe_dir = bac.join("Program Files/Tune");
     let localappdata = bac.join("AppData/Local");
@@ -450,6 +452,7 @@ fn la_migration_complete_pose_la_base_et_ses_annexes_et_cree_le_dossier() {
 
 #[test]
 fn une_migration_echouee_laisse_la_base_d_origine_intacte() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let bac = bac("winmig-a7c254-echec");
     let exe_dir = bac.join("Program Files/Tune");
     let localappdata = bac.join("AppData/Local");

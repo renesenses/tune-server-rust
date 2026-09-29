@@ -112,6 +112,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
 
 #[tokio::test]
 async fn le_refus_qui_propose_une_station_laisse_une_trace_nommee() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let journal = JournalCapture::default();
     let abonne = tracing_subscriber::fmt()
         .with_writer(journal.clone())
