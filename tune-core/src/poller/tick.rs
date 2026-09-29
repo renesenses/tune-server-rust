@@ -2484,14 +2484,25 @@ impl PositionPoller {
                                     // MESURÉ (`ASec`) : le `0` d'ignorance ne
                                     // déclenche plus la relance automatique
                                     // Pause→Stop→Play sur une zone qui joue.
-                                    force_stop_demarrage_mort = decisions::demarrage_mort(
-                                        all_zones
-                                            .iter()
-                                            .find(|z| z.id == Some(zone_id))
-                                            .and_then(|z| z.output_type.as_deref())
-                                            .unwrap_or(""),
-                                        current_bytes,
-                                    );
+                                    let type_de_sortie = all_zones
+                                        .iter()
+                                        .find(|z| z.id == Some(zone_id))
+                                        .and_then(|z| z.output_type.as_deref())
+                                        .unwrap_or("");
+                                    // #4661 (fil 1912) — un renderer qui
+                                    // sonde avant de lire (darTZeel) ne rend
+                                    // jamais « 0 octet » : quelques centaines
+                                    // de Kio tirés, position restée à zéro,
+                                    // flux incomplet. C'est le même démarrage
+                                    // mort, et la même relance.
+                                    force_stop_demarrage_mort =
+                                        decisions::demarrage_mort(type_de_sortie, current_bytes)
+                                            || decisions::demarrage_mort_apres_sondage(
+                                                type_de_sortie,
+                                                ps.peak_position_ms,
+                                                current_bytes,
+                                                total,
+                                            );
                                 }
                             } else {
                                 debug!(

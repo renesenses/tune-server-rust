@@ -366,6 +366,49 @@ pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
     output_type == "dlna" && bytes_sent == 0
 }
 
+/// 🔴 #4661 (fil 1912) — le démarrage mort d'un renderer qui SONDE avant de
+/// lire : quelques centaines de kilo-octets tirés, puis plus rien, et la
+/// position n'a jamais quitté zéro.
+///
+/// [`demarrage_mort`] exige « zéro octet servi ». Un darTZeel LHC-208 ne le
+/// rend jamais : il ouvre chaque piste par une requête sans `Range` qu'il
+/// lâche après ~700 Kio, puis une seconde `Range: bytes=44-`. Mesure du
+/// 24/09/2026 (Sevy Tabroc, 0.9.163, zone 10) : la piste adoptée par
+/// l'enchaînement gapless a reçu ces deux requêtes, fermées au bout de 43 et
+/// 44 ms — 1 572 864 octets sur 52 510 796 —, le renderer est resté
+/// `Stopped` à la position 0, et le sondeur a coupé la zone 33 s plus tard.
+///
+/// Aucune des deux reprises ne s'armait : la relance du démarrage mort
+/// voulait 0 octet, la reprise à la position atteinte
+/// ([`reprise_apres_renderer_cale_autorisee`]) veut une piste qui a joué et
+/// renvoie explicitement `position 0` au démarrage mort. Ce cas tombait entre
+/// les deux, et la file s'arrêtait.
+///
+/// Trois conditions, toutes nécessaires :
+///
+/// * sortie DLNA (le seul chemin de la relance Pause→Stop→Play) ;
+/// * le renderer n'a JAMAIS annoncé de position (`peak_position_ms == 0`) —
+///   rejouer depuis le début ne répète donc rien qu'il ait dit avoir joué ;
+/// * le flux est MESURÉ incomplet (`octets_total` connu, non atteint). Un
+///   fichier servi en entier à un renderer muet sur sa position peut avoir
+///   été joué jusqu'au bout (fil 1877) : le rejouer serait une faute, on
+///   coupe comme avant. Un total inconnu ne prouve rien non plus.
+///
+/// La fenêtre de [`relance_demarrage_mort_autorisee`] s'applique telle
+/// quelle : un renderer qui refuse de nouveau la piste voit sa zone coupée
+/// au second échec, comme pour le démarrage mort.
+pub fn demarrage_mort_apres_sondage(
+    output_type: &str,
+    peak_position_ms: u64,
+    octets_servis: u64,
+    octets_total: Option<u64>,
+) -> bool {
+    output_type == "dlna"
+        && peak_position_ms == 0
+        && octets_servis > 0
+        && octets_total.is_some_and(|total| octets_servis < total)
+}
+
 /// 🔴 #4661 — le renderer peut-il encore être en train de jouer un fichier
 /// qu'il a reçu EN ENTIER ?
 ///

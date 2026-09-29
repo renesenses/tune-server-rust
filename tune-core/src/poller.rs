@@ -1290,6 +1290,11 @@ mod fin_hors_temps_reel_tests;
 #[cfg(test)]
 mod fin_de_piste_a_l_horloge_4661;
 
+/// #4661 (fil 1912) — un renderer qui sonde la piste puis la lâche, position
+/// restée à zéro, relève de la relance du démarrage mort.
+#[cfg(test)]
+mod demarrage_mort_apres_sondage_4661;
+
 /// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
 /// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
 /// gelée à la durée) au lieu de jeter le flux qu'il tient et de repartir en
