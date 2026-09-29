@@ -52,6 +52,7 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::settings_repo::SettingsRepo;
 use super::track_repo::sql::chemin_ouvrable;
 use crate::TuneError;
+use crate::library::local_path::{dossier_comparable, dossier_et_nom, sous_le_dossier_stocke};
 use crate::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
 
 /// Clé, dans `album_metadata`, du marqueur de coffret. Valeur : un
@@ -121,8 +122,21 @@ fn artiste_de_compilation(nom: &str) -> bool {
     l == "various artists" || l == "various" || l == "va" || l == "compilations"
 }
 
+/// Le dossier d'un chemin stocké, `/` et `\` confondus sous Windows (#5318).
+///
+/// 🔴 `rsplit_once('/')` seul ne trouvait RIEN dans `D:\Musique\X\CD1\01.flac`
+/// — `tracks.file_path` porte des antislashs sous Windows : la passe sautait
+/// tous les albums, et l'onglet « Coffrets » n'en voyait aucun rangé disque
+/// par disque. La coupe est celle de [`dossier_et_nom`], qui s'appuie sur la
+/// reconnaissance des racines de `library::local_path` (lecteur, UNC, POSIX).
 fn dossier_de(chemin: &str) -> Option<&str> {
-    chemin.rsplit_once('/').map(|(d, _)| d)
+    dossier_et_nom(chemin).map(|(d, _)| d)
+}
+
+/// Deux dossiers stockés désignent-ils le même ? Casse du lecteur et
+/// séparateurs Windows ne comptent pas ([`dossier_comparable`]).
+fn meme_dossier(a: Option<&str>, b: Option<&str>) -> bool {
+    a.map(dossier_comparable) == b.map(dossier_comparable)
 }
 
 fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
@@ -193,7 +207,7 @@ pub fn inventaire(db: &Arc<dyn DbBackend>) -> Result<Inventaire, TuneError> {
         let Some(dossier) = dossier_de(&premier) else {
             continue;
         };
-        if dossier_de(&dernier) != Some(dossier) {
+        if !meme_dossier(dossier_de(&dernier), Some(dossier)) {
             plusieurs_dossiers.insert(id);
         }
         albums.push(AlbumAGrouper {
@@ -293,7 +307,7 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
         }
     }
     disques.sort_by_key(|d| d.n);
-    disques.dedup_by(|a, b| a.dossier == b.dossier);
+    disques.dedup_by(|a, b| meme_dossier(Some(&a.dossier), Some(&b.dossier)));
 
     for &(n, id) in &c.disques {
         if inv.plusieurs_dossiers.contains(&id) {
@@ -492,10 +506,12 @@ pub fn defaire(db: &Arc<dyn DbBackend>, cible: i64) -> Result<Vec<i64>, RefusDef
     let (p1, p2) = placeholders(db);
     let mut recrees = Vec::new();
     for d in marqueur.disques.iter().skip(1) {
-        let prefixe = format!("{}/", d.dossier);
+        // `…/CD2/` en dur ne reconnaissait aucune piste de `C:\…\CD2\` : sous
+        // Windows le disque restait DANS le coffret alors que le refus était
+        // retenu (#5318).
         let siennes: Vec<i64> = pistes
             .iter()
-            .filter(|(_, chemin)| chemin.starts_with(&prefixe))
+            .filter(|(_, chemin)| sous_le_dossier_stocke(chemin, &d.dossier))
             .map(|(id, _)| *id)
             .collect();
         if siennes.is_empty() {
@@ -576,7 +592,8 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         let premier = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
         let dernier = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
         let origine = marques.get(&id).map(|m| m.origine.clone());
-        let range_disque_par_disque = disques >= 2 && dossier_de(&premier) != dossier_de(&dernier);
+        let range_disque_par_disque =
+            disques >= 2 && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
         if origine.is_some() || range_disque_par_disque {
             rendu.push(CoffretListe {
                 album_id: id,
