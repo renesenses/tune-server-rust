@@ -15,6 +15,8 @@ pub mod spotify;
 pub mod spotify_connect;
 pub mod tidal;
 pub mod traits;
+/// La vignette d'un podcast mise en cache à l'abonnement (#5214).
+pub mod vignette_podcast;
 pub mod youtube;
 
 pub use registry::ServiceRegistry;

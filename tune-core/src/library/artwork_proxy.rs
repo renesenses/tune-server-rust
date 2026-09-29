@@ -707,6 +707,131 @@ impl Relais {
         }
         Err(Refus::TropDeRedirections.into())
     }
+
+    /// Télécharge une image que le SERVEUR a choisie (#5214), pour la mettre en
+    /// cache — jamais une URL reçue d'un client pour être relayée.
+    ///
+    /// C'est le chemin de la vignette d'un podcast auquel l'utilisateur s'est
+    /// abonné : l'adresse vient du flux RSS qu'il a choisi, et les hébergeurs
+    /// de flux sont en nombre illimité. La liste d'hôtes ne s'y applique donc
+    /// pas — comme pour une URL signée —, et elle n'est pas élargie : le
+    /// relais `/library/artwork/proxy` reste exactement ce qu'il était.
+    ///
+    /// Tout le reste de la garde s'applique, à chaque saut : schéma
+    /// `http`/`https`, adresse littérale jugée par la politique du relais,
+    /// résolution DNS par [`ResolveurGarde`], redirections suivies à la main
+    /// (au plus [`REDIRECTIONS_MAX`]) et jugées comme la première URL. Et deux
+    /// bornes propres à une mise en cache :
+    ///
+    /// - `Content-Type` : une réponse qui en annonce un doit dire `image/…`
+    ///   (ou `application/octet-stream`, que des CDN posent sur tout) ;
+    /// - taille : au plus `taille_max` octets, jugés sur `Content-Length`
+    ///   quand il est là ET pendant la lecture, qui s'arrête au dépassement.
+    pub async fn telecharger_image(
+        &self,
+        url: &str,
+        taille_max: usize,
+    ) -> Result<Relaye, EchecTelechargement> {
+        let premiere = reqwest::Url::parse(url).map_err(|_| Refus::UrlInvalide(url.to_string()))?;
+        self.juger(&premiere, true, None, &[])?;
+        let mut courante = premiere;
+        for _ in 0..=REDIRECTIONS_MAX {
+            let mut reponse =
+                self.client.get(courante.clone()).send().await.map_err(
+                    |e| match adresse_refusee(&e) {
+                        Some(r) => EchecTelechargement::Refus(Refus::AdresseInterdite {
+                            hote: r.hote,
+                            ip: r.ip,
+                        }),
+                        None => EchecTelechargement::Amont(e.to_string()),
+                    },
+                )?;
+            let statut = reponse.status();
+            if statut.is_redirection() {
+                let Some(cible) = reponse
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|l| courante.join(l).ok())
+                else {
+                    return Err(EchecTelechargement::Amont(format!(
+                        "redirection sans Location ({statut})"
+                    )));
+                };
+                self.juger(&cible, true, None, &[]).map_err(|r| match r {
+                    Refus::AdresseInterdite { .. } => r,
+                    _ => Refus::RedirectionRefusee(cible.to_string()),
+                })?;
+                courante = cible;
+                continue;
+            }
+            if !statut.is_success() {
+                return Err(EchecTelechargement::Amont(format!("amont : {statut}")));
+            }
+            let content_type = reponse
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().to_ascii_lowercase());
+            if let Some(ct) = content_type.as_deref() {
+                let essence = ct.split(';').next().unwrap_or("").trim();
+                if !(essence.starts_with("image/") || essence == "application/octet-stream") {
+                    return Err(EchecTelechargement::TypeRefuse(essence.to_string()));
+                }
+            }
+            if let Some(annoncee) = reponse.content_length()
+                && annoncee > taille_max as u64
+            {
+                return Err(EchecTelechargement::TropVolumineuse(taille_max));
+            }
+            let mut octets: Vec<u8> = Vec::new();
+            while let Some(morceau) = reponse
+                .chunk()
+                .await
+                .map_err(|e| EchecTelechargement::Amont(e.to_string()))?
+            {
+                if octets.len() + morceau.len() > taille_max {
+                    return Err(EchecTelechargement::TropVolumineuse(taille_max));
+                }
+                octets.extend_from_slice(&morceau);
+            }
+            return Ok(Relaye {
+                content_type: content_type.unwrap_or_else(|| "image/jpeg".into()),
+                octets,
+            });
+        }
+        Err(Refus::TropDeRedirections.into())
+    }
+}
+
+/// Pourquoi [`Relais::telecharger_image`] n'a pas rendu d'image.
+#[derive(Debug)]
+pub enum EchecTelechargement {
+    /// La garde d'adresse ou de schéma a refusé (première URL ou redirection).
+    Refus(Refus),
+    /// L'amont a répondu autre chose qu'une image, ou n'a pas répondu.
+    Amont(String),
+    /// `Content-Type` qui n'est pas une image.
+    TypeRefuse(String),
+    /// Plus de N octets.
+    TropVolumineuse(usize),
+}
+
+impl From<Refus> for EchecTelechargement {
+    fn from(r: Refus) -> Self {
+        EchecTelechargement::Refus(r)
+    }
+}
+
+impl std::fmt::Display for EchecTelechargement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EchecTelechargement::Refus(r) => write!(f, "{r}"),
+            EchecTelechargement::Amont(e) => write!(f, "{e}"),
+            EchecTelechargement::TypeRefuse(t) => write!(f, "type refusé : {t}"),
+            EchecTelechargement::TropVolumineuse(n) => write!(f, "plus de {n} octets"),
+        }
+    }
 }
 
 /// Retrouve un [`AdresseRefusee`] dans la chaîne des causes d'une erreur

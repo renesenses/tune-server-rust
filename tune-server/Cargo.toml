@@ -840,6 +840,14 @@ path = "tests/serveur_media_criteres_canoniques.rs"
 name = "artwork_proxy_relais_ferme_4260"
 path = "tests/artwork_proxy_relais_ferme_4260.rs"
 
+# #5214 : la vignette d'un podcast mise en cache à l'abonnement, servie par la
+# liste des abonnements et par l'épisode en lecture. Cible propre : le banc pose
+# `TUNE_ARTWORK_DIR` pour tout son processus. `autotests = false` : sans cette
+# entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "vignette_podcast_en_cache_5214"
+path = "tests/vignette_podcast_en_cache_5214.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
