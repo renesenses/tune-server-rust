@@ -68,7 +68,8 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 # tests de tune-server (32 fils, chacun sa base), la relecture de 501 pistes
 # du témoin de #3816 passait 28,4 s dans `execute` au lieu de 0,6 s seule, avec
 # 411 871 changements de contexte volontaires ; comptabilité coupée,
-# 1,2 s et 813 changements, et `routes::` entier 202 s → 34 s.
+# 1,2 s et 813 changements. La lib entière (`--test-threads=32`) est passée
+# de 247-277 s à 57-69 s.
 #
 # Tune ne lit aucune de ces statistiques (ni `sqlite3_memory_used`, ni
 # `soft_heap_limit`) ; c'est l'une des options de compilation que la
