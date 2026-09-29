@@ -492,17 +492,21 @@ fn base_url(state: &AppState) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
-/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
-/// 412 seulement si NI l'un NI l'autre n'est disponible.
-fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+/// L'identité du compte vers mozaiklabs, si Tune en connaît une : jeton OAuth
+/// (SSO) en priorité, sinon la clé de licence avec l'empreinte machine.
+///
+/// Partagée depuis #5428 avec le rapport de bug envoyé au forum
+/// (`routes/system/diagnostics.rs::envoyer_le_rapport`), qui l'attribue ainsi
+/// à son auteur. Contrairement au support, le rapport part aussi SANS
+/// identité : c'est [`auth`], et lui seul, qui transforme l'absence en 412.
+pub(crate) fn identite_du_compte(state: &AppState) -> Option<support::SupportAuth> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Chemin 1 : token OAuth premium (login SSO dans Tune).
     if let Some(token) = settings.get("mozaik_access_token").ok().flatten()
         && !token.is_empty()
     {
-        return Ok(support::SupportAuth::Bearer(token));
+        return Some(support::SupportAuth::Bearer(token));
     }
 
     // Chemin 2 : clé de licence. mozaiklabs vérifie la licence premium et
@@ -516,7 +520,18 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
             .flatten()
             .filter(|f| !f.is_empty())
             .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
-        return Ok(support::SupportAuth::License { key, fingerprint });
+        return Some(support::SupportAuth::License { key, fingerprint });
+    }
+
+    None
+}
+
+/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
+/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
+/// 412 seulement si NI l'un NI l'autre n'est disponible.
+fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+    if let Some(identite) = identite_du_compte(state) {
+        return Ok(identite);
     }
 
     Err((

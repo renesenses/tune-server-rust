@@ -53,7 +53,12 @@ pub enum SupportAuth {
 
 impl SupportAuth {
     /// Applique l'auth à une requête sortante vers mozaiklabs.
-    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    ///
+    /// Publique depuis #5428 : le rapport de bug envoyé au forum
+    /// (`tune-server`, `routes/system/diagnostics.rs`) porte la MÊME identité
+    /// que le support, par la même fonction — une seule façon d'écrire ces
+    /// en-têtes. Aucune trace ici : ni jeton ni clé ne doivent être journalisés.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             SupportAuth::Bearer(token) => req.bearer_auth(token),
             SupportAuth::License { key, fingerprint } => req
