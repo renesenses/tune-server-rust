@@ -2002,6 +2002,17 @@ impl QobuzService {
             ));
         }
 
+        Self::flux_de_get_file_url(&data)
+    }
+
+    /// La réponse de `/track/getFileUrl`, lue en [`StreamUrl`].
+    ///
+    /// #5283 — Qobuz peut rendre `sampling_rate: 0, bit_depth: 0` pour un FLAC
+    /// hi-res bien réel (fil 2000). Ce zéro est rendu TEL QUEL : il signifie
+    /// « inconnu », et c'est l'orchestrateur qui le remplace par l'en-tête du
+    /// flux ou le catalogue (`streaming::cadence_du_flux`). Le repli 44,1/16
+    /// ne vaut que pour un champ absent, comme avant.
+    pub(crate) fn flux_de_get_file_url(data: &serde_json::Value) -> Result<StreamUrl, String> {
         let url = data["url"].as_str().ok_or("no url")?.to_string();
         let mime = data["mime_type"]
             .as_str()

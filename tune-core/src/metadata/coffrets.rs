@@ -51,6 +51,15 @@
 //! disque classé « Various Artists » ne départage pas. Voir [`coffrets`].
 //! L'application — au scan et au démarrage — vit dans
 //! `crate::db::coffrets_auto`.
+//!
+//! # Le 28/09/2026 : le marqueur EN TÊTE, et les albums nés d'une feuille CUE
+//!
+//! GO de Bertrand sur #5317 et #5357 (Marco Polo, fil 2009). Le marqueur se
+//! lit aussi en tête du nom — « CD1 - Titre », « Disc 2 - Titre »,
+//! « CD 03 · Titre » ([`marqueur_de_tete`]) — et la passe voit désormais les
+//! albums dont les pistes sont des tranches d'une image CUE (côté base, dans
+//! `crate::db::coffrets_auto`). Les quatre gardes de [`coffrets`] ne
+//! changent pas : même parent, même socle, même artiste, numéros distincts.
 
 use std::collections::BTreeMap;
 
@@ -170,6 +179,70 @@ pub fn marqueur_final(nom: &str) -> Option<(String, u32)> {
         return Some((socle.to_string(), numero));
     }
     None
+}
+
+/// Ce qui sépare un marqueur de TÊTE de son titre : « CD1 - Titre »,
+/// « Disc 2: Titre », « CD 03 · Titre ». Ni parenthèse ni crochet : ils
+/// appartiennent au titre qui suit.
+const LIAISONS_DE_TETE: [char; 12] = [
+    ' ', '.', '_', '-', ',', ':', ';', '\u{2013}', '\u{2014}', '\u{b7}', '\u{2022}', '|',
+];
+
+/// Le marqueur de disque EN TÊTE de nom, et le titre qui le suit (#5357).
+///
+/// Formes lues : « CD1 - Titre », « Disc 2 - Titre », « CD 03 · Titre »,
+/// « Disque 2 : Titre ». Mêmes exigences que [`marqueur_final`] : un mot de
+/// [`MOTS_DE_DISQUE`] (jamais `vol`), un numéro d'un ou deux chiffres qui ne
+/// vaut pas zéro, et un titre non vide derrière. Le mot est un MOT :
+/// « Discovery 2 - X » ou « CDs 2 - X » n'ont pas de marqueur ; le numéro
+/// aussi : « CD1Titre » ou « CD 123 - X » non plus.
+///
+/// ⚠️ Retirer ce marqueur ne suffit pas à former un coffret : [`coffrets`]
+/// exige toujours un SOCLE commun. « CD01 - Bruch… » et « CD02 - Brahms… »
+/// (Philips Original Jackets, #5357) restent deux albums — ce sont deux
+/// albums.
+pub fn marqueur_de_tete(nom: &str) -> Option<(String, u32)> {
+    let n = nom.trim_start();
+    for mot in MOTS_DE_DISQUE {
+        // `get` et non `[..]` : le NOM peut commencer par un caractère de
+        // plusieurs octets (« Été »), et une coupe en son milieu paniquerait.
+        if !n
+            .get(..mot.len())
+            .is_some_and(|t| t.eq_ignore_ascii_case(mot))
+        {
+            continue;
+        }
+        let apres_mot = n[mot.len()..].trim_start_matches([' ', '.', '_', '-']);
+        let chiffres_fin = apres_mot
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(apres_mot.len());
+        let chiffres = &apres_mot[..chiffres_fin];
+        if chiffres.is_empty() || chiffres.len() > 2 {
+            continue;
+        }
+        let Some(numero) = chiffres.parse::<u32>().ok().filter(|&d| d > 0) else {
+            continue;
+        };
+        let reste = &apres_mot[chiffres_fin..];
+        // Le numéro se termine par une LIAISON, pas par une lettre :
+        // « CD1Titre » n'est pas lu.
+        if !reste.starts_with(LIAISONS_DE_TETE) {
+            continue;
+        }
+        let socle = reste.trim_start_matches(LIAISONS_DE_TETE).trim_end();
+        if socle.is_empty() {
+            return None;
+        }
+        return Some((socle.to_string(), numero));
+    }
+    None
+}
+
+/// Le marqueur d'un NOM, où qu'il soit : en fin d'abord (la forme historique,
+/// et celle d'un double album emboîté dans une collection, « CD10 - Il
+/// Corsaro - CD1 »), en tête à défaut.
+fn marqueur_du_nom(nom: &str) -> Option<(String, u32)> {
+    marqueur_final(nom).or_else(|| marqueur_de_tete(nom))
 }
 
 /// « Titre (CD 2) », « Titre [Disc 2] » — le marqueur tient TOUT le contenu
@@ -324,8 +397,11 @@ fn parent_et_feuille(dossier: &str) -> (String, String) {
 /// porte un titre SANS marqueur (« Early Works ») mais vit toujours dans le
 /// dossier de son disque 1 — c'est ce qui permet d'y rattacher un disque
 /// arrivé plus tard.
+///
+/// Dans chacun des deux, le marqueur de FIN est cherché avant celui de TÊTE
+/// ([`marqueur_du_nom`], #5357).
 fn marqueur_de_l_album(a: &AlbumAGrouper, feuille: &str) -> Option<(String, u32)> {
-    marqueur_final(&a.titre).or_else(|| marqueur_final(feuille))
+    marqueur_du_nom(&a.titre).or_else(|| marqueur_du_nom(feuille))
 }
 
 /// Les coffrets ÉCLATÉS d'un lot d'albums.
@@ -337,8 +413,9 @@ fn marqueur_de_l_album(a: &AlbumAGrouper, feuille: &str) -> Option<(String, u32)
 /// 1. **frères** — même dossier parent. C'est ce qui empêche de rapprocher
 ///    deux *Greatest Hits, Disc 1* de deux artistes rangés ailleurs ;
 /// 2. **du même socle** — même titre une fois le marqueur (« Disc N »,
-///    « CDN », « (CD N) », « [Disc N] »…) retiré, sans casse, sans espaces
-///    doublés, sans année de tête ;
+///    « CDN », « (CD N) », « [Disc N] »… en fin de nom, ou « CDN - »,
+///    « Disc N - » en tête, #5357) retiré, sans casse, sans espaces doublés,
+///    sans année de tête ;
 /// 3. **du même artiste d'album** — un disque classé « Various Artists » ne
 ///    départage pas (*A Love Supreme*), deux artistes réels différents si ;
 /// 4. **de numéros DISTINCTS** — deux « Disc 1 » sous un même socle sont deux
@@ -385,7 +462,7 @@ pub fn coffrets(albums: &[AlbumAGrouper]) -> Vec<Coffret> {
             let titre = v
                 .first()
                 .map(|(_, a)| {
-                    marqueur_final(&a.titre)
+                    marqueur_du_nom(&a.titre)
                         .map(|(s, _)| s)
                         .unwrap_or_else(|| a.titre.clone())
                 })
@@ -759,6 +836,170 @@ mod tests {
         assert_eq!(c[0].disques, vec![(1, 2), (2, 1), (10, 3)]);
         assert_eq!(c[0].cible(), Some(2));
         assert_eq!(c[0].absorbes(), vec![1, 3]);
+    }
+
+    // ------------------------------------------------------------------
+    // Le marqueur EN TÊTE — #5357 (Marco Polo, fil 2009), GO du 28/09/2026
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn le_marqueur_de_tete_se_lit_sous_ses_formes() {
+        assert_eq!(marqueur_de_tete("CD1 - Titre"), Some(("Titre".into(), 1)));
+        assert_eq!(
+            marqueur_de_tete("Disc 2 - Titre"),
+            Some(("Titre".into(), 2))
+        );
+        assert_eq!(marqueur_de_tete("CD 03 · Titre"), Some(("Titre".into(), 3)));
+        assert_eq!(
+            marqueur_de_tete("disque 2 : Le Titre"),
+            Some(("Le Titre".into(), 2))
+        );
+        assert_eq!(
+            marqueur_de_tete("CD01 - Bruch Violin Concertos Nos. 1 & 2; Scottish Fantasy"),
+            Some((
+                "Bruch Violin Concertos Nos. 1 & 2; Scottish Fantasy".into(),
+                1
+            ))
+        );
+        // `marqueur_du_nom` lit la tête quand la fin ne porte rien.
+        assert_eq!(marqueur_du_nom("CD2 - Titre"), Some(("Titre".into(), 2)));
+    }
+
+    #[test]
+    fn le_marqueur_de_tete_est_etroit() {
+        // Le mot est un MOT.
+        assert_eq!(marqueur_de_tete("Discovery 2 - Daft Punk"), None);
+        assert_eq!(marqueur_de_tete("CDs 2 - Titre"), None);
+        // Le numéro est un NOMBRE d'un ou deux chiffres, jamais zéro, suivi
+        // d'une liaison.
+        assert_eq!(marqueur_de_tete("CD1Titre"), None);
+        assert_eq!(marqueur_de_tete("CD 123 - Titre"), None);
+        assert_eq!(marqueur_de_tete("CD 0 - Titre"), None);
+        assert_eq!(marqueur_de_tete("CD - Titre"), None);
+        // Un titre DERRIÈRE, sinon c'est un dossier de disque (« CD1 »).
+        assert_eq!(marqueur_de_tete("CD1"), None);
+        assert_eq!(marqueur_de_tete("CD1 - "), None);
+        // 🔴 PIÈGE N° 1, en tête aussi : un volume n'est pas un disque.
+        assert_eq!(marqueur_de_tete("Vol. 2 - Titre"), None);
+        // Un titre qui commence par un caractère large ne panique pas.
+        assert_eq!(marqueur_de_tete("Été 85"), None);
+        assert_eq!(marqueur_de_tete("É"), None);
+        assert_eq!(marqueur_de_tete(""), None);
+    }
+
+    /// `CD1 - Titre` / `CD2 - Titre`, dossiers frères, même artiste : UN
+    /// coffret de deux disques, titré sans le marqueur.
+    #[test]
+    fn cd1_titre_et_cd2_titre_font_un_coffret() {
+        let base = "/m/Handel/Messiah (Gardiner)";
+        let c = coffrets(&[
+            alb(20, "CD2 - Messiah", &format!("{base}/CD2 - Messiah")),
+            alb(10, "CD1 - Messiah", &format!("{base}/CD1 - Messiah")),
+        ]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].disques, vec![(1, 10), (2, 20)]);
+        assert_eq!(c[0].titre, "Messiah");
+    }
+
+    /// Le titre d'album SANS marqueur, le marqueur en tête du DOSSIER : lu à
+    /// défaut, comme le marqueur de fin.
+    #[test]
+    fn le_marqueur_de_tete_du_dossier_sert_a_defaut() {
+        let base = "/m/Handel/Messiah (Gardiner)";
+        let c = coffrets(&[
+            alb(10, "Messiah", &format!("{base}/Disc 1 - Messiah")),
+            alb(20, "Messiah", &format!("{base}/Disc 2 - Messiah")),
+        ]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].disques, vec![(1, 10), (2, 20)]);
+    }
+
+    /// 🔴 La capture de #5357 : *Philips Original Jackets Collection (55
+    /// CDs)*. Chaque disque est un AUTRE album, sous un même parent. Les
+    /// marqueurs de tête sont LUS — la première boucle le prouve —, et
+    /// pourtant rien n'est réuni : il n'y a pas de socle commun. Même classés
+    /// sous un seul artiste (le pire cas), ils restent séparés.
+    #[test]
+    fn une_collection_de_disques_differents_n_est_pas_un_coffret() {
+        let base = "/m/Coffrets/Philips Original Jackets Collection (55 CDs)";
+        let noms = [
+            "CD01 - Bruch Violin Concertos Nos. 1 & 2; Scottish Fantasy",
+            "CD02 - Brahms Wolf Lieder",
+            "CD03 - Brahms - Piano Concerto No.2",
+            "CD09 - Rossini - Stabat Mater",
+        ];
+        for n in noms {
+            assert!(marqueur_de_tete(n).is_some(), "marqueur non lu : {n}");
+        }
+        let albums: Vec<AlbumAGrouper> = noms
+            .iter()
+            .enumerate()
+            .map(|(i, n)| alb(i as i64 + 1, n, &format!("{base}/{n}")))
+            .collect();
+        let c = coffrets(&albums);
+        assert!(c.is_empty(), "{c:?}");
+    }
+
+    /// Le cas EMBOÎTÉ de #5357 : *Il Corsaro*, double album logé dans la
+    /// collection (`CD10 - … - CD1`, `CD11 - … - CD2`). Le marqueur de FIN
+    /// l'emporte. Lus sur les dossiers, les socles gardent leur préfixe
+    /// (« CD10 - … », « CD11 - … ») et diffèrent : rien n'est réuni. Lus sur
+    /// des titres sans préfixe, *Il Corsaro* est réuni en DEUX disques, et
+    /// la collection n'est pas touchée.
+    #[test]
+    fn le_double_album_emboite_dans_une_collection() {
+        let base = "/m/Coffrets/Philips Original Jackets Collection (55 CDs)";
+        let d10 = format!("{base}/CD10 - Verdi - Il Corsaro - Gardelli - CD1");
+        let d11 = format!("{base}/CD11 - Verdi - Il Corsaro - Gardelli - CD2");
+        let par_dossiers = coffrets(&[alb(10, "Il Corsaro", &d10), alb(11, "Il Corsaro", &d11)]);
+        assert!(par_dossiers.is_empty(), "{par_dossiers:?}");
+
+        let par_titres = coffrets(&[
+            alb(10, "Verdi - Il Corsaro - Gardelli - CD1", &d10),
+            alb(11, "Verdi - Il Corsaro - Gardelli - CD2", &d11),
+            alb(
+                12,
+                "CD12 - Berlioz -Symphonie Fantastique",
+                &format!("{base}/CD12 - Berlioz -Symphonie Fantastique"),
+            ),
+        ]);
+        assert_eq!(par_titres.len(), 1, "{par_titres:?}");
+        assert_eq!(par_titres[0].disques, vec![(1, 10), (2, 11)]);
+        assert_eq!(par_titres[0].titre, "Verdi - Il Corsaro - Gardelli");
+    }
+
+    /// Les gardes valent pour le marqueur de tête : deux artistes réels
+    /// différents, ou deux parents différents, ne font pas un coffret.
+    #[test]
+    fn le_marqueur_de_tete_passe_par_les_memes_gardes() {
+        let base = "/m/Compilations";
+        let artistes = coffrets(&[
+            alb_de(
+                1,
+                "CD1 - Best Of",
+                &format!("{base}/CD1 - Best Of"),
+                10,
+                false,
+            ),
+            alb_de(
+                2,
+                "CD2 - Best Of",
+                &format!("{base}/CD2 - Best Of"),
+                20,
+                false,
+            ),
+        ]);
+        assert!(artistes.is_empty(), "{artistes:?}");
+        let parents = coffrets(&[
+            alb(1, "CD1 - Best Of", "/m/Artiste A/CD1 - Best Of"),
+            alb(2, "CD2 - Best Of", "/m/Artiste B/CD2 - Best Of"),
+        ]);
+        assert!(parents.is_empty(), "{parents:?}");
+        let doublon = coffrets(&[
+            alb(1, "CD1 - Best Of", &format!("{base}/CD1 - Best Of")),
+            alb(2, "Disc 1 - Best Of", &format!("{base}/Disc 1 - Best Of")),
+        ]);
+        assert!(doublon.is_empty(), "deux disques 1 : {doublon:?}");
     }
 
     // ------------------------------------------------------------------

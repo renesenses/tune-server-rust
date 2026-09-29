@@ -400,3 +400,102 @@ async fn album_inconnu_404_et_corps_invalide_422() {
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(v["error"], "corps_invalide");
 }
+
+/// #5314 (décision de Bertrand du 28/09/2026) : la route écrit aussi GENRE,
+/// d'après les genres de chaque piste EN BASE — genres multiples en valeurs
+/// séparées ; une piste sans genre en base garde la balise de son fichier.
+#[tokio::test]
+async fn genre_5314_la_route_ecrit_le_genre_de_la_base() {
+    let banc = banc();
+    let b = &banc.state.backend;
+    b.execute(
+        "UPDATE tracks SET genre = 'Jazz', genres = '[\"Jazz\",\"Fusion\"]' WHERE id = 11",
+        &[],
+    )
+    .unwrap();
+    b.execute(
+        "UPDATE tracks SET genre = 'Blues', genres = NULL WHERE id = 12",
+        &[],
+    )
+    .unwrap();
+    b.execute(
+        "UPDATE tracks SET genre = NULL, genres = NULL WHERE id = 13",
+        &[],
+    )
+    .unwrap();
+    // Le M4A porte déjà un genre, que la base (13 : sans genre) ne connaît pas.
+    let m4a = banc.album.join("03.m4a");
+    tag_writer::write_tags(
+        m4a.to_str().unwrap(),
+        &tag_writer::TagUpdate {
+            genre: Some("Soul".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let genres_m4a_avant = tune_core::metadata::read_metadata(&m4a).unwrap().genres;
+    assert_eq!(genres_m4a_avant, vec!["Soul".to_string()], "témoin posé");
+
+    let (s, v) = appeler(&banc.state, 1, "").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["erreurs"], json!([]), "{v}");
+    let genre_ecrit = |id: i64| {
+        v["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["track_id"] == id)
+            .and_then(|p| {
+                p["changements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["champ"] == "GENRE")
+                    .cloned()
+            })
+    };
+    assert_eq!(
+        genre_ecrit(11).map(|c| c["apres"].clone()),
+        Some(json!("Jazz; Fusion")),
+        "{v}"
+    );
+    assert_eq!(
+        genre_ecrit(12).map(|c| c["apres"].clone()),
+        Some(json!("Blues")),
+        "{v}"
+    );
+    assert!(
+        genre_ecrit(13).is_none(),
+        "13 n'a pas de genre en base : {v}"
+    );
+
+    let lu = |nom: &str| tune_core::metadata::read_metadata(&banc.album.join(nom)).unwrap();
+    assert_eq!(
+        lu("01.flac").genres,
+        vec!["Jazz".to_string(), "Fusion".to_string()],
+        "#5314 : GENRE du FLAC"
+    );
+    assert_eq!(
+        lu("02.mp3").genres,
+        vec!["Blues".to_string()],
+        "#5314 : TCON du MP3"
+    );
+    assert_eq!(
+        lu("03.m4a").genres,
+        genres_m4a_avant,
+        "#5314 : sans genre en base, le ©gen du M4A reste"
+    );
+
+    // Relue après écriture, la base garde les genres qu'elle avait.
+    let t = tune_core::db::track_repo::TrackRepo::with_backend(b.clone())
+        .get(11)
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.genre.as_deref(), Some("Jazz"));
+    assert_eq!(t.genres.as_deref(), Some(r#"["Jazz","Fusion"]"#));
+
+    // Seconde écriture : plus rien à faire.
+    let (_, v) = appeler(&banc.state, 1, "{}").await;
+    assert_eq!(v["ecrits"], 0, "{v}");
+}
