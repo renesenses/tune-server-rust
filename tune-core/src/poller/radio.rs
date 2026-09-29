@@ -65,6 +65,7 @@ impl PositionPoller {
                         source: "radio".into(),
                         source_id: np.source_id.clone(),
                         stream_id: np.stream_id.clone(),
+                        channels: np.channels,
                         ..Default::default()
                     };
                     // Le renderer, lui, ne lit pas le now-playing : il

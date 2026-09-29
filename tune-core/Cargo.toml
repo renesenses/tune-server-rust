@@ -21,6 +21,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 lofty = { workspace = true }
+# #5297 — textes d'un disque SACD en Shift-JIS, KS C 5601, GB 2312 ou Big5.
+# Déjà dans l'arbre (tiré par reqwest), aucune caisse nouvelle.
+encoding_rs = "0.8"
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
@@ -350,6 +353,14 @@ path = "tests/scan_refus_insertion_comptes_2939.rs"
 [[test]]
 name = "cue_gapless_un_fichier_par_piste"
 path = "tests/cue_gapless_un_fichier_par_piste.rs"
+
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
+# #5298 — images de CD audio BIN/CUE : deux pistes, pregap, CD-Text, CD mixte
+# et CD Extra (piste de donnees ignoree), un BIN par piste ; bornes et
+# deplacement a l'echantillon pres par le chemin de lecture.
+[[test]]
+name = "cue_image_cd_bin_5298"
+path = "tests/cue_image_cd_bin_5298.rs"
 
 # `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
 # #2569 / #2775 — l'instantane de file d'attente ne doit pas etre ecrase par une
