@@ -3667,8 +3667,10 @@ pub(super) struct CoffretManuel {
 ///
 /// Le numéro de disque de chaque album — `1`, `2`, … dans l'ordre reçu — puis
 /// la fusion par [`AlbumRepo::absorber`], celle-là même qu'emploie le
-/// regroupement automatique. Rien n'est écrit dans les FICHIERS : réparer la
-/// base est réversible d'un rescan, réécrire un FLAC ne l'est pas.
+/// regroupement automatique, et la disposition de chaque piste, TENUE
+/// (`edition_pistes`) pour qu'un scan qui relit les fichiers ne défasse pas
+/// le coffret (#5319). Rien n'est écrit dans les FICHIERS : réécrire un FLAC
+/// n'est pas réversible.
 ///
 /// ⚠️ Le titre du coffret est le plus long préfixe COMMUN des titres réunis
 /// ([`titre_commun`]) — « 101 » pour les deux disques de Bertrand. Faute de
@@ -3727,6 +3729,15 @@ pub(super) async fn composer_coffret(
         return super::refus_source_non_locale();
     }
     let cible = ids[0];
+    // Ce que chaque album tient déjà (renommages de pistes, disposition) : lu
+    // AVANT la réunion, que l'absorption des métadonnées brouillerait.
+    let heritage = match tune_core::db::edition_album::editions_tenues(&state.backend, &ids) {
+        Ok(h) => h,
+        Err(e) => {
+            return AppError::internal(format!("lecture des éditions tenues : {e}"))
+                .into_response();
+        }
+    };
 
     // Le numéro de disque, dans l'ordre reçu — y compris pour la cible, qui
     // devient le disque 1 même si ses pistes se déclaraient autre chose.
@@ -3782,6 +3793,17 @@ pub(super) async fn composer_coffret(
             .set(cible, coffrets_auto::CLE_COFFRET, &marqueur)
     {
         tracing::warn!(album = cible, erreur = %e, "coffret_manuel_non_marque");
+    }
+    // 🔴 #5319 — la disposition TENUE, piste par piste. Le marqueur ne protège
+    // que de la passe automatique : un scan qui relit les fichiers rend
+    // chaque piste à l'album de son DOSSIER et au numéro de disque de ses
+    // balises (ou de sa feuille CUE). Seules les tenues (`edition_pistes`,
+    // par chemin, ou par identité CUE pour une tranche d'image) lui font
+    // garder sa place — c'est ce qu'« attacher » écrit déjà.
+    if let Err(e) =
+        tune_core::db::edition_album::tenir_la_disposition(&state.backend, cible, &heritage)
+    {
+        tracing::warn!(album = cible, erreur = %e, "coffret_manuel_disposition_non_tenue");
     }
     state.event_bus.emit(
         tune_core::event_types::EventType::LibraryUpdated.as_str(),

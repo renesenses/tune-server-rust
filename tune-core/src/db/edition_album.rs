@@ -29,7 +29,10 @@
 //!   disque) et ce qu'il a RENOMMÉ (titre, artiste de piste). La piste y est
 //!   désignée par son CHEMIN : le surveillant de fichiers supprime puis recrée
 //!   la ligne d'un fichier modifié, son identifiant ne survit pas ; son chemin
-//!   si.
+//!   si. Une tranche d'image découpée par une feuille CUE n'a pas de
+//!   `file_path` : elle est désignée par son identité CUE, le couple
+//!   `(cue_media_path, cue_start_ms)` que tient `idx_tracks_cue_identity`
+//!   et que relit `scanner::cue_bibliotheque` (#5319).
 //!
 //! # Pourquoi une analyse ne l'écrase plus
 //!
@@ -114,6 +117,14 @@ pub struct PisteTenue {
     pub id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chemin: Option<String>,
+    /// L'image qui porte la piste, quand une feuille CUE la découpe
+    /// (`tracks.cue_media_path`). Avec [`Self::cue_debut_ms`], c'est ce qui
+    /// désigne une tranche, qui n'a pas de chemin à elle (#5319).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_media: Option<String>,
+    /// Le début de la tranche dans l'image (`tracks.cue_start_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_debut_ms: Option<i64>,
     pub disque: i32,
     pub numero: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +171,8 @@ fn lire_edition(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<EditionPistes,
 struct Ligne {
     id: i64,
     chemin: Option<String>,
+    /// `(cue_media_path, cue_start_ms)` d'une piste découpée par une feuille.
+    cue: Option<(String, i64)>,
     disque: i32,
     numero: i32,
     nom_disque: Option<String>,
@@ -167,7 +180,8 @@ struct Ligne {
 
 fn sql_lignes(engine: Engine) -> String {
     format!(
-        "SELECT id, file_path, disc_number, track_number, disc_subtitle \
+        "SELECT id, file_path, disc_number, track_number, disc_subtitle, \
+         cue_media_path, cue_start_ms \
          FROM tracks WHERE album_id = {} ORDER BY id",
         marque(engine, 1)
     )
@@ -188,6 +202,11 @@ fn lignes_de(rows: Vec<Vec<SqlValue>>) -> Vec<Ligne> {
                     .get(4)
                     .and_then(|v| v.as_string())
                     .filter(|s| !s.trim().is_empty()),
+                cue: r
+                    .get(5)
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+                    .zip(r.get(6).and_then(|v| v.as_i64())),
             })
         })
         .collect()
@@ -207,22 +226,34 @@ fn construire(
 ) -> EditionPistes {
     let mut anciens: HashMap<i64, &PisteTenue> = HashMap::new();
     let mut anciens_par_chemin: HashMap<&str, &PisteTenue> = HashMap::new();
+    let mut anciens_par_cue: HashMap<(&str, i64), &PisteTenue> = HashMap::new();
     for e in heritage {
         for p in &e.pistes {
             anciens.insert(p.id, p);
             if let Some(c) = p.chemin.as_deref() {
                 anciens_par_chemin.insert(c, p);
             }
+            if let (Some(m), Some(d)) = (p.cue_media.as_deref(), p.cue_debut_ms) {
+                anciens_par_cue.insert((m, d), p);
+            }
         }
     }
     let pistes = lignes
         .iter()
         .filter_map(|l| {
-            let ancien = anciens.get(&l.id).copied().or_else(|| {
-                l.chemin
-                    .as_deref()
-                    .and_then(|c| anciens_par_chemin.get(c).copied())
-            });
+            let ancien = anciens
+                .get(&l.id)
+                .copied()
+                .or_else(|| {
+                    l.chemin
+                        .as_deref()
+                        .and_then(|c| anciens_par_chemin.get(c).copied())
+                })
+                .or_else(|| {
+                    l.cue
+                        .as_ref()
+                        .and_then(|(m, d)| anciens_par_cue.get(&(m.as_str(), *d)).copied())
+                });
             let titre = titres
                 .get(&l.id)
                 .cloned()
@@ -237,6 +268,8 @@ fn construire(
             Some(PisteTenue {
                 id: l.id,
                 chemin: l.chemin.clone(),
+                cue_media: l.cue.as_ref().map(|(m, _)| m.clone()),
+                cue_debut_ms: l.cue.as_ref().map(|(_, d)| *d),
                 disque: l.disque,
                 numero: l.numero,
                 nom_disque: l.nom_disque.clone(),
@@ -284,6 +317,30 @@ fn figer(
     ecrire_edition(db, album_id, &e)
 }
 
+/// Ce que chaque album tient déjà (disposition, renommages de pistes), lu
+/// AVANT une réunion qui va les absorber : c'est l'héritage que
+/// [`tenir_la_disposition`] reprend.
+pub fn editions_tenues(
+    db: &Arc<dyn DbBackend>,
+    album_ids: &[i64],
+) -> Result<Vec<EditionPistes>, TuneError> {
+    album_ids.iter().map(|&id| lire_edition(db, id)).collect()
+}
+
+/// Tient la disposition ACTUELLE d'un album, piste par piste : album, disque,
+/// numéro, nom du disque. C'est ce que fait déjà « attacher » ; la
+/// composition d'un coffret à la main (`POST /library/albums/coffret`) ne le
+/// faisait pas, et un scan qui relisait les fichiers rendait chaque disque à
+/// son dossier (#5319). Les renommages de `heritage` sont repris.
+pub fn tenir_la_disposition(
+    db: &Arc<dyn DbBackend>,
+    album_id: i64,
+    heritage: &[EditionPistes],
+) -> Result<(), TuneError> {
+    let heritage: Vec<&EditionPistes> = heritage.iter().collect();
+    figer(db, album_id, &heritage)
+}
+
 // ---------------------------------------------------------------------------
 // Les TENUES — ce que les analyses n'écrasent plus
 // ---------------------------------------------------------------------------
@@ -298,11 +355,14 @@ pub struct Tenue {
     pub artiste_id: Option<i64>,
 }
 
-/// Toutes les tenues de la bibliothèque, par chemin de fichier. Chargé UNE
-/// fois par scan : quelques albums édités, une requête.
+/// Toutes les tenues de la bibliothèque, par chemin de fichier — et, pour une
+/// tranche découpée par une feuille CUE, qui n'a pas de chemin, par son
+/// identité `(cue_media_path, cue_start_ms)` (#5319). Chargé UNE fois par
+/// scan : quelques albums édités, une requête.
 #[derive(Clone, Debug, Default)]
 pub struct Tenues {
     par_chemin: HashMap<String, Tenue>,
+    par_cue: HashMap<(String, i64), Tenue>,
     albums_disposes: HashSet<i64>,
     /// #5314 — `(tracks.genre, tracks.genres)` recopiés du genre de l'album,
     /// par album (marqueur `genre_pistes`, voir
@@ -390,29 +450,49 @@ impl Tenues {
                 t.albums_disposes.insert(album_id);
             }
             for p in e.pistes {
-                let Some(chemin) = p.chemin else { continue };
-                t.par_chemin.insert(
-                    chemin,
-                    Tenue {
-                        album_id,
-                        disposition: e
-                            .disposition
-                            .then(|| (p.disque, p.numero, p.nom_disque.clone())),
-                        titre: p.titre,
-                        artiste_id: p.artiste_id.filter(|a| vivants.contains(a)),
-                    },
-                );
+                let tenue = Tenue {
+                    album_id,
+                    disposition: e
+                        .disposition
+                        .then(|| (p.disque, p.numero, p.nom_disque.clone())),
+                    titre: p.titre,
+                    artiste_id: p.artiste_id.filter(|a| vivants.contains(a)),
+                };
+                if let (Some(m), Some(d)) = (p.cue_media, p.cue_debut_ms) {
+                    t.par_cue.insert((m, d), tenue.clone());
+                }
+                if let Some(chemin) = p.chemin {
+                    t.par_chemin.insert(chemin, tenue);
+                }
             }
         }
         Ok(t)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.par_chemin.is_empty() && self.genres_par_album.is_empty()
+        self.par_chemin.is_empty() && self.par_cue.is_empty() && self.genres_par_album.is_empty()
     }
 
     pub fn get(&self, chemin: &str) -> Option<&Tenue> {
         self.par_chemin.get(chemin)
+    }
+
+    /// La tenue d'une tranche CUE, par son image et son début.
+    pub fn get_cue(&self, media: &str, debut_ms: i64) -> Option<&Tenue> {
+        self.par_cue.get(&(media.to_string(), debut_ms))
+    }
+
+    /// La tenue d'une ligne piste : par son chemin, sinon par son identité
+    /// CUE.
+    fn de_la_piste(&self, track: &Track) -> Option<&Tenue> {
+        track
+            .file_path
+            .as_deref()
+            .and_then(|c| self.par_chemin.get(c))
+            .or_else(|| {
+                let media = track.cue_media_path.as_deref()?;
+                self.get_cue(media, track.cue_start_ms?)
+            })
     }
 
     /// Les albums dont la disposition des disques est tenue à la main.
@@ -423,10 +503,8 @@ impl Tenues {
     /// Pose sur une ligne piste — construite depuis les balises, pas encore
     /// écrite — ce que l'utilisateur a tenu. Rend vrai si la ligne a changé.
     pub fn appliquer(&self, track: &mut Track) -> bool {
-        let tenue = track
-            .file_path
-            .as_deref()
-            .and_then(|c| self.par_chemin.get(c));
+        // Par chemin, sinon par identité CUE (#5319).
+        let tenue = self.de_la_piste(track);
         let change = tenue.is_some();
         if let Some(t) = tenue {
             self.appliquer_tenue(t, track);
