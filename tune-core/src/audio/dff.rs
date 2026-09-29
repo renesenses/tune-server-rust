@@ -23,7 +23,7 @@
 //! All multi-byte values are big-endian.
 //! DSD bit ordering: MSB first within each byte.
 
-use std::fs::File;
+use crate::audio::iso9660::{FichierSource, ouvrir_fichier};
 use std::io::{Read, Seek, SeekFrom};
 
 /// Taille RÉELLEMENT occupée par un chunk IFF, en-tête exclu (#2218 T4).
@@ -171,7 +171,7 @@ fn read_u64_be(buf: &[u8], offset: usize) -> u64 {
 
 /// Parse a DFF (DSDIFF) file and return metadata needed for decoding.
 pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
-    let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+    let mut file = ouvrir_fichier(path).map_err(|e| format!("dff open: {e}"))?;
 
     // --- FRM8 header (12 bytes): "FRM8" + size(u64) + "DSD " ---
     let mut frm8 = [0u8; 12];
@@ -403,7 +403,7 @@ pub fn parse_dff(path: &str) -> Result<DffInfo, String> {
 pub fn read_dff_data(path: &str, info: &DffInfo) -> Result<Vec<u8>, String> {
     info.ensure_raw_dsd()?;
 
-    let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+    let mut file = ouvrir_fichier(path).map_err(|e| format!("dff open: {e}"))?;
     file.seek(SeekFrom::Start(info.data_offset))
         .map_err(|e| format!("dff seek: {e}"))?;
 
@@ -422,7 +422,7 @@ pub fn read_dff_data(path: &str, info: &DffInfo) -> Result<Vec<u8>, String> {
 ///
 /// Memory usage: O(chunk_size), typically 32 KB per call.
 pub struct DffStreamReader {
-    file: File,
+    file: FichierSource,
     remaining: usize,
     chunk_buf: Vec<u8>,
     data_offset: u64,
@@ -449,7 +449,7 @@ impl DffStreamReader {
         }
         info.ensure_raw_dsd()?;
 
-        let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+        let mut file = ouvrir_fichier(path).map_err(|e| format!("dff open: {e}"))?;
         file.seek(SeekFrom::Start(info.data_offset))
             .map_err(|e| format!("dff seek: {e}"))?;
 
@@ -482,7 +482,7 @@ impl DffStreamReader {
             )
         })?;
         let octets_par_trame = decodeur.dsd_frame_bytes();
-        let file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+        let file = ouvrir_fichier(path).map_err(|e| format!("dff open: {e}"))?;
         let decode_total = info.dst_frames.map_or(usize::MAX, |n| {
             (n as usize).saturating_mul(octets_par_trame)
         });
@@ -587,7 +587,10 @@ impl LecteurDst {
     /// Lit l'en-tête du prochain sous-chunk et avance le curseur au-delà.
     /// Rend son identifiant et la taille de sa charge utile, ou `None` à la
     /// fin de l'enveloppe.
-    fn sous_chunk_suivant(&mut self, file: &mut File) -> Result<Option<([u8; 4], u64)>, String> {
+    fn sous_chunk_suivant(
+        &mut self,
+        file: &mut FichierSource,
+    ) -> Result<Option<([u8; 4], u64)>, String> {
         if self.curseur.saturating_add(12) > self.fin {
             return Ok(None);
         }
@@ -610,7 +613,7 @@ impl LecteurDst {
         Ok(Some((id, taille)))
     }
 
-    fn trame_suivante(&mut self, file: &mut File) -> Result<Option<Vec<u8>>, String> {
+    fn trame_suivante(&mut self, file: &mut FichierSource) -> Result<Option<Vec<u8>>, String> {
         while let Some((id, taille)) = self.sous_chunk_suivant(file)? {
             if &id != b"DSTF" {
                 continue; // FRTE, DSTC (CRC)… : rien à décoder
@@ -645,7 +648,7 @@ impl LecteurDst {
         Ok(None)
     }
 
-    fn rechercher(&mut self, file: &mut File, cible: usize) -> Result<usize, String> {
+    fn rechercher(&mut self, file: &mut FichierSource, cible: usize) -> Result<usize, String> {
         let trame_cible = (cible / self.octets_par_trame) as u64;
         self.curseur = self.debut;
         self.trame = 0;

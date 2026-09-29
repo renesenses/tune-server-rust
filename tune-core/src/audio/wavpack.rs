@@ -9,7 +9,7 @@
 //! - Joint stereo
 //! - Adaptive entropy coding (3-median Golomb/Rice)
 
-use std::fs::File;
+use crate::audio::iso9660::{FichierSource, ouvrir_fichier};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 use tracing::{debug, warn};
@@ -1273,7 +1273,7 @@ fn apply_extended_int(s: &mut i32, zeros: u32, ones: u32, dups: u32) {
 
 /// Parse a WavPack file and extract format information without decoding.
 pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
-    let file = File::open(path).map_err(|e| format!("open: {e}"))?;
+    let file = ouvrir_fichier(path).map_err(|e| format!("open: {e}"))?;
     let mut reader = BufReader::new(file);
 
     let header = read_block_header(&mut reader)?;
@@ -1347,7 +1347,7 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
 /// File-backed incremental decoder. Only one compressed block and its PCM are
 /// retained; the caller controls when the next block is read (#4120).
 pub(super) struct WavPackDecoder {
-    reader: BufReader<File>,
+    reader: BufReader<FichierSource>,
     pub info: WavPackInfo,
     skip_samples: u64,
     position: u64,
@@ -1356,7 +1356,8 @@ pub(super) struct WavPackDecoder {
 impl WavPackDecoder {
     pub fn open(path: &str, seek_s: f64) -> Result<Self, String> {
         let info = parse_wavpack(path)?;
-        let reader = BufReader::new(File::open(path).map_err(|e| format!("wavpack open: {e}"))?);
+        let reader =
+            BufReader::new(ouvrir_fichier(path).map_err(|e| format!("wavpack open: {e}"))?);
         let skip_samples = (seek_s.max(0.0) * info.sample_rate as f64) as u64;
         Ok(Self {
             reader,
@@ -1449,7 +1450,7 @@ pub fn decode_wavpack_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let file = File::open(path).map_err(|e| format!("open: {e}"))?;
+    let file = ouvrir_fichier(path).map_err(|e| format!("open: {e}"))?;
     let mut reader = BufReader::new(file);
 
     // Read first header for format info

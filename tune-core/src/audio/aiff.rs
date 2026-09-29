@@ -8,7 +8,7 @@
 // la logique audio pour un gain de forme (clippy 1.98).
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::while_let_loop)]
 
-use std::fs::File;
+use crate::audio::iso9660::ouvrir_fichier;
 use std::io::{Read, Seek, SeekFrom};
 
 use tracing::debug;
@@ -61,7 +61,7 @@ fn read_bytes<const N: usize>(r: &mut impl Read) -> Result<[u8; N], String> {
 
 /// Parse an AIFF or AIFC file and return its metadata.
 pub fn parse_aiff(path: &str) -> Result<AiffInfo, String> {
-    let mut f = File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut f = ouvrir_fichier(path).map_err(|e| format!("open: {e}"))?;
 
     // --- FORM header (12 bytes) ---
     let magic = read_bytes::<4>(&mut f)?;
@@ -237,7 +237,7 @@ pub fn decode_aiff_to_pcm(
     }
 
     // Open file and seek to PCM data start + seek offset
-    let mut f = File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut f = ouvrir_fichier(path).map_err(|e| format!("open: {e}"))?;
     let pcm_offset = info.data_offset + seek_frames * frame_size as u64;
     f.seek(SeekFrom::Start(pcm_offset))
         .map_err(|e| format!("seek to PCM data: {e}"))?;
