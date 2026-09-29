@@ -1344,7 +1344,22 @@ impl PositionPoller {
                     status.position_ms,
                 );
 
-            if !in_seek_grace && !echantillon_perime {
+            // #5498 — la grâce écarte la position d'AVANT le déplacement,
+            // pas celles d'après : un échantillon en lecture, cohérent avec la
+            // cible et le temps écoulé depuis, se publie dès qu'il arrive.
+            // Sans cela, 10 s de lecture après un Seek en streaming ne
+            // laissaient aucune trace dans la position retenue, et une pause
+            // dans ces 10 s enregistrait la cible (Devialet, fil 2037).
+            let posterieur_au_deplacement = in_seek_grace
+                && status.state == TransportState::Playing
+                && zone_state.last_seek_at.is_some_and(|t| {
+                    decisions::echantillon_posterieur_au_deplacement(
+                        ps.cible_du_deplacement_ms,
+                        t.elapsed().as_millis() as u64,
+                        status.position_ms,
+                    )
+                });
+            if (!in_seek_grace || posterieur_au_deplacement) && !echantillon_perime {
                 // Clamp the reported position to the track duration so the UI
                 // progress bar doesn't briefly overshoot past the end. The
                 // output can report a position a few seconds past the duration
