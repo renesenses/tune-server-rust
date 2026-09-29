@@ -26,18 +26,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::TuneConfig;
 
-/// Racine temporaire du processus de test, créée une fois.
+static RACINE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Racine temporaire du processus de test, créée une fois, sous le répertoire
+/// temporaire du système — jamais dans l'arbre source.
 ///
-/// Elle survit au processus (un `static` ne se détruit pas) ; elle vit sous le
-/// répertoire temporaire du système, jamais dans l'arbre source.
+/// Partagée par tous les tests du binaire, elle ne peut pas vivre dans un
+/// garde à `Drop` (un `static` ne se détruit pas) : elle est supprimée à la
+/// sortie du binaire par [`garde_de_sortie`] (Linux, macOS).
 fn racine() -> &'static Path {
-    static RACINE: OnceLock<PathBuf> = OnceLock::new();
     RACINE.get_or_init(|| {
-        tempfile::Builder::new()
-            .prefix("tune-server-lib-tests-")
-            .tempdir()
-            .expect("répertoire temporaire des tests de la lib (#5467)")
-            .keep()
+        // tmp-autorise: dossier partagé par tout le binaire, supprimé par l'atexit de garde_de_sortie
+        tune_core::test_scratch::scratch_dir("tune-server-lib-5467").renoncer_au_nettoyage()
     })
 }
 
@@ -131,6 +131,9 @@ mod garde_de_sortie {
     }
 
     extern "C" fn verifier() {
+        if let Some(racine) = super::RACINE.get() {
+            let _ = std::fs::remove_dir_all(racine);
+        }
         let apparus: Vec<&PathBuf> = ABSENTS
             .get()
             .into_iter()
