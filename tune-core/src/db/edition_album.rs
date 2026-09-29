@@ -553,6 +553,10 @@ pub struct VueEdition {
     /// manuel — un serveur antérieur ne l'envoie pas, et le bouton n'apparaît
     /// pas.
     pub defaire_coffret_manuel: bool,
+    /// Ce serveur sait RÉTABLIR un champ depuis les balises
+    /// (`POST /library/albums/{id}/edition/retablir`, #5319) : la sonde des
+    /// boutons « Rétablir » de l'écran « Modifier ».
+    pub retablir_champ: bool,
 }
 
 /// Les noms de `edition_manuelle` rendus sous ceux du contrat de l'écran.
@@ -662,6 +666,7 @@ pub fn lire_vue(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<Option<VueEdit
         tracks,
         ecriture_balises: true,
         defaire_coffret_manuel: true,
+        retablir_champ: true,
     }))
 }
 
@@ -1445,12 +1450,342 @@ pub fn defaire_coffret_manuel(
         );
         ecrire_edition(db, id, &e)?;
     }
+    // Décision de Bertrand du 29/09/2026 : le refus est RETENU, comme pour
+    // un coffret automatique défait. Si la passe sait reconnaître ces disques
+    // (CD1/CD2 en dossiers frères), elle ne les réunit plus au scan suivant.
+    let defaits: HashSet<i64> = std::iter::once(album_id)
+        .chain(recrees.iter().copied())
+        .collect();
+    let inv = coffrets_auto::inventaire(db)?;
+    for c in crate::metadata::coffrets::coffrets(&inv.albums) {
+        if c.disques.iter().any(|(_, id)| defaits.contains(id)) {
+            coffrets_auto::retenir_refus(db, &c.cle)?;
+        }
+    }
     tracing::info!(
         coffret = album_id,
         albums_recrees = ?recrees,
         "coffret_manuel_defait"
     );
     Ok(recrees)
+}
+
+// ---------------------------------------------------------------------------
+// Rétablir UN champ depuis les balises — décision de Bertrand du 29/09/2026
+// ---------------------------------------------------------------------------
+
+/// Ce que disent les balises d'une piste — ou sa feuille CUE, qui en tient
+/// lieu pour une tranche d'image.
+#[derive(Clone, Debug, Default)]
+struct Balises {
+    album: Option<String>,
+    artiste_album: Option<String>,
+    artiste: Option<String>,
+    titre: Option<String>,
+    annee: Option<i32>,
+    genre: Option<String>,
+    label: Option<String>,
+    disque: Option<i32>,
+    numero: Option<i32>,
+    nom_disque: Option<String>,
+}
+
+fn non_vide(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Les balises de chaque piste, relues sur le disque. Une piste illisible
+/// (fichier absent, support démonté) n'y figure pas.
+fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
+    use crate::scanner::cue_album::{PlanCue, planifier_dossier};
+    use std::path::{Path, PathBuf};
+    let mut plans: HashMap<PathBuf, PlanCue> = HashMap::new();
+    let mut rendu = HashMap::new();
+    for l in lignes {
+        let b = if let Some((media, debut)) = &l.cue {
+            // Une tranche : la feuille est la source, comme au scan.
+            let media = Path::new(media);
+            let Some(dossier) = media.parent() else {
+                continue;
+            };
+            let plan = plans
+                .entry(dossier.to_path_buf())
+                .or_insert_with(|| planifier_dossier(dossier));
+            let trouve = plan.albums.iter().find_map(|a| {
+                a.pistes
+                    .iter()
+                    .find(|p| p.media == media && p.debut_ms as i64 == *debut)
+                    .map(|p| (a, p))
+            });
+            let Some((a, p)) = trouve else { continue };
+            Balises {
+                album: non_vide(a.titre.clone()),
+                artiste_album: non_vide(a.interprete.clone()),
+                artiste: non_vide(p.interprete.clone().or_else(|| a.interprete.clone())),
+                titre: non_vide(p.titre.clone()),
+                annee: a.annee.as_deref().and_then(|brut| {
+                    let c: String = brut.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    c.parse::<i32>().ok().filter(|y| *y > 0)
+                }),
+                genre: non_vide(a.genre.clone()),
+                label: None,
+                disque: Some(1),
+                numero: Some(p.numero as i32),
+                nom_disque: None,
+            }
+        } else if let Some(chemin) = &l.chemin {
+            let Some(m) = crate::metadata::read_metadata(Path::new(chemin)) else {
+                continue;
+            };
+            Balises {
+                album: non_vide(m.album),
+                artiste_album: non_vide(m.album_artist),
+                artiste: non_vide(m.artist),
+                titre: non_vide(m.title),
+                annee: m.year.map(|y| y as i32).filter(|y| *y > 0),
+                genre: non_vide(m.genre),
+                label: non_vide(m.label),
+                disque: m.disc_number.map(|d| d as i32),
+                numero: m.track_number.map(|n| n as i32),
+                nom_disque: non_vide(m.disc_subtitle),
+            }
+        } else {
+            continue;
+        };
+        rendu.insert(l.id, b);
+    }
+    rendu
+}
+
+/// La première valeur que portent les pistes, dans l'ordre des disques et des
+/// numéros — celle de la piste qui, au scan, a créé l'album.
+fn premiere<T: Clone>(
+    lignes: &[Ligne],
+    balises: &HashMap<i64, Balises>,
+    champ: impl Fn(&Balises) -> Option<T>,
+) -> Option<T> {
+    let mut ordre: Vec<&Ligne> = lignes.iter().collect();
+    ordre.sort_by_key(|l| (l.disque, l.numero, l.id));
+    ordre
+        .into_iter()
+        .find_map(|l| balises.get(&l.id).and_then(&champ))
+}
+
+/// Les champs que « Rétablir » connaît, sous leur nom du contrat de l'écran.
+pub const CHAMPS_RETABLISSABLES: [&str; 9] = [
+    "title",
+    "album_artist",
+    "year",
+    "label",
+    "genre",
+    "release_type",
+    "compilation_mode",
+    "discs",
+    "tracks",
+];
+
+/// RÉTABLIT un champ modifié à la main : sa valeur revient à celle des
+/// balises des fichiers (ou de la feuille CUE), et la marque « modifié à la
+/// main » est retirée. `champ` est un nom de `champs_edites`.
+///
+/// - `title`, `album_artist`, `year`, `label`, `genre` : la valeur de la
+///   piste qui ouvre l'album (disque, puis numéro). Sans balise, `year`,
+///   `label` et `genre` sont vidés ; `title` et `album_artist` gardent leur
+///   valeur — un album a toujours un titre et un artiste.
+/// - `release_type` : aucune balise ne le porte ; il est vidé, et
+///   l'enrichissement pourra le reposer.
+/// - `compilation_mode` : le mode revient à `auto` (la règle juge).
+/// - `tracks` : titres et artistes de pistes renommés reprennent ceux des
+///   balises. La disposition des disques, si elle est tenue, reste.
+/// - `discs` : numéros de disque, de piste et noms de disque reprennent ceux
+///   des balises, et la disposition n'est plus tenue. Refusé
+///   (`retablir_par_defaire`) sur un coffret : le geste est « Défaire le
+///   coffret ».
+///
+/// Refus `champ_inconnu` ou `champ_non_modifie` (422).
+pub fn retablir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(), RefusEdition> {
+    let repo = AlbumRepo::with_backend(db.clone());
+    if repo.get(album_id)?.is_none() {
+        return Err(RefusEdition::AlbumInconnu(album_id));
+    }
+    if !CHAMPS_RETABLISSABLES.contains(&champ) {
+        return Err(invalide(
+            "champ_inconnu",
+            format!("« {champ} » n'est pas un champ que l'on sait rétablir"),
+        ));
+    }
+    let edites = lire_vue(db, album_id)?
+        .map(|v| v.album.champs_edites)
+        .unwrap_or_default();
+    if !edites.iter().any(|c| c == champ) {
+        return Err(invalide(
+            "champ_non_modifie",
+            format!("« {champ} » n'est pas modifié à la main sur l'album {album_id}"),
+        ));
+    }
+    if champ == "compilation_mode" {
+        return appliquer(
+            db,
+            album_id,
+            &Modification {
+                compilation_mode: Some(MODE_AUTO.into()),
+                ..Default::default()
+            },
+        );
+    }
+    let engine = db.engine();
+    let p = |n| marque(engine, n);
+    let (p1, p2, p3, p4) = (p(1), p(2), p(3), p(4));
+    let lignes =
+        lignes_de(db.query_many_strong(&sql_lignes(engine), &[&album_id as &dyn ToSqlValue])?);
+    match champ {
+        "discs" => {
+            if marqueur_coffret(db, album_id)?.is_some() {
+                return Err(invalide(
+                    "retablir_par_defaire",
+                    "un coffret se rétablit par « Défaire le coffret »",
+                ));
+            }
+            let balises = relire_les_balises(&lignes);
+            for l in &lignes {
+                let b = balises.get(&l.id);
+                let disque = b.and_then(|b| b.disque).unwrap_or(1).max(1) as i64;
+                let numero = b.and_then(|b| b.numero).unwrap_or(l.numero) as i64;
+                let nom = b.and_then(|b| b.nom_disque.clone());
+                db.execute(
+                    &format!(
+                        "UPDATE tracks SET disc_number = {p1}, track_number = {p2}, \
+                         disc_subtitle = {p3} WHERE id = {p4}"
+                    ),
+                    &[&disque as &dyn ToSqlValue, &numero, &nom, &l.id],
+                )?;
+            }
+            let precedent = lire_edition(db, album_id)?;
+            let apres = lignes_de(
+                db.query_many_strong(&sql_lignes(engine), &[&album_id as &dyn ToSqlValue])?,
+            );
+            let disques = apres
+                .iter()
+                .map(|l| l.disque)
+                .collect::<BTreeSet<_>>()
+                .len() as i64;
+            db.execute(
+                &format!("UPDATE albums SET disc_count = {p1} WHERE id = {p2}"),
+                &[&disques as &dyn ToSqlValue, &album_id],
+            )?;
+            let e = construire(
+                &apres,
+                false,
+                &[&precedent],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            ecrire_edition(db, album_id, &e)?;
+        }
+        "tracks" => {
+            let precedent = lire_edition(db, album_id)?;
+            let renommees: HashSet<i64> = precedent
+                .pistes
+                .iter()
+                .filter(|p| p.titre.is_some() || p.artiste_id.is_some())
+                .map(|p| p.id)
+                .collect();
+            let concernees: Vec<Ligne> = lignes
+                .iter()
+                .filter(|l| renommees.contains(&l.id))
+                .cloned()
+                .collect();
+            let balises = relire_les_balises(&concernees);
+            let artistes = ArtistRepo::with_backend(db.clone());
+            for l in &concernees {
+                let Some(b) = balises.get(&l.id) else {
+                    continue;
+                };
+                if let Some(t) = &b.titre {
+                    db.execute(
+                        &format!("UPDATE tracks SET title = {p1} WHERE id = {p2}"),
+                        &[t as &dyn ToSqlValue, &l.id],
+                    )?;
+                }
+                if let Some(a) = &b.artiste {
+                    let a = artiste_nomme(&artistes, a)?;
+                    db.execute(
+                        &format!("UPDATE tracks SET artist_id = {p1} WHERE id = {p2}"),
+                        &[&a as &dyn ToSqlValue, &l.id],
+                    )?;
+                }
+            }
+            // La disposition, si elle est tenue, reste ; sinon plus rien.
+            let disposition = precedent.disposition;
+            let sans_renommage = EditionPistes {
+                disposition,
+                pistes: if disposition {
+                    precedent
+                        .pistes
+                        .into_iter()
+                        .map(|p| PisteTenue {
+                            titre: None,
+                            artiste_id: None,
+                            ..p
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            };
+            ecrire_edition(db, album_id, &sans_renommage)?;
+        }
+        _ => {
+            let balises = relire_les_balises(&lignes);
+            let texte = |f: fn(&Balises) -> Option<String>| premiere(&lignes, &balises, f);
+            let (interne, colonne, valeur): (&str, &str, Option<String>) = match champ {
+                "title" => ("title", "title", texte(|b| b.album.clone())),
+                "label" => ("label", "label", texte(|b| b.label.clone())),
+                "genre" => ("genre", "genre", texte(|b| b.genre.clone())),
+                "release_type" => ("release_type", "release_type", None),
+                "year" => ("year", "year", None),
+                _ => ("artist", "artist_id", None),
+            };
+            match champ {
+                "title" => {
+                    if let Some(t) = &valeur {
+                        db.execute(
+                            &format!("UPDATE albums SET title = {p1} WHERE id = {p2}"),
+                            &[t as &dyn ToSqlValue, &album_id],
+                        )?;
+                    }
+                }
+                "year" => {
+                    let y = premiere(&lignes, &balises, |b| b.annee);
+                    db.execute(
+                        &format!("UPDATE albums SET year = {p1} WHERE id = {p2}"),
+                        &[&y as &dyn ToSqlValue, &album_id],
+                    )?;
+                }
+                "album_artist" => {
+                    let nom = premiere(&lignes, &balises, |b| {
+                        b.artiste_album.clone().or_else(|| b.artiste.clone())
+                    });
+                    if let Some(nom) = nom {
+                        let a = artiste_nomme(&ArtistRepo::with_backend(db.clone()), &nom)?;
+                        db.execute(
+                            &format!("UPDATE albums SET artist_id = {p1} WHERE id = {p2}"),
+                            &[&a as &dyn ToSqlValue, &album_id],
+                        )?;
+                    }
+                }
+                _ => {
+                    db.execute(
+                        &format!("UPDATE albums SET {colonne} = {p1} WHERE id = {p2}"),
+                        &[&valeur as &dyn ToSqlValue, &album_id],
+                    )?;
+                }
+            }
+            ne_plus_tenir(db, album_id, interne)?;
+        }
+    }
+    tracing::info!(album_id, champ, "champ_retabli_depuis_les_balises");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

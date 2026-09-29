@@ -414,10 +414,14 @@ async fn composer_defaire_puis_rescanner(b: &Bibliotheque, cd1: &Path, cd2: &Pat
 }
 
 fn disques_flac(b: &Bibliotheque) -> Vec<std::path::PathBuf> {
+    disques_flac_nommes(b, &["Disc A", "Disc B"])
+}
+
+fn disques_flac_nommes(b: &Bibliotheque, noms: &[&str]) -> Vec<std::path::PathBuf> {
     let parent = b.racine.join("Handel - Messiah, Gardiner (Philips 2CD)");
     let hier = SystemTime::now() - Duration::from_secs(86_400);
     let mut disques = Vec::new();
-    for cd in ["Disc A", "Disc B"] {
+    for &cd in noms {
         let dossier = parent.join(cd);
         std::fs::create_dir_all(&dossier).unwrap();
         for n in 1..=2 {
@@ -431,6 +435,7 @@ fn disques_flac(b: &Bibliotheque) -> Vec<std::path::PathBuf> {
                     ("ALBUMARTIST", "G. F. Handel"),
                     ("ALBUM", &format!("Messiah - Gardiner - {cd}")),
                     ("TRACKNUMBER", &n.to_string()),
+                    ("DATE", "1988"),
                 ],
                 hier,
             );
@@ -518,4 +523,218 @@ async fn defaire_refuse_ce_qui_n_est_pas_un_coffret_manuel_5319() {
     let (statut, _) = defaire(&b.etat, 999_999).await;
     assert_eq!(statut, StatusCode::NOT_FOUND, "album inconnu");
     assert_eq!((disposition(&b.db), albums(&b.db)), avant, "rien n'a bougé");
+}
+
+// ---------------------------------------------------------------------------
+// Décisions de Bertrand du 29/09/2026, suite : refus retenu, « Rétablir »
+// ---------------------------------------------------------------------------
+
+/// Les coffrets refusés (`settings.coffrets_auto_refuses`).
+fn refus(db: &Arc<dyn DbBackend>) -> String {
+    SettingsRepo::with_backend(db.clone())
+        .get(tune_core::db::coffrets_auto::CLE_REFUS)
+        .unwrap()
+        .unwrap_or_default()
+}
+
+/// Des disques que la passe AUTOMATIQUE sait réunir — dossiers frères
+/// « Gardiner CD1 » / « Gardiner CD2 » (un dossier nommé `CD1` tout court est,
+/// lui, replié sur son parent dès le scan : un seul album). Défaire le coffret
+/// MANUEL qu'on en a fait retient le refus : le scan suivant ne le reforme
+/// pas.
+#[tokio::test]
+async fn defaire_un_coffret_manuel_retient_le_refus_5319() {
+    let b = bibliotheque("refus");
+    let d = disques_flac_nommes(&b, &["Gardiner CD1", "Gardiner CD2"]);
+    scan_force(&b.etat).await;
+    // Montage : la passe les a réunis ; on défait ce coffret automatique, puis
+    // on OUBLIE son refus — l'état d'un coffret composé à la main sur un
+    // serveur dont la passe ne voyait pas ces disques (#5317, #5318).
+    let auto = album_de(&b.db, &d[0].to_string_lossy());
+    assert_eq!(
+        albums(&b.db).len(),
+        1,
+        "montage : la passe a réuni CD1 et CD2"
+    );
+    let (statut, corps) = appel(
+        &b.etat,
+        "POST",
+        &format!("/api/v1/library/coffrets/{auto}/defaire"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "montage : {corps}");
+    SettingsRepo::with_backend(b.db.clone())
+        .delete(tune_core::db::coffrets_auto::CLE_REFUS)
+        .unwrap();
+    let d1 = album_de(&b.db, &d[0].to_string_lossy());
+    let d2 = album_de(&b.db, &d[1].to_string_lossy());
+    composer(&b.etat, &[d1, d2]).await;
+
+    let (statut, corps) = defaire(&b.etat, d1).await;
+    assert_eq!(statut, StatusCode::OK, "défaire refusé : {corps}");
+    assert!(
+        refus(&b.db).contains('"'),
+        "aucun refus retenu : « {} »",
+        refus(&b.db)
+    );
+
+    scan_force(&b.etat).await;
+    assert_eq!(
+        albums(&b.db).len(),
+        2,
+        "le scan a reformé le coffret défait : {:?}",
+        albums(&b.db)
+    );
+}
+
+/// `POST …/edition/retablir`.
+async fn retablir(etat: &AppState, id: i64, champ: &str) -> (StatusCode, Value) {
+    appel(
+        etat,
+        "POST",
+        &format!("/api/v1/library/albums/{id}/edition/retablir"),
+        json!({ "field": champ }),
+    )
+    .await
+}
+
+fn edites(vue: &Value) -> Vec<String> {
+    vue["album"]["champs_edites"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// « Rétablir » : chaque champ reprend la valeur des BALISES et perd sa
+/// marque ; les autres champs modifiés restent modifiés.
+#[tokio::test]
+async fn retablir_un_champ_reprend_les_balises_et_retire_la_marque_5319() {
+    let b = bibliotheque("retablir");
+    let d = disques_flac(&b);
+    scan_force(&b.etat).await;
+    let id = album_de(&b.db, &d[0].to_string_lossy());
+    let piste: i64 =
+        b.db.query_many(
+            "SELECT id FROM tracks WHERE album_id = ? ORDER BY file_path LIMIT 1",
+            &[&id as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .unwrap()[0][0]
+            .as_i64()
+            .unwrap();
+    let (statut, corps) = appel(
+        &b.etat,
+        "PUT",
+        &format!("/api/v1/library/albums/{id}/edition"),
+        json!({
+            "title": "Mon titre", "year": 2001, "genre": "Baroque",
+            "tracks": [ { "id": piste, "title": "Ma piste" } ]
+        }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "montage : {corps}");
+    assert_eq!(edites(&corps), vec!["genre", "title", "tracks", "year"]);
+    assert_eq!(
+        vue_edition(&b.etat, id).await["retablir_champ"],
+        true,
+        "la sonde"
+    );
+
+    let (statut, vue) = retablir(&b.etat, id, "title").await;
+    assert_eq!(statut, StatusCode::OK, "{vue}");
+    assert_eq!(
+        vue["album"]["title"], "Messiah - Gardiner - Disc A",
+        "titre des balises"
+    );
+    assert_eq!(
+        edites(&vue),
+        vec!["genre", "tracks", "year"],
+        "seul le titre est rétabli"
+    );
+
+    let (_, vue) = retablir(&b.etat, id, "year").await;
+    assert_eq!(vue["album"]["year"], 1988, "année des balises");
+    let (_, vue) = retablir(&b.etat, id, "genre").await;
+    assert_eq!(
+        vue["album"]["genre"],
+        Value::Null,
+        "aucune balise GENRE : vidé"
+    );
+    let (_, vue) = retablir(&b.etat, id, "tracks").await;
+    let titre_piste = vue["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"].as_i64() == Some(piste))
+        .unwrap()["title"]
+        .clone();
+    assert_eq!(titre_piste, "Disc A piste 1", "titre de piste des balises");
+    assert_eq!(
+        edites(&vue),
+        Vec::<String>::new(),
+        "plus rien de modifié à la main"
+    );
+    assert_eq!(
+        cles(&b.db, id),
+        Vec::<String>::new(),
+        "aucune marque restante"
+    );
+
+    // Refus clairs.
+    let (statut, corps) = retablir(&b.etat, id, "title").await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+    assert_eq!(corps["error"], "champ_non_modifie");
+    let (statut, corps) = retablir(&b.etat, id, "cover_path").await;
+    assert_eq!(corps["error"], "champ_inconnu", "{statut} {corps}");
+}
+
+/// Une tranche CUE : la valeur « des balises » est celle de la FEUILLE.
+#[tokio::test]
+async fn retablir_le_titre_d_un_album_cue_reprend_la_feuille_5319() {
+    let b = bibliotheque("retablir-cue");
+    let i = images_cue(&b);
+    scan_force(&b.etat).await;
+    let id = album_de(&b.db, &i[0].to_string_lossy());
+    let (statut, corps) = appel(
+        &b.etat,
+        "PUT",
+        &format!("/api/v1/library/albums/{id}/edition"),
+        json!({ "title": "Mon titre" }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "montage : {corps}");
+    let (statut, vue) = retablir(&b.etat, id, "title").await;
+    assert_eq!(statut, StatusCode::OK, "{vue}");
+    assert_eq!(
+        vue["album"]["title"], "Messiah - Gardiner - Disc A",
+        "TITLE de la feuille"
+    );
+    assert!(!edites(&vue).contains(&"title".to_string()));
+    scan_force(&b.etat).await;
+    assert_eq!(
+        vue_edition(&b.etat, id).await["album"]["title"],
+        "Messiah - Gardiner - Disc A"
+    );
+}
+
+/// Sur un coffret composé : le titre revient à celui de la piste qui l'ouvre ;
+/// les disques se rétablissent par « Défaire », pas ici.
+#[tokio::test]
+async fn retablir_sur_un_coffret_compose_5319() {
+    let b = bibliotheque("retablir-coffret");
+    let d = disques_flac(&b);
+    scan_force(&b.etat).await;
+    let d1 = album_de(&b.db, &d[0].to_string_lossy());
+    let d2 = album_de(&b.db, &d[1].to_string_lossy());
+    composer(&b.etat, &[d1, d2]).await;
+    let (statut, corps) = retablir(&b.etat, d1, "discs").await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(corps["error"], "retablir_par_defaire");
+    let (statut, vue) = retablir(&b.etat, d1, "title").await;
+    assert_eq!(statut, StatusCode::OK, "{vue}");
+    assert_eq!(vue["album"]["title"], "Messiah - Gardiner - Disc A");
 }

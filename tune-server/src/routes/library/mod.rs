@@ -327,6 +327,7 @@ pub fn router() -> Router<AppState> {
             "/albums/{id}/edition/write-tags",
             post(edition_balises::ecrire_balises),
         )
+        .route("/albums/{id}/edition/retablir", post(edition::retablir))
         .route("/albums/{id}/discs/attach", post(edition::attacher))
         .route(
             "/albums/{id}/discs/{number}/detach",
