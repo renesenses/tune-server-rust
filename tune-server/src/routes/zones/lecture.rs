@@ -431,12 +431,19 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 None => None,
             };
             inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
+            // #5353 — le backend de CETTE sortie, pas celui du processus.
+            let audio_backend_de_la_zone = super::backend_affiche_de_la_zone(
+                &state,
+                z.output_device_id.as_deref(),
+                audio_backend,
+            )
+            .await;
             let signal_path = build_signal_path(
                 &ps,
                 z,
                 &state.backend,
                 renderer_label,
-                audio_backend,
+                audio_backend_de_la_zone,
                 wire.as_ref(),
             );
             obj.insert("signal_path".into(), json!(signal_path));
@@ -608,12 +615,19 @@ pub(super) async fn get_zone(
                     None => None,
                 };
                 inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
+                // #5353 — voir la note au site jumeau (`list_zones`).
+                let audio_backend_de_la_zone = super::backend_affiche_de_la_zone(
+                    &state,
+                    zone.output_device_id.as_deref(),
+                    audio_backend,
+                )
+                .await;
                 let signal_path = build_signal_path(
                     &ps,
                     &zone,
                     &state.backend,
                     renderer_label,
-                    audio_backend,
+                    audio_backend_de_la_zone,
                     wire.as_ref(),
                 );
                 obj.insert("signal_path".into(), json!(signal_path));
