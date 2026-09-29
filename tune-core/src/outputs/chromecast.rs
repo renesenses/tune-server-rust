@@ -12,6 +12,26 @@ use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, TransportSta
 /// One Cast operation gets one global budget: DNS, every address attempt,
 /// TLS and all protocol exchanges included.
 const CAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+/// #5323 — budget du SEUL réessai d'une lecture dont la première tentative a
+/// épuisé [`CAST_COMMAND_TIMEOUT`].
+///
+/// Un premier `Play` sur un récepteur au repos enchaîne connexion, TLS,
+/// `GET_STATUS`, puis le `LAUNCH` de l'application réceptrice : sur le
+/// Beosound Stage de FabienM, la chaîne dépasse 2 s (`after 2000ms of 2000ms
+/// budget`, deux fois dans son journal, dont une sur `launch app:`), alors
+/// que la relance passe. La zone « Enfants » du même testeur lance à froid en
+/// 1 455 ms : le budget commun est juste pour un Nest, trop court pour ce B&O.
+///
+/// Pourquoi un réessai et pas un budget unique plus grand pour tout : le
+/// `LAUNCH` parti pendant la première tentative continue côté récepteur, et le
+/// réessai le retrouve lancé (`GET_STATUS` → session réutilisée, aucun second
+/// carillon). Le budget des autres commandes — et donc du poller, séquentiel
+/// sur toutes les zones — ne bouge pas.
+///
+/// Borne : 2 s + 3 s = 5 s au pire, soit le délai que le poller accorde déjà
+/// à une zone (`TUNE_POLLER_STATUS_TIMEOUT_SECS`, 5 s par défaut). UN réessai,
+/// jamais une boucle.
+const CAST_PLAY_RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CAST_COMMAND_WORKERS: usize = 4;
 static CAST_COMMAND_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)));
@@ -76,6 +96,50 @@ fn with_elapsed(error: String, started: Instant, budget: Duration) -> String {
         started.elapsed().as_millis(),
         budget.as_millis()
     )
+}
+
+/// Une erreur Cast qui dit « budget épuisé » — et seulement celle-là.
+///
+/// Toutes les échéances de la chaîne portent ce texte : la nôtre
+/// (`chromecast command deadline elapsed`, `… worker/resolution deadline
+/// elapsed`) comme celle que `rust_cast` traduit depuis la socket (`launch
+/// app: Cast command deadline elapsed`). Un refus franc (port fermé, liaison
+/// coupée) ne le porte pas : l'appareil a répondu, réessayer ne changerait
+/// rien.
+fn est_une_echeance(error: &str) -> bool {
+    error.contains("deadline elapsed")
+}
+
+/// #5323 — une lecture, et au plus UN réessai si la première tentative a
+/// épuisé son budget.
+///
+/// `attempt` reçoit le budget de la tentative. Le réessai n'a lieu que sur
+/// une échéance ([`est_une_echeance`]) ; toute autre erreur rend tout de
+/// suite. L'erreur finale est préfixée `retry:` pour que le bandeau et le
+/// journal disent qu'un réessai a eu lieu ; la première erreur, avec sa
+/// mesure, part dans la ligne `chromecast_play_retry_after_deadline`.
+async fn play_with_one_retry<F, Fut>(
+    first_budget: Duration,
+    retry_budget: Duration,
+    mut attempt: F,
+) -> Result<(), String>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    match attempt(first_budget).await {
+        Err(first) if est_une_echeance(&first) => {
+            tracing::warn!(
+                first_error = %first,
+                retry_budget_ms = retry_budget.as_millis() as u64,
+                "chromecast_play_retry_after_deadline"
+            );
+            attempt(retry_budget)
+                .await
+                .map_err(|second| format!("retry: {second}"))
+        }
+        other => other,
+    }
 }
 
 async fn run_cast_command<T, F>(
@@ -455,6 +519,9 @@ pub struct ChromecastOutput {
     host: String,
     port: u16,
     command_timeout: Duration,
+    /// #5323 — budget du réessai unique de `play_media`, voir
+    /// [`CAST_PLAY_RETRY_TIMEOUT`].
+    play_retry_timeout: Duration,
     command_slots: Arc<Semaphore>,
 }
 
@@ -466,6 +533,7 @@ impl ChromecastOutput {
             host,
             port,
             command_timeout: CAST_COMMAND_TIMEOUT,
+            play_retry_timeout: CAST_PLAY_RETRY_TIMEOUT,
             command_slots: Arc::clone(&CAST_COMMAND_SLOTS),
         }
     }
@@ -473,6 +541,7 @@ impl ChromecastOutput {
     #[cfg(test)]
     fn with_command_limits(mut self, timeout: Duration, slots: Arc<Semaphore>) -> Self {
         self.command_timeout = timeout;
+        self.play_retry_timeout = timeout;
         self.command_slots = slots;
         self
     }
@@ -533,78 +602,83 @@ impl OutputTarget for ChromecastOutput {
     }
 
     async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
-        let cast_media = build_cast_media(media);
-        let url = media.url.to_string();
-        let host = self.host.clone();
-        let port = self.port;
-        let name = self.name.clone();
-        let device_key = self.device_id.clone();
-        let timeout = self.command_timeout;
-        let slots = Arc::clone(&self.command_slots);
+        // #5323 — un récepteur au repos peut dépasser le budget commun au
+        // premier `Play` : un réessai, borné, voir `CAST_PLAY_RETRY_TIMEOUT`.
+        // Chaque tentative rebâtit sa connexion et REDEMANDE le statut : le
+        // `LAUNCH` parti la première fois est retrouvé, pas renvoyé.
+        play_with_one_retry(self.command_timeout, self.play_retry_timeout, |timeout| {
+            let cast_media = build_cast_media(media);
+            let url = media.url.to_string();
+            let host = self.host.clone();
+            let port = self.port;
+            let name = self.name.clone();
+            let device_key = self.device_id.clone();
+            let slots = Arc::clone(&self.command_slots);
 
-        run_cast_command(host, port, timeout, slots, move |device| {
-            device
-                .connection
-                .connect("receiver-0")
-                .map_err(|e| format!("connect receiver: {e}"))?;
+            run_cast_command(host, port, timeout, slots, move |device| {
+                device
+                    .connection
+                    .connect("receiver-0")
+                    .map_err(|e| format!("connect receiver: {e}"))?;
 
-            // Réutiliser la session en cours plutôt que de relancer le
-            // récepteur : un LAUNCH sur une application déjà lancée la
-            // redémarre, et l'enceinte carillonne (#1953). Un GET_STATUS
-            // en échec retombe sur le lancement — le comportement d'avant.
-            let app_id = app_id_du_lecteur();
-            let status = device.receiver.get_status().ok();
-            let plan = plan_play(status.as_ref().map(|s| s.applications.as_slice()), &app_id);
+                // Réutiliser la session en cours plutôt que de relancer le
+                // récepteur : un LAUNCH sur une application déjà lancée la
+                // redémarre, et l'enceinte carillonne (#1953). Un GET_STATUS
+                // en échec retombe sur le lancement — le comportement d'avant.
+                let app_id = app_id_du_lecteur();
+                let status = device.receiver.get_status().ok();
+                let plan = plan_play(status.as_ref().map(|s| s.applications.as_slice()), &app_id);
 
-            let (transport_id, session_id, session_reused, raison) = match plan {
-                PlayPlan::Reuse {
-                    transport_id,
-                    session_id,
-                } => (transport_id, session_id, true, "session_reutilisee"),
-                PlayPlan::Launch { raison } => {
-                    let app = device
-                        .receiver
-                        .launch_app(
-                            &rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver,
-                        )
-                        .map_err(|e| format!("launch app: {e}"))?;
-                    (app.transport_id, app.session_id, false, raison.raison())
-                }
-            };
+                let (transport_id, session_id, session_reused, raison) = match plan {
+                    PlayPlan::Reuse {
+                        transport_id,
+                        session_id,
+                    } => (transport_id, session_id, true, "session_reutilisee"),
+                    PlayPlan::Launch { raison } => {
+                        let app = device
+                            .receiver
+                            .launch_app(
+                                &rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver,
+                            )
+                            .map_err(|e| format!("launch app: {e}"))?;
+                        (app.transport_id, app.session_id, false, raison.raison())
+                    }
+                };
 
-            device
-                .connection
-                .connect(&transport_id)
-                .map_err(|e| format!("connect transport: {e}"))?;
+                device
+                    .connection
+                    .connect(&transport_id)
+                    .map_err(|e| format!("connect transport: {e}"))?;
 
-            device
-                .media
-                .load(&transport_id, &session_id, &cast_media)
-                .map_err(|e| format!("load media: {e}"))?;
+                device
+                    .media
+                    .load(&transport_id, &session_id, &cast_media)
+                    .map_err(|e| format!("load media: {e}"))?;
 
-            // `session_reused=false` sur une piste qui n'est pas la première
-            // d'une écoute désigne le vrai coupable du carillon : la session
-            // n'a pas survécu au changement de piste.
-            //
-            // `raison` dit LAQUELLE des trois causes a imposé le `LAUNCH`, et
-            // `depuis_arret_ms` — présent seulement sur la première lecture qui
-            // suit un arrêt — dit combien de temps l'appareil est resté sans
-            // rien jouer. Ensemble, les deux tranchent le scénario de FabienM :
-            // `raison=appareil_au_repos` avec un délai de quelques secondes
-            // accuse Tune ; le même avec plusieurs minutes accuse la mise au
-            // repos autonome du récepteur.
-            let depuis_arret_ms = STOP_CLOCK
-                .take_age(&device_key, Instant::now())
-                .map(|age| age.as_millis());
-            info!(
-                device = %name,
-                url,
-                session_reused,
-                raison,
-                depuis_arret_ms = ?depuis_arret_ms,
-                "chromecast_play"
-            );
-            Ok::<(), String>(())
+                // `session_reused=false` sur une piste qui n'est pas la première
+                // d'une écoute désigne le vrai coupable du carillon : la session
+                // n'a pas survécu au changement de piste.
+                //
+                // `raison` dit LAQUELLE des trois causes a imposé le `LAUNCH`, et
+                // `depuis_arret_ms` — présent seulement sur la première lecture qui
+                // suit un arrêt — dit combien de temps l'appareil est resté sans
+                // rien jouer. Ensemble, les deux tranchent le scénario de FabienM :
+                // `raison=appareil_au_repos` avec un délai de quelques secondes
+                // accuse Tune ; le même avec plusieurs minutes accuse la mise au
+                // repos autonome du récepteur.
+                let depuis_arret_ms = STOP_CLOCK
+                    .take_age(&device_key, Instant::now())
+                    .map(|age| age.as_millis());
+                info!(
+                    device = %name,
+                    url,
+                    session_reused,
+                    raison,
+                    depuis_arret_ms = ?depuis_arret_ms,
+                    "chromecast_play"
+                );
+                Ok::<(), String>(())
+            })
         })
         .await
     }
@@ -1397,6 +1471,184 @@ mod deadline_tests {
             elapsed_ms < 1_000,
             "un refus immédiat ne doit pas être confondu avec un budget épuisé ({elapsed_ms} ms)"
         );
+    }
+
+    /// #5323 — faux récepteur LENT : il ne répond qu'au bout de `reveil`
+    /// depuis le premier contact, comme un Beosound qui sort du repos.
+    ///
+    /// Chaque tentative dispose de son budget : si l'appareil sera prêt avant
+    /// la fin, elle attend et réussit ; sinon elle consomme tout le budget et
+    /// rend l'échéance, avec le texte exact que rend la chaîne Cast.
+    struct RecepteurQuiSeReveille {
+        premier_contact: Instant,
+        reveil: Duration,
+        tentatives: AtomicUsize,
+    }
+
+    impl RecepteurQuiSeReveille {
+        fn new(reveil: Duration) -> Self {
+            Self {
+                premier_contact: Instant::now(),
+                reveil,
+                tentatives: AtomicUsize::new(0),
+            }
+        }
+
+        async fn jouer(&self, budget: Duration) -> Result<(), String> {
+            self.tentatives.fetch_add(1, Ordering::SeqCst);
+            let debut = Instant::now();
+            let pret_dans = self.reveil.saturating_sub(self.premier_contact.elapsed());
+            if pret_dans <= budget {
+                tokio::time::sleep(pret_dans).await;
+                Ok(())
+            } else {
+                tokio::time::sleep(budget).await;
+                Err(with_elapsed(
+                    "launch app: Cast command deadline elapsed".into(),
+                    debut,
+                    budget,
+                ))
+            }
+        }
+    }
+
+    /// #5323 — le scénario de FabienM : le premier `Play` épuise son budget
+    /// pendant que le récepteur se réveille, le second passe. Tune doit faire
+    /// le second tout seul au lieu d'arrêter la zone.
+    #[tokio::test]
+    async fn un_recepteur_lent_au_reveil_joue_au_reessai() {
+        let recepteur = RecepteurQuiSeReveille::new(Duration::from_millis(250));
+
+        let resultat = play_with_one_retry(
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            |budget| recepteur.jouer(budget),
+        )
+        .await;
+
+        assert_eq!(
+            resultat,
+            Ok(()),
+            "le réessai doit trouver le récepteur réveillé"
+        );
+        assert_eq!(recepteur.tentatives.load(Ordering::SeqCst), 2);
+    }
+
+    /// Jamais d'attente infinie : un récepteur qui ne se réveille pas coûte
+    /// exactement deux tentatives bornées, et l'erreur dit qu'on a réessayé.
+    #[tokio::test]
+    async fn un_recepteur_qui_ne_se_reveille_pas_coute_deux_budgets_au_plus() {
+        let recepteur = RecepteurQuiSeReveille::new(Duration::from_secs(3_600));
+        let debut = Instant::now();
+
+        let erreur = play_with_one_retry(
+            Duration::from_millis(100),
+            Duration::from_millis(150),
+            |budget| recepteur.jouer(budget),
+        )
+        .await
+        .expect_err("le récepteur ne se réveille jamais");
+
+        assert_eq!(
+            recepteur.tentatives.load(Ordering::SeqCst),
+            2,
+            "UN réessai, pas plus"
+        );
+        assert!(erreur.starts_with("retry: "), "{erreur}");
+        assert!(erreur.contains("of 150ms budget"), "{erreur}");
+        assert!(
+            debut.elapsed() < Duration::from_millis(1_000),
+            "deux budgets de 100 + 150 ms ne peuvent pas durer {:?}",
+            debut.elapsed()
+        );
+    }
+
+    /// Un refus franc n'est pas une lenteur : aucun réessai.
+    #[tokio::test]
+    async fn un_refus_franc_n_est_pas_reessaye() {
+        let tentatives = AtomicUsize::new(0);
+
+        let erreur = play_with_one_retry(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            |_| {
+                tentatives.fetch_add(1, Ordering::SeqCst);
+                async { Err("chromecast connect: Connection refused (os error 111)".to_string()) }
+            },
+        )
+        .await
+        .expect_err("refusé");
+
+        assert_eq!(tentatives.load(Ordering::SeqCst), 1);
+        assert!(!erreur.starts_with("retry: "), "{erreur}");
+    }
+
+    /// Faux pair TCP silencieux qui COMPTE les connexions reçues : c'est la
+    /// preuve, côté réseau, que `play_media` lui-même réessaie — et que les
+    /// autres commandes (poller compris) ne le font pas.
+    async fn pair_silencieux_qui_compte() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connexions = Arc::new(AtomicUsize::new(0));
+        let compteur = Arc::clone(&connexions);
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                compteur.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut bytes = [0u8; 1024];
+                    while socket.read(&mut bytes).await.unwrap_or(0) != 0 {}
+                });
+            }
+        });
+        (port, connexions, task)
+    }
+
+    #[tokio::test]
+    async fn la_lecture_reessaie_une_fois_sur_un_appareil_muet_et_le_sondage_jamais() {
+        let (port, connexions, server) = pair_silencieux_qui_compte().await;
+        let output = test_output(
+            port,
+            Duration::from_millis(150),
+            Arc::new(Semaphore::new(MAX_CAST_COMMAND_WORKERS)),
+        );
+
+        let debut = Instant::now();
+        let erreur = output
+            .play_url(
+                "http://127.0.0.1/audio.flac",
+                "audio/flac",
+                Some("Temoin"),
+                None,
+            )
+            .await
+            .expect_err("le pair se tait");
+        let duree = debut.elapsed();
+
+        assert_eq!(
+            connexions.load(Ordering::SeqCst),
+            2,
+            "la lecture doit tenter UNE seconde connexion après l'échéance : {erreur}"
+        );
+        assert!(erreur.starts_with("retry: "), "{erreur}");
+        assert!(duree < Duration::from_secs(2), "réessai borné : {duree:?}");
+
+        output.get_status().await.expect_err("le pair se tait");
+        assert_eq!(
+            connexions.load(Ordering::SeqCst),
+            3,
+            "le sondage garde une seule tentative : le poller est séquentiel"
+        );
+        server.abort();
+    }
+
+    /// Le budget de production reste borné par ce que le poller accorde déjà
+    /// à une zone (5 s) : un premier `Play` lent ne doit pas l'immobiliser
+    /// plus longtemps qu'un appareil mort.
+    #[test]
+    fn le_pire_cas_de_la_lecture_tient_dans_le_delai_du_poller() {
+        let output = ChromecastOutput::new("c".into(), "c".into(), "127.0.0.1".into(), 8009);
+        assert!(output.play_retry_timeout > output.command_timeout);
+        assert!(output.command_timeout + output.play_retry_timeout <= Duration::from_secs(5));
     }
 }
 
