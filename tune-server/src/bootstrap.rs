@@ -324,6 +324,18 @@ pub async fn run_with(opts: RunOptions) {
 
     crate::boot_status::set_phase("configuration");
     state.restore_tokens().await;
+    // #5427 — anciennes copies de l'ARL, et `TUNE_DEEZER_ARL`. En tâche de
+    // fond : l'essai interroge Deezer, il ne doit pas retenir le démarrage.
+    {
+        let state = state.clone();
+        // Lue ici, dans l'environnement : le champ `deezer_arl` de
+        // `tune-core/src/config.rs` appartient à une configuration que rien
+        // ne construit, et l'ARL n'a rien à faire dans `tune.toml`.
+        let arl_env = std::env::var("TUNE_DEEZER_ARL").ok();
+        tokio::spawn(async move {
+            crate::routes::service_tokens::amorcer_arl_deezer(&state, arl_env.as_deref()).await;
+        });
+    }
 
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
