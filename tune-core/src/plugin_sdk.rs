@@ -481,9 +481,9 @@ pub const PLUGIN_SETUP_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
 pub enum PluginSetupErrorReason {
     /// `setup()` a dépassé [`PLUGIN_SETUP_TIMEOUT`] : « démarrage trop long ».
     SetupTimeout,
-    /// `setup()` a rendu une erreur lors d'un nouvel essai
-    /// ([`PluginLoader::retry_setup`]). Au démarrage, un greffon en échec
-    /// reste écarté sans trace dans le gestionnaire, comme avant.
+    /// `setup()` a rendu une erreur, au démarrage ou lors d'un nouvel essai
+    /// ([`PluginLoader::retry_setup`]). Le message du greffon suit, passé par
+    /// [`public_setup_message`].
     SetupFailed,
 }
 
@@ -516,7 +516,8 @@ pub struct PluginSetupError {
     pub duration_ms: u64,
     /// La borne appliquée à cet essai.
     pub timeout_ms: u64,
-    /// Le message d'un `setup()` en échec ; absent pour une coupure.
+    /// Le message d'un `setup()` en échec, tronqué et expurgé
+    /// ([`public_setup_message`]) ; absent pour une coupure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -755,9 +756,16 @@ impl PluginLoader {
                     }
                     loaded.push(name);
                 }
-                // Un échec reste écarté sans trace dans le gestionnaire,
-                // comme avant #5403.
-                SetupRun::Failed(..) => {}
+                // #5403 (décision du 29/09) — un échec reste visible lui aussi,
+                // avec le message du greffon, et se réessaie.
+                SetupRun::Failed(message, duration_ms) => {
+                    errors.push(self.setup_error(
+                        &**plugin,
+                        PluginSetupErrorReason::SetupFailed,
+                        duration_ms,
+                        Some(message),
+                    ));
+                }
                 SetupRun::TimedOut(duration_ms) => {
                     errors.push(self.setup_error(
                         &**plugin,
@@ -774,8 +782,9 @@ impl PluginLoader {
         // receiving every event via on_event on half-built state — the very
         // hazard setup registrations are dropped for (review #907).
         //
-        // #5403 — un greffon COUPÉ à la borne quitte lui aussi le jeu résident
-        // (même danger), mais il n'est pas détruit : il attend un nouvel essai.
+        // #5403 — un greffon COUPÉ à la borne, ou dont le `setup()` a échoué,
+        // quitte le jeu résident (même danger), mais il n'est pas détruit : il
+        // attend un nouvel essai.
         let mut parked = Vec::new();
         for plugin in std::mem::take(&mut *plugins) {
             if loaded.iter().any(|n| n == plugin.name()) {
@@ -902,7 +911,7 @@ impl PluginLoader {
             reason,
             duration_ms,
             timeout_ms: self.setup_timeout.as_millis() as u64,
-            message,
+            message: message.map(|m| public_setup_message(&m)),
         }
     }
 
@@ -1101,6 +1110,46 @@ impl PluginLoader {
             .iter()
             .map(|p| p.name().to_string())
             .collect()
+    }
+}
+
+/// Longueur maximale, en caractères, du message d'échec publié (#5403).
+pub const PLUGIN_SETUP_MESSAGE_MAX_CHARS: usize = 200;
+
+/// Le message d'un `setup()` en échec, tel que le gestionnaire peut le montrer
+/// (#5403).
+///
+/// Le texte vient du greffon et part vers l'écran de quiconque ouvre le
+/// gestionnaire : il ne doit porter ni secret ni pavé. Sont remplacés par
+/// `***` les identifiants d'une URL (`scheme://user:pass@`) et la valeur qui
+/// suit un mot-clé sensible (`token`, `password`, `secret`, `api_key`,
+/// `authorization`, `bearer`…). Les retours à la ligne et les contrôles
+/// deviennent des espaces, puis le tout est coupé à
+/// [`PLUGIN_SETUP_MESSAGE_MAX_CHARS`] caractères.
+pub fn public_setup_message(raw: &str) -> String {
+    use std::sync::LazyLock;
+    static URL_CREDENTIALS: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@").unwrap());
+    static SENSITIVE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)(access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|authorization|bearer|cookie)(\s*[=:]\s*|\s+)((?:(?:bearer|basic)\s+)?(?:"[^"]*"|'[^']*'|[^\s,;&]+))"#,
+        )
+        .unwrap()
+    });
+
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = URL_CREDENTIALS.replace_all(&flat, "${1}***@");
+    let flat = SENSITIVE.replace_all(&flat, "${1}${2}***");
+    if flat.chars().count() > PLUGIN_SETUP_MESSAGE_MAX_CHARS {
+        let mut cut: String = flat.chars().take(PLUGIN_SETUP_MESSAGE_MAX_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        flat.into_owned()
     }
 }
 
@@ -1360,8 +1409,8 @@ mod tests {
         let r = rapport(&loader);
         assert_eq!(
             r.errors.len(),
-            1,
-            "le greffon coupé doit rester visible, et lui seul (un échec reste écarté) : {:?}",
+            2,
+            "le greffon coupé ET le greffon en échec doivent rester visibles : {:?}",
             r.errors
         );
         let e = &r.errors[0];
@@ -1376,6 +1425,116 @@ mod tests {
         );
         assert!(e.message.is_none());
         assert!(r.loaded_after_retry.is_empty());
+    }
+
+    /// Échoue à ses `echecs` premiers `setup()`, avec un secret dans le
+    /// message, puis charge.
+    struct EchoueNFois {
+        essais: Arc<std::sync::atomic::AtomicUsize>,
+        echecs: usize,
+    }
+
+    #[async_trait]
+    impl TunePlugin for EchoueNFois {
+        fn name(&self) -> &str {
+            "echoue"
+        }
+        fn version(&self) -> &str {
+            "0.3.0"
+        }
+        fn description(&self) -> &str {
+            "Fails, then loads"
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            let n = self
+                .essais
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.echecs {
+                return Err(format!(
+                    "appareil injoignable\nhttp://admin:hunter2@192.168.1.9/api token=abc123 {}",
+                    "x".repeat(400)
+                ));
+            }
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// #5403 (décision du 29/09) — un `setup()` qui ÉCHOUE au démarrage reste
+    /// visible lui aussi : `setup_failed`, avec le message du greffon, tronqué
+    /// et sans secret. Réessayer le recharge.
+    #[tokio::test]
+    async fn un_greffon_en_echec_reste_visible_et_se_reessaie_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let essais = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader
+            .register(Box::new(EchoueNFois {
+                essais: Arc::clone(&essais),
+                echecs: 1,
+            }))
+            .await;
+
+        assert!(loader.setup_all("http://localhost:8888").await.is_empty());
+        assert_eq!(
+            loader.plugin_count().await,
+            0,
+            "pas résident après un échec"
+        );
+        let r = rapport(&loader);
+        assert_eq!(
+            r.errors.len(),
+            1,
+            "l'échec doit rester visible : {:?}",
+            r.errors
+        );
+        let e = &r.errors[0];
+        assert_eq!(e.name, "echoue");
+        assert_eq!(e.reason, PluginSetupErrorReason::SetupFailed);
+        assert_eq!(e.reason.as_str(), "setup_failed");
+        let m = e.message.as_deref().expect("le message du greffon");
+        assert!(m.starts_with("appareil injoignable http://"), "{m}");
+        assert!(
+            !m.contains("hunter2") && !m.contains("abc123"),
+            "secret publié : {m}"
+        );
+        assert!(
+            m.chars().count() <= PLUGIN_SETUP_MESSAGE_MAX_CHARS + 1,
+            "tronqué : {} caractères",
+            m.chars().count()
+        );
+
+        assert!(matches!(
+            loader.retry_setup("echoue").await,
+            PluginRetryOutcome::Loaded { .. }
+        ));
+        assert_eq!(loader.plugin_count().await, 1);
+        assert!(rapport(&loader).errors.is_empty());
+    }
+
+    #[test]
+    fn le_message_publie_est_expurge_et_borne_5403() {
+        assert_eq!(public_setup_message("ok\n  court"), "ok court");
+        assert_eq!(
+            public_setup_message("GET https://u:p4ss@h.example/x refusé"),
+            "GET https://***@h.example/x refusé"
+        );
+        for (brut, secret) in [
+            ("password=s3cr3t", "s3cr3t"),
+            ("api_key: \"k-123\"", "k-123"),
+            ("Authorization: Bearer eyJhbGciOi", "eyJhbGciOi"),
+            ("my_token=zz9", "zz9"),
+            ("client_secret 'qq'", "qq"),
+        ] {
+            let m = public_setup_message(brut);
+            assert!(!m.contains(secret), "{brut} → {m}");
+            assert!(m.contains("***"), "{brut} → {m}");
+        }
+        let long = public_setup_message(&"é".repeat(500));
+        assert_eq!(long.chars().count(), PLUGIN_SETUP_MESSAGE_MAX_CHARS + 1);
+        assert!(long.ends_with('…'));
     }
 
     /// #5403 — Réessayer relance le `setup()` sous la même borne : le greffon

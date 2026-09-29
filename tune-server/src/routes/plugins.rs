@@ -366,9 +366,11 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         plugins.push(card);
     }
 
-    // #5403 — les greffons compilés dont le `setup()` a dépassé la borne. Ils
-    // ne tournent pas, mais ils ne disparaissent plus : statut « error », motif
-    // `setup_timeout` (« démarrage trop long »), durée, et la route Réessayer.
+    // #5403 — les greffons compilés dont le `setup()` a dépassé la borne ou
+    // a échoué. Ils ne tournent pas, mais ils ne disparaissent plus : statut
+    // « error », motif `setup_timeout` (« démarrage trop long ») ou
+    // `setup_failed` (avec le message expurgé du greffon), durée, et la route
+    // Réessayer.
     for error in &report.errors {
         plugins.push(carte_en_erreur(&settings, error));
     }
