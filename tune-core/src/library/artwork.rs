@@ -119,7 +119,19 @@ pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    match lofty::read_from_path(&*extended_path(audio_path)) {
+    // #5299 — une piste rangée dans une image ISO se lit par son lecteur
+    // interne ; tout autre chemin garde `read_from_path`.
+    let lu = match crate::audio::iso9660::ouvrir_si_virtuel(audio_path) {
+        Some(lecteur) => lecteur
+            .map_err(lofty::error::LoftyError::from)
+            .and_then(|l| {
+                lofty::probe::Probe::new(std::io::BufReader::new(l))
+                    .guess_file_type()?
+                    .read()
+            }),
+        None => lofty::read_from_path(&*extended_path(audio_path)),
+    };
+    match lu {
         Ok(tagged) => {
             if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag())
                 && let Some(pic) = tag.pictures().first()
@@ -221,7 +233,21 @@ pub fn empreinte_jaquette_flac(chemin: &Path) -> Option<EmpreinteJaquette> {
     }
 }
 
+/// Les octets d'une image de pochette trouvée par [`find_folder_cover`] :
+/// lue dans l'image ISO quand son chemin est virtuel (#5299), sur le disque
+/// sinon.
+pub fn lire_l_image(chemin: &Path) -> std::io::Result<Vec<u8>> {
+    crate::audio::iso9660::lire_si_virtuel(chemin)
+        .unwrap_or_else(|| std::fs::read(&*extended_path(chemin)))
+}
+
 pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
+    // #5299 — une piste rangée dans une image ISO : la pochette de son dossier
+    // DANS l'image (chemin virtuel), sinon celle posée à côté de l'image.
+    if let Some((image, _)) = crate::audio::iso9660::decouper(&audio_path.to_string_lossy()) {
+        return crate::audio::iso9660::chemin_de_pochette(audio_path)
+            .or_else(|| find_folder_cover(&image));
+    }
     let dir = audio_path.parent()?;
     for name in FOLDER_COVER_NAMES {
         let candidate = dir.join(name);
@@ -2260,7 +2286,7 @@ pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> 
     if find_cached(cache_dir, &legacy).is_some() {
         return Some(legacy);
     }
-    let data = std::fs::read(&*extended_path(&folder_cover)).ok()?;
+    let data = lire_l_image(&folder_cover).ok()?;
     // Nouvelle écriture : adressée par le CONTENU (#1444). La même `cover.jpg`
     // recopiée dans N dossiers d'artiste (compilation éclatée façon Qobuz,
     // #1440) ne peuple plus le cache que d'UNE entrée.
@@ -2383,7 +2409,7 @@ pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String>
     // dossier dupliquait la même pochette dans le cache. Le condensat de
     // contenu les fait toutes converger vers une seule entrée.
     if let Some(folder_cover) = find_folder_cover(audio_path) {
-        match std::fs::read(&*extended_path(&folder_cover)) {
+        match lire_l_image(&folder_cover) {
             Ok(data) => {
                 let hash = content_hash(&data);
                 if find_cached(cache_dir, &hash).is_some() {

@@ -339,6 +339,84 @@ pub(crate) fn genres_de_l_album(
         .collect()
 }
 
+/// Les albums ÉCOUTÉS et le NOMBRE d'écoutes de chacun — v0.9.168.
+///
+/// 🔴 Même jointure que `ALBUMS_ECOUTES` de `dashboard.rs`, à UNE différence
+/// qui est tout le sujet : celle-là fait `SELECT DISTINCT` et perd donc les
+/// répétitions, parce qu'elle ne répond qu'à « combien de genres distincts ».
+/// On ne peut pas en tirer un classement par volume : deux albums de mêmes
+/// colonnes de genre y tiennent une seule ligne, et cent écoutes d'un album y
+/// pèsent autant qu'une. Ici on veut le VOLUME — donc `GROUP BY` sur les deux
+/// colonnes de genre avec son `COUNT(*)`, une écoute de plus doit peser.
+///
+/// Grouper sur les colonnes de genre plutôt que sur `al.id` suffit — seul le
+/// couple (genre, genres) sert ensuite — et remonte d'autant moins de lignes.
+/// `TEXT` sous SQLite comme sous PostgreSQL : le `GROUP BY` est portable,
+/// comme l'était le `DISTINCT`.
+///
+/// Comme pour `unique_genres`, une écoute de service (Qobuz…) sans album local
+/// n'a pas de genre connu et ne compte pas — limite assumée, dite dans #4527.
+const ECOUTES_PAR_GENRES_D_ALBUM: &str = "SELECT al.genre, al.genres, COUNT(*) \
+     FROM listen_history lh \
+     LEFT JOIN tracks t ON t.id = lh.track_id \
+     JOIN albums al ON al.id = COALESCE(lh.album_id, t.album_id) \
+     WHERE (al.genre IS NOT NULL AND al.genre != '') \
+        OR (al.genres IS NOT NULL AND al.genres != '') \
+     GROUP BY al.genre, al.genres";
+
+/// Le cumul des écoutes PAR CLÉ de genre.
+///
+/// 🔴 Un album porte souvent PLUSIEURS genres, et ses écoutes comptent pour
+/// CHACUN d'eux : dix écoutes d'un album « Jazz ; Blues » font dix écoutes de
+/// Jazz ET dix de Blues. On ne divise pas — la question posée par le panneau
+/// est « ce genre, l'écoutes-tu ? », pas « quelle part de ton temps ».
+///
+/// Le découpage passe par `genres_de_l_album`, la seule définition du genre :
+/// le classement se range donc exactement sur les mêmes clés que les pastilles
+/// qu'il ordonne, et sur celles que compte `unique_genres`.
+///
+/// Fonction pure, sans base : c'est elle que gardent les témoins.
+fn cumul_des_ecoutes(
+    lignes: &[(Option<String>, Option<String>, i64)],
+) -> std::collections::HashMap<String, i64> {
+    let mut par_cle: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (genre, genres, ecoutes) in lignes {
+        for (cle, _) in genres_de_l_album(genre.as_deref(), genres.as_deref()) {
+            *par_cle.entry(cle).or_insert(0) += *ecoutes;
+        }
+    }
+    par_cle
+}
+
+/// Les écoutes par clé de genre, ou `None` si la requête échoue.
+///
+/// `None` et non une carte vide : le champ `plays` est alors ABSENT de la
+/// réponse, au lieu de valoir 0 partout. Même doctrine que `unique_genres`
+/// (#4527) — sauf qu'ici l'absence porte en plus une consigne d'affichage :
+/// l'écran, ne voyant aucune écoute, retombe sur l'ordre de la bibliothèque
+/// plutôt que de montrer un panneau vide. Un `plays: 0` généralisé
+/// produirait le même écran, mais en AFFIRMANT que rien n'a été écouté.
+fn ecoutes_par_cle(state: &AppState) -> Option<std::collections::HashMap<String, i64>> {
+    let lignes = match state.backend.query_many(ECOUTES_PAR_GENRES_D_ALBUM, &[]) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "library_genres_ecoutes_error");
+            return None;
+        }
+    };
+    let tuples: Vec<(Option<String>, Option<String>, i64)> = lignes
+        .iter()
+        .map(|row| {
+            (
+                row.first().and_then(|v| v.as_string()),
+                row.get(1).and_then(|v| v.as_string()),
+                row.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            )
+        })
+        .collect();
+    Some(cumul_des_ecoutes(&tuples))
+}
+
 pub(super) async fn list_genres(
     State(state): State<AppState>,
     Query(params): Query<GenreQuery>,
@@ -373,12 +451,26 @@ pub(super) async fn list_genres(
         }
     }
 
+    // Le VOLUME D'ÉCOUTE de chaque genre — v0.9.168, décision de Bertrand du
+    // 27/09/2026. Le panneau « Genres » de la première ligne de l'accueil
+    // triait sur `count`, c'est-à-dire sur ce que l'utilisateur POSSÈDE : d'où
+    // Pop-Rock en tête d'une bibliothèque qui en est pleine, quoi qu'on
+    // écoute. Il doit trier sur ce qu'on ÉCOUTE.
+    //
+    // 🔴 Le classement est servi ICI, dans la réponse que le panneau appelle
+    // DÉJÀ, et non à côté de `unique_genres` dans `/dashboard/stats` : la
+    // première ligne se peint au démarrage, une requête de plus s'y verrait.
+    // Et le repli « aucune écoute → ordre de la bibliothèque » a besoin des
+    // DEUX chiffres dans la même main : les servir séparément obligerait
+    // l'écran à attendre deux réponses pour savoir laquelle il doit croire.
+    let ecoutes = ecoutes_par_cle(&state);
+
     // Filter by query parameter (case-insensitive LIKE match)
     let filter = params.query.map(|q| q.to_lowercase());
 
     let items: Vec<Value> = groups
-        .values()
-        .filter_map(|variants| {
+        .iter()
+        .filter_map(|(cle, variants)| {
             let count: i64 = variants.values().sum();
             // Display label = the most common spelling; ties broken by the
             // lexicographically smallest for a stable, deterministic label.
@@ -386,10 +478,19 @@ pub(super) async fn list_genres(
                 .iter()
                 .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then_with(|| bn.cmp(an)))
                 .map(|(name, _)| name.clone())?;
-            match &filter {
-                Some(q) if !name.to_lowercase().contains(q) => None,
-                _ => Some(json!({ "name": name, "count": count })),
+            if let Some(q) = &filter
+                && !name.to_lowercase().contains(q)
+            {
+                return None;
             }
+            let mut item = json!({ "name": name, "count": count });
+            // `plays` est ABSENT si la requête d'écoutes a échoué, et vaut 0
+            // pour un genre possédé mais jamais écouté. Les deux se lisent
+            // différemment côté écran : voir `ecoutes_par_cle`.
+            if let Some(par_cle) = &ecoutes {
+                item["plays"] = json!(par_cle.get(cle).copied().unwrap_or(0));
+            }
+            Some(item)
         })
         .collect();
 
@@ -535,6 +636,277 @@ mod genres_de_l_album_4527 {
             trip["count"],
             json!(2),
             "les deux graphies doivent se fondre en UNE carte de 2 albums"
+        );
+    }
+}
+
+/// 🔴 LE CLASSEMENT PAR VOLUME D'ÉCOUTE — v0.9.168, décision de Bertrand du
+/// 27/09/2026.
+///
+/// Le panneau « Genres » de la première ligne de l'accueil triait sur `count`,
+/// le nombre d'albums EN BIBLIOTHÈQUE. Pop-Rock y arrivait donc en tête d'une
+/// collection qui en est pleine, même si son propriétaire n'écoute que du
+/// jazz. `plays` porte désormais ce qu'il ÉCOUTE, et l'écran s'y range.
+///
+/// Ces témoins gardent les trois choses qui peuvent silencieusement se perdre :
+/// que le classement suit bien le volume et non la taille de la bibliothèque,
+/// qu'un album à plusieurs genres compte pour CHACUN, et que `unique_genres`
+/// — servi par `/dashboard/stats`, voisin de ce panneau sur le même écran —
+/// garde exactement la valeur qu'il avait.
+#[cfg(test)]
+mod classement_par_ecoutes_168 {
+    use super::*;
+    use tune_core::metadata::genre_key;
+
+    /// La forme que rend `ECOUTES_PAR_GENRES_D_ALBUM` : (genre, genres, n).
+    fn lignes(
+        brut: &[(Option<&str>, Option<&str>, i64)],
+    ) -> Vec<(Option<String>, Option<String>, i64)> {
+        brut.iter()
+            .map(|(g, gs, n)| (g.map(str::to_string), gs.map(str::to_string), *n))
+            .collect()
+    }
+
+    /// Le classement décroissant, tel que l'écran le lira.
+    fn classement(par_cle: &std::collections::HashMap<String, i64>) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = par_cle.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// 🔴 Dix écoutes passent devant deux. C'est tout le chantier.
+    #[test]
+    fn un_genre_ecoute_dix_fois_passe_devant_un_ecoute_deux_fois() {
+        let par_cle = cumul_des_ecoutes(&lignes(&[
+            (Some("Blues"), None, 2),
+            (Some("Jazz"), None, 10),
+        ]));
+        assert_eq!(par_cle.get(&genre_key("Jazz")).copied(), Some(10));
+        assert_eq!(par_cle.get(&genre_key("Blues")).copied(), Some(2));
+        let rangs = classement(&par_cle);
+        assert_eq!(
+            rangs.first().map(|(k, n)| (k.as_str(), *n)),
+            Some((genre_key("Jazz").as_str(), 10)),
+            "le plus écouté doit être en tête : {rangs:?}"
+        );
+    }
+
+    /// 🔴 Plusieurs lignes d'un même genre S'ADDITIONNENT. Le `GROUP BY` porte
+    /// sur les colonnes de genre, pas sur la clé canonique : « Trip Hop » et
+    /// « Trip-Hop » arrivent en DEUX lignes et doivent se cumuler en une seule
+    /// pastille, sinon la pastille affichée ne pèse que la moitié de ce qu'on
+    /// écoute et rate son rang.
+    #[test]
+    fn deux_graphies_du_meme_genre_cumulent_leurs_ecoutes() {
+        let par_cle = cumul_des_ecoutes(&lignes(&[
+            (Some("Trip Hop"), None, 4),
+            (Some("Trip-Hop"), None, 3),
+            (Some("Jazz"), None, 5),
+        ]));
+        assert_eq!(par_cle.get(&genre_key("Trip Hop")).copied(), Some(7));
+        let rangs = classement(&par_cle);
+        assert_eq!(
+            rangs.first().map(|(k, _)| k.clone()),
+            Some(genre_key("Trip Hop")),
+            "4 + 3 = 7 doit passer devant 5 : {rangs:?}"
+        );
+    }
+
+    /// 🔴 Un album à PLUSIEURS genres compte pour CHACUN d'eux, sans division.
+    #[test]
+    fn un_album_a_plusieurs_genres_compte_pour_chacun() {
+        // Colonne héritée découpée…
+        let par_cle = cumul_des_ecoutes(&lignes(&[(Some("Jazz; Blues"), None, 10)]));
+        assert_eq!(par_cle.get(&genre_key("Jazz")).copied(), Some(10));
+        assert_eq!(par_cle.get(&genre_key("Blues")).copied(), Some(10));
+        // …et tableau JSON, qui prime sur elle.
+        let par_cle = cumul_des_ecoutes(&lignes(&[(
+            Some("Ignoré"),
+            Some(r#"["Rock","Pop","Folk"]"#),
+            6,
+        )]));
+        assert_eq!(par_cle.get(&genre_key("Rock")).copied(), Some(6));
+        assert_eq!(par_cle.get(&genre_key("Pop")).copied(), Some(6));
+        assert_eq!(par_cle.get(&genre_key("Folk")).copied(), Some(6));
+        assert_eq!(par_cle.get(&genre_key("Ignoré")).copied(), None);
+    }
+
+    /// 🔴 `unique_genres` ne change pas de valeur.
+    ///
+    /// `/dashboard/stats` compte les genres écoutés en versant les clés dans un
+    /// `HashSet` et en rendant son `len()`. Ce chantier n'a pas touché
+    /// `dashboard.rs` — mais il ne suffit pas de le dire : ce témoin rejoue
+    /// l'algorithme du tableau de bord sur les mêmes lignes et exige que
+    /// l'ENSEMBLE DES CLÉS du nouveau compteur soit exactement le même. Un
+    /// compteur qui se mettrait à retenir une clé de plus (ou une de moins)
+    /// déplacerait le chiffre « N genres écoutés » affiché juste à côté.
+    #[test]
+    fn le_compteur_garde_le_meme_jeu_de_cles_que_unique_genres() {
+        let brut = &[
+            (Some("Jazz; Blues"), None, 10),
+            (Some("Pop-Rock"), None, 1),
+            (Some("Ignoré"), Some(r#"["Rock","Pop"]"#), 3),
+            (Some("Trip Hop"), None, 4),
+            (Some("Trip-Hop"), None, 2),
+            (None, None, 7),
+        ];
+        // L'algorithme de `dashboard::genres_ecoutes` — un ensemble, pas un
+        // compteur : les écoutes n'y entrent pas.
+        let mut cles: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (genre, genres, _) in brut {
+            for (cle, _) in genres_de_l_album(*genre, *genres) {
+                cles.insert(cle);
+            }
+        }
+        let par_cle = cumul_des_ecoutes(&lignes(brut));
+        let nouvelles: std::collections::HashSet<String> = par_cle.keys().cloned().collect();
+        assert_eq!(
+            nouvelles, cles,
+            "le compteur doit porter EXACTEMENT les clés que compte unique_genres"
+        );
+        assert_eq!(
+            par_cle.len(),
+            cles.len(),
+            "unique_genres = {} genres écoutés, et ce chiffre ne bouge pas",
+            cles.len()
+        );
+    }
+
+    /// 🔴 LA ROUTE : `plays` arrive vraiment dans le JSON, et il DÉSACCORDE
+    /// `count` — c'est à cela qu'on voit qu'il ne le recopie pas.
+    ///
+    /// Les données sont choisies pour que les deux ordres se contredisent :
+    /// Pop-Rock est le genre le plus POSSÉDÉ (3 albums) et presque pas écouté
+    /// (1 écoute) ; Jazz n'a qu'un album et dix écoutes. Un tri par `count`
+    /// mettrait Pop-Rock en tête, un tri par `plays` met Jazz. Le témoin exige
+    /// les deux affirmations à la fois.
+    #[tokio::test]
+    async fn la_route_sert_les_ecoutes_et_elles_contredisent_la_taille() {
+        use tune_core::db::artist_repo::ArtistRepo;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let ar = ArtistRepo::with_backend(state.backend.clone())
+            .get_or_create("Artiste", None, None)
+            .unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for (titre, genre) in [
+            ("PR1", "Pop-Rock"),
+            ("PR2", "Pop-Rock"),
+            ("PR3", "Pop-Rock"),
+            ("JB", "Jazz; Blues"),
+            ("CL", "Classique"),
+        ] {
+            let id = AlbumRepo::with_backend(state.backend.clone())
+                .get_or_create(titre, ar.id.unwrap(), None)
+                .unwrap()
+                .id
+                .unwrap();
+            state
+                .backend
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[&genre.to_string(), &id],
+                )
+                .unwrap();
+            ids.insert(titre, id);
+        }
+        // Dix écoutes de l'album « Jazz ; Blues », par `listen_history.album_id`.
+        for i in 0..10 {
+            state
+                .backend
+                .execute(
+                    "INSERT INTO listen_history (title, album_id, listened_at) VALUES (?, ?, ?)",
+                    &[
+                        &format!("piste {i}"),
+                        &ids["JB"],
+                        &"2026-09-27T10:00:00Z".to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+        // UNE écoute d'un album Pop-Rock, par la PISTE : l'album se retrouve
+        // par `COALESCE(lh.album_id, t.album_id)`, l'autre branche de la
+        // jointure. Sans elle, une écoute sur deux ne compterait pour rien.
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms) \
+                 VALUES (901, 'une piste pop', ?, ?, '/music/pr.flac', 200000)",
+                &[&ids["PR1"], &ar.id.unwrap()],
+            )
+            .unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, track_id, listened_at) \
+                 VALUES ('une piste pop', 901, '2026-09-27T11:00:00Z')",
+                &[],
+            )
+            .unwrap();
+
+        // `AppError` n'implémente pas `Debug` : pas de `.unwrap()` ici.
+        let Ok(Json(v)) = list_genres(State(state), Query(GenreQuery { query: None })).await else {
+            panic!("GET /library/genres a échoué");
+        };
+        let rangs = v.as_array().expect("une liste").clone();
+        let par_nom = |nom: &str| -> (i64, i64) {
+            let item = rangs
+                .iter()
+                .find(|r| r["name"].as_str() == Some(nom))
+                .unwrap_or_else(|| panic!("le genre {nom} a disparu de {v}"));
+            (
+                item["count"].as_i64().unwrap_or(-1),
+                item["plays"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("`plays` absent pour {nom} dans {v}")),
+            )
+        };
+
+        // Un album à deux genres : ses dix écoutes comptent pour CHACUN.
+        assert_eq!(par_nom("Jazz"), (1, 10), "Jazz : 1 album, 10 écoutes");
+        assert_eq!(par_nom("Blues"), (1, 10), "Blues : le même album, idem");
+        // Le plus POSSÉDÉ est presque pas écouté.
+        assert_eq!(
+            par_nom("Pop-Rock"),
+            (3, 1),
+            "Pop-Rock : 3 albums en rayon, 1 seule écoute"
+        );
+        // Possédé, jamais écouté : `plays` vaut 0, et non « absent ».
+        assert_eq!(
+            par_nom("Classique"),
+            (1, 0),
+            "Classique : en rayon, jamais écouté"
+        );
+
+        // 🔴 Les deux ordres se contredisent, et c'est le volume qui gagne.
+        let par_ecoutes = |a: &Value, b: &Value| {
+            b["plays"]
+                .as_i64()
+                .unwrap_or(0)
+                .cmp(&a["plays"].as_i64().unwrap_or(0))
+        };
+        let mut sur_ecoutes = rangs.clone();
+        sur_ecoutes.sort_by(par_ecoutes);
+        assert_eq!(
+            sur_ecoutes.first().map(|r| r["plays"].as_i64()),
+            Some(Some(10)),
+            "le tri par écoutes doit commencer par les 10 écoutes : {sur_ecoutes:?}"
+        );
+        let mut sur_taille = rangs.clone();
+        sur_taille.sort_by(|a, b| {
+            b["count"]
+                .as_i64()
+                .unwrap_or(0)
+                .cmp(&a["count"].as_i64().unwrap_or(0))
+        });
+        assert_eq!(
+            sur_taille.first().map(|r| r["name"].as_str()),
+            Some(Some("Pop-Rock")),
+            "le tri par taille de bibliothèque, lui, mettrait Pop-Rock en tête"
+        );
+        assert_ne!(
+            sur_taille.first().map(|r| r["name"].clone()),
+            sur_ecoutes.first().map(|r| r["name"].clone()),
+            "si les deux ordres coïncidaient, ce témoin ne prouverait rien"
         );
     }
 }

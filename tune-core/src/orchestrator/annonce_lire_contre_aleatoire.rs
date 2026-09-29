@@ -133,6 +133,37 @@ fn ligne_16_bits(
     pistes.create(&piste).unwrap()
 }
 
+#[tokio::test]
+async fn lecture_annonce_les_canaux_source_avant_repli_5336() {
+    let orch = orchestrateur_de_test();
+    let pistes = TrackRepo::with_backend(orch.db.clone());
+    let mut piste = Track::new("DSD 5.1".into());
+    piste.channels = 6;
+    piste.format = Some("dsf".into());
+    let id = pistes.create(&piste).unwrap();
+    let resolu = flux_local_resolu(Some(44100), Some(24));
+    let habillage = Habillage {
+        album: None,
+        cover_path: None,
+    };
+    let np = orch.composer_le_now_playing(&demande_lire(id), &resolu, &habillage);
+    assert_eq!(
+        serde_json::to_value(np).unwrap()["channels"],
+        6,
+        "#5336 : un fichier 5.1 reste annoncé à six canaux après repli stéréo"
+    );
+    let sans = PlayRequest {
+        track_id: None,
+        ..demande_lire(id)
+    };
+    assert_eq!(
+        orch.composer_le_now_playing(&sans, &resolu, &habillage)
+            .channels,
+        None,
+        "la sortie seule ne renseigne pas les canaux source"
+    );
+}
+
 /// Une ligne qui SAIT : 44,1 kHz / 16 bits, sortie transcodée en 24 bits.
 /// Les deux chemins doivent annoncer 16, pas 24.
 #[tokio::test]
