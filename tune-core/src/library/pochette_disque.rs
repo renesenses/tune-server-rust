@@ -58,11 +58,26 @@ pub enum Geste {
     Retirer,
 }
 
+/// Le fichier existe-t-il ? Un chemin rangé dans une image ISO (#5299) n'a
+/// pas d'`exists()` : il existe si l'image le contient.
+fn existe(fichier: &Path) -> bool {
+    if crate::audio::iso9660::est_chemin_virtuel(&fichier.to_string_lossy()) {
+        return crate::audio::iso9660::taille_et_mtime(fichier).is_some();
+    }
+    extended_path(fichier).exists()
+}
+
 /// « mtime:taille » d'un fichier, `None` s'il n'existe plus.
 ///
 /// Secondes entières : SMB et FAT ne portent pas mieux, et deux lectures du
 /// même fichier doivent rendre la même empreinte.
 pub fn empreinte_du_fichier(fichier: &Path) -> Option<String> {
+    // #5299 — une pochette ou une piste rangée dans une image ISO : sa taille
+    // propre, la date de l'image.
+    if crate::audio::iso9660::est_chemin_virtuel(&fichier.to_string_lossy()) {
+        let (taille, mtime) = crate::audio::iso9660::taille_et_mtime(fichier)?;
+        return Some(format!("{}:{taille}", mtime as u64));
+    }
     let meta = std::fs::metadata(&*extended_path(fichier)).ok()?;
     let mtime = meta
         .modified()
@@ -115,7 +130,7 @@ pub fn lire_la_jaquette(
 /// L'image du DOSSIER d'une piste (`cover.jpg`, `folder.jpg`…).
 pub fn lire_l_image_du_dossier(piste: &Path, cache_dir: &Path) -> Option<PochetteLue> {
     let image = find_folder_cover(piste)?;
-    let data = match std::fs::read(&*extended_path(&image)) {
+    let data = match crate::library::artwork::lire_l_image(&image) {
         Ok(d) => d,
         Err(e) => {
             debug!(path = %image.display(), error = %e, "pochette_dossier_illisible");
@@ -197,7 +212,7 @@ fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<
 pub fn lire_depuis_l_album(pistes: &[PathBuf], cache_dir: &Path) -> Option<PochetteLue> {
     pistes
         .iter()
-        .filter(|p| extended_path(p).exists())
+        .filter(|p| existe(p))
         .find_map(|p| lire_la_jaquette(p, cache_dir, None))
         .or_else(|| {
             pistes
@@ -492,7 +507,7 @@ fn suivre(
     let source_disparue = etat
         .fichier
         .as_deref()
-        .is_some_and(|f| !extended_path(Path::new(f)).exists());
+        .is_some_and(|f| !existe(Path::new(f)));
     // Disparu, ou réécrit depuis la lecture : l'empreinte (« mtime:taille »)
     // ne correspond plus.
     let source_changee = source_disparue

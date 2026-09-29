@@ -204,6 +204,137 @@ pub(super) fn corps_network_health(
     })
 }
 
+/// #5336 : seule une observation SOURCE peut compléter une radio. Les
+/// canaux du fil sortant peuvent avoir subi une conversion et ne font pas foi.
+fn inject_source_channels(
+    obj: &mut serde_json::Map<String, Value>,
+    np: Option<&tune_core::playback::NowPlaying>,
+    wire: Option<&tune_core::http::streamer::StreamInfo>,
+) {
+    if np.is_some_and(|np| np.source == "radio")
+        && let Some(channels) = wire
+            .and_then(|w| w.radio_source)
+            .and_then(|r| r.channels)
+            .filter(|n| *n > 0)
+        && let Some(track) = obj.get_mut("current_track").and_then(Value::as_object_mut)
+    {
+        track.insert("channels".into(), json!(channels));
+    }
+}
+
+#[cfg(test)]
+mod canaux_tests_5336 {
+    use super::*;
+    #[tokio::test]
+    async fn les_deux_routes_servent_les_canaux_source_5336() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::http::streamer::{RadioSourceInfo, StreamInfo};
+        use tune_core::playback::NowPlaying;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Canaux 5336", Some("browser"), None)
+            .unwrap();
+        let router = crate::routes::router(state.clone());
+        let info = StreamInfo {
+            channels: 2,
+            ..Default::default()
+        };
+        let (sid, _tx, _ready, session) = state.streamer.create_radio_session(info, 8).await;
+        session.publish_radio_source(RadioSourceInfo {
+            channels: Some(6),
+            ..Default::default()
+        });
+        for (np, attendu) in [
+            (
+                NowPlaying {
+                    source: "radio".into(),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+                6,
+            ),
+            (
+                NowPlaying {
+                    source: "local".into(),
+                    channels: Some(8),
+                    ..Default::default()
+                },
+                8,
+            ),
+        ] {
+            state.playback.play(id, np).await;
+            for (url, liste) in [
+                ("/api/v1/zones".to_string(), true),
+                (format!("/api/v1/zones/{id}"), false),
+            ] {
+                let reponse = router
+                    .clone()
+                    .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(reponse.status(), StatusCode::OK, "{url}");
+                let json: Value = serde_json::from_slice(
+                    &to_bytes(reponse.into_body(), 1_000_000).await.unwrap(),
+                )
+                .unwrap();
+                let zone = if liste {
+                    json.as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|z| z["id"] == id)
+                        .unwrap()
+                } else {
+                    &json
+                };
+                assert_eq!(
+                    zone["current_track"]["channels"], attendu,
+                    "#5336 : {url} doit servir les canaux SOURCE dans current_track"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn radio_mesuree_et_sortie_repliee_5336() {
+        let np = tune_core::playback::NowPlaying {
+            source: "radio".into(),
+            ..Default::default()
+        };
+        let mut wire = tune_core::http::streamer::StreamInfo {
+            channels: 2,
+            radio_source: Some(tune_core::http::streamer::RadioSourceInfo {
+                channels: Some(6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert("current_track".into(), json!(np));
+        inject_source_channels(&mut obj, Some(&np), Some(&wire));
+        assert_eq!(
+            obj["current_track"]["channels"], 6,
+            "#5336 : annoncer les canaux radio mesurés, pas la sortie stéréo"
+        );
+        wire.radio_source = None;
+        obj.insert("current_track".into(), json!(np));
+        inject_source_channels(&mut obj, Some(&np), Some(&wire));
+        assert!(
+            obj["current_track"]["channels"].is_null(),
+            "sortie seule : source inconnue"
+        );
+        let local = tune_core::playback::NowPlaying {
+            source: "local".into(),
+            channels: Some(8),
+            ..Default::default()
+        };
+        obj.insert("current_track".into(), json!(local));
+        inject_source_channels(&mut obj, Some(&local), Some(&wire));
+        assert_eq!(obj["current_track"]["channels"], 8);
+    }
+}
+
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     // #5077 — une zone masquée qui joue reste dans la liste.
@@ -299,6 +430,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 Some(sid) => state.streamer.stream_output_wire(sid).await,
                 None => None,
             };
+            inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
             let signal_path = build_signal_path(
                 &ps,
                 z,
@@ -475,6 +607,7 @@ pub(super) async fn get_zone(
                     Some(sid) => state.streamer.stream_output_wire(sid).await,
                     None => None,
                 };
+                inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
                 let signal_path = build_signal_path(
                     &ps,
                     &zone,
