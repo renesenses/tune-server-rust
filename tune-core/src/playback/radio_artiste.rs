@@ -37,7 +37,7 @@ use crate::streaming::traits::{StreamTrack, StreamingService};
 /// Part de l'artiste de départ dans un lot (décision 3 : « environ 20 % »).
 pub const PART_GRAINE: f64 = 0.2;
 /// Titres par lot : celui de la route, et chaque rechargement.
-pub const TAILLE_LOT: usize = 25;
+pub const TAILLE_LOT: usize = 50;
 /// Nombre de titres déjà proposés que la radio garde en mémoire pour ne pas
 /// les reproposer (environ douze lots).
 pub const FENETRE_ANTI_DOUBLON: usize = 300;
@@ -45,6 +45,9 @@ pub const FENETRE_ANTI_DOUBLON: usize = 300;
 const MAX_VOISINS: usize = 30;
 /// Titres demandés à une source pour un artiste.
 const TITRES_PAR_ARTISTE: usize = 20;
+/// Albums de l'artiste de départ ouverts au plus par lot. Chaque album coûte
+/// un appel au service (`get_album_tracks`) : c'est la borne de ce coût.
+pub const MAX_ALBUMS_PAR_LOT: usize = 12;
 
 /// Un titre que la radio peut mettre en file. Un lot en compte 25 : la
 /// différence de taille entre les deux variantes ne coûte rien ici.
@@ -104,6 +107,20 @@ impl Candidat {
             normaliser(self.artiste()),
             normaliser(self.titre())
         )
+    }
+
+    /// L'album du titre, pour la diversité par album : son titre normalisé
+    /// (le même album sur deux services ou deux éditions se reconnaît), à
+    /// défaut son identifiant chez le service. `None` : on ne sait pas.
+    pub fn album_cle(&self) -> Option<String> {
+        let (titre, id) = match self {
+            Candidat::Local { album, .. } => (album.as_deref(), None),
+            Candidat::Service { piste, .. } => (piste.album.as_deref(), piste.album_id.as_deref()),
+        };
+        titre
+            .map(normaliser)
+            .filter(|t| !t.is_empty())
+            .or_else(|| id.filter(|i| !i.is_empty()).map(|i| format!("id:{i}")))
     }
 
     /// L'identité de la ligne de file : `local:<id>` ou `<service>:<id>`.
@@ -172,14 +189,34 @@ pub fn identite_service(source: &str, source_id: &str) -> String {
     format!("{source}:{source_id}")
 }
 
+/// Un album DE l'artiste (pas un album où il n'est qu'invité), tel qu'une
+/// source sait le rouvrir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumRadio {
+    pub id: String,
+    pub titre: String,
+}
+
 /// Une source de la radio : elle nomme des voisins, et elle rend des titres
 /// d'un artiste. Une source peut ne savoir faire que l'un des deux (l'API
 /// d'enrichissement ne rend aucun titre).
+///
+/// La DISCOGRAPHIE (`albums_de` / `titres_album`, #5395 point 6 du fil 2037)
+/// sert la part de l'artiste de départ. Par défaut une source n'en a pas :
+/// seules la fiche (son service) et la bibliothèque la fournissent.
 #[async_trait::async_trait]
 pub trait SourceRadio: Send + Sync {
     fn nom(&self) -> String;
     async fn artistes_similaires(&self, artiste: &str, max: usize) -> Vec<String>;
     async fn titres_de(&self, artiste: &str, max: usize) -> Vec<Candidat>;
+    /// Les albums DE l'artiste — ceux où il n'est qu'invité sont écartés.
+    async fn albums_de(&self, _artiste: &str) -> Vec<AlbumRadio> {
+        Vec::new()
+    }
+    /// Les titres de l'artiste sur l'un de ses albums.
+    async fn titres_album(&self, _artiste: &str, _album: &AlbumRadio) -> Vec<Candidat> {
+        Vec::new()
+    }
 }
 
 /// Tirage pseudo-aléatoire sans dépendance (`xorshift64`, comme
@@ -307,14 +344,25 @@ pub async fn composer_lot(
     // Un titre par voisin, puis un deuxième tour s'il en manque : une radio,
     // pas la discographie d'un seul voisin.
     let mut titres_voisins: Vec<Candidat> = Vec::new();
+    // Les albums déjà pris chez chaque voisin : son deuxième titre vient d'un
+    // AUTRE album quand il en a un.
+    let mut albums_pris: Vec<HashSet<String>> = vec![HashSet::new(); pools.len()];
     'tours: loop {
         let mut avance = false;
-        for pool in pools.iter_mut() {
+        for (pool, pris) in pools.iter_mut().zip(albums_pris.iter_mut()) {
             if titres_voisins.len() >= voulus_voisins {
                 break 'tours;
             }
-            while let Some(c) = pool.pop() {
+            while !pool.is_empty() {
+                let i = pool
+                    .iter()
+                    .rposition(|c| c.album_cle().is_none_or(|a| !pris.contains(&a)))
+                    .unwrap_or(pool.len() - 1);
+                let c = pool.remove(i);
                 if prendre(&c, &mut deja) {
+                    if let Some(a) = c.album_cle() {
+                        pris.insert(a);
+                    }
                     titres_voisins.push(c);
                     avance = true;
                     break;
@@ -327,26 +375,70 @@ pub async fn composer_lot(
     }
 
     // 3. Les titres de l'artiste de départ — sa part, élargie de ce que les
-    //    voisins n'ont pas pu fournir. La première source qui en a d'abord ;
-    //    les suivantes seulement s'il en manque.
+    //    voisins n'ont pas pu fournir. Ils puisent dans TOUTE sa discographie
+    //    (fil 2037, point 6) : la première source qui a ses albums (la fiche,
+    //    à défaut la bibliothèque), au plus un titre par album et par lot tant
+    //    qu'il reste des albums. Les titres phares ne servent qu'à compléter.
     let voulus_graine = voulus_graine + voulus_voisins.saturating_sub(titres_voisins.len());
-    let mut reserve_graine: Vec<Candidat> = Vec::new();
+    let mut titres_graine: Vec<Candidat> = Vec::new();
+    let est_de_la_graine = |c: &Candidat| normaliser(c.artiste()) == graine_norm;
     for source in sources {
-        if reserve_graine.len() >= voulus_graine {
+        let mut albums = source.albums_de(graine).await;
+        if albums.is_empty() {
+            continue;
+        }
+        alea.melanger(&mut albums);
+        // Un album de plus que de titres voulus, pour absorber un album vide
+        // ou déjà entendu, et jamais plus que la borne d'appels.
+        albums.truncate((voulus_graine + 2).min(MAX_ALBUMS_PAR_LOT));
+        let par_album =
+            futures_util::future::join_all(albums.iter().map(|al| source.titres_album(graine, al)))
+                .await;
+        let mut par_album: Vec<Vec<Candidat>> = par_album
+            .into_iter()
+            .map(|mut p| {
+                p.retain(|c| est_de_la_graine(c));
+                alea.melanger(&mut p);
+                p
+            })
+            .collect();
+        'albums: loop {
+            let mut avance = false;
+            for pool in par_album.iter_mut() {
+                if titres_graine.len() >= voulus_graine {
+                    break 'albums;
+                }
+                while let Some(c) = pool.pop() {
+                    if prendre(&c, &mut deja) {
+                        titres_graine.push(c);
+                        avance = true;
+                        break;
+                    }
+                }
+            }
+            if !avance {
+                break;
+            }
+        }
+        break;
+    }
+    for source in sources {
+        if titres_graine.len() >= voulus_graine {
             break;
         }
         let mut titres = source.titres_de(graine, TITRES_PAR_ARTISTE).await;
         alea.melanger(&mut titres);
         for c in titres {
+            if titres_graine.len() >= voulus_graine {
+                break;
+            }
             // Un titre phare d'un service peut être signé d'un autre artiste
             // (featuring, compilation) : on ne garde que ceux de la graine.
-            if normaliser(c.artiste()) == graine_norm && prendre(&c, &mut deja) {
-                reserve_graine.push(c);
+            if est_de_la_graine(&c) && prendre(&c, &mut deja) {
+                titres_graine.push(c);
             }
         }
     }
-    let mut titres_graine = reserve_graine;
-    titres_graine.truncate(voulus_graine);
     let n_graine = titres_graine.len();
 
     // 4. L'ordre : mélangé, puis étalé pour que deux titres du même artiste
@@ -372,15 +464,18 @@ pub async fn composer_lot(
     }
 }
 
-/// Ordonne `restants` (déjà mélangés) pour qu'aucun artiste ne se suive,
-/// quand c'est possible. À chaque pas on prend le premier titre d'un artiste
-/// différent du précédent — l'ordre reste celui du tirage —, sauf quand un
-/// artiste a plus de titres que tous les autres réunis : il passe alors en
-/// premier, sans quoi la fin du lot serait une série de lui seul.
+/// Ordonne `restants` (déjà mélangés) pour que ni un artiste ni un album ne
+/// se suivent, quand c'est possible. À chaque pas on prend le premier titre
+/// d'un artiste ET d'un album différents du précédent — l'ordre reste celui du
+/// tirage —, à défaut d'un artiste différent ; sauf quand un artiste a plus de
+/// titres que tous les autres réunis : il passe alors en premier, sans quoi la
+/// fin du lot serait une série de lui seul.
 fn etaler(mut restants: Vec<Candidat>, precedent: &mut Option<String>) -> Vec<Candidat> {
     let mut sortie = Vec::with_capacity(restants.len());
+    let mut album_precedent: Option<String> = None;
     while !restants.is_empty() {
         let artistes: Vec<String> = restants.iter().map(|c| normaliser(c.artiste())).collect();
+        let albums: Vec<Option<String>> = restants.iter().map(Candidat::album_cle).collect();
         let mut comptes: HashMap<&str, usize> = HashMap::new();
         for a in &artistes {
             *comptes.entry(a.as_str()).or_default() += 1;
@@ -391,15 +486,37 @@ fn etaler(mut restants: Vec<Candidat>, precedent: &mut Option<String>) -> Vec<Ca
             .filter(|(a, c)| **c * 2 > n && precedent.as_deref() != Some(**a))
             .map(|(a, _)| a.to_string())
             .next();
+        let autre_album = |i: usize| {
+            album_precedent.is_none() || albums[i].is_none() || albums[i] != album_precedent
+        };
+        // Même règle pour un album qui tiendrait plus de la moitié du reste
+        // (une compilation commune à plusieurs voisins) : il passe dès qu'il
+        // le peut, sinon il finirait en série.
+        let mut comptes_albums: HashMap<&str, usize> = HashMap::new();
+        for a in albums.iter().flatten() {
+            *comptes_albums.entry(a.as_str()).or_default() += 1;
+        }
+        let album_dominant = comptes_albums
+            .iter()
+            .filter(|(a, c)| **c * 2 >= n && album_precedent.as_deref() != Some(**a))
+            .map(|(a, _)| a.to_string())
+            .next();
+        let autre_artiste = |i: usize| precedent.as_deref() != Some(artistes[i].as_str());
         let choix = match dominant {
-            Some(d) => artistes.iter().position(|a| *a == d),
-            None => artistes
-                .iter()
-                .position(|a| precedent.as_deref() != Some(a.as_str())),
+            Some(d) => (0..n)
+                .find(|&i| artistes[i] == d && autre_album(i))
+                .or_else(|| artistes.iter().position(|a| *a == d)),
+            None => album_dominant
+                .as_ref()
+                .and_then(|d| (0..n).find(|&i| albums[i].as_ref() == Some(d) && autre_artiste(i)))
+                .or_else(|| (0..n).find(|&i| autre_artiste(i) && autre_album(i)))
+                .or_else(|| (0..n).find(|&i| autre_artiste(i)))
+                .or_else(|| (0..n).find(|&i| autre_album(i))),
         }
         .unwrap_or(0);
         let c = restants.remove(choix);
         *precedent = Some(artistes[choix].clone());
+        album_precedent = albums[choix].clone();
         sortie.push(c);
     }
     sortie
@@ -521,6 +638,9 @@ pub struct SourceService {
     service: Service,
     ids: std::sync::Mutex<HashMap<String, Option<String>>>,
     bannis: HashSet<String>,
+    /// Vrai pour le service de la FICHE seulement : c'est lui qui fournit la
+    /// discographie de l'artiste de départ (décision du 29/09, fil 2037).
+    discographie: bool,
 }
 
 impl SourceService {
@@ -539,7 +659,28 @@ impl SourceService {
             service,
             ids: std::sync::Mutex::new(ids),
             bannis,
+            discographie: false,
         }
+    }
+
+    /// Ce service est celui de la fiche : il fournit la discographie.
+    pub fn avec_discographie(mut self) -> Self {
+        self.discographie = true;
+        self
+    }
+
+    fn en_candidats(&self, pistes: Vec<StreamTrack>, max: usize) -> Vec<Candidat> {
+        pistes
+            .into_iter()
+            .filter(|p| {
+                !p.id.is_empty() && p.disponible != Some(false) && !self.bannis.contains(&p.id)
+            })
+            .take(max)
+            .map(|piste| Candidat::Service {
+                source: self.nom.clone(),
+                piste,
+            })
+            .collect()
     }
 
     fn id_en_cache(&self, artiste: &str) -> Option<Option<String>> {
@@ -618,17 +759,69 @@ impl SourceRadio for SourceService {
                 Vec::new()
             }
         };
-        pistes
+        self.en_candidats(pistes, max)
+    }
+
+    /// Les albums DE l'artiste chez le service : `get_artist_albums` rend aussi
+    /// ceux où il n'est qu'invité (compilations, featuring) ; un album signé
+    /// d'un AUTRE artiste — identifiant ou nom — est écarté. Un album sans
+    /// artiste déclaré est gardé : ses titres sont filtrés un par un sur
+    /// l'artiste (`composer_lot`). Un seul appel.
+    async fn albums_de(&self, artiste: &str) -> Vec<AlbumRadio> {
+        if !self.discographie {
+            return Vec::new();
+        }
+        let Some(id) = self.id_de(artiste).await else {
+            return Vec::new();
+        };
+        let albums = match self.service.read().await.get_artist_albums(&id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(service = %self.nom, artiste, error = %e, "radio_artiste_albums_echoues");
+                Vec::new()
+            }
+        };
+        let nom = normaliser(artiste);
+        albums
             .into_iter()
-            .filter(|p| {
-                !p.id.is_empty() && p.disponible != Some(false) && !self.bannis.contains(&p.id)
-            })
-            .take(max)
-            .map(|piste| Candidat::Service {
-                source: self.nom.clone(),
-                piste,
+            .filter(|al| !al.id.is_empty())
+            .filter(
+                |al| match al.artist_id.as_deref().filter(|a| !a.is_empty()) {
+                    Some(aid) => aid == id,
+                    None => al.artist.trim().is_empty() || normaliser(&al.artist) == nom,
+                },
+            )
+            .map(|al| AlbumRadio {
+                id: al.id,
+                titre: al.title,
             })
             .collect()
+    }
+
+    /// Les titres d'un album : un appel par album ouvert, borné par
+    /// `MAX_ALBUMS_PAR_LOT`.
+    async fn titres_album(&self, artiste: &str, album: &AlbumRadio) -> Vec<Candidat> {
+        let pistes = match self.service.read().await.get_album_tracks(&album.id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(service = %self.nom, artiste, album = %album.id, error = %e, "radio_artiste_album_echoue");
+                Vec::new()
+            }
+        };
+        let pistes = pistes
+            .into_iter()
+            .map(|mut p| {
+                // Une piste d'album ne porte pas toujours le titre de son album.
+                if p.album.as_deref().is_none_or(|a| a.is_empty()) {
+                    p.album = Some(album.titre.clone());
+                }
+                if p.album_id.is_none() {
+                    p.album_id = Some(album.id.clone());
+                }
+                p
+            })
+            .collect();
+        self.en_candidats(pistes, usize::MAX)
     }
 }
 
@@ -698,6 +891,57 @@ impl SourceRadio for SourceBibliotheque {
             })
         })
         .collect()
+    }
+
+    /// Les albums DE l'artiste dans la bibliothèque : ceux dont l'artiste
+    /// d'album est lui. Une compilation ou l'album d'un autre où il est invité
+    /// a un autre artiste d'album : écartée.
+    async fn albums_de(&self, artiste: &str) -> Vec<AlbumRadio> {
+        let nom = artiste.trim().to_lowercase();
+        self.db
+            .query_many(
+                "SELECT al.id, al.title FROM albums al JOIN artists aa ON al.artist_id = aa.id \
+                 WHERE LOWER(aa.name) = ?1 ORDER BY al.id",
+                &[&nom],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                Some(AlbumRadio {
+                    id: r.first()?.as_i64()?.to_string(),
+                    titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    async fn titres_album(&self, artiste: &str, album: &AlbumRadio) -> Vec<Candidat> {
+        let Ok(album_id) = album.id.parse::<i64>() else {
+            return Vec::new();
+        };
+        let nom = artiste.trim().to_lowercase();
+        let sans_bannis = crate::db::facet_filter::banned_tracks_excluded(
+            crate::db::hidden_repo::profil_de_selection_automatique(&self.db),
+        );
+        let sql = format!(
+            "SELECT t.id, t.title, ar.name, t.duration_ms FROM tracks t \
+             JOIN artists ar ON t.artist_id = ar.id \
+             WHERE t.album_id = ?1 AND LOWER(ar.name) = ?2 AND {sans_bannis}"
+        );
+        self.db
+            .query_many(&sql, &[&album_id, &nom])
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                Some(Candidat::Local {
+                    track_id: r.first()?.as_i64()?,
+                    titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    artiste: r.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    album: Some(album.titre.clone()),
+                    duree_ms: r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                })
+            })
+            .collect()
     }
 }
 
@@ -770,7 +1014,14 @@ pub async fn sources_de_la_radio(
             .then_some(contexte.artiste_id.as_deref())
             .flatten()
             .map(|id| (contexte.artiste.as_str(), id));
-        sources.push(Box::new(SourceService::new(&nom, service, bannis, connu)));
+        let source = SourceService::new(&nom, service, bannis, connu);
+        // La discographie de l'artiste de départ vient de la fiche seule.
+        let source = if Some(&nom) == fiche.as_ref() {
+            source.avec_discographie()
+        } else {
+            source
+        };
+        sources.push(Box::new(source));
     }
     sources.push(Box::new(SourceEnrichissement::new(db.clone())));
     sources.push(Box::new(SourceBibliotheque::new(db.clone())));
