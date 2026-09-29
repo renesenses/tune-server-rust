@@ -1953,6 +1953,13 @@ pub(crate) fn reimporter_fichier_surveillant(
             }
         }
 
+        // #5454 — la pochette de l'album AVANT cette piste : si la piste la
+        // change, l'album est tranché par la majorité de ses pistes une fois
+        // la piste rangée (une jaquette retouchée n'est suivie que si elle
+        // devient majoritaire).
+        let pochette_avant = album_id
+            .and_then(|aid| album_repo.etat_pochette(aid).ok().flatten())
+            .and_then(|e| e.cover_path);
         if let Some(aid) = album_id {
             // #5034 — la même règle que le scan : pochette posée si l'album
             // n'en a pas, RETIRÉE quand cette piste portait la jaquette de
@@ -1976,7 +1983,48 @@ pub(crate) fn reimporter_fichier_surveillant(
         // part avec les orphelins en fin de lot).
         let ancien_album = ancienne.as_ref().and_then(|a| a.album_id);
         track.id = ancienne.as_ref().and_then(|a| a.id);
-        if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
+        let rangee = ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id);
+        // #5454 — l'album est tranché par la majorité quand cette piste a
+        // CHANGÉ sa pochette, ou quand sa jaquette s'écarte d'une pochette
+        // tirée du disque (le single retouché garde alors la sienne, #4650).
+        let en_desaccord = album_id.is_some_and(|aid| {
+            let apres = album_repo.etat_pochette(aid).ok().flatten();
+            let pochette_apres = apres.as_ref().and_then(|e| e.cover_path.clone());
+            if pochette_avant.is_some() && pochette_apres != pochette_avant {
+                return true;
+            }
+            let Some(pochette) = pochette_apres.filter(|_| {
+                apres
+                    .as_ref()
+                    .and_then(|e| e.source)
+                    .is_some_and(|s| s.vient_du_disque())
+            }) else {
+                return false;
+            };
+            let relue;
+            let jaquette = match sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref()) {
+                Some(j) => Some(j),
+                None => {
+                    relue = tune_core::library::artwork::extract_cover_art(std::path::Path::new(
+                        &sf.path,
+                    ));
+                    relue.as_ref()
+                }
+            };
+            jaquette.is_some_and(|j| tune_core::library::artwork::content_hash(&j.0) != pochette)
+        });
+        if let Some(aid) = album_id
+            && en_desaccord
+        {
+            let tranche = tune_core::library::pochette_disque::trancher_par_la_majorite(
+                db,
+                aid,
+                &crate::routes::library::artwork_cache_dir(),
+                false,
+            );
+            tracing::debug!(album_id = aid, ?tranche, "watcher_pochette_majoritaire");
+        }
+        if rangee {
             // #5346 — comme le scan, relire aussi ReplayGain, crédits, etc.
             // La lecture forte retrouve également l'identifiant d'une piste
             // neuve. L'upsert conserve les clés absentes du fichier (mesures
@@ -3205,6 +3253,10 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "pochettes_majorite_tests_5454.rs"]
+mod pochettes_majorite_tests_5454;
 
 #[cfg(test)]
 #[path = "iso_donnees_tests_5299.rs"]
