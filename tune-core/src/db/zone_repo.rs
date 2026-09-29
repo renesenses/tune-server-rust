@@ -1180,10 +1180,23 @@ impl ZoneRepo {
     /// comme avant. Relue par son identifiant ([`Self::get`] ne filtre pas le
     /// masquage) ; une zone réellement effacée entre-temps est simplement
     /// ignorée.
+    ///
+    /// 🔴 #5322 — SAUF une zone que l'utilisateur a lui-même retirée
+    /// (supprimer, tout supprimer, fusionner : les motifs de
+    /// [`MotifMasquage::ecrase_un_masquage_existant`]). FabienM (0.9.167, fil
+    /// 2013) supprimait sa zone « Parents » DLNA EN PAUSE : le DELETE la
+    /// masquait bien, puis cette exception la remettait dans la liste à chaque
+    /// rafraîchissement — « je clique sur Supprimer cette zone et je refresh la
+    /// page, elle est toujours là ». L'exception ne vaut que pour un masquage
+    /// que l'utilisateur n'a PAS demandé (appareil ignoré, motif inconnu
+    /// d'avant la migration 112) : c'est le cas du DMP-A6 ci-dessus.
     pub fn list_avec_masquees_en_lecture(&self, en_lecture: &[i64]) -> Result<Vec<Zone>, String> {
         let mut zones = self.list()?;
         for &id in en_lecture {
             if zones.iter().any(|z| z.id == Some(id)) {
+                continue;
+            }
+            if self.retiree_par_l_utilisateur(id) {
                 continue;
             }
             if let Some(zone) = self.get(id)? {
@@ -1191,6 +1204,25 @@ impl ZoneRepo {
             }
         }
         Ok(zones)
+    }
+
+    /// La zone `id` est-elle masquée par un geste EXPLICITE de l'utilisateur
+    /// (#5322) ? Lecture forte : le client relit `/zones` juste après son
+    /// DELETE, et une lecture en retard rendrait la zone « visible ».
+    ///
+    /// Motif inconnu, base sans la colonne, erreur de lecture : `false` — on
+    /// garde alors le comportement de #5077 (la zone qui joue se montre).
+    fn retiree_par_l_utilisateur(&self, id: i64) -> bool {
+        let sql = self.dialect_sql(sql::etat_de_masquage, sql::etat_de_masquage);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let Ok(Some(ligne)) = self.db.query_one_strong(&sql, &params) else {
+            return false;
+        };
+        let masquee = ligne.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        let motif = ligne.get(1).and_then(|v| v.as_string());
+        masquee
+            && MotifMasquage::depuis_stocke(motif.as_deref())
+                .is_some_and(MotifMasquage::ecrase_un_masquage_existant)
     }
 
     pub fn create(
@@ -2773,9 +2805,12 @@ impl ZoneRepo {
     /// Un chemin automatique qui masque une zone passe par [`Self::masquer`]
     /// avec SON motif. Ce défaut-ci est le prudent : un appelant qui aurait
     /// oublié de nommer sa raison obtient le motif que rien ne répare.
-    pub fn delete(&self, id: i64) -> Result<(), String> {
+    ///
+    /// Rend le nombre de lignes masquées (#5322) : `0` veut dire qu'aucune
+    /// zone ne porte cet identifiant. Le jeter faisait répondre `204` à la
+    /// route pour une suppression qui n'avait rien touché.
+    pub fn delete(&self, id: i64) -> Result<usize, String> {
         self.masquer(id, MotifMasquage::SuppressionUtilisateur)
-            .map(|_| ())
     }
 
     /// Masque la zone `id` en retenant POURQUOI et QUAND (#5077). Rend le
