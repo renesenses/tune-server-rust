@@ -297,6 +297,7 @@ impl PlaybackOrchestrator {
         let _ = cellule.set(Arc::downgrade(&session));
         session.publish_detected_output_format(format.frequence, format.canaux);
         session.publish_radio_source(crate::http::streamer::RadioSourceInfo {
+            channels: Some(format.canaux),
             format: Some("wav"),
             sample_rate: Some(format.frequence),
             bit_depth: Some(format.bits),

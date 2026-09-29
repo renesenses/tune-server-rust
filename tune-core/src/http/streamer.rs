@@ -64,6 +64,7 @@ pub type ReresolveFn = std::sync::Arc<
 /// Missing fields mean unknown, never an inference from the output container.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RadioSourceInfo {
+    pub channels: Option<u16>,
     pub format: Option<&'static str>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
