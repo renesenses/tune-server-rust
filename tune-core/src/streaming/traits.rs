@@ -247,11 +247,38 @@ pub const LIMITE_PAGE_SANS_PAGINATION: usize = 50;
 ///
 /// Rend aussi la borne appliquée, pour que la page sache si c'est NOUS qui
 /// avons coupé — sans quoi elle annoncerait un catalogue épuisé.
+///
+/// Depuis #4803, ce n'est plus la limite du `search_page` PAR DÉFAUT (voir
+/// [`limite_hors_pagination`]) : c'est la page de 50 d'un service qui pagine
+/// par pages de 50.
 pub fn limite_sans_pagination(limit: usize) -> usize {
     if limit == 0 {
         LIMITE_PAGE_SANS_PAGINATION
     } else {
         limit.min(LIMITE_PAGE_SANS_PAGINATION)
+    }
+}
+
+/// Plafond haut de la limite qu'un service reçoit pour UNE recherche, par
+/// catégorie (#4803, décision de Bertrand du 29/09/2026).
+///
+/// La même valeur que le `PLAFOND_RECHERCHE` de Qobuz (`qobuz.rs`), qui
+/// borne déjà sa recherche à 500 par catégorie : aucun service ne reçoit
+/// davantage, paginé ou non. Sans lui, `?limit=100000` partait tel quel dans
+/// l'URL d'un service sans pagination. La route de recherche fédérée applique
+/// la MÊME borne à son chemin non paginé, pour que la première page soit
+/// identique avec ou sans `paged=true`.
+pub const PLAFOND_LIMITE_RECHERCHE: usize = 500;
+
+/// La limite qu'un service SANS pagination reçoit de [`StreamingService::search_page`]
+/// par défaut : celle du chemin non paginé, `0` (« Tous ») excepté, qui
+/// devient une page de [`LIMITE_PAGE_SANS_PAGINATION`] (#2160, #4803), et
+/// bornée à [`PLAFOND_LIMITE_RECHERCHE`].
+pub fn limite_hors_pagination(limit: usize) -> usize {
+    if limit == 0 {
+        LIMITE_PAGE_SANS_PAGINATION
+    } else {
+        limit.min(PLAFOND_LIMITE_RECHERCHE)
     }
 }
 
@@ -498,21 +525,6 @@ pub trait StreamingService: Send + Sync {
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError>;
 
-    /// Une PAGE de recherche : `limit` éléments par catégorie à partir de
-    /// `offset`, avec de quoi savoir s'il en reste (#2160).
-    ///
-    /// Défaut : le service ne sait pas paginer sa recherche. À `offset = 0` il
-    /// rend sa page unique ; au-delà il rend du vide, car recycler la première
-    /// page en prétendant que c'est la seconde ferait afficher deux fois les
-    /// mêmes titres.
-    ///
-    /// La limite est d'abord ramenée à ce qu'un service sans pagination sait
-    /// recevoir ([`limite_sans_pagination`]) : la route parle la convention de
-    /// Qobuz — `0` = « Tous » —, et la recopier telle quelle dans l'URL d'un
-    /// service qui ne pagine pas produit `limit=0`, c'est-à-dire une page vide
-    /// ou un refus de l'API (#2160). C'est le seul endroit où cette traduction
-    /// peut vivre une fois pour toutes : chaque service la referait sinon, et
-    /// aucun ne la faisait.
     /// Combien d'éléments PAR CATÉGORIE [`Self::search_page`] rend réellement
     /// pour une `limit` demandée (#4803).
     ///
@@ -521,13 +533,35 @@ pub trait StreamingService: Send + Sync {
     /// quand le service en a servi moins ferait un TROU — Qobuz ramène un
     /// `limit=1000` à 500 : avancer de 1000 sauterait les rangs 500 à 999.
     ///
-    /// Défaut : la borne de [`Self::search_page`] par défaut,
-    /// [`limite_sans_pagination`]. Un service qui redéfinit `search_page`
-    /// avec un autre plafond doit redéfinir aussi cette méthode.
+    /// Défaut : la limite de [`Self::search_page`] par défaut,
+    /// [`limite_hors_pagination`]. Un service qui redéfinit `search_page`
+    /// avec un plafond doit redéfinir aussi cette méthode — avec
+    /// [`limite_sans_pagination`] pour une page de 50.
     fn limite_de_page_recherche(&self, limit: usize) -> usize {
-        limite_sans_pagination(limit)
+        limite_hors_pagination(limit)
     }
 
+    /// Une PAGE de recherche : `limit` éléments par catégorie à partir de
+    /// `offset`, avec de quoi savoir s'il en reste (#2160).
+    ///
+    /// Défaut : le service ne sait pas paginer sa recherche. À `offset = 0` il
+    /// rend sa page unique ; au-delà il rend du vide, car recycler la première
+    /// page en prétendant que c'est la seconde ferait afficher deux fois les
+    /// mêmes titres.
+    ///
+    /// La page unique est celle du chemin NON paginé : la même `limit`
+    /// (#4803, décision de Bertrand du 29/09/2026). La borner à 50 faisait
+    /// perdre la moitié de la première page à Tidal, Deezer, Spotify, Amazon
+    /// et YouTube dès que l'écran demande `paged=true` — le chemin non paginé
+    /// leur passe la limite du client, 100 (`SEARCH_FEDEREE_LIMIT` du client
+    /// web). Seul `0` est traduit ([`limite_hors_pagination`]) : c'est le
+    /// « Tous » de la route, et `limit=0` dans l'URL d'un service qui ne
+    /// pagine pas rend une page vide ou un refus (#2160).
+    ///
+    /// `has_more` reste FAUX : il n'y a pas de page suivante à servir, et un
+    /// « Charger plus » qui rendrait du vide mentirait. Une page pleine le dit
+    /// par `truncated` — le service a peut-être davantage, qu'on ne sait pas
+    /// demander.
     async fn search_page(
         &self,
         query: &str,
@@ -537,11 +571,10 @@ pub trait StreamingService: Send + Sync {
         if offset > 0 {
             return Ok(SearchPage::au_dela(offset));
         }
-        let borne = limite_sans_pagination(limit);
-        Ok(SearchPage::page_unique_bornee(
-            self.search(query, borne).await?,
-            borne,
-        ))
+        let borne = limite_hors_pagination(limit);
+        let mut page = SearchPage::page_unique_bornee(self.search(query, borne).await?, borne);
+        page.has_more = false;
+        Ok(page)
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError>;
@@ -1280,15 +1313,16 @@ mod tests_limite_sans_pagination {
     }
 
     #[tokio::test]
-    async fn une_limite_extravagante_est_ramenee_a_la_page() {
-        let (svc, vues) = service(50);
-        svc.search_page("depeche mode", 100_000, 0)
-            .await
-            .expect("page");
-        assert_eq!(
-            *vues.lock().expect("verrou d'essai"),
-            vec![LIMITE_PAGE_SANS_PAGINATION]
-        );
+    async fn la_limite_du_chemin_non_pagine_n_est_pas_ramenee_a_50() {
+        // #4803, décision de Bertrand (29/09/2026) : sous `paged=true`, un
+        // service qui ne pagine pas reçoit la limite du chemin non paginé — le
+        // client web envoie 100. La borner à 50 lui faisait perdre la moitié
+        // de sa première page.
+        let (svc, vues) = service(100);
+        let page = svc.search_page("depeche mode", 100, 0).await.expect("page");
+        assert_eq!(*vues.lock().expect("verrou d'essai"), vec![100]);
+        assert_eq!(page.results.tracks.len(), 100);
+        assert!(!page.has_more, "aucune page suivante à servir");
     }
 
     #[tokio::test]
@@ -1312,13 +1346,16 @@ mod tests_limite_sans_pagination {
         // « totaux annoncés » : rendre exactement la borne ne prouve pas que
         // le catalogue est épuisé. `page_unique` affirmait pourtant
         // `has_more: false` et un total égal au nombre rendu.
+        //
+        // #4803 : le doute est porté par `truncated` seul. `has_more` reste
+        // FAUX — il n'y a pas de page suivante à servir (décision de Bertrand).
         let (svc, _vues) = service(LIMITE_PAGE_SANS_PAGINATION);
         let page = svc.search_page("somebody", 0, 0).await.expect("page");
         assert!(
-            page.has_more,
-            "50 rendus sur un plafond de 50 : on ne sait pas si c'est tout"
+            page.truncated,
+            "50 rendus sur une limite de 50 : on ne sait pas si c'est tout"
         );
-        assert!(page.truncated, "et c'est NOTRE plafond qui a coupé");
+        assert!(!page.has_more, "mais aucun « Charger plus » à promettre");
     }
 
     #[tokio::test]
@@ -1342,6 +1379,19 @@ mod tests_limite_sans_pagination {
         assert!(vues.lock().expect("verrou d'essai").is_empty());
         assert_eq!(page.offset, 50);
         assert!(page.results.tracks.is_empty());
+    }
+
+    #[test]
+    fn hors_pagination_seul_tous_est_traduit() {
+        assert_eq!(limite_hors_pagination(0), LIMITE_PAGE_SANS_PAGINATION);
+        assert_eq!(limite_hors_pagination(20), 20);
+        assert_eq!(limite_hors_pagination(100), 100);
+        assert_eq!(limite_hors_pagination(500), 500);
+        assert_eq!(
+            limite_hors_pagination(100_000),
+            PLAFOND_LIMITE_RECHERCHE,
+            "un plafond haut, décision de Bertrand"
+        );
     }
 
     #[test]
