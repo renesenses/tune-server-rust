@@ -13,6 +13,12 @@ use super::traits::*;
 
 use crate::TuneError;
 const API_BASE: &str = "https://api.tidal.com/v1";
+
+/// Rangs qu'une recherche TIDAL sert au plus, par catégorie, `offset` compris
+/// (#4803). python-tidal, `Session.search` : « While you can set the offset,
+/// there aren't more than 300 items available in a search. »
+/// `totalNumberOfItems` peut annoncer davantage ; l'API ne le sert pas.
+const PLAFOND_RECHERCHE_TIDAL: usize = 300;
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const LOGIN_BASE: &str = "https://login.tidal.com";
 /// tidalapi client — Device Code + refresh + playback work.
@@ -151,6 +157,9 @@ pub struct TidalService {
     /// ne peut pas être rempli — c'est exactement ce qui l'avait condamné.
     featured_cache: std::sync::Mutex<Option<FeaturedCache>>,
     enabled_override: Option<bool>,
+    /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
+    /// (#4803). `None` partout ailleurs : [`API_BASE`].
+    base_forcee: Option<String>,
 }
 
 impl Default for TidalService {
@@ -182,6 +191,7 @@ impl TidalService {
             device_auth_started: None,
             featured_cache: std::sync::Mutex::new(None),
             enabled_override: None,
+            base_forcee: None,
         }
     }
 
@@ -730,7 +740,8 @@ impl TidalService {
 
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let base = self.base_forcee.as_deref().unwrap_or(API_BASE);
+        let url = format!("{base}{path}");
         let resp = self
             .client
             .get(&url)
@@ -1328,6 +1339,86 @@ impl TidalService {
 
     /// Les playlists d'une réponse de recherche. Isolé de `search` pour être
     /// testable : le reste de l'extraction demande un aller-retour HTTP.
+    /// Les quatre listes d'une réponse `/search`, dans la forme que rendait
+    /// déjà [`StreamingService::search`] — la page et la recherche d'avant
+    /// lisent la réponse par le MÊME chemin.
+    fn resultats_de_recherche(data: &serde_json::Value) -> SearchResults {
+        let tracks = data["tracks"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default();
+        let albums = data["albums"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        let artists = data["artists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_artist).collect())
+            .unwrap_or_default();
+
+        SearchResults {
+            tracks,
+            albums,
+            artists,
+            playlists: Self::search_playlists(data),
+        }
+    }
+
+    /// Un refus que l'API rend EN JSON (`{"status": 429, "userMessage": …}`).
+    ///
+    /// [`Self::api_get`] lit le corps de toute réponse autre qu'un 401 : un
+    /// 429 y passe pour une réponse vide. Pour une page, ce serait « plus rien
+    /// à charger » — faux. Le message du 429 est celui de
+    /// `fetch_playback_info`.
+    fn refus_de_l_api(data: &serde_json::Value) -> Result<(), String> {
+        match data["status"].as_u64() {
+            Some(429) => Err("tidal rate limited".into()),
+            Some(status) if status >= 400 => Err(format!(
+                "tidal search {status}: {}",
+                data["userMessage"].as_str().unwrap_or("")
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// La page `depart` d'une réponse `/search`, avec ses totaux (#4803).
+    ///
+    /// Chaque catégorie de TIDAL porte `totalNumberOfItems`. Il peut dépasser
+    /// ce que l'API sert ([`PLAFOND_RECHERCHE_TIDAL`]) : `has_more` se juge
+    /// donc sur le plus petit des deux, et `truncated` dit que c'est le
+    /// plafond de l'API, pas le catalogue, qui arrête la suite. Une catégorie
+    /// sans total n'annonce aucune suite : on ne promet pas ce qu'on ne sait
+    /// pas servir. Une page vide non plus, quel que soit le total.
+    fn page_de_recherche(data: &serde_json::Value, depart: usize) -> SearchPage {
+        let total = |cle: &str| data[cle]["totalNumberOfItems"].as_u64().unwrap_or(0) as usize;
+        let totals = SearchTotals {
+            tracks: total("tracks"),
+            albums: total("albums"),
+            artists: total("artists"),
+            playlists: total("playlists"),
+        };
+        let results = Self::resultats_de_recherche(data);
+        let par_categorie = [
+            (results.tracks.len(), totals.tracks),
+            (results.albums.len(), totals.albums),
+            (results.artists.len(), totals.artists),
+            (results.playlists.len(), totals.playlists),
+        ];
+        let has_more = par_categorie.iter().any(|&(rendu, total)| {
+            rendu > 0 && depart + rendu < total.min(PLAFOND_RECHERCHE_TIDAL)
+        });
+        let truncated = par_categorie.iter().any(|&(rendu, total)| {
+            total > PLAFOND_RECHERCHE_TIDAL && depart + rendu >= PLAFOND_RECHERCHE_TIDAL
+        });
+        SearchPage {
+            results,
+            offset: depart,
+            totals,
+            has_more,
+            truncated,
+        }
+    }
+
     fn search_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
         data["playlists"]["items"]
             .as_array()
@@ -1608,25 +1699,50 @@ impl StreamingService for TidalService {
             ))
             .await?;
 
-        let tracks = data["tracks"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        let albums = data["albums"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_album).collect())
-            .unwrap_or_default();
-        let artists = data["artists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_artist).collect())
-            .unwrap_or_default();
+        Ok(Self::resultats_de_recherche(&data))
+    }
 
-        Ok(SearchResults {
-            tracks,
-            albums,
-            artists,
-            playlists: Self::search_playlists(&data),
-        })
+    /// La page de [`Self::search_page`] : 50, `0` (« Tous ») compris (#4803).
+    /// Explicite, et non hérité : le défaut du trait suit la limite du chemin
+    /// non paginé depuis la PR de la limite de #4803, et ce n'est pas la
+    /// page de ce service.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_sans_pagination(limit)
+    }
+
+    /// Une PAGE de la recherche TIDAL (#4803) : `limit` et `offset` de
+    /// `GET /v1/search`, les deux paramètres de pagination de l'API — ceux que
+    /// `get_playlist_tracks` envoie déjà à `/playlists/{id}/tracks`.
+    ///
+    /// Pages de 50 ([`limite_sans_pagination`]), et
+    /// [`Self::limite_de_page_recherche`] le dit à la route, pour que son
+    /// curseur avance sans trou.
+    ///
+    /// Au-delà de [`PLAFOND_RECHERCHE_TIDAL`] l'API ne sert plus rien, quel que
+    /// soit `totalNumberOfItems` : on rend la page vide SANS appel réseau.
+    ///
+    /// Les erreurs sont celles d'[`Self::api_get`] (jeton expiré : un
+    /// rafraîchissement puis un nouvel essai), plus un refus d'API rendu en
+    /// JSON — un 429 surtout —, qui devient une erreur au lieu d'une page vide
+    /// annonçant, à tort, la fin du catalogue.
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        if offset >= PLAFOND_RECHERCHE_TIDAL {
+            return Ok(SearchPage::au_dela(offset));
+        }
+        let borne = limite_sans_pagination(limit).min(PLAFOND_RECHERCHE_TIDAL - offset);
+        let data = self
+            .api_get(&format!(
+                "/search?query={}&limit={borne}&offset={offset}&types=TRACKS,ALBUMS,ARTISTS,PLAYLISTS",
+                urlencoding::encode(query)
+            ))
+            .await?;
+        Self::refus_de_l_api(&data)?;
+        Ok(Self::page_de_recherche(&data, offset))
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
@@ -4184,5 +4300,204 @@ mod tests {
         let element = TidalService::favori_date(&enveloppe, "artists").expect("un artiste");
         assert!(element.get("created_at").is_none());
         assert_eq!(element["name"], json!("Miles Davis"));
+    }
+}
+
+/*
+| #4803 — la recherche TIDAL pagine : `limit` et `offset` de `GET /v1/search`.
+|
+| Un serveur factice sur la boucle locale sert un catalogue de `total` pistes
+| (et rien au-delà du plafond de 300 de l'API), et NOTE chaque requête reçue.
+| Les témoins lisent ce qui est parti sur le fil, pas seulement ce qui revient :
+| un `offset` calculé et jamais envoyé rendrait la page 1 à chaque appel.
+*/
+#[cfg(test)]
+mod pagination_recherche_i4803 {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex as SyncMutex;
+
+    type Journal = Arc<SyncMutex<Vec<HashMap<String, String>>>>;
+
+    impl TidalService {
+        fn avec_base_forcee(base: String) -> Self {
+            let mut svc = Self::new();
+            svc.base_forcee = Some(base);
+            svc.tokens = Mutex::new(TokenState {
+                access_token: Some("jeton-essai".into()),
+                refresh_token: None,
+                token_expires: None,
+            });
+            svc
+        }
+    }
+
+    /// Un catalogue de `total_pistes` pistes pour toute requête, sauf
+    /// `query=quota`, qui rend le refus JSON d'un 429.
+    async fn faux_tidal(total_pistes: usize) -> (TidalService, Journal) {
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        async fn recherche(
+            State((journal, total)): State<(Journal, usize)>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            journal.lock().unwrap().push(q.clone());
+            if q.get("query").map(String::as_str) == Some("quota") {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({"status": 429, "subStatus": 0,
+                        "userMessage": "Rate limit exceeded"})),
+                )
+                    .into_response();
+            }
+            let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            let servi = total.min(PLAFOND_RECHERCHE_TIDAL);
+            let items: Vec<_> = (offset..(offset + limit).min(servi))
+                .map(|i| json!({"id": i + 1, "title": format!("piste {}", i + 1)}))
+                .collect();
+            let vide = json!({"limit": limit, "offset": offset,
+                "totalNumberOfItems": 0, "items": []});
+            axum::Json(json!({
+                "tracks": {"limit": limit, "offset": offset,
+                    "totalNumberOfItems": total, "items": items},
+                "albums": vide,
+                "artists": vide,
+                "playlists": vide,
+            }))
+            .into_response()
+        }
+
+        let journal: Journal = Arc::default();
+        let app = axum::Router::new()
+            .route("/search", get(recherche))
+            .with_state((journal.clone(), total_pistes));
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (
+            TidalService::avec_base_forcee(format!("http://{adresse}")),
+            journal,
+        )
+    }
+
+    fn ids(page: &SearchPage) -> Vec<String> {
+        page.results.tracks.iter().map(|t| t.id.clone()).collect()
+    }
+
+    fn envoye(journal: &Journal, rang: usize, cle: &str) -> Option<String> {
+        journal.lock().unwrap()[rang].get(cle).cloned()
+    }
+
+    #[tokio::test]
+    async fn la_premiere_page_envoie_offset_zero_et_annonce_la_suite() {
+        let (svc, journal) = faux_tidal(120).await;
+        let page = svc.search_page("coltrane", 50, 0).await.expect("page 1");
+
+        assert_eq!(envoye(&journal, 0, "offset").as_deref(), Some("0"));
+        assert_eq!(envoye(&journal, 0, "limit").as_deref(), Some("50"));
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(ids(&page)[0], "1");
+        assert_eq!(page.offset, 0);
+        assert_eq!(
+            page.totals.tracks, 120,
+            "le total de l'API, pas la longueur"
+        );
+        assert!(page.has_more, "70 pistes restent");
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn la_deuxieme_page_transmet_son_offset_a_l_api() {
+        let (svc, journal) = faux_tidal(120).await;
+        let page = svc.search_page("coltrane", 50, 50).await.expect("page 2");
+
+        assert_eq!(
+            envoye(&journal, 0, "offset").as_deref(),
+            Some("50"),
+            "sans offset envoyé, TIDAL rend la page 1 une deuxième fois"
+        );
+        assert_eq!(ids(&page).first().map(String::as_str), Some("51"));
+        assert_eq!(ids(&page).last().map(String::as_str), Some("100"));
+        assert_eq!(page.offset, 50);
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn la_derniere_page_n_annonce_plus_rien() {
+        let (svc, _) = faux_tidal(120).await;
+        let page = svc.search_page("coltrane", 50, 100).await.expect("page 3");
+
+        assert_eq!(page.results.tracks.len(), 20);
+        assert_eq!(ids(&page).last().map(String::as_str), Some("120"));
+        assert!(!page.has_more, "120 sur 120 : plus de « Charger plus »");
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn le_plafond_de_300_de_l_api_arrete_la_suite_et_le_dit() {
+        let (svc, journal) = faux_tidal(5000).await;
+        let page = svc.search_page("love", 50, 250).await.expect("page 6");
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(page.totals.tracks, 5000);
+        assert!(!page.has_more, "l'API ne sert rien au-delà du rang 300");
+        assert!(
+            page.truncated,
+            "c'est le plafond de l'API, pas le catalogue"
+        );
+
+        let au_dela = svc.search_page("love", 50, 300).await.expect("au-delà");
+        assert!(au_dela.results.tracks.is_empty());
+        assert!(!au_dela.has_more);
+        assert_eq!(journal.lock().unwrap().len(), 1, "au-delà : aucun appel");
+    }
+
+    #[tokio::test]
+    async fn tous_et_les_limites_extravagantes_valent_une_page_de_50() {
+        let (svc, journal) = faux_tidal(500).await;
+        svc.search_page("x", 0, 0).await.expect("Tous");
+        svc.search_page("x", 100_000, 0).await.expect("énorme");
+        assert_eq!(envoye(&journal, 0, "limit").as_deref(), Some("50"));
+        assert_eq!(envoye(&journal, 1, "limit").as_deref(), Some("50"));
+        assert_eq!(
+            svc.limite_de_page_recherche(0),
+            50,
+            "le curseur avance de 50"
+        );
+        assert_eq!(
+            svc.limite_de_page_recherche(100),
+            50,
+            "100 demandés, 50 servis : le curseur avance de 50, sans trou"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_429_est_une_erreur_pas_une_fin_de_catalogue() {
+        let (svc, _) = faux_tidal(120).await;
+        let err = svc.search_page("quota", 50, 50).await.unwrap_err();
+        assert!(
+            err.to_string().contains("rate limited"),
+            "un 429 lu comme page vide dirait has_more=false : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_recherche_sans_page_part_comme_avant_sans_offset() {
+        let (svc, journal) = faux_tidal(120).await;
+        let res = svc.search("coltrane", 30).await.expect("search");
+        assert_eq!(res.tracks.len(), 30);
+        assert_eq!(envoye(&journal, 0, "limit").as_deref(), Some("30"));
+        assert_eq!(
+            envoye(&journal, 0, "offset"),
+            None,
+            "sans paged=true, la requête d'avant #4803, intacte"
+        );
     }
 }
