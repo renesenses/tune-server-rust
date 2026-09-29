@@ -287,7 +287,7 @@ async fn la_borne_limit_est_tenue() {
     assert_eq!(pistes.len(), 1);
 }
 
-/// Tidal, Bandcamp… ne connaissent pas leurs artistes similaires : refus
+/// Un service qui ne connaît pas ses artistes similaires (Bandcamp, Spotify…) : refus
 /// explicite, pas une liste vide.
 #[tokio::test]
 async fn un_service_sans_similarite_recoit_un_501() {
