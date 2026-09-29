@@ -239,6 +239,10 @@ pub async fn list(
             "fields": [{"key": "arl", "label": tr("svctok.deezer.fieldArl"), "type": "password"}],
             "help_url": "/streaming/deezer",
             "help_steps": [tr("svctok.deezer.step1"), tr("svctok.deezer.step2"), tr("svctok.deezer.step3")],
+            // #5427 — ce serveur remet l'ARL enregistré ici au service de
+            // streaming et répond `etat`. Le client web n'offre le champ ARL
+            // sur la carte Streaming que s'il lit ce drapeau.
+            "arl_streaming": true,
         }),
     ];
     Json(json!(services))
@@ -362,20 +366,28 @@ async fn enregistrer_arl_deezer(
             );
             json!({
                 "valid": true,
+                "etat": "accepte",
                 "validation_message": tr("svctok.deezer.connected")
                     .replace("{user}", status.username.as_deref().unwrap_or("?")),
             })
         }
         Ok(_) => json!({
             "valid": false,
+            "etat": "refuse",
             "validation_message": tr("svctok.err.generic")
                 .replace("{error}", "Deezer n'a ouvert aucune session"),
         }),
         Err(e) => {
             let raison = e.to_string();
             tracing::warn!(error = %raison, "deezer_arl_saisi_refuse");
+            let etat = if raison.starts_with(tune_core::streaming::deezer::ARL_INJOIGNABLE) {
+                "injoignable"
+            } else {
+                "refuse"
+            };
             json!({
                 "valid": false,
+                "etat": etat,
                 "validation_message": tr("svctok.err.generic").replace("{error}", &raison),
             })
         }
@@ -507,7 +519,70 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> im
     // Also remove from streaming_auth table (saved by validate_and_save)
     let svc_mgr = ServicesManager::with_backend(state.backend.clone());
     svc_mgr.delete_token(&id).ok();
+    // #5427 — l'ARL vit dans le service de streaming : « Supprimer » le
+    // déconnecte, et la ligne persistée est réécrite sans identifiant.
+    if id == "deezer" {
+        let svc = state.services.lock().await.get("deezer");
+        if let Some(svc) = svc {
+            svc.write().await.logout().await.ok();
+        }
+        state.save_tokens().await;
+    }
     StatusCode::NO_CONTENT
+}
+
+/// #5427 — au démarrage, après la restauration des sessions.
+///
+/// 1. Les anciennes copies de l'ARL (`settings.deezer_arl`, ligne `deezer`
+///    de `streaming_auth`), écrites par « Accès et jetons » jusqu'à la
+///    v0.9.168 et lues par personne, sont effacées.
+/// 2. Si Deezer n'a aucune session, l'ARL est pris dans `TUNE_DEEZER_ARL`
+///    (`.env.tune.example` l'annonce) ou, à défaut, dans l'ancienne copie :
+///    l'ARL que l'utilisateur a saisi avant ce correctif sert enfin.
+///
+/// ⛔ La valeur de l'ARL n'est jamais journalisée.
+pub async fn amorcer_arl_deezer(state: &AppState, arl_env: Option<&str>) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let svc_mgr = ServicesManager::with_backend(state.backend.clone());
+
+    let ancienne_copie = settings
+        .get("deezer_arl")
+        .ok()
+        .flatten()
+        .or_else(|| svc_mgr.get_credential("deezer", "arl"))
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    let ancienne_copie_presente =
+        ancienne_copie.is_some() || svc_mgr.load_token("deezer").ok().flatten().is_some();
+    if ancienne_copie_presente {
+        settings.delete("deezer_arl").ok();
+        svc_mgr.delete_token("deezer").ok();
+        tracing::info!("deezer_arl_anciennes_copies_effacees");
+    }
+
+    let Some(svc) = state.services.lock().await.get("deezer") else {
+        return;
+    };
+    if svc.read().await.auth_status().await.authenticated {
+        return;
+    }
+    let (arl, origine) = match arl_env.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => (a.to_string(), "TUNE_DEEZER_ARL"),
+        None => match ancienne_copie {
+            Some(a) => (a, "ancienne_copie"),
+            None => return,
+        },
+    };
+    let resultat = svc.write().await.authenticate(&json!({ "arl": arl })).await;
+    state.save_tokens().await;
+    match resultat {
+        Ok(status) => tracing::info!(
+            origine,
+            authentifie = status.authenticated,
+            "deezer_arl_amorce"
+        ),
+        Err(e) => tracing::warn!(origine, error = %e, "deezer_arl_amorce_refuse"),
+    }
 }
 
 /// Step 1: generate a Last.fm auth token and return the auth URL.
