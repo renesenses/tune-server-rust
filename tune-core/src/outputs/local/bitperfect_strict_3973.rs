@@ -175,4 +175,14 @@ fn enchainement_3973_la_boucle_gapless_sort_avant_de_convertir() {
         decision < conversion,
         "la règle doit trancher AVANT le rééchantillonnage"
     );
+    // #5416 — le seul chemin de la frontière qui ne consulte pas la règle
+    // (même cadence source, conversion déjà en cours) est fermé au strict.
+    let raccourci = src[corps..]
+        .find("letmeme_source_deja_convertie=")
+        .expect("le raccourci #5416 de la frontière");
+    assert!(
+        src[corps + raccourci..].starts_with("letmeme_source_deja_convertie=!regles.strict&&"),
+        "le raccourci #5416 doit exclure le bit-perfect strict en premier"
+    );
+    assert!(raccourci < conversion);
 }
