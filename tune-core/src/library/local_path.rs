@@ -196,7 +196,7 @@ fn merite_un_parcours(stored: &str) -> bool {
 ///
 /// `None` pour tout ce qui n'est pas absolu, `C:Musique` (relatif au
 /// répertoire courant du lecteur) compris.
-fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
+pub(crate) fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
     if let Some(reste) = stored.strip_prefix('/') {
         return Some(("/".to_string(), reste, '/'));
     }
