@@ -1927,7 +1927,8 @@ async fn spawn_library_scan_avec_lecteur(
                 ecartes: &files_ecartes,
             },
         )
-        .with_force_artwork(force);
+        .with_force_artwork(force)
+        .avec_pochettes_differees();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
@@ -2292,6 +2293,17 @@ async fn spawn_library_scan_avec_lecteur(
                     }
                 }
                 drop(sqlite_write_guard);
+
+                // #5202 — les pochettes du lot relisent le disque : APRÈS le
+                // COMMIT, chaque lecture sous délai, arrêt compris.
+                {
+                    let mut lectures = crate::lecture_bornee::LecturesBornees::new(
+                        delai_credits,
+                        &scan_cancel_requested,
+                    );
+                    let a_poser = importer.traiter_les_pochettes_differees(&mut lectures, batch_idx);
+                    crate::scan_import::poser_les_pochettes_de_piste(&db, &a_poser);
+                }
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;
