@@ -24,15 +24,25 @@
 //!
 //! La route traitée (`Processed*`, anneau flottant) n'enchaîne pas : le bras
 //! le déclare dès l'ouverture (`chain_exhausted`), le sondeur n'arme pas.
+//!
+//! #5451 — le bras CoreAudio exclusif (macOS, `bras_coreaudio.rs`) enchaîne
+//! par la MÊME poursuite : elle est générique sur [`EtageDeLaChaine`], que
+//! l'étage natif d'ASIO et l'étage flottant au format identité de CoreAudio
+//! ([`EtageDeConversion`]) implémentent l'un et l'autre. `bras_coreaudio.rs`
+//! ne se compile que sous macOS ; ce module, lui, est jugé sur Linux.
 
 use std::io::Read;
 
-use super::chaine_native::{FinDeChaine, IssueDeLaChaine, ReserveDeLaChaine, accepter_la_suivante};
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
+use super::BlocDecode;
+use super::chaine_native::{
+    FinDeChaine, FrontiereExclusive, IssueDeLaChaine, ReserveDeLaChaine, accepter_la_suivante,
+};
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 use super::etage_natif::{EcritureNative, EtageNatif};
 use super::*;
-use super::{
-    BlocDecode, BoucleProducteur, CompteursDePiste, Etage, FinDeBoucle, PousseeVersLePuits,
-};
+use super::{BoucleProducteur, CompteursDePiste, Etage, FinDeBoucle, PousseeVersLePuits};
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 use crate::outputs::traits::{PuitsNatif, TransformationsReelles};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -44,6 +54,7 @@ use crate::outputs::traits::{PuitsNatif, TransformationsReelles};
 /// (`publish_windows_signal_path_status`, journal
 /// `windows_exclusive_signal_contract` — au premier bloc, puis à chaque
 /// changement de verdict).
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 pub(super) struct ContratDuSignal<'a> {
     pub(super) signal_path_status: &'a std::sync::Mutex<Option<OutputSignalPathStatus>>,
     pub(super) transport_natif: bool,
@@ -59,6 +70,7 @@ pub(super) struct ContratDuSignal<'a> {
     pub(super) bit_perfect_state: Option<bool>,
 }
 
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 impl ContratDuSignal<'_> {
     pub(super) fn publier(&mut self, dop: bool, bit_perfect: bool) {
         if self.dop_active.swap(dop, Ordering::SeqCst) != dop {
@@ -98,11 +110,13 @@ impl ContratDuSignal<'_> {
 
 /// Le bloc que l'observateur de la boucle voit sur la route native : ce que
 /// `EtageNatif::decoder_et_pousser` vient de pousser.
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 pub(super) struct BlocNatif {
     echantillons: usize,
     non_nul: bool,
 }
 
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 impl BlocDecode for BlocNatif {
     fn nb_echantillons(&self) -> usize {
         self.echantillons
@@ -127,6 +141,7 @@ impl BlocDecode for BlocNatif {
 /// octets reçus jusqu'à la poussée. La fermeture `refuser_le_porteur_dop` est
 /// reçue et ignorée : la route native ne refuse rien, elle porte le DoP et le
 /// dit.
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 pub(super) struct EtageNatifAsio<'a> {
     pub(super) etage: EtageNatif<'a>,
     pub(super) recu: Vec<u8>,
@@ -136,6 +151,7 @@ pub(super) struct EtageNatifAsio<'a> {
     pub(super) reliquat_force_brut: Option<u64>,
 }
 
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 impl Etage for EtageNatifAsio<'_> {
     type Puits<'p> = dyn PuitsNatif + 'p;
     type Bloc = BlocNatif;
@@ -227,14 +243,14 @@ impl Etage for EtageNatifAsio<'_> {
 /// le bras, la pompe HTTP (`SourcePompee`), qui garde le fil du périphérique
 /// hors du réseau. `trames` : les trames déjà poussées de la piste courante.
 ///
-/// Le reliquat 24 bits de CHAQUE piste part brut à sa fin de flux, la
-/// dernière comprise : l'appelant ne le refait pas. La queue du DSP, le
+/// Le geste de fin de flux de CHAQUE piste ([`EtageDeLaChaine::finir_la_piste`])
+/// est fait ici, la dernière comprise : l'appelant ne le refait pas. La queue du DSP, le
 /// signal de fin naturelle et le vidage restent au bras, à la fin de la
 /// chaîne — comme sur le bras WASAPI.
-pub(super) fn poursuivre_la_chaine_par_la_boucle<R, S>(
+pub(super) fn poursuivre_la_chaine_par_la_boucle<R, S, E>(
     reserve: &mut R,
-    etage: &mut EtageNatifAsio<'_>,
-    puits: &mut dyn PuitsNatif,
+    etage: &mut E,
+    puits: &mut E::Puits<'_>,
     producteur: &BoucleProducteur<'_>,
     tampon: &mut [u8],
     mut sourcer: impl FnMut(R::Lecteur) -> S,
@@ -243,18 +259,18 @@ pub(super) fn poursuivre_la_chaine_par_la_boucle<R, S>(
 where
     R: ReserveDeLaChaine,
     S: Read,
+    E: EtageDeLaChaine,
 {
     let mut trames = trames;
     let mut pistes_enchainees = 0u32;
     // La route native ne refuse aucun porteur : elle porte le DoP et le dit.
     let mut ne_rien_refuser = |_: bool, _: u32, _: u16| false;
     loop {
-        // Fin de flux de la piste courante : le reliquat part brut.
-        etage.vider(&mut *puits);
-        if let Some(reliquat) = etage.reliquat_force_brut.take() {
-            trames += reliquat;
-        }
-        let (lecteur, entete) = match accepter_la_suivante(reserve, &mut etage.etage) {
+        // Fin de flux de la piste courante : son geste de fin (ASIO : le
+        // reliquat 24 bits part brut ; CoreAudio : la sonde incomplète est
+        // rapportée, comme à l'EOF d'avant #5451).
+        trames += etage.finir_la_piste(&mut *puits);
+        let (lecteur, entete) = match accepter_la_suivante(reserve, etage) {
             Ok(acceptee) => acceptee,
             Err(fin) => {
                 return IssueDeLaChaine {
@@ -308,5 +324,91 @@ where
                 };
             }
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Les étages qui savent enchaîner.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Un étage que [`poursuivre_la_chaine_par_la_boucle`] sait faire passer
+/// d'une piste à la suivante sans refermer le puits : la frontière
+/// ([`FrontiereExclusive`]) plus le geste de fin de flux de chaque piste.
+pub(super) trait EtageDeLaChaine: Etage + FrontiereExclusive {
+    /// Fin de flux d'une piste, avant la frontière. Rend les trames source
+    /// poussées par ce geste (elles comptent dans la position).
+    fn finir_la_piste(&mut self, puits: &mut Self::Puits<'_>) -> u64;
+}
+
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
+impl FrontiereExclusive for EtageNatifAsio<'_> {
+    fn spec_courante(&self) -> AudioSpec {
+        self.etage.spec()
+    }
+
+    fn enchainer_a_format_egal(
+        &mut self,
+        suivante: AudioSpec,
+    ) -> Result<(), super::enchainement_exclusif::EnchainementNatif> {
+        self.etage.enchainer_la_piste(suivante)
+    }
+}
+
+/// ASIO, route native : le reliquat 24 bits jamais classé part brut
+/// (`vider`), et ses trames comptent.
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
+impl EtageDeLaChaine for EtageNatifAsio<'_> {
+    fn finir_la_piste(&mut self, puits: &mut (dyn PuitsNatif + '_)) -> u64 {
+        self.vider(puits);
+        self.reliquat_force_brut.take().unwrap_or(0)
+    }
+}
+
+/// #5451 — l'étage flottant du bras CoreAudio exclusif, monté au format
+/// IDENTITÉ (`bras_coreaudio.rs` : la sortie est ouverte à la cadence, à la
+/// profondeur et aux canaux de la source, contrat physique vérifié). Même
+/// règle de frontière que les bras Windows : à format égal, la suivante
+/// entre dans l'anneau ouvert ; sinon on rouvre.
+///
+/// À format égal, rien n'est rendu au puits ici : la queue du DSP et l'état
+/// du convolveur font partie du flux continu, comme sur le chemin partagé à
+/// format identique. Ce qui change : la sonde DoP/PCM repart de zéro pour la
+/// nouvelle piste (comme en début de piste), et les octets non alignés de la
+/// piste finie sont jetés — l'EOF d'avant #5451 les jetait aussi.
+#[cfg(any(target_os = "macos", test))]
+impl FrontiereExclusive for EtageDeConversion<'_> {
+    fn spec_courante(&self) -> AudioSpec {
+        self.spec
+    }
+
+    fn enchainer_a_format_egal(
+        &mut self,
+        suivante: AudioSpec,
+    ) -> Result<(), super::enchainement_exclusif::EnchainementNatif> {
+        use super::enchainement_exclusif::{EnchainementNatif, decider_l_enchainement_natif};
+        // Un étage qui convertit n'est pas celui d'un transport exclusif : il
+        // n'enchaîne pas par ici (le chemin partagé a sa propre frontière).
+        if self.needs_resample || self.needs_channel_adapt() {
+            return Err(EnchainementNatif::Rouvrir);
+        }
+        match decider_l_enchainement_natif(self.spec, self.sortie, suivante) {
+            EnchainementNatif::Rouvrir => Err(EnchainementNatif::Rouvrir),
+            EnchainementNatif::Enchainer => {
+                self.en_attente.clear();
+                self.pcm_kind = LocalPcmKind::for_bit_depth(suivante.profondeur().bits_declares());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// #5451 — CoreAudio : à l'EOF, une sonde 24 bits restée incomplète est
+/// RAPPORTÉE (`report_incomplete_local_pcm_probe`), exactement ce que le bras
+/// faisait à la fin de sa piste unique. Aucune trame n'est poussée.
+#[cfg(any(target_os = "macos", test))]
+impl EtageDeLaChaine for EtageDeConversion<'_> {
+    fn finir_la_piste(&mut self, _puits: &mut (dyn PuitsDEchantillons + '_)) -> u64 {
+        report_incomplete_local_pcm_probe(self.pcm_kind, self.en_attente.len());
+        0
     }
 }
