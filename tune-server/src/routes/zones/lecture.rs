@@ -359,6 +359,8 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let audio_backend = tune_core::outputs::local::active_backend_name(&audio_backend_pref);
     #[cfg(not(feature = "local-audio"))]
     let audio_backend = "none";
+    // #5353 — le backend CHOISI, face auquel une sortie est signalée.
+    let backend_configure = state.effective_audio_backend();
     let mut result = Vec::new();
     for z in &zones {
         let zone_id = z.id.unwrap_or(0);
@@ -432,12 +434,12 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             };
             inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
             // #5353 — le backend de CETTE sortie, pas celui du processus.
-            let audio_backend_de_la_zone = super::backend_affiche_de_la_zone(
-                &state,
-                z.output_device_id.as_deref(),
-                audio_backend,
-            )
-            .await;
+            let backend_sortie =
+                super::backend_de_la_sortie_de_la_zone(&state, z.output_device_id.as_deref()).await;
+            let audio_backend_de_la_zone =
+                super::backend_affiche_pour_la_sortie(audio_backend, backend_sortie.as_deref());
+            // #5353 — décision du 29/09 : jouable, mais SIGNALÉE.
+            super::injecter_backend_de_sortie(obj, &backend_configure, backend_sortie.as_deref());
             let signal_path = build_signal_path(
                 &ps,
                 z,
@@ -616,12 +618,18 @@ pub(super) async fn get_zone(
                 };
                 inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
                 // #5353 — voir la note au site jumeau (`list_zones`).
-                let audio_backend_de_la_zone = super::backend_affiche_de_la_zone(
+                let backend_sortie = super::backend_de_la_sortie_de_la_zone(
                     &state,
                     zone.output_device_id.as_deref(),
-                    audio_backend,
                 )
                 .await;
+                let audio_backend_de_la_zone =
+                    super::backend_affiche_pour_la_sortie(audio_backend, backend_sortie.as_deref());
+                super::injecter_backend_de_sortie(
+                    obj,
+                    &state.effective_audio_backend(),
+                    backend_sortie.as_deref(),
+                );
                 let signal_path = build_signal_path(
                     &ps,
                     &zone,
