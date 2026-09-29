@@ -518,7 +518,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // Progress telemetry for the auto/startup scan (parity with the manual
         // scan) so the UI shows a live bar during it too.
-        let scan_total = files_to_scan.len() as i64;
+        // #5371 — le numérateur (`inserted + updated + skipped`) part de
+        // `pre_skipped` : les fichiers inchangés, écartés avant lecture, y sont
+        // comptés. Le dénominateur doit donc les compter aussi, comme le scan
+        // manuel (`total = total_to_scan + pre_skipped`). Sans eux, Tades a vu
+        // « 438 443 fichiers sur 41 166 — 100 % » pendant un scan en cours.
+        let scan_total = (files_to_scan.len() + pre_skipped) as i64;
         let scan_timer_start = std::time::Instant::now();
         let mut last_progress_emit = scan_timer_start;
 
@@ -3167,3 +3172,7 @@ mod surveillant_retouche_garde_l_identifiant_tests_5341;
 #[cfg(test)]
 #[path = "surveillant_metadonnees_tests_5346.rs"]
 mod surveillant_metadonnees_tests_5346;
+
+#[cfg(test)]
+#[path = "compteur_demarrage_tests_5371.rs"]
+mod compteur_demarrage_tests_5371;
