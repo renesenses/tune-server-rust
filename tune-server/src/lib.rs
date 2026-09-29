@@ -28,6 +28,7 @@ pub mod gel_executeur;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
+mod lecture_bornee;
 pub mod lien_de_partage;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
