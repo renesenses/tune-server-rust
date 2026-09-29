@@ -159,7 +159,7 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
     info!(server_id = %server_id, "server disconnected");
 }
 
-async fn handle_server_message(state: &RelayState, server_id: &str, text: &str) {
+pub(crate) async fn handle_server_message(state: &RelayState, server_id: &str, text: &str) {
     // Les morceaux audio passent AVANT l'analyse JSON : `BINARY:<id>:<base64>`
     // n'est pas du JSON, donc `parse_message_type` rend `None` et la trame
     // etait jetee sans un mot. C'est par la que tout le son disparaissait.
