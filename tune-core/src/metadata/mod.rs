@@ -2355,7 +2355,9 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         format,
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
-            .map(|m| m.len()),
+            .map(|m| m.len())
+            // #5299 — fichier rangé dans une image ISO : sa taille propre.
+            .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
         duration_ms: Some(props.duration().as_millis() as u64),
@@ -2459,7 +2461,9 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         format: Some(ext),
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
-            .map(|m| m.len()),
+            .map(|m| m.len())
+            // #5299 — fichier rangé dans une image ISO : sa taille propre.
+            .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         sample_rate: sonde.sample_rate,
         channels: sonde.channels,
         duration_ms: sonde.duration_ms,
@@ -2531,7 +2535,9 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         format: Some(ext),
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
-            .map(|m| m.len()),
+            .map(|m| m.len())
+            // #5299 — fichier rangé dans une image ISO : sa taille propre.
+            .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         sample_rate: None,
         channels: Some(2),
         duration_ms: None,
@@ -3323,10 +3329,43 @@ mod coffret_multicanal_tests_4846;
 #[cfg(test)]
 mod label_tests_4836;
 
-fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
+/// Les balises d'un fichier, lues par lofty sans charger les images.
+///
+/// Les deux lectures de balises du scan (`try_read_metadata_unsanitized`,
+/// `read_extended_metadata`) passent par ici. `.read_cover_art(false)` : lofty
+/// chargerait sinon tout le bloc PICTURE en mémoire pour CHAQUE fichier, et une
+/// image énorme multipliée par la concurrence du scan (jusqu'à 32 lectures à la
+/// fois) a déjà envoyé le serveur à l'OOM (JeromeQ : 261 fichiers → 6,1 Go ;
+/// .15 : 31 115 fichiers → ~14 Go). La pochette est extraite à part, par
+/// `artwork::get_or_extract`.
+///
+/// #5299 — un fichier rangé dans une image ISO (`image.iso!/…`) est lu par le
+/// lecteur interne de l'image ; tout autre chemin garde `Probe::open`.
+fn sonder_balises(path: &Path) -> lofty::error::Result<lofty::file::TaggedFile> {
     use lofty::config::{ParseOptions, ParsingMode};
-    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
+    fn lire<R: std::io::Read + std::io::Seek>(
+        p: Probe<R>,
+    ) -> lofty::error::Result<lofty::file::TaggedFile> {
+        p.options(
+            ParseOptions::new()
+                .parsing_mode(ParsingMode::Relaxed)
+                .max_junk_bytes(1024 * 1024)
+                .read_cover_art(false),
+        )
+        .guess_file_type()?
+        .read()
+    }
+    match crate::audio::iso9660::ouvrir_si_virtuel(path) {
+        Some(lecteur) => lecteur
+            .map_err(lofty::error::LoftyError::from)
+            .and_then(|l| lire(Probe::new(std::io::BufReader::new(l)))),
+        None => Probe::open(path).and_then(lire),
+    }
+}
+
+fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
+    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
 
     // Matroska AVANT lofty : lofty ne connaît pas ce conteneur, et l'y passer
@@ -3338,26 +3377,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         return matroska_metadata(path);
     }
 
-    let tagged = match Probe::open(path).and_then(|p| {
-        p.options(
-            ParseOptions::new()
-                .parsing_mode(ParsingMode::Relaxed)
-                .max_junk_bytes(1024 * 1024)
-                // Don't load embedded cover art in the tag pass: lofty otherwise
-                // reads the whole PICTURE block into memory, and a huge/malformed
-                // embedded image, multiplied by the scan's concurrency (up to 32
-                // reads at once), spikes the scanner past the OOM killer (JeromeQ:
-                // 261 files → 6.1 GB RSS → tune-server killed, black screen). The
-                // cover is extracted separately, sequentially, by
-                // `artwork::get_or_extract` when the album needs one, so artwork
-                // is unaffected. (has_cover becomes false here — it has no
-                // consumers beyond serialization; the album cover_path is the
-                // real signal.)
-                .read_cover_art(false),
-        )
-        .guess_file_type()?
-        .read()
-    }) {
+    let tagged = match sonder_balises(path) {
         Ok(t) => t,
         Err(e) => {
             // Try DSF/DFF fallback first
@@ -3633,7 +3653,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         }),
         file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
             .ok()
-            .map(|m| m.len()),
+            .map(|m| m.len())
+            // #5299 — fichier rangé dans une image ISO : sa taille propre.
+            .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         bpm,
         compilation,
         label: label_du_tag(&get),
@@ -3678,32 +3700,12 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
 /// This extracts tags like composer, conductor, lyricist, performer, remixer,
 /// ReplayGain values, MusicBrainz IDs, and other extended fields.
 pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
-    use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
-    use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
 
     let mut meta = HashMap::new();
 
-    let tagged = match Probe::open(path).and_then(|p| {
-        p.options(
-            ParseOptions::new()
-                .parsing_mode(ParsingMode::Relaxed)
-                .max_junk_bytes(1024 * 1024)
-                // Don't load embedded cover art: this pass only reads text tags
-                // (sort orders, credits, ISRC, lyrics…) via get_string and never
-                // touches the picture. Without this, lofty reads the whole PICTURE
-                // block into memory for EVERY file the scanner processes (called
-                // per file in auto_scan's batch callback), and a huge/malformed
-                // embedded image spikes RSS past the OOM killer — the same failure
-                // try_read_metadata was hardened against (#JeromeQ), which this
-                // second read path was missing (.15: 31 115 new files → ~14 GB RSS
-                // → OOM crash-loop). Cover extraction stays in artwork::get_or_extract.
-                .read_cover_art(false),
-        )
-        .guess_file_type()?
-        .read()
-    }) {
+    let tagged = match sonder_balises(path) {
         Ok(t) => t,
         Err(_) => return meta,
     };

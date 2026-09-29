@@ -1104,10 +1104,34 @@ async fn resolve_albums(
     profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
-        load_collection_criteria(&state, id)?
-    else {
+    let Some(albums) = albums_de_la_collection(&state, id, profile.id()).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    // Return a bare array, matching the regular collections endpoint
+    // (GET /library/collections/{id}/albums). The previous {"albums":[…],
+    // "total":N} wrapper made the iOS client fail to decode
+    // (DecodingError.typeMismatch: expected Array, found dictionary) when
+    // opening a smart collection in remote mode; the web client already
+    // accepts either shape.
+    Ok(Json(albums).into_response())
+}
+
+/// Les albums d'une collection pour un profil, tels que la vue les rend :
+/// bibliothèque, favoris et étiquettes de service, catalogue. `None` si la
+/// collection n'existe pas.
+///
+/// UNE résolution, partagée par la route et par le partage d'une collection
+/// avec un cercle (Tune Circle T3, #5326) : ce qu'un contact reçoit est ce que
+/// le propriétaire voit, sans copie de la logique.
+async fn albums_de_la_collection(
+    state: &SmartHttpState,
+    id: i64,
+    profile_id: i64,
+) -> Result<Option<Vec<Value>>, AppError> {
+    let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
+        load_collection_criteria(state, id)?
+    else {
+        return Ok(None);
     };
 
     // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
@@ -1115,7 +1139,7 @@ async fn resolve_albums(
     // `Send` et axum refuse le handler.
     let (where_clause, order, limit_clause) = {
         let resolver = DbRefResolver::new(&state.backend);
-        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let ctx = RefCtx::root(&resolver, Some(profile_id));
         build_album_query(
             &rules_json,
             &match_mode,
@@ -1125,26 +1149,93 @@ async fn resolve_albums(
             &ctx,
         )
     };
-    let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+    let albums = execute_album_query(state, &where_clause, &order, &limit_clause)?;
     let albums = avec_albums_de_service(
-        &state,
+        state,
         albums,
         &rules_json,
         &match_mode,
-        profile.id(),
+        profile_id,
         &sort_by,
         &sort_order,
         max_limit,
     )?;
-    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
+    let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
+    Ok(Some(albums))
+}
 
-    // Return a bare array, matching the regular collections endpoint
-    // (GET /library/collections/{id}/albums). The previous {"albums":[…],
-    // "total":N} wrapper made the iOS client fail to decode
-    // (DecodingError.typeMismatch: expected Array, found dictionary) when
-    // opening a smart collection in remote mode; the web client already
-    // accepts either shape.
-    Ok(Json(albums).into_response())
+/// Un album d'une collection intelligente, vu par qui la PARTAGE avec un
+/// cercle (Tune Circle T3, #5326).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlbumPartage {
+    /// Un album de la bibliothèque : son identifiant local, celui que
+    /// `library_sync` pousse dans la copie en ligne.
+    Local(i64),
+    /// Un album de service (favori, étiquette, catalogue) : une RÉFÉRENCE,
+    /// jamais une pochette ni une adresse.
+    DeService {
+        source: String,
+        source_id: String,
+        title: String,
+        artist_name: Option<String>,
+    },
+}
+
+/// Une collection intelligente résolue pour un partage : son nom et ses albums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionPartagee {
+    pub nom: String,
+    pub albums: Vec<AlbumPartage>,
+}
+
+/// Résout la collection `id` pour le profil `profile_id`, avec le même moteur
+/// que `GET /smart-collections/{id}/albums` (Tune Circle T3, #5326).
+///
+/// `Ok(None)` : la collection n'existe pas. `Err` : la résolution a échoué
+/// (base, règle de catalogue refusée) — l'appelant ne pousse rien plutôt
+/// qu'une liste fausse.
+pub async fn resoudre_pour_partage(
+    state: &SmartHttpState,
+    id: i64,
+    profile_id: i64,
+) -> Result<Option<CollectionPartagee>, String> {
+    let nom = state
+        .backend
+        .query_one(
+            "SELECT name FROM smart_collections WHERE id = $1",
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_default();
+    let Some(albums) = albums_de_la_collection(state, id, profile_id)
+        .await
+        .map_err(|e| e.message)?
+    else {
+        return Ok(None);
+    };
+    let albums = albums
+        .iter()
+        .filter_map(|a| {
+            if let Some(id) = a["id"].as_i64() {
+                return Some(AlbumPartage::Local(id));
+            }
+            let texte = |cle: &str| {
+                a[cle]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            Some(AlbumPartage::DeService {
+                source: texte("source")?,
+                source_id: texte("source_id")?,
+                title: texte("title")?,
+                artist_name: texte("artist_name"),
+            })
+        })
+        .collect();
+    Ok(Some(CollectionPartagee { nom, albums }))
 }
 
 async fn preview_albums(
@@ -2214,5 +2305,103 @@ mod tests {
             assert!(col["track_count"].is_null(), "{col}");
             assert_eq!(col["track_count_partiel"], true, "{col}");
         }
+    }
+
+    /// Tune Circle T3 (#5326) — la résolution d'un PARTAGE est celle de la
+    /// vue : les albums de la bibliothèque par leur identifiant local, les
+    /// favoris de service en références, et une règle changée change le
+    /// résultat. Le profil qui résout est celui qu'on passe.
+    #[tokio::test]
+    async fn le_partage_resout_comme_la_vue_et_suit_la_regle() {
+        use crate::SmartHttpState;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS smart_collections (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
+                     match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                 CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);
+                 INSERT INTO artists (id, name) VALUES (1, 'Miles Davis');
+                 INSERT INTO albums (id, title, artist_id, year) VALUES
+                     (10, 'Kind of Blue', 1, 1959), (11, 'Bitches Brew', 1, 1970);
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, year) VALUES
+                     (100, 'So What', 10, 1, '/m/a.flac', 1959),
+                     (101, 'Spanish Key', 11, 1, '/m/b.flac', 1970);
+                 INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title, artist, cover_url)
+                     VALUES (7, 'album', 'qobuz', 'q-123', 'A Love Supreme', 'John Coltrane', 'https://img/x.jpg'),
+                            (1, 'album', 'qobuz', 'q-999', 'Autre profil', 'X', NULL);",
+            )
+            .expect("données");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        backend
+            .execute(
+                "INSERT INTO smart_collections (id, name, rules, match_mode, sort_by, sort_order) \
+                 VALUES (1, 'Années 50', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"year","op":"<","value":"1960"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection");
+        backend
+            .execute(
+                "INSERT INTO smart_collections (id, name, rules, match_mode, sort_by, sort_order) \
+                 VALUES (2, 'Qobuz', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"source","op":"=","value":"qobuz"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection de service");
+        let etat = SmartHttpState::new(backend.clone());
+
+        let c = super::resoudre_pour_partage(&etat, 1, 7)
+            .await
+            .unwrap()
+            .expect("la collection existe");
+        assert_eq!(c.nom, "Années 50");
+        assert_eq!(c.albums, vec![super::AlbumPartage::Local(10)]);
+
+        // La règle change : le résultat suit, sans rien d'autre à toucher.
+        backend
+            .execute(
+                "UPDATE smart_collections SET rules = ?1 WHERE id = 1",
+                &[&r#"[{"field":"year","op":">","value":"1960"}]"# as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let c = super::resoudre_pour_partage(&etat, 1, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.albums, vec![super::AlbumPartage::Local(11)]);
+
+        // Les favoris de service : des références, du PROFIL passé, jamais la
+        // pochette.
+        let c = super::resoudre_pour_partage(&etat, 2, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            c.albums,
+            vec![super::AlbumPartage::DeService {
+                source: "qobuz".into(),
+                source_id: "q-123".into(),
+                title: "A Love Supreme".into(),
+                artist_name: Some("John Coltrane".into()),
+            }]
+        );
+
+        // Inexistante : `None`, pas une liste vide.
+        assert!(
+            super::resoudre_pour_partage(&etat, 99, 7)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
