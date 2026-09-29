@@ -95,7 +95,7 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                         && !super::is_tune_temp_file(path)
                     {
                         let _ = event_tx.send(FileChange {
-                            change_type: ct.clone(),
+                            change_type: genre_d_un_fichier(&event.kind, path, &ct),
                             path: path.to_string_lossy().to_string(),
                         });
                     }
@@ -153,6 +153,29 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
         Err(e) => {
             warn!(error = %e, "watcher_error");
         }
+    }
+}
+
+/// #4896 — le genre d'un événement portant sur un fichier audio (ou une
+/// feuille CUE).
+///
+/// Un RENOMMAGE (`Modify(Name)`) arrive pour l'ancien nom comme pour le
+/// nouveau — Windows `Name(From)`/`Name(To)`, macOS `Name(Any)` deux fois,
+/// Linux `Name(From)`/`Name(To)`/`Name(Both)`. Il était traduit en
+/// `Modified` des deux côtés ; or l'ancien nom n'existe plus : l'attente
+/// d'écriture stable le jetait comme transitoire, et sa ligne restait en base
+/// jusqu'au scan suivant, sous un chemin mort, à côté de la ligne du nouveau
+/// nom. Sous macOS, mettre UN fichier à la corbeille est aussi un
+/// `Name(Any)` : il ne disparaissait pas davantage. Un nom qui n'existe plus
+/// à l'arrivée de l'événement est donc une DISPARITION ; `auto_scan` apparie
+/// ensuite ancien et nouveau nom quand c'est le même fichier.
+fn genre_d_un_fichier(genre: &EventKind, chemin: &Path, traduit: &ChangeType) -> ChangeType {
+    if matches!(genre, EventKind::Modify(ModifyKind::Name(_)))
+        && std::fs::symlink_metadata(chemin).is_err()
+    {
+        ChangeType::Deleted
+    } else {
+        traduit.clone()
     }
 }
 
@@ -582,26 +605,42 @@ mod tests {
     fn les_sequences_windows_d_une_retouche_atteignent_le_fichier_audio_4896() {
         use notify::event::{CreateKind, RemoveKind, RenameMode};
         let x = r"D:\Musique\Pink Floyd\Multichannel 7.1\01 - Speak To Me.flac";
-        let tmp = r"D:\Musique\Pink Floyd\Multichannel 7.1\01 - Speak To Me.tmp";
         // Écriture en place (FLAC au remplissage suffisant).
         let en_place = rejouer(vec![ev(EventKind::Modify(ModifyKind::Any), x)]);
         assert_eq!(en_place.get(x), Some(&ChangeType::Modified));
-        // Fichier temporaire du même dossier, puis renommage par-dessus.
+        // Fichier temporaire du même dossier, puis renommage par-dessus. Le
+        // disque tel que le moteur le laisse : le FLAC réécrit est en place,
+        // le temporaire n'existe plus — un nom de renommage absent du disque
+        // serait une disparition (`genre_d_un_fichier`).
+        let scene = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-retouche-par-renommage-4896",
+        );
+        let x_reel = scene.join("01 - Speak To Me.flac");
+        let tmp_reel = scene.join("01 - Speak To Me.tmp");
+        fs::write(&x_reel, b"x").unwrap();
+        let (x_reel, tmp_reel) = (
+            x_reel.to_string_lossy().into_owned(),
+            tmp_reel.to_string_lossy().into_owned(),
+        );
         let par_renommage = rejouer(vec![
-            ev(EventKind::Create(CreateKind::Any), tmp),
-            ev(EventKind::Modify(ModifyKind::Any), tmp),
-            ev(EventKind::Remove(RemoveKind::Any), x),
-            ev(EventKind::Modify(ModifyKind::Name(RenameMode::From)), tmp),
-            ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), x),
+            ev(EventKind::Create(CreateKind::Any), &tmp_reel),
+            ev(EventKind::Modify(ModifyKind::Any), &tmp_reel),
+            ev(EventKind::Remove(RemoveKind::Any), &x_reel),
+            ev(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &tmp_reel,
+            ),
+            ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &x_reel),
         ]);
-        assert_eq!(par_renommage.get(x), Some(&ChangeType::Modified));
+        assert_eq!(par_renommage.get(&x_reel), Some(&ChangeType::Modified));
         // Le temporaire n'est pas un changement de FICHIER audio. Disparu du
         // disque, il peut sortir en candidat « dossier disparu » : `auto_scan`
         // l'écarte faute de piste indexée sous ce chemin (#4896,
         // `un_chemin_disparu_sans_piste_ne_touche_a_rien_4896`).
         assert!(
             !matches!(
-                par_renommage.get(tmp),
+                par_renommage.get(&tmp_reel),
                 Some(ChangeType::Added | ChangeType::Modified | ChangeType::Deleted)
             ),
             "le temporaire est filtré"

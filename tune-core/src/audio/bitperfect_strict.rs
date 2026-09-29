@@ -31,6 +31,63 @@ use crate::db::settings_repo::SettingsRepo;
 /// `error` de la réponse HTTP, préfixe de la sentinelle.
 pub const CODE_REFUS: &str = "bitperfect_strict_refused";
 
+/// #5217 — la cadence peut rester identique alors que des bits sont perdus.
+/// Code distinct : les clients existants ne doivent pas traduire des bits en Hz.
+const CODE_REFUS_PROFONDEUR: &str = "bitperfect_depth_strict_refused";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusProfondeur {
+    pub demandee_bits: u16,
+    pub sortie_bits: u16,
+}
+
+impl RefusProfondeur {
+    pub fn sentinelle(&self) -> String {
+        format!(
+            "{CODE_REFUS_PROFONDEUR}:{}:{}",
+            self.demandee_bits, self.sortie_bits
+        )
+    }
+
+    pub fn depuis_sentinelle(message: &str) -> Option<Self> {
+        let (_, reste) = message.split_once(&format!("{CODE_REFUS_PROFONDEUR}:"))?;
+        let mut parts = reste.split(':');
+        Some(Self {
+            demandee_bits: parts.next()?.parse().ok()?,
+            sortie_bits: parts.next()?.parse().ok()?,
+        })
+    }
+
+    pub fn charge_utile(&self, zone_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "zone_id": zone_id,
+            "code": CODE_REFUS_PROFONDEUR,
+            "requested_bits": self.demandee_bits,
+            "device_bits": self.sortie_bits,
+            "fatal": true,
+            "error": format!(
+                "Bit-perfect strict : lecture refusée — ce chemin de lecture réduit la source de {} bits à {} bits. Désactivez « Bit-perfect strict » dans les réglages de la zone pour jouer avec conversion.",
+                self.demandee_bits, self.sortie_bits
+            ),
+        })
+    }
+}
+
+/// Une profondeur inconnue ne prouve aucune perte ; un élargissement ne perd
+/// aucun bit. Cette garde couvre pour l'instant le décodeur de radio (#5217).
+pub fn refus_reduction_profondeur(
+    source: Option<u16>,
+    sortie: u16,
+    strict: bool,
+) -> Option<RefusProfondeur> {
+    source
+        .filter(|bits| strict && sortie != 0 && *bits > sortie)
+        .map(|bits| RefusProfondeur {
+            demandee_bits: bits,
+            sortie_bits: sortie,
+        })
+}
+
 /// La clé de réglage d'une zone. Présente et à `"true"` = armé ; absente =
 /// défaut désarmé (la clé est supprimée à la désactivation, comme
 /// `zone_{id}_mono_downmix`).
