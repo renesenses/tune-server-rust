@@ -8,7 +8,7 @@ license.workspace = true
 serde_json = { workspace = true }
 # Compiler + runtime + WAT parsing only: no async, component model, GC,
 # threads, profiling, pooling, coredump or debug support.
-wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
+wasmtime = { version = "48.0.3", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 
 [dev-dependencies]
 tempfile = "3"

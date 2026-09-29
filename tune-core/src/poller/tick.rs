@@ -331,6 +331,10 @@ impl PositionPoller {
                             source: last_source,
                             source_id: last_source_id,
                             stream_id: stream_id_repris,
+                            channels: db_track
+                                .as_ref()
+                                .and_then(|t| u16::try_from(t.channels).ok())
+                                .filter(|n| *n > 0),
                             ..Default::default()
                         };
                         let stream_id_journal =

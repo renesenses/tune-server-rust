@@ -1186,6 +1186,11 @@ pub(super) struct MotifsDeTranscodage {
     /// piste. Seul le décodage sait replier proprement (ITU-R BS.775), donc le
     /// passthrough est désarmé. Voir [`crate::audio::canaux_reseau_4573`].
     pub(super) reduction_de_canaux: bool,
+    /// #5299 — la piste est rangée DANS une image ISO (`image.iso!/…`). Le
+    /// passthrough sert le fichier par son chemin, et le serveur HTTP ouvre un
+    /// fichier du disque : seul le décodage, qui lit l'image par étendues, la
+    /// rend.
+    pub(super) dans_une_image_iso: bool,
 }
 
 /// La piste doit-elle être transcodée ? Un OU de tous les motifs, dans l'ordre
@@ -1203,6 +1208,7 @@ pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
         || motifs.est_une_tranche_cue
         || (motifs.flac_ffmpeg_vers_le_reseau && !motifs.conteneur_flac_neuf_pret)
         || motifs.reduction_de_canaux
+        || motifs.dans_une_image_iso
 }
 
 #[cfg(test)]
@@ -1403,6 +1409,7 @@ mod lecture_locale_tests {
             flac_ffmpeg_vers_le_reseau: false,
             conteneur_flac_neuf_pret: false,
             reduction_de_canaux: false,
+            dans_une_image_iso: false,
         }
     }
 
@@ -1418,7 +1425,7 @@ mod lecture_locale_tests {
 
     #[test]
     fn chaque_motif_seul_exige_le_transcodage() {
-        let seuls: [(&str, MotifsDeTranscodage); 11] = [
+        let seuls: [(&str, MotifsDeTranscodage); 12] = [
             (
                 "needs_transcode_for_output",
                 MotifsDeTranscodage {
@@ -1496,6 +1503,15 @@ mod lecture_locale_tests {
                 "reduction_de_canaux",
                 MotifsDeTranscodage {
                     reduction_de_canaux: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                // #5299 — une piste rangée dans une image ISO de données.
+                "dans_une_image_iso",
+                MotifsDeTranscodage {
+                    dans_une_image_iso: true,
+                    will_be_flac: true,
                     ..aucun_motif()
                 },
             ),
@@ -1577,6 +1593,7 @@ mod flac_ffmpeg_tests {
             flac_ffmpeg_vers_le_reseau: true,
             conteneur_flac_neuf_pret: false,
             reduction_de_canaux: false,
+            dans_une_image_iso: false,
         }
     }
 
