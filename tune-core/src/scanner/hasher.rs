@@ -7,8 +7,19 @@ const SAMPLE_SIZE: usize = 65536; // 64 KB
 const AUDIO_HASH_VERSION: &str = "sample64k-v2";
 
 pub fn compute_audio_hash(path: &Path) -> Option<String> {
+    // #5299 — un fichier rangé dans une image ISO : même recette, lue dans
+    // l'image par son lecteur interne.
+    if let Some(lecteur) = crate::audio::iso9660::ouvrir_si_virtuel(path) {
+        let mut lecteur = lecteur.ok()?;
+        let taille = lecteur.taille();
+        return empreinte_echantillonnee(&mut lecteur, taille);
+    }
     let mut file = File::open(path).ok()?;
     let file_size = file.metadata().ok()?.len();
+    empreinte_echantillonnee(&mut file, file_size)
+}
+
+fn empreinte_echantillonnee<R: Read + Seek>(file: &mut R, file_size: u64) -> Option<String> {
     if file_size == 0 {
         return None;
     }
