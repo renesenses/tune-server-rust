@@ -128,6 +128,14 @@ impl LocalPath {
 /// version normalisée. C'est le point 2 de l'en-tête de module : ce que
 /// l'appelant passera à `open()` a déjà été validé par un `exists()`.
 pub fn resolve_local_path(stored: &str) -> LocalPath {
+    // #5299 — un fichier rangé dans une image ISO n'a pas d'`exists()` : il
+    // est présent si l'image est là et le contient. Il se rend tel quel, et
+    // c'est le lecteur interne de l'image qui l'ouvrira.
+    if crate::audio::iso9660::est_chemin_virtuel(stored)
+        && crate::audio::iso9660::taille_et_mtime(std::path::Path::new(stored)).is_some()
+    {
+        return LocalPath::Found(stored.to_string());
+    }
     if let Some(p) = local_path_candidates(stored)
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())

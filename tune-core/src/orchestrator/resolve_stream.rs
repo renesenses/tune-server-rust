@@ -340,8 +340,19 @@ impl PlaybackOrchestrator {
         //
         // Ask for the zone preference on the primary request and on the auth
         // retry. Passing `None` means the provider's highest/default quality.
-        let stream_data =
+        let mut stream_data =
             request_stream_at_quality(&mut **svc, source_id, provider_quality).await?;
+        // #5283 — une cadence annoncée NULLE (Qobuz `sampling_rate: 0`) est
+        // remplacée par l'en-tête du flux, ou le catalogue, avant que quoi
+        // que ce soit ne la lise. Sans effet si la qualité annoncée est
+        // complète.
+        crate::streaming::cadence_du_flux::completer_la_cadence(
+            &mut stream_data,
+            &**svc,
+            service_name,
+            source_id,
+        )
+        .await;
         let quality_observation = quality_preference.observe(service_name, &stream_data);
 
         info!(
@@ -668,6 +679,19 @@ impl PlaybackOrchestrator {
             .flatten()
             .and_then(|z| z.max_sample_rate);
         let mut sr = stream_data.quality.sample_rate;
+        // #5283 — jamais de WAV, de session ni de transcodage à 0 Hz : la
+        // cadence est restée inconnue après l'en-tête du flux et le catalogue
+        // (`completer_la_cadence`). Le décodeur l'aurait refusée plus tard,
+        // en silence, et la sortie aurait accusé le fichier.
+        if sr == 0 {
+            warn!(
+                zone_id = req.zone_id,
+                "streaming_wav_target_sample_rate_unknown_refused"
+            );
+            return Err(crate::streaming::cadence_du_flux::erreur_cadence_inconnue(
+                req.source.as_deref().unwrap_or("service"),
+            ));
+        }
         if let Some(max_sr) = zone_max_sample_rate
             && sr > max_sr
         {

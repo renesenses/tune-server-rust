@@ -247,6 +247,38 @@ async fn pg_edition_album_scenarios() {
     reset_schema(&db);
 }
 
+/// #5314 — le genre posé sur un album vaut pour ses pistes : LES MÊMES
+/// scénarios que SQLite (`genre_album_pistes_tests.rs`), sur le VRAI moteur.
+/// La recopie dans la transaction de l'édition, le drapeau `SMALLINT` de
+/// l'exception des compilations, le marqueur dans `album_metadata`, la tenue
+/// relue par le scan et le rattrapage (`LIKE` sur le JSON d'`edition_manuelle`)
+/// y passent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_genre_album_pistes_5314() {
+    use crate::db::genre_album_pistes::tests as g;
+    type Scenario = fn(&Arc<dyn DbBackend>);
+    let db = pg_or_skip!();
+    let scenarios: [(&str, Scenario); 5] = [
+        (
+            "edition_recopie_et_tient",
+            g::scenario_edition_recopie_et_tient,
+        ),
+        ("genres_multiples", g::scenario_genres_multiples),
+        ("compilation", g::scenario_compilation),
+        (
+            "sans_changement_et_effacement",
+            g::scenario_sans_changement_et_effacement,
+        ),
+        ("rattrapage", g::scenario_rattrapage),
+    ];
+    for (nom, scenario) in scenarios {
+        eprintln!("pg_genre_album_pistes_5314 : {nom}");
+        reset_schema(&db);
+        scenario(&db);
+    }
+    reset_schema(&db);
+}
+
 /// LA règle « compilation » du 25/09/2026 rejouée sur une base PostgreSQL :
 /// `recalculer_les_compilations` lit le drapeau (`SMALLINT` depuis PG 028)
 /// par `COALESCE(…, 0) <> 0`, puis le BAISSE par `set_compilation` et rend à

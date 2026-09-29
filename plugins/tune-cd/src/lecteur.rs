@@ -2,8 +2,8 @@
 //!
 //! Trois implémentations : Linux (ioctl sur `/dev/sr*`, `linux.rs`), macOS
 //! (le volume `cddafs` monté sous `/Volumes`, `cddafs.rs` et `macos.rs`) et
-//! simulée (en mémoire, pour les tests, `simule.rs`). Windows
-//! (`IOCTL_CDROM_RAW_READ`) reste à faire. Tout ce qui est au-dessus — flux,
+//! Windows (`IOCTL_CDROM_READ_TOC_EX` et `IOCTL_CDROM_RAW_READ`, `windows.rs`)
+//! et simulée (en mémoire, pour les tests, `simule.rs`). Tout ce qui est au-dessus — flux,
 //! identifiant, routes — ne connaît que ce trait.
 
 use std::fmt;
@@ -78,6 +78,9 @@ pub trait LecteurDisque: Send + Sync {
 /// macOS : toujours un lecteur, dont la présence dit « aucun lecteur »,
 /// « vide » ou « disque » (un lecteur USB se branche à chaud) ;
 /// `TUNE_CD_DEVICE` y impose un DOSSIER de volume.
+///
+/// Windows : lettres de lecteur optique recherchées à chaque branchement ;
+/// `TUNE_CD_DEVICE` impose un chemin de périphérique (par ex. `\\.\D:`).
 pub fn lecteur_du_systeme() -> Option<Arc<dyn LecteurDisque>> {
     #[cfg(target_os = "linux")]
     {
@@ -99,9 +102,23 @@ pub fn lecteur_du_systeme() -> Option<Arc<dyn LecteurDisque>> {
     {
         Some(Arc::new(crate::macos::lecteur_du_systeme()))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
     {
-        // Windows : pas encore (#4863).
+        if let Ok(chemin) = std::env::var("TUNE_CD_DEVICE") {
+            return Some(Arc::new(crate::windows::LecteurWindows::new(chemin)));
+        }
+        Some(Arc::new(LecteurBranchable::new(
+            r"\\.\*:",
+            INTERVALLE_DE_RECHERCHE,
+            Box::new(|| {
+                crate::windows::premier_lecteur().map(|c| {
+                    Arc::new(crate::windows::LecteurWindows::new(c)) as Arc<dyn LecteurDisque>
+                })
+            }),
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
         None
     }
 }
@@ -219,7 +236,11 @@ impl LecteurDisque for LecteurBranchable {
 
 /// La plateforme a-t-elle une implémentation ?
 pub const fn plateforme_prise_en_charge() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 }
 
 #[cfg(test)]

@@ -1123,6 +1123,13 @@ impl PlaybackOrchestrator {
             // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
             // n'en porte pas : sa résolution réelle est lue au scan.
             bitrate_kbps: resolved.bitrate_kbps,
+            // #5336 : resolved.channels décrit la SORTIE (potentiellement
+            // repliée). Seule la ligne source fait autorité ici. Les radios
+            // décodées sont complétées à la lecture de leur observation.
+            channels: track_meta
+                .as_ref()
+                .and_then(|t| u16::try_from(t.channels).ok())
+                .filter(|n| *n > 0),
         }
     }
 
@@ -1263,11 +1270,30 @@ impl PlaybackOrchestrator {
                     // Plafond : une station lente ou muette ne doit jamais
                     // geler le départ — `Play` part de toute façon.
                     let timeout = std::time::Duration::from_secs(if is_radio { 8 } else { 4 });
-                    let reached = self
-                        .streamer
-                        .wait_prefill_ready(sid, target_bytes, timeout)
-                        .await;
+                    let reached = if is_radio {
+                        self.streamer
+                            .wait_radio_prefill_ready(sid, secs, timeout)
+                            .await
+                    } else {
+                        self.streamer
+                            .wait_prefill_ready(sid, target_bytes, timeout)
+                            .await
+                    };
                     prebuffer_ms = prebuffer_start.elapsed().as_millis();
+                    let target_bytes = if is_radio {
+                        self.streamer
+                            .stream_output_wire(sid)
+                            .await
+                            .map(|info| {
+                                u64::from(info.sample_rate)
+                                    * u64::from(info.channels)
+                                    * u64::from(info.bit_depth / 8)
+                                    * secs
+                            })
+                            .unwrap_or(target_bytes)
+                    } else {
+                        target_bytes
+                    };
                     info!(
                         zone_id = req.zone_id,
                         stream_id = %sid,
