@@ -928,6 +928,12 @@ impl StreamingService for DeezerService {
         Ok(Self::artistes_proches(&data))
     }
 
+    /// `get_similar_artists` ci-dessus : « Plus comme ça » s'ouvre aussi à ce
+    /// service (#5395, décision de Bertrand du 29/09/2026).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
+    }
+
     // ── playlist ─────────────────────────────────────────────────────
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
@@ -1454,6 +1460,13 @@ mod tests {
         assert_eq!(noms, vec![("6404", "Justice"), ("2049", "Cassius")]);
         assert_eq!(v[0].image_path.as_deref(), Some("https://x/500.jpg"));
         assert!(DeezerService::artistes_proches(&json!({"error": {}})).is_empty());
+    }
+
+    /// #5395 — « Plus comme ça » est ouvert à Deezer : la route ne lui répond
+    /// plus 501.
+    #[test]
+    fn deezer_declare_ses_artistes_similaires() {
+        assert!(DeezerService::new().propose_des_artistes_similaires());
     }
 
     #[test]

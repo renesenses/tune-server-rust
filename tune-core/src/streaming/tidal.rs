@@ -2091,6 +2091,12 @@ impl StreamingService for TidalService {
         Ok(Self::artistes_proches(&data))
     }
 
+    /// `get_similar_artists` ci-dessus : « Plus comme ça » s'ouvre aussi à ce
+    /// service (#5395, décision de Bertrand du 29/09/2026).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
+    }
+
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
         Ok(Self::map_playlist(&data))
@@ -3380,6 +3386,13 @@ mod tests {
         let noms: Vec<(&str, &str)> = v.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect();
         assert_eq!(noms, vec![("3346", "Gorillaz"), ("7804", "Blur")]);
         assert!(TidalService::artistes_proches(&serde_json::json!({})).is_empty());
+    }
+
+    /// #5395 — « Plus comme ça » est ouvert à TIDAL : la route ne lui répond
+    /// plus 501.
+    #[test]
+    fn tidal_declare_ses_artistes_similaires() {
+        assert!(TidalService::new().propose_des_artistes_similaires());
     }
 
     #[test]
