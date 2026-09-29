@@ -22,6 +22,9 @@ mod duplicates;
 mod edition;
 mod edition_balises;
 mod enrich;
+// #5469 — les passes que `crate::reprise_des_passes` sait relancer.
+pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
+pub(crate) use enrich::demarrer_enrich_all;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
 mod facets;

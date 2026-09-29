@@ -155,26 +155,52 @@ pub(super) async fn enrich_all_library(
     State(state): State<AppState>,
     CorpsJsonOptionnel(body): CorpsJsonOptionnel<EnrichAllBody>,
 ) -> impl IntoResponse {
+    let chemin = body
+        .and_then(|b| b.path)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    demarrer_enrich_all(
+        &state,
+        chemin,
+        crate::reprise_des_passes::Declencheur::Geste,
+    )
+    .await
+}
+
+/// Ouvrir la passe d'enrichissement des métadonnées. Le bouton y passe, et la
+/// reprise d'une passe coupée par un arrêt aussi (#5469,
+/// `crate::reprise_des_passes`). C'est le même chemin, à une différence près :
+/// une reprise ne passe pas par la garde du quota.
+pub(crate) async fn demarrer_enrich_all(
+    state: &AppState,
+    chemin: Option<String>,
+    declencheur: crate::reprise_des_passes::Declencheur,
+) -> axum::response::Response {
     // Portée résolue AVANT le gate de quota : un chemin invalide ne doit rien
     // consommer. Refus franc, jamais de repli sur la bibliothèque entière —
     // le repli enrichirait exactement ce que l'utilisateur voulait épargner.
-    let scope = match body
-        .and_then(|b| b.path)
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-    {
-        Some(p) => match crate::routes::system::resoudre_portee(&state, &p) {
+    let scope = match chemin {
+        Some(p) => match crate::routes::system::resoudre_portee(state, &p) {
             Ok(s) => Some(s),
-            Err(resp) => return resp,
+            Err(resp) => return resp.into_response(),
         },
         None => None,
     };
     // Full-library MusicBrainz enrichment is the same class of operation as the
     // premium-gated /system/enrich-metadata, so gate it the same way (premium
     // unlimited, free daily quota) instead of leaving it a free bypass (#6).
-    let premium = match crate::routes::system::gate_enrichment(&state).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    // #5469 — une reprise n'est pas un geste : elle continue une passe dont le
+    // geste a déjà été compté (voir `crate::reprise_des_passes`).
+    let premium = if declencheur.garde_le_quota() {
+        match crate::routes::system::gate_enrichment(state).await {
+            Ok(p) => p,
+            Err(resp) => return resp.into_response(),
+        }
+    } else {
+        state
+            .license
+            .check_feature(tune_core::license::Feature::AutoEnrichment)
+            .await
     };
     // La sélection locale doit réussir avant le 202 et avant toute annonce
     // de tâche (#3810). Une panne SQL n'est pas une bibliothèque vide.
@@ -192,7 +218,8 @@ pub(super) async fn enrich_all_library(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "enrichment_candidates_unavailable"})),
-            );
+            )
+                .into_response();
         }
     };
     let scope_tache = scope.clone();
@@ -238,6 +265,15 @@ pub(super) async fn enrich_all_library(
         "enrich_all",
         "Enrichissement des métadonnées…",
         "enrichment",
+    );
+    // #5469 — le repère de reprise, posé avec l'inscription au registre : si
+    // le serveur s'arrête avant la fin de la boucle, le démarrage suivant
+    // relance la passe sur la même portée.
+    let jeton_de_reprise = crate::reprise_des_passes::noter_ouverture(
+        &state.backend,
+        crate::reprise_des_passes::Passe::Metadonnees,
+        scope.as_ref().map(|s| s.dir.as_str()),
+        declencheur,
     );
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
@@ -560,7 +596,7 @@ pub(super) async fn enrich_all_library(
             }
         }
 
-        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend2);
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone());
         settings
             .set(
                 "enrich_all_status",
@@ -592,6 +628,14 @@ pub(super) async fn enrich_all_library(
             }),
         );
         info!(task_id = %task_id_clone, enriched, errors, total, "enrich_all_library done");
+        // #5469 — fin NORMALE, et seulement elle : le repère part. Un arrêt
+        // n'arrive jamais ici, et c'est ce qui permet au démarrage suivant de
+        // relancer la passe.
+        crate::reprise_des_passes::noter_fin(
+            &backend2,
+            crate::reprise_des_passes::Passe::Metadonnees,
+            &jeton_de_reprise,
+        );
     });
 
     (
@@ -608,6 +652,7 @@ pub(super) async fn enrich_all_library(
             "directory_artists": scope.as_ref().map(|s| s.artist_ids.len()),
         })),
     )
+        .into_response()
 }
 
 pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Value> {
