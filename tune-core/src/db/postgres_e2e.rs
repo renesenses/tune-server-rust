@@ -2930,3 +2930,14 @@ async fn pg_4806_titres_de_service_bannis() {
     assert!(!repo.is_streaming_track_banned(1, "qobuz", "pg-7").unwrap());
     assert_eq!(compte(1), 2, "débannir rend tout");
 }
+/// #5413 (Rhorn, fil 2032) — les filtres `quality` de la liste d'albums
+/// rendent exactement les albums badgés, sur le VRAI moteur : le prédicat
+/// d'`Album::quality_sql` (`REPLACE`, `COALESCE`, comparaisons d'entiers)
+/// doit dire la même chose sous PostgreSQL que sous SQLite. Scénario partagé
+/// avec le témoin SQLite `i5413_les_filtres_de_qualite_suivent_le_badge`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_5413_filtres_de_qualite_suivent_le_badge() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::album_repo::tests::scenario_filtres_de_qualite_5413(db);
+}
