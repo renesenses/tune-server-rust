@@ -1347,6 +1347,17 @@ impl TidalService {
         }
     }
 
+    /// La réponse de `/artists/{id}/similar`, sans les entrées sans identifiant.
+    fn artistes_proches(data: &serde_json::Value) -> Vec<StreamArtist> {
+        data["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_artist).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.id != "0" && !a.name.is_empty())
+            .collect()
+    }
+
     fn map_artist(item: &serde_json::Value) -> StreamArtist {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
@@ -2062,6 +2073,22 @@ impl StreamingService for TidalService {
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
+    }
+
+    /// `GET /artists/{id}/similar` (API v1, la même que `toptracks`) : les
+    /// artistes proches, paginés en `items` comme les autres listes. Le point
+    /// d'entrée existe — 401 sans jeton, là où un chemin inconnu rend 404
+    /// (mesuré le 29/09/2026) — et c'est celui que lit `tidalapi`
+    /// (`Artist.get_similar`). Sert la radio artiste (#5395).
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let data = self
+            .api_get(&format!("/artists/{artist_id}/similar?limit={limit}"))
+            .await?;
+        Ok(Self::artistes_proches(&data))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
@@ -3337,6 +3364,22 @@ mod tests {
         assert!(!img.contains("480x480"));
         // dashes in the picture id become path slashes
         assert!(img.contains("aa/bb/cc/dd"));
+    }
+
+    #[test]
+    fn artistes_proches_de_similar() {
+        let data = serde_json::json!({
+            "limit": 10, "offset": 0, "totalNumberOfItems": 3,
+            "items": [
+                {"id": 3346, "name": "Gorillaz", "picture": "ab-cd"},
+                {"id": 7804, "name": "Blur"},
+                {"name": "sans identifiant"}
+            ]
+        });
+        let v = TidalService::artistes_proches(&data);
+        let noms: Vec<(&str, &str)> = v.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect();
+        assert_eq!(noms, vec![("3346", "Gorillaz"), ("7804", "Blur")]);
+        assert!(TidalService::artistes_proches(&serde_json::json!({})).is_empty());
     }
 
     #[test]

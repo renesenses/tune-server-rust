@@ -1216,6 +1216,11 @@ mod lire_ensuite_dans_la_fenetre_gapless;
 #[cfg(test)]
 mod suivante_bannie_5143;
 
+/// #5395 — la radio artiste se recharge par la vraie fin de file, et une file
+/// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
+#[cfg(test)]
+mod radio_artiste_5395;
+
 /// Garde-fou #2991 — les DEUX branchements que ce ticket a posés vivent chacun
 /// à un EMPLACEMENT précis d'une boucle de dix mille lignes. Retirés, ils
 /// restent compilés, testés et verts — et plus personne ne les appelle : le

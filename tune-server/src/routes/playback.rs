@@ -1265,6 +1265,10 @@ pub fn router() -> Router<AppState> {
             axum::routing::delete(queue_remove),
         )
         .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
+        .route(
+            "/{id}/radio/artist",
+            post(radio_artiste::lancer_radio_artiste),
+        )
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
         // DSP route is in zones.rs (/{id}/dsp GET+PUT)
@@ -1356,6 +1360,9 @@ mod refus_entier_negatif_3966;
 /// #4283 — `queue/jump` valide la position avant que le curseur ne bouge.
 #[cfg(test)]
 mod saut_hors_file_4283;
+
+/// #5395 — la radio artiste à la demande.
+mod radio_artiste;
 
 /// Replace a zone's queue after taking the SQLite user-write lane.
 ///

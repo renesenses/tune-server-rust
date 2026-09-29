@@ -2,6 +2,7 @@ pub mod auto_dj;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
+pub mod radio_artiste;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.
