@@ -16,6 +16,9 @@ pub struct RelayState {
     /// Verificateur d'eligibilite premium, interroge AVANT tout
     /// enregistrement. Voir `crate::licence`.
     pub licences: std::sync::Arc<crate::licence::Licences>,
+    /// Vérificateur des billets d'écoute de Tune Circle (#5327), interrogé à
+    /// CHAQUE requête de `/stream/circle/{ticket}`. Voir `crate::circle`.
+    pub billets: std::sync::Arc<crate::circle::Billets>,
     pub max_servers: usize,
     pub max_clients_per_server: usize,
     pub max_streams_per_server: usize,
@@ -27,6 +30,7 @@ impl RelayState {
             servers: DashMap::new(),
             tokens: DashMap::new(),
             licences: crate::licence::Licences::depuis_environnement(),
+            billets: crate::circle::Billets::depuis_environnement(),
             max_servers: 100,
             max_clients_per_server: 10,
             max_streams_per_server: 5,
@@ -166,6 +170,10 @@ mod tests {
             // Sans jeton de service, `verifier` laisse passer : ces tests
             // portent sur les regles d'enregistrement, pas sur la licence.
             licences: crate::licence::Licences::depuis_environnement(),
+            billets: std::sync::Arc::new(crate::circle::Billets::nouveau(
+                "http://cloud.invalide",
+                None,
+            )),
             max_servers,
             max_clients_per_server: 10,
             max_streams_per_server: 5,

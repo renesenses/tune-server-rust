@@ -55,6 +55,9 @@ pub mod flac_vendeur;
 pub mod fondu_enchaine;
 pub mod formats;
 pub mod http_range;
+pub mod image_cdda;
+/// #5299 — les fichiers audio d'une image ISO de données, lus sans la monter.
+pub mod iso9660;
 pub mod iso_sacd;
 pub mod levels;
 pub mod limiteur;
@@ -88,6 +91,11 @@ pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]
 pub mod runtime;
+/// Lecture native des images SACD : sommaires, textes, DSD lu dans l'ISO (#5297).
+pub mod sacd;
+/// #5297 — une piste d'ISO SACD emprunte le chemin DSD existant (PCM, DoP).
+#[cfg(test)]
+mod sacd_lecture_5297_tests;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
 pub mod staged_growth;
