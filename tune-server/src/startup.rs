@@ -1590,6 +1590,9 @@ pub async fn register_local_outputs(state: &AppState) {
     // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
     // sorties qui ne sont pas ASIO.
     let exclusive_demande = state.requested_exclusive_mode();
+    // #5353 — l'écho du forçage ASIO n'est pas une demande pour une sortie
+    // qui ne s'ouvrira pas en ASIO.
+    let exclusif_arme_par_asio = state.exclusif_arme_par_asio();
     // Publish it: this is the value the outputs below are built with, and the
     // only honest answer for the signal path until the next restart.
     if let Ok(mut slot) = state.active_audio_backend.write() {
@@ -1755,6 +1758,7 @@ pub async fn register_local_outputs(state: &AppState) {
                 audio_backend,
                 Some(dev.backend.as_str()),
                 exclusive_demande,
+                exclusif_arme_par_asio,
             );
             let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
                 dev.name.clone(),

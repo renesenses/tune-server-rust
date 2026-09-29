@@ -51,12 +51,25 @@ const JALON_AVANCEMENT: i32 = 25;
 /// Les pistes CANDIDATES : un `dr_track` non vide calculé par Tune, sur un
 /// fichier local. La sélection par conteneur se fait en Rust — l'extension
 /// est une affaire de chemin, pas de SQL.
-const SQL_CANDIDATES: &str = "SELECT t.id, t.file_path, m.value \
-     FROM tracks t \
-     JOIN track_metadata m ON m.track_id = t.id AND m.key = 'dr_track' \
-     JOIN track_metadata s ON s.track_id = t.id AND s.key = 'dr_source' AND s.value = 'analysis' \
-     WHERE t.file_path IS NOT NULL AND t.file_path != '' AND TRIM(m.value) != '' \
-     ORDER BY t.id";
+///
+/// 🔴 « Local » se lit sur la SOURCE. Le commentaire ci-dessus le disait déjà,
+/// la requête ne le vérifiait pas : elle n'avait que
+/// `t.file_path IS NOT NULL AND t.file_path != ''`, c'est-à-dire le chemin pris
+/// pour un substitut de la source. Cette passe **réécrit les balises des
+/// fichiers de l'utilisateur** ; le prédicat manquant est donc ajouté, sans
+/// retirer celui du chemin — les deux questions sont distinctes.
+fn sql_candidates() -> String {
+    format!(
+        "SELECT t.id, t.file_path, m.value \
+         FROM tracks t \
+         JOIN track_metadata m ON m.track_id = t.id AND m.key = 'dr_track' \
+         JOIN track_metadata s ON s.track_id = t.id AND s.key = 'dr_source' AND s.value = 'analysis' \
+         WHERE {piste_locale} \
+           AND t.file_path IS NOT NULL AND t.file_path != '' AND TRIM(m.value) != '' \
+         ORDER BY t.id",
+        piste_locale = tune_core::db::track_repo::sql::PISTE_LOCALE,
+    )
+}
 
 /// Ce qu'il y a à graver, mesuré maintenant. Sert à l'écran AVANT de lancer
 /// (« 1 234 pistes à graver ») comme au rapport de fin.
@@ -71,7 +84,7 @@ pub(crate) struct Inventaire {
 fn inventaire(state: &AppState) -> (Inventaire, Vec<(i64, String, String)>) {
     let rows = state
         .backend
-        .query_many(SQL_CANDIDATES, &[])
+        .query_many(&sql_candidates(), &[])
         .ou_defaut_journalise();
     let mut inv = Inventaire::default();
     let mut candidates = Vec::with_capacity(rows.len());
@@ -363,5 +376,60 @@ mod tests {
         // Plus rien à graver pour la piste 1 ; la 2 reste (introuvable ≠ gravée).
         let (inv, _) = inventaire(&s);
         assert_eq!(inv.a_graver, 1);
+    }
+}
+
+/// Témoins de la règle « bibliothèque LOCALE » — Bertrand, 27/09/2026.
+#[cfg(test)]
+mod tests_source_locale_20260927 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    fn banc() -> AppState {
+        let s = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let repo = TrackMetadataRepo::with_backend(s.backend.clone());
+        // 🔴 La piste distante porte un chemin ET un DR calculé : le cas que la
+        // base de Bertrand ne contient pas, et sans lequel le filtre par chemin
+        // rendrait le même résultat.
+        for (id, chemin, source) in [(1i64, "/m/a.flac", "local"), (2, "/u/b.flac", "upnp")] {
+            let c = chemin.to_string();
+            let src = source.to_string();
+            s.backend
+                .execute(
+                    "INSERT INTO tracks (id, title, file_path, source) VALUES (?1, ?2, ?3, ?4)",
+                    &[&id as &dyn ToSqlValue, &format!("p{id}"), &c, &src],
+                )
+                .expect("piste");
+            repo.set(id, "dr_track", "12").unwrap();
+            repo.set(id, "dr_source", "analysis").unwrap();
+        }
+        s
+    }
+
+    /// 🔴 Cette passe RÉÉCRIT LES BALISES DES FICHIERS.
+    #[test]
+    fn la_gravure_dr_ecarte_une_piste_non_locale_qui_porte_un_chemin() {
+        let (inv, cand) = inventaire(&banc());
+        let ids: Vec<i64> = cand.iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            !ids.contains(&2),
+            "la piste 2 est `source = upnp` : son fichier ne doit PAS être \
+             réécrit — candidates {ids:?}"
+        );
+        assert_eq!(
+            inv.a_graver, 1,
+            "l'écran annoncerait sinon une piste de plus qu'il ne doit graver"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, un filtre qui rejette tout serait vert.
+    #[test]
+    fn la_gravure_dr_garde_la_piste_locale() {
+        let (_, cand) = inventaire(&banc());
+        let ids: Vec<i64> = cand.iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            ids.contains(&1),
+            "la piste LOCALE 1 doit rester candidate — candidates {ids:?}"
+        );
     }
 }
