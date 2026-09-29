@@ -1002,14 +1002,30 @@ impl PlaybackOrchestrator {
             } else {
                 true
             };
-            if let Some(path) = fichier_a_mesurer_apres_avance(
+            let a_mesurer = fichier_a_mesurer_apres_avance(
                 format.as_deref(),
                 track.and_then(|t| t.file_path),
                 la_sortie_mesure,
-            ) {
-                // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
-                // bien la piste devenue courante (#1110).
-                let play_seq = self.playback.current_play_seq(zone_id).await;
+            );
+            // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
+            // bien la piste devenue courante (#1110).
+            let play_seq = self.playback.current_play_seq(zone_id).await;
+            // #5104 — lancée ou non, et pourquoi : une ligne par piste.
+            super::trace_des_niveaux::niveaux_apres_avance(
+                zone_id,
+                play_seq,
+                self.playback
+                    .levels_gen(zone_id)
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                Some(track_id),
+                format.as_deref(),
+                match (&a_mesurer, la_sortie_mesure) {
+                    (Some(_), _) => "decodage_du_fichier",
+                    (None, false) => "non_lance_sortie_dsd_sans_mesure",
+                    (None, true) => "non_lance_sans_fichier",
+                },
+            );
+            if let Some(path) = a_mesurer {
                 spawn_local_file_levels_decode(bus, self.playback.clone(), zone_id, play_seq, path);
             }
         } else if let (Some(bus), Some(source_id)) =
@@ -1024,6 +1040,22 @@ impl PlaybackOrchestrator {
             // niveaux que la lecture explicite en proxy ; un `file://` (fMP4
             // DASH déjà sur disque) se décode localement, comme une piste
             // passthrough.
+            let play_seq = self.playback.current_play_seq(zone_id).await;
+            // #5104 — même ligne que la branche fichier ci-dessus.
+            super::trace_des_niveaux::niveaux_apres_avance(
+                zone_id,
+                play_seq,
+                self.playback
+                    .levels_gen(zone_id)
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                None,
+                None,
+                if advance_source != "local" && advance_source != "radio" {
+                    "sonde_du_service"
+                } else {
+                    "non_lance_source_sans_sonde"
+                },
+            );
             if advance_source != "local" && advance_source != "radio" {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
@@ -1034,8 +1066,8 @@ impl PlaybackOrchestrator {
                 // rattachait la sonde à ce que la zone jouait ALORS. Si
                 // l'auditeur avait enchaîné entre-temps, le forwarder héritait
                 // de la nouvelle génération et survivait, en publiant le PCM de
-                // la piste précédente sur l'horloge de la nouvelle (#1110).
-                let play_seq = self.playback.current_play_seq(zone_id).await;
+                // la piste précédente sur l'horloge de la nouvelle (#1110) :
+                // c'est le `play_seq` lu juste au-dessus.
                 tokio::spawn(async move {
                     // #2723 — même règle que la lecture explicite : la piste
                     // avancée sans blanc se résout à la qualité de la zone.
