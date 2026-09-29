@@ -207,6 +207,53 @@ const MIGRATION_TABLES: &[&str] = &[
     "track_source_links",
 ];
 
+/// Tables copiees APRES la mise a niveau du schema (`run_pg_migrations`),
+/// et non avec [`MIGRATION_TABLES`] (#5389).
+///
+/// Aucune de ces tables n'etait copiee : la bascule les perdait toutes. La
+/// plupart ne sont pas dans `PG_FULL_SCHEMA` ; ce sont les scripts numerotes
+/// (008, 015, 020, 023, 073) qui les creent, avec leurs VRAIS types
+/// (BIGINT, BYTEA, DOUBLE PRECISION), leurs sequences et leurs clefs
+/// etrangeres vers `tracks(id)` / `albums(id)`. Ces clefs etrangeres ne
+/// peuvent pas exister AVANT la mise a niveau : `PG_FULL_SCHEMA` cree
+/// `tracks.id` et `albums.id` en TEXT, et la migration 012 ne les convertit
+/// en BIGINT qu'apres la copie. Les ajouter a `PG_FULL_SCHEMA` aurait donc
+/// voulu dire un second schema, sans clef etrangere, qui diverge de celui
+/// d'une installation neuve ; les copier apres la mise a niveau les fait
+/// arriver dans le schema canonique. `column_casts` lit les types dans le
+/// catalogue, [`recaler_les_sequences`] remet chaque sequence apres le plus
+/// grand `id` copie.
+///
+/// Ordre : parents avant enfants (`tracks` et `albums` sont deja copiees).
+///
+/// Non copiee, `task_runs` : le choix est delibere et ecrit (migration PG
+/// 040, bloc `task_runs` de `PG_FULL_SCHEMA`) — ses `boot_id` designent des
+/// incarnations de l'AUTRE moteur, l'historique d'observabilite recommence.
+///
+/// Non copiee : `playback_history`. Aucun code du serveur ne la cree ni ne
+/// l'ecrit (`PlaybackHistory::setup_table` n'a pas d'appelant hors de ses
+/// tests, `DashboardService` n'est branche sur aucune route), et aucun
+/// schema PostgreSQL ne la declare.
+const MIGRATION_TABLES_APRES_MISE_A_NIVEAU: &[&str] = &[
+    // Favoris Qobuz/Tidal/... (StreamingFavoritesRepo). La table est dans
+    // `PG_FULL_SCHEMA`, mais son `id` n'y devient BIGINT qu'avec 012/061.
+    "streaming_favorites",
+    // Jetons des services, copies tels quels (JSON en clair, meme format des
+    // deux cotes) : d'une base locale a une autre base locale du meme
+    // utilisateur. Aucune valeur n'est journalisee.
+    "streaming_auth",
+    // Dossier prefere pour lire un album (#4907) — choix de l'utilisateur.
+    "album_preferred_roots",
+    "metadata_reports",
+    "metadata_proposals",
+    "metadata_suggestions",
+    "sync_changelog",
+    // Recalculables, mais couteux a recalculer : copiees aussi.
+    "lyrics_cache",
+    "track_audio_embedding",
+    "track_copies",
+];
+
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
 ///
 /// Numeric columns (year, track_number, duration_ms, sample_rate, …) are
@@ -1264,6 +1311,38 @@ pub async fn migrate_sqlite_to_pg(
             .push(format!("file_mtime normalisation failed: {e}"));
     }
 
+    // Seconde phase (#5389) : les tables dont le schema canonique vient des
+    // scripts numerotes, qui viennent de passer.
+    for table_name in MIGRATION_TABLES_APRES_MISE_A_NIVEAU {
+        let copie = match migrate_table(sqlite_db, &pool, table_name).await {
+            Ok(rows) => recaler_les_sequences(&pool, table_name)
+                .await
+                .map(|()| rows),
+            Err(e) => Err(e),
+        };
+        match copie {
+            Ok(rows) => {
+                info!(table = table_name, rows, "pg_migrate_table_done");
+                result.tables_migrated += 1;
+                result.total_rows += rows;
+                result.details.push(TableMigrationDetail {
+                    table: table_name.to_string(),
+                    rows,
+                    skipped: false,
+                });
+            }
+            Err(e) => {
+                info!(table = table_name, error = %e, "pg_migrate_table_skipped");
+                result.errors.push(format!("{table_name}: {e}"));
+                result.details.push(TableMigrationDetail {
+                    table: table_name.to_string(),
+                    rows: 0,
+                    skipped: true,
+                });
+            }
+        }
+    }
+
     let elapsed = start.elapsed();
     info!(
         tables = result.tables_migrated,
@@ -1290,7 +1369,10 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
 
     // Read all rows from SQLite
     let col_list = columns.join(", ");
-    let sql = format!("SELECT {col_list} FROM {table}");
+    let sql = match filtre_de_copie(table) {
+        Some(filtre) => format!("SELECT {col_list} FROM {table} WHERE {filtre}"),
+        None => format!("SELECT {col_list} FROM {table}"),
+    };
 
     let rows: Vec<Vec<SqlValue>> = {
         let conn = sqlite_db.read_connection();
@@ -1394,9 +1476,81 @@ fn conflict_clause(table: &str) -> &'static str {
         // `DO NOTHING` garde une bascule rejouee (#5199) sans doublon, et ne
         // reecrit pas une date deja posee en PostgreSQL.
         "file_first_seen" => "ON CONFLICT (file_path) DO NOTHING",
+        // Seconde phase (#5389). Clef naturelle quand la table en a une :
+        // une ligne nee en PostgreSQL apres une premiere bascule peut porter
+        // un autre `id` pour la meme chose.
+        "streaming_favorites" => {
+            "ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING"
+        }
+        "streaming_auth" => "ON CONFLICT (service) DO NOTHING",
+        "album_preferred_roots" => "ON CONFLICT (album_id) DO NOTHING",
+        "metadata_proposals" => "ON CONFLICT (entity, cloud_entity_id, field) DO NOTHING",
+        "lyrics_cache" => "ON CONFLICT (track_id) DO NOTHING",
+        "track_audio_embedding" => "ON CONFLICT (track_id) DO NOTHING",
+        "track_copies" => "ON CONFLICT (file_path) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }
+}
+
+/// Le filtre SQLite d'une copie, pour les tables qui portent en PostgreSQL
+/// une clef etrangere que SQLite n'impose pas (`PRAGMA foreign_keys` n'y est
+/// pas garanti) : une ligne orpheline ferait tomber tout son lot de 1000.
+/// L'orpheline, elle, n'a aucun sens — sa piste ou son album n'existe plus,
+/// et `ON DELETE CASCADE` l'aurait emportee (#5389).
+fn filtre_de_copie(table: &str) -> Option<&'static str> {
+    match table {
+        "album_preferred_roots" => Some("album_id IN (SELECT id FROM albums)"),
+        "track_audio_embedding" | "track_copies" => Some("track_id IN (SELECT id FROM tracks)"),
+        _ => None,
+    }
+}
+
+/// Remet chaque sequence de `table` apres la plus grande valeur copiee.
+///
+/// La copie insere des `id` explicites : une sequence restee a 1 ferait
+/// echouer la PREMIERE insertion suivante du serveur (« duplicate key value
+/// violates unique constraint »). La sequence se lit dans le `DEFAULT
+/// nextval(...)` de la colonne, et n'est jamais reculee — une valeur deja
+/// consommee ne se redonne pas (meme regle que la migration 061).
+async fn recaler_les_sequences(pool: &PgPool, table: &str) -> Result<(), String> {
+    let colonnes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name::text, column_default::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 \
+           AND column_default LIKE 'nextval(%'",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("sequences de {table} : {e}"))?;
+    for (colonne, defaut) in colonnes {
+        let Some(sequence) = defaut
+            .strip_prefix("nextval('")
+            .and_then(|r| r.split_once('\''))
+            .map(|(nom, _)| nom.to_string())
+        else {
+            continue;
+        };
+        let nom_sur = |n: &str| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        };
+        if !nom_sur(&sequence) || !nom_sur(&colonne) {
+            return Err(format!(
+                "sequence de {table}.{colonne} illisible : {defaut}"
+            ));
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SELECT setval('{sequence}', s.m, true) \
+               FROM (SELECT MAX({colonne})::bigint AS m FROM {table}) s, {sequence} q \
+              WHERE s.m IS NOT NULL AND (s.m > q.last_value OR (s.m = q.last_value AND NOT q.is_called))"
+        )))
+        .execute(pool)
+        .await
+        .map_err(|e| format!("recalage de {sequence} : {e}"))?;
+    }
+    Ok(())
 }
 
 /// Insert a batch of rows into PG using a single multi-row INSERT.
@@ -1862,9 +2016,23 @@ mod tests {
             .execute(&mut c)
             .await
             .expect("PG_FULL_SCHEMA");
+        // La seconde phase (#5389) copie dans le schema des scripts
+        // numerotes : on le monte comme la bascule le fait.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&cible)
+            .await
+            .unwrap();
+        crate::db::migrations::run_pg_migrations(&pool)
+            .await
+            .expect("run_pg_migrations");
+        pool.close().await;
 
         let mut ecarts = Vec::new();
-        for table in MIGRATION_TABLES {
+        for table in MIGRATION_TABLES
+            .iter()
+            .chain(MIGRATION_TABLES_APRES_MISE_A_NIVEAU)
+        {
             let clause = conflict_clause(table);
             let mut visees: Vec<String> = clause
                 .split_once('(')
@@ -1970,6 +2138,334 @@ mod tests {
         assert_eq!(
             apres_seconde, attendu,
             "la bascule rejouee a double ou change la date d'ajout (#5199, #5389)"
+        );
+    }
+
+    /// Seconde phase de la bascule (#5389) : une base SQLite de depart qui
+    /// porte `sql` en plus des lignes communes, basculee DEUX fois (#5199).
+    /// Rend les deux resultats et l'URL de la base PostgreSQL, que
+    /// l'appelant supprime.
+    async fn bascule_rejouee(
+        url: &str,
+        base: &str,
+        sql: &str,
+    ) -> (MigrationResult, MigrationResult, String) {
+        let cible = base_jetable(url, base).await;
+        let sqlite = sqlite_de_depart();
+        sqlite
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(sql)
+            .expect("lignes SQLite de la seconde phase");
+        let premiere = migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("premiere bascule : {e}"));
+        let seconde = migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("seconde bascule : {e}"));
+        (premiere, seconde, cible)
+    }
+
+    /// Les erreurs de copie des `tables`, sur les deux passes.
+    fn erreurs_de(r: &[&MigrationResult], tables: &[&str]) -> Vec<String> {
+        r.iter()
+            .flat_map(|r| r.errors.iter())
+            .filter(|e| tables.iter().any(|t| e.starts_with(&format!("{t}:"))))
+            .cloned()
+            .collect()
+    }
+
+    /// Une colonne texte, lue ligne a ligne.
+    async fn textes(url: &str, sql: &str) -> Vec<String> {
+        let mut c = PgConnection::connect(url).await.unwrap();
+        let v = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_all(&mut c)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} : {e}"))
+            .iter()
+            .map(|l| l.get::<String, _>(0))
+            .collect();
+        c.close().await.ok();
+        v
+    }
+
+    /// Un INSERT du serveur, qui OMET l'`id` : il doit recevoir l'`id`
+    /// suivant le plus grand copie, pas entrer en collision avec lui.
+    async fn id_suivant(url: &str, insert: &str) -> Result<i64, String> {
+        let mut c = PgConnection::connect(url).await.unwrap();
+        let r = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("{insert} RETURNING id")))
+            .fetch_one(&mut c)
+            .await
+            .map_err(|e| e.to_string());
+        c.close().await.ok();
+        r
+    }
+
+    /// Favoris de service et jetons (#5389). Jeton FACTICE.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_seconde_phase_services_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_services_5389";
+        let (r1, r2, cible) = bascule_rejouee(
+            &url,
+            BASE,
+            "INSERT INTO streaming_favorites (id, profile_id, item_type, service, service_id, title)
+                 VALUES (7, 1, 'album', 'qobuz', 'q-7', 'Kind of Blue'),
+                        (9, 1, 'track', 'tidal', 't-9', 'So What');
+             INSERT INTO streaming_auth (service, token_data)
+                 VALUES ('qobuz', '{\"jeton\":\"factice-5389\"}');",
+        )
+        .await;
+        let favoris = textes(
+            &cible,
+            "SELECT concat_ws('|', id, profile_id, item_type, service, service_id, title) \
+             FROM streaming_favorites ORDER BY id",
+        )
+        .await;
+        let jetons = textes(
+            &cible,
+            "SELECT service || '|' || token_data FROM streaming_auth ORDER BY 1",
+        )
+        .await;
+        let suivant = id_suivant(
+            &cible,
+            "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id) \
+             VALUES (1, 'album', 'qobuz', 'q-neuf')",
+        )
+        .await;
+        supprimer_base(&url, BASE).await;
+
+        let erreurs = erreurs_de(&[&r1, &r2], &["streaming_favorites", "streaming_auth"]);
+        assert!(erreurs.is_empty(), "erreurs de copie : {erreurs:?}");
+        assert_eq!(
+            favoris,
+            [
+                "7|1|album|qobuz|q-7|Kind of Blue",
+                "9|1|track|tidal|t-9|So What"
+            ],
+            "favoris de service perdus ou doubles a la bascule (#5389)"
+        );
+        assert_eq!(
+            jetons,
+            ["qobuz|{\"jeton\":\"factice-5389\"}"],
+            "jeton perdu ou altere a la bascule (#5389)"
+        );
+        assert_eq!(
+            suivant,
+            Ok(10),
+            "la sequence de streaming_favorites n'a pas ete recalee"
+        );
+    }
+
+    /// Les tables a clef etrangere vers `tracks` / `albums` (#5389) : les
+    /// lignes arrivent a l'identique, les orphelines sont laissees.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_seconde_phase_clefs_etrangeres_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_fk_5389";
+        let (r1, r2, cible) = bascule_rejouee(
+            &url,
+            BASE,
+            "INSERT INTO artists (id, name) VALUES (31, 'Miles Davis');
+             INSERT INTO albums (id, title, artist_id) VALUES (41, 'Kind of Blue', 31);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path)
+                 VALUES (51, 'So What', 41, 31, '/musique/nas/01.flac');
+             -- Les orphelines (piste / album 999) d'une base ou les clefs
+             -- etrangeres n'etaient pas imposees.
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO album_preferred_roots (album_id, root)
+                 VALUES (41, '/musique/nas'), (999, '/orpheline');
+             INSERT INTO track_copies (id, track_id, file_path, format, sample_rate, bit_depth,
+                                       file_size, file_mtime, audio_hash)
+                 VALUES (3, 51, '/musique/usb/01.flac', 'flac', 44100, 16, 1234, 1316000000.5, 'h1'),
+                        (4, 999, '/musique/usb/orpheline.flac', 'flac', 44100, 16, 1, 1.0, 'h2');
+             INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at)
+                 VALUES (51, 'clap', X'00010203', 1700000000),
+                        (999, 'clap', X'FF', 1);
+             PRAGMA foreign_keys = ON;",
+        )
+        .await;
+        let racines = textes(
+            &cible,
+            "SELECT album_id || '|' || root FROM album_preferred_roots ORDER BY 1",
+        )
+        .await;
+        let copies = textes(
+            &cible,
+            "SELECT concat_ws('|', id, track_id, file_path, format, sample_rate, bit_depth, \
+             file_size, file_mtime, audio_hash) FROM track_copies ORDER BY id",
+        )
+        .await;
+        let empreintes = textes(
+            &cible,
+            "SELECT concat_ws('|', track_id, model, encode(embedding, 'hex'), analyzed_at) \
+             FROM track_audio_embedding ORDER BY 1",
+        )
+        .await;
+        let suivant = id_suivant(
+            &cible,
+            "INSERT INTO track_copies (track_id, file_path) VALUES (51, '/musique/neuf.flac')",
+        )
+        .await;
+        supprimer_base(&url, BASE).await;
+
+        let erreurs = erreurs_de(
+            &[&r1, &r2],
+            &[
+                "album_preferred_roots",
+                "track_copies",
+                "track_audio_embedding",
+            ],
+        );
+        assert!(erreurs.is_empty(), "erreurs de copie : {erreurs:?}");
+        assert_eq!(
+            racines,
+            ["41|/musique/nas"],
+            "album_preferred_roots (#5389)"
+        );
+        assert_eq!(
+            copies,
+            ["3|51|/musique/usb/01.flac|flac|44100|16|1234|1316000000.5|h1"],
+            "track_copies (#5389)"
+        );
+        assert_eq!(
+            empreintes,
+            ["51|clap|00010203|1700000000"],
+            "track_audio_embedding (#5389)"
+        );
+        assert_eq!(
+            suivant,
+            Ok(4),
+            "la sequence de track_copies n'a pas ete recalee"
+        );
+    }
+
+    /// Signalements, propositions et suggestions de metadonnees, journal de
+    /// synchronisation, cache des paroles (#5389).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_seconde_phase_metadonnees_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_metadonnees_5389";
+        // `metadata_suggestions` est creee au demarrage du serveur par
+        // `SuggestionStore::setup_table`, pas par les migrations : meme DDL.
+        let (r1, r2, cible) = bascule_rejouee(
+            &url,
+            BASE,
+            "CREATE TABLE IF NOT EXISTS metadata_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                track_id BIGINT,
+                album_id BIGINT,
+                field TEXT NOT NULL,
+                suggested_value TEXT NOT NULL,
+                source TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT
+             );
+             INSERT INTO metadata_suggestions (id, track_id, field, suggested_value, source, confidence)
+                 VALUES (8, 51, 'genre', 'Jazz', 'musicbrainz', 0.75);
+             INSERT INTO metadata_reports (id, entity, entity_id, reason, created_at)
+                 VALUES (5, 'album', 41, 'mauvaise pochette', '2026-09-01T10:00:00Z');
+             INSERT INTO metadata_proposals (id, entity, cloud_entity_id, local_id, field,
+                                             proposed_value, servers_count, fetched_at)
+                 VALUES (6, 'album', 900, 41, 'year', '1959', 3, '2026-09-02T10:00:00Z');
+             INSERT INTO sync_changelog (id, entity_type, entity_id, action, changed_at, synced)
+                 VALUES (12, 'playlist', 3, 'update', '2026-09-03T10:00:00.000', 1);
+             INSERT INTO lyrics_cache (track_id, title, artist, plain_lyrics, fetched_at)
+                 VALUES (51, 'So What', 'Miles Davis', 'instrumental', '2026-09-04T10:00:00Z');",
+        )
+        .await;
+        let lignes = [
+            textes(
+                &cible,
+                "SELECT concat_ws('|', id, track_id, field, suggested_value, source, confidence, status) \
+                 FROM metadata_suggestions",
+            )
+            .await,
+            textes(
+                &cible,
+                "SELECT concat_ws('|', id, entity, entity_id, reason, created_at) FROM metadata_reports",
+            )
+            .await,
+            textes(
+                &cible,
+                "SELECT concat_ws('|', id, entity, cloud_entity_id, local_id, field, proposed_value, \
+                 servers_count) FROM metadata_proposals",
+            )
+            .await,
+            textes(
+                &cible,
+                "SELECT concat_ws('|', id, entity_type, entity_id, action, changed_at, synced) \
+                 FROM sync_changelog",
+            )
+            .await,
+            textes(
+                &cible,
+                "SELECT concat_ws('|', track_id, title, artist, plain_lyrics, fetched_at) FROM lyrics_cache",
+            )
+            .await,
+        ];
+        let suivants = [
+            id_suivant(
+                &cible,
+                "INSERT INTO metadata_suggestions (field, suggested_value, source) VALUES ('x', 'y', 'z')",
+            )
+            .await,
+            id_suivant(
+                &cible,
+                "INSERT INTO metadata_reports (entity, reason, created_at) VALUES ('album', 'r', 'now')",
+            )
+            .await,
+            id_suivant(
+                &cible,
+                "INSERT INTO metadata_proposals (entity, cloud_entity_id, local_id, field, fetched_at) \
+                 VALUES ('album', 901, 41, 'year', 'now')",
+            )
+            .await,
+            id_suivant(
+                &cible,
+                "INSERT INTO sync_changelog (entity_type, entity_id, action) VALUES ('playlist', 3, 'add')",
+            )
+            .await,
+        ];
+        supprimer_base(&url, BASE).await;
+
+        let erreurs = erreurs_de(
+            &[&r1, &r2],
+            &[
+                "metadata_suggestions",
+                "metadata_reports",
+                "metadata_proposals",
+                "sync_changelog",
+                "lyrics_cache",
+            ],
+        );
+        assert!(erreurs.is_empty(), "erreurs de copie : {erreurs:?}");
+        assert_eq!(
+            lignes,
+            [
+                vec!["8|51|genre|Jazz|musicbrainz|0.75|pending".to_string()],
+                vec!["5|album|41|mauvaise pochette|2026-09-01T10:00:00Z".to_string()],
+                vec!["6|album|900|41|year|1959|3".to_string()],
+                vec!["12|playlist|3|update|2026-09-03T10:00:00.000|1".to_string()],
+                vec!["51|So What|Miles Davis|instrumental|2026-09-04T10:00:00Z".to_string()],
+            ],
+            "metadonnees perdues, doublees ou alterees a la bascule (#5389)"
+        );
+        assert_eq!(
+            suivants,
+            [Ok(9), Ok(6), Ok(7), Ok(13)],
+            "une sequence n'a pas ete recalee apres la copie"
         );
     }
 }
