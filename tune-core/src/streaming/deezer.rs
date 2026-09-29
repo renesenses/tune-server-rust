@@ -60,6 +60,10 @@ pub struct DeezerService {
     /// repart VRAIMENT dans l'appel suivant — et pas seulement qu'une
     /// fonction sait le mettre en forme.
     gw_url: String,
+    /// Racine de l'API publique. Vaut [`API_BASE`] partout ailleurs ; seuls
+    /// les témoins de pagination de la recherche (#4803) la déplacent vers un
+    /// serveur factice.
+    api_url: String,
     arl_rejected: bool,
     /// Cet ARL-ci a-t-il DÉJÀ authentifié dans ce processus ?
     ///
@@ -204,6 +208,7 @@ impl DeezerService {
             proxy_base_url: None,
             sid: std::sync::Mutex::new(None),
             gw_url: DEEZER_GW.to_string(),
+            api_url: API_BASE.to_string(),
             arl_rejected: false,
             arl_authenticated_once: false,
             arl_zero_user_streak: 0,
@@ -518,7 +523,7 @@ impl DeezerService {
     /// Generic GET against the Deezer public API.
     /// Appends `access_token` query parameter when authenticated.
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
-        let mut url = format!("{API_BASE}{path}");
+        let mut url = format!("{}{path}", self.api_url);
         if let Some(ref token) = self.access_token {
             let sep = if url.contains('?') { '&' } else { '?' };
             url = format!("{url}{sep}access_token={token}");
@@ -644,6 +649,47 @@ impl DeezerService {
     }
 
     /// Collect items from a Deezer paginated `data` array.
+    /// La page `depart` des quatre réponses de recherche — pistes, albums,
+    /// artistes, playlists, dans cet ordre (#4803).
+    ///
+    /// `has_more` suit `next`, le signal de Deezer lui-même : il manque à la
+    /// dernière page. Une page vide n'annonce jamais de suite. `total` peut
+    /// promettre plus que ce que `next` sert encore : la page le dit alors
+    /// par `truncated`, sans inventer de suite.
+    fn page_de_recherche(reponses: [&serde_json::Value; 4], depart: usize) -> SearchPage {
+        let [tracks, albums, artists, playlists] = reponses;
+        let total = |r: &serde_json::Value| r["total"].as_u64().unwrap_or(0) as usize;
+        let results = SearchResults {
+            tracks: Self::collect_data(tracks, Self::map_track),
+            albums: Self::collect_data(albums, Self::map_album),
+            artists: Self::collect_data(artists, Self::map_artist),
+            playlists: Self::collect_data(playlists, Self::map_playlist),
+        };
+        let par_categorie = [
+            (tracks, results.tracks.len()),
+            (albums, results.albums.len()),
+            (artists, results.artists.len()),
+            (playlists, results.playlists.len()),
+        ];
+        let suite = |r: &serde_json::Value, rendu: usize| rendu > 0 && r["next"].is_string();
+        let has_more = par_categorie.iter().any(|&(r, rendu)| suite(r, rendu));
+        let truncated = par_categorie
+            .iter()
+            .any(|&(r, rendu)| !suite(r, rendu) && depart + rendu < total(r));
+        SearchPage {
+            results,
+            offset: depart,
+            totals: SearchTotals {
+                tracks: total(tracks),
+                albums: total(albums),
+                artists: total(artists),
+                playlists: total(playlists),
+            },
+            has_more,
+            truncated,
+        }
+    }
+
     fn collect_data<T>(data: &serde_json::Value, mapper: fn(&serde_json::Value) -> T) -> Vec<T> {
         data["data"]
             .as_array()
@@ -776,6 +822,52 @@ impl StreamingService for DeezerService {
             artists: Self::collect_data(&artists_data, Self::map_artist),
             playlists: Self::collect_data(&playlists_data, Self::map_playlist),
         })
+    }
+
+    /// La page de [`Self::search_page`] : 50, `0` (« Tous ») compris (#4803).
+    /// Explicite, et non hérité : le défaut du trait suit la limite du chemin
+    /// non paginé depuis la PR de la limite de #4803, et ce n'est pas la
+    /// page de ce service.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_sans_pagination(limit)
+    }
+
+    /// Une PAGE de la recherche Deezer (#4803) : `index` et `limit`, les deux
+    /// paramètres de pagination de l'API publique. Chaque réponse de
+    /// `/search`, `/search/album`, `/search/artist` et `/search/playlist`
+    /// porte `data`, `total` et, tant qu'il en reste, `next` — l'URL de la page
+    /// suivante (`…&index=52` après `index=50&limit=2`, mesuré le 29/09/2026).
+    ///
+    /// Pages de 50 ([`limite_sans_pagination`]), et
+    /// [`Self::limite_de_page_recherche`] le dit à la route, pour que son
+    /// curseur avance sans trou.
+    ///
+    /// Contrairement à [`Self::search`], qui tait l'échec des trois requêtes
+    /// secondaires, une page échoue ENTIÈRE si l'une échoue : une catégorie
+    /// vidée par un refus (quota, code 4) annoncerait `has_more: false`, soit
+    /// la fin d'un catalogue qui continue. Les refus sont ceux
+    /// d'[`Self::api_get`] (objet `error` de la réponse).
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let encoded = urlencoding::encode(query);
+        let borne = limite_sans_pagination(limit);
+        let fenetre = format!("q={encoded}&index={offset}&limit={borne}");
+        let [pistes, albums, artistes, listes] = ["", "/album", "/artist", "/playlist"]
+            .map(|categorie| format!("/search{categorie}?{fenetre}"));
+        let (tracks, albums, artists, playlists) = tokio::try_join!(
+            self.api_get(&pistes),
+            self.api_get(&albums),
+            self.api_get(&artistes),
+            self.api_get(&listes),
+        )?;
+        Ok(Self::page_de_recherche(
+            [&tracks, &albums, &artists, &playlists],
+            offset,
+        ))
     }
 
     // ── track ────────────────────────────────────────────────────────
@@ -1934,5 +2026,234 @@ mod tests {
             "http://192.168.1.10:8888/deezer-proxy/deezer/92720184.flac"
         );
         assert_eq!(stream.mime_type, "audio/flac");
+    }
+}
+
+/*
+| #4803 — la recherche Deezer pagine : `index` et `limit` de l'API publique.
+|
+| Un serveur factice sur la boucle locale sert, sur les quatre routes de
+| recherche, un catalogue de `total` éléments dont il ne sert que les `servi`
+| premiers (`next` s'arrête là), et NOTE chaque requête reçue. Les témoins
+| lisent ce qui est parti sur le fil : un `index` calculé et jamais envoyé
+| rendrait la page 1 à chaque appel.
+*/
+#[cfg(test)]
+mod pagination_recherche_i4803 {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    type Journal = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+    #[derive(Clone)]
+    struct Catalogue {
+        journal: Journal,
+        total: usize,
+        servi: usize,
+    }
+
+    async fn faux_deezer(total: usize, servi: usize) -> (DeezerService, Journal) {
+        use axum::extract::{Query, State};
+        use axum::http::Uri;
+        use axum::routing::get;
+
+        async fn recherche(
+            State(c): State<Catalogue>,
+            uri: Uri,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let route = uri.path().to_string();
+            c.journal.lock().unwrap().push((route.clone(), q.clone()));
+            if q.get("q").map(String::as_str) == Some("quota") && route == "/search/album" {
+                return axum::Json(json!({"error": {"type": "Exception",
+                    "message": "Quota limit exceeded", "code": 4}}));
+            }
+            let index: usize = q.get("index").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
+            let fin = (index + limit).min(c.servi).min(c.total);
+            let data: Vec<_> = (index..fin.max(index))
+                .map(|i| {
+                    json!({"id": i + 1, "title": format!("n{}", i + 1),
+                    "name": format!("n{}", i + 1), "artist": {"name": "X"}, "album": {}})
+                })
+                .collect();
+            let mut corps = json!({"data": data, "total": c.total});
+            if fin < c.total.min(c.servi) {
+                corps["next"] = json!(format!(
+                    "https://api.deezer.com{route}?q=x&limit={limit}&index={fin}"
+                ));
+            }
+            axum::Json(corps)
+        }
+
+        let journal: Journal = Arc::default();
+        let etat = Catalogue {
+            journal: journal.clone(),
+            total,
+            servi,
+        };
+        let app = axum::Router::new()
+            .route("/search", get(recherche))
+            .route("/search/album", get(recherche))
+            .route("/search/artist", get(recherche))
+            .route("/search/playlist", get(recherche))
+            .with_state(etat);
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = DeezerService::new();
+        svc.api_url = format!("http://{adresse}");
+        (svc, journal)
+    }
+
+    /// Ce que la route `route` a reçu en `cle`, pour chacun de ses appels.
+    fn envoye(journal: &Journal, route: &str, cle: &str) -> Vec<Option<String>> {
+        journal
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == route)
+            .map(|(_, q)| q.get(cle).cloned())
+            .collect()
+    }
+
+    fn ids(page: &SearchPage) -> Vec<String> {
+        page.results.tracks.iter().map(|t| t.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn la_premiere_page_envoie_index_zero_et_annonce_la_suite() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 0).await.expect("page 1");
+
+        for route in [
+            "/search",
+            "/search/album",
+            "/search/artist",
+            "/search/playlist",
+        ] {
+            assert_eq!(
+                envoye(&journal, route, "index"),
+                vec![Some("0".into())],
+                "{route}"
+            );
+            assert_eq!(
+                envoye(&journal, route, "limit"),
+                vec![Some("50".into())],
+                "{route}"
+            );
+        }
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(page.results.albums.len(), 50);
+        assert_eq!(ids(&page)[0], "1");
+        assert_eq!(
+            page.totals.tracks, 120,
+            "le total de l'API, pas la longueur"
+        );
+        assert_eq!(page.totals.playlists, 120);
+        assert!(page.has_more);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn la_deuxieme_page_transmet_son_index_a_l_api() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 50).await.expect("page 2");
+
+        assert_eq!(
+            envoye(&journal, "/search", "index"),
+            vec![Some("50".into())],
+            "sans index envoyé, Deezer rend la page 1 une deuxième fois"
+        );
+        assert_eq!(
+            envoye(&journal, "/search/artist", "index"),
+            vec![Some("50".into())]
+        );
+        assert_eq!(ids(&page).first().map(String::as_str), Some("51"));
+        assert_eq!(ids(&page).last().map(String::as_str), Some("100"));
+        assert_eq!(page.offset, 50);
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn la_derniere_page_n_annonce_plus_rien() {
+        let (svc, _) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 100).await.expect("page 3");
+
+        assert_eq!(page.results.tracks.len(), 20);
+        assert_eq!(ids(&page).last().map(String::as_str), Some("120"));
+        assert!(!page.has_more, "pas de `next` : plus de « Charger plus »");
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn un_total_que_next_ne_sert_plus_est_une_page_tronquee() {
+        let (svc, _) = faux_deezer(5000, 300).await;
+        let page = svc.search_page("love", 50, 250).await.expect("page 6");
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(page.totals.tracks, 5000);
+        assert!(!page.has_more, "Deezer ne donne plus de `next`");
+        assert!(page.truncated, "le total promet plus que ce qui est servi");
+
+        let au_dela = svc.search_page("love", 50, 300).await.expect("au-delà");
+        assert!(au_dela.results.tracks.is_empty());
+        assert!(!au_dela.has_more, "une page vide n'annonce jamais de suite");
+    }
+
+    #[tokio::test]
+    async fn tous_et_les_limites_extravagantes_valent_une_page_de_50() {
+        let (svc, journal) = faux_deezer(500, usize::MAX).await;
+        svc.search_page("x", 0, 0).await.expect("Tous");
+        svc.search_page("x", 100_000, 0).await.expect("énorme");
+        assert_eq!(
+            envoye(&journal, "/search", "limit"),
+            vec![Some("50".into()), Some("50".into())]
+        );
+        assert_eq!(
+            svc.limite_de_page_recherche(0),
+            50,
+            "le curseur avance de 50"
+        );
+        assert_eq!(
+            svc.limite_de_page_recherche(100),
+            50,
+            "100 demandés, 50 servis : le curseur avance de 50, sans trou"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_quota_depasse_est_une_erreur_pas_une_fin_de_catalogue() {
+        let (svc, _) = faux_deezer(120, usize::MAX).await;
+        let err = svc.search_page("quota", 50, 50).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Quota limit exceeded"),
+            "des albums vidés par un refus diraient has_more=false : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_recherche_sans_page_part_comme_avant_sans_index() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let res = svc.search("coltrane", 30).await.expect("search");
+        assert_eq!(res.tracks.len(), 30);
+        for route in [
+            "/search",
+            "/search/album",
+            "/search/artist",
+            "/search/playlist",
+        ] {
+            assert_eq!(envoye(&journal, route, "limit"), vec![Some("30".into())]);
+            assert_eq!(
+                envoye(&journal, route, "index"),
+                vec![None],
+                "sans paged=true, la requête d'avant #4803, intacte ({route})"
+            );
+        }
     }
 }
