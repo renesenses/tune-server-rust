@@ -62,7 +62,24 @@ pub struct CueSheet {
     pub album_genre: Option<String>,
     /// `REM DATE …`. Idem — l'année de l'album, absente du CUE standard.
     pub album_date: Option<String>,
+    /// Les pistes AUDIO de la feuille. Une piste de données (`MODE1/2352`,
+    /// `MODE2/2352`, `MODE1/2048`…) d'un CD mixte n'y figure pas : elle n'a
+    /// rien d'audible, et la jouer comme du PCM rendrait un bruit blanc à
+    /// pleine échelle (#5298). Ses numéros sont dans [`Self::pistes_de_donnees`].
     pub tracks: Vec<CueTrack>,
+    /// Le type de chaque `FILE`, en majuscules, tel qu'écrit après le nom :
+    /// `WAVE`, `BINARY`, `MOTOROLA`, `MP3`, `AIFF`. C'est lui qui dit qu'un
+    /// `.bin` porte du PCM little-endian brut (`BINARY`) ou gros-boutiste
+    /// (`MOTOROLA`).
+    pub file_types: Vec<(String, String)>,
+    /// Numéros des pistes de données écartées de [`Self::tracks`].
+    pub pistes_de_donnees: Vec<u32>,
+    /// Une piste de données aux secteurs de moins de 2352 octets
+    /// (`MODE1/2048`, `MODE2/2336`…) PRÉCÈDE une piste audio dans le même
+    /// fichier. Les temps de la feuille comptent des secteurs, pas des octets :
+    /// dans ce fichier, un secteur audio n'est plus à `secteur × 2352`, et
+    /// découper l'image à cet endroit jouerait des données comme du son.
+    pub donnees_avant_l_audio_non_brutes: bool,
 }
 
 impl CueSheet {
@@ -70,6 +87,14 @@ impl CueSheet {
     /// feuilles.
     pub fn premier_fichier(&self) -> Option<&str> {
         self.audio_files.first().map(String::as_str)
+    }
+
+    /// Le type déclaré d'un `FILE` (`BINARY`, `WAVE`…), en majuscules.
+    pub fn type_du_fichier(&self, nom: &str) -> Option<&str> {
+        self.file_types
+            .iter()
+            .find(|(n, _)| n == nom)
+            .map(|(_, t)| t.as_str())
     }
 }
 
@@ -138,7 +163,16 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
         album_genre: None,
         album_date: None,
         tracks: Vec::new(),
+        file_types: Vec::new(),
+        pistes_de_donnees: Vec::new(),
+        donnees_avant_l_audio_non_brutes: false,
     };
+    // Par piste, dans l'ordre de `sheet.tracks` : son type (`AUDIO`,
+    // `MODE1/2352`…) et son pré-gap `INDEX 00` avec le fichier qui le porte.
+    // Le pré-gap d'une piste de DONNÉES borne la piste audio qui la précède
+    // (#5298) : sur un CD mixte il est déjà écrit en secteurs de données.
+    let mut modes: Vec<String> = Vec::new();
+    let mut pregaps: Vec<Option<(Option<String>, u64)>> = Vec::new();
     // `TITLE` et `PERFORMER` valent pour l'album AVANT le premier `TRACK`, et
     // pour la piste après : c'est la position qui décide, pas le mot-clé.
     let mut in_track = false;
@@ -160,20 +194,25 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 // `FILE "album.ape" WAVE` — le type suit le nom entre
                 // guillemets. Sans guillemets, on garde tout sauf le dernier
                 // mot, qui est le type.
-                let nom = if let Some(start) = rest.find('"')
+                let (nom, type_fichier) = if let Some(start) = rest.find('"')
                     && let Some(len) = rest[start + 1..].find('"')
                 {
-                    unquote(&rest[start..start + len + 2])
+                    (
+                        unquote(&rest[start..start + len + 2]),
+                        rest[start + len + 2..].split_whitespace().last(),
+                    )
                 } else {
                     let mut w: Vec<&str> = rest.split_whitespace().collect();
-                    if w.len() > 1 {
-                        w.pop();
-                    }
-                    unquote(&w.join(" "))
+                    let type_fichier = if w.len() > 1 { w.pop() } else { None };
+                    (unquote(&w.join(" ")), type_fichier)
                 };
                 if let Some(nom) = nom {
                     if !sheet.audio_files.contains(&nom) {
                         sheet.audio_files.push(nom.clone());
+                        sheet.file_types.push((
+                            nom.clone(),
+                            type_fichier.unwrap_or_default().to_ascii_uppercase(),
+                        ));
                     }
                     fichier_courant = Some(nom);
                 }
@@ -193,11 +232,15 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 }
             }
             "TRACK" => {
-                let number = rest
-                    .split_whitespace()
+                let mut mots = rest.split_whitespace();
+                let number = mots
                     .next()
                     .and_then(|n| n.trim_start_matches('0').parse().ok().or(Some(0)))
                     .unwrap_or(0);
+                // Sans type écrit, la piste reste audio : c'est le cas de
+                // toutes les feuilles écrites à la main.
+                modes.push(mots.next().unwrap_or("AUDIO").to_ascii_uppercase());
+                pregaps.push(None);
                 sheet.tracks.push(CueTrack {
                     number,
                     title: None,
@@ -236,7 +279,12 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 let idx = it.next().unwrap_or("");
                 let time = it.next().unwrap_or("");
                 if idx.trim_start_matches('0').is_empty() {
-                    continue; // INDEX 00
+                    // INDEX 00 : retenu à part, il ne sert qu'à borner la
+                    // piste audio qui précède une piste de données.
+                    if let (Some(p), Some(ms)) = (pregaps.last_mut(), parse_cue_time(time)) {
+                        *p = Some((fichier_courant.clone(), ms));
+                    }
+                    continue;
                 }
                 if let (Some(track), Some(ms)) = (sheet.tracks.last_mut(), parse_cue_time(time)) {
                     track.start_ms = ms;
@@ -268,12 +316,53 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
     // dernière piste d'un fichier une fin ANTÉRIEURE à son début, donc une
     // durée négative. La dernière piste de chaque fichier reste ouverte
     // jusqu'à la fin de ce fichier.
+    //
+    // Devant une piste de DONNÉES, la fin est son pré-gap `INDEX 00` quand il
+    // vit dans le même fichier : sur un CD mixte, ces deux secondes sont déjà
+    // des secteurs de données, pas du silence audio (#5298).
     for i in 0..sheet.tracks.len().saturating_sub(1) {
         if sheet.tracks[i].audio_file != sheet.tracks[i + 1].audio_file {
             continue;
         }
-        let next_start = sheet.tracks[i + 1].start_ms;
+        let mut next_start = sheet.tracks[i + 1].start_ms;
+        if modes[i + 1] != "AUDIO"
+            && let Some((fichier, pregap)) = &pregaps[i + 1]
+            && *fichier == sheet.tracks[i].audio_file
+        {
+            next_start = next_start.min(*pregap);
+        }
         sheet.tracks[i].end_ms = Some(next_start);
+    }
+
+    // Les pistes de données sortent de la feuille (#5298). Un fichier qui ne
+    // portait QUE des données sort avec elles : la feuille ne doit pas exiger
+    // qu'il soit présent, ni qu'un décodeur sache le lire.
+    let est_audio: Vec<bool> = modes.iter().map(|m| m == "AUDIO").collect();
+    for (i, piste) in sheet.tracks.iter().enumerate() {
+        if est_audio[i] || modes[i].ends_with("/2352") {
+            continue;
+        }
+        if sheet.tracks[i + 1..]
+            .iter()
+            .zip(&est_audio[i + 1..])
+            .any(|(suivante, audio)| *audio && suivante.audio_file == piste.audio_file)
+        {
+            sheet.donnees_avant_l_audio_non_brutes = true;
+        }
+    }
+    if est_audio.contains(&false) {
+        let mut audio = est_audio.iter();
+        let (gardees, donnees): (Vec<CueTrack>, Vec<CueTrack>) = std::mem::take(&mut sheet.tracks)
+            .into_iter()
+            .partition(|_| *audio.next().unwrap_or(&true));
+        sheet.pistes_de_donnees = donnees.iter().map(|t| t.number).collect();
+        let donnees_seules = |f: &String| {
+            donnees.iter().any(|t| t.audio_file.as_ref() == Some(f))
+                && !gardees.iter().any(|t| t.audio_file.as_ref() == Some(f))
+        };
+        sheet.audio_files.retain(|f| !donnees_seules(f));
+        sheet.file_types.retain(|(f, _)| !donnees_seules(f));
+        sheet.tracks = gardees;
     }
 
     // L'interprète de l'album comble celui des pistes qui n'en déclarent pas —
@@ -637,6 +726,67 @@ FILE "03. Sledgehammer.wav" WAVE
             parse_cue_bytes(latin1).album_title.as_deref(),
             Some("Fantésie")
         );
+    }
+
+    /// #5298 — le type du `FILE` est retenu : c'est lui qui dit qu'un `.bin`
+    /// porte du PCM little-endian brut.
+    #[test]
+    fn le_type_de_chaque_fichier_est_retenu() {
+        let s = parse_cue_sheet(
+            "FILE \"a b.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE nu.img motorola\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        );
+        assert_eq!(s.type_du_fichier("a b.bin"), Some("BINARY"));
+        assert_eq!(s.type_du_fichier("nu.img"), Some("MOTOROLA"));
+        assert_eq!(s.type_du_fichier("absent.bin"), None);
+    }
+
+    /// #5298 — CD mixte : la piste de données sort de la feuille, les pistes
+    /// audio gardent leur numéro et leurs temps.
+    #[test]
+    fn une_piste_de_donnees_est_ignoree() {
+        let s = parse_cue_sheet(
+            "FILE \"cd.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 00:02:00\n    INDEX 01 00:04:00\n  TRACK 03 AUDIO\n    INDEX 01 00:05:10\n",
+        );
+        let nums: Vec<u32> = s.tracks.iter().map(|t| t.number).collect();
+        assert_eq!(nums, vec![2, 3]);
+        assert_eq!(s.pistes_de_donnees, vec![1]);
+        assert_eq!(s.tracks[0].start_ms, 4000);
+        assert_eq!(s.tracks[0].end_ms, Some(5133));
+        assert_eq!(s.audio_files, vec!["cd.bin"]);
+        assert!(!s.donnees_avant_l_audio_non_brutes);
+    }
+
+    /// #5298 — CD Extra : la dernière piste audio s'arrête au PRÉGAP de la
+    /// piste de données, déjà écrit en secteurs de données.
+    #[test]
+    fn la_piste_audio_avant_les_donnees_s_arrete_a_leur_pregap() {
+        let s = parse_cue_sheet(
+            "FILE \"cd.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 MODE2/2352\nINDEX 00 00:03:00\nINDEX 01 00:05:00\n",
+        );
+        assert_eq!(s.tracks.len(), 1);
+        assert_eq!(s.tracks[0].end_ms, Some(3000));
+    }
+
+    /// #5298 — un fichier qui ne porte que des données sort de la feuille :
+    /// elle ne doit pas exiger qu'il soit là.
+    #[test]
+    fn un_fichier_de_donnees_seules_n_est_pas_exige() {
+        let s = parse_cue_sheet(
+            "FILE \"01.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE \"02.bin\" BINARY\nTRACK 02 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        assert_eq!(s.audio_files, vec!["01.bin"]);
+        assert_eq!(s.file_types.len(), 1);
+        assert!(!s.donnees_avant_l_audio_non_brutes);
+    }
+
+    /// #5298 — des données en secteurs de 2048 octets AVANT l'audio du même
+    /// fichier : les temps ne désignent plus les bons octets, c'est signalé.
+    #[test]
+    fn des_donnees_non_brutes_avant_l_audio_sont_signalees() {
+        let s = parse_cue_sheet(
+            "FILE \"cd.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:04:00\n",
+        );
+        assert!(s.donnees_avant_l_audio_non_brutes);
     }
 
     #[test]

@@ -22,7 +22,9 @@ pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
 ];
 
 /// Extensions admises par le catalogue. `iso` est l'unique exception au
-/// contrat de décodage direct : le walker l'extrait d'abord en pistes DSF.
+/// contrat de décodage direct : le walker en fait des pistes virtuelles lues
+/// dans l'image (#5297, [`super::sacd`]), ou, pour un disque DST, l'extrait en
+/// pistes DSF par `sacd_extract` s'il est installé.
 ///
 /// `oga` est l'extension normalisée d'un flux audio Ogg (Vorbis, FLAC-in-Ogg
 /// ou Opus). Elle manquait ici seule, alors que tout le reste de la chaîne la
@@ -48,7 +50,11 @@ pub const KNOWN_UNREAD_AUDIO_EXTENSIONS: &[&str] = &[
     "wma", "asf", // aucun décodeur WMA/ASF livré (#2078, #2242)
     "dst", // flux DST autonome sans décodeur (#2242)
     "mpc", "mp+", "mpp", // Musepack (Rhorn, #1763)
-    "cue", // feuille de découpe, jamais interprétée
+    // `cue` n'est PLUS ici (#5285) : une feuille CUE n'est pas un fichier
+    // audio, c'est la description d'un album, découpée par l'étape CUE du scan
+    // (#1763, #3631). La ranger ici la faisait compter « format audio reconnu
+    // mais non pris en charge » — 798 feuilles chez Belkadi (fil 2003), dont
+    // l'étape suivante lisait 427 albums. Le parcours la retient à part.
     "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
     "m4b", "m4p", // livres audio, achats protégés
     "dts", "ac3", "eac3", // conteneurs plutôt vidéo/multicanal
@@ -120,6 +126,17 @@ pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
             })
         }
         ext_mkv if super::matroska::est_extension_matroska(ext_mkv) => refus_matroska(&ext, path),
+        // #5297 — une image SACD en DSD brut se lit dans l'ISO ; une image
+        // DST, une image de données ou une structure abîmée se refusent, et
+        // se NOMMENT, avant toute promesse de décodage.
+        "iso" => super::sacd::refus_de_decodage(path).map(|motif| UnsupportedLibraryAudio {
+            report_key: if motif == super::sacd::MOTIF_ISO_SACD_DST {
+                super::sacd::CLE_RAPPORT_ISO_SACD_DST.into()
+            } else {
+                super::iso_sacd::CLE_RAPPORT_ISO_SACD.into()
+            },
+            reason: motif.into(),
+        }),
         _ => None,
     }
 }

@@ -6,6 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
 pub struct RelayClient {
@@ -16,6 +17,10 @@ pub struct RelayClient {
     connected: Arc<AtomicBool>,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
     http_client: reqwest::Client,
+    /// La base des réglages, pour savoir si le greffon `circle` est installé
+    /// (Tune Circle T4, #5327). `None` : aucune écoute de contact n'est
+    /// servie — une absence ne vaut jamais une autorisation.
+    reglages: Option<Arc<dyn DbBackend>>,
 }
 
 impl RelayClient {
@@ -37,7 +42,15 @@ impl RelayClient {
             connected: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
             http_client,
+            reglages: None,
         }
+    }
+
+    /// Donne au client la base des réglages : sans elle, il refuse toute
+    /// écoute de contact (`relay.circle_stream_request`).
+    pub fn avec_reglages(mut self, backend: Arc<dyn DbBackend>) -> Self {
+        self.reglages = Some(backend);
+        self
     }
 
     pub fn is_connected(&self) -> bool {
@@ -278,83 +291,223 @@ impl RelayClient {
                 let http = self.http_client.clone();
 
                 tokio::spawn(async move {
-                    let mut req = http.get(&url);
-                    if let Some(r) = range {
-                        req = req.header("range", r);
-                    }
-
-                    match req.send().await {
-                        Ok(resp) => {
-                            let status = resp.status().as_u16();
-                            let content_length = resp
-                                .headers()
-                                .get("content-length")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse::<u64>().ok());
-
-                            let hdrs = entetes_de_flux(resp.headers());
-
-                            let start_msg = serde_json::json!({
-                                "type": "relay.stream_start",
-                                "id": id,
-                                "status": status,
-                                "headers": hdrs,
-                                "content_length": content_length,
-                            });
-
-                            emettre_vers_le_relais(&ws_tx, start_msg.to_string()).await;
-
-                            use futures_util::StreamExt;
-                            let mut stream = resp.bytes_stream();
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(bytes) => {
-                                        // Trame TEXTE `BINARY:<id>:<base64>`.
-                                        // Le canal vers le relais ne porte que
-                                        // du texte (`mpsc::Sender<String>`),
-                                        // d'ou l'encodage. Une trame binaire
-                                        // prefixee de l'identifiant etait
-                                        // assemblee ici puis jetee sans etre
-                                        // envoyee : elle laissait croire a un
-                                        // second format de fil qui n'a jamais
-                                        // existe.
-                                        //
-                                        // C'est ICI que la liaison lente se
-                                        // fait sentir : ce `send` attend que le
-                                        // relais ait de la place. Il attend
-                                        // sans le verrou, sinon le `relay.pong`
-                                        // ne partirait plus et la session
-                                        // entiere serait coupee.
-                                        emettre_vers_le_relais(
-                                            &ws_tx,
-                                            format!("BINARY:{}:{}", id, base64_encode(&bytes)),
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        warn!(id = %id, error = %e, "stream chunk error");
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
-                            emettre_vers_le_relais(&ws_tx, end_msg.to_string()).await;
-                        }
-                        Err(e) => {
-                            warn!(id = %id, error = %e, "relay stream request failed");
-                            let resp = serde_json::json!({
-                                "type": "relay.stream_start",
-                                "id": id,
-                                "status": 502,
-                                "headers": {},
-                            });
-                            emettre_vers_le_relais(&ws_tx, resp.to_string()).await;
-                        }
-                    }
+                    pomper_le_flux(&http, &url, range, &id, &ws_tx).await;
                 });
             }
+            MESSAGE_FLUX_DE_CERCLE => {
+                self.servir_un_flux_de_cercle(&v).await;
+            }
             _ => {}
+        }
+    }
+}
+
+/// Message du pont : un contact écoute une piste de CE serveur (Tune Circle
+/// T4, #5327). Voir [`RelayClient::servir_un_flux_de_cercle`].
+pub const MESSAGE_FLUX_DE_CERCLE: &str = "relay.circle_stream_request";
+
+/// Le `track_id` d'une écoute de contact, s'il désigne bien UNE piste : des
+/// chiffres ASCII, un entier strictement positif, rien d'autre. Ni signe, ni
+/// espace, ni `/`, ni `.`, ni encodage `%` : ce qui n'est pas un entier ne
+/// devient jamais un morceau de chemin.
+///
+/// Le pont envoie une chaîne ; un nombre JSON est admis aussi.
+pub(crate) fn track_id_de_cercle(valeur: Option<&serde_json::Value>) -> Option<i64> {
+    let texte = match valeur? {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.as_u64()?.to_string(),
+        _ => return None,
+    };
+    if texte.is_empty() || texte.len() > 19 || !texte.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    texte.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+/// Le greffon `circle` est-il installé et actif sur ce serveur ?
+///
+/// Même règle que le chargeur de greffons (`plugin_sdk::setup_all`) pour un
+/// greffon opt-in : actif si `plugin_circle_installed` vaut `true` et que
+/// `plugin_circle_enabled` ne vaut pas `false`. Relu à chaque demande : une
+/// désinstallation vaut dès l'écoute suivante, même cloud injoignable.
+pub(crate) fn greffon_circle_actif(reglages: &SettingsRepo) -> bool {
+    let installe = reglages
+        .get("plugin_circle_installed")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.trim() == "true");
+    let desactive = reglages
+        .get("plugin_circle_enabled")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.trim() == "false");
+    installe && !desactive
+}
+
+impl RelayClient {
+    /// `relay.circle_stream_request { id, track_id, range }` : servir l'audio
+    /// d'UNE piste de la bibliothèque, et rien d'autre.
+    ///
+    /// * **Une seule route atteignable** : `/api/v1/library/tracks/{id}/audio`,
+    ///   `id` réduit à un entier par [`track_id_de_cercle`]. Tout autre
+    ///   `track_id` est refusé en 404 SANS appel local.
+    /// * **Le droit n'est pas jugé ici.** Le cloud l'a jugé en délivrant le
+    ///   billet, le pont l'a revérifié à cette requête, et le message arrive
+    ///   par la connexion authentifiée au pont (le seul canal qui porte ce
+    ///   message). Ce serveur ne garde rien du cercle.
+    /// * **Le propriétaire garde la main** : greffon `circle` désinstallé ou
+    ///   désactivé → 404, sans appel local.
+    /// * **Même chemin de morceaux** que `relay.stream_request`, `Range`
+    ///   compris : le fichier d'origine, octet pour octet (bit-perfect).
+    /// * **Journal** : piste, statut, octets, durée. Ni identité, ni billet —
+    ///   ce serveur ne les reçoit d'ailleurs pas.
+    async fn servir_un_flux_de_cercle(&self, v: &serde_json::Value) {
+        let id = v
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string();
+        let range = v
+            .get("range")
+            .and_then(|r| r.as_str())
+            .map(|s| s.to_string());
+
+        let permis = self
+            .reglages
+            .as_ref()
+            .is_some_and(|b| greffon_circle_actif(&SettingsRepo::with_backend(b.clone())));
+        let track_id = track_id_de_cercle(v.get("track_id"));
+
+        let (Some(track_id), true) = (track_id, permis) else {
+            if permis {
+                warn!("circle_ecoute_track_id_refuse");
+            } else {
+                info!("circle_ecoute_refusee_greffon_inactif");
+            }
+            let refus = serde_json::json!({
+                "type": "relay.stream_start",
+                "id": id,
+                "status": 404,
+                "headers": {},
+            });
+            emettre_vers_le_relais(&self.ws_tx, refus.to_string()).await;
+            return;
+        };
+
+        let url = format!(
+            "http://127.0.0.1:{}/api/v1/library/tracks/{}/audio",
+            self.local_port, track_id
+        );
+        let ws_tx = self.ws_tx.clone();
+        let http = self.http_client.clone();
+        tokio::spawn(async move {
+            let debut = std::time::Instant::now();
+            let bilan = pomper_le_flux(&http, &url, range, &id, &ws_tx).await;
+            info!(
+                track_id,
+                statut = bilan.statut,
+                octets = bilan.octets,
+                duree_ms = debut.elapsed().as_millis() as u64,
+                "circle_ecoute_de_contact"
+            );
+        });
+    }
+}
+
+/// Ce qu'un flux relayé a donné, pour le journal.
+pub(crate) struct BilanDuFlux {
+    pub statut: u16,
+    pub octets: u64,
+}
+
+/// Lit `url` en local (avec le `Range` reçu) et le pousse au relais :
+/// `relay.stream_start`, puis les morceaux `BINARY:<id>:<base64>`, puis
+/// `relay.stream_end`. Chemin commun à `relay.stream_request` et à
+/// `relay.circle_stream_request`.
+pub(crate) async fn pomper_le_flux(
+    http: &reqwest::Client,
+    url: &str,
+    range: Option<String>,
+    id: &str,
+    ws_tx: &Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
+) -> BilanDuFlux {
+    let mut req = http.get(url);
+    if let Some(r) = range {
+        req = req.header("range", r);
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let content_length = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let hdrs = entetes_de_flux(resp.headers());
+
+            let start_msg = serde_json::json!({
+                "type": "relay.stream_start",
+                "id": id,
+                "status": status,
+                "headers": hdrs,
+                "content_length": content_length,
+            });
+
+            emettre_vers_le_relais(ws_tx, start_msg.to_string()).await;
+
+            let mut octets: u64 = 0;
+            use futures_util::StreamExt;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        octets += bytes.len() as u64;
+                        // Trame TEXTE `BINARY:<id>:<base64>`. Le canal vers le
+                        // relais ne porte que du texte (`mpsc::Sender<String>`),
+                        // d'ou l'encodage. Une trame binaire prefixee de
+                        // l'identifiant etait assemblee ici puis jetee sans
+                        // etre envoyee : elle laissait croire a un second
+                        // format de fil qui n'a jamais existe.
+                        //
+                        // C'est ICI que la liaison lente se fait sentir : ce
+                        // `send` attend que le relais ait de la place. Il
+                        // attend sans le verrou, sinon le `relay.pong` ne
+                        // partirait plus et la session entiere serait coupee.
+                        emettre_vers_le_relais(
+                            ws_tx,
+                            format!("BINARY:{}:{}", id, base64_encode(&bytes)),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(id = %id, error = %e, "stream chunk error");
+                        break;
+                    }
+                }
+            }
+
+            let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
+            emettre_vers_le_relais(ws_tx, end_msg.to_string()).await;
+            BilanDuFlux {
+                statut: status,
+                octets,
+            }
+        }
+        Err(e) => {
+            warn!(id = %id, error = %e, "relay stream request failed");
+            let resp = serde_json::json!({
+                "type": "relay.stream_start",
+                "id": id,
+                "status": 502,
+                "headers": {},
+            });
+            emettre_vers_le_relais(ws_tx, resp.to_string()).await;
+            BilanDuFlux {
+                statut: 502,
+                octets: 0,
+            }
         }
     }
 }
@@ -599,7 +752,11 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "Tune Server".to_string())
 }
 
-pub fn spawn_relay_client(settings: &SettingsRepo, local_port: u16) -> Option<Arc<RelayClient>> {
+pub fn spawn_relay_client(
+    backend: Arc<dyn DbBackend>,
+    local_port: u16,
+) -> Option<Arc<RelayClient>> {
+    let settings = &SettingsRepo::with_backend(backend.clone());
     let enabled = settings
         .get("bridge_enabled")
         .ok()
@@ -645,12 +802,246 @@ pub fn spawn_relay_client(settings: &SettingsRepo, local_port: u16) -> Option<Ar
 
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(settings);
 
-    let client = Arc::new(RelayClient::new(
-        server_id,
-        bridge_token,
-        relay_url,
-        local_port,
-    ));
+    let client = Arc::new(
+        RelayClient::new(server_id, bridge_token, relay_url, local_port).avec_reglages(backend),
+    );
     client.clone().spawn();
     Some(client)
+}
+
+/// Tune Circle T4 (#5327) : `relay.circle_stream_request`, contre un faux
+/// serveur local qui note chaque chemin demandé.
+#[cfg(test)]
+mod flux_de_cercle_tests {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use std::sync::Mutex as StdMutex;
+
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// (chemin, `Range`) de chaque requête reçue par le faux serveur local.
+    type Journal = Arc<StdMutex<Vec<(String, Option<String>)>>>;
+
+    /// Le faux serveur local : seule la piste 42 existe, et son audio répond
+    /// à un `Range` comme la vraie route (#3579). Tout le reste : 404.
+    async fn repondre(State(journal): State<Journal>, uri: Uri, headers: HeaderMap) -> Response {
+        let range = headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        journal
+            .lock()
+            .unwrap()
+            .push((uri.path().to_string(), range.clone()));
+        if uri.path() != "/api/v1/library/tracks/42/audio" {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        match range.as_deref() {
+            Some("bytes=0-3") => (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    ("content-type", "audio/flac"),
+                    ("content-range", "bytes 0-3/8"),
+                    ("accept-ranges", "bytes"),
+                ],
+                b"fLaC".to_vec(),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::OK,
+                [("content-type", "audio/flac"), ("accept-ranges", "bytes")],
+                b"fLaC\0\0\0\x22".to_vec(),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn serveur_local() -> (u16, Journal) {
+        let journal: Journal = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new().fallback(repondre).with_state(journal.clone());
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = ecoute.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(ecoute, app).await.unwrap();
+        });
+        (port, journal)
+    }
+
+    fn base(installe: Option<&str>, active: Option<&str>) -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let s = SettingsRepo::with_backend(backend.clone());
+        if let Some(v) = installe {
+            s.set("plugin_circle_installed", v).unwrap();
+        }
+        if let Some(v) = active {
+            s.set("plugin_circle_enabled", v).unwrap();
+        }
+        backend
+    }
+
+    async fn client(
+        port: u16,
+        reglages: Option<Arc<dyn DbBackend>>,
+    ) -> (RelayClient, mpsc::Receiver<String>) {
+        let mut c = RelayClient::new("srv".into(), "jeton-du-pont".into(), "ws://x".into(), port);
+        if let Some(b) = reglages {
+            c = c.avec_reglages(b);
+        }
+        let (tx, rx) = mpsc::channel::<String>(64);
+        *c.ws_tx.lock().await = Some(tx);
+        (c, rx)
+    }
+
+    fn demande(track_id: serde_json::Value, range: Option<&str>) -> String {
+        serde_json::json!({
+            "type": MESSAGE_FLUX_DE_CERCLE,
+            "id": "req-c",
+            "track_id": track_id,
+            "range": range,
+        })
+        .to_string()
+    }
+
+    async fn trame(rx: &mut mpsc::Receiver<String>) -> String {
+        tokio::time::timeout(PATIENCE, rx.recv())
+            .await
+            .expect("aucune trame vers le pont")
+            .expect("canal ferme")
+    }
+
+    fn json(t: &str) -> serde_json::Value {
+        serde_json::from_str(t).unwrap()
+    }
+
+    /// Une piste existante : son audio, `Range` compris, par le chemin de
+    /// morceaux de `relay.stream_request` — et seulement sa route.
+    #[tokio::test]
+    async fn sert_l_audio_d_une_piste_existante_avec_range() {
+        let (port, journal) = serveur_local().await;
+        let (c, mut rx) = client(port, Some(base(Some("true"), None))).await;
+
+        c.handle_message(&demande(serde_json::json!("42"), Some("bytes=0-3")))
+            .await;
+
+        let debut = json(&trame(&mut rx).await);
+        assert_eq!(debut["type"], "relay.stream_start");
+        assert_eq!(debut["id"], "req-c");
+        assert_eq!(debut["status"], 206);
+        assert_eq!(debut["headers"]["content-range"], "bytes 0-3/8");
+        assert_eq!(debut["headers"]["content-type"], "audio/flac");
+        assert_eq!(trame(&mut rx).await, "BINARY:req-c:ZkxhQw==");
+        assert_eq!(json(&trame(&mut rx).await)["type"], "relay.stream_end");
+
+        assert_eq!(
+            *journal.lock().unwrap(),
+            vec![(
+                "/api/v1/library/tracks/42/audio".to_string(),
+                Some("bytes=0-3".to_string())
+            )]
+        );
+    }
+
+    /// Un `track_id` inconnu : le 404 de la route locale, relayé.
+    #[tokio::test]
+    async fn un_track_id_inconnu_rend_404() {
+        let (port, journal) = serveur_local().await;
+        let (c, mut rx) = client(port, Some(base(Some("true"), None))).await;
+
+        c.handle_message(&demande(serde_json::json!(999), None))
+            .await;
+
+        let debut = json(&trame(&mut rx).await);
+        assert_eq!(debut["status"], 404);
+        assert_eq!(
+            journal.lock().unwrap()[0].0,
+            "/api/v1/library/tracks/999/audio"
+        );
+    }
+
+    /// Aucune autre route n'est atteignable par ce message : tout ce qui n'est
+    /// pas un entier positif est refusé en 404, SANS aucun appel local.
+    #[tokio::test]
+    async fn aucune_autre_route_n_est_atteignable() {
+        let (port, journal) = serveur_local().await;
+        let (c, mut rx) = client(port, Some(base(Some("true"), None))).await;
+
+        for mauvais in [
+            serde_json::json!("../1"),
+            serde_json::json!("42/../../../system/health"),
+            serde_json::json!("1/../../stream/1"),
+            serde_json::json!("42/"),
+            serde_json::json!("/42"),
+            serde_json::json!("42?x=1"),
+            serde_json::json!("4%32"),
+            serde_json::json!(" 42"),
+            serde_json::json!("-1"),
+            serde_json::json!("0"),
+            serde_json::json!(""),
+            serde_json::json!("1.0"),
+            serde_json::json!("99999999999999999999"),
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["42"]),
+        ] {
+            c.handle_message(&demande(mauvais.clone(), None)).await;
+            let debut = json(&trame(&mut rx).await);
+            assert_eq!(debut["status"], 404, "track_id {mauvais}");
+            assert_eq!(debut["id"], "req-c");
+        }
+        // Sans `track_id` du tout.
+        c.handle_message(
+            &serde_json::json!({"type": MESSAGE_FLUX_DE_CERCLE, "id": "req-c"}).to_string(),
+        )
+        .await;
+        assert_eq!(json(&trame(&mut rx).await)["status"], 404);
+
+        assert!(
+            journal.lock().unwrap().is_empty(),
+            "un appel local est parti : {:?}",
+            journal.lock().unwrap()
+        );
+    }
+
+    /// Le propriétaire garde la main : greffon non installé, désactivé, ou
+    /// client sans réglages → 404, aucun appel local.
+    #[tokio::test]
+    async fn greffon_circle_inactif_rien_n_est_servi() {
+        let (port, journal) = serveur_local().await;
+        for reglages in [
+            None,
+            Some(base(None, None)),
+            Some(base(Some("false"), None)),
+            Some(base(Some("true"), Some("false"))),
+        ] {
+            let (c, mut rx) = client(port, reglages).await;
+            c.handle_message(&demande(serde_json::json!("42"), None))
+                .await;
+            assert_eq!(json(&trame(&mut rx).await)["status"], 404);
+        }
+        assert!(journal.lock().unwrap().is_empty());
+    }
+
+    /// Non-régression : `relay.stream_request` suit toujours `/stream/{id}`.
+    #[tokio::test]
+    async fn le_flux_d_orchestrateur_suit_toujours_son_chemin() {
+        let (port, journal) = serveur_local().await;
+        let (c, mut rx) = client(port, None).await;
+        c.handle_message(
+            &serde_json::json!({"type": "relay.stream_request", "id": "s", "stream_id": "abc"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(json(&trame(&mut rx).await)["status"], 404);
+        assert_eq!(journal.lock().unwrap()[0].0, "/stream/abc");
+    }
 }

@@ -672,6 +672,7 @@ async fn edit_album(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let genre_avant = album.genre.clone();
 
     if let Some(ref v) = body.title {
         album.title = v.clone();
@@ -701,7 +702,16 @@ async fn edit_album(
         }
     }
 
-    repo.update(&album).ok();
+    // #5314 — le genre CHANGÉ de l'album vaut pour ses pistes (Oxygen).
+    if repo.update(&album).is_ok()
+        && body.genre.is_some()
+        && tune_core::db::genre_album_pistes::genre_change(
+            genre_avant.as_deref(),
+            album.genre.as_deref(),
+        )
+    {
+        tune_core::db::genre_album_pistes::recopier_ou_journaliser(&state.backend, id, false);
+    }
 
     Json(json!({ "status": "ok", "album_id": id })).into_response()
 }
@@ -1802,6 +1812,12 @@ async fn fix_genres_by_artist(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -1926,6 +1942,12 @@ async fn fix_genres_by_artist_fuzzy(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2087,6 +2109,12 @@ async fn fix_genres_by_family(
                     ],
                 )
                 .ok();
+            // #5314 — le genre réparé vaut pour les pistes (Oxygen).
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 200 {
                 details.push(json!({
@@ -2328,6 +2356,12 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
                     ],
                 )
                 .ok();
+            // #5314 — le genre trouvé (Last.fm, Discogs) vaut pour les pistes.
+            tune_core::db::genre_album_pistes::recopier_ou_journaliser(
+                &state.backend,
+                *album_id,
+                false,
+            );
             fixed += 1;
             if details.len() < 100 {
                 details.push(json!({
@@ -2669,6 +2703,19 @@ async fn merge_albums(
             Json(json!({"error": "need at least 2 album_ids"})),
         )
             .into_response();
+    }
+    // 🔴 La bibliothèque LOCALE seulement — arbitrage de Bertrand du
+    // 27/09/2026. Cette route appelle `AlbumRepo::absorber`, exactement comme
+    // `absorber_album` et `composer_coffret` : même geste, même refus, même
+    // code. La garde est celle du dépôt, pas une variante
+    // (`library::albums_non_locaux`).
+    //
+    // Elle est posée DANS LA ROUTE et non dans `fusionner_les_albums` : cette
+    // fonction est le moteur, et le refus est une décision d'interface. Elle
+    // n'a aujourd'hui qu'un appelant — cette route — mais la règle vaut pour le
+    // geste de l'utilisateur, pas pour la mécanique de fusion.
+    if crate::routes::library::albums_non_locaux(&state.backend, &body.album_ids) > 0 {
+        return crate::routes::library::refus_source_non_locale();
     }
     match fusionner_les_albums(&state.backend, &body.album_ids) {
         Ok(b) => Json(json!({
@@ -3466,6 +3513,174 @@ mod tests_ensemble_5236 {
         assert_eq!(
             normalize_artist_for_grouping("İlhan Ersahin Quartet"),
             normalize_artist_for_grouping("İlhan Ersahin")
+        );
+    }
+}
+
+/// Témoins de LA garde de source de `POST /metadata/albums/merge` — arbitrage de
+/// Bertrand du 27/09/2026.
+///
+/// Cette route appelle `AlbumRepo::absorber`, comme `absorber_album` et
+/// `composer_coffret` : le même geste doit rendre le même refus. Les témoins des
+/// deux autres, et celui de la garde partagée elle-même, vivent dans
+/// `routes::library::albums`.
+#[cfg(test)]
+mod tests_garde_source_fusion_20260927 {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    use crate::state::AppState;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état")
+    }
+
+    /// Deux albums fusionnables, le second de la source demandée. Chacun porte
+    /// une piste : `fusionner_les_albums` choisit son maître au nombre de
+    /// pistes, il lui en faut donc.
+    fn deux_albums(s: &AppState, source_du_second: &str) {
+        let b = &s.backend;
+        for (id, src) in [(1i64, "local"), (2, source_du_second)] {
+            let source = src.to_string();
+            b.execute(
+                "INSERT INTO albums (id, title, source) VALUES (?1, 'Kind of Blue', ?2)",
+                &[&id as &dyn ToSqlValue, &source],
+            )
+            .expect("album");
+            let chemin = format!("/m/kob/{id:02}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    &format!("p{id}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &source,
+                    &id,
+                ],
+            )
+            .expect("piste");
+        }
+    }
+
+    /// Par la ROUTE, pas par la fonction : c'est là que la garde est posée.
+    async fn fusionner(s: &AppState, ids: &str) -> (StatusCode, Value) {
+        let r = super::router()
+            .with_state(s.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/albums/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!("{{\"album_ids\":{ids}}}")))
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let code = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (code, serde_json::from_slice(&octets).unwrap_or(Value::Null))
+    }
+
+    fn albums_restants(s: &AppState) -> i64 {
+        s.backend
+            .query_one("SELECT COUNT(*) FROM albums", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1)
+    }
+
+    #[tokio::test]
+    async fn fusionner_refuse_un_album_non_local() {
+        let s = etat();
+        deux_albums(&s, "upnp");
+        let (code, v) = fusionner(&s, "[1,2]").await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "l'album 2 est `source = upnp` : 409 attendu — rendu {v}"
+        );
+        assert_eq!(
+            v["error"], "source_non_locale",
+            "le MÊME code que `absorber_album` et `composer_coffret` : {v}"
+        );
+        assert_eq!(
+            albums_restants(&s),
+            2,
+            "refusée, la fusion ne doit avoir supprimé aucun album"
+        );
+    }
+
+    /// L'AUTRE sens : sans lui, une garde qui refuse tout serait verte.
+    #[tokio::test]
+    async fn fusionner_accepte_deux_albums_locaux() {
+        let s = etat();
+        deux_albums(&s, "local");
+        let (code, v) = fusionner(&s, "[1,2]").await;
+        assert_ne!(
+            v["error"], "source_non_locale",
+            "deux albums LOCAUX ne doivent jamais buter sur la garde de source — {v}"
+        );
+        assert_eq!(code, StatusCode::OK, "la fusion locale doit passer — {v}");
+        assert_eq!(
+            v["tracks_moved"], 1,
+            "la piste du doublon doit avoir rejoint le maître — {v}"
+        );
+    }
+}
+
+/// #5314 — une RÉPARATION de genre d'album (ici par artiste, sans réseau) vaut
+/// pour ses pistes : c'est ce que lit la facette Genre d'Oxygen.
+#[cfg(test)]
+mod tests_genre_repare_5314 {
+    use super::*;
+
+    #[tokio::test]
+    async fn le_genre_repare_par_artiste_descend_sur_les_pistes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Miles Davis')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, genre) VALUES \
+             (1, 'Kind of Blue', 1, 'Jazz'), (2, 'Sketches', 1, '')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, genre) VALUES \
+             (1, 'So What', 1, 1, '/m/1.flac', 'Jazz'), (2, 'Saeta', 2, 1, '/m/2.flac', NULL)",
+            &[],
+        )
+        .unwrap();
+        let _ = fix_genres_by_artist(
+            State(state.clone()),
+            Query(CoherenceParams {
+                min_coherence: None,
+            }),
+        )
+        .await
+        .into_response();
+        let ligne = b
+            .query_one("SELECT genre, genres FROM tracks WHERE id = 2", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                ligne[0].as_string().as_deref(),
+                ligne[1].as_string().as_deref()
+            ),
+            (Some("Jazz"), Some(r#"["Jazz"]"#)),
+            "#5314 : le genre réparé de l'album doit descendre sur sa piste"
         );
     }
 }
