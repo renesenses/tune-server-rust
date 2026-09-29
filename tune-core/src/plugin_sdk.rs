@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -436,6 +437,23 @@ pub trait TunePlugin: Send + Sync {
     }
 }
 
+/// Durée maximale du `setup()` d'UN greffon au démarrage (#5403).
+///
+/// Sans borne, un greffon qui attend le réseau (un appareil éteint, un service
+/// qui ne répond pas) tenait l'étape « greffons » du démarrage indéfiniment, et
+/// avec elle tous les greffons suivants. Au-delà de cette durée, le greffon est
+/// journalisé (`plugin_setup_timed_out`) et écarté comme un greffon dont le
+/// `setup()` a échoué ; le démarrage continue. Trente secondes : la même
+/// patience que la sonde de chargement d'un greffon WASM
+/// (`tune-server/src/plugins_host.rs`), et des milliers de fois ce que coûte
+/// un `setup()` sain, qui ne fait qu'enregistrer des sorties, des routes et des
+/// zones.
+///
+/// Limite : la borne ne coupe qu'un `setup()` qui rend la main à l'exécuteur
+/// (une attente `async`). Un `setup()` qui bloque le fil lui-même (appel
+/// bloquant, `std::thread::sleep`) n'est pas interruptible de l'extérieur.
+pub const PLUGIN_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PluginLoader {
     plugins: Arc<tokio::sync::Mutex<Vec<Box<dyn TunePlugin>>>>,
     data_root: PathBuf,
@@ -449,6 +467,8 @@ pub struct PluginLoader {
     /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
     /// disabled), kept so the plugin manager can still surface them.
     unloaded: StdMutex<Vec<AvailablePluginInfo>>,
+    /// Borne du `setup()` de chaque greffon ; [`PLUGIN_SETUP_TIMEOUT`] sauf en test.
+    setup_timeout: Duration,
 }
 
 impl PluginLoader {
@@ -462,7 +482,14 @@ impl PluginLoader {
             event_dispatch_handle: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
             unloaded: StdMutex::new(Vec::new()),
+            setup_timeout: PLUGIN_SETUP_TIMEOUT,
         }
+    }
+
+    /// Change la borne du `setup()` de chaque greffon (#5403).
+    pub fn with_setup_timeout(mut self, timeout: Duration) -> Self {
+        self.setup_timeout = timeout;
+        self
     }
 
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
@@ -577,8 +604,19 @@ impl PluginLoader {
                 ctx = ctx.with_license(Arc::clone(license));
             }
 
-            match plugin.setup(&ctx).await {
-                Ok(()) => {
+            // #5403 — borné : un `setup()` qui ne rend jamais la main ne doit
+            // pas tenir le démarrage, ni les greffons qui le suivent.
+            match tokio::time::timeout(self.setup_timeout, plugin.setup(&ctx)).await {
+                Err(_elapsed) => {
+                    // Même sort qu'un échec : ctx n'est pas vidé, ce que le
+                    // greffon a enregistré à moitié est abandonné.
+                    warn!(
+                        plugin_name = %name,
+                        timeout_ms = self.setup_timeout.as_millis() as u64,
+                        "plugin_setup_timed_out"
+                    );
+                }
+                Ok(Ok(())) => {
                     let reg = ctx.take_registrations();
                     #[cfg(feature = "plugin-http")]
                     let router_count = reg.routers.len();
@@ -597,7 +635,7 @@ impl PluginLoader {
                     }
                     loaded.push(name);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // Deliberately not draining ctx here: a plugin that failed
                     // halfway may have registered an output backed by
                     // half-initialised state. Dropping it is the safe move.
@@ -862,6 +900,61 @@ mod tests {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "test-plugin");
         assert_eq!(loader.plugin_count().await, 1);
+    }
+
+    /// Greffon dont le `setup()` attend quelque chose qui ne vient jamais
+    /// (un appareil du réseau éteint, un service muet) — #5403.
+    struct HangingPlugin;
+
+    #[async_trait]
+    impl TunePlugin for HangingPlugin {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn version(&self) -> &str {
+            "0.0.1"
+        }
+        fn description(&self) -> &str {
+            "Never finishes its setup"
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// #5403 — un `setup()` qui ne rend jamais la main est coupé à
+    /// [`PLUGIN_SETUP_TIMEOUT`] : le démarrage continue, le greffon suivant se
+    /// charge, et celui qui pendait n'est pas résident.
+    ///
+    /// Horloge en pause : les 30 s passent sans qu'on les attende. La borne
+    /// extérieure (une heure) ne sert qu'à rendre un ROUGE lisible au lieu d'un
+    /// test qui pend quand la borne du chargeur manque.
+    #[tokio::test(start_paused = true)]
+    async fn un_setup_qui_pend_est_coupe_et_le_demarrage_continue_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(HangingPlugin)).await;
+        loader.register(Box::new(TestPlugin::new())).await;
+
+        let debut = tokio::time::Instant::now();
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(3600),
+            loader.setup_all("http://localhost:8888"),
+        )
+        .await
+        .expect("setup_all doit rendre la main malgré un setup() qui pend (#5403)");
+        let ecoule = debut.elapsed();
+
+        assert_eq!(loaded, vec!["test-plugin"]);
+        assert_eq!(loader.plugin_count().await, 1);
+        assert!(
+            ecoule >= PLUGIN_SETUP_TIMEOUT && ecoule < PLUGIN_SETUP_TIMEOUT * 2,
+            "coupé à la borne, pas avant ni bien après : {ecoule:?}"
+        );
     }
 
     /// Opt-in plugin: dormant until explicitly installed (like DJ/Karaoke).

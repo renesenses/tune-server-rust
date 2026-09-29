@@ -953,7 +953,7 @@ pub(crate) fn maybe_run_wasm_probe() {
 /// vanished mid-startup, log ending at `plugins_scanned`, nothing to catch
 /// in-process). A child that dies proves it at zero cost; the parent skips
 /// the plugin and the server lives.
-fn probe_wasm_load(entry: &Path) -> bool {
+async fn probe_wasm_load(entry: &Path) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -963,18 +963,32 @@ fn probe_wasm_load(entry: &Path) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    let Ok(mut child) = child else {
+    let Ok(child) = child else {
         return false;
     };
     // Bounded wait: a hung probe must not hang startup either. Generous
     // deadline: a DEBUG build compiles party's wasm in ~12 s (cranelift
     // unoptimised); release builds take well under a second.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    attendre_la_sonde(child, WASM_PROBE_DEADLINE).await
+}
+
+/// Patience accordée au processus fils de [`probe_wasm_load`].
+const WASM_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Attend la fin du processus sonde, au plus `delai` ; au-delà, le tue.
+///
+/// Rend `true` seulement si le fils a fini avec succès. #5403 — l'attente se
+/// fait par `tokio::time::sleep`, jamais par `std::thread::sleep` : cette
+/// fonction tourne sur un fil de l'exécuteur tokio pendant le démarrage, et un
+/// sommeil bloquant l'y tenait jusqu'à 30 s par greffon WASM, avec tout ce que
+/// ce fil portait d'autre.
+async fn attendre_la_sonde(mut child: std::process::Child, delai: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + delai;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             _ => {
                 let _ = child.kill();
@@ -1049,7 +1063,7 @@ pub async fn load_wasm_plugins(state: &AppState) {
         let skip_probe = std::env::var(WASM_PROBE_SKIP_ENV)
             .map(|v| v == "1")
             .unwrap_or(false);
-        if !skip_probe && !probe_wasm_load(&entry) {
+        if !skip_probe && !probe_wasm_load(&entry).await {
             warn!(
                 id = %id,
                 entry = %entry.display(),
@@ -1608,5 +1622,54 @@ mod le_greffon_ne_compte_que_ce_qui_est_entre_3663 {
         assert_eq!(reponse["added"], 2);
         assert_eq!(reponse["demandees"], 2);
         assert_eq!(reponse["absentes"], 0);
+    }
+}
+
+/// #5403 — l'attente de la sonde WASM ne tient pas le fil de l'exécuteur.
+#[cfg(all(test, unix))]
+mod la_sonde_wasm_ne_bloque_pas_l_executeur_5403 {
+    use super::attendre_la_sonde;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn fils_qui_dort(secondes: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg(secondes)
+            .spawn()
+            .expect("lancer sleep")
+    }
+
+    /// Exécuteur à UN fil : une tâche voisine ne peut tourner pendant
+    /// l'attente que si l'attente rend la main. Avec un `std::thread::sleep`,
+    /// elle ne tourne qu'après, et le drapeau est encore faux au retour.
+    #[tokio::test(flavor = "current_thread")]
+    async fn une_tache_voisine_avance_pendant_l_attente_de_la_sonde() {
+        let voisine_a_tourne = Arc::new(AtomicBool::new(false));
+        let drapeau = Arc::clone(&voisine_a_tourne);
+        tokio::spawn(async move {
+            drapeau.store(true, Ordering::SeqCst);
+        });
+
+        let reussie = attendre_la_sonde(fils_qui_dort("0.3"), Duration::from_secs(20)).await;
+
+        assert!(reussie, "un fils qui finit bien rend true");
+        assert!(
+            voisine_a_tourne.load(Ordering::SeqCst),
+            "la tâche voisine devait tourner PENDANT l'attente : l'attente a bloqué le fil"
+        );
+    }
+
+    /// Au-delà du délai, le fils est tué et la sonde rend false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn une_sonde_trop_longue_est_tuee_et_rend_false() {
+        let debut = std::time::Instant::now();
+        let reussie = attendre_la_sonde(fils_qui_dort("30"), Duration::from_millis(200)).await;
+        assert!(!reussie);
+        assert!(
+            debut.elapsed() < Duration::from_secs(10),
+            "le fils devait être tué au délai : {:?}",
+            debut.elapsed()
+        );
     }
 }
