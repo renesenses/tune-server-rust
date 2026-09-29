@@ -1939,6 +1939,26 @@ pub(crate) fn reimporter_fichier_surveillant(
         let ancien_album = ancienne.as_ref().and_then(|a| a.album_id);
         track.id = ancienne.as_ref().and_then(|a| a.id);
         if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
+            // #5346 — comme le scan, relire aussi ReplayGain, crédits, etc.
+            // La lecture forte retrouve également l'identifiant d'une piste
+            // neuve. L'upsert conserve les clés absentes du fichier (mesures
+            // Tune, enrichissement), comme les deux autres chemins de scan.
+            let metadonnees = (|| -> Result<(), String> {
+                let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
+                    db,
+                    std::slice::from_ref(&sf.path),
+                )?;
+                let id = ids.get(&sf.path).copied().ok_or_else(|| {
+                    "piste enregistrée introuvable pour ses métadonnées étendues".to_string()
+                })?;
+                let ext =
+                    tune_core::metadata::read_extended_metadata(std::path::Path::new(&sf.path));
+                tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
+                    .set_batch(id, &ext)
+            })();
+            if let Err(e) = metadonnees {
+                tracing::warn!(path = %sf.path, error = %e, "watcher_extended_metadata_failed");
+            }
             if let Some(ancien) = ancien_album.filter(|&a| Some(a) != album_id) {
                 album_repo.update_track_count(ancien).ok();
                 album_repo.update_quality_from_tracks(ancien).ok();
@@ -3143,3 +3163,7 @@ mod pochettes_cue_tests_5222;
 #[cfg(test)]
 #[path = "surveillant_retouche_garde_l_identifiant_tests_5341.rs"]
 mod surveillant_retouche_garde_l_identifiant_tests_5341;
+
+#[cfg(test)]
+#[path = "surveillant_metadonnees_tests_5346.rs"]
+mod surveillant_metadonnees_tests_5346;
