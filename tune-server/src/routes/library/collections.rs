@@ -289,12 +289,17 @@ pub(crate) fn dossiers_servis_parmi(state: &AppState, ids: &[i64]) -> Result<Vec
 pub(super) async fn list_collections(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let data = dossiers_stockes(&state);
-    let album_repo = AlbumRepo::with_backend(state.backend.clone());
-    let servis = data
-        .iter()
-        .map(|c| dossier_servi(&album_repo, c))
-        .collect::<Result<Vec<Value>, AppError>>()?;
+    // #5438 — demandée avec la liste des collections intelligentes à chaque
+    // ouverture de l'écran (raccourci compris) : ses lectures d'albums sont
+    // synchrones, hors de l'exécuteur.
+    let servis = super::facets::hors_executeur("list_collections", move || {
+        let data = dossiers_stockes(&state);
+        let album_repo = AlbumRepo::with_backend(state.backend.clone());
+        data.iter()
+            .map(|c| dossier_servi(&album_repo, c))
+            .collect::<Result<Vec<Value>, AppError>>()
+    })
+    .await??;
     Ok(Json(json!(servis)))
 }
 
@@ -448,7 +453,25 @@ pub(super) async fn collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(query): Query<CollectionAlbumsQuery>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // #5438 — l'écran des collections la demande pour CHAQUE dossier sans
+    // pochette, en parallèle : une lecture par album, hors de l'exécuteur.
+    match super::facets::hors_executeur("collection_albums", move || {
+        lire_les_albums_du_dossier(&state, id, query)
+    })
+    .await
+    {
+        Ok(reponse) => reponse,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Le corps de `GET /library/collections/{id}/albums`, HORS de l'exécuteur.
+fn lire_les_albums_du_dossier(
+    state: &AppState,
+    id: i64,
+    query: CollectionAlbumsQuery,
+) -> axum::response::Response {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let collections: Vec<Value> = settings
         .get("collections")

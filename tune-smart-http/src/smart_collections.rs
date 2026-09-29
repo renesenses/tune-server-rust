@@ -198,10 +198,43 @@ pub(crate) fn compte_albums_ventile(
     (en_base, en_service)
 }
 
+/// Faire tourner les lectures synchrones d'une route de collection
+/// intelligente HORS des fils de l'exécuteur async — #5438.
+///
+/// Un clic sur un raccourci vers une collection intelligente ouvre l'écran des
+/// collections : `GET /library/smart-collections` (deux `COUNT(DISTINCT …)`
+/// sur toute la bibliothèque PAR collection), puis `GET …/{id}/albums` pour
+/// chacune, en parallèle. Posées sur les fils de l'exécuteur, ces lectures
+/// les tenaient tous à la fois et le flux vers le renderer se taisait — la
+/// micro-coupure constatée chez Yves Corbat (58 359 pistes). Même remède que
+/// `list_albums` (#4800) : le pool de fils bloquants de Tokio.
+///
+/// Une tâche perdue (panique) rend 500 et le journal dit quelle route.
+async fn hors_executeur<T, F>(route: &'static str, travail: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(travail).await.map_err(|e| {
+        tracing::error!(route, error = %e, "collection_intelligente_tache_bloquante_perdue");
+        AppError::internal(format!("{route} : lecture interrompue"))
+    })
+}
+
 async fn list_collections(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
 ) -> Result<Json<Value>, AppError> {
+    let profile_id = profile.id();
+    hors_executeur("smart_collections_list", move || {
+        lister_les_collections(&state, profile_id)
+    })
+    .await?
+    .map(Json)
+}
+
+/// Le corps de `GET /library/smart-collections`, exécuté HORS de l'exécuteur.
+fn lister_les_collections(state: &SmartHttpState, profile_id: i64) -> Result<Value, AppError> {
     let rows = state
         .backend
         .query_many(
@@ -213,7 +246,7 @@ async fn list_collections(
         .map_err(AppError::internal)?;
 
     let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let ctx = RefCtx::root(&resolver, Some(profile_id));
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -246,7 +279,7 @@ async fn list_collections(
                 &album_count_sql,
                 &rules_str,
                 match_mode,
-                profile.id(),
+                profile_id,
             );
             col["album_count"] = json!(albums_en_base + albums_de_service);
             // 🔴 #4466 — `track_count` ne compte QUE la base. Tant que les
@@ -289,7 +322,7 @@ async fn list_collections(
             col
         })
         .collect();
-    Ok(Json(json!(items)))
+    Ok(json!(items))
 }
 
 /// La borne `max_limit` d'une collection intelligente, ou 400.
@@ -1128,15 +1161,37 @@ async fn albums_de_la_collection(
     id: i64,
     profile_id: i64,
 ) -> Result<Option<Vec<Value>>, AppError> {
+    // #5438 — les critères, la requête d'albums et les albums de service sont
+    // des lectures synchrones : hors de l'exécuteur. Seul le catalogue (appel
+    // réseau, async) reste ici.
+    let lu = hors_executeur("smart_collection_albums", {
+        let state = state.clone();
+        move || albums_de_la_bibliotheque(&state, id, profile_id)
+    })
+    .await??;
+    let Some((albums, rules_json, max_limit)) = lu else {
+        return Ok(None);
+    };
+    let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
+    Ok(Some(albums))
+}
+
+/// Albums locaux et de service, règles et borne — de quoi joindre ensuite le
+/// catalogue.
+type AlbumsDeLaBibliotheque = (Vec<Value>, String, Option<i64>);
+
+/// Les albums locaux et de service de la collection `id`, et de quoi y
+/// joindre le catalogue (règles, borne). Synchrone : HORS de l'exécuteur.
+fn albums_de_la_bibliotheque(
+    state: &SmartHttpState,
+    id: i64,
+    profile_id: i64,
+) -> Result<Option<AlbumsDeLaBibliotheque>, AppError> {
     let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
         load_collection_criteria(state, id)?
     else {
         return Ok(None);
     };
-
-    // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
-    // doivent mourir avant le `.await` du catalogue, sinon le futur n'est plus
-    // `Send` et axum refuse le handler.
     let (where_clause, order, limit_clause) = {
         let resolver = DbRefResolver::new(&state.backend);
         let ctx = RefCtx::root(&resolver, Some(profile_id));
@@ -1160,8 +1215,7 @@ async fn albums_de_la_collection(
         &sort_order,
         max_limit,
     )?;
-    let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
-    Ok(Some(albums))
+    Ok(Some((albums, rules_json, max_limit)))
 }
 
 /// Un album d'une collection intelligente, vu par qui la PARTAGE avec un
@@ -1248,39 +1302,47 @@ async fn preview_albums(
     // pas reproduire (#2732).
     borne_valide(body.max_limit)?;
     let rules_json = body.rules.to_string();
-    let match_mode = body.match_mode.as_deref().unwrap_or("all");
-    let sort_by = body.sort_by.as_deref().unwrap_or("title");
-    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+    let max_limit = body.max_limit;
+    let profile_id = profile.id();
 
-    // Les références à l'état meurent avant le `.await` du catalogue (voir
-    // `resolve_albums`).
-    let (where_clause, order, limit_clause) = {
-        let resolver = DbRefResolver::new(&state.backend);
-        let ctx = RefCtx::root(&resolver, Some(profile.id()));
-        build_album_query(
-            &rules_json,
-            match_mode,
-            sort_by,
-            sort_order,
-            body.max_limit,
-            &ctx,
-        )
-    };
-    let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
-    let albums = avec_albums_de_service(
-        &state,
-        albums,
-        &rules_json,
-        match_mode,
-        profile.id(),
-        sort_by,
-        sort_order,
-        body.max_limit,
-    )?;
+    // #5438 — la requête d'albums et les albums de service sont des lectures
+    // synchrones : hors de l'exécuteur, comme la collection enregistrée.
+    let albums = hors_executeur("smart_collection_preview", {
+        let (state, rules_json) = (state.clone(), rules_json.clone());
+        move || {
+            let match_mode = body.match_mode.as_deref().unwrap_or("all");
+            let sort_by = body.sort_by.as_deref().unwrap_or("title");
+            let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+            let (where_clause, order, limit_clause) = {
+                let resolver = DbRefResolver::new(&state.backend);
+                let ctx = RefCtx::root(&resolver, Some(profile_id));
+                build_album_query(
+                    &rules_json,
+                    match_mode,
+                    sort_by,
+                    sort_order,
+                    max_limit,
+                    &ctx,
+                )
+            };
+            let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+            avec_albums_de_service(
+                &state,
+                albums,
+                &rules_json,
+                match_mode,
+                profile_id,
+                sort_by,
+                sort_order,
+                max_limit,
+            )
+        }
+    })
+    .await??;
     // 🔴 #4473 — l'aperçu de l'éditeur est ce que la collection rendra : sans
     // cet appel, une règle « catalogue » s'y montrait VIDE et sans refus, puis
     // la collection enregistrée rendait des albums, ou un 400.
-    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, body.max_limit).await?;
+    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }
