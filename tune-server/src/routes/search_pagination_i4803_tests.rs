@@ -554,3 +554,27 @@ async fn sous_paged_un_service_sans_pagination_garde_la_limite_d_avant() {
         "paginé ou non, la première page d'un service sans pagination est la même"
     );
 }
+
+/// #4803, décision de Bertrand (29/09/2026) : un plafond haut de 500. Un
+/// `limit=100000` rend 500 lignes au plus, paginé ou non — et les deux
+/// premières pages sont les mêmes.
+#[tokio::test]
+async fn une_limite_extravagante_est_bornee_a_500_avec_et_sans_paged() {
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    state
+        .services
+        .lock()
+        .await
+        .register(Box::new(Nu { catalogue: 1_000 }));
+
+    let pagine = chercher(&state, "q=coltrane&limit=100000&sources=nu&paged=true").await;
+    let bloc = &pagine["services"]["nu"];
+    assert_eq!(ids(bloc).len(), 500, "paginé : {}", bloc["limit"]);
+    assert_eq!(bloc["limit"], 500, "la limite SERVIE : {}", bloc["limit"]);
+    assert_eq!(bloc["has_more"], false);
+
+    let non_pagine = chercher(&state, "q=coltrane&limit=100000&sources=nu").await;
+    let bloc_np = &non_pagine["services"]["nu"];
+    assert_eq!(ids(bloc_np).len(), 500, "non paginé : même plafond");
+    assert_eq!(ids(bloc_np), ids(bloc), "la même première page");
+}

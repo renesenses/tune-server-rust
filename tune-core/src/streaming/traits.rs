@@ -259,14 +259,26 @@ pub fn limite_sans_pagination(limit: usize) -> usize {
     }
 }
 
+/// Plafond haut de la limite qu'un service reçoit pour UNE recherche, par
+/// catégorie (#4803, décision de Bertrand du 29/09/2026).
+///
+/// La même valeur que le `PLAFOND_RECHERCHE` de Qobuz (`qobuz.rs`), qui
+/// borne déjà sa recherche à 500 par catégorie : aucun service ne reçoit
+/// davantage, paginé ou non. Sans lui, `?limit=100000` partait tel quel dans
+/// l'URL d'un service sans pagination. La route de recherche fédérée applique
+/// la MÊME borne à son chemin non paginé, pour que la première page soit
+/// identique avec ou sans `paged=true`.
+pub const PLAFOND_LIMITE_RECHERCHE: usize = 500;
+
 /// La limite qu'un service SANS pagination reçoit de [`StreamingService::search_page`]
 /// par défaut : celle du chemin non paginé, `0` (« Tous ») excepté, qui
-/// devient une page de [`LIMITE_PAGE_SANS_PAGINATION`] (#2160, #4803).
+/// devient une page de [`LIMITE_PAGE_SANS_PAGINATION`] (#2160, #4803), et
+/// bornée à [`PLAFOND_LIMITE_RECHERCHE`].
 pub fn limite_hors_pagination(limit: usize) -> usize {
     if limit == 0 {
         LIMITE_PAGE_SANS_PAGINATION
     } else {
-        limit
+        limit.min(PLAFOND_LIMITE_RECHERCHE)
     }
 }
 
@@ -1374,6 +1386,12 @@ mod tests_limite_sans_pagination {
         assert_eq!(limite_hors_pagination(0), LIMITE_PAGE_SANS_PAGINATION);
         assert_eq!(limite_hors_pagination(20), 20);
         assert_eq!(limite_hors_pagination(100), 100);
+        assert_eq!(limite_hors_pagination(500), 500);
+        assert_eq!(
+            limite_hors_pagination(100_000),
+            PLAFOND_LIMITE_RECHERCHE,
+            "un plafond haut, décision de Bertrand"
+        );
     }
 
     #[test]
