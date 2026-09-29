@@ -4126,11 +4126,30 @@ struct NotesServies {
 /// Le filtre est **positif** : on nomme ce qu'on sert. Une troisième famille
 /// de tags apparaîtra un jour ; elle sera écartée sans qu'on ait à y penser.
 /// C'est le même choix, et la même forme, que `notes-de-version-watch.sh`.
+///
+/// Une pré-version `vX.Y.Z-<pré>` (`v1.0.0-rc1`, 29/09/2026) EST une version
+/// de Tune : la 1.0.0-rc1 part chez tout le monde, ses notes doivent paraître
+/// dans le panneau. Le suffixe suit la grammaire semver des pré-versions
+/// (`[0-9A-Za-z.]`, non vide) ; `moissonneur-v1.0.0-rc1` reste écarté par le
+/// préfixe.
 fn est_une_version_de_tune(tag: &str) -> bool {
     let Some(reste) = tag.strip_prefix('v') else {
         return false;
     };
-    let mut morceaux = reste.split('.');
+    let (base, pre) = match reste.split_once('-') {
+        Some((base, pre)) => (base, Some(pre)),
+        None => (reste, None),
+    };
+    if let Some(pre) = pre
+        && (pre.is_empty()
+            || pre.starts_with('.')
+            || pre.ends_with('.')
+            || pre.contains("..")
+            || !pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'))
+    {
+        return false;
+    }
+    let mut morceaux = base.split('.');
     let trois = [morceaux.next(), morceaux.next(), morceaux.next()];
     morceaux.next().is_none()
         && trois
@@ -5936,8 +5955,23 @@ mod changelog_forme_tests {
         // partiel : le filtre est positif, il ne liste pas ce qu'il écarte.
         assert!(!est_une_version_de_tune("os-v0.9.161"));
         assert!(!est_une_version_de_tune("v0.9"));
-        assert!(!est_une_version_de_tune("v0.9.161-rc1"));
         assert!(!est_une_version_de_tune("0.9.161"));
+    }
+
+    /// La 1.0.0-rc1 (29/09/2026) part chez tout le monde : ses notes doivent
+    /// paraître dans le panneau. Avant ce correctif, ce test affirmait
+    /// l'inverse (`!est_une_version_de_tune("v0.9.161-rc1")`).
+    #[test]
+    fn une_pre_version_de_tune_est_une_version_de_tune() {
+        assert!(est_une_version_de_tune("v1.0.0-rc1"));
+        assert!(est_une_version_de_tune("v1.0.0-rc0-test"));
+        assert!(est_une_version_de_tune("v2.0.0-alpha.3"));
+        assert!(!est_une_version_de_tune("moissonneur-v1.0.0-rc1"));
+        assert!(!est_une_version_de_tune("tune-os-rpi-v1.0.0-rc1"));
+        assert!(!est_une_version_de_tune("v1.0.0-"));
+        assert!(!est_une_version_de_tune("v1.0.0-rc_1"));
+        assert!(!est_une_version_de_tune("v1.0.0-.rc1"));
+        assert!(!est_une_version_de_tune("v1.0-rc1"));
     }
 
     /// Le décor du 23/09/2026 : huit releases du moissonneur mêlées aux
