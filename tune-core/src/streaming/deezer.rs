@@ -36,6 +36,22 @@ pub const ARL_REFUSE: &str = "deezer: ARL refusé par Deezer";
 /// est gardé, rien n'est établi sur sa validité (`etat: "injoignable"`).
 pub const ARL_INJOIGNABLE: &str = "deezer: ARL non vérifié, Deezer injoignable";
 
+/// #5427 — clé du marqueur PERSISTANT de déconnexion volontaire, posée dans
+/// la ligne `auth_tokens_deezer` (table `settings`) par `save_tokens` après
+/// un `logout`. Tant qu'il est là, `TUNE_DEEZER_ARL` n'est plus relue au
+/// démarrage. Une nouvelle authentification (ARL saisi) l'efface : la ligne
+/// suivante porte l'ARL et plus le marqueur.
+pub const MARQUEUR_DECONNEXION_VOLONTAIRE: &str = "deconnexion_volontaire";
+
+/// La ligne `auth_tokens_deezer` porte-t-elle le marqueur de déconnexion
+/// volontaire ?
+pub fn deconnexion_volontaire(ligne: &serde_json::Value) -> bool {
+    ligne
+        .get(MARQUEUR_DECONNEXION_VOLONTAIRE)
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
 pub struct DeezerService {
     client: Client,
     access_token: Option<String>,
@@ -1223,7 +1239,10 @@ impl StreamingService for DeezerService {
             // celle de la session close (#5427). `restore_tokens` la relit
             // comme « rien à restaurer ».
             if self.deconnecte {
-                return Some(serde_json::json!({ "quality": self.quality }));
+                return Some(serde_json::json!({
+                    "quality": self.quality,
+                    MARQUEUR_DECONNEXION_VOLONTAIRE: true,
+                }));
             }
             return None;
         }
@@ -1238,6 +1257,9 @@ impl StreamingService for DeezerService {
 
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
         let mut restored = false;
+        // Le marqueur survit aux redémarrages : relu ici, il est réécrit par
+        // le prochain `save_tokens` tant qu'aucun ARL n'a été saisi.
+        self.deconnecte = deconnexion_volontaire(tokens);
         if let Some(t) = tokens["access_token"].as_str() {
             self.access_token = Some(t.into());
             restored = true;
@@ -2125,5 +2147,37 @@ mod tests {
             !relu.restore_tokens(&ligne),
             "la ligne écrite après déconnexion ne doit rien restaurer"
         );
+    }
+
+    /// #5427 (Bertrand, 29/09 au soir) — la déconnexion pose un marqueur
+    /// PERSISTANT, relu au démarrage et effacé par une nouvelle saisie.
+    #[tokio::test]
+    async fn la_deconnexion_pose_un_marqueur_persistant_qu_une_saisie_efface() {
+        let mut svc = DeezerService::new();
+        svc.restore_tokens(&json!({ "arl": "d".repeat(192) }));
+        svc.logout().await.unwrap();
+        let ligne = svc.save_tokens().expect("ligne après déconnexion");
+        assert!(deconnexion_volontaire(&ligne), "marqueur absent : {ligne}");
+
+        // Redémarrage : le marqueur est relu, et réécrit tel quel.
+        let mut relu = DeezerService::new();
+        relu.restore_tokens(&ligne);
+        assert!(deconnexion_volontaire(
+            &relu.save_tokens().expect("ligne relue")
+        ));
+
+        // Nouvelle saisie : la ligne porte l'ARL et plus le marqueur.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string()],
+        ));
+        relu.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        relu.authenticate(&json!({ "arl": "e".repeat(192) }))
+            .await
+            .unwrap();
+        serveur.await.unwrap();
+        assert!(!deconnexion_volontaire(&relu.save_tokens().unwrap()));
     }
 }
