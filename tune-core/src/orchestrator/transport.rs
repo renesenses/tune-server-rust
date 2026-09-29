@@ -2136,11 +2136,12 @@ impl PlaybackOrchestrator {
         ) {
             return;
         }
-
+        let seq_au_depart = self.playback.current_transport_seq(zone_id).await;
         self.detacher_le_seek_apres_reprise(
             zone_id,
             did.to_string(),
             position_ms,
+            seq_au_depart,
             std::time::Duration::from_millis(REPLAY_OUTPUT_SEEK_SETTLE_MS),
             "relecture",
             // Flux NEUF : la session repart de l'octet 0, le renderer aussi —
@@ -2152,29 +2153,39 @@ impl PlaybackOrchestrator {
 
     /// Le seek qui suit une reprise ou une relecture sur un renderer réseau
     /// part en tâche détachée : la réponse à l'appelant n'attend plus le temps
-    /// de pose (LAT-P2). La tâche capture la génération de lecture au départ
-    /// et abandonne si un stop, un next ou une nouvelle lecture est intervenu
-    /// pendant la pose — sinon elle seekerait la piste suivante.
+    /// de pose (LAT-P2). La tâche abandonne si une commande de transport est
+    /// intervenue depuis `seq_au_depart` — sinon elle seekerait la piste
+    /// suivante, ou écraserait un déplacement de l'utilisateur.
+    ///
+    /// `seq_au_depart` (#5476) est la génération des commandes de transport
+    /// ([`crate::playback::PlaybackManager::current_transport_seq`]) prise
+    /// par l'appelant : pour une reprise, À SON ENTRÉE, avant le `Play`. Un
+    /// Seek de l'utilisateur arrivé pendant ce `Play` (8 s sur le Devialet de
+    /// FabienM, fil 2037) rend donc la tâche caduque, même s'il attend encore
+    /// le verrou de la sortie quand elle démarre. Elle relit la génération
+    /// après la pose, puis une seconde fois sortie en main, juste avant le
+    /// Seek : c'est là qu'elle a pu attendre la commande qui la rend caduque.
     ///
     /// `seulement_si_decale` (#5050) : la tâche lit d'abord où l'appareil en
     /// est ([`crate::outputs::OutputTarget::position_mesuree_ms`]) et n'envoie
     /// le Seek que s'il n'est pas à `position_ms`, à
     /// [`ECART_TOLERE_APRES_REPRISE_MS`] près. Position illisible : Seek.
+    #[allow(clippy::too_many_arguments)]
     async fn detacher_le_seek_apres_reprise(
         &self,
         zone_id: i64,
         device_id: String,
         position_ms: u64,
+        seq_au_depart: u64,
         pose: std::time::Duration,
         motif: &'static str,
         seulement_si_decale: bool,
     ) {
-        let seq_au_depart = self.playback.current_play_seq(zone_id).await;
         let outputs = self.outputs.clone();
         let playback = self.playback.clone();
         tokio::spawn(async move {
             tokio::time::sleep(pose).await;
-            let seq_courante = playback.current_play_seq(zone_id).await;
+            let seq_courante = playback.current_transport_seq(zone_id).await;
             if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
                 info!(
                     zone_id,
@@ -2218,6 +2229,23 @@ impl PlaybackOrchestrator {
                     motif,
                     "seek_apres_reprise_renderer_decale"
                 );
+            }
+            // #5476 — seconde lecture de la génération, sortie en main : la
+            // tâche a pu attendre le verrou derrière un Seek de l'utilisateur
+            // (ou une pause), puis mesurer une position qui est la SIENNE, pas
+            // un décalage. Une commande survenue depuis la reprise rend ce
+            // Seek caduc.
+            let seq_courante = playback.current_transport_seq(zone_id).await;
+            if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
+                info!(
+                    zone_id,
+                    position_ms,
+                    motif,
+                    seq_au_depart,
+                    seq_courante,
+                    "seek_apres_reprise_abandonne_commande_survenue"
+                );
+                return;
             }
             match sortie.checked_seek(position_ms).await {
                 Ok(()) => {
@@ -2325,6 +2353,8 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        // #5476 — rend caduc un Seek de reprise détaché encore en attente.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         if let Some(did) = device_id {
             // Le backend confirme la commande AVANT que la copie mémoire et
             // la base annoncent Paused.
@@ -2453,6 +2483,9 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
+        // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
+        let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
@@ -2697,6 +2730,7 @@ impl PlaybackOrchestrator {
                 zone_id,
                 did.to_string(),
                 position_ms,
+                seq_de_la_reprise,
                 std::time::Duration::from_millis(RESUME_OUTPUT_SEEK_SETTLE_MS),
                 "reprise",
                 // #5050 — seulement si l'appareil n'a pas repris en place.
@@ -2727,6 +2761,8 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        // #5476 — rend caduc un Seek de reprise détaché encore en attente.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
@@ -2824,6 +2860,10 @@ impl PlaybackOrchestrator {
         mut position_ms: u64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #5476 — compté à l'ENTRÉE, avant d'attendre la sortie : un Seek de
+        // reprise détaché qui attend le même verrou doit savoir qu'il est
+        // caduc quand il l'obtiendra.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         let seek_start = std::time::Instant::now();
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
