@@ -4851,6 +4851,9 @@ impl OutputTarget for LocalOutput {
             // instead of waiting forever on a ring buffer nobody drains.
             let device_gone = Arc::new(AtomicBool::new(false));
 
+            // #5439 — un flux décodé en continu repart du début de la piste :
+            // son seek passe par le saut d'octets du chemin PCM.
+            let mut pre_seeked = pre_seeked;
             let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
             {
@@ -4862,6 +4865,48 @@ impl OutputTarget for LocalOutput {
                     "local_audio_wav_header_parsed"
                 );
                 parsed
+            } else if let Some(extension) =
+                decodage_en_continu::extension_decodable_en_continu(&header_buf)
+            {
+                // #5439 — FLAC ou MP3 servi tel quel (serveur multimédia) :
+                // le décodeur des fichiers locaux le rend en WAV au fil de
+                // l'eau, et la suite est le chemin PCM — décision de cadence,
+                // rééchantillonneur en flux, seek, enchaînement, arrêt. Plus
+                // rien n'attend la fin du téléchargement.
+                info!(
+                    format = extension,
+                    "local_audio_flux_compresse_decode_en_continu"
+                );
+                reader = reader.decoder_en_continu(std::mem::take(&mut header_buf), extension);
+                pre_seeked = false;
+                match decodage_en_continu::lire_l_entete_decodee(&mut reader, &force_silent) {
+                    decodage_en_continu::EnteteDecodee::Pret { octets, format } => {
+                        header_buf = octets;
+                        info!(
+                            channels = format.0,
+                            sample_rate = format.1,
+                            bit_depth = format.2,
+                            data_offset = format.3,
+                            "local_audio_wav_header_parsed"
+                        );
+                        format
+                    }
+                    decodage_en_continu::EnteteDecodee::Interrompu => {
+                        debug!("local_audio_header_read_aborted");
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    decodage_en_continu::EnteteDecodee::Echec => {
+                        let motif = decodage_en_continu::motif_de_l_echec(
+                            reader.echec_du_decodage().as_deref(),
+                        );
+                        record_compressed_decode_failure(motif, &device_name, &open_failure);
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
             } else {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
@@ -6975,6 +7020,11 @@ pub use resolution::*;
 // #5439 — la cadence d'ouverture du chemin compressé (serveur multimédia,
 // radio décodée), décidée comme celle du chemin PCM.
 mod cadence_du_flux_compresse;
+// #5439 — FLAC et MP3 servis tels quels, décodés au fil de l'eau par le
+// décodeur des fichiers locaux, puis joués par le chemin PCM.
+mod decodage_en_continu;
+#[cfg(test)]
+mod decodage_en_continu_5439;
 #[cfg(test)]
 mod flux_compresse_a_la_cadence_source_5439;
 
