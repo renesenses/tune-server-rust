@@ -1230,6 +1230,10 @@ pub(super) async fn delete_all_zones(State(state): State<AppState>) -> impl Into
     }
 }
 
+/// Le temps laissé à l'arrêt d'une zone avant sa suppression (#5322). Un
+/// renderer injoignable ne doit pas faire attendre le DELETE indéfiniment.
+const ARRET_AVANT_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) async fn delete_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -1241,6 +1245,29 @@ pub(super) async fn delete_zone(
     // zone. On relève la zone visée AVANT de la masquer.
     let visee = repo.get(id).ok().flatten();
     let lecture = state.playback.get_state(id).await.state;
+    // #5322, décision de Bertrand : une zone qui joue ou est en pause est
+    // d'abord ARRÊTÉE — le même geste que le stop de l'utilisateur
+    // (`orchestrator.stop`, qui coupe aussi la sortie) — puis masquée. Sans
+    // cela, la musique continuait sur l'appareil d'une zone devenue invisible.
+    // Un arrêt qui échoue ou traîne est journalisé, et ne bloque pas la
+    // suppression : l'utilisateur l'a confirmée.
+    if let Some(zone) = visee.as_ref()
+        && lecture != tune_core::playback::PlayState::Stopped
+    {
+        let arret = state
+            .orchestrator
+            .stop(id, zone.output_device_id.as_deref());
+        match tokio::time::timeout(ARRET_AVANT_SUPPRESSION, arret).await {
+            Ok(()) => {
+                info!(zone_id = id, etat_lecture = ?lecture, "zone_delete_arretee_avant_masquage")
+            }
+            Err(_) => warn!(
+                zone_id = id,
+                delai_s = ARRET_AVANT_SUPPRESSION.as_secs(),
+                "zone_delete_arret_hors_delai_suppression_maintenue"
+            ),
+        }
+    }
     match repo.delete(id) {
         Ok(0) => {
             warn!(zone_id = id, "zone_delete_aucune_zone_de_cet_identifiant");

@@ -260,3 +260,130 @@ async fn une_zone_masquee_par_un_ignore_en_pause_reste_montree() {
         "l'exception de #5077 doit tenir pour un masquage non demandé"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #5322, décision de Bertrand : supprimer une zone qui joue ou est en pause
+// l'ARRÊTE d'abord (le stop de l'utilisateur, jusqu'à sa sortie), puis la
+// masque. Les autres zones, elles, ne reçoivent rien.
+// ---------------------------------------------------------------------------
+
+/// Une sortie factice par zone du banc, enregistrée sous l'appareil de la zone.
+async fn brancher_des_sorties(banc: &Banc) {
+    let depot = banc.depot();
+    let mut registre = banc.state.outputs.lock().await;
+    for (nom, protocole, id) in &banc.zones {
+        let appareil = depot.get(*id).unwrap().unwrap().output_device_id.unwrap();
+        registre.register(Box::new(
+            tune_core::outputs::mock::MockOutput::new(&appareil, nom).with_type(protocole),
+        ));
+    }
+}
+
+/// Combien de `Stop` la sortie de la zone `id` a REÇUS.
+async fn arrets_recus(banc: &Banc, id: i64) -> u64 {
+    let appareil = banc
+        .depot()
+        .get(id)
+        .unwrap()
+        .unwrap()
+        .output_device_id
+        .unwrap();
+    let registre = banc.state.outputs.lock().await;
+    let arc = registre.get(&appareil).expect("sortie enregistrée");
+    let sortie = arc.lock().await;
+    sortie
+        .as_any()
+        .downcast_ref::<tune_core::outputs::mock::MockOutput>()
+        .expect("MockOutput")
+        .stop_call_count()
+}
+
+/// 🔴 La zone qui JOUE reçoit le stop sur sa sortie, passe à l'arrêt et
+/// disparaît de `GET /zones` ; Salon, qui joue aussi, et les autres zones
+/// ne reçoivent aucun stop et ne changent pas.
+#[tokio::test]
+async fn supprimer_une_zone_qui_joue_l_arrete_puis_la_masque_et_epargne_les_autres() {
+    let banc = monter();
+    brancher_des_sorties(&banc).await;
+    let parents_dlna = banc.id("Parents", "dlna");
+    let salon = banc.id("Salon", "dlna");
+    banc.state.playback.play(parents_dlna, piste()).await;
+    banc.state.playback.play(salon, piste()).await;
+    for (_, _, id) in &banc.zones {
+        assert_eq!(arrets_recus(&banc, *id).await, 0, "prémisse : aucun stop");
+    }
+
+    assert_eq!(
+        supprimer(&banc.state, parents_dlna).await,
+        StatusCode::NO_CONTENT
+    );
+
+    assert!(
+        arrets_recus(&banc, parents_dlna).await >= 1,
+        "la zone {parents_dlna} jouait : sa sortie devait recevoir un stop avant \
+         le masquage (#5322)"
+    );
+    assert_eq!(
+        banc.state.playback.get_state(parents_dlna).await.state,
+        PlayState::Stopped,
+        "la zone supprimée doit être à l'arrêt"
+    );
+    let liste = ids_de_la_liste(&banc.state).await;
+    assert!(
+        !liste.contains(&parents_dlna),
+        "zone supprimée encore listée : {liste:?}"
+    );
+    for (nom, protocole, id) in &banc.zones {
+        if *id == parents_dlna {
+            continue;
+        }
+        assert_eq!(
+            arrets_recus(&banc, *id).await,
+            0,
+            "« {nom} » ({protocole}, id {id}) a reçu un stop"
+        );
+        let etat = banc.depot().etat_de_masquage(*id).unwrap().unwrap();
+        assert!(!etat.masquee, "« {nom} » ({protocole}) masquée");
+        assert!(
+            liste.contains(id),
+            "« {nom} » ({protocole}) absente de la liste"
+        );
+    }
+    assert_eq!(
+        banc.state.playback.get_state(salon).await.state,
+        PlayState::Playing,
+        "Salon jouait et doit continuer"
+    );
+}
+
+/// Une zone EN PAUSE est arrêtée elle aussi ; une zone à l'arrêt ne reçoit
+/// pas de stop superflu.
+#[tokio::test]
+async fn supprimer_une_zone_en_pause_l_arrete_et_une_zone_arretee_ne_recoit_rien() {
+    let banc = monter();
+    brancher_des_sorties(&banc).await;
+    let parents_dlna = banc.id("Parents", "dlna");
+    let bureau = banc.id("Bureau", "chromecast");
+    banc.state.playback.play(parents_dlna, piste()).await;
+    banc.state.playback.pause(parents_dlna).await;
+
+    assert_eq!(
+        supprimer(&banc.state, parents_dlna).await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        arrets_recus(&banc, parents_dlna).await >= 1,
+        "zone en pause non arrêtée"
+    );
+    assert_eq!(
+        banc.state.playback.get_state(parents_dlna).await.state,
+        PlayState::Stopped
+    );
+
+    assert_eq!(supprimer(&banc.state, bureau).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        arrets_recus(&banc, bureau).await,
+        0,
+        "une zone déjà à l'arrêt n'a pas à recevoir de stop"
+    );
+}
