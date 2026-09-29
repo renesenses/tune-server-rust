@@ -269,6 +269,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5077 -- --nocapture --test-threads=1
 
+      # #5464 — une collision d'`output_device_id` (index unique partiel des
+      # zones) se reconnaît par relecture : l'ancien filet cherchait le texte
+      # SQLite « UNIQUE constraint failed » et ne se déclenchait jamais sur PG.
+      - name: Collision de sortie des zones sur PostgreSQL (#5464)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5464 -- --nocapture --test-threads=1
+
       # #5263 — une base issue de SQLite garde plusieurs réglages de zones en
       # TEXT ; leur report précède la suppression des doublons au démarrage.
       - name: Réglages des zones en double sur PostgreSQL (#5263)
