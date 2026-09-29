@@ -1073,6 +1073,20 @@ impl TrackImporter {
             } else {
                 tune_core::library::artwork::save_embedded_cover(chemin, &self.cache_dir, cover)
             };
+            // #5454 — décision de Bertrand (30/09/2026) : la règle de la
+            // majorité vaut aussi pour l'album nommé d'après son dossier. Sa
+            // pochette n'est plus celle du premier fichier lu : une piste dont
+            // l'image s'écarte de la référence met l'album en désaccord, et la
+            // majorité de ses pistes tranche en fin de lot (à égalité, la
+            // première piste dans l'ordre du disque). Chaque piste garde son
+            // image (#1284) : la tranche repose les pochettes propres.
+            if let Some(aid) = album_id
+                && self.album_ref_cover.get(&aid).is_some_and(|reference| {
+                    *reference != tune_core::library::artwork::content_hash(&cover.0)
+                })
+            {
+                self.albums_en_desaccord.insert(aid);
+            }
         } else if let Some(cover) = jaquette
             && let Some(aid) = album_id
         {
