@@ -24,6 +24,11 @@ pub const CLE_RAPPORT_ISO_DONNEES: &str = "iso";
 
 /// Extract DSF tracks from a SACD ISO file using sacd_extract.
 /// Returns the paths of the extracted DSF files in a temp directory.
+///
+/// #5297 — ce n'est plus le chemin ordinaire : une image en DSD brut se lit
+/// dans l'ISO ([`super::sacd`]). L'extraction reste le REPLI des disques DST
+/// (DSD compressé, que Tune ne décode pas), des structures que la lecture
+/// native refuse, et des images qu'une version antérieure avait déjà extraites.
 pub fn extract_iso_to_dsf(iso_path: &Path) -> Result<Vec<PathBuf>, String> {
     let sacd_extract =
         find_sacd_extract().ok_or("sacd_extract not found — install it for ISO SACD support")?;

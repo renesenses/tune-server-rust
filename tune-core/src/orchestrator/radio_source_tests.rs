@@ -70,6 +70,7 @@ async fn preparer_contre_la_station(
             levels_tx: &None,
             rt: &rt,
             strict_bitperfect,
+            sortie_locale: false,
         };
         match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
             Ok(_) => Ok(()),
@@ -148,7 +149,7 @@ async fn radio_4346_mp3_probe_keeps_source_distinct_from_wav_output() {
 }
 
 #[tokio::test]
-async fn radio_4346_flac_probe_keeps_original_resolution() {
+async fn radio_4346_flac_probe_keeps_original_resolution_5336() {
     let wire = observe_station(
         include_bytes!("../../tests/fixtures/flac/ref_24_96000_stereo.flac"),
         "flac",
@@ -157,6 +158,7 @@ async fn radio_4346_flac_probe_keeps_original_resolution() {
     assert_eq!(
         wire.radio_source,
         Some(RadioSourceInfo {
+            channels: Some(2),
             format: Some("flac"),
             sample_rate: Some(96_000),
             bit_depth: Some(24),
