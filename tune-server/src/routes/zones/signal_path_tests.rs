@@ -1207,6 +1207,7 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
         "none",
         Some(&StreamInfo {
             radio_source: Some(tune_core::http::streamer::RadioSourceInfo {
+                channels: Some(2),
                 format: Some("mp3"),
                 sample_rate: Some(48_000),
                 bit_depth: None,
@@ -2965,6 +2966,7 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
     ] {
         let stream = StreamInfo {
             radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
                 format: codec,
                 sample_rate: rate,
                 bit_depth: bits,
@@ -3074,6 +3076,7 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
         zone.output_type = Some(output.into());
         let stream = StreamInfo {
             radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
                 format: Some("flac"),
                 sample_rate: Some(96_000),
                 bit_depth: Some(24),
@@ -3207,6 +3210,7 @@ fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
     ] {
         let stream = StreamInfo {
             radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
                 format: Some(codec),
                 sample_rate: Some(44_100),
                 bit_depth: bits,
