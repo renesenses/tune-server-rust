@@ -35,7 +35,12 @@ pub struct ConvertSource {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartJobRequest {
+    #[serde(default)]
     pub sources: Vec<ConvertSource>,
+    /// #5483 — des pistes choisies une à une, en plus de `sources`. Une piste
+    /// déjà couverte par un album de `sources` n'est convertie qu'une fois.
+    #[serde(default)]
+    pub track_ids: Vec<i64>,
     pub format: String,
     pub quality: Option<String>,
     pub sample_rate: Option<u32>,
@@ -230,6 +235,10 @@ fn job_store() -> JobStore {
         .clone()
 }
 
+// #5483 — résolution des sources (albums, pistes, dossiers) sans doublon.
+#[path = "convertisseur_pistes.rs"]
+mod pistes;
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -379,51 +388,11 @@ async fn start_job(
         )));
     }
 
-    // Resolve all source paths
+    // Resolve all source paths — #5483 : `sources` puis `track_ids`, sans
+    // doublon, dans l'ordre de la demande.
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let mut file_paths: Vec<PathBuf> = Vec::new();
-
-    for src in &body.sources {
-        if let Some(track_id) = src.track_id {
-            match repo.get(track_id) {
-                Ok(Some(track)) => {
-                    if let Some(ref fp) = track.file_path {
-                        file_paths.push(PathBuf::from(fp));
-                    } else {
-                        warn!(track_id, "converter_skip_no_file_path");
-                    }
-                }
-                Ok(None) => {
-                    warn!(track_id, "converter_skip_track_not_found");
-                }
-                Err(e) => {
-                    warn!(track_id, error = %e, "converter_skip_track_lookup_error");
-                }
-            }
-        } else if let Some(album_id) = src.album_id {
-            match repo.list_by_album(album_id) {
-                Ok(tracks) => {
-                    for t in tracks {
-                        if let Some(ref fp) = t.file_path {
-                            file_paths.push(PathBuf::from(fp));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(album_id, error = %e, "converter_skip_album_lookup_error");
-                }
-            }
-        } else if let Some(ref path) = src.path {
-            let p = PathBuf::from(path);
-            if p.is_dir() {
-                collect_audio_files(&p, &mut file_paths);
-            } else if p.is_file() && convertible_input(path) {
-                file_paths.push(p);
-            } else {
-                warn!(path, "converter_skip_not_audio_or_missing");
-            }
-        }
-    }
+    let resolues = pistes::resoudre_les_sources(&repo, &body.sources, &body.track_ids);
+    let file_paths: Vec<PathBuf> = resolues.iter().map(|p| p.chemin.clone()).collect();
 
     if file_paths.is_empty() {
         return Err(AppError::bad_request("no audio files found in sources"));
@@ -919,7 +888,14 @@ async fn run_conversion(
         }
 
         let ext = output_extension(format);
-        let out_path = output_dir.join(format!("{filename}.{ext}"));
+        // #5483 — dans une archive, deux pistes homonymes (CD1/01.flac,
+        // CD2/01.flac) ne visent plus le même fichier. Le mode « dossier de
+        // travail » garde sa règle : un fichier présent reste intact.
+        let out_path = if destination_serveur {
+            output_dir.join(format!("{filename}.{ext}"))
+        } else {
+            pistes::sortie_libre(output_dir, &filename, ext)
+        };
 
         // ON N'ÉCRASE JAMAIS (#2944). Dans le dossier de l'utilisateur, un
         // fichier déjà présent est soit une conversion précédente, soit — si
