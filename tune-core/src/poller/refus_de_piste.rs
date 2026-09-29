@@ -38,7 +38,12 @@
 /// `no url` : Qobuz, `qobuz.rs` — `data["url"].as_str().ok_or("no url")`. Le
 /// service a répondu, la piste n'a simplement pas d'adresse de flux pour ce
 /// compte, cette région, cet abonnement.
-const MOTIFS_PROPRES_A_LA_PISTE: [&str; 1] = ["no url"];
+///
+/// `source_url: piste refusee` : une source fournie par un greffon
+/// (`crate::source_url`, Tune Circle #5327) dit que CETTE piste ne se joue
+/// pas — retirée du partage, introuvable. Le refus vient du greffon, par la
+/// marque qu'il pose lui-même : jamais d'une panne.
+const MOTIFS_PROPRES_A_LA_PISTE: [&str; 2] = ["no url", crate::source_url::MOTIF_PISTE_REFUSEE];
 
 /// Ce refus ne vise-t-il QUE cette piste ?
 ///
