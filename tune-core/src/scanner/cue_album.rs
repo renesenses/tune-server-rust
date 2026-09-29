@@ -82,6 +82,11 @@ pub enum MotifEcart {
     ImageIntrouvable { fichier: String },
     /// L'image existe mais aucun décodeur livré ne sait la lire.
     ImageNonDecodable { fichier: String, extension: String },
+    /// Image de CD brute où une piste de données aux secteurs de moins de
+    /// 2352 octets précède l'audio : les temps de la feuille ne désignent
+    /// plus les bons octets, découper jouerait des données comme du son
+    /// (#5298).
+    DonneesNonBrutes { fichier: String },
 }
 
 impl MotifEcart {
@@ -93,6 +98,7 @@ impl MotifEcart {
             MotifEcart::SansFichier => "cue-sans-fichier",
             MotifEcart::ImageIntrouvable { .. } => "cue-image-introuvable",
             MotifEcart::ImageNonDecodable { .. } => "cue-image-non-decodable",
+            MotifEcart::DonneesNonBrutes { .. } => "cue-image-cd-donnees-non-brutes",
         }
     }
 
@@ -107,6 +113,9 @@ impl MotifEcart {
             }
             MotifEcart::ImageNonDecodable { .. } => {
                 "feuille CUE posée sur un format qu'aucun décodeur livré ne lit"
+            }
+            MotifEcart::DonneesNonBrutes { .. } => {
+                "image de CD mixte dont la piste de données n'est pas en secteurs bruts de 2352 octets"
             }
         }
     }
@@ -309,7 +318,23 @@ pub fn planifier_dossier(dossier: &Path) -> PlanCue {
                 });
                 break;
             };
-            if !crate::audio::support::native_decoder_supports(&image) {
+            // #5298 — une image de CD brute (`.bin`, `.img`) n'est lisible
+            // que déclarée `BINARY` : du PCM 16 bits little-endian.
+            // `MOTOROLA` (gros-boutiste) ou `WAVE` sur un `.bin` jouerait
+            // du bruit.
+            let image_cdda = crate::audio::image_cdda::est_image_cdda(&image);
+            let decodable = if image_cdda {
+                feuille.type_du_fichier(reference) == Some("BINARY")
+            } else {
+                crate::audio::support::native_decoder_supports(&image)
+            };
+            if image_cdda && decodable && feuille.donnees_avant_l_audio_non_brutes {
+                ecart = Some(MotifEcart::DonneesNonBrutes {
+                    fichier: reference.clone(),
+                });
+                break;
+            }
+            if !decodable {
                 ecart = Some(MotifEcart::ImageNonDecodable {
                     extension: image
                         .extension()
@@ -624,6 +649,43 @@ mod tests {
             }
         );
         assert_eq!(plan.ecartees[0].1.cle(), "cue-image-introuvable");
+    }
+
+    /// #5298 — un `.bin` n'est découpé que déclaré `BINARY` : `MOTOROLA`
+    /// (gros-boutiste) jouerait du bruit, il reste écarté et nommé.
+    #[test]
+    fn une_image_cd_n_est_lue_que_declaree_binary() {
+        let d = tempfile::TempDir::new().unwrap();
+        fs::write(d.path().join("cd.bin"), vec![0u8; 2352 * 75]).unwrap();
+        let feuille = "TITLE \"CD\"\nFILE \"cd.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+        fs::write(d.path().join("album.cue"), feuille).unwrap();
+        let plan = planifier_dossier(d.path());
+        assert_eq!(plan.albums.len(), 1, "{plan:?}");
+
+        fs::write(
+            d.path().join("album.cue"),
+            feuille.replace("BINARY", "MOTOROLA"),
+        )
+        .unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty());
+        assert_eq!(plan.ecartees[0].1.cle(), "cue-image-non-decodable");
+    }
+
+    /// #5298 — données en secteurs de 2048 octets avant l'audio du même BIN :
+    /// écarté avec son propre motif, jamais découpé de travers.
+    #[test]
+    fn une_image_cd_aux_donnees_non_brutes_est_ecartee() {
+        let d = tempfile::TempDir::new().unwrap();
+        fs::write(d.path().join("cd.bin"), vec![0u8; 2352 * 400]).unwrap();
+        fs::write(
+            d.path().join("album.cue"),
+            "FILE \"cd.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:04:00\n",
+        )
+        .unwrap();
+        let plan = planifier_dossier(d.path());
+        assert!(plan.albums.is_empty());
+        assert_eq!(plan.ecartees[0].1.cle(), "cue-image-cd-donnees-non-brutes");
     }
 
     /// Découper ce qu'on ne sait pas décoder produit les mêmes albums

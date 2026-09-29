@@ -133,6 +133,17 @@ struct SondeImage {
 /// poller perd l'armement gapless, l'avance en fin de piste et le préchargement.
 fn sonder_image(image: &Path) -> SondeImage {
     use lofty::file::AudioFile;
+    // #5298 — une image de CD brute n'a pas d'en-tête : sa taille EST sa
+    // durée, et son format est celui du CD audio, par définition.
+    if crate::audio::image_cdda::est_image_cdda(image) {
+        use crate::audio::image_cdda::{CADENCE, CANAUX, PROFONDEUR, duree_ms};
+        return SondeImage {
+            duree_ms: duree_ms(image),
+            sample_rate: Some(CADENCE as i32),
+            bit_depth: Some(PROFONDEUR as i32),
+            channels: Some(CANAUX as i32),
+        };
+    }
     match lofty::read_from_path(image) {
         Ok(tagged) => {
             let p = tagged.properties();
@@ -159,8 +170,17 @@ fn sonder_image(image: &Path) -> SondeImage {
 /// autour d'elle. C'est le cas de toute feuille « gapless » (un `FILE` par
 /// piste), et c'est ce qui autorise à lui poser un `file_path` — voir
 /// [`piste_en_ligne`].
+///
+/// ⛔ Jamais pour une image de CD brute (#5298). Le scan ordinaire ne voit pas
+/// un `.bin` : lui poser un `file_path` le mettrait hors de ses fichiers
+/// découverts, et la purge de fin de scan effacerait la piste qu'on vient
+/// d'écrire. Toutes les passes par chemin (balises, ReplayGain) le prendraient
+/// en outre pour un fichier audio ordinaire.
 fn occupe_le_fichier_entier(piste: &PisteCue, tranches_du_fichier: usize) -> bool {
-    tranches_du_fichier == 1 && piste.debut_ms == 0 && piste.fin_ms.is_none()
+    tranches_du_fichier == 1
+        && piste.debut_ms == 0
+        && piste.fin_ms.is_none()
+        && !crate::audio::image_cdda::est_image_cdda(&piste.media)
 }
 
 /// Combien de tranches chaque fichier image porte, dans cet album.
@@ -325,6 +345,30 @@ struct Depots {
     tenues: Tenues,
 }
 
+impl Depots {
+    fn pour(db: &Arc<dyn DbBackend>) -> Self {
+        Self {
+            artistes: ArtistRepo::with_backend(db.clone()),
+            albums: AlbumRepo::with_backend(db.clone()),
+            pistes: TrackRepo::with_backend(db.clone()),
+            metadonnees: AlbumMetadataRepo::with_backend(db.clone()),
+            // Une lecture par passe, comme au scan ordinaire (`TrackImporter`).
+            tenues: Tenues::charger(db),
+        }
+    }
+}
+
+/// Ce qu'un album qui ne vient pas d'une feuille CUE impose à ses lignes.
+///
+/// Une image SACD (#5297) décrit elle-même ses propriétés audio : la sonde
+/// `lofty` n'y lit rien, et le format rangé doit être celui que la lecture
+/// reconnaît (`dsd`), pas l'extension `iso`. `None` pour une feuille CUE : le
+/// chemin d'avant, inchangé.
+struct Imposition<'a> {
+    sonde: SondeImage,
+    retoucher: &'a dyn Fn(&PisteCue, &mut Track),
+}
+
 /// Écrit un album CUE : artiste, album, puis ses pistes virtuelles.
 fn ecrire_album(
     dossier: &Path,
@@ -332,6 +376,18 @@ fn ecrire_album(
     depots: &Depots,
     bilan: &mut BilanCue,
     images_couvertes: &mut HashSet<PathBuf>,
+) {
+    ecrire_album_avec(dossier, album, depots, bilan, images_couvertes, None);
+}
+
+/// [`ecrire_album`], avec ce qu'impose une source autre qu'une feuille.
+fn ecrire_album_avec(
+    dossier: &Path,
+    album: &AlbumCue,
+    depots: &Depots,
+    bilan: &mut BilanCue,
+    images_couvertes: &mut HashSet<PathBuf>,
+    imposition: Option<&Imposition<'_>>,
 ) {
     let Depots {
         artistes: artist_repo,
@@ -462,9 +518,12 @@ fn ecrire_album(
     let mut images_decoupees: HashSet<PathBuf> = HashSet::new();
 
     for piste in &album.pistes {
-        let sonde = *sondes
-            .entry(piste.media.clone())
-            .or_insert_with(|| sonder_image(&piste.media));
+        let sonde = match imposition {
+            Some(i) => i.sonde,
+            None => *sondes
+                .entry(piste.media.clone())
+                .or_insert_with(|| sonder_image(&piste.media)),
+        };
         let fichier_entier = occupe_le_fichier_entier(
             piste,
             tranches.get(piste.media.as_path()).copied().unwrap_or(1),
@@ -472,7 +531,29 @@ fn ecrire_album(
         if !fichier_entier {
             images_decoupees.insert(piste.media.clone());
         }
-        let mut ligne = piste_en_ligne(piste, album, ligne_album, artist_id, sonde, fichier_entier);
+        // Le `PERFORMER` d'une piste — le CD-Text d'un disque à plusieurs
+        // interprètes — est SON artiste ; l'album garde le sien (#5298). Sans
+        // cela, le soliste invité d'une piste disparaissait derrière
+        // l'interprète de l'album.
+        let artiste_de_la_piste = piste
+            .interprete
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && *n != nom_artiste)
+            .and_then(|n| artist_repo.get_or_create(n, None, None).ok())
+            .and_then(|a| a.id)
+            .or(artist_id);
+        let mut ligne = piste_en_ligne(
+            piste,
+            album,
+            ligne_album,
+            artiste_de_la_piste,
+            sonde,
+            fichier_entier,
+        );
+        if let Some(i) = imposition {
+            (i.retoucher)(piste, &mut ligne);
+        }
         // L'édition manuelle prime sur la feuille, comme sur les balises au
         // scan ordinaire (`TrackImporter::import`) : album, disque, numéro,
         // titre et artiste que l'utilisateur a tenus, par chemin ou par
@@ -676,8 +757,8 @@ fn confronter_au_scan(
     c: &ConfrontationDuScan<'_>,
     bilan: &mut BilanCue,
 ) {
-    let images = match track_repo.cue_media_paths() {
-        Ok(v) => v,
+    let images: Vec<String> = match track_repo.cue_media_paths() {
+        Ok(v) => v.into_iter().filter(|m| !tranche_d_image_sacd(m)).collect(),
         Err(e) => {
             warn!(error = %e, "cue_confrontation_base_illisible");
             return;
@@ -744,14 +825,7 @@ fn ecrire_les_dossiers(
     dossiers: &[PathBuf],
     mut observer: impl FnMut(&Path, &PlanCue),
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
-    let depots = Depots {
-        artistes: ArtistRepo::with_backend(db.clone()),
-        albums: AlbumRepo::with_backend(db.clone()),
-        pistes: TrackRepo::with_backend(db.clone()),
-        metadonnees: AlbumMetadataRepo::with_backend(db.clone()),
-        // Une lecture par passe, comme au scan ordinaire (`TrackImporter`).
-        tenues: Tenues::charger(db),
-    };
+    let depots = Depots::pour(db);
     let mut bilan = BilanCue::default();
     let mut images_couvertes: HashSet<PathBuf> = HashSet::new();
 
@@ -762,6 +836,146 @@ fn ecrire_les_dossiers(
         observer(dossier, plan);
     });
     (inventaire, bilan, images_couvertes)
+}
+
+/// L'identité d'album d'une image SACD, et son numéro de disque.
+///
+/// Une image = un album : le dossier ne suffit pas, plusieurs ISO se rangent
+/// souvent côte à côte, et les fondre en un album les mélangerait. L'identité
+/// est donc le CHEMIN de l'image. Exception : le disque d'un coffret
+/// (`album_set_size` > 1 dans le Master TOC) rejoint ses frères du même
+/// dossier, sous le numéro de disque que le Master TOC lui donne.
+fn identite_de_l_album_iso(iso: &crate::audio::sacd::IsoSacdLu) -> (PathBuf, i32) {
+    let d = &iso.disque;
+    match iso.chemin.parent() {
+        Some(parent) if d.disques_dans_l_album > 1 && d.rang_dans_l_album > 0 => {
+            (parent.to_path_buf(), i32::from(d.rang_dans_l_album))
+        }
+        _ => (iso.chemin.clone(), 1),
+    }
+}
+
+/// L'album d'une image SACD, dans la forme que l'écriture CUE range.
+fn album_de_l_iso(
+    iso: &crate::audio::sacd::IsoSacdLu,
+    zone: &crate::audio::sacd::ZoneSacd,
+) -> AlbumCue {
+    let d = &iso.disque;
+    let coffret = d.disques_dans_l_album > 1;
+    let titre = if coffret {
+        d.album_titre.clone().or_else(|| d.disque_titre.clone())
+    } else {
+        d.titre().map(str::to_string)
+    }
+    .or_else(|| {
+        iso.chemin
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    });
+    AlbumCue {
+        feuilles: vec![iso.chemin.clone()],
+        titre,
+        interprete: d.artiste().map(str::to_string),
+        genre: None,
+        annee: d.annee.map(|a| a.to_string()),
+        pistes: zone
+            .pistes
+            .iter()
+            .map(|p| PisteCue {
+                media: iso.chemin.clone(),
+                numero: p.numero,
+                titre: p.titre.clone(),
+                interprete: p.interprete.clone(),
+                // La piste est une tranche de la zone, sur son horloge :
+                // c'est ce que la lecture rejoue (`audio::sacd::ouvrir_lecture`).
+                debut_ms: p.debut_ms(),
+                fin_ms: Some(p.fin_ms()),
+            })
+            .collect(),
+    }
+}
+
+/// Écrit les albums des images SACD que le parcours a lues nativement (#5297).
+///
+/// Chaque piste devient une TRANCHE de l'image, exactement comme une piste de
+/// feuille CUE : `file_path = NULL`, `cue_media_path` = l'image,
+/// `cue_start_ms`/`cue_end_ms` = la piste sur l'horloge de la zone lue. Le
+/// même écrivain range les deux : identité `(image, début)`, reprise de
+/// l'acquis d'enrichissement, élagage quand l'image disparaît. Rien n'est
+/// extrait, rien n'est copié.
+pub fn ecrire_les_iso_sacd(
+    db: &Arc<dyn DbBackend>,
+    isos: &[crate::audio::sacd::IsoSacdLu],
+    bilan: &mut BilanCue,
+) {
+    if isos.is_empty() {
+        return;
+    }
+    // Les tenues aussi : une image SACD est désignée par `(image, début)`
+    // comme une tranche de feuille (#5319).
+    let depots = Depots::pour(db);
+    let mut couvertes: HashSet<PathBuf> = HashSet::new();
+    let avant = bilan.pistes_creees + bilan.pistes_mises_a_jour;
+    for iso in isos {
+        let Some(zone) = iso.disque.zone_de_lecture() else {
+            continue;
+        };
+        let album = album_de_l_iso(iso, zone);
+        let (identite, disque) = identite_de_l_album_iso(iso);
+        let compositeurs: HashMap<u32, Option<String>> = zone
+            .pistes
+            .iter()
+            .map(|p| (p.numero, p.compositeur.clone()))
+            .collect();
+        let canaux = i32::from(zone.canaux);
+        let retoucher = move |piste: &PisteCue, t: &mut Track| {
+            t.format = Some("dsd".into());
+            t.disc_number = disque;
+            if t.composer.is_none() {
+                t.composer = compositeurs.get(&piste.numero).cloned().flatten();
+            }
+            t.channels = canaux;
+        };
+        let imposition = Imposition {
+            sonde: SondeImage {
+                duree_ms: None,
+                sample_rate: Some(crate::audio::sacd::FREQUENCE_DSD64 as i32),
+                bit_depth: Some(1),
+                channels: Some(canaux),
+            },
+            retoucher: &retoucher,
+        };
+        ecrire_album_avec(
+            &identite,
+            &album,
+            &depots,
+            bilan,
+            &mut couvertes,
+            Some(&imposition),
+        );
+        debug!(
+            iso = %iso.chemin.display(),
+            zone = zone.genre.as_str(),
+            pistes = zone.pistes.len(),
+            "iso_sacd_album_ecrit"
+        );
+    }
+    info!(
+        images = isos.len(),
+        pistes = bilan.pistes_creees + bilan.pistes_mises_a_jour - avant,
+        "scan_iso_sacd_natif — images SACD lues sans outil externe"
+    );
+}
+
+/// Une tranche posée par une image SACD, et non par une feuille CUE.
+///
+/// La confrontation aux feuilles (#5108) retire les tranches qu'AUCUNE feuille
+/// ne décrit : appliquée à une image SACD, elle effacerait l'album à chaque
+/// scan d'un dossier qui porte aussi un `.cue`. Ces tranches-là ne relèvent
+/// que de l'écriture des images et de l'élagage des images disparues.
+fn tranche_d_image_sacd(media: &str) -> bool {
+    crate::audio::sacd::est_extension_iso(Path::new(media))
 }
 
 /// Ce que [`relire_le_dossier`] a changé dans la bibliothèque (#5073).
@@ -925,7 +1139,7 @@ pub fn relire_le_dossier(db: &Arc<dyn DbBackend>, dossier: &Path) -> RelectureDu
     let images_avant: Vec<String> = match track_repo.cue_media_paths() {
         Ok(v) => v
             .into_iter()
-            .filter(|m| Path::new(m).parent() == Some(dossier))
+            .filter(|m| Path::new(m).parent() == Some(dossier) && !tranche_d_image_sacd(m))
             .collect(),
         Err(e) => {
             warn!(dossier = %dossier.display(), error = %e, "cue_relecture_base_illisible");
@@ -1586,5 +1800,87 @@ mod tests {
         assert_eq!(annee_en_nombre("1981-03-12"), Some(1981));
         assert_eq!(annee_en_nombre("inconnue"), None);
         assert_eq!(annee_en_nombre(""), None);
+    }
+
+    /// #5297 — une image SACD lue nativement devient un album de TRANCHES :
+    /// titres, compositeurs, bornes et propriétés DSD viennent des sommaires
+    /// du disque. Un second passage met à jour sans doubler, la confrontation
+    /// aux feuilles CUE du même dossier ne la touche pas, et l'élagage la
+    /// retire quand l'image disparaît.
+    #[test]
+    fn une_image_sacd_devient_un_album_de_tranches() {
+        use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire};
+        let d = tempfile::TempDir::new().unwrap();
+        let db = base_fichier(d.path());
+        let dossier = d.path().join("Miles Davis");
+        fs::create_dir_all(&dossier).unwrap();
+        let iso = dossier.join("Kind of Blue.iso");
+        let bornes = ecrire(&iso, &ImageFabriquee::deux_pistes());
+        let isos = vec![crate::audio::sacd::IsoSacdLu {
+            chemin: iso.clone(),
+            disque: crate::audio::sacd::lire_disque(&iso).unwrap(),
+        }];
+
+        let mut bilan = BilanCue::default();
+        ecrire_les_iso_sacd(&db, &isos, &mut bilan);
+        assert_eq!((bilan.albums, bilan.pistes_creees, bilan.echecs), (1, 2, 0));
+
+        let repo = TrackRepo::with_backend(db.clone());
+        let media = iso.to_string_lossy().into_owned();
+        let (debut, fin) = bornes[1];
+        let debut_ms = crate::audio::sacd::trames_en_ms(debut);
+        let fin_ms = crate::audio::sacd::trames_en_ms(fin);
+        let t = repo
+            .get_by_cue_identity(&media, debut_ms as i64)
+            .unwrap()
+            .expect("la piste 2 est une tranche de l'image");
+        assert_eq!(t.title, "Freddie Freeloader");
+        assert_eq!(t.track_number, 2);
+        assert_eq!(t.album_title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(t.composer.as_deref(), Some("Miles Davis"));
+        assert_eq!(t.year, Some(1959));
+        assert_eq!(t.file_path, None, "une tranche n'a pas de chemin propre");
+        assert_eq!(t.cue_end_ms, Some(fin_ms as i64));
+        assert_eq!(t.duration_ms, (fin_ms - debut_ms) as i64);
+        assert_eq!(t.format.as_deref(), Some("dsd"));
+        assert_eq!(t.sample_rate, Some(2_822_400));
+        assert_eq!(t.bit_depth, Some(1));
+        assert_eq!(t.channels, 2);
+        assert_eq!(
+            crate::audio::formats::AudioFormat::from_extension(t.format.as_deref().unwrap()),
+            Some(crate::audio::formats::AudioFormat::Dsd),
+            "la lecture doit reconnaître le format rangé comme du DSD"
+        );
+
+        // Un second scan : mise à jour en place, aucun doublon.
+        let mut bilan = BilanCue::default();
+        ecrire_les_iso_sacd(&db, &isos, &mut bilan);
+        assert_eq!((bilan.pistes_creees, bilan.pistes_mises_a_jour), (0, 2));
+        assert_eq!(repo.count().unwrap(), 2);
+
+        // Une feuille CUE dans le même dossier : la confrontation du
+        // surveillant, puis celle du scan, ne retirent pas les tranches de
+        // l'image, qu'aucune feuille ne décrit.
+        let wav = dossier.join("image.wav");
+        ecrire_wav(&wav, 4_000);
+        fs::write(dossier.join("album.cue"), FEUILLE).unwrap();
+        let relecture = relire_le_dossier(&db, &dossier);
+        assert_eq!(relecture.tranches_retirees, 0);
+        let (_, bilan, _) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: std::slice::from_ref(&wav),
+                trop_massive: &|_, _| false,
+            },
+        );
+        assert_eq!(bilan.tranches_retirees, 0);
+        assert_eq!(repo.tranches_cue_du_media(&media).unwrap().len(), 2);
+
+        // L'image disparue : ses tranches partent avec elle.
+        fs::remove_file(&iso).unwrap();
+        assert_eq!(elaguer_les_pistes_cue(&repo, &racines(d.path())), 2);
+        assert!(repo.tranches_cue_du_media(&media).unwrap().is_empty());
     }
 }
