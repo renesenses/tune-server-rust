@@ -146,6 +146,49 @@ pub(crate) fn message_de_refus_de_zone(
     }
 }
 
+/// #5464 — le refus quand la sortie vivante du même nom appartient déjà à une
+/// autre zone : deux zones ne peuvent pas partager une sortie
+/// (`idx_zones_output_device_id`), donc le rebond de #1287 n'a pas lieu.
+///
+/// Trois formes, parce que le geste utile n'est pas le même :
+/// - l'autre zone porte le MÊME nom (le cas de Lulu, #3738) : la nommer par
+///   son nom ne distinguerait rien, on dit « une autre zone nommée elle aussi » ;
+/// - l'autre zone a un autre nom : on la nomme, c'est là qu'il faut lancer ;
+/// - l'autre zone est SUPPRIMÉE (masquée) : on ne propose pas d'y lancer la
+///   lecture, l'auditeur ne la voit plus.
+pub(crate) fn message_de_sortie_deja_tenue(
+    zone_name: &str,
+    sortie: &str,
+    autre_zone: &str,
+    autre_supprimee: bool,
+) -> String {
+    const SENTINELLE: &str = "zone_output_unavailable:";
+    let appareil = nom_lisible_de_l_appareil(sortie).unwrap_or_else(|| zone_name.to_string());
+    let debut = format!(
+        "{SENTINELLE}La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
+         est bien présente, mais"
+    );
+    if autre_supprimee {
+        format!(
+            "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
+             zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
+             réglages de la zone « {zone_name} »."
+        )
+    } else if autre_zone.eq_ignore_ascii_case(zone_name) {
+        format!(
+            "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
+             zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
+             zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+        )
+    } else {
+        format!(
+            "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
+             partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
+             autre sortie dans les réglages de la zone « {zone_name} »."
+        )
+    }
+}
+
 /// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
 ///
 /// Les deux travaux de la soirée se rencontrent ici, et ils COEXISTENT :
@@ -442,11 +485,32 @@ impl PlaybackOrchestrator {
         // output carrying the same name (#1287).
         if let Some((new_id, new_type)) = self.find_rebind_target(&zone.name).await {
             let repo = ZoneRepo::with_backend(self.db.clone());
+            // 🔴 #5464 — la sortie vivante du même nom peut déjà être CELLE
+            // d'une autre zone : deux zones homonymes (#3738, Lulu), l'une
+            // tenant le DAC, l'autre pointant une sortie disparue. L'index
+            // unique partiel `idx_zones_output_device_id` refuse alors
+            // l'`UPDATE`, et l'erreur SQL brute (`execute: UNIQUE constraint
+            // failed: zones.output_device_id`) remontait par `?` jusqu'au
+            // toast, à chaque clic Lecture. Ni rebond ni vol : un refus nommé.
+            if let Some(msg) = self.refus_sortie_deja_tenue(&repo, zone_id, zone, dev_id, &new_id) {
+                return Err(msg);
+            }
             // Persist so the rebind is sticky — the point is that the user never
             // has to think about this again. `output_type` must follow the id:
             // leaving a zone typed `dlna` while pointing at a `local:` output
             // would take the wrong branch everywhere downstream.
-            repo.update_output_device(zone_id, &new_id)?;
+            if let Err(e) = repo.update_output_device(zone_id, &new_id) {
+                // #5464 — une autre zone a pu prendre la sortie entre la lecture
+                // ci-dessus et l'écriture (découverte en tâche de fond). On relit
+                // l'occupant plutôt que de reconnaître le texte de l'erreur, qui
+                // diffère entre SQLite et PostgreSQL.
+                if let Some(msg) =
+                    self.refus_sortie_deja_tenue(&repo, zone_id, zone, dev_id, &new_id)
+                {
+                    return Err(msg);
+                }
+                return Err(e);
+            }
             repo.update_output_type(zone_id, &new_type)?;
             repo.update_online(zone_id, true)?;
             info!(
@@ -586,6 +650,51 @@ impl PlaybackOrchestrator {
             bus.emit("zone.playback_error", charge);
         }
         Err(msg)
+    }
+
+    /// #5464 — `Some(refus)` quand `sortie` est déjà l'`output_device_id`
+    /// d'une AUTRE zone que `zone_id`, visible ou supprimée (une zone masquée
+    /// garde sa ligne, et l'index unique la compte).
+    ///
+    /// Émet `zone.playback_error` comme le refus ordinaire (phrase sans
+    /// sentinelle, `fatal`), pour que l'auditeur lise la même chose par les
+    /// deux canaux.
+    fn refus_sortie_deja_tenue(
+        &self,
+        repo: &ZoneRepo,
+        zone_id: i64,
+        zone: &crate::db::zone_repo::Zone,
+        dev_id: &str,
+        sortie: &str,
+    ) -> Option<String> {
+        let occupante = repo
+            .get_by_device_id(sortie)
+            .ok()
+            .flatten()
+            .filter(|z| z.id.is_some_and(|id| id != zone_id))?;
+        let supprimee = repo.is_device_hidden(sortie);
+        let msg = message_de_sortie_deja_tenue(&zone.name, sortie, &occupante.name, supprimee);
+        warn!(
+            zone_id,
+            zone_name = %zone.name,
+            stale_device_id = dev_id,
+            target_device_id = sortie,
+            holder_zone_id = occupante.id.unwrap_or_default(),
+            holder_hidden = supprimee,
+            "zone_rebind_target_held_by_other_zone"
+        );
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": phrase_sans_sentinelle(&msg),
+                    "code": "zone_output_unavailable",
+                    "fatal": true,
+                }),
+            );
+        }
+        Some(msg)
     }
 
     pub(super) async fn play_inner(
