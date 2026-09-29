@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use super::artwork::{
-    FOLDER_COVER_NAMES, artwork_hash, content_hash, extended_path, extract_cover_art, find_cached,
-    find_folder_cover, save_to_cache,
+    EmpreinteJaquette, FOLDER_COVER_NAMES, artwork_hash, content_hash, empreinte_jaquette_flac,
+    extended_path, extract_cover_art, find_cached, find_folder_cover, save_to_cache,
 };
 use crate::db::album_repo::{AlbumRepo, EtatPochette};
 use crate::db::backend::DbBackend;
@@ -204,21 +204,111 @@ fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<
     integree.or_else(|| lire_l_image_du_dossier(piste, cache_dir))
 }
 
-/// L'album ENTIER, relu sur le disque : la première jaquette intégrée parmi
-/// ses pistes (dans l'ordre du disque), sinon la première image de dossier.
+/// L'album ENTIER, relu sur le disque : la jaquette intégrée que porte la
+/// MAJORITÉ de ses pistes (à égalité, la première dans l'ordre du disque),
+/// sinon la première image de dossier.
 ///
-/// Ne sert qu'aux reprises — un fichier source disparu ou changé — jamais au
-/// fil du scan : c'est la seule lecture qui ouvre toutes les pistes.
+/// #5454 (Fuccaro, fil 1317) — c'était « la première jaquette intégrée dans
+/// l'ordre du disque » : le single éponyme en piste 1 (*À partir de
+/// maintenant*) imposait son image à tout l'album. Décision de Bertrand du
+/// 29/09/2026 : l'image portée par la majorité des pistes.
+///
+/// Ne sert qu'aux reprises — un fichier source disparu ou changé, une
+/// jaquette en désaccord — jamais à chaque piste du scan : c'est la seule
+/// lecture qui ouvre toutes les pistes.
 pub fn lire_depuis_l_album(pistes: &[PathBuf], cache_dir: &Path) -> Option<PochetteLue> {
-    pistes
-        .iter()
-        .filter(|p| existe(p))
-        .find_map(|p| lire_la_jaquette(p, cache_dir, None))
+    lire_selon_le_decompte(&compter_les_jaquettes(pistes), pistes, cache_dir)
+}
+
+fn lire_selon_le_decompte(
+    decompte: &Decompte,
+    pistes: &[PathBuf],
+    cache_dir: &Path,
+) -> Option<PochetteLue> {
+    decompte
+        .gagnante()
+        .and_then(|g| lire_la_jaquette(&g.fichier, cache_dir, None))
         .or_else(|| {
             pistes
                 .iter()
                 .find_map(|p| lire_l_image_du_dossier(p, cache_dir))
         })
+}
+
+/// Une image distincte parmi les jaquettes d'un album (#5454).
+#[derive(Debug, Clone)]
+struct Groupe {
+    condensat: String,
+    /// Nombre de pistes (de FICHIERS) qui la portent.
+    voix: usize,
+    /// La première piste, dans l'ordre du disque, qui la porte.
+    fichier: PathBuf,
+    empreinte: Option<EmpreinteJaquette>,
+}
+
+/// Les jaquettes intégrées d'un album, comptées piste par piste (#5454).
+#[derive(Debug, Default)]
+struct Decompte {
+    /// Chaque fichier présent — son rang dans la liste comptée, qui suit
+    /// l'ordre du disque — avec le condensat de sa jaquette (`None` : il n'en
+    /// porte pas, il ne vote pas).
+    pistes: Vec<(usize, Option<String>)>,
+    /// Les images distinctes, dans l'ordre de leur première apparition.
+    groupes: Vec<Groupe>,
+}
+
+impl Decompte {
+    /// L'image portée par le plus de pistes ; à égalité, celle qui apparaît
+    /// la première dans l'ordre du disque (disque, puis numéro de piste).
+    fn gagnante(&self) -> Option<&Groupe> {
+        // `groupes` est rangé par première apparition : garder le premier en
+        // cas d'égalité, c'est garder le premier dans l'ordre du disque.
+        self.groupes
+            .iter()
+            .fold(None, |meilleur, g| match meilleur {
+                Some(m) if m.voix >= g.voix => Some(m),
+                _ => Some(g),
+            })
+    }
+}
+
+/// Compte les jaquettes intégrées des pistes, DANS L'ORDRE DONNÉ (celui du
+/// disque).
+///
+/// Sans charger chaque image : l'EMPREINTE d'un FLAC (longueur du bloc
+/// PICTURE et trois échantillons, `artwork::empreinte_jaquette_flac`) déjà
+/// vue dit de quelle image il s'agit ; seule la première piste de chaque
+/// image est relue en entier, pour son condensat. Les autres formats sont
+/// relus, comme au fil du scan. Aucun octet n'est gardé en mémoire.
+fn compter_les_jaquettes(pistes: &[PathBuf]) -> Decompte {
+    let mut connues: Vec<(EmpreinteJaquette, String)> = Vec::new();
+    let mut d = Decompte::default();
+    for (rang, p) in pistes.iter().enumerate().filter(|(_, p)| existe(p)) {
+        let empreinte = empreinte_jaquette_flac(p);
+        let connu = empreinte
+            .as_ref()
+            .and_then(|e| connues.iter().find(|(x, _)| x == e).map(|(_, c)| c.clone()));
+        let condensat = connu.or_else(|| {
+            let c = content_hash(&extract_cover_art(p)?.0);
+            if let Some(e) = &empreinte {
+                connues.push((e.clone(), c.clone()));
+            }
+            Some(c)
+        });
+        if let Some(c) = &condensat {
+            match d.groupes.iter_mut().find(|g| &g.condensat == c) {
+                Some(g) => g.voix += 1,
+                None => d.groupes.push(Groupe {
+                    condensat: c.clone(),
+                    voix: 1,
+                    fichier: p.clone(),
+                    empreinte: empreinte.clone(),
+                }),
+            }
+        }
+        d.pistes.push((rang, condensat));
+    }
+    d
 }
 
 /// Les adresses qu'aurait données, AVANT #1444, une pochette tirée de ces
@@ -346,15 +436,36 @@ fn appliquer(repo: &AlbumRepo, album_id: i64, geste: &Geste) -> bool {
 /// le fichier cover.jpg associé au FLAC quand il est associé à un fichier
 /// CUE »).
 fn pistes_de_l_album(db: &std::sync::Arc<dyn DbBackend>, album_id: i64) -> Vec<PathBuf> {
-    let mut vues = std::collections::HashSet::new();
-    crate::db::track_repo::TrackRepo::with_backend(db.clone())
+    fichiers_de_l_album(db, album_id)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// Comme [`pistes_de_l_album`], avec les identifiants des pistes que porte
+/// chaque fichier (plusieurs pour une image découpée par une feuille CUE).
+fn fichiers_de_l_album(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+) -> Vec<(PathBuf, Vec<i64>)> {
+    let mut fichiers: Vec<(PathBuf, Vec<i64>)> = Vec::new();
+    let mut rang: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in crate::db::track_repo::TrackRepo::with_backend(db.clone())
         .list_by_album(album_id)
         .unwrap_or_default()
-        .into_iter()
-        .filter_map(|t| t.file_path.or(t.cue_media_path))
-        .filter(|p| vues.insert(p.clone()))
-        .map(PathBuf::from)
-        .collect()
+    {
+        let Some(p) = t.file_path.or(t.cue_media_path) else {
+            continue;
+        };
+        let i = *rang.entry(p.clone()).or_insert_with(|| {
+            fichiers.push((PathBuf::from(&p), Vec::new()));
+            fichiers.len() - 1
+        });
+        if let Some(id) = t.id {
+            fichiers[i].1.push(id);
+        }
+    }
+    fichiers
 }
 
 /// L'album entier, relu sur le disque, puis la règle. Pour les reprises :
@@ -407,6 +518,154 @@ fn reevaluer_avec(
     let geste = arbitrer(etat, lue.as_ref(), complet, du_disque);
     appliquer(repo, album_id, &geste);
     geste
+}
+
+/// Ce que [`trancher_par_la_majorite`] a décidé pour un album (#5454).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tranche {
+    pub geste: Geste,
+    /// L'image qui fait RÉFÉRENCE pour les pistes de l'album : une piste qui
+    /// porte une autre jaquette garde la sienne, les autres retombent sur la
+    /// pochette de l'album. C'est la pochette de l'album quand elle vient du
+    /// disque ; sinon (téléversée, fournisseur) la jaquette majoritaire.
+    /// `None` : aucune piste ne porte de jaquette, rien n'a été tranché.
+    pub reference: Option<String>,
+    /// L'empreinte FLAC de la référence, quand elle est connue.
+    pub empreinte: Option<EmpreinteJaquette>,
+    /// Pistes qui portent une pochette propre après la décision.
+    pub propres: usize,
+}
+
+/// #5454 — la pochette d'un album dont les pistes portent des jaquettes
+/// DIFFÉRENTES est celle que porte la MAJORITÉ des pistes ; à égalité, celle
+/// de la première piste dans l'ordre du disque. Décision de Bertrand du
+/// 29/09/2026 (Fuccaro, fil 1317 : le single éponyme *À partir de
+/// maintenant*, lu le premier, imposait son image à tout l'album de
+/// Hallyday).
+///
+/// Relit l'album entier ([`compter_les_jaquettes`]), puis :
+/// - la pochette de l'album suit [`arbitrer`], comme toute reprise : une
+///   pochette TÉLÉVERSÉE n'est jamais touchée ; celle d'un fournisseur ne
+///   cède qu'à une Analyse complète (`complet`) ;
+/// - chaque piste dont la jaquette diffère de la référence reçoit sa
+///   pochette propre (#4650) — le single garde la sienne ;
+/// - une pochette propre ÉGALE à la référence est retirée : la piste retombe
+///   sur celle de l'album.
+///
+/// Et la retouche d'une jaquette (#5034, point 1) ? Suivie seulement si elle
+/// devient majoritaire : retoucher la seule piste qui avait donné la pochette
+/// ne la change plus, la piste garde sa nouvelle image pour elle.
+///
+/// Appelée par le scan pour un album en DÉSACCORD — une piste relue dont la
+/// jaquette s'écarte de la référence, ou une pochette changée par une piste —
+/// jamais pour un album à jaquette unique : celui-là ne coûte rien de plus.
+pub fn trancher_par_la_majorite(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    cache_dir: &Path,
+    complet: bool,
+) -> Tranche {
+    let rien = Tranche {
+        geste: Geste::Garder,
+        reference: None,
+        empreinte: None,
+        propres: 0,
+    };
+    let repo = AlbumRepo::with_backend(db.clone());
+    let Ok(Some(etat)) = repo.etat_pochette(album_id) else {
+        return rien;
+    };
+    let fichiers = fichiers_de_l_album(db, album_id);
+    let pistes: Vec<PathBuf> = fichiers.iter().map(|(p, _)| p.clone()).collect();
+    let decompte = compter_les_jaquettes(&pistes);
+    let Some(gagnante) = decompte.gagnante().cloned() else {
+        // Aucune jaquette : l'image du dossier, s'il y en a une, reste
+        // l'affaire des règles de #5034/#5035.
+        return rien;
+    };
+
+    let televersee =
+        etat.cover_path.is_some() && matches!(etat.source, Some(SourcePochette::Televersee));
+    let geste = if televersee {
+        Geste::Garder
+    } else {
+        match lire_la_jaquette(&gagnante.fichier, cache_dir, None) {
+            Some(lue) => {
+                let du_disque = vient_du_disque(&etat, Some(&lue), &pistes);
+                let g = arbitrer(&etat, Some(&lue), complet, du_disque);
+                appliquer(&repo, album_id, &g);
+                g
+            }
+            // Relue entre-temps sans jaquette : la prochaine passe tranchera.
+            None => return rien,
+        }
+    };
+
+    let apres = repo.etat_pochette(album_id).ok().flatten();
+    let reference = match apres {
+        Some(EtatPochette {
+            cover_path: Some(c),
+            source: Some(s),
+            ..
+        }) if s.vient_du_disque() => c,
+        _ => gagnante.condensat.clone(),
+    };
+    let empreinte = (reference == gagnante.condensat)
+        .then(|| gagnante.empreinte.clone())
+        .flatten();
+
+    // Les pochettes propres : chaque image distincte de la référence est mise
+    // en cache UNE fois (relue sur la première piste qui la porte).
+    let mut en_cache: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    let mut a_poser: Vec<crate::db::models::Track> = Vec::new();
+    for (rang, c) in &decompte.pistes {
+        let Some(c) = c.as_deref().filter(|c| *c != reference) else {
+            continue;
+        };
+        let ids = &fichiers[*rang].1;
+        let pret = *en_cache.entry(c).or_insert_with(|| {
+            decompte
+                .groupes
+                .iter()
+                .find(|g| g.condensat == c)
+                .and_then(|g| lire_la_jaquette(&g.fichier, cache_dir, None))
+                .is_some_and(|l| l.condensat == c)
+        });
+        if !pret {
+            continue;
+        }
+        for id in ids {
+            let mut t = crate::db::models::Track::new(String::new());
+            t.id = Some(*id);
+            t.cover_path = Some(c.to_string());
+            a_poser.push(t);
+        }
+    }
+    let pistes_repo = crate::db::track_repo::TrackRepo::with_backend(db.clone());
+    let propres = match pistes_repo.appliquer_pochettes_de_piste(&a_poser) {
+        Ok(_) => a_poser.len(),
+        Err(e) => {
+            warn!(album_id, error = %e, "pochettes_de_piste_majorite_echec");
+            0
+        }
+    };
+    if let Err(e) = pistes_repo.retirer_pochettes_de_piste_egales(album_id, &reference) {
+        warn!(album_id, error = %e, "pochettes_de_piste_redondantes_non_retirees");
+    }
+    debug!(
+        album_id,
+        voix = gagnante.voix,
+        images = decompte.groupes.len(),
+        propres,
+        ?geste,
+        "pochette_album_tranchee_par_la_majorite"
+    );
+    Tranche {
+        geste,
+        reference: Some(reference),
+        empreinte,
+        propres,
+    }
 }
 
 /// Ce que le scan retient d'une piste pour la pochette de son album.

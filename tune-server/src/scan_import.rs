@@ -380,14 +380,26 @@ pub struct TrackImporter {
     /// donc la comparaison ne rouvre aucun fichier.
     ///
     /// ⚠️ C'est bien la pochette RÉELLEMENT retenue pour l'album qui sert de
-    /// référence, et non l'image majoritaire du dossier. Une piste qui ne
-    /// porte pas de pochette propre retombe par `COALESCE` sur celle de son
-    /// album : une référence qui ne serait pas celle de l'album ferait donc
-    /// afficher la mauvaise image à toutes les pistes du repli.
+    /// référence. Une piste qui ne porte pas de pochette propre retombe par
+    /// `COALESCE` sur celle de son album : une référence qui ne serait pas
+    /// celle de l'album ferait donc afficher la mauvaise image à toutes les
+    /// pistes du repli.
+    ///
+    /// #5454 — cette pochette est désormais l'image MAJORITAIRE des pistes :
+    /// au fil du lot, la référence est provisoire (la première piste lue) ;
+    /// un album en désaccord est tranché en fin de lot
+    /// (`trancher_les_albums_en_desaccord`), qui recale la référence et
+    /// repose les pochettes propres de toutes ses pistes.
     album_ref_cover: HashMap<i64, String>,
     /// Par album : l'EMPREINTE (`artwork::empreinte_jaquette_flac`) de la
     /// jaquette qui fait référence — pour la reconnaître sans relire l'image.
     album_ref_empreinte: HashMap<i64, tune_core::library::artwork::EmpreinteJaquette>,
+    /// #5454 — albums dont une piste relue par ce lot s'écarte de la
+    /// référence, ou dont une piste a CHANGÉ la pochette : ils sont tranchés
+    /// par la majorité de leurs pistes à la fin du lot
+    /// (`pochette_disque::trancher_par_la_majorite`). Un album à jaquette
+    /// unique n'y entre jamais.
+    albums_en_desaccord: std::collections::BTreeSet<i64>,
     /// First track-artist seen per folder, used to pin the album artist when a
     /// track has no `album_artist` tag (classical soloists / features).
     dir_album_artist: HashMap<String, String>,
@@ -539,6 +551,7 @@ impl TrackImporter {
             albums_vus: HashSet::new(),
             album_ref_cover: HashMap::new(),
             album_ref_empreinte: HashMap::new(),
+            albums_en_desaccord: std::collections::BTreeSet::new(),
             dir_album_artist: HashMap::new(),
             preuves,
             albums_reclasses: HashSet::new(),
@@ -918,6 +931,15 @@ impl TrackImporter {
             // automatiques — sans quoi un album illustré par son `cover.jpg`
             // relirait l'image à chacune de ses pistes.
             let premiere = self.albums_vus.insert(aid);
+            // #5454 — la pochette AVANT cette piste : si la piste la change,
+            // l'album est tranché par la majorité en fin de lot (une jaquette
+            // retouchée n'est suivie que si elle devient majoritaire).
+            let pochette_avant = self
+                .album_repo
+                .etat_pochette(aid)
+                .ok()
+                .flatten()
+                .and_then(|e| e.cover_path);
             // #5202 — la règle relit le disque (jaquette, image du dossier,
             // pistes de l'album) : bornée comme le reste. Ses écritures se
             // font en base hors de toute transaction de lot.
@@ -951,7 +973,14 @@ impl TrackImporter {
             // Depuis la migration 111, une pochette tirée du disque est
             // adressée par le condensat de son CONTENU (jamais par l'adresse
             // héritée dérivée d'un chemin) : elle se compare aux octets.
-            if let Ok(Some(etat)) = self.album_repo.etat_pochette(aid)
+            let etat_apres = self.album_repo.etat_pochette(aid).ok().flatten();
+            if pochette_avant.is_some()
+                && etat_apres.as_ref().and_then(|e| e.cover_path.as_ref())
+                    != pochette_avant.as_ref()
+            {
+                self.albums_en_desaccord.insert(aid);
+            }
+            if let Some(etat) = etat_apres
                 && etat.source.is_some_and(|s| s.vient_du_disque())
                 && let Some(pochette) = etat.cover_path
             {
@@ -1088,6 +1117,10 @@ impl TrackImporter {
                         &self.cache_dir,
                         cover,
                     );
+                    // #5454 — un désaccord : la majorité des pistes dira, en
+                    // fin de lot, laquelle des deux images est celle de
+                    // l'album. Sans quoi la première piste lue l'emportait.
+                    self.albums_en_desaccord.insert(aid);
                 }
                 // Même image que l'album : rien à faire, la lecture retombe
                 // sur la pochette d'album par `COALESCE`.
@@ -1128,7 +1161,7 @@ impl TrackImporter {
             None => return Vec::new(),
         };
         let total = travail.len();
-        let mut a_poser = Vec::new();
+        let mut a_poser: Vec<(Option<i64>, String, String)> = Vec::new();
         for (i, t) in travail.iter().enumerate() {
             if lectures.arret_demande() || lectures.epuise() {
                 tracing::warn!(
@@ -1143,10 +1176,68 @@ impl TrackImporter {
                 break;
             }
             if let Some(Some(pochette)) = self.pochettes_de_la_piste(t, Some(&mut *lectures)) {
-                a_poser.push((t.chemin.clone(), pochette));
+                a_poser.push((t.album_id, t.chemin.clone(), pochette));
             }
         }
+        let tranches = self.trancher_les_albums_en_desaccord(lectures);
         a_poser
+            .into_iter()
+            // Les pochettes propres d'un album tranché ont été posées par la
+            // majorité, sur TOUTES ses pistes : celles du lot, calculées face à
+            // l'ancienne référence, ne valent plus.
+            .filter(|(album, _, _)| album.is_none_or(|a| !tranches.contains(&a)))
+            .map(|(_, chemin, pochette)| (chemin, pochette))
+            .collect()
+    }
+
+    /// #5454 — tranche par la MAJORITÉ de leurs pistes les albums que ce lot
+    /// a vus en désaccord (voir `albums_en_desaccord`), et recale la
+    /// référence de chacun pour les lots suivants. Chaque album est UNE
+    /// lecture bornée (#5202) : elle relit toutes ses pistes. Rend les albums
+    /// tranchés.
+    fn trancher_les_albums_en_desaccord(
+        &mut self,
+        lectures: &mut crate::lecture_bornee::LecturesBornees<'_>,
+    ) -> std::collections::BTreeSet<i64> {
+        let mut tranches = std::collections::BTreeSet::new();
+        for aid in std::mem::take(&mut self.albums_en_desaccord) {
+            if lectures.arret_demande() || lectures.epuise() {
+                break;
+            }
+            let db = self.db.clone();
+            let cache = self.cache_dir.clone();
+            let complet = self.force_artwork;
+            let Some(tranche) =
+                lectures.lire("pochette_majoritaire", &format!("album {aid}"), move || {
+                    tune_core::library::pochette_disque::trancher_par_la_majorite(
+                        &db, aid, &cache, complet,
+                    )
+                })
+            else {
+                continue;
+            };
+            let Some(reference) = tranche.reference else {
+                continue;
+            };
+            if matches!(
+                tranche.geste,
+                tune_core::library::pochette_disque::Geste::Poser(_)
+            ) && self.album_ref_cover.get(&aid) != Some(&reference)
+            {
+                self.artwork_extracted += 1;
+            }
+            self.album_ref_cover.insert(aid, reference);
+            match tranche.empreinte {
+                Some(e) => {
+                    self.album_ref_empreinte.insert(aid, e);
+                }
+                None => {
+                    self.album_ref_empreinte.remove(&aid);
+                }
+            }
+            tranches.insert(aid);
+        }
+        tranches
     }
 
     pub fn import(&mut self, sf: &ScannedFile) -> Option<(Track, Option<i64>)> {
@@ -3042,8 +3133,11 @@ mod tests {
         let dossier = tmp.path().join("The Rolling Stones - Hackney Diamonds");
         std::fs::create_dir_all(&dossier).unwrap();
 
-        // La première piste vue donne sa pochette à l'album — c'est le
-        // comportement en place. Ici c'est « Get Close », une piste ordinaire.
+        // Import sur-le-champ (sans le mode différé des lots) : la première
+        // piste vue sert de référence, ici « Get Close », une piste ordinaire.
+        // En production, la majorité des pistes tranche en fin de lot (#5454,
+        // `majorite_tests_5454`) ; ce témoin ne porte que sur la pochette
+        // propre de la piste qui s'écarte.
         let lot = vec![
             piste_avec_jaquette(&dossier, "02.flac", "Get Close", 2, JAQUETTE_ALBUM),
             piste_avec_jaquette(&dossier, "01.flac", "Angry", 1, JAQUETTE_SINGLE),
@@ -3079,43 +3173,104 @@ mod tests {
         );
     }
 
-    /// ⚠️ LE REVERS, mesuré et assumé : quand c'est le SINGLE qui est vu en
-    /// premier, c'est lui qui donne sa pochette à l'album — comportement en
-    /// place, hors périmètre de #4650 — et ce sont les autres pistes qui
-    /// portent alors une pochette propre.
+    /// Le single VU EN PREMIER (ex-`single_vu_en_premier_la_pochette_propre_change_de_camp_4650`).
     ///
-    /// L'affichage reste JUSTE dans les deux cas : chaque piste montre son
-    /// image réelle. Seule la vignette de l'ALBUM dépend de l'ordre de lecture,
-    /// et c'est un défaut antérieur (la pochette d'album est celle du premier
-    /// fichier vu). Ce témoin existe pour que ce revers soit écrit quelque
-    /// part plutôt que découvert par un testeur.
+    /// Ce témoin figeait un REVERS assumé : la piste lue la première donnait
+    /// sa pochette à l'album, et c'étaient les AUTRES pistes qui portaient
+    /// alors une pochette propre. Ce revers est exactement le défaut de #5454
+    /// (Fuccaro, fil 1317 : le single éponyme de Hallyday imposait son image
+    /// à l'album). Décision de Bertrand du 29/09/2026 : la pochette de l'album
+    /// est l'image de la MAJORITÉ des pistes ; à égalité, celle de la
+    /// première piste dans l'ordre du disque. L'ordre de LECTURE ne compte
+    /// plus.
+    ///
+    /// Ce qu'il protégeait d'autre, et qu'il garde : **chaque piste affiche
+    /// son image réelle** — la piste qui s'écarte de l'album porte la sienne,
+    /// les autres n'écrivent rien et retombent sur celle de l'album.
+    ///
+    /// Il passe désormais par le trajet de production d'un lot (import
+    /// différé, lignes écrites, pochettes après le COMMIT — #5202) sur de
+    /// vrais FLAC : c'est en fin de lot que la majorité tranche, et
+    /// `meta.cover_art` est vide en production.
     #[test]
-    fn single_vu_en_premier_la_pochette_propre_change_de_camp_4650() {
+    fn single_vu_en_premier_la_pochette_propre_reste_au_single_4650_5454() {
+        use super::majorite_tests_5454::{
+            ALBUM, SINGLE, base, piste, pochette_affichee, pochette_album, pochette_propre, scanner,
+        };
         let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("artwork_cache");
         let dossier = tmp.path().join("The Rolling Stones - Hackney Diamonds");
         std::fs::create_dir_all(&dossier).unwrap();
+        let condensat_single = tune_core::library::artwork::content_hash(SINGLE);
+        let condensat_album = tune_core::library::artwork::content_hash(ALBUM);
 
+        // Trois pistes, le single en piste 1 et lu le PREMIER : la majorité
+        // (deux contre un) donne la jaquette de l'album. Avant #5454, l'album
+        // prenait celle du single.
         let lot = vec![
-            piste_avec_jaquette(&dossier, "01.flac", "Angry", 1, JAQUETTE_SINGLE),
-            piste_avec_jaquette(&dossier, "02.flac", "Get Close", 2, JAQUETTE_ALBUM),
+            piste(&dossier, 1, "Angry", SINGLE),
+            piste(&dossier, 2, "Get Close", ALBUM),
+            piste(&dossier, 3, "Depending On You", ALBUM),
         ];
-        let pochettes = pochettes_de_piste(&lot, &cache);
-        let condensat_album = tune_core::library::artwork::content_hash(JAQUETTE_ALBUM);
-
+        let db = base();
+        scanner(&db, &tmp.path().join("cache-3"), &lot, 100, false);
         assert_eq!(
-            pochettes.get("Angry").cloned().flatten(),
-            None,
-            "la piste vue en PREMIÈRE donne sa pochette à l'album : elle n'a \
-             rien à écrire. Pochettes vues : {pochettes:?}"
-        );
-        assert_eq!(
-            pochettes.get("Get Close").cloned().flatten().as_deref(),
+            pochette_album(&db, &lot).as_deref(),
             Some(condensat_album.as_str()),
-            "et c'est la piste ordinaire qui porte alors une pochette propre — \
-             son image RÉELLE, donc un affichage juste. Pochettes vues : \
-             {pochettes:?}"
+            "#5454 : le single lu le premier ne donne plus sa pochette à l'album — la \
+             majorité des pistes porte l'autre image"
         );
+        assert_eq!(
+            (
+                pochette_propre(&db, &lot[0]),
+                pochette_propre(&db, &lot[1]),
+                pochette_propre(&db, &lot[2])
+            ),
+            (Some(condensat_single.clone()), None, None),
+            "le single garde SA pochette ; les pistes à l'image de l'album n'écrivent rien"
+        );
+        for f in &lot {
+            assert!(
+                pochette_affichee(&db, f).is_some(),
+                "chaque piste affiche une image"
+            );
+        }
+        assert_eq!(
+            pochette_affichee(&db, &lot[0]).as_deref(),
+            Some(condensat_single.as_str()),
+            "l'affichage reste JUSTE : le single montre son image réelle"
+        );
+
+        // Deux pistes seulement : ÉGALITÉ, la première piste du disque
+        // l'emporte — ici le single. C'est l'ancien constat, désormais
+        // justifié par l'ordre du DISQUE et non par l'ordre de lecture : lu en
+        // second, le single l'emporte tout autant.
+        for (nom, ordre) in [
+            ("single lu le premier", vec![lot[0].clone(), lot[1].clone()]),
+            ("single lu le second", vec![lot[1].clone(), lot[0].clone()]),
+        ] {
+            let db = base();
+            scanner(
+                &db,
+                &tmp.path().join(format!("cache-{nom}")),
+                &ordre,
+                100,
+                false,
+            );
+            assert_eq!(
+                (
+                    pochette_album(&db, &lot[..2]),
+                    pochette_propre(&db, &lot[0]),
+                    pochette_propre(&db, &lot[1])
+                ),
+                (
+                    Some(condensat_single.clone()),
+                    None,
+                    Some(condensat_album.clone())
+                ),
+                "{nom} : à égalité, la piste 1 donne sa pochette à l'album, et l'autre \
+                 piste porte SON image réelle"
+            );
+        }
     }
 
     /// LE TÉMOIN DU COÛT : un album de trente pistes à jaquette UNIQUE
@@ -3293,3 +3448,7 @@ mod tests_edition_manuelle {
 #[cfg(all(test, unix))]
 #[path = "scan_import_pochettes_bornees_tests_5202.rs"]
 mod pochettes_bornees_tests_5202;
+
+#[cfg(test)]
+#[path = "scan_import_majorite_tests_5454.rs"]
+mod majorite_tests_5454;
