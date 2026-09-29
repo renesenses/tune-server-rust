@@ -1386,8 +1386,16 @@ fn la_promotion_emporte_le_paquet_debian_dans_son_propre_run() {
     assert!(paquet.contains("tag: v${{ inputs.version }}"));
     assert!(paquet.contains("publish: true"));
     assert!(
-        paquet.contains("if: ${{ !inputs.dry_run }}"),
+        paquet.contains("if: ${{ !inputs.dry_run && "),
         "un dry-run de promotion attacherait un paquet pour de vrai"
+    );
+    // 29/09/2026 : une PRE-VERSION ne part pas en .deb (apt n'a qu'un
+    // canal). Le drapeau vient du manifeste via le job `promote` ; la
+    // comparaison a `'false'` (et non `!= 'true'`) fait qu'un drapeau absent
+    // ou vide n'emet RIEN, plutot que d'emettre par defaut.
+    assert!(
+        paquet.contains("needs.promote.outputs.prerelease == 'false'"),
+        "le paquet Debian ne tient plus compte du drapeau prerelease"
     );
 }
 
@@ -2102,4 +2110,73 @@ fn lecteur_workspace_respecte_dependance_implicite_et_exclusion() {
         "an excluded path dependency is not a Cargo workspace member: {members:?}"
     );
     assert_eq!(members.len(), 11);
+}
+
+/// 29/09/2026 — la 1.0.0-rc1 part chez TOUT LE MONDE (décision de Bertrand) :
+/// release « Latest », Docker `:latest`, Homebrew, `.deb`, images Tune OS.
+///
+/// Avant, un `-` dans le tag faisait une pré-version, point. Le choix vit
+/// désormais dans le manifeste du train (`"prerelease": false`), lu par UN
+/// script, `scripts/canal-de-release.sh`, que release.yml et la promotion
+/// appellent tous les deux. Sans le champ, la règle d'avant s'applique.
+#[test]
+fn le_drapeau_prerelease_vient_du_manifeste_et_regit_la_promotion() {
+    autotest("canal-de-release.sh", 10);
+
+    let release = workflow("release.yml");
+    assert!(release.contains("bash scripts/canal-de-release.sh"));
+    assert!(release.contains("prerelease: ${{ steps.canal.outputs.prerelease == 'true' }}"));
+    assert!(
+        !release.contains("prerelease: ${{ contains(github.ref_name, '-') }}"),
+        "release.yml décide de nouveau par le seul `-` du tag : la rc1 partirait en pré-version"
+    );
+
+    let promotion = workflow("promote-release.yml");
+    assert!(promotion.contains(r#"bash scripts/canal-de-release.sh "$TAG" "$PLAN""#));
+    assert!(
+        promotion.contains("--json isPrerelease"),
+        "la promotion ne compare plus le drapeau du brouillon à celui du manifeste"
+    );
+    assert!(
+        promotion.contains(r#"gh release edit "$TAG" --draft=false --latest=false"#),
+        "une pré-version recevrait `--latest`"
+    );
+
+    // Le suffixe est accepté partout où la version est validée.
+    for fichier in [
+        "release-controller.yml",
+        "promote-release.yml",
+        "trigger-os-images.yml",
+    ] {
+        assert!(
+            workflow(fichier).contains(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$"),
+            "{fichier} refuse de nouveau une version suffixée"
+        );
+    }
+    assert!(
+        !workflow("trigger-os-images.yml").contains("!contains(inputs.version, '-')"),
+        "les images Tune OS sautent de nouveau les pré-versions"
+    );
+}
+
+/// `cross` ne transmet au conteneur que les variables listées : sans
+/// `TUNE_VERSION`, les binaires ARM (image Tune OS du Raspberry Pi comprise)
+/// se déclareraient « 1.0.0 » sous le tag v1.0.0-rc1, donc plus récents que
+/// la rc2 — plus aucune mise à jour proposée.
+#[test]
+fn cross_transmet_tune_version_aux_deux_cibles_arm() {
+    let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cross = fs::read_to_string(racine.join("../Cross.toml")).expect("Cross.toml lisible");
+    for cible in ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"] {
+        let entete = format!("[target.{cible}.env]");
+        let debut = cross
+            .find(&entete)
+            .unwrap_or_else(|| panic!("{entete} absent de Cross.toml"));
+        let bloc = &cross[debut..];
+        let fin = bloc[1..].find("\n[").map(|i| i + 1).unwrap_or(bloc.len());
+        assert!(
+            bloc[..fin].contains("\"TUNE_VERSION\""),
+            "{cible} : TUNE_VERSION n'est plus transmis au conteneur cross"
+        );
+    }
 }

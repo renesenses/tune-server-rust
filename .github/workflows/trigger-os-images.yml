@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: "Tune version (X.Y.Z, sans v)"
+        description: "Tune version (X.Y.Z ou X.Y.Z-pre, sans v)"
         required: true
         type: string
     secrets:
@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tune version (X.Y.Z, sans v)"
+        description: "Tune version (X.Y.Z ou X.Y.Z-pre, sans v)"
         required: true
         type: string
 
@@ -24,7 +24,9 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    if: ${{ !contains(inputs.version, '-') }}
+    # Plus de saut des pre-versions : la 1.0.0-rc1 part chez tout le monde,
+    # images Tune OS comprises. Sans elles, `staging-complete` (release.yml)
+    # restait rouge et la promotion ne trouvait aucune release OS.
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +36,7 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           V="$RELEASE_VERSION"
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
             echo "::error::version invalide: $V"
             exit 1
           }

@@ -114,9 +114,20 @@ pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get --assume-yes --no-install-recommends install libasound2-dev:$CROSS_DEB_ARCH",
 ]
+# ## Depuis le 29/09/2026 (1.0.0-rc1) : TUNE_VERSION entre dans le conteneur
+#
+# `tune_core::version()` lit `option_env!("TUNE_VERSION")` A LA COMPILATION,
+# repli sur CARGO_PKG_VERSION. release.yml pose TUNE_VERSION depuis le tag,
+# mais `cross` compile dans un conteneur qui ne recoit que les variables
+# listees ici. Tant que tag et Cargo.toml disaient la meme chose (X.Y.Z), le
+# repli masquait l'oubli. Avec le tag v1.0.0-rc1 et des fichiers a 1.0.0, les
+# deux binaires ARM — dont celui de l'image Tune OS du Raspberry Pi —
+# se seraient declares « 1.0.0 », donc PLUS RECENTS que la rc2 : plus aucune
+# mise a jour proposee avant la 1.0.1.
 [target.aarch64-unknown-linux-gnu.env]
 passthrough = [
     "PKG_CONFIG_ALLOW_CROSS=1",
+    "TUNE_VERSION",
 ]
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
@@ -130,4 +141,6 @@ passthrough = [
     # Cargo applique bien son `[env]`, mais on le répète ici pour que la valeur
     # soit présente dans l'environnement du conteneur au moment où CMake tourne.
     "CMAKE_POLICY_VERSION_MINIMUM=3.5",
+    # Cf. la cible gnu ci-dessus : la version du tag, pas celle de Cargo.toml.
+    "TUNE_VERSION",
 ]

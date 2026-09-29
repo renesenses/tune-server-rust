@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version du train à auditer (ex. 0.9.128)"
+        description: "Version du train à auditer (ex. 0.9.128, 1.0.0-rc1)"
         required: true
         type: string
 
@@ -53,6 +53,13 @@ jobs:
           ok()   { printf '  ✅ %s\n' "$1"; }
           ko()   { printf '  ❌ %s\n' "$1"; echec=1; }
           na()   { printf '  ⚠️  %s\n' "$1"; }
+
+          # La LIGNE du train porte la base X.Y.Z : la 1.0.0-rc1 vit sur
+          # `rc/v1.0.0`, pas sur `rc/v1.0.0-rc1`. Un nom suffixe serait trie
+          # APRES `rc/v1.0.0` par `sort -V` (auditer-topologie-pr.sh,
+          # `rc_vivante`) et designerait la mauvaise RC comme vivante — et la
+          # rc2 vivra sur la meme ligne. Les tags, eux, gardent le suffixe.
+          LIGNE="rc/v${VERSION%%-*}"
 
           PUBLICS="tune-server-rust tune-web-client"
           PRIVES="tune-os tune-server-universal"
@@ -93,7 +100,7 @@ jobs:
               ko "$d : dépôt PUBLIC inaccessible — l'audit ne peut pas conclure"
               continue
             fi
-            for br in main "rc/v$VERSION"; do
+            for br in main "$LIGNE"; do
               case "$br" in main) classe=main ;; *) classe=rc ;; esac
               enc=$(printf '%s' "$br" | sed 's#/#%2F#g')
               if ! r=$(gh api "repos/renesenses/$d/rules/branches/$enc" 2>/dev/null); then
@@ -234,7 +241,7 @@ jobs:
               # chaque train. Un audit rouge en permanence finit ignoré —
               # même issue qu'un vert creux. Repli sur `main` si la `rc`
               # n'existe pas encore.
-              ref="rc/v$VERSION"
+              ref="$LIGNE"
               if ! gh api "repos/$repo/branches/$(printf '%s' "$ref" | sed 's#/#%2F#g')" \
                      --jq '.name' >/dev/null 2>&1; then
                 ref=main
