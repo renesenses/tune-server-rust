@@ -118,19 +118,20 @@ impl StreamingService for Simule {
     ) -> Result<SearchPage, TuneError> {
         if !self.pagine {
             // Le défaut du trait, recopié : un service qui ne pagine pas.
+            // Le défaut LUI-MÊME est éprouvé par `Nu`, plus bas.
             if offset > 0 {
                 self.appels.search_page.fetch_add(1, Ordering::SeqCst);
                 return Ok(SearchPage::au_dela(offset));
             }
             // `search` compte lui-même cet appel-là : un seul appel réseau.
-            let borne = tune_core::streaming::traits::limite_sans_pagination(limit);
-            return Ok(SearchPage::page_unique_bornee(
-                self.search(query, borne).await?,
-                borne,
-            ));
+            let borne = tune_core::streaming::traits::limite_hors_pagination(limit);
+            let mut page = SearchPage::page_unique_bornee(self.search(query, borne).await?, borne);
+            page.has_more = false;
+            return Ok(page);
         }
         self.appels.search_page.fetch_add(1, Ordering::SeqCst);
-        let fin = (offset + limit).min(self.catalogue);
+        // Un service qui pagine par pages de 50, comme Tidal et Deezer.
+        let fin = (offset + self.limite_de_page_recherche(limit)).min(self.catalogue);
         let tracks: Vec<StreamTrack> = (offset.min(fin)..fin)
             .map(|i| piste(i, &format!("{}-", self.nom)))
             .collect();
@@ -145,6 +146,13 @@ impl StreamingService for Simule {
             has_more: offset + rendus < self.catalogue,
             truncated: false,
         })
+    }
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        if self.pagine {
+            tune_core::streaming::traits::limite_sans_pagination(limit)
+        } else {
+            tune_core::streaming::traits::limite_hors_pagination(limit)
+        }
     }
     async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
         Err("hors sujet".into())
@@ -431,4 +439,118 @@ async fn sans_parametre_la_reponse_est_celle_d_avant() {
     assert_eq!(b.pagineur.search.load(Ordering::SeqCst), 1);
     assert_eq!(b.pagineur.search_page.load(Ordering::SeqCst), 0);
     assert_eq!(b.sanspage.search_page.load(Ordering::SeqCst), 0);
+}
+
+/// Un service qui n'implémente QUE `search` : `search_page` et
+/// `limite_de_page_recherche` lui viennent du trait — c'est le défaut
+/// lui-même qui est éprouvé, pas une copie.
+struct Nu {
+    catalogue: usize,
+}
+
+#[async_trait::async_trait]
+impl StreamingService for Nu {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "nu"
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+    async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+        Ok(self.auth_status().await)
+    }
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authenticated: true,
+            ..Default::default()
+        }
+    }
+    async fn logout(&mut self) -> Result<(), TuneError> {
+        Ok(())
+    }
+    async fn search(&self, _q: &str, limit: usize) -> Result<SearchResults, TuneError> {
+        Ok(resultats(
+            (0..limit.min(self.catalogue))
+                .map(|i| piste(i, "nu-"))
+                .collect(),
+        ))
+    }
+    async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        Err("hors sujet".into())
+    }
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+        Ok(vec![])
+    }
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+        Ok(vec![])
+    }
+}
+
+/// #4803, décision de Bertrand (29/09/2026) : sous `paged=true`, un service
+/// qui NE pagine PAS garde la limite du chemin non paginé — 100, ce qu'envoie
+/// le client web — et `has_more: false` ; un service qui pagine garde sa page
+/// de 50 et annonce la suite. Avant, le défaut du trait ramenait le premier à
+/// 50 : la moitié de sa première page disparaissait dès `paged=true`.
+#[tokio::test]
+async fn sous_paged_un_service_sans_pagination_garde_la_limite_d_avant() {
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    {
+        let mut registre = state.services.lock().await;
+        registre.register(Box::new(Nu { catalogue: 150 }));
+        registre.register(Box::new(Simule {
+            nom: "pagineur",
+            pagine: true,
+            catalogue: 150,
+            appels: Arc::default(),
+        }));
+    }
+
+    let r = chercher(
+        &state,
+        "q=coltrane&limit=100&sources=nu,pagineur&paged=true",
+    )
+    .await;
+    let nu = &r["services"]["nu"];
+    assert_eq!(ids(nu).len(), 100, "la limite du chemin non paginé : {nu}");
+    assert_eq!(nu["limit"], 100, "{nu}");
+    assert_eq!(nu["has_more"], false, "rien à charger ensuite : {nu}");
+    let pagineur = &r["services"]["pagineur"];
+    assert_eq!(ids(pagineur).len(), 50, "un service qui pagine : sa page");
+    assert_eq!(pagineur["limit"], 50, "{pagineur}");
+    assert_eq!(pagineur["has_more"], true, "{pagineur}");
+
+    let avant = chercher(&state, "q=coltrane&limit=100&sources=nu").await;
+    assert_eq!(
+        ids(&avant["services"]["nu"]),
+        ids(nu),
+        "paginé ou non, la première page d'un service sans pagination est la même"
+    );
 }

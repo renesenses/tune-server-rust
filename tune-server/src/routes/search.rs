@@ -68,8 +68,9 @@
 //! Le service est lu par SON `search_page` — celui que sert déjà
 //! `/streaming/{service}/search` — : sa pagination et son plafond sont les
 //! siens. Qobuz pagine (pages de 50 par requête, 500 par catégorie au plus) ;
-//! les autres services n'ont aujourd'hui qu'une page (50 au plus), et un
-//! décalage au-delà rend une page vide SANS appel réseau.
+//! les autres services n'ont aujourd'hui qu'une page — à la limite du chemin
+//! non paginé, `has_more` toujours faux (décision de Bertrand, 29/09/2026) —,
+//! et un décalage au-delà rend une page vide SANS appel réseau.
 //!
 //! La fusion n'est pas réinventée : une page de curseur est la même réponse,
 //! assemblée par la même route et le même [`recherches_concurrentes`]. Le
@@ -704,8 +705,8 @@ async fn federated_search(
                 };
                 // #4803 — la page du service, par SON `search_page` : la
                 // pagination et le plafond sont les siens (Qobuz : 500 par
-                // catégorie ; un service sans pagination : une page de 50,
-                // puis rien).
+                // catégorie ; un service sans pagination : une page à la
+                // limite du chemin non paginé, puis rien).
                 let page = svc.search_page(&requete, demandee, decalage).await.ok()?;
                 let servie = svc.limite_de_page_recherche(demandee);
                 let mut results = page.results;
