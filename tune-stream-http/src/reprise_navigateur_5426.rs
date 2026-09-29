@@ -79,7 +79,12 @@ async fn servir(
 }
 
 async fn demander(url: &str, debut: u64, quoi: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    // Le constructeur partagé du dépôt (garde `http_client_seam`) ; un
+    // client neuf par requête : une connexion neuve, comme la reprise du
+    // navigateur.
+    tune_core::http::client::builder()
+        .build()
+        .expect("client HTTP")
         .get(url)
         .header("User-Agent", NAVIGATEUR)
         .header("Range", format!("bytes={debut}-"))
