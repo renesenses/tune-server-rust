@@ -9,6 +9,9 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# #5438 — `spawn_blocking` : les lectures des collections intelligentes hors
+# de l'exécuteur. Déjà au graphe (tune-core, tune-server) ; rien de nouveau.
+tokio = { workspace = true }
 tune-core = { path = "../tune-core", default-features = false }
 async-trait = { workspace = true }
 tune-http-types = { path = "../tune-http-types" }
