@@ -85,9 +85,21 @@ pub struct Marqueur {
     /// Identité stable du coffret (vide pour un coffret manuel).
     #[serde(default)]
     pub cle: String,
-    /// Les disques d'origine, par numéro croissant (vide pour un manuel).
+    /// Les disques d'origine, par numéro croissant. Pour un coffret manuel,
+    /// ceux que la composition a réunis (vide pour un coffret composé avant
+    /// #5319, ou par « attacher »).
     #[serde(default)]
     pub disques: Vec<DisqueRetenu>,
+    /// Coffret manuel : le titre que la COMPOSITION lui a donné (#5319).
+    /// « Défaire » ne rend son titre d'origine à l'album que s'il porte
+    /// encore celui-là — un titre changé depuis est celui de l'utilisateur.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titre_compose: Option<String>,
+    /// Coffret manuel : le titre de l'album cible était DÉJÀ tenu à la main
+    /// (`edition_manuelle`) avant la composition. « Défaire » ne retire
+    /// alors pas ce marquage, qui n'est pas le sien.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub titre_tenu_avant: bool,
 }
 
 impl Marqueur {
@@ -96,7 +108,13 @@ impl Marqueur {
             origine: ORIGINE_MANUEL.into(),
             cle: String::new(),
             disques: vec![],
+            titre_compose: None,
+            titre_tenu_avant: false,
         }
+    }
+
+    pub fn est_manuel(&self) -> bool {
+        self.origine == ORIGINE_MANUEL
     }
 
     fn est_auto(&self) -> bool {
@@ -348,6 +366,8 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
         origine: ORIGINE_AUTO.into(),
         cle: c.cle.clone(),
         disques,
+        titre_compose: None,
+        titre_tenu_avant: false,
     };
     let json = serde_json::to_string(&marqueur).unwrap_or_default();
     if let Err(e) = meta.set(cible, CLE_COFFRET, &json) {

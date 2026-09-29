@@ -7,6 +7,10 @@
 //!   disque suivant ;
 //! - `POST /library/albums/{id}/discs/{number}/detach` — le disque redevient
 //!   un album séparé.
+//! - `POST /library/albums/{id}/edition/retablir` — un champ reprend la
+//!   valeur des balises (#5319) ;
+//! - `POST /library/coffrets/{id}/defaire-manuel` — un coffret composé à la
+//!   main redevient ses albums (#5319).
 //!
 //! La logique, et ce qui la rend durable face aux analyses, vit dans
 //! [`tune_core::db::edition_album`] ; ces routes ne font que traduire.
@@ -112,6 +116,63 @@ pub(super) async fn detacher(
         }
         Ok(None) => refuser(RefusEdition::AlbumInconnu(id)),
         Err(e) => refuser(RefusEdition::Base(e.to_string())),
+    }
+}
+
+/// Le corps de `POST /library/albums/{id}/edition/retablir`.
+#[derive(Deserialize)]
+pub(super) struct ChampARetablir {
+    /// Un nom de `champs_edites` (`title`, `album_artist`, `year`, …).
+    pub field: String,
+}
+
+/// `POST /library/albums/{id}/edition/retablir` — `{ "field": "title" }` :
+/// le champ reprend la valeur des balises des fichiers, et n'est plus marqué
+/// modifié à la main (décision de Bertrand du 29/09/2026, #5319). Rend la vue
+/// d'édition. Voir [`edition_album::retablir`].
+pub(super) async fn retablir(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(corps): Json<ChampARetablir>,
+) -> Response {
+    let backend = state.backend.clone();
+    let champ = corps.field.clone();
+    // Relire des fichiers est BLOQUANT : hors du réacteur.
+    let fait = tokio::task::spawn_blocking(move || edition_album::retablir(&backend, id, &champ))
+        .await
+        .unwrap_or_else(|e| Err(RefusEdition::Base(e.to_string())));
+    match fait {
+        Ok(()) => {
+            annoncer(&state, "champ_retabli", id);
+            vue(&state, id)
+        }
+        Err(RefusEdition::Invalide {
+            code: code @ "retablir_par_defaire",
+            message,
+        }) => refus(StatusCode::CONFLICT, code, message),
+        Err(e) => refuser(e),
+    }
+}
+
+/// `POST /library/coffrets/{id}/defaire-manuel` — DÉFAIRE un coffret composé
+/// à la main (décision de Bertrand du 29/09/2026, #5319). Voir
+/// [`edition_album::defaire_coffret_manuel`]. Rend `{ cible, albums_recrees }`,
+/// comme `POST /library/coffrets/{id}/defaire` pour un coffret automatique,
+/// qui reste inchangé. 409 `pas_un_coffret_manuel` sur tout autre album.
+pub(super) async fn defaire_coffret_manuel(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    match edition_album::defaire_coffret_manuel(&state.backend, id) {
+        Ok(recrees) => {
+            annoncer(&state, "coffret_manuel_defait", id);
+            Json(json!({ "cible": id, "albums_recrees": recrees })).into_response()
+        }
+        Err(RefusEdition::Invalide {
+            code: code @ "pas_un_coffret_manuel",
+            message,
+        }) => refus(StatusCode::CONFLICT, code, message),
+        Err(e) => refuser(e),
     }
 }
 
