@@ -915,4 +915,27 @@ mod tests {
         assert!(tables.contains(&"tracks".to_string()));
         assert!(tables.contains(&"track_credits".to_string()));
     }
+
+    /// #5397 — le SQLite embarqué est compilé SANS comptabilité mémoire
+    /// globale (`LIBSQLITE3_FLAGS` dans `.cargo/config.toml`). Avec elle,
+    /// chaque allocation de chaque connexion du processus passe par un même
+    /// mutex : 32 fils de tests ont suffi à rendre une relecture de 501
+    /// pistes 20 fois plus lente. Ce garde rougit si le réglage se perd (une
+    /// variable d'environnement `LIBSQLITE3_FLAGS` le remplace, par exemple).
+    #[test]
+    fn sqlite_embarque_sans_comptabilite_memoire_globale_5397() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let compile: i64 = conn
+            .query_row(
+                "SELECT sqlite_compileoption_used('DEFAULT_MEMSTATUS=0')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            compile, 1,
+            "SQLite doit être compilé avec SQLITE_DEFAULT_MEMSTATUS=0 (voir .cargo/config.toml)"
+        );
+    }
 }
