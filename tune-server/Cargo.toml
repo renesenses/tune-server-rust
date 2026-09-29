@@ -219,6 +219,13 @@ path = "tests/titres_de_service_bannis_4806.rs"
 name = "pistes_bibliotheque_lentes_5138"
 path = "tests/pistes_bibliotheque_lentes_5138.rs"
 
+# #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
+# sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "doublons_metadonnees_5455"
+path = "tests/doublons_metadonnees_5455.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
