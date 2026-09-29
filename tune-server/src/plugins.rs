@@ -167,12 +167,25 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // Tune Circle, étape T1 (#5018). La base seule : le greffon y relit, à
     // chaque appel, la session SSO du serveur (`mozaik_access_token`,
     // `mozaik_refresh_token`, `mozaik_base_url`) — la même que lisent
-    // `library_sync` et les routes `/cloud/*`. Aucun service hôte de plus.
+    // `library_sync` et les routes `/cloud/*`. T2 (#5325) : la licence, pour
+    // que `GET /library-sync` dise Premium avec le même juge que la synchro.
+    // T4 (#5327) : le gestionnaire de lecture, pour l'écoute chez un contact.
     #[cfg(feature = "circle")]
     loader
         .register(Box::new(tune_circle::CirclePlugin::new(
             tune_circle::HostServices {
                 backend: state.backend.clone(),
+                license: state.license.clone(),
+                // T3 (#5326) : le profil d'une requête et la résolution d'une
+                // collection intelligente, par les juges du serveur.
+                hote: std::sync::Arc::new(HoteDuCercle {
+                    state: state.clone(),
+                }),
+                // T5 (#5328) : rejouer une playlist de cercle chez
+                // l'utilisateur, puis la jouer sur une zone.
+                services: state.services.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
             },
         )))
         .await;
@@ -443,3 +456,72 @@ pub fn maybe_run_wasm_probe() {
 
 #[cfg(not(feature = "plugins-wasm"))]
 pub fn maybe_run_wasm_probe() {}
+
+/// L'hôte des rayons de Tune Circle (T3, #5326) : ce que le greffon ne peut pas
+/// juger seul, sans copie de la logique du serveur.
+#[cfg(feature = "circle")]
+struct HoteDuCercle {
+    state: AppState,
+}
+
+#[cfg(feature = "circle")]
+#[async_trait::async_trait]
+impl tune_circle::ensembles::Hote for HoteDuCercle {
+    /// Le même extracteur que toutes les routes : `X-Profile-Id` permis,
+    /// appelant authentifié, puis profil global.
+    async fn profil_actif(&self, parts: &mut axum::http::request::Parts) -> i64 {
+        use axum::extract::FromRequestParts;
+        match tune_http_types::ActiveProfile::from_request_parts(parts, &self.state).await {
+            Ok(p) => p.id(),
+            Err(never) => match never {},
+        }
+    }
+
+    async fn collection_intelligente(
+        &self,
+        id: i64,
+        profile_id: i64,
+    ) -> Result<Option<tune_circle::ensembles::Membres>, String> {
+        use axum::extract::FromRef;
+        let smart = tune_smart_http::SmartHttpState::from_ref(&self.state);
+        let Some(c) =
+            tune_smart_http::smart_collections::resoudre_pour_partage(&smart, id, profile_id)
+                .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(membres_de_collection(c)))
+    }
+}
+
+/// Une collection résolue, dans la forme du greffon : les albums de la
+/// bibliothèque par identifiant, ceux des services en références.
+#[cfg(feature = "circle")]
+fn membres_de_collection(
+    c: tune_smart_http::smart_collections::CollectionPartagee,
+) -> tune_circle::ensembles::Membres {
+    use tune_smart_http::smart_collections::AlbumPartage;
+    let mut m = tune_circle::ensembles::Membres {
+        nom: c.nom,
+        ..Default::default()
+    };
+    for a in c.albums {
+        match a {
+            AlbumPartage::Local(id) => m.albums.push(id),
+            AlbumPartage::DeService {
+                source,
+                source_id,
+                title,
+                artist_name,
+            } => m.references.push(tune_circle::ensembles::Reference {
+                genre: "album".into(),
+                titre: title,
+                artiste: artist_name,
+                album: None,
+                service: source,
+                id_de_service: source_id,
+            }),
+        }
+    }
+    m
+}
