@@ -131,6 +131,13 @@ const MIGRATION_TABLES: &[&str] = &[
     "artists",
     "albums",
     "tracks",
+    // Date d'ajout a la bibliotheque (#473, #4546). Sans cette ligne, la table
+    // arrivait VIDE en PostgreSQL : chaque piste retombait sur son
+    // `file_mtime` (`home_queries.rs`, `DATE_D_AJOUT`), et le scan complet
+    // suivant figeait ce mtime pour de bon — des albums d'il y a 13 ans
+    // remontaient parmi les « ajouts recents » (#5389). Pas de colonne `id` :
+    // la clef est `file_path` (voir `conflict_clause`).
+    "file_first_seen",
     "track_credits",
     "track_metadata",
     "album_metadata",
@@ -1383,6 +1390,10 @@ fn conflict_clause(table: &str) -> &'static str {
         "hidden_items" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "album_distinct_pairs" => "ON CONFLICT (profile_id, album_a_id, album_b_id) DO NOTHING",
         "ignored_devices" => "ON CONFLICT (device_id) DO NOTHING",
+        // Pas de colonne `id` : la clef primaire est le chemin (#5389).
+        // `DO NOTHING` garde une bascule rejouee (#5199) sans doublon, et ne
+        // reecrit pas une date deja posee en PostgreSQL.
+        "file_first_seen" => "ON CONFLICT (file_path) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }
@@ -1889,6 +1900,76 @@ mod tests {
             ecarts.is_empty(),
             "clause ON CONFLICT sans clef correspondante — la bascule perdrait ces tables :\n{}",
             ecarts.join("\n")
+        );
+    }
+
+    /// #5389 : la date d'ajout (`file_first_seen`) passe la bascule, a
+    /// l'identique, et une bascule rejouee (#5199) ne la double ni ne la
+    /// change. Sans elle, les « ajouts recents » retombaient sur le mtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_copie_file_first_seen_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_first_seen_5389";
+        const CHEMIN: &str = "/musique/Miles Davis/Kind of Blue/01 So What.flac";
+        // Une valeur a decimales, pour qu'un arrondi en route se voie.
+        const PREMIERE_VUE: f64 = 1_316_000_000.123_456_7;
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        sqlite
+            .connection()
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES (?1, ?2)",
+                rusqlite::params![CHEMIN, PREMIERE_VUE],
+            )
+            .expect("ligne file_first_seen en SQLite");
+
+        async fn lignes(url: &str) -> Vec<(String, f64)> {
+            let mut c = PgConnection::connect(url).await.unwrap();
+            let l = sqlx::query(
+                "SELECT file_path, first_seen_at::float8 FROM file_first_seen ORDER BY 1",
+            )
+            .fetch_all(&mut c)
+            .await
+            .unwrap()
+            .iter()
+            .map(|l| (l.get::<String, _>(0), l.get::<f64, _>(1)))
+            .collect();
+            c.close().await.ok();
+            l
+        }
+
+        let premiere = migrate_sqlite_to_pg(&sqlite, &cible).await;
+        let apres_premiere = lignes(&cible).await;
+        let seconde = migrate_sqlite_to_pg(&sqlite, &cible).await;
+        let apres_seconde = lignes(&cible).await;
+        supprimer_base(&url, BASE).await;
+
+        let premiere = premiere.unwrap_or_else(|e| panic!("premiere bascule : {e}"));
+        let seconde = seconde.unwrap_or_else(|e| panic!("seconde bascule : {e}"));
+        for (passe, r) in [("premiere", &premiere), ("seconde", &seconde)] {
+            let erreurs: Vec<&String> = r
+                .errors
+                .iter()
+                .filter(|e| e.starts_with("file_first_seen:"))
+                .collect();
+            assert!(
+                erreurs.is_empty(),
+                "{passe} bascule : file_first_seen en erreur {erreurs:?}"
+            );
+        }
+        let attendu = vec![(CHEMIN.to_string(), PREMIERE_VUE)];
+        assert_eq!(
+            apres_premiere, attendu,
+            "la date d'ajout n'a pas passe la bascule SQLite -> PostgreSQL (#5389)"
+        );
+        assert_eq!(
+            apres_seconde, attendu,
+            "la bascule rejouee a double ou change la date d'ajout (#5199, #5389)"
         );
     }
 }
