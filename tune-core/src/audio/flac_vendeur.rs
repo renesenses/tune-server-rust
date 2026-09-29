@@ -250,6 +250,32 @@ pub fn conteneur_neuf_pour_passthrough(
     conteneur_neuf(&mut std::io::BufReader::new(f), taille)
 }
 
+/// #5283 — la cadence et la profondeur que le STREAMINFO d'un FLAC ÉNONCE,
+/// lues sur les premiers octets du flux (`fLaC`, en-tête de bloc, puis les
+/// 34 octets de STREAMINFO : 42 octets suffisent).
+///
+/// C'est la seule source qui ne ment pas quand le service annonce une qualité
+/// nulle : Qobuz rend parfois `sampling_rate: 0, bit_depth: 0` pour un FLAC
+/// 24/192 bien réel. `None` si ce n'est pas un FLAC, si STREAMINFO est
+/// tronqué, ou si la cadence y vaut zéro (gabarit jamais rempli).
+pub fn cadence_streaminfo(octets: &[u8]) -> Option<(u32, u16)> {
+    if octets.len() < 42 || &octets[0..4] != b"fLaC" {
+        return None;
+    }
+    let longueur = u32::from_be_bytes([0, octets[5], octets[6], octets[7]]);
+    if octets[4] & 0x7f != 0 || longueur != 34 {
+        return None;
+    }
+    let si = &octets[8..42];
+    // 20 bits de cadence, 3 bits de canaux − 1, 5 bits de profondeur − 1.
+    let cadence = u32::from_be_bytes([si[10], si[11], si[12], si[13]]) >> 12;
+    if cadence == 0 {
+        return None;
+    }
+    let profondeur = ((u16::from(si[12] & 0x01) << 4) | u16::from(si[13] >> 4)) + 1;
+    Some((cadence, profondeur))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3703,7 +3703,28 @@ impl EtageDeConversion<'_> {
         let new_ch = nouvelle_spec.canaux();
         let output_sr = self.sortie.cadence;
         let output_ch = self.sortie.canaux;
-        let decision = decider_la_cadence_enchainee(new_sr, output_sr, regles);
+        // #5416 — la piste qui se termine est DÉJÀ convertie (le périphérique
+        // n'a pas suivi sa cadence à l'ouverture : WASAPI partagé à 192 kHz,
+        // greffon…) et la suivante a la MÊME cadence source. Rouvrir
+        // reproduirait exactement la même conversion : PURE ou « le
+        // périphérique suit la source » n'y gagnent rien, et l'enchaînement
+        // sans blanc était perdu à chaque piste (Didier, SMSL SU-8, 0.9.167 :
+        // `local_audio_gapless_rate_change_reopen requested_sr=44100
+        // stream_sr=192000 motif="pure"` puis `famine_anneau_debut`). Le
+        // bit-perfect strict, lui, garde sa règle de #3973 telle quelle.
+        let meme_source_deja_convertie =
+            !regles.strict && self.needs_resample && new_sr == self.sample_rate();
+        let decision = if meme_source_deja_convertie {
+            info!(
+                device = %device_name,
+                source_sr = new_sr,
+                stream_sr = output_sr,
+                "local_audio_gapless_conversion_conservee"
+            );
+            CadenceEnchainee::Convertir
+        } else {
+            decider_la_cadence_enchainee(new_sr, output_sr, regles)
+        };
         if let CadenceEnchainee::Rouvrir(motif) = decision {
             journaliser_la_reouverture(motif, new_sr, output_sr, device_name);
             return Err(motif);
@@ -6959,6 +6980,11 @@ mod bitperfect_strict_3973;
 // #4953 — changement de cadence en gapless : rouvrir plutôt que convertir.
 #[cfg(test)]
 mod gapless_changement_de_cadence_4953;
+
+// #5416 — PURE sur une sortie qui convertit déjà : même cadence source,
+// l'enchaînement sans blanc est gardé.
+#[cfg(test)]
+mod gapless_pure_reechantillonne_5416;
 
 // #5204 — gapless en mode exclusif : à format égal, la sortie enchaîne sans
 // refermer le flux ; sinon elle rouvre le périphérique.

@@ -1085,6 +1085,17 @@ fn stage_locally_for_decode(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Option<Arc<StagedFile>> {
+    // #5297 — une image SACD pèse des gigaoctets et la piste n'en lit qu'une
+    // tranche : la rapatrier entière avant la première note serait absurde.
+    // Le lecteur SACD saute directement au secteur de la piste.
+    if super::sacd::est_extension_iso(Path::new(src)) {
+        return None;
+    }
+    // #5299 — un fichier rangé dans une image ISO n'est jamais recopié : il se
+    // lit par étendues, dans l'image, là où elle est.
+    if super::iso9660::est_chemin_virtuel(src) {
+        return None;
+    }
     stager_pour_decodage(
         src,
         chemin_sur_montage_reseau(Path::new(src)),
@@ -1144,7 +1155,7 @@ fn stager_pour_decodage(
         let ext = src_path
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("bin");
+            .unwrap_or("tmp");
         let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
         let growth = crate::audio::staged_growth::StageGrowth::new(m.len());
         crate::audio::staged_growth::register(&dst.to_string_lossy(), growth.clone());
@@ -1209,7 +1220,9 @@ fn stager_pour_decodage(
     let ext = src_path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("bin");
+        // `tmp`, pas `bin` : `.bin` désigne une image de CD brute (#5298), et
+        // un fichier sans extension mis en scène ne doit pas en devenir une.
+        .unwrap_or("tmp");
     let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
     let resultat = match std::fs::copy(src_path, &dst) {
         Ok(bytes) => {
@@ -1326,7 +1339,15 @@ pub fn decode_to_pcm(
     // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
     // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
     // whole decode; the temp is removed when it drops.
-    let _staged = stage_locally_for_decode(file_path, seek_s, max_duration_s);
+    //
+    // #5298 — jamais pour une image de CD brute : elle se lit par fenêtre,
+    // au décalage exact de la tranche, et la copier entière (700 Mo) pour
+    // quelques minutes d'analyse coûterait plus que la lecture elle-même.
+    let _staged = if super::image_cdda::est_image_cdda(Path::new(file_path)) {
+        None
+    } else {
+        stage_locally_for_decode(file_path, seek_s, max_duration_s)
+    };
     let file_path: &str = _staged
         .as_ref()
         .and_then(|s| s.path.to_str())
@@ -1340,7 +1361,7 @@ pub fn decode_to_pcm(
 
     let decoded = if matches!(ext.as_str(), "aiff" | "aif" | "aifc") {
         super::aiff::decode_aiff_to_pcm(file_path, seek_s, max_duration_s)
-    } else if ext == "dsf" || ext == "dff" {
+    } else if ext == "dsf" || ext == "dff" || ext == "iso" {
         decode_dsd_to_pcm(
             file_path,
             &ext,
@@ -1816,6 +1837,27 @@ pub fn decode_to_pcm_streaming_tranche(
     seek_s: f64,
     duree_s: Option<f64>,
 ) -> Result<(u16, u32), String> {
+    // #5298 — une image de CD brute : la tranche EST la fenêtre, bornée au
+    // secteur près des deux côtés. Aucun relais de fin : la fenêtre s'arrête
+    // d'elle-même sur la dernière trame de la piste, que les millisecondes de
+    // la base ne sauraient pas désigner exactement.
+    if super::image_cdda::est_image_cdda(Path::new(file_path)) {
+        let fenetre =
+            super::image_cdda::SourceWavCdda::ouvrir(Path::new(file_path), seek_s, duree_s)
+                .map_err(|e| format!("open (image CD): {e}"))?;
+        return decode_to_pcm_streaming_inner(
+            file_path,
+            target_sample_rate,
+            target_channels,
+            target_bit_depth,
+            tx,
+            chunk_size,
+            Some(data_ready),
+            Some(levels_tx),
+            0.0,
+            Some(Box::new(fenetre)),
+        );
+    }
     let tx = borner_la_fin(
         tx,
         duree_s,
@@ -2009,11 +2051,25 @@ fn decode_to_pcm_streaming_inner(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    // #5298 — une image de CD brute passe par le chemin symphonia ci-dessous,
+    // sous la forme d'une fenêtre WAV qui commence à `seek_s`. La fenêtre
+    // bornée d'une tranche est ouverte par `decode_to_pcm_streaming_tranche`,
+    // qui la transmet par `source_override`.
+    let image_cdda = super::image_cdda::est_image_cdda(Path::new(file_path));
+    let (source_override, seek_s) = match source_override {
+        None if image_cdda => {
+            let fenetre =
+                super::image_cdda::SourceWavCdda::ouvrir(Path::new(file_path), seek_s, None)
+                    .map_err(|e| format!("open (image CD): {e}"))?;
+            (Some(Box::new(fenetre) as Box<dyn MediaSource>), 0.0)
+        }
+        autre => (autre, seek_s),
+    };
 
     let mut first_chunk_sent = false;
     // DSD files (DSF/DFF): streaming decode using chunk-based DSD→PCM converter.
     // This avoids loading the entire DSD file into memory (200MB+ → OOM).
-    if matches!(ext.as_str(), "dsf" | "dff") {
+    if matches!(ext.as_str(), "dsf" | "dff" | "iso") {
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| "no tokio runtime for streaming decode")?;
         let output_bd: u16 = target_bit_depth.unwrap_or(24);
@@ -2022,6 +2078,10 @@ fn decode_to_pcm_streaming_inner(
         let (dsd_rate, dsd_ch) = if ext == "dsf" {
             let info = super::dsf::parse_dsf(file_path)?;
             (info.sample_rate, info.channels)
+        } else if ext == "iso" {
+            // #5297 — la zone que Tune lit dans l'image SACD.
+            let (frequence, canaux) = super::sacd::parametres_de_lecture(Path::new(file_path))?;
+            (frequence, canaux as u32)
         } else {
             let info = super::dff::parse_dff(file_path)?;
             (info.sample_rate, info.channels as u32)
@@ -2279,13 +2339,19 @@ fn decode_to_pcm_streaming_inner(
         let source = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(source), Default::default())
+    } else if let Some(source) = super::iso9660::source_symphonia(file_path) {
+        // #5299 — un fichier rangé dans une image ISO : lecture ciblée de ses
+        // étendues, jamais l'image entière.
+        MediaSourceStream::new(source?, Default::default())
     } else {
         let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
         MediaSourceStream::new(Box::new(file), Default::default())
     };
 
     let mut hint = Hint::new();
-    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+    if image_cdda {
+        hint.with_extension("wav");
+    } else if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
 
@@ -3526,7 +3592,31 @@ fn decode_symphonia(
     // instead of a plain File (which would EOF-truncate at the write frontier).
     // Registry is empty unless TUNE_DASH_STREAM_DECODE armed a download — then
     // this is byte-identical to the File path.
-    let mss = if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
+    //
+    // #5298 — une image de CD brute se lit par sa FENÊTRE, présentée comme un
+    // WAV : le début et la durée demandés deviennent les bornes exactes de la
+    // fenêtre, et le décodage part de zéro dans celle-ci.
+    let image_cdda = super::image_cdda::est_image_cdda(Path::new(file_path));
+    let fenetre_cdda = if image_cdda {
+        Some(
+            super::image_cdda::SourceWavCdda::ouvrir(
+                Path::new(file_path),
+                seek_s,
+                (max_duration_s > 0.0).then_some(max_duration_s),
+            )
+            .map_err(|e| format!("open (image CD): {e}"))?,
+        )
+    } else {
+        None
+    };
+    let (seek_s, max_duration_s) = if image_cdda {
+        (0.0, 0.0)
+    } else {
+        (seek_s, max_duration_s)
+    };
+    let mss = if let Some(fenetre) = fenetre_cdda {
+        MediaSourceStream::new(Box::new(fenetre), Default::default())
+    } else if let Some(growth) = crate::audio::staged_growth::take_for(file_path) {
         // Staging pipeliné (lenteurs Yves, phase 2) : le fichier réseau est
         // copié en fond ; on décode au fur et à mesure via une source SEEKABLE
         // (l'ALAC moov-at-end peut chercher la fin). Registre vide sauf
@@ -3538,13 +3628,19 @@ fn decode_symphonia(
         let src = crate::audio::dash_growth::GrowingFileSource::open(file_path, growth)
             .map_err(|e| format!("open (growing): {e}"))?;
         MediaSourceStream::new(Box::new(src), Default::default())
+    } else if let Some(source) = super::iso9660::source_symphonia(file_path) {
+        // #5299 — un fichier rangé dans une image ISO : lecture ciblée de ses
+        // étendues, jamais l'image entière.
+        MediaSourceStream::new(source?, Default::default())
     } else {
         let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
         MediaSourceStream::new(Box::new(file), Default::default())
     };
 
     let mut hint = Hint::new();
-    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+    if image_cdda {
+        hint.with_extension("wav");
+    } else if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
 
@@ -3824,6 +3920,39 @@ fn decode_dsd_streaming(
             dsd_rate,
             channels,
             lsb_first,
+            target_sample_rate,
+            target_channels,
+            output_bd,
+            tx,
+            chunk_size,
+            first_chunk_sent,
+            data_ready,
+            levels_tx,
+            rt,
+            || reader.next_chunk(),
+        );
+    }
+    if ext == "iso" {
+        // #5297 — le DSD est lu dans l'image, secteur par secteur, à partir
+        // de la trame qui contient l'instant demandé : `seek_s` est déjà
+        // « début de la piste + déplacement de l'utilisateur », sur l'horloge
+        // de la zone. Octets entrelacés, bit de poids fort en premier : la
+        // disposition d'un DFF (`lsb_first` faux).
+        let chemin = Path::new(file_path);
+        let (dsd_rate, channels) = super::sacd::parametres_de_lecture(chemin)?;
+        let debut_ms = (seek_s.max(0.0) * 1000.0).round() as u64;
+        let mut reader = super::sacd::ouvrir_lecture(chemin, debut_ms, None)?;
+        tracing::info!(
+            seek_s,
+            trame = reader.trame_atteinte(),
+            "dsd_streaming_seek_iso_sacd"
+        );
+        return decoder_le_dsd_par_blocs(
+            file_path,
+            ext,
+            dsd_rate,
+            channels,
+            false,
             target_sample_rate,
             target_channels,
             output_bd,
@@ -4156,10 +4285,69 @@ pub fn decode_dsd_to_dop_streaming(
     )
 }
 
+/// Le DoP d'une TRANCHE : `debut_ms` à `fin_ms` sur l'horloge du fichier.
+///
+/// #5297 — la piste d'une image SACD est une tranche de la zone, comme celle
+/// d'une feuille CUE : servir l'image depuis son début jouerait tout le disque
+/// sous le nom de sa première piste. Le lecteur SACD part directement de la
+/// trame de `debut_ms` et s'arrête à celle de `fin_ms`.
+///
+/// Pour un DSF ou un DFF, la tranche n'est pas encore appliquée par ce
+/// chemin (comportement d'avant, inchangé) : seul l'ISO la reçoit.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_dsd_to_dop_streaming_tranche(
+    file_path: &str,
+    ext: &str,
+    debut_ms: u64,
+    fin_ms: Option<u64>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    rt: &tokio::runtime::Handle,
+) -> Result<(u16, u32), String> {
+    decode_dsd_to_dop_streaming_inner(
+        file_path,
+        ext,
+        Some((debut_ms, fin_ms)),
+        tx,
+        chunk_size,
+        first_chunk_sent,
+        data_ready,
+        rt,
+        std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_dsd_to_dop_streaming_with_timeout(
     file_path: &str,
     ext: &str,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    rt: &tokio::runtime::Handle,
+    send_timeout: std::time::Duration,
+) -> Result<(u16, u32), String> {
+    decode_dsd_to_dop_streaming_inner(
+        file_path,
+        ext,
+        None,
+        tx,
+        chunk_size,
+        first_chunk_sent,
+        data_ready,
+        rt,
+        send_timeout,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_dsd_to_dop_streaming_inner(
+    file_path: &str,
+    ext: &str,
+    tranche: Option<(u64, Option<u64>)>,
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     first_chunk_sent: &mut bool,
@@ -4172,6 +4360,8 @@ fn decode_dsd_to_dop_streaming_with_timeout(
     let (dsd_rate, channels) = if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         (info.sample_rate, info.channels as usize)
+    } else if ext == "iso" {
+        super::sacd::parametres_de_lecture(Path::new(file_path))?
     } else {
         let info = super::dff::parse_dff(file_path)?;
         (info.sample_rate, info.channels as usize)
@@ -4198,6 +4388,12 @@ fn decode_dsd_to_dop_streaming_with_timeout(
     if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            process_chunk(&dsd_chunk)?;
+        }
+    } else if ext == "iso" {
+        let (debut_ms, fin_ms) = tranche.unwrap_or((0, None));
+        let mut reader = super::sacd::ouvrir_lecture(Path::new(file_path), debut_ms, fin_ms)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
             process_chunk(&dsd_chunk)?;
         }
@@ -4320,8 +4516,40 @@ fn decode_dsd_to_pcm(
     };
 
     let mut all_samples: Vec<i32> = Vec::new();
+    // Ce qu'il reste à retrancher du PCM décodé pour atteindre `seek_s`. Un
+    // DSF ou un DFF est décodé depuis son début : tout le déplacement est à
+    // retrancher. Une image SACD, elle, est ouverte directement sur la trame
+    // qui contient `seek_s` : il ne reste que l'écart à l'intérieur de cette
+    // trame (moins de 1/75 s).
+    let mut seek_pcm_s = seek_s;
 
-    let (dsd_rate, output_rate, channels) = if ext == "dsf" {
+    let (dsd_rate, output_rate, channels) = if ext == "iso" {
+        let chemin = Path::new(file_path);
+        let (dsd_rate, channels) = super::sacd::parametres_de_lecture(chemin)?;
+        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        let debut_ms = (seek_s.max(0.0) * 1000.0).round() as u64;
+        let mut reader = super::sacd::ouvrir_lecture(chemin, debut_ms, None)?;
+        let atteint_s = reader.trame_atteinte().map_or(0.0, |t| {
+            f64::from(t) / f64::from(super::sacd::TRAMES_PAR_SECONDE)
+        });
+        seek_pcm_s = (seek_s - atteint_s).max(0.0);
+        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
+        let needed = dsd_needed_samples(seek_pcm_s, max_duration_s, output_rate, channels);
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
+            // Même balise que les branches DSF et DFF (#3140).
+            super::decode_progress::publier(
+                all_samples.len() as u64 / channels as u64 * 1000 / output_rate as u64,
+            );
+            if all_samples.len() >= needed {
+                break;
+            }
+        }
+        if all_samples.len() < needed {
+            append_pcm24(&mut all_samples, &streamer.flush());
+        }
+        (dsd_rate, output_rate, channels)
+    } else if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
@@ -4382,8 +4610,8 @@ fn decode_dsd_to_pcm(
     };
 
     // Apply seek and duration limits on the output PCM
-    let skip_frames = if seek_s > 0.0 {
-        (seek_s * output_rate as f64) as usize
+    let skip_frames = if seek_pcm_s > 0.0 {
+        (seek_pcm_s * output_rate as f64) as usize
     } else {
         0
     };
