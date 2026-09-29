@@ -60,4 +60,5 @@ pub use bootstrap::run;
 mod premium_audio_plugins;
 
 mod audio_job_journal;
+mod catalogue_greffons_audio;
 mod native_audio;
