@@ -53,12 +53,19 @@ impl BrasDeLecture {
     /// - cpal partagé : oui, depuis toujours ;
     /// - WASAPI exclusif : oui depuis #5204, à format égal (sinon il rend la
     ///   main et la fin naturelle rouvre) ;
-    /// - ASIO et CoreAudio exclusifs : **non**, leurs bras sortent encore à
-    ///   l'EOF sans consommer la suivante. Les déclarer enchaînables ferait
-    ///   armer le gapless par le sondeur, qui attendrait une transition qui ne
-    ///   vient jamais (DEvir, ASIO Fireface : album figé après chaque piste).
+    /// - ASIO exclusif : oui depuis #5204 (seconde tranche), à format égal,
+    ///   sur la route native (`chaine_par_la_boucle.rs`). Sa route traitée
+    ///   (anneau flottant) n'enchaîne pas : le bras lève `chain_exhausted` dès
+    ///   l'ouverture, et la sonde de la sortie retombe à « non » avant que le
+    ///   sondeur arme — sans quoi il attendrait une transition qui ne vient
+    ///   jamais (DEvir, ASIO Fireface : album figé après chaque piste) ;
+    /// - CoreAudio exclusif : **non**, son bras sort encore à l'EOF sans
+    ///   consommer la suivante.
     pub(crate) fn sait_enchainer(self) -> bool {
-        matches!(self, Self::CpalPartage | Self::WasapiExclusif)
+        matches!(
+            self,
+            Self::CpalPartage | Self::WasapiExclusif | Self::AsioExclusif
+        )
     }
 }
 

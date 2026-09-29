@@ -35,8 +35,10 @@
 // ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------
 
 use super::backend::{Observation, RefusDOuverture, Vidage};
-use super::chaine_native::{FinDeChaine, HoteDeChaineNative, Suivante, jouer_la_chaine_native};
-use super::enchainement_exclusif::{lire_l_entete_enchainee, ouvrir_la_piste_suivante};
+use super::chaine_native::{
+    FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, ReserveHttp, Suivante,
+    jouer_la_chaine_native,
+};
 use super::etage_natif::{EcritureNative, EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
 use super::*;
 use crate::outputs::wasapi_exclusive::WasapiExclusiveOutput;
@@ -291,34 +293,32 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
 /// `set_next_media`, que le bras consomme enfin à l'EOF.
 struct HoteWasapi<'a, F: FnMut(bool, bool)> {
     stop_rx: &'a std::sync::mpsc::Receiver<()>,
-    force_silent: &'a Arc<AtomicBool>,
     position_ms: &'a AtomicU64,
     publier: &'a mut F,
-    next_media: &'a std::sync::Mutex<Option<PendingNextMedia>>,
-    /// La suivante retirée de la réserve, en attente de la décision de format.
-    en_cours: Option<PendingNextMedia>,
-    current_uri: &'a std::sync::Mutex<Option<String>>,
-    track_title: &'a std::sync::Mutex<Option<String>>,
-    track_artist: &'a std::sync::Mutex<Option<String>>,
-    duration_ms: &'a AtomicU64,
-    seek_offset_ms: &'a AtomicU64,
-    track_ended_naturally: &'a AtomicBool,
-    track_ended_generation: &'a AtomicU64,
-    dop_active: &'a AtomicBool,
-    volume: &'a Arc<AtomicU32>,
-    user_volume: &'a Arc<AtomicU32>,
-    rg_factor: &'a Arc<AtomicU32>,
+    /// La réserve de la suivante et sa publication, partagées avec le bras
+    /// ASIO (`chaine_native::ReserveHttp`).
+    reserve: ReserveHttp<'a>,
+}
+
+impl<F: FnMut(bool, bool)> ReserveDeLaChaine for HoteWasapi<'_, F> {
+    type Lecteur = super::LecteurHttpAnnulable;
+
+    fn silence_force(&self) -> bool {
+        self.reserve.silence_force()
+    }
+
+    fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
+        self.reserve.preparer_la_suivante()
+    }
+
+    fn piste_enchainee(&mut self) {
+        self.reserve.piste_enchainee();
+    }
 }
 
 impl<F: FnMut(bool, bool)> HoteDeChaineNative for HoteWasapi<'_, F> {
-    type Lecteur = super::LecteurHttpAnnulable;
-
     fn arret_recu(&mut self) -> bool {
         self.stop_rx.try_recv().is_ok()
-    }
-
-    fn silence_force(&self) -> bool {
-        self.force_silent.load(Ordering::Relaxed)
     }
 
     fn publier_le_verdict(&mut self, dop: bool, bit_perfect: bool) {
@@ -327,51 +327,6 @@ impl<F: FnMut(bool, bool)> HoteDeChaineNative for HoteWasapi<'_, F> {
 
     fn publier_la_position(&mut self, position_ms: u64) {
         self.position_ms.store(position_ms, Ordering::Relaxed);
-    }
-
-    fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
-        let Some(suivante) = self.next_media.lock().unwrap().take() else {
-            return Suivante::Aucune;
-        };
-        info!(
-            next_title = ?suivante.title,
-            next_url = %suivante.url,
-            "local_audio_gapless_chaining_next_track"
-        );
-        let Some(mut lecteur) = ouvrir_la_piste_suivante(&suivante.url, self.force_silent) else {
-            return Suivante::Refusee;
-        };
-        match lire_l_entete_enchainee(&mut lecteur, self.force_silent) {
-            Ok(entete) => {
-                self.en_cours = Some(suivante);
-                Suivante::Prete { lecteur, entete }
-            }
-            Err(_) => Suivante::Refusee,
-        }
-    }
-
-    /// Même bascule que le chemin partagé, une fois l'enchaînement acquis :
-    /// le morceau suivant est publié, la position repart de zéro — le sondeur
-    /// y lit une transition interne et avance la file sans `play`. La
-    /// décision DoP de la nouvelle piste repart de zéro, comme en début de
-    /// piste : elle n'hérite pas de l'état DoP/volume de la précédente.
-    fn piste_enchainee(&mut self) {
-        let Some(suivante) = self.en_cours.take() else {
-            return;
-        };
-        self.track_ended_naturally.store(false, Ordering::SeqCst);
-        self.track_ended_generation.store(0, Ordering::SeqCst);
-        *self.current_uri.lock().unwrap() = Some(suivante.url);
-        *self.track_title.lock().unwrap() = suivante.title;
-        *self.track_artist.lock().unwrap() = suivante.artist;
-        if let Some(duree) = suivante.duration_ms {
-            self.duration_ms.store(duree, Ordering::SeqCst);
-        }
-        self.seek_offset_ms.store(0, Ordering::SeqCst);
-        self.position_ms.store(0, Ordering::SeqCst);
-        if self.dop_active.swap(false, Ordering::SeqCst) {
-            sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, false);
-        }
     }
 }
 
@@ -598,22 +553,25 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     // naturelle rouvre le périphérique au nouveau format (0.9.165).
     let mut hote = HoteWasapi {
         stop_rx: &stop_rx,
-        force_silent: &force_silent,
         position_ms: &position_ms,
         publier: &mut publier_le_verdict,
-        next_media: &next_media,
-        en_cours: None,
-        current_uri: &current_uri,
-        track_title: &track_title,
-        track_artist: &track_artist,
-        duration_ms: &duration_ms,
-        seek_offset_ms: &seek_offset_ms,
-        track_ended_naturally: &track_ended_naturally,
-        track_ended_generation: &track_ended_generation,
-        dop_active: &dop_active,
-        volume: &volume,
-        user_volume: &user_volume_ref,
-        rg_factor: &rg_factor_ref,
+        reserve: ReserveHttp {
+            force_silent: &force_silent,
+            position_ms: &position_ms,
+            next_media: &next_media,
+            en_cours: None,
+            current_uri: &current_uri,
+            track_title: &track_title,
+            track_artist: &track_artist,
+            duration_ms: &duration_ms,
+            seek_offset_ms: &seek_offset_ms,
+            track_ended_naturally: &track_ended_naturally,
+            track_ended_generation: &track_ended_generation,
+            dop_active: &dop_active,
+            volume: &volume,
+            user_volume: &user_volume_ref,
+            rg_factor: &rg_factor_ref,
+        },
     };
     let issue = jouer_la_chaine_native(
         &mut hote,
