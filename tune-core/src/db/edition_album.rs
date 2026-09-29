@@ -1844,6 +1844,24 @@ pub fn retablir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(
                     )?;
                 }
             }
+            if champ == "genre" {
+                // #5314 — le genre de l'album avait été RECOPIÉ sur ses pistes,
+                // et le marqueur le reposait à chaque scan : chaque piste
+                // reprend le genre de SES balises, et le marqueur s'en va.
+                for l in &lignes {
+                    let (genre, genres) = balises
+                        .get(&l.id)
+                        .and_then(|b| b.genre.as_deref())
+                        .and_then(super::genre_album_pistes::colonnes_de_piste)
+                        .map_or((None, None), |(g, j)| (Some(g), Some(j)));
+                    db.execute(
+                        &format!("UPDATE tracks SET genre = {p1}, genres = {p2} WHERE id = {p3}"),
+                        &[&genre as &dyn ToSqlValue, &genres, &l.id],
+                    )?;
+                }
+                AlbumMetadataRepo::with_backend(db.clone())
+                    .delete(album_id, super::genre_album_pistes::CLE_GENRE_PISTES)?;
+            }
             ne_plus_tenir(db, album_id, interne)?;
         }
     }

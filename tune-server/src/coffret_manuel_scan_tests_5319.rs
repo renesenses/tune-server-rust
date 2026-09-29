@@ -671,6 +671,20 @@ async fn retablir_un_champ_reprend_les_balises_et_retire_la_marque_5319() {
         Value::Null,
         "aucune balise GENRE : vidé"
     );
+    // #5314 : le genre recopié sur les pistes s'en va avec lui.
+    let genres_pistes: Vec<Option<String>> =
+        b.db.query_many(
+            "SELECT genre FROM tracks WHERE album_id = ?",
+            &[&id as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r[0].as_string())
+        .collect();
+    assert!(
+        genres_pistes.iter().all(Option::is_none),
+        "les pistes gardent le genre recopié : {genres_pistes:?}"
+    );
     let (_, vue) = retablir(&b.etat, id, "tracks").await;
     let titre_piste = vue["tracks"]
         .as_array()
