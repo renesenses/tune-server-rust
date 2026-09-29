@@ -238,7 +238,28 @@ with open(os.environ["MANQ_FILS"], encoding="utf-8") as f:
     fils = json.load(f)
 
 tous = fils.get("threads", [])
-titres = [t.get("title") or "" for t in tous if t.get("type") == "release"]
+# Un fil de notes est de type `release`... ou `discussion` depuis que l'API du
+# forum REFUSE `release` (HTTP 422 « The selected type is invalid », constate
+# le 27/09/2026) : les fils de la .165 a la .167 existent, epingles, et la
+# sonde les accusait tous.
+#
+# Un `discussion` compte s'il OUVRE par « Tune vX.Y.Z », ou s'il porte « Notes
+# de version ». Le titre de la procedure (« Tune v0.9.154 — Notes de version »)
+# n'est plus suivi a la lettre : les vrais fils sont thematiques, « Tune
+# v0.9.167 — l'egaliseur sans saut de volume, … » (fils 1942, 1980, 2007, lus
+# sur l'API le 28/09/2026). L'auteur ne departage rien : « Admin » ou
+# « Bertrand » selon le fil. Un fil de bug est de type `bug` et titre
+# « v0.9.166: … » ; une discussion qui cite la version en cours de phrase
+# n'ouvre pas par « Tune v » : ni l'un ni l'autre n'annonce.
+def fil_de_notes(t):
+    if t.get("type") == "release":
+        return True
+    titre = t.get("title") or ""
+    return t.get("type") == "discussion" and (
+        re.match(r"\s*Tune v\d+\.\d+\.\d+", titre) is not None
+        or re.search(r"notes de version", titre, re.IGNORECASE) is not None)
+
+titres = [t.get("title") or "" for t in tous if fil_de_notes(t)]
 
 # Symetrique du filtre pose sur les tags (#4461) : un fil du MOISSONNEUR
 # n'annonce pas une version de Tune, et doit etre retire d'ici avant tout
@@ -434,7 +455,8 @@ fi
     printf '`.github/scripts/notes-de-version-watch.sh --forme notes.md`\n\n'
   fi
   printf '\n## Quoi faire\n\n'
-  printf 'Ecrire le fil, a la main, comme d habitude : `type=release`, titre\n'
+  printf 'Ecrire le fil, a la main, comme d habitude : `type=discussion` (l API\n'
+  printf 'refuse `release` depuis le 27/09/2026), titre\n'
   printf '`Tune <version> — Notes de version`, `user_id=18` (Bertrand — le compte 1\n'
   printf 's affiche « Admin »), puis `moderation_status = approved`, sans quoi\n'
   printf 'PERSONNE ne voit le fil. Un fil groupe couvrant plusieurs versions\n'

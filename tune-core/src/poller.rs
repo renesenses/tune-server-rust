@@ -935,7 +935,7 @@ impl PositionPoller {
 mod radio;
 
 mod fin_de_piste;
-mod refus_de_piste;
+pub(crate) mod refus_de_piste;
 
 mod tick;
 
@@ -1220,6 +1220,12 @@ mod suivante_bannie_5143;
 /// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
 #[cfg(test)]
 mod radio_artiste_5395;
+
+/// #5327 — une file dont un greffon fournit l'URL de chaque piste au moment
+/// de la jouer : une demande par piste, piste refusée sautée, arrêt de la
+/// file sur demande de la source, aucune URL gardée.
+#[cfg(test)]
+mod source_url_5327;
 
 /// Garde-fou #2991 — les DEUX branchements que ce ticket a posés vivent chacun
 /// à un EMPLACEMENT précis d'une boucle de dix mille lignes. Retirés, ils

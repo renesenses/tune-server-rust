@@ -223,6 +223,26 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
         )
             .into_response();
     }
+    // #5283 — le service n'a annoncé aucune fréquence d'échantillonnage, et ni
+    // l'en-tête du flux ni le catalogue ne la donnent. Le motif contient
+    // « streaming » et « Qobuz » : sans cette branche, le fourre-tout
+    // ci-dessous le rendait en 502 `upstream_error`, le code enfoui dans le
+    // texte. Le client web (`PLAY_ERROR_KEYS`) attend un code STABLE pour
+    // afficher sa phrase traduite ; 422 comme `format_not_playable` : la piste
+    // ne peut pas être lue telle qu'elle est décrite, ce n'est pas une panne.
+    let code_cadence = tune_core::streaming::cadence_du_flux::CODE_CADENCE_INCONNUE;
+    if let Some(pos) = e.find(code_cadence) {
+        let motif = e[pos + code_cadence.len()..].trim_start_matches(':').trim();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": code_cadence,
+                "code": code_cadence,
+                "message": motif,
+            })),
+        )
+            .into_response();
+    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
@@ -1522,6 +1542,41 @@ mod refus_bitperfect_strict_3973 {
                 && message.contains("refused"),
             "{message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cadence_inconnue_5283 {
+    use super::play_error_response;
+    use axum::http::StatusCode;
+    use serde_json::Value;
+    use tune_core::streaming::cadence_du_flux::{CODE_CADENCE_INCONNUE, erreur_cadence_inconnue};
+
+    /// #5283 — l'erreur nommée du cœur sort de la route avec un code STABLE
+    /// (`error` et `code`), en 422, et non en 502 `upstream_error` où le
+    /// client ne pouvait la reconnaître qu'en lisant le texte.
+    #[tokio::test]
+    async fn la_route_rend_le_code_stable_de_la_cadence_inconnue() {
+        let reponse = play_error_response(erreur_cadence_inconnue("qobuz"), "fr");
+        assert_eq!(reponse.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(corps["error"], CODE_CADENCE_INCONNUE, "{corps}");
+        assert_eq!(corps["code"], CODE_CADENCE_INCONNUE, "{corps}");
+        let message = corps["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("qobuz") && !message.contains(CODE_CADENCE_INCONNUE),
+            "le motif humain, sans le code en tête : {message}"
+        );
+    }
+
+    /// Contre-épreuve du périmètre : une autre panne Qobuz garde son 502.
+    #[tokio::test]
+    async fn une_autre_panne_qobuz_reste_en_502() {
+        let reponse = play_error_response("Qobuz stream url: 500".into(), "fr");
+        assert_eq!(reponse.status(), StatusCode::BAD_GATEWAY);
     }
 }
 
@@ -5594,17 +5649,30 @@ async fn set_audiophile(
     // ReplayGain continuaient de travailler pendant que le badge PURE
     // s'allumait (#1986). Même famille que #1725 (EQ) et #1786 (crossfeed) —
     // et le garde-fou de `routes/mod.rs` couvre désormais cette clé aussi.
-    let applique_a_chaud = if body.enabled.is_some() {
-        state.orchestrator.apply_audiophile_change(zone_id).await
+    //
+    // #4680 — la PORTÉE, et pas seulement le booléen : sur une zone réseau dont
+    // le flux porte un traitement que PURE gouverne, la bascule relance le
+    // flux à la position courante (`restart`) — elle s'entend dans l'instant.
+    // `applied_live: false` seul faisait annoncer « prendra effet à la piste
+    // suivante ». `null` quand la requête ne bascule pas PURE.
+    let portee = if body.enabled.is_some() {
+        Some(
+            state
+                .orchestrator
+                .apply_audiophile_change_portee(zone_id)
+                .await,
+        )
     } else {
-        false
+        None
     };
+    let applique_a_chaud = portee == Some(tune_core::orchestrator::PorteeDuReglage::Immediate);
     info!(
         zone_id,
         enabled = target_enabled,
         lock_volume = ?target_override,
         effective_lock_volume = target_lock,
         applique_a_chaud,
+        portee = portee.map(|p| p.code()),
         "audiophile_mode_set"
     );
 
@@ -5616,6 +5684,9 @@ async fn set_audiophile(
         "lock_volume": target_override,
         "effective_lock_volume": target_lock,
         "applied_live": applique_a_chaud,
+        // #4680 — `immediate` | `restart` | `next_track` | `not_playing`,
+        // même contrat que `portee` de la route d'égaliseur.
+        "portee": portee.map(|p| p.code()),
     }))
     .into_response()
 }

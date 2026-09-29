@@ -127,6 +127,10 @@ pub struct NowPlaying {
     /// `#[serde(default)]` : un client plus ancien ne l'envoie pas.
     #[serde(default)]
     pub bitrate_kbps: Option<u32>,
+    /// Canaux de la SOURCE, avant un éventuel repli vers la sortie.
+    /// Inconnus pour un ancien client ou une source non mesurée.
+    #[serde(default)]
+    pub channels: Option<u16>,
 }
 
 impl NowPlaying {
@@ -168,6 +172,7 @@ impl NowPlaying {
             // champ existe pour les flux distants qui, eux, nomment leur
             // encodage (#2074).
             bitrate_kbps: None,
+            channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
         }
     }
 }
@@ -2356,6 +2361,39 @@ mod tests {
         assert_eq!(np.bit_depth, Some(24));
         assert_eq!(np.genre.as_deref(), Some("Jazz"));
         assert_eq!(np.year, Some(1959));
+    }
+
+    #[test]
+    fn canaux_source_serialises_et_anciens_clients_5336() {
+        for n in [1, 2, 6, 8] {
+            let mut track = crate::db::models::Track::new("source".into());
+            track.channels = n;
+            let np = NowPlaying::from_track(&track);
+            let json = serde_json::to_value(&np).unwrap();
+            assert_eq!(
+                json["channels"], n,
+                "#5336 : les canaux source arrivent dans current_track"
+            );
+            assert_eq!(
+                serde_json::from_value::<NowPlaying>(json.clone())
+                    .unwrap()
+                    .channels,
+                Some(n as u16)
+            );
+            let mut ancien = json;
+            ancien.as_object_mut().unwrap().remove("channels");
+            assert_eq!(
+                serde_json::from_value::<NowPlaying>(ancien)
+                    .unwrap()
+                    .channels,
+                None
+            );
+        }
+        for n in [-1, 0, 65536] {
+            let mut track = crate::db::models::Track::new("inconnu".into());
+            track.channels = n;
+            assert_eq!(NowPlaying::from_track(&track).channels, None);
+        }
     }
 
     #[test]

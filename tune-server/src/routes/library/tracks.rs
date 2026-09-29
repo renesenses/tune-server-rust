@@ -624,9 +624,24 @@ pub(super) async fn stream_track_audio(
     let file_path = tune_core::library::local_path::resolve_existing_local_path(file_path)
         .unwrap_or_else(|| file_path.clone());
     let path = std::path::Path::new(&file_path);
-    let file_size = match tokio::fs::metadata(path).await {
-        Ok(m) => m.len(),
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    // #5299 — un fichier rangé dans une image ISO : sa taille se lit dans
+    // l'index de l'image, ses octets par le lecteur interne (plus bas).
+    let dans_une_image = tune_core::audio::iso9660::est_chemin_virtuel(&file_path);
+    let file_size = if dans_une_image {
+        let chemin = file_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(&chemin))
+        })
+        .await
+        {
+            Ok(Some((taille, _))) => taille,
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        }
+    } else {
+        match tokio::fs::metadata(path).await {
+            Ok(m) => m.len(),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
     };
 
     // Seconde frontière de lecture, et la plus trompeuse (#3234). Le chemin
@@ -772,6 +787,10 @@ pub(super) async fn stream_track_audio(
     );
 
     let path_owned = file_path.clone();
+    if dans_une_image {
+        let body = Body::from_stream(octets_dans_l_image(path_owned, debut, longueur));
+        return (statut, headers, body).into_response();
+    }
     let body = Body::from_stream(async_stream::stream! {
         if let Ok(mut file) = tokio::fs::File::open(&path_owned).await {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -795,6 +814,57 @@ pub(super) async fn stream_track_audio(
     });
 
     (statut, headers, body).into_response()
+}
+
+/// Les octets `[debut, debut + longueur)` d'un fichier rangé dans une image
+/// ISO (#5299), lus par le lecteur interne dans un fil bloquant : lecture
+/// ciblée des étendues du fichier, jamais de l'image entière.
+fn octets_dans_l_image(
+    chemin: String,
+    debut: u64,
+    longueur: u64,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let mut lecteur = match tune_core::audio::iso9660::ouvrir(&chemin) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        };
+        if let Err(e) = lecteur.seek(std::io::SeekFrom::Start(debut)) {
+            let _ = tx.blocking_send(Err(e));
+            return;
+        }
+        let mut restant = longueur;
+        let mut buf = vec![0u8; 65536];
+        while restant > 0 {
+            let vise = buf.len().min(restant as usize);
+            match lecteur.read(&mut buf[..vise]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    restant -= n as u64;
+                    if tx
+                        .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    async_stream::stream! {
+        while let Some(morceau) = rx.recv().await {
+            yield morceau;
+        }
+    }
 }
 
 pub(super) async fn rescan_track(
@@ -3319,5 +3389,52 @@ mod tests_termes_de_chemin_5192 {
         .expect("les facettes répondent");
         assert_eq!(f["label"][0]["value"], "Melodiya", "{f}");
         assert_eq!(f["label"][0]["count"], 1, "{f}");
+    }
+}
+
+/// #5299 — la route des octets bruts sert un fichier rangé dans une image ISO
+/// par lecture ciblée : l'intervalle demandé, rien avant, rien après.
+#[cfg(test)]
+mod tests_octets_dans_une_image_5299 {
+    use super::octets_dans_l_image;
+    use futures_util::StreamExt;
+    use tune_core::audio::iso9660::{self, fabrique};
+
+    #[tokio::test]
+    async fn l_intervalle_demande_est_lu_dans_l_image() {
+        let dossier = tempfile::tempdir().unwrap();
+        let octets: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let image = dossier.path().join("donnees.iso");
+        std::fs::write(
+            &image,
+            fabrique::iso(
+                &vec![("Album/01 - Titre long.flac".to_string(), octets.clone())],
+                fabrique::Noms::Joliet,
+            ),
+        )
+        .unwrap();
+        let chemin = iso9660::chemin_virtuel(&image, "Album/01 - Titre long.flac");
+        for (debut, longueur) in [(0u64, 200_000u64), (70_000, 100_000), (199_990, 10)] {
+            let mut lu = Vec::new();
+            let mut flux = std::pin::pin!(octets_dans_l_image(chemin.clone(), debut, longueur));
+            while let Some(morceau) = flux.next().await {
+                lu.extend_from_slice(&morceau.unwrap());
+            }
+            let (d, f) = (debut as usize, (debut + longueur) as usize);
+            assert!(
+                lu == octets[d..f],
+                "intervalle {debut}+{longueur} : {} octets lus",
+                lu.len()
+            );
+        }
+        let mut absent = std::pin::pin!(octets_dans_l_image(
+            iso9660::chemin_virtuel(&image, "Album/absent.flac"),
+            0,
+            10
+        ));
+        assert!(
+            absent.next().await.unwrap().is_err(),
+            "un fichier absent de l'image est une erreur"
+        );
     }
 }

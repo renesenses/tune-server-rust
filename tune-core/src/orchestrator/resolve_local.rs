@@ -325,6 +325,9 @@ fn assembler_la_decision(
         // le passthrough enverrait le FLAC 5.1 intact et `channels` mentirait
         // dans le DIDL. Seul le décodage sait replier.
         reduction_de_canaux: canaux_reduits.is_some(),
+        // #5299 — le passthrough servirait le fichier par son chemin, que le
+        // serveur HTTP ne sait pas ouvrir dans une image.
+        dans_une_image_iso: crate::audio::iso9660::est_chemin_virtuel(&file_path),
     });
     if flac_ffmpeg_vers_le_reseau && needs_transcode {
         // Le conteneur neuf n'a pas pu être préparé, ou un autre motif
@@ -645,8 +648,11 @@ impl PlaybackOrchestrator {
         // sentinelle que `play_error_response` sait déjà nommer, comme
         // `file_not_found:`, et il répète le motif que le rapport de parcours
         // affiche depuis #2992.
-        if let Some(motif) =
-            crate::audio::iso_sacd::refus_de_lecture(std::path::Path::new(&file_path))
+        //
+        // #5297 — une image SACD en DSD brut se DÉCODE désormais : ses pistes
+        // sont des tranches lues dans l'ISO. Seules une image DST, une image
+        // de données ou une structure abîmée restent refusées, et nommées.
+        if let Some(motif) = crate::audio::sacd::refus_de_decodage(std::path::Path::new(&file_path))
         {
             warn!(track_id, file = %file_path, motif, "local_track_format_not_playable");
             return Err(format!("format_not_playable:{motif}"));
@@ -832,7 +838,15 @@ impl PlaybackOrchestrator {
         let sorties =
             reconnaitre_les_sorties(req, source_format, source.zone_output_type.as_deref());
         if let Some(resolu) = self
-            .decider_le_dop(req, track, &file_path, source_format, &source, &sorties)
+            .decider_le_dop(
+                req,
+                track,
+                &file_path,
+                source_format,
+                &source,
+                &sorties,
+                tranche_cue,
+            )
             .await?
         {
             return Ok(DecisionOuResolu::Resolu(resolu));
@@ -950,6 +964,7 @@ impl PlaybackOrchestrator {
         source_format: Option<AudioFormat>,
         source: &SourceEtZone,
         sorties: &Sorties,
+        tranche_cue: Option<TrancheCue>,
     ) -> Result<Option<ResolvedStream>, String> {
         let Sorties {
             is_local_output,
@@ -1040,6 +1055,16 @@ impl PlaybackOrchestrator {
         }
 
         if source_format == Some(AudioFormat::Dsd) && dop_requested {
+            // #5297 — la tranche d'une piste d'image SACD, déplacement de
+            // l'utilisateur compris : le DoP part de ce début et s'arrête à
+            // la fin de la piste, au lieu de jouer le disque entier.
+            let tranche = tranche_cue.map(|t| {
+                let seek = req.seek_ms.unwrap_or(0);
+                (
+                    t.debut_ms + seek,
+                    t.duree_ms.map(|d| t.debut_ms + d.max(seek)),
+                )
+            });
             return self
                 .anticiper_le_dop(
                     track,
@@ -1047,6 +1072,7 @@ impl PlaybackOrchestrator {
                     source.zone_max_sample_rate,
                     is_local_output,
                     crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                    tranche,
                 )
                 .await;
         }
@@ -1575,6 +1601,7 @@ impl PlaybackOrchestrator {
         zone_max_sample_rate: Option<u32>,
         is_local_output: bool,
         strict_bitperfect: bool,
+        tranche: Option<(u64, Option<u64>)>,
     ) -> Result<Option<ResolvedStream>, String> {
         // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
         // pas dans la base.
@@ -1602,6 +1629,10 @@ impl PlaybackOrchestrator {
                 crate::audio::dff::parse_dff(&file_path)
                     .ok()
                     .map(|i| (i.sample_rate, i.channels))
+            } else if ext == "iso" {
+                crate::audio::sacd::parametres_de_lecture(std::path::Path::new(&file_path))
+                    .ok()
+                    .map(|(frequence, canaux)| (frequence, canaux as u32))
             } else {
                 crate::audio::dsf::parse_dsf(&file_path)
                     .ok()
@@ -1716,7 +1747,12 @@ impl PlaybackOrchestrator {
                 .and_then(|e| e.to_str())
                 .unwrap_or("dsf")
                 .to_lowercase();
-            let duree_ms = track.duration_ms as u64;
+            // La durée annoncée est celle qui reste à jouer : pour une
+            // tranche entamée par un déplacement, pas la piste entière.
+            let duree_ms = match tranche {
+                Some((debut, Some(fin))) => fin.saturating_sub(debut),
+                _ => track.duration_ms as u64,
+            };
             tokio::task::spawn_blocking(move || {
                 // Send WAV header first
                 //
@@ -1740,9 +1776,17 @@ impl PlaybackOrchestrator {
                 data_ready.notify_one();
 
                 let mut first = false;
-                match crate::audio::decode::decode_dsd_to_dop_streaming(
-                    &fp, &ext, tx, 65536, &mut first, &None, &rt,
-                ) {
+                let resultat = match tranche {
+                    Some((debut_ms, fin_ms)) => {
+                        crate::audio::decode::decode_dsd_to_dop_streaming_tranche(
+                            &fp, &ext, debut_ms, fin_ms, tx, 65536, &mut first, &None, &rt,
+                        )
+                    }
+                    None => crate::audio::decode::decode_dsd_to_dop_streaming(
+                        &fp, &ext, tx, 65536, &mut first, &None, &rt,
+                    ),
+                };
+                match resultat {
                     Ok(_) => tracing::debug!("dsd_dop_stream_complete"),
                     Err(e) => tracing::warn!(error = %e, "dsd_dop_stream_failed"),
                 }

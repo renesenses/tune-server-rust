@@ -515,6 +515,17 @@ impl PositionPoller {
                 }
                 Err(e) => {
                     warn!(zone_id, error = %e, pos = attempt_pos, "auto_next_failed");
+                    // #5327 — la source dit que plus rien de cette file ne se
+                    // jouera (serveur du contact éteint) : on s'arrête ici,
+                    // sans essayer une à une les pistes qui suivent.
+                    if crate::source_url::arret_de_la_file(&e.to_string()) {
+                        warn!(
+                            zone_id,
+                            pos = attempt_pos,
+                            "auto_next_arret_demande_par_la_source"
+                        );
+                        break;
+                    }
                     if let Some(ref bus) = self.event_bus {
                         bus.emit(
                             "playback.track_skipped",
