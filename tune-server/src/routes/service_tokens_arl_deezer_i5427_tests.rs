@@ -34,6 +34,9 @@ fn arl_factice() -> String {
 struct FauxDeezer {
     recus: Arc<Mutex<Vec<Value>>>,
     arl: Option<String>,
+    /// Comme `DeezerService` : posé par `logout`, persisté dans la ligne
+    /// sous la clé de `MARQUEUR_DECONNEXION_VOLONTAIRE`, relu au démarrage.
+    deconnecte: bool,
 }
 
 #[async_trait::async_trait]
@@ -56,6 +59,7 @@ impl StreamingService for FauxDeezer {
         match c["arl"].as_str() {
             Some(arl) if arl == arl_factice() => {
                 self.arl = Some(arl.to_string());
+                self.deconnecte = false;
                 Ok(self.auth_status().await)
             }
             Some(arl) if arl.starts_with('I') => Err(format!(
@@ -83,13 +87,23 @@ impl StreamingService for FauxDeezer {
         // ligne persistée est réécrite sans identifiant.
         self.recus.lock().unwrap().push(json!({ "logout": true }));
         self.arl = None;
+        self.deconnecte = true;
         Ok(())
     }
     fn save_tokens(&self) -> Option<Value> {
         Some(match &self.arl {
             Some(a) => json!({ "arl": a }),
+            None if self.deconnecte => json!({
+                "quality": "FLAC",
+                tune_core::streaming::deezer::MARQUEUR_DECONNEXION_VOLONTAIRE: true,
+            }),
             None => json!({ "quality": "FLAC" }),
         })
+    }
+    fn restore_tokens(&mut self, tokens: &Value) -> bool {
+        self.deconnecte = tune_core::streaming::deezer::deconnexion_volontaire(tokens);
+        self.arl = tokens["arl"].as_str().map(str::to_string);
+        self.arl.is_some()
     }
     async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
         Err("hors sujet".into())
@@ -132,6 +146,7 @@ async fn app() -> (axum::Router, crate::state::AppState, Arc<Mutex<Vec<Value>>>)
     state.services.lock().await.register(Box::new(FauxDeezer {
         recus: recus.clone(),
         arl: None,
+        deconnecte: false,
     }));
     (crate::routes::router(state.clone()), state, recus)
 }
@@ -360,4 +375,104 @@ async fn la_liste_annonce_que_l_arl_sert_le_streaming() {
         .find(|s| s["id"] == "deezer")
         .expect("entrée deezer");
     assert_eq!(deezer["arl_streaming"], true, "{deezer}");
+}
+
+// ── Bertrand, 29/09 au soir : `TUNE_DEEZER_ARL` est une AMORCE ─────────
+
+/// Un « redémarrage » sur la même base : un service Deezer neuf, puis ce que
+/// fait `bootstrap.rs` — restaurer les sessions, puis amorcer.
+async fn redemarrer(
+    state: &crate::state::AppState,
+    arl_env: Option<&str>,
+) -> Arc<Mutex<Vec<Value>>> {
+    let recus = Arc::new(Mutex::new(Vec::new()));
+    state.services.lock().await.register(Box::new(FauxDeezer {
+        recus: recus.clone(),
+        arl: None,
+        deconnecte: false,
+    }));
+    state.restore_tokens().await;
+    super::amorcer_arl_deezer(state, arl_env).await;
+    recus
+}
+
+async fn connecte(app: &axum::Router) -> bool {
+    let (test, _) = post(app, "/api/v1/services/tokens/deezer/test", json!({})).await;
+    test["valid"] == true
+}
+
+/// 1. Premier démarrage avec la variable : connecté.
+#[tokio::test]
+async fn amorce_premier_demarrage_avec_la_variable_connecte() {
+    let (app, state, _) = app().await;
+    let recus = redemarrer(&state, Some(&arl_factice())).await;
+    assert_eq!(
+        recus.lock().unwrap().len(),
+        1,
+        "la variable doit amorcer Deezer au premier démarrage"
+    );
+    assert!(connecte(&app).await);
+}
+
+/// 2. Déconnexion, puis redémarrage avec la variable : NON connecté.
+#[tokio::test]
+async fn amorce_apres_deconnexion_volontaire_la_variable_n_est_plus_relue() {
+    let (app, state, _) = app().await;
+    redemarrer(&state, Some(&arl_factice())).await;
+    assert!(connecte(&app).await);
+
+    let (rep, _) = post(&app, "/api/v1/streaming/deezer/logout", json!({})).await;
+    assert_eq!(rep["status"], "logged_out", "{rep}");
+
+    let recus = redemarrer(&state, Some(&arl_factice())).await;
+    assert!(
+        recus.lock().unwrap().is_empty(),
+        "après une déconnexion volontaire, TUNE_DEEZER_ARL ne doit plus être relue (#5427)"
+    );
+    assert!(
+        !connecte(&app).await,
+        "Deezer ne doit pas se reconnecter au redémarrage"
+    );
+    let ligne = SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_tokens_deezer")
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        !ligne.contains(&arl_factice()),
+        "la ligne ne doit plus porter l'ARL"
+    );
+}
+
+/// 3. Nouvelle ARL saisie : connecté, et le marqueur est effacé — la
+/// session revient au redémarrage suivant.
+#[tokio::test]
+async fn amorce_une_nouvelle_saisie_efface_le_marqueur() {
+    let (app, state, _) = app().await;
+    redemarrer(&state, Some(&arl_factice())).await;
+    post(&app, "/api/v1/streaming/deezer/logout", json!({})).await;
+    redemarrer(&state, Some(&arl_factice())).await;
+    assert!(!connecte(&app).await);
+
+    let (rep, texte) = post(
+        &app,
+        "/api/v1/services/tokens/deezer",
+        json!({ "arl": arl_factice() }),
+    )
+    .await;
+    assert_eq!(rep["valid"], true, "{texte}");
+    assert!(connecte(&app).await);
+    let ligne = SettingsRepo::with_backend(state.backend.clone())
+        .get("auth_tokens_deezer")
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        !ligne.contains(tune_core::streaming::deezer::MARQUEUR_DECONNEXION_VOLONTAIRE),
+        "une nouvelle saisie doit effacer le marqueur : {}",
+        ligne.len()
+    );
+    redemarrer(&state, None).await;
+    assert!(
+        connecte(&app).await,
+        "la session saisie doit revenir au redémarrage"
+    );
 }

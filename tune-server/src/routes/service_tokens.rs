@@ -566,6 +566,19 @@ pub async fn amorcer_arl_deezer(state: &AppState, arl_env: Option<&str>) {
     if svc.read().await.auth_status().await.authenticated {
         return;
     }
+    // Bertrand, 29/09 au soir : `TUNE_DEEZER_ARL` est une AMORCE. Après une
+    // déconnexion volontaire (marqueur posé dans `auth_tokens_deezer`), elle
+    // n'est plus relue ; une nouvelle saisie de l'ARL efface le marqueur.
+    let deconnecte = settings
+        .get("auth_tokens_deezer")
+        .ok()
+        .flatten()
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+        .is_some_and(|l| tune_core::streaming::deezer::deconnexion_volontaire(&l));
+    if deconnecte {
+        tracing::info!("deezer_amorce_ignoree_apres_deconnexion_volontaire");
+        return;
+    }
     let (arl, origine) = match arl_env.map(str::trim).filter(|a| !a.is_empty()) {
         Some(a) => (a.to_string(), "TUNE_DEEZER_ARL"),
         None => match ancienne_copie {
