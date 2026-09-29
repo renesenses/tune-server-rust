@@ -372,6 +372,17 @@ fn piste_en_ligne(
     }
     t.genre = album.genre.clone();
     t.year = album.annee.as_deref().and_then(annee_en_nombre);
+    // #5463 — ce que la feuille dit de la piste, puis de l'album. Posés ICI,
+    // avant `completer_par_les_balises` : la feuille prime sur le fichier.
+    t.isrc = piste.isrc.clone();
+    t.composer = piste
+        .compositeur
+        .clone()
+        .or_else(|| album.compositeur.clone());
+    t.comments = piste
+        .commentaire
+        .clone()
+        .or_else(|| album.commentaire.clone());
     t.cue_media_path = Some(piste.media.to_string_lossy().into_owned());
     t.cue_start_ms = Some(piste.debut_ms as i64);
     t.cue_end_ms = piste.fin_ms.map(|f| f as i64);
@@ -605,6 +616,18 @@ fn ecrire_album_avec(
                 }
                 Err(e) => warn!(album_id = id, error = %e, "cue_titre_album_non_ecrit"),
             }
+        }
+    }
+
+    // #5463 — `CATALOG` : le code-barres du disque. La feuille prime, comme
+    // pour le titre ; aucune autre source du scan ne le pose.
+    if let (Some(id), Some(code)) = (ligne_album, album.catalogue.as_deref()) {
+        let code = code.trim();
+        if !code.is_empty()
+            && ligne.barcode.as_deref() != Some(code)
+            && let Err(e) = album_repo.force_update_barcode(id, code)
+        {
+            warn!(album_id = id, error = %e, "cue_code_barres_non_ecrit");
         }
     }
 
@@ -983,6 +1006,9 @@ fn album_de_l_iso(
         interprete: d.artiste().map(str::to_string),
         genre: None,
         annee: d.annee.map(|a| a.to_string()),
+        compositeur: None,
+        catalogue: None,
+        commentaire: None,
         pistes: zone
             .pistes
             .iter()
@@ -991,6 +1017,9 @@ fn album_de_l_iso(
                 numero: p.numero,
                 titre: p.titre.clone(),
                 interprete: p.interprete.clone(),
+                isrc: None,
+                compositeur: None,
+                commentaire: None,
                 // La piste est une tranche de la zone, sur son horloge :
                 // c'est ce que la lecture rejoue (`audio::sacd::ouvrir_lecture`).
                 debut_ms: p.debut_ms(),
@@ -2047,6 +2076,110 @@ mod tests {
         );
         assert_eq!(t.title, "Catherine of Aragon");
         assert_eq!(t.disc_subtitle.as_deref(), Some("Remastered Album"));
+    }
+
+    /// #5463, suite — l'`ISRC`, le `SONGWRITER` et le `REM COMMENT` de la
+    /// FEUILLE primaient en principe, mais l'analyseur les jetait : sur la
+    /// piste du fichier entier, c'est l'ISRC et le compositeur du FICHIER qui
+    /// passaient. La feuille dit, le fichier se tait.
+    #[test]
+    fn la_feuille_prime_sur_le_fichier_pour_isrc_et_compositeur_5463() {
+        const FEUILLE_COMPLETE: &str = "REM COMMENT \"ExactAudioCopy v1.0b4\"\nPERFORMER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n    ISRC USAM17302204\n    SONGWRITER \"R. Wakeman\"\n    INDEX 01 00:00:00\n";
+        let pistes = scanner_flac_et_feuille(FEUILLE_COMPLETE);
+        assert_eq!(pistes.len(), 1, "pistes : {pistes:?}");
+        let t = &pistes[0];
+        assert!(
+            t.file_path.is_some(),
+            "montage : la piste occupe le fichier entier"
+        );
+        assert_eq!(
+            t.isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — l'ISRC de la feuille doit primer sur celui du fichier"
+        );
+        assert_eq!(
+            t.composer.as_deref(),
+            Some("R. Wakeman"),
+            "#5463 — le SONGWRITER de la feuille doit primer sur le COMPOSER du fichier"
+        );
+        assert_eq!(t.comments.as_deref(), Some("ExactAudioCopy v1.0b4"));
+        // Ce que la feuille ne dit pas vient toujours du fichier.
+        assert_eq!(t.label.as_deref(), Some("A&M Records"));
+    }
+
+    /// #5463 — `CATALOG` est le code-barres UPC/EAN du disque : il va sur
+    /// l'album, et y reprend la main sur une valeur plus ancienne.
+    #[test]
+    fn le_catalog_de_la_feuille_devient_le_code_barres_de_l_album_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        flac_etiquete(&dossier.join("image.flac"), BALISES_DU_FLAC);
+        fs::write(
+            dossier.join("album.cue"),
+            format!("CATALOG 0600753562390\n{DEUX_TRANCHES_SANS_REM}"),
+        )
+        .unwrap();
+        let db = base();
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        let media = dossier.join("image.flac").to_string_lossy().to_string();
+        let album_id = TrackRepo::with_backend(db.clone())
+            .get_by_cue_identity(&media, 0)
+            .unwrap()
+            .and_then(|t| t.album_id)
+            .expect("la piste 1 et son album doivent exister");
+        let album = AlbumRepo::with_backend(db).get(album_id).unwrap().unwrap();
+        assert_eq!(
+            album.barcode.as_deref(),
+            Some("0600753562390"),
+            "#5463 — le CATALOG de la feuille doit devenir le code-barres de l'album"
+        );
+    }
+
+    /// #5463 — une feuille RETOUCHÉE (un ISRC ajouté) doit atteindre la base
+    /// au rescan : la ligne existe déjà, c'est `TrackRepo::update` qui
+    /// l'écrit — et il n'écrivait pas la colonne `isrc`.
+    #[test]
+    fn une_feuille_retouchee_pose_son_isrc_au_rescan_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        let image = dossier.join("image.flac");
+        flac_etiquete(&image, BALISES_DU_FLAC);
+        let cue = dossier.join("album.cue");
+        fs::write(&cue, DEUX_TRANCHES_SANS_REM).unwrap();
+        let db = base();
+        let dossiers = std::slice::from_ref(&dossier);
+        inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+
+        fs::write(
+            &cue,
+            DEUX_TRANCHES_SANS_REM.replace(
+                "    INDEX 01 00:00:00\n",
+                "    ISRC USAM17302204\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+        assert_eq!(bilan.pistes_mises_a_jour, 2, "bilan : {bilan:?}");
+
+        let repo = TrackRepo::with_backend(db);
+        let media = image.to_string_lossy().to_string();
+        let une = repo.get_by_cue_identity(&media, 0).unwrap().unwrap();
+        assert_eq!(
+            une.isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — l'ISRC ajouté à la feuille doit atteindre la ligne déjà en base"
+        );
+        let deux = repo.get_by_cue_identity(&media, 493).unwrap().unwrap();
+        assert_eq!(
+            deux.isrc, None,
+            "l'ISRC d'une piste ne déborde pas sur l'autre"
+        );
     }
 
     /// #5297 — une image SACD lue nativement devient un album de TRANCHES :
