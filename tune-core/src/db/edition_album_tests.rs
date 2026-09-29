@@ -838,6 +838,53 @@ pub(crate) fn scenario_balises_effectives(db: &Arc<dyn DbBackend>) {
         p.iter()
             .all(|x| x.balises.compilation == Some(DrapeauAEcrire::Retrait))
     );
+
+    // #5314 — GENRE : `tracks.genres` s'il porte un genre, sinon
+    // `tracks.genre`, sinon rien (la balise du fichier reste).
+    let m1 = marque(db.engine(), 1);
+    let m2 = marque(db.engine(), 2);
+    let m3 = marque(db.engine(), 3);
+    let poser_genre = |id: i64, genre: Option<&str>, genres: Option<&str>| {
+        db.execute(
+            &format!("UPDATE tracks SET genre = {m1}, genres = {m2} WHERE id = {m3}"),
+            &[
+                &genre.map(str::to_string) as &dyn ToSqlValue,
+                &genres.map(str::to_string),
+                &id,
+            ],
+        )
+        .unwrap();
+    };
+    poser_genre(k.a[0], Some("Jazz"), Some(r#"["Jazz","Fusion"]"#));
+    poser_genre(k.a[1], Some("Blues"), None);
+    poser_genre(k.a[2], Some("Soul"), Some("[]"));
+    poser_genre(k.b[0], None, None);
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    let genres = |id: i64| {
+        p.iter()
+            .find(|x| x.id == id)
+            .expect("piste")
+            .balises
+            .genres
+            .clone()
+    };
+    assert_eq!(genres(k.a[0]), vec!["Jazz", "Fusion"], "#5314 tableau");
+    assert_eq!(genres(k.a[1]), vec!["Blues"], "#5314 colonne seule");
+    assert_eq!(genres(k.a[2]), vec!["Soul"], "#5314 tableau vide");
+    assert!(genres(k.b[0]).is_empty(), "#5314 sans genre : rien");
+
+    // Et le genre posé sur l'album à la fiche (#5342) descend jusqu'aux
+    // balises à écrire, genres multiples compris.
+    modifier(db, k.album, json!({ "genre": "Rock; Pop" })).unwrap();
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    for x in &p {
+        assert_eq!(
+            x.balises.genres,
+            vec!["Rock", "Pop"],
+            "#5314 piste {}",
+            x.id
+        );
+    }
 }
 
 #[test]
