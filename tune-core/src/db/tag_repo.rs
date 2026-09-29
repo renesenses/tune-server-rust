@@ -165,12 +165,20 @@ pub mod sql {
 
     /// INSERT OR IGNORE rewritten to portable ON CONFLICT DO NOTHING.
     /// UNIQUE(tag_id, item_type, item_id) is enforced by the schema.
+    ///
+    /// `created_at` est la date du DÉPÔT (#5478, web#1802 « Écouter plus
+    /// tard »), posée par l'expression « maintenant » du moteur — même forme
+    /// que `tag_streaming_item` : la colonne n'a pas de DEFAULT (elle arrive
+    /// par `ADD COLUMN`, et les lignes d'avant doivent rester NULL). Un second
+    /// dépôt du même objet tombe dans `DO NOTHING` : la date du PREMIER dépôt
+    /// n'est jamais réécrite.
     pub fn tag_item<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO item_tags (tag_id, item_type, item_id) VALUES ({}, {}, {}) ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+            "INSERT INTO item_tags (tag_id, item_type, item_id, created_at) VALUES ({}, {}, {}, {}) ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
             d.placeholder(1),
             d.placeholder(2),
-            d.placeholder(3)
+            d.placeholder(3),
+            d.now_iso8601(),
         )
     }
 
@@ -186,6 +194,17 @@ pub mod sql {
     pub fn items_by_tag<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT item_id FROM item_tags WHERE tag_id = {} AND item_type = {} ORDER BY item_id",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// Comme [`items_by_tag`], avec la date du dépôt (`NULL` pour une ligne
+    /// posée avant la migration 113 / PG 077). Même ordre, pour ne rien
+    /// changer à ce que les écrans lisent déjà : c'est au client de trier.
+    pub fn items_by_tag_dated<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT item_id, created_at FROM item_tags WHERE tag_id = {} AND item_type = {} ORDER BY item_id",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -291,7 +310,7 @@ pub mod sql {
         )
     }
 
-    const COLS_STREAMING: &str = "SELECT item_type, source, source_id, title, artist, album, cover_url \
+    const COLS_STREAMING: &str = "SELECT item_type, source, source_id, title, artist, album, cover_url, created_at \
          FROM streaming_item_tags";
 
     pub fn streaming_items_by_tag<D: SqlDialect>(d: &D) -> String {
@@ -375,6 +394,11 @@ pub struct StreamingTagItem {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub cover_url: Option<String>,
+    /// La date du dépôt, LUE dans la table (#5478). Jamais écrite par ce
+    /// champ : `tag_streaming_item` pose « maintenant » lui-même, et un corps
+    /// de requête qui la porterait n'antidaterait rien.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 pub struct TagRepo {
@@ -502,6 +526,27 @@ impl TagRepo {
         Ok(rows
             .into_iter()
             .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    /// Les objets locaux d'une étiquette, avec la date de leur dépôt (#5478).
+    ///
+    /// `None` quand la ligne est plus ancienne que la colonne : aucune date
+    /// n'est inventée pour elle.
+    pub fn items_by_tag_dated(
+        &self,
+        tag_id: i64,
+        item_type: &str,
+    ) -> Result<Vec<(i64, Option<String>)>, String> {
+        let sql = self.dialect_sql(sql::items_by_tag_dated, sql::items_by_tag_dated);
+        let params: [&dyn ToSqlValue; 2] = [&tag_id, &item_type];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                let id = cols.first().and_then(|v| v.as_i64())?;
+                Some((id, cols.get(1).and_then(|v| v.as_string())))
+            })
             .collect())
     }
 
@@ -731,6 +776,7 @@ fn row_to_streaming_tag_item(cols: &Vec<SqlValue>) -> StreamingTagItem {
         artist: cols.get(4).and_then(|v| v.as_string()),
         album: cols.get(5).and_then(|v| v.as_string()),
         cover_url: cols.get(6).and_then(|v| v.as_string()),
+        created_at: cols.get(7).and_then(|v| v.as_string()),
     }
 }
 
@@ -1123,6 +1169,7 @@ mod tests {
             artist: Some("Keith Jarrett".into()),
             album: None,
             cover_url: Some(format!("https://static.qobuz.com/{source_id}.jpg")),
+            created_at: None,
         }
     }
 
