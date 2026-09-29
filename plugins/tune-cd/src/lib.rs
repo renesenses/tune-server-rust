@@ -10,6 +10,7 @@
 //! LecteurDisque (trait)  ── linux.rs  : ioctl /dev/sr*
 //!        │                ├─ cddafs.rs : volume cddafs (AIFF + .TOC.plist),
 //!        │                │              découvert par macos.rs
+//!        │                ├─ windows.rs : ioctl sur lecteur optique Windows
 //!        │                └─ simule.rs : TOC et secteurs en mémoire (témoins)
 //!        ▼
 //! toc.rs / discid.rs / musicbrainz.rs   (purs : TOC, identifiant, métadonnées)
@@ -28,9 +29,7 @@
 //!
 //! ## Hors de ce greffon
 //!
-//! L'extraction vers la bibliothèque (#2466) et Windows
-//! (`IOCTL_CDROM_RAW_READ`) : l'abstraction [`lecteur::LecteurDisque`] est
-//! prête à les recevoir.
+//! L'extraction vers la bibliothèque (#2466).
 
 pub mod cddafs;
 pub mod discid;
@@ -48,6 +47,9 @@ pub mod routes;
 pub mod simule;
 pub mod source;
 pub mod toc;
+#[cfg(target_os = "windows")]
+pub mod windows;
+mod windows_toc;
 
 use std::sync::Arc;
 
@@ -95,7 +97,7 @@ impl TunePlugin for CdPlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux et macOS)"
+        "Lecture directe d'un CD audio vers une zone, sans extraction (Linux, macOS et Windows)"
     }
     /// Opt-in : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -104,9 +106,7 @@ impl TunePlugin for CdPlugin {
     /// Au catalogue (#4863) : l'écran « Lecture CD » du client web consomme
     /// ses trois routes, donc la doctrine #2090 est remplie — le gestionnaire
     /// peut proposer « Installer ». Gratuit, comme `bandcamp` (absent de
-    /// `premium_plugins`). Sous Windows, l'installation réussit et
-    /// `/etat` répond `plateforme_prise_en_charge: false` : un état, pas une
-    /// erreur.
+    /// `premium_plugins`).
     fn catalogued(&self) -> bool {
         true
     }
@@ -131,7 +131,7 @@ impl TunePlugin for CdPlugin {
             &etat_routes,
         ));
         publication.publier_sans_lecteur();
-        // #5161 — sous Linux et macOS, `lecteur` est toujours là : un lecteur
+        // #5161 — sur les plateformes prises en charge, `lecteur` est toujours là : un lecteur
         // absent au démarrage se branche plus tard, et c'est la surveillance
         // qui le voit arriver. `None` ne reste que sans implémentation.
         match &lecteur {
