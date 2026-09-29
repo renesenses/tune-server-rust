@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "cfdc755e1d9bfac7de2c074c58687a9cbda990ff",
+    "web_sha": "d4c99567f8b82bf3fc46432c593ec30911f55d07",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
