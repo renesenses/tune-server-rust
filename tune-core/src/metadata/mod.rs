@@ -3069,13 +3069,30 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Find one field in an already-read Vorbis header.
+///
+/// #5397 — le motif finit toujours par `=`, octet qu'aucune casse ne change :
+/// une position `i` ne peut convenir que si `data[i + nlen - 1]` vaut `=`. On
+/// saute donc d'un `=` au suivant au lieu de comparer `nlen` octets à CHAQUE
+/// position. Mêmes positions retenues, dans le même ordre, donc même résultat ;
+/// seul le coût change. Mesuré sur Shrek (5 champs cherchés par fichier, tête
+/// de 1 Mio) : 25 ms → 5,8 ms par fichier en `--release`, 808 → 41 ms en
+/// profil de test — où le témoin de #3816 (relecture de 501 pistes) passait
+/// ici 6,5 s sur 9 et dépassait son délai de 30 s sous charge.
 fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
     let needle = format!("{}=", field_name.to_ascii_uppercase());
     let nlen = needle.len();
     if data.len() <= nlen {
         return None;
     }
-    for i in 4..=data.len() - nlen {
+    // `fin` parcourt les positions du `=` final : i = fin + 1 - nlen, i >= 4.
+    let mut fin = nlen + 3;
+    while let Some(pas) = data
+        .get(fin..)
+        .and_then(|reste| reste.iter().position(|&b| b == b'='))
+    {
+        fin += pas;
+        let i = fin + 1 - nlen;
+        fin += 1;
         if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
             continue;
         }
@@ -3962,7 +3979,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // MEDIA (Vorbis) / TMED (ID3v2) via ItemKey::OriginalMediaType, with the
     // legacy Vorbis `SOURCE` tag as a fallback for files tagged before the
     // switch (D. Pamingle : « nommer MEDIA, ID3v2 TMED, aligné sur MusicBrainz »).
-    if let Some(v) = get(ItemKey::OriginalMediaType).or_else(|| raw_vorbis_comment(path, "SOURCE"))
+    // La tête Vorbis est lue UNE fois, pour `SOURCE` comme pour les quatre
+    // graphies du DR plus bas (#5397) : `raw_vorbis_comment` la relisait.
+    let header = read_vorbis_header(path);
+    if let Some(v) = get(ItemKey::OriginalMediaType)
+        .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
     {
         meta.insert("source_media".into(), v);
     }
@@ -3983,7 +4004,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // `ALBUM DR` / `DR` are accepted as secondary spellings. The header is read
     // ONCE for all four: a file without any of them — the common case — would
     // otherwise pay four separate 1 MB reads per scan.
-    if let Some(header) = read_vorbis_header(path) {
+    if let Some(header) = header {
         if let Some(v) = find_vorbis_comment(&header, "ALBUM DYNAMIC RANGE")
             .or_else(|| find_vorbis_comment(&header, "ALBUM DR"))
         {
@@ -4402,6 +4423,66 @@ mod dynamic_range_tests {
         let data = comment_block(&[("album dynamic range", "9")]);
         assert_eq!(
             find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("9")
+        );
+    }
+
+    /// #5397 — le saut d'un `=` au suivant doit retenir exactement ce que
+    /// retenait la comparaison à chaque position : même valeur, y compris
+    /// sur du bruit binaire (les trames audio que la tête de 1 Mio embarque),
+    /// avec un commentaire à la première position admise (4) et un en fin.
+    #[test]
+    fn le_saut_sur_egal_retient_ce_que_retenait_le_balayage_complet_5397() {
+        fn balayage_complet(data: &[u8], field_name: &str) -> Option<String> {
+            let needle = format!("{}=", field_name.to_ascii_uppercase());
+            let nlen = needle.len();
+            if data.len() <= nlen {
+                return None;
+            }
+            for i in 4..=data.len() - nlen {
+                if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
+                    continue;
+                }
+                let len = u32::from_le_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]])
+                    as usize;
+                if len < nlen || i + len > data.len() {
+                    continue;
+                }
+                if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len])
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut bruit: Vec<u8> = (0..65_536)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // Beaucoup de `=` et de lettres : le cas le plus dur pour le saut.
+                [b'=', b'D', b'r', b'R', 0, 7][(x % 6) as usize]
+            })
+            .collect();
+        let mut poser = |off: usize, entree: &str| {
+            bruit[off - 4..off].copy_from_slice(&(entree.len() as u32).to_le_bytes());
+            bruit[off..off + entree.len()].copy_from_slice(entree.as_bytes());
+        };
+        poser(4, "dr=12");
+        poser(30_000, "DYNAMIC RANGE=9");
+        poser(65_536 - 9, "SOURCE=CD");
+        for champ in ["DR", "DYNAMIC RANGE", "ALBUM DR", "SOURCE", "R", "ABSENT"] {
+            assert_eq!(
+                find_vorbis_comment(&bruit, champ),
+                balayage_complet(&bruit, champ),
+                "{champ}"
+            );
+        }
+        assert_eq!(find_vorbis_comment(&bruit, "SOURCE").as_deref(), Some("CD"));
+        assert_eq!(
+            find_vorbis_comment(&bruit, "DYNAMIC RANGE").as_deref(),
             Some("9")
         );
     }

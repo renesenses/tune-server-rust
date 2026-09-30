@@ -58,3 +58,22 @@ rustflags = ["-C", "link-arg=-lc"]
 # ne fait rien.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+# SQLite embarqué (`rusqlite/bundled`) : pas de comptabilité mémoire globale
+# (#5397).
+#
+# Par défaut, SQLite tient des statistiques d'allocation (`sqlite3_status`)
+# sous UN mutex global au processus, pris à chaque `sqlite3_malloc` et
+# `sqlite3_free` — des centaines de fois par requête. Toutes les connexions du
+# processus le partagent. Mesuré sur Shrek le 29/09/2026 : dans la lib de
+# tests de tune-server (32 fils, chacun sa base), la relecture de 501 pistes
+# du témoin de #3816 passait 28,4 s dans `execute` au lieu de 0,6 s seule, avec
+# 411 871 changements de contexte volontaires ; comptabilité coupée,
+# 1,2 s et 813 changements. La lib entière (`--test-threads=32`) est passée
+# de 247-277 s à 57-69 s.
+#
+# Tune ne lit aucune de ces statistiques (ni `sqlite3_memory_used`, ni
+# `soft_heap_limit`) ; c'est l'une des options de compilation que la
+# documentation de SQLite recommande (« Recommended Compile-time Options »).
+# `rusqlite` étant compilé une seule fois pour tout l'espace de travail, le
+# réglage vaut pour le serveur, la CLI et tune-ffi.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
