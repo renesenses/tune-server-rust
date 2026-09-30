@@ -750,16 +750,24 @@ pub mod sql {
     /// [`update_du_scan`] et le commentaire qui l'explique ne puissent pas
     /// diverger.
     ///
-    /// `isrc` n'y figure pas : [`update`] ne l'écrit pas du tout — le scan ne
-    /// peut donc pas l'effacer, et l'ajouter ici laisserait croire l'inverse.
-    pub const COLONNES_DE_CONNAISSANCE: [&str; 6] = [
+    /// `isrc` y est depuis #5463 : [`update`] ne l'écrivait pas du tout, si
+    /// bien qu'un ISRC découvert après la création de la ligne (feuille CUE
+    /// relue, fichier retagué) n'atteignait jamais la base. Il est désormais
+    /// écrit, et gardé au scan comme les autres — et même hors du scan : voir
+    /// `update_avec`.
+    pub const COLONNES_DE_CONNAISSANCE: [&str; 7] = [
         "genre",
         "genres",
         "composer",
         "year",
         "label",
         "musicbrainz_recording_id",
+        "isrc",
     ];
+
+    /// Le nombre de valeurs liées par [`update`] et [`update_du_scan`] : leurs
+    /// 25 colonnes, puis l'`id`.
+    pub const NB_PARAMS_UPDATE: usize = 26;
 
     /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
     ///
@@ -834,7 +842,7 @@ pub mod sql {
     ///
     /// ⚠️ UNE seule définition de l'ordre des colonnes, donc de l'ordre des
     /// paramètres liés : `update` et `update_du_scan` partagent le même
-    /// tableau de 25 valeurs chez leurs appelants. Deux `format!` recopiés
+    /// tableau de [`NB_PARAMS_UPDATE`] valeurs chez leurs appelants. Deux `format!` recopiés
     /// auraient fini par diverger d'un cran, et un décalage de paramètres
     /// écrit des valeurs justes dans les mauvaises colonnes sans lever la
     /// moindre erreur.
@@ -858,6 +866,9 @@ pub mod sql {
             }
         };
         let brut = |n: usize, col: &str| format!("{col} = {}", d.placeholder(n));
+        let garde = |n: usize, col: &str| {
+            format!("{col} = COALESCE(NULLIF({}, ''), {col})", d.placeholder(n))
+        };
         let colonnes = [
             brut(1, "title"),
             brut(2, "album_id"),
@@ -883,11 +894,19 @@ pub mod sql {
             texte(22, "label"),
             texte(23, "musicbrainz_recording_id"),
             brut(24, "comments"),
+            // #5463 — `isrc` est ÉCRIT par les deux formes, mais jamais
+            // EFFACÉ, pas même par [`update`] : plusieurs de ses appelants
+            // reconstruisent la ligne sans relire la base (réindexation UPnP,
+            // relecture d'une piste depuis son fichier), et l'ISRC que
+            // l'enrichissement avait posé y serait perdu. Avant #5463 la
+            // colonne n'était pas écrite du tout : ne rien effacer garde tout
+            // ce qui marchait.
+            garde(25, "isrc"),
         ];
         format!(
             "UPDATE tracks SET {} WHERE id = {}",
             colonnes.join(", "),
-            d.placeholder(25)
+            d.placeholder(NB_PARAMS_UPDATE)
         )
     }
 
@@ -2081,7 +2100,7 @@ impl TrackRepo {
             .id
             .ok_or_else(|| TuneError::NotFound("track has no id".into()))?;
         let sql = self.dialect_sql(sql::update, sql::update);
-        let params: [&dyn ToSqlValue; 25] = [
+        let params: [&dyn ToSqlValue; sql::NB_PARAMS_UPDATE] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -2106,6 +2125,7 @@ impl TrackRepo {
             &track.label,
             &track.musicbrainz_recording_id,
             &track.comments,
+            &track.isrc,
             &id,
         ];
         // #4546 : figer la date d'ajout AVANT que `file_mtime` ne soit récrit.
@@ -3370,7 +3390,7 @@ impl TrackRepo {
     /// See `create_batch` for rationale.
     /// La mise à jour par LOT — le chemin du scan, et rien d'autre.
     ///
-    /// Elle prend [`sql::update_du_scan`], pas [`sql::update`] : les six
+    /// Elle prend [`sql::update_du_scan`], pas [`sql::update`] : les
     /// colonnes de connaissance ne sont écrasées que par une balise qui parle.
     /// Voir la fiche de [`sql::update_du_scan`] pour le défaut mesuré et la
     /// règle.
@@ -3383,7 +3403,7 @@ impl TrackRepo {
         let mut figer_params: Vec<Vec<SqlValue>> = Vec::new();
         for track in tracks {
             let Some(id) = track.id else { continue };
-            let params: [&dyn ToSqlValue; 25] = [
+            let params: [&dyn ToSqlValue; sql::NB_PARAMS_UPDATE] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -3408,6 +3428,7 @@ impl TrackRepo {
                 &track.label,
                 &track.musicbrainz_recording_id,
                 &track.comments,
+                &track.isrc,
                 &id,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
@@ -5763,6 +5784,78 @@ mod tests {
         );
     }
 
+    /// #5463 — `TrackRepo::update` n'écrivait PAS la colonne `isrc` : un ISRC
+    /// posé sur une ligne déjà en base (fiche de piste, feuille CUE relue)
+    /// était perdu sans erreur.
+    #[test]
+    fn la_mise_a_jour_ecrit_l_isrc_5463() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        let mut fiche = repo.get(id).unwrap().unwrap();
+        assert_eq!(fiche.isrc, None, "montage : la piste part sans ISRC");
+        fiche.isrc = Some("USAM17302204".into());
+        repo.update(&fiche).unwrap();
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — `TrackRepo::update` doit écrire la colonne isrc"
+        );
+
+        // Le scan aussi : une balise ISRC présente gagne.
+        let mut ligne = ligne_du_scan(id, None);
+        ligne.isrc = Some("GBAAA1500001".into());
+        repo.update_batch(&[ligne]).unwrap();
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().isrc.as_deref(),
+            Some("GBAAA1500001"),
+            "#5463 — le scan doit écrire l'ISRC que porte le fichier"
+        );
+    }
+
+    /// LA CONTRE-ÉPREUVE — une ligne reconstruite SANS ISRC ne l'efface pas,
+    /// ni par la mise à jour ordinaire, ni par celle du scan.
+    #[test]
+    fn une_mise_a_jour_sans_isrc_ne_l_efface_pas_5463() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+        let mut fiche = repo.get(id).unwrap().unwrap();
+        fiche.isrc = Some("USAM17302204".into());
+        repo.update(&fiche).unwrap();
+
+        let mut reconstruite = ligne_du_scan(id, None);
+        reconstruite.isrc = None;
+        repo.update(&reconstruite).unwrap();
+        repo.update_batch(&[reconstruite.clone()]).unwrap();
+        reconstruite.isrc = Some(String::new());
+        repo.update_batch(&[reconstruite]).unwrap();
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — une ligne reconstruite sans ISRC a effacé celui de la base"
+        );
+    }
+
+    /// Les deux moteurs partagent le même texte : l'ISRC y est la 25e valeur
+    /// liée, l'`id` la 26e — pour SQLite comme pour PostgreSQL.
+    #[test]
+    fn le_sql_de_mise_a_jour_porte_l_isrc_sur_les_deux_moteurs_5463() {
+        fn verifier<D: SqlDialect>(d: &D) {
+            for sql in [sql::update(d), sql::update_du_scan(d)] {
+                let isrc = format!("isrc = COALESCE(NULLIF({}, ''), isrc)", d.placeholder(25));
+                assert!(sql.contains(&isrc), "{isrc} absent : {sql}");
+                assert!(
+                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(26))),
+                    "l'id doit être la 26e valeur : {sql}"
+                );
+            }
+        }
+        verifier(&SqliteDialect);
+        verifier(&PostgresDialect);
+    }
+
     /// La garde porte sur les SIX colonnes nommées, et sur elles seules.
     ///
     /// Un `COALESCE` posé par erreur sur `file_mtime`, `audio_hash` ou
@@ -5808,12 +5901,13 @@ mod tests {
             !sql.contains("COALESCE(genre,"),
             "ordre inversé : la valeur stockée serait figée pour toujours"
         );
-        // Les 25 paramètres restent à leur rang, dans les deux formes.
+        // Les paramètres restent à leur rang, dans les deux formes : 26
+        // depuis que `isrc` est écrit (#5463).
         for forme in [sql::update(&SqliteDialect), sql] {
             assert_eq!(
                 forme.matches('?').count(),
-                25,
-                "25 paramètres liés, ni plus ni moins : {forme}"
+                sql::NB_PARAMS_UPDATE,
+                "26 paramètres liés, ni plus ni moins : {forme}"
             );
         }
     }
@@ -5845,7 +5939,11 @@ mod tests {
             ),
             "{sql}"
         );
-        assert!(sql.ends_with("WHERE id = $25"), "{sql}");
+        assert!(
+            sql.contains("isrc = COALESCE(NULLIF($25, ''), isrc)"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("WHERE id = $26"), "{sql}");
     }
 }
 
