@@ -855,6 +855,14 @@ path = "tests/serveur_media_criteres_canoniques.rs"
 name = "serveur_media_ordre_alphabetique_4956"
 path = "tests/serveur_media_ordre_alphabetique_4956.rs"
 
+# #4956, suite — l'API REST de la bibliothèque (mode paginé du client web)
+# trie artistes, albums (titre, artiste) et listes de lecture dans l'ordre du
+# serveur média : ordre, pages sans perte ni doublon, saut par lettre. SQLite
+# et PostgreSQL (`TUNE_TEST_PG_URL`, étape de test-postgres.yml).
+[[test]]
+name = "bibliotheque_rest_ordre_alphabetique_4956"
+path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.

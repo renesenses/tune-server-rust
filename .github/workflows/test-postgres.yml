@@ -189,6 +189,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
 
+      # #4956, suite — l'ordre alphabétique des listes REST paginées (artistes,
+      # albums par titre et par artiste, listes de lecture) : le tri se fait en
+      # Rust, et doit rendre le même ordre, les mêmes pages et le même saut par
+      # lettre que sur SQLite.
+      - name: Ordre alphabetique des listes REST sur PostgreSQL (#4956)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test bibliotheque_rest_ordre_alphabetique_4956 -- --nocapture --test-threads=1
+
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
       # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
