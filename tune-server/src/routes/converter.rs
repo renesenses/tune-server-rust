@@ -106,6 +106,9 @@ struct JobError {
 
 struct ConvertJob {
     cancellation: Arc<std::sync::atomic::AtomicBool>,
+    /// #5482 — le nom de l'archive téléchargée, « Artiste - Album (FORMAT).zip »,
+    /// fixé au lancement depuis les pistes résolues.
+    nom_archive: String,
     status: JobStatus,
     total: usize,
     completed: usize,
@@ -437,8 +440,21 @@ async fn start_job(
         );
     }
 
+    // #5482 — le nom de l'archive, tant que l'on sait encore d'où viennent
+    // les fichiers.
+    let nom_archive = archive::nom_de_l_archive(
+        &resolues,
+        &archive::libelle_du_format(
+            &format,
+            body.quality.as_deref(),
+            body.sample_rate,
+            body.bit_depth,
+        ),
+    );
+
     let job = Arc::new(Mutex::new(ConvertJob {
         cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        nom_archive,
         status: JobStatus::Running,
         total,
         completed: 0,
@@ -641,6 +657,8 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
 
     json!({
         "job_id": job_id,
+        // #5482 — le nom sous lequel l'archive sera téléchargée.
+        "archive_name": job.nom_archive,
         // Forme historique — conservée telle quelle.
         "status": job.status.as_str(),
         "total": job.total,
@@ -682,6 +700,10 @@ async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
 // GET /download/{job_id} — stream a ZIP of the converted files
 // ---------------------------------------------------------------------------
 
+// #5482 — le nom de l'archive et son `Content-Disposition`.
+#[path = "convertisseur_archive.rs"]
+mod archive;
+
 async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoResponse, AppError> {
     let store = job_store();
     let map = store.lock().await;
@@ -706,6 +728,7 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
     }
 
     let output_dir = job.output_dir.clone();
+    let nom_archive = job.nom_archive.clone();
     drop(job);
     drop(map);
 
@@ -717,12 +740,17 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/zip"));
+    // #5482 — « Artiste - Album (FORMAT).zip », repli ASCII et nom UTF-8.
     headers.insert(
         "Content-Disposition",
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"tune-convert-{job_id}.zip\""
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+        HeaderValue::from_str(&archive::content_disposition(&nom_archive))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+    );
+    // Le web télécharge par `fetch` : sans cette ligne, un client servi
+    // depuis une autre origine ne pourrait pas lire l'en-tête.
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Content-Disposition"),
     );
 
     Ok((StatusCode::OK, headers, Body::from(zip_bytes)))
@@ -2013,6 +2041,7 @@ mod tests {
     fn job_temoin(status: JobStatus, completed: usize) -> ConvertJob {
         ConvertJob {
             cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            nom_archive: "Nico - Chelsea Girl (FLAC 16-44.1).zip".into(),
             status,
             total: 4,
             completed,
@@ -2022,6 +2051,49 @@ mod tests {
             output_bytes: 128_400_000,
             destination_serveur: false,
         }
+    }
+
+    /// #5482 — l'écran lit le nom de l'archive dans le statut.
+    #[test]
+    fn le_statut_porte_le_nom_de_l_archive() {
+        let statut = payload_statut("j", &job_temoin(JobStatus::Completed, 4));
+        assert_eq!(
+            statut["archive_name"],
+            "Nico - Chelsea Girl (FLAC 16-44.1).zip"
+        );
+    }
+
+    /// #5482 — la route de téléchargement nomme l'archive d'après l'album,
+    /// en ASCII ET en UTF-8, et laisse le web lire l'en-tête.
+    #[tokio::test]
+    async fn l_archive_se_telecharge_sous_le_nom_de_l_album() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("01 - Orbits.flac"), b"fLaC").unwrap();
+        let mut job = job_temoin(JobStatus::Completed, 4);
+        job.nom_archive = "Beyoncé - Lemonade (FLAC 24).zip".into();
+        job.output_dir = dir.path().to_path_buf();
+        let id = format!("essai-5482-{}", uuid::Uuid::new_v4());
+        job_store()
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(job)));
+
+        let reponse = download_job(AxumPath(id.clone()))
+            .await
+            .map_err(|e| e.message)
+            .unwrap()
+            .into_response();
+        job_store().lock().await.remove(&id);
+        let en_tetes = reponse.headers();
+        assert_eq!(
+            en_tetes["Content-Disposition"],
+            "attachment; filename=\"Beyonce - Lemonade (FLAC 24).zip\"; \
+             filename*=UTF-8''Beyonc%C3%A9%20-%20Lemonade%20%28FLAC%2024%29.zip"
+        );
+        assert_eq!(
+            en_tetes["Access-Control-Expose-Headers"],
+            "Content-Disposition"
+        );
     }
 
     #[test]
