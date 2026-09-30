@@ -192,6 +192,9 @@ pub async fn run_with(opts: RunOptions) {
         .expect("Failed to install rustls CryptoProvider");
 
     let config = TuneConfig::load();
+    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
+    // pas la configuration sous la main.
+    crate::chemins_de_donnees::retenir(&config);
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
 

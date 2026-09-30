@@ -3510,9 +3510,13 @@ pub fn chemin_du_rapport_de_scan() -> String {
     if let Some(chemin) = crate::isolement_disque_tests_5467::chemin_du_rapport_de_scan() {
         return chemin.to_string_lossy().into_owned();
     }
-    std::env::var("TUNE_DB_PATH")
-        .unwrap_or_else(|_| "tune.db".into())
-        .replace(".db", "-scan-report.json")
+    // #5513 — à côté de la base retenue au démarrage (`config.db_path`), et
+    // non plus du seul `TUNE_DB_PATH` : sous le LaunchAgent macOS, le littéral
+    // `tune.db` visait `/`.
+    crate::chemins_de_donnees::rapport_de_scan(
+        crate::chemins_de_donnees::base_retenue(),
+        std::env::var("TUNE_DB_PATH").ok().as_deref(),
+    )
 }
 
 /// Build a JSON array string for the `genres` column from parsed metadata.
