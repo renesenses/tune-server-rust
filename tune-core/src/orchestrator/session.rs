@@ -260,8 +260,10 @@ pub(super) fn seek_de_reprise_necessaire(position_pausee_ms: u64, mesuree_ms: Op
 /// Le seek détaché n'a de sens que pour la lecture qui l'a demandé : entre le
 /// départ de la tâche et la fin de son temps de pose, un stop, un next ou une
 /// nouvelle lecture peuvent être passés — il seekerait alors la piste
-/// SUIVANTE. La génération de lecture (`play_seq`) capturée au départ doit
-/// être celle du moment du seek.
+/// SUIVANTE. Un Seek ou une pause de l'utilisateur aussi — il écraserait
+/// alors son déplacement (#5476). La génération des commandes de transport
+/// (`transport_seq`, et non `play_seq`, qu'un déplacement ne fait pas
+/// bouger) capturée au départ doit être celle du moment du seek.
 pub(super) fn reprise_toujours_la_notre(seq_au_depart: u64, seq_courante: u64) -> bool {
     seq_au_depart == seq_courante
 }

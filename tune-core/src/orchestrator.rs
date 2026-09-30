@@ -1845,6 +1845,10 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
+/// le Seek de reprise détaché.
+#[cfg(test)]
+mod seek_de_reprise_caduc_5476;
 /// #5050 — le Seek d'après reprise DLNA/OpenHome n'est plus envoyé qu'à un
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
