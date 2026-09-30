@@ -918,6 +918,18 @@ pub mod sql {
         )
     }
 
+    /// #5454 — retire la pochette PROPRE des pistes d'un album qui portent
+    /// exactement sa pochette de référence : elles retombent sur celle de
+    /// l'album par `COALESCE`. Une pochette propre égale à la référence ne dit
+    /// rien de plus, et masquerait une pochette téléversée plus tard.
+    pub fn retirer_pochettes_de_piste_egales<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET cover_path = NULL WHERE album_id = {} AND cover_path = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn delete<D: SqlDialect>(d: &D) -> String {
         format!("DELETE FROM tracks WHERE id = {}", d.placeholder(1))
     }
@@ -3477,6 +3489,21 @@ impl TrackRepo {
             }
         }
         Ok(count)
+    }
+
+    /// #5454 — voir [`sql::retirer_pochettes_de_piste_egales`]. Rend le
+    /// nombre de lignes modifiées.
+    pub fn retirer_pochettes_de_piste_egales(
+        &self,
+        album_id: i64,
+        pochette: &str,
+    ) -> Result<usize, TuneError> {
+        let sql = self.dialect_sql(
+            sql::retirer_pochettes_de_piste_egales,
+            sql::retirer_pochettes_de_piste_egales,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&album_id, &pochette];
+        Ok(self.db.execute(&sql, &params)?)
     }
 
     // ─── Group B: metadata accessors via DbBackend ───────────────────
