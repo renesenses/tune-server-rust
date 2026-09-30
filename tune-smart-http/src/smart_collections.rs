@@ -911,6 +911,16 @@ pub fn build_album_query(
             continue;
         }
 
+        // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
+        if field == "rating" {
+            if let Some(c) =
+                crate::regles_sql::condition_note("al.id", op, value_raw, ctx.profile_id)
+            {
+                conditions.push(c);
+            }
+            continue;
+        }
+
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
@@ -936,7 +946,6 @@ pub fn build_album_query(
             "track_number" => "CAST(t.track_number AS INTEGER)",
             "disc_number" => "CAST(t.disc_number AS INTEGER)",
             "bpm" => "CAST(t.bpm AS INTEGER)",
-            "rating" => "CAST(t.rating AS INTEGER)",
             _ => continue,
         };
 
@@ -2584,5 +2593,52 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+/// #5547 — l'APERÇU réel de la route, avec une règle « Note » : il rendait une
+/// erreur 500 (`no such column: t.rating`) sur le .18 en 0.9.169.
+#[cfg(test)]
+mod apercu_note_5547 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    async fn apercu(regles: &str, profil: i64) -> serde_json::Value {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let r = super::preview_albums(
+            axum::extract::State(SmartHttpState::new(backend)),
+            tune_http_types::ActiveProfile(profil),
+            axum::Json(super::PreviewRequest {
+                rules: serde_json::from_str(regles).expect("json"),
+                match_mode: None,
+                sort_by: None,
+                sort_order: None,
+                max_limit: None,
+            }),
+        )
+        .await;
+        match r {
+            Ok(axum::Json(v)) => v,
+            Err(e) => panic!(
+                "l'aperçu échoue au lieu de répondre : statut {}",
+                axum::response::IntoResponse::into_response(e).status()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn l_apercu_d_une_regle_note_repond_sans_erreur() {
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 1).await;
+        assert_eq!(
+            v["albums"].as_array().map(|a| a.len()),
+            v["total"].as_u64().map(|n| n as usize)
+        );
+        let attendu = if "albums" == "tracks" { 2 } else { 1 };
+        assert_eq!(v["total"], attendu, "{v}");
+        // Le profil 2 n'a noté que Giant Steps.
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
+        assert_eq!(v["total"], 1, "{v}");
     }
 }
