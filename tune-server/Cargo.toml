@@ -1022,6 +1022,11 @@ path = "tests/bug_report_captures_4564.rs"
 name = "bug_report_limite_5068"
 path = "tests/bug_report_limite_5068.rs"
 
+# #5428 — le rapport porte l'identité du compte (Bearer, sinon clé de licence).
+[[test]]
+name = "bug_report_identite_5428"
+path = "tests/bug_report_identite_5428.rs"
+
 # Les étiquettes — types admis, playlists, et depuis le 22/09/2026 le refus
 # d'un `item_id` nul. Le fichier existait, mais `autotests = false` plus haut le
 # laissait hors compilation : ses gardes n'étaient exécutées par personne.

@@ -497,7 +497,9 @@ pub(crate) fn base_url(state: &AppState) -> Option<String> {
 /// (premium par clé, sans SSO — la majorité des testeurs). Vide quand il n'y a
 /// ni l'un ni l'autre. Partagé avec l'installation de greffons audio depuis le
 /// catalogue (`catalogue_greffons_audio`), qui essaie la clé quand le compte
-/// SSO est refusé.
+/// SSO est refusé, et avec le rapport de bug envoyé au forum
+/// (`routes/system/diagnostics.rs::envoyer_le_rapport`, #5428), qui prend le
+/// premier et part aussi SANS identité.
 pub(crate) fn identifiants_mozaiklabs(settings: &SettingsRepo) -> Vec<support::SupportAuth> {
     let mut identifiants = Vec::new();
 
