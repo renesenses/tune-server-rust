@@ -51,6 +51,8 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod isolement_disque_tests_5467;
+#[cfg(test)]
 mod labels_albums_4836_tests;
 
 /// The whole server startup, so out-of-tree binaries can compose it with their

@@ -332,6 +332,11 @@ impl AppState {
     }
 
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
+        // #5467 — en build de test, les chemins relatifs de la configuration
+        // (`tune.db`, `artwork_cache`) ne se résolvent plus depuis le répertoire
+        // courant, c'est-à-dire l'arbre source. Sans effet en production.
+        #[cfg(test)]
+        let tune_config = crate::isolement_disque_tests_5467::isoler_config(tune_config);
         // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
         // default to SQLite.
         let selected_engine = tune_config
