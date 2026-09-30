@@ -750,8 +750,11 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 ///
 /// #5223 : conserver la fraction de seconde ET la comparer sans tolérance.
 /// Une copie préallouée ou une retouche en place peut changer les balises
-/// à taille égale dans la même seconde. Les anciennes dates tronquées sont
-/// relues une fois si la date précise diffère, puis le raccourci s'applique.
+/// à taille égale dans la même seconde. Seule exception (décision du
+/// 30/09/2026) : une date enregistrée sans fraction, égale à la partie
+/// entière de celle du disque, à taille égale, vient d'une version qui
+/// tronquait — elle est tenue pour inchangée et réécrite précise
+/// ([`EtatDuFichier::DateAPreciser`]).
 ///
 /// The lookup key is NFC-normalized because the stored `file_path`s (and the
 /// `discovered_paths` set) are NFC, while a filename on disk may be NFD (a FR
@@ -764,18 +767,84 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// so they can't diverge again — they previously held two copies and only one
 /// received the NFC fix.
 pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
+    matches!(
+        etat_du_fichier(path, existing_tracks),
+        EtatDuFichier::ARelire
+    )
+}
+
+/// Ce que le préfiltre sait d'un fichier sur disque, face à sa ligne en base.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EtatDuFichier {
+    /// Neuf, ou taille/date différentes : relire ses balises.
+    ARelire,
+    /// Taille et date précise identiques : sauter.
+    Inchange,
+    /// Taille identique, et date enregistrée SANS fraction égale à la partie
+    /// entière de la date du disque : une ligne écrite avant #5223 (≤ 0.9.166,
+    /// qui tronquait à la seconde). Tenue pour inchangée, SANS relecture ; la
+    /// date précise est à réécrire en base (décision de Bertrand, 30/09/2026,
+    /// ticket 201 : 20 284 fichiers sur 20 348 relus au premier démarrage).
+    DateAPreciser {
+        /// Clé NFC, telle que la base la range.
+        chemin: String,
+        mtime: f64,
+        taille: u64,
+    },
+}
+
+/// Le verdict du préfiltre, partagé par les scans manuel et de démarrage.
+/// Voir [`file_needs_scan`] pour la clé NFC et la mesure des chemins virtuels.
+pub fn etat_du_fichier(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> EtatDuFichier {
     let path_str: String = path.to_string_lossy().nfc().collect();
     // #5299 — même mesure que le parcours (`ScannedFile`), chemins virtuels
     // `image.iso!/…` compris : sans elle, chaque piste d'une image serait
     // relue à chaque scan.
-    if let Some(info) = existing_tracks.get(path_str.as_str())
-        && let Some((taille, mtime)) = tune_core::audio::iso9660::taille_et_mtime(path)
-    {
-        let unchanged =
-            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == taille as i64);
-        return !unchanged;
+    let (Some(info), Some((taille, mtime))) = (
+        existing_tracks.get(path_str.as_str()),
+        tune_core::audio::iso9660::taille_et_mtime(path),
+    ) else {
+        return EtatDuFichier::ARelire;
+    };
+    if !info.taille.is_some_and(|s| s == taille as i64) {
+        return EtatDuFichier::ARelire;
     }
-    true
+    match info.mtime {
+        Some(m) if m == mtime => EtatDuFichier::Inchange,
+        Some(m) if m.fract() == 0.0 && mtime.fract() != 0.0 && m == mtime.trunc() => {
+            EtatDuFichier::DateAPreciser {
+                chemin: path_str,
+                mtime,
+                taille,
+            }
+        }
+        _ => EtatDuFichier::ARelire,
+    }
+}
+
+/// Réécrit en base la date précise des fichiers que le préfiltre a tenus pour
+/// inchangés sur une date tronquée ([`EtatDuFichier::DateAPreciser`]). Sans
+/// relire le fichier. Rend le nombre de dates réécrites.
+pub(crate) fn preciser_les_dates(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    dates: Vec<(String, f64, u64)>,
+) -> usize {
+    if dates.is_empty() {
+        return 0;
+    }
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
+    let mut faites = 0usize;
+    for (chemin, mtime, taille) in &dates {
+        match repo.update_mtime_and_size(chemin, *mtime, *taille as i64) {
+            Ok(()) => faites += 1,
+            Err(e) => tracing::warn!(error = %e, "scan_date_precise_non_ecrite"),
+        }
+    }
+    tracing::info!(
+        dates = faites,
+        "scan_dates_precisees — dates tronquées (avant #5223) remplacées sans relecture"
+    );
+    faites
 }
 
 /// `file_path` → la ligne de `tracks` qui le possède, toutes sources.
@@ -1886,6 +1955,7 @@ async fn spawn_library_scan_avec_lecteur(
         // qu'ils PÈSENT. Le verdict « compilation » porte sur le dossier
         // entier, et la base est le seul témoin de ceux que ce scan ne relira
         // pas (#3528, `TrackImporter::amorcer_depuis_la_base`).
+        let dates_a_preciser = std::sync::Mutex::new(Vec::new());
         let (files_to_scan, files_ecartes): (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) =
             files.into_par_iter().partition(|path| {
                 if scan_cancel_requested() {
@@ -1898,8 +1968,24 @@ async fn spawn_library_scan_avec_lecteur(
                 // Shared with auto_scan so the manual and watcher scans can't
                 // diverge on the NFC key handling (the "scan interminable" bug).
                 // Un exemplaire inchangé se saute comme une piste (#4907).
-                file_needs_scan(path, &existing_tracks) && file_needs_scan(path, &existing_copies)
+                match etat_du_fichier(path, &existing_tracks) {
+                    EtatDuFichier::Inchange => false,
+                    EtatDuFichier::DateAPreciser { chemin, mtime, taille } => {
+                        dates_a_preciser
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((chemin, mtime, taille));
+                        false
+                    }
+                    EtatDuFichier::ARelire => file_needs_scan(path, &existing_copies),
+                }
             });
+        if !scan_cancel_requested() {
+            preciser_les_dates(
+                &db,
+                dates_a_preciser.into_inner().unwrap_or_else(|e| e.into_inner()),
+            );
+        }
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
         tracing::info!(
