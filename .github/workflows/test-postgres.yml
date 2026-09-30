@@ -255,6 +255,8 @@ jobs:
       # les tables sans colonne `id` (masques, favoris de facette, doublons
       # arbitres, appareils ignores) doivent arriver entieres, deux fois de
       # suite. Bases jetables creees puis supprimees par le test.
+      # Le filtre `pg_bascule_` joue aussi `pg_bascule_copie_file_first_seen_5389` :
+      # la date d'ajout (`file_first_seen`) doit passer la bascule a l'identique.
       - name: Bascule SQLite -> PostgreSQL, clefs de conflit (#5134)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
