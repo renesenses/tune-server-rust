@@ -63,7 +63,7 @@ fi
 #     TUNE_VERSION, pose depuis le tag).
 # La rc2, puis la 1.0.0 finale, n'appellent PAS de nouveau bump des fichiers
 # serveur et web : seuls les numeros de build clients avancent.
-if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$ ]]; then
+if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
     echo "Error: $VERSION porte un suffixe de pre-version." >&2
     echo "       Le suffixe vit sur le tag seul (convention A) : lancer" >&2
     echo "         $0 ${VERSION%%-*}" >&2
@@ -79,7 +79,7 @@ fi
 # etre rattrapee, pas sautee en silence. Tous les motifs de reecriture
 # ci-dessous acceptent donc ce suffixe facultatif, et chaque fichier est relu
 # apres coup : un `sed` qui ne trouve rien rend 0.
-PRE='(-[0-9A-Za-z.]+)?'
+PRE='(-[0-9A-Za-z.-]+)?'
 verifier_ecrit() {
     local fichier="$1" motif="$2"
     grep -Eq "$motif" "$fichier" || {
