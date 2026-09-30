@@ -4130,7 +4130,7 @@ struct NotesServies {
 /// Une pré-version `vX.Y.Z-<pré>` (`v1.0.0-rc1`, 29/09/2026) EST une version
 /// de Tune : la 1.0.0-rc1 part chez tout le monde, ses notes doivent paraître
 /// dans le panneau. Le suffixe suit la grammaire semver des pré-versions
-/// (`[0-9A-Za-z.]`, non vide) ; `moissonneur-v1.0.0-rc1` reste écarté par le
+/// (`[0-9A-Za-z.-]`, non vide) ; `moissonneur-v1.0.0-rc1` reste écarté par le
 /// préfixe.
 fn est_une_version_de_tune(tag: &str) -> bool {
     let Some(reste) = tag.strip_prefix('v') else {
@@ -4145,7 +4145,9 @@ fn est_une_version_de_tune(tag: &str) -> bool {
             || pre.starts_with('.')
             || pre.ends_with('.')
             || pre.contains("..")
-            || !pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'))
+            || !pre
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
     {
         return false;
     }
@@ -5966,9 +5968,10 @@ mod changelog_forme_tests {
         assert!(est_une_version_de_tune("v1.0.0-rc1"));
         assert!(est_une_version_de_tune("v1.0.0-rc0.test"));
         // Même alphabet que le contrôleur et la promotion
-        // (`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`, 29/09/2026) : un
-        // second tiret n'y entre pas.
-        assert!(!est_une_version_de_tune("v1.0.0-rc0-test"));
+        // (`^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`, 30/09/2026) : le
+        // numéro de répétition porte un second tiret.
+        assert!(est_une_version_de_tune("v1.0.0-rc0-test"));
+        assert!(!est_une_version_de_tune("v1.0.0-rc1;id"));
         assert!(est_une_version_de_tune("v2.0.0-alpha.3"));
         assert!(!est_une_version_de_tune("moissonneur-v1.0.0-rc1"));
         assert!(!est_une_version_de_tune("tune-os-rpi-v1.0.0-rc1"));
