@@ -90,7 +90,8 @@ train. Ce train :
 1. conserve la GitHub Release serveur en brouillon ;
 2. pousse Docker uniquement sous `staging-vX.Y.Z` ;
 3. transmet à Tune OS le SHA OS, la version serveur et les deux SHA-256 Linux ;
-4. attend les trois builds OS et leurs tests ;
+4. attend les builds OS et leurs tests : image Raspberry Pi, image x86_64,
+   image VM ARM64 en UEFI (qcow2, démarrée dans `qemu-system-aarch64`, #5529) ;
 5. conserve leur release en brouillon.
 
 Le tarball serveur attesté est embarqué dans chaque image OS. Le premier

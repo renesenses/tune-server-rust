@@ -235,6 +235,11 @@ fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
         // bien les deux images qui, elles, sont livrees.
         "wait_workflow build-rpi-image.yml",
         "wait_workflow build-x86-image.yml",
+        // #5529 — image VM ARM64 en UEFI (qcow2), deposee seulement apres un
+        // demarrage reel dans qemu-system-aarch64 : le train l'attend et la
+        // matrice staged l'exige.
+        "wait_workflow build-arm64-vm-image.yml",
+        "aarch64-vm-.*\\.qcow2$",
     ] {
         assert!(
             os.contains(preuve),
@@ -268,6 +273,8 @@ fn la_promotion_est_manuelle_armee_et_idempotente() {
             .contains("if [ \"$(gh release view \"$TAG\" --json isDraft --jq .isDraft)\" = true ]")
     );
     assert!(promotion.contains("Android inchange : absent du manifeste a quatre composants"));
+    // #5529 — la promotion ne publie pas une release OS sans l'image VM ARM64.
+    assert!(promotion.contains("aarch64-vm-.*\\.qcow2$"));
 }
 
 #[test]
