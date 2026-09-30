@@ -1176,6 +1176,14 @@ path = "tests/crossfeed_reglable_zone_reseau_2742.rs"
 name = "collections_albums_manquants_901"
 path = "tests/collections_albums_manquants_901.rs"
 
+# Les manquants d'un dossier « Collections » se résolvent (#5527, #5528,
+# Lulu) : ranger l'album vivant retire ses identifiants morts, `/missing`
+# propose des remplaçants, et le VRAI scan de disques retagués fait suivre le
+# dossier. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "collections_suivi_5527_5528"
+path = "tests/collections_suivi_5527_5528.rs"
+
 # #4805 — le pilote de lot de l'identification. `autotests = false` en tête de
 # ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et le
 # témoin du refus Premium ne serait exécuté par personne — ni en local, ni en CI.

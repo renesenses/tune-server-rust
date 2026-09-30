@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::error::AppError;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::dossiers_des_collections as dossiers;
 
 use super::album_order::{CollectionOrder, CollectionSort, sort_albums};
 use super::now_iso_utc;
@@ -118,7 +119,7 @@ fn partager_ids(repo: &AlbumRepo, album_ids: &[i64]) -> Result<(Vec<i64>, Vec<i6
 /// lisible NULLE PART au moment où on voudrait l'afficher. Le seul instant où
 /// il l'est encore, c'est quand l'album est rangé (ou quand le dossier est
 /// ouvert alors qu'il vit encore). On l'écrit donc là, et pas ailleurs.
-const ETIQUETTES: &str = "album_labels";
+const ETIQUETTES: &str = dossiers::ETIQUETTES;
 
 /// Le nom d'un album, tel qu'il est au moment où on le regarde.
 fn etiquette_de(album: &tune_core::db::models::Album) -> Value {
@@ -139,7 +140,12 @@ fn etiquettes_stockees(collection: &Value) -> serde_json::Map<String, Value> {
 /// `title`/`artist` valent `null` pour un album rangé avant que ce champ
 /// n'existe et mort sans que le dossier ait jamais été rouvert entre-temps :
 /// il ne reste alors que son identifiant, et on ne l'invente pas.
-fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
+///
+/// `merged_into` (#5528) : l'album VIVANT qui a reçu ses pistes, quand il est
+/// connu et unique — `{id, title, artist}` —, sinon `null`. Le dossier le
+/// remplace de lui-même à la purge des albums vidés ; ce champ couvre ce qui
+/// a disparu par un autre chemin, et l'écran le dit « Réuni dans … ».
+fn albums_manquants(repo: &AlbumRepo, collection: &Value, morts: &[i64]) -> Vec<Value> {
     let etiquettes = etiquettes_stockees(collection);
     morts
         .iter()
@@ -151,9 +157,31 @@ fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
                     .cloned()
                     .unwrap_or(Value::Null)
             };
-            json!({ "id": id, "title": champ("title"), "artist": champ("artist") })
+            let reuni = e
+                .map(|e| reuni_dans_vivant(repo, *id, e))
+                .unwrap_or(Value::Null);
+            json!({
+                "id": id,
+                "title": champ("title"),
+                "artist": champ("artist"),
+                "merged_into": reuni,
+            })
         })
         .collect()
+}
+
+/// L'album vivant, unique, noté comme ayant reçu les pistes de `id` — ou
+/// `null`. Plusieurs albums vivants : c'est un partage, on ne choisit pas.
+fn reuni_dans_vivant(repo: &AlbumRepo, id: i64, etiquette: &Value) -> Value {
+    let vivants: Vec<tune_core::db::models::Album> = dossiers::reunis_dans(etiquette)
+        .into_iter()
+        .filter(|r| *r != id)
+        .filter_map(|r| repo.get(r).ok().flatten())
+        .collect();
+    match vivants.as_slice() {
+        [seul] => json!({ "id": seul.id, "title": seul.title, "artist": seul.artist_name }),
+        _ => Value::Null,
+    }
 }
 
 /// Les pochettes de la mosaïque d'un dossier — #5438.
@@ -212,7 +240,7 @@ fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError
             morts.len()
         );
     }
-    let manquants = albums_manquants(collection, &morts);
+    let manquants = albums_manquants(repo, collection, &morts);
     let mut servi = collection.clone();
     if let Some(obj) = servi.as_object_mut() {
         obj.insert("album_count".into(), json!(vivants.len()));
@@ -256,8 +284,20 @@ fn conserver_etiquettes(
     let mut etiquettes = etiquettes_stockees(collection);
     let mut change = false;
     for (id, valeur) in nouvelles {
-        if etiquettes.get(id) != Some(valeur) {
-            etiquettes.insert(id.clone(), valeur.clone());
+        // #5528 — la note « réuni dans » posée par le scan survit au relevé
+        // du nom : elle attend la purge qui établira la disparition.
+        let mut valeur = valeur.clone();
+        if let (Some(reuni), Some(obj)) = (
+            etiquettes
+                .get(id)
+                .and_then(|e| e.get(dossiers::REUNI_DANS))
+                .cloned(),
+            valeur.as_object_mut(),
+        ) {
+            obj.insert(dossiers::REUNI_DANS.into(), reuni);
+        }
+        if etiquettes.get(id) != Some(&valeur) {
+            etiquettes.insert(id.clone(), valeur);
             change = true;
         }
     }
@@ -615,10 +655,17 @@ pub(super) async fn add_album_to_collection(
             }
         }
     }
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    let album = album_repo.get(path.album_id);
+    // #5527 — l'album rangé REMPLACE ses identifiants morts dans ce dossier.
+    let oublies = match &album {
+        Ok(Some(a)) => oublier_les_morts_du_meme_album(&album_repo, collection, a)?,
+        _ => Vec::new(),
+    };
     // #901 — le nom de l'album est lisible MAINTENANT, et seulement
     // maintenant : on le range avec lui. Un album introuvable ou une base
     // muette ne fait pas échouer le rangement, elle laisse l'étiquette vide.
-    let etiquette = match AlbumRepo::with_backend(state.backend.clone()).get(path.album_id) {
+    let etiquette = match album {
         Ok(Some(album)) => Some(etiquette_de(&album)),
         Ok(None) => None,
         Err(e) => {
@@ -640,9 +687,152 @@ pub(super) async fn add_album_to_collection(
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
-    Ok(Json(
-        json!({"added": true, "collection_id": path.id, "album_id": path.album_id}),
-    ))
+    Ok(Json(json!({
+        "added": true,
+        "collection_id": path.id,
+        "album_id": path.album_id,
+        "replaced_album_ids": oublies,
+    })))
+}
+
+/// #5527 (Lulu, fil 1891) — « lorsque je transfère un album manquant de la
+/// bibliothèque vers un répertoire de Collections, cet album figure encore
+/// dans la liste des albums manquants ».
+///
+/// L'album rangé porte un identifiant neuf (rescan, réunion de disques…) ;
+/// l'ancien, mort, restait dans le dossier sous le même titre. Ranger l'album
+/// retire donc du dossier les identifiants MORTS dont l'étiquette désigne le
+/// même album : même artiste, même titre, à la casse, aux accents, à la
+/// ponctuation et au numéro de disque près
+/// ([`dossiers::cle_d_album`]). Un identifiant VIVANT n'est jamais retiré, et
+/// un mort sans étiquette non plus : on ne sait pas ce qu'il était.
+///
+/// Ce n'est pas une purge sur lecture : c'est l'utilisateur qui range l'album
+/// vivant équivalent. Rend les identifiants retirés.
+fn oublier_les_morts_du_meme_album(
+    repo: &AlbumRepo,
+    collection: &mut Value,
+    album: &tune_core::db::models::Album,
+) -> Result<Vec<i64>, AppError> {
+    let Some(cle) = dossiers::cle_d_album(&album.title, album.artist_name.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    let (_, morts) = partager_ids(repo, &ids_stockes(collection))?;
+    let mut etiquettes = etiquettes_stockees(collection);
+    let oublies: Vec<i64> = morts
+        .into_iter()
+        .filter(|id| Some(*id) != album.id)
+        .filter(|id| {
+            etiquettes
+                .get(&id.to_string())
+                .and_then(dossiers::cle_d_etiquette)
+                .is_some_and(|c| c == cle)
+        })
+        .collect();
+    if oublies.is_empty() {
+        return Ok(oublies);
+    }
+    for id in &oublies {
+        etiquettes.remove(&id.to_string());
+    }
+    if let Some(obj) = collection.as_object_mut() {
+        if let Some(arr) = obj.get_mut("album_ids").and_then(|v| v.as_array_mut()) {
+            arr.retain(|v| v.as_i64().is_none_or(|id| !oublies.contains(&id)));
+        }
+        obj.insert(ETIQUETTES.into(), Value::Object(etiquettes));
+    }
+    tracing::info!(
+        "dossier {:?}: album {:?} rangé, identifiant(s) mort(s) du même album retiré(s): {oublies:?} (#5527)",
+        collection.get("id"),
+        album.id
+    );
+    Ok(oublies)
+}
+
+/// `GET /library/collections/{id}/missing` — les albums manquants d'un
+/// dossier, avec de quoi les résoudre (#5527, #5528).
+///
+/// Chaque entrée reprend `orphan_albums` (`id`, `title`, `artist`,
+/// `merged_into`) et y ajoute `candidates` : les albums VIVANTS de même
+/// artiste et de même titre ([`dossiers::cle_d_album`]), à PROPOSER — jamais
+/// substitués d'office. `in_collection` dit si le candidat est déjà rangé
+/// ici : l'entrée morte n'est alors qu'un doublon à oublier.
+///
+/// Toute la bibliothèque est relue pour former les clés : c'est pourquoi
+/// cette lecture est une route à part, demandée à l'ouverture de la liste,
+/// et non un champ de `GET /library/collections`.
+pub(super) async fn collection_missing(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let servi =
+        super::facets::hors_executeur("collection_missing", move || lire_les_manquants(&state, id))
+            .await??;
+    Ok(Json(servi))
+}
+
+/// Combien de remplaçants proposer au plus par album manquant.
+const CANDIDATS_MAX: usize = 5;
+
+fn lire_les_manquants(state: &AppState, id: i64) -> Result<Value, AppError> {
+    let dossiers_stockes = dossiers_stockes(state);
+    let Some(collection) = dossiers_stockes
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id))
+    else {
+        return Err(AppError::not_found("collection not found"));
+    };
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let (vivants, morts) = partager_ids(&repo, &ids_stockes(collection))?;
+    let mut manquants = albums_manquants(&repo, collection, &morts);
+    if manquants.is_empty() {
+        return Ok(json!(manquants));
+    }
+    let etiquettes = etiquettes_stockees(collection);
+    let cles_voulues: std::collections::HashSet<String> = morts
+        .iter()
+        .filter_map(|m| {
+            etiquettes
+                .get(&m.to_string())
+                .and_then(dossiers::cle_d_etiquette)
+        })
+        .collect();
+    let mut par_cle: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    if !cles_voulues.is_empty() {
+        let identites = repo.identites().map_err(|e| {
+            tracing::error!("collections: identités des albums illisibles: {e}");
+            AppError::internal("lecture des albums impossible")
+        })?;
+        for (aid, titre, artiste) in identites {
+            let Some(cle) = dossiers::cle_d_album(&titre, artiste.as_deref()) else {
+                continue;
+            };
+            if !cles_voulues.contains(&cle) {
+                continue;
+            }
+            let liste = par_cle.entry(cle).or_default();
+            if liste.len() < CANDIDATS_MAX {
+                liste.push(json!({
+                    "id": aid,
+                    "title": titre,
+                    "artist": artiste,
+                    "in_collection": vivants.contains(&aid),
+                }));
+            }
+        }
+    }
+    for (entree, mort) in manquants.iter_mut().zip(morts.iter()) {
+        let candidats = etiquettes
+            .get(&mort.to_string())
+            .and_then(dossiers::cle_d_etiquette)
+            .and_then(|c| par_cle.get(&c).cloned())
+            .unwrap_or_default();
+        if let Some(obj) = entree.as_object_mut() {
+            obj.insert("candidates".into(), json!(candidats));
+        }
+    }
+    Ok(json!(manquants))
 }
 
 pub(super) async fn remove_album_from_collection(

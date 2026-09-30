@@ -683,6 +683,11 @@ pub fn router() -> Router<AppState> {
             get(collections::collection_albums),
         )
         .route(
+            // #5527, #5528 — les manquants d'un dossier, avec leurs remplaçants.
+            "/collections/{id}/missing",
+            get(collections::collection_missing),
+        )
+        .route(
             "/collections/{id}/albums/{album_id}",
             post(collections::add_album_to_collection)
                 .delete(collections::remove_album_from_collection),

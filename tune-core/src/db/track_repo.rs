@@ -3396,6 +3396,9 @@ impl TrackRepo {
     /// règle.
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let update_sql = self.dialect_sql(sql::update_du_scan, sql::update_du_scan);
+        // #5528 — relevé AVANT d'écrire : c'est le seul instant où l'on sait
+        // de quel album la piste part.
+        let deplacements = self.deplacements_vers_un_autre_album(tracks);
         let mut count = 0usize;
         // Rows without an id are skipped, so collect the params first and
         // batch them through one execute_many call (see create_batch).
@@ -3466,7 +3469,42 @@ impl TrackRepo {
                 "track_update_failures_truncated"
             );
         }
+        if !deplacements.is_empty()
+            && let Err(e) =
+                super::dossiers_des_collections::noter_les_deplacements(&self.db, &deplacements)
+        {
+            tracing::warn!(error = %e, "collections_deplacements_non_notes (#5528)");
+        }
         Ok(count)
+    }
+
+    /// Les pistes de ce lot qui QUITTENT un album rangé dans un dossier
+    /// « Collections » pour un autre : `(album de départ, album d'arrivée)`.
+    ///
+    /// #5528 — un rescan qui réunit des disques (fichiers retagués, même
+    /// chemin) change l'`album_id` des pistes, puis la purge de fin de scan
+    /// supprime les albums vidés. Rien ne disait où leurs pistes étaient
+    /// passées, et le dossier gardait un identifiant mort. Rien n'est lu
+    /// quand aucun dossier ne range d'album : c'est le cas ordinaire.
+    fn deplacements_vers_un_autre_album(&self, tracks: &[Track]) -> Vec<(i64, i64)> {
+        let pistes: Vec<(i64, i64)> = tracks
+            .iter()
+            .filter_map(|t| Some((t.id?, t.album_id?)))
+            .collect();
+        if pistes.is_empty() {
+            return Vec::new();
+        }
+        let releve =
+            super::dossiers_des_collections::albums_ranges(&self.db).and_then(|r| match r {
+                Some(ranges) => super::dossiers_des_collections::deplacements_a_venir(
+                    &self.db, &pistes, &ranges,
+                ),
+                None => Ok(Vec::new()),
+            });
+        releve.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "collections_deplacements_illisibles (#5528)");
+            Vec::new()
+        })
     }
 
     /// Écrit la pochette PROPRE des pistes qui en portent une, et seulement
