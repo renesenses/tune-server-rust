@@ -1832,9 +1832,30 @@ mod tests {
         let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
         let album_repo = AlbumRepo::with_backend(backend.clone());
 
+        // #5394 — les deux images ont la même taille ET la même date : leur
+        // empreinte « mtime:taille » (`pochette_disque::empreinte_du_fichier`,
+        // secondes entières) est identique, le remplacement est invisible à un
+        // `stat`. C'est le cas que seul le « Scan complet » rattrape. Sans date
+        // fixée, le test dépendait de l'horloge : deux écritures de part et
+        // d'autre d'un changement de seconde donnaient deux empreintes, et le
+        // scan ordinaire suivait alors — à bon droit depuis #5034 — l'image
+        // changée, ce qui faisait rougir le témoin.
         let dossier = tmp.path().join("Bilou").join("Album");
         std::fs::create_dir_all(&dossier).unwrap();
-        std::fs::write(dossier.join("cover.jpg"), b"ANCIENNE-POCHETTE").unwrap();
+        let ecrire_cover = |octets: &[u8]| {
+            let image = dossier.join("cover.jpg");
+            std::fs::write(&image, octets).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&image)
+                .and_then(|f| {
+                    f.set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+                    )
+                })
+                .expect("date de modification");
+        };
+        ecrire_cover(b"ANCIENNE-POCHETTE");
         let chemin = dossier
             .join("01 - titre.flac")
             .to_string_lossy()
@@ -1859,7 +1880,7 @@ mod tests {
         let ancien = album_repo.get(aid).unwrap().unwrap().cover_path.unwrap();
 
         // L'utilisateur remplace l'image sur son disque.
-        std::fs::write(dossier.join("cover.jpg"), b"NOUVELLE-POCHETTE").unwrap();
+        ecrire_cover(b"NOUVELLE-POCHETTE");
 
         // TÉMOIN — scan ordinaire : rien ne bouge, l'URL distribuée tient.
         let mut ordinaire =
