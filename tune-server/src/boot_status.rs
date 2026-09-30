@@ -27,14 +27,59 @@ use tune_core::db::migration_status::{self, MigrationProgress};
 /// Étape de démarrage en cours, affichée tant que le serveur ne sert pas.
 static PHASE: LazyLock<Mutex<&'static str>> = LazyLock::new(|| Mutex::new("démarrage"));
 
+/// Ce que l'étape en cours est en train de traiter — aujourd'hui le greffon
+/// en cours de chargement (#5370). Remis à zéro à chaque changement d'étape.
+static CURRENT: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
 /// Déclare l'étape de démarrage en cours (voir `bootstrap.rs`).
 pub fn set_phase(phase: &'static str) {
     *PHASE.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+    set_current(None);
 }
 
 /// L'étape de démarrage en cours.
 pub fn phase() -> &'static str {
     *PHASE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Déclare ce que l'étape en cours traite (le greffon en cours de chargement).
+pub fn set_current(current: Option<&str>) {
+    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = current.map(str::to_string);
+}
+
+/// Ce que l'étape en cours traite, s'il y a lieu.
+pub fn current() -> Option<String> {
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Ce que fait chaque étape de `bootstrap.rs`, en une phrase.
+///
+/// #5370 — la page disait « Cela peut prendre quelques minutes sur une grande
+/// bibliothèque » quelle que soit l'étape, jusque pendant « greffons » : un
+/// testeur (603 834 pistes) a demandé, à juste titre, quel rapport il y avait
+/// entre la taille de sa bibliothèque et les greffons. La taille de la
+/// bibliothèque n'est citée que là où elle compte : la base de données, dont
+/// la mise à niveau parcourt les tables.
+fn phase_detail(phase: &str) -> &'static str {
+    match phase {
+        "démarrage" => "Tune prépare son démarrage.",
+        "attente du disque de données" => {
+            "Tune attend le disque qui contient ses données. Vérifiez qu'il est branché."
+        }
+        "base de données" => {
+            "Tune ouvre sa base de données et la met à niveau si besoin. \
+             Cela peut prendre quelques minutes sur une grande bibliothèque."
+        }
+        "configuration" => "Tune restaure ses réglages et ses zones.",
+        "partages réseau" => {
+            "Tune remonte les partages réseau de la bibliothèque. \
+             Un partage lent ou injoignable peut retarder cette étape."
+        }
+        "sorties audio" => "Tune recherche les sorties audio de cette machine.",
+        "greffons" => "Tune charge ses greffons, un par un.",
+        "découverte réseau" => "Tune se prépare à découvrir les appareils du réseau.",
+        _ => "Tune termine son démarrage.",
+    }
 }
 
 /// Le répondeur de démarrage ; [`stop`](BootResponder::stop) le termine.
@@ -98,7 +143,13 @@ fn answer(mut stream: TcpStream) {
     let head = String::from_utf8_lossy(&buf[..read]);
     let path = request_path(&head).unwrap_or("/");
 
-    let body = response(path, phase(), migration_status::snapshot());
+    let current = current();
+    let body = response(
+        path,
+        phase(),
+        current.as_deref(),
+        migration_status::snapshot(),
+    );
     let _ = stream.write_all(body.as_bytes());
     let _ = stream.flush();
 }
@@ -114,7 +165,12 @@ fn wants_json(path: &str) -> bool {
 }
 
 /// La réponse HTTP complète servie pendant le démarrage.
-fn response(path: &str, phase: &str, progress: Option<MigrationProgress>) -> String {
+fn response(
+    path: &str,
+    phase: &str,
+    current: Option<&str>,
+    progress: Option<MigrationProgress>,
+) -> String {
     let detail = progress.as_ref().map(|p| p.describe());
     let (content_type, body) = if wants_json(path) {
         (
@@ -124,7 +180,7 @@ fn response(path: &str, phase: &str, progress: Option<MigrationProgress>) -> Str
     } else {
         (
             "text/html; charset=utf-8",
-            html_body(phase, detail.as_deref()),
+            html_body(phase, current, detail.as_deref()),
         )
     };
 
@@ -199,9 +255,36 @@ fn json_body(phase: &str, progress: &Option<MigrationProgress>) -> String {
     .to_string()
 }
 
-fn html_body(phase: &str, detail: Option<&str>) -> String {
-    let detail =
-        detail.unwrap_or("Cela peut prendre quelques minutes sur une grande bibliothèque.");
+/// Échappe le texte inséré dans la page : un nom de greffon vient d'un
+/// manifeste wasm, c'est-à-dire d'un fichier que Tune n'a pas écrit.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn html_body(phase: &str, current: Option<&str>, detail: Option<&str>) -> String {
+    // Une migration en cours dit mieux que quiconque ce qui se passe ; sinon,
+    // la phrase propre à l'étape.
+    let detail = detail.unwrap_or_else(|| phase_detail(phase));
+    let current = match current {
+        Some(name) if phase == "greffons" => {
+            format!(
+                "<p>Greffon en cours de chargement : {}.</p>",
+                escape_html(name)
+            )
+        }
+        _ => String::new(),
+    };
     format!(
         "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\">\
          <meta http-equiv=\"refresh\" content=\"3\">\
@@ -211,7 +294,7 @@ fn html_body(phase: &str, detail: Option<&str>) -> String {
          display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}}\
          .c{{max-width:32rem;padding:2rem}}h1{{font-size:1.4rem;font-weight:600}}\
          p{{color:#aaa;line-height:1.6}}</style></head><body><div class=\"c\">\
-         <h1>Tune démarre…</h1><p>Étape en cours : {phase}.</p><p>{detail}</p>\
+         <h1>Tune démarre…</h1><p>Étape en cours : {phase}.</p>{current}<p>{detail}</p>\
          <p>Ne fermez pas l'application : cette page se rafraîchit toute seule.</p>\
          </div></body></html>"
     )
@@ -240,7 +323,7 @@ mod tests {
             step: "upgrade_fts5_tables".to_string(),
             elapsed: Duration::from_secs(61),
         };
-        let raw = response("/api/v1/zones", "base de données", Some(progress));
+        let raw = response("/api/v1/zones", "base de données", None, Some(progress));
         assert!(
             raw.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
             "{raw}"
@@ -271,10 +354,11 @@ mod tests {
     /// premières secondes du démarrage.
     #[test]
     fn le_client_qui_attend_une_mise_a_jour_lit_la_version_qui_demarre() {
-        let sans_migration = response("/api/v1/system/update/status", "démarrage", None);
+        let sans_migration = response("/api/v1/system/update/status", "démarrage", None, None);
         let avec_migration = response(
             "/api/v1/system/update/status",
             "base de données",
+            None,
             Some(MigrationProgress {
                 engine: "sqlite",
                 done: 0,
@@ -306,7 +390,7 @@ mod tests {
     /// c'est tout ce qui séparait « ça travaille » de « c'est planté » (#1701).
     #[test]
     fn browsers_get_a_self_refreshing_page_that_says_what_is_happening() {
-        let raw = response("/", "base de données", None);
+        let raw = response("/", "base de données", None, None);
         assert!(raw.contains("text/html"), "{raw}");
         let body = raw.split("\r\n\r\n").nth(1).expect("corps absent");
         assert!(body.contains("Tune démarre"), "{body}");
@@ -320,6 +404,76 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .expect("Content-Length absent");
         assert_eq!(declared, body.len());
+    }
+
+    /// Les étapes que `bootstrap.rs` pose réellement, dans l'ordre.
+    const ETAPES: [&str; 8] = [
+        "démarrage",
+        "attente du disque de données",
+        "base de données",
+        "configuration",
+        "partages réseau",
+        "sorties audio",
+        "greffons",
+        "découverte réseau",
+    ];
+
+    /// #5370 — chaque étape a sa phrase, et la taille de la bibliothèque
+    /// n'est citée que pendant la base de données.
+    #[test]
+    fn chaque_etape_dit_ce_quelle_fait_et_la_bibliotheque_seulement_pour_la_base() {
+        let mut phrases = std::collections::HashSet::new();
+        for etape in ETAPES {
+            let page = html_body(etape, None, None);
+            assert!(
+                page.contains(&format!("Étape en cours : {etape}.")),
+                "{page}"
+            );
+            let phrase = phase_detail(etape);
+            assert!(page.contains(phrase), "{etape} : phrase absente de {page}");
+            assert!(
+                phrases.insert(phrase),
+                "{etape} partage sa phrase : {phrase}"
+            );
+            assert_eq!(
+                page.contains("grande bibliothèque"),
+                etape == "base de données",
+                "la taille de la bibliothèque ne compte que pour la base, \
+                 pas pour « {etape} » : {page}"
+            );
+        }
+        assert!(
+            html_body("greffons", None, None).contains("greffons"),
+            "la phrase des greffons doit parler des greffons"
+        );
+        // Une étape inconnue (ajoutée sans phrase) ne ment pas non plus.
+        let inconnue = html_body("étape future", None, None);
+        assert!(!inconnue.contains("bibliothèque"), "{inconnue}");
+    }
+
+    /// #5370 — pendant « greffons », la page nomme le greffon en cours.
+    #[test]
+    fn la_page_nomme_le_greffon_en_cours_de_chargement() {
+        let page = html_body("greffons", Some("tune-diretta"), None);
+        assert!(
+            page.contains("Greffon en cours de chargement : tune-diretta."),
+            "{page}"
+        );
+        // Le nom vient parfois d'un manifeste wasm : il est échappé.
+        let page = html_body("greffons", Some("<b>x</b>"), None);
+        assert!(page.contains("&lt;b&gt;x&lt;/b&gt;"), "{page}");
+        assert!(!page.contains("<b>x</b>"), "{page}");
+        // Hors de l'étape des greffons, rien n'est nommé.
+        let page = html_body("découverte réseau", Some("tune-diretta"), None);
+        assert!(!page.contains("tune-diretta"), "{page}");
+    }
+
+    /// Une migration en cours garde la main sur l'explication.
+    #[test]
+    fn une_migration_en_cours_remplace_la_phrase_de_l_etape() {
+        let page = html_body("base de données", None, Some("Mise à niveau 5/12"));
+        assert!(page.contains("Mise à niveau 5/12"), "{page}");
+        assert!(!page.contains(phase_detail("base de données")), "{page}");
     }
 
     /// Le vrai test du bug : une connexion qui arrive pendant le démarrage
