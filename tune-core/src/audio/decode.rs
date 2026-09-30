@@ -1325,6 +1325,40 @@ pub fn decode_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    let decoded = decode_natif(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        seek_s,
+        max_duration_s,
+    )?;
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+}
+
+/// L'adaptation commune de [`decode_to_pcm`] (canaux puis cadence), appliquée
+/// à un décodage NATIF de [`decode_natif`].
+///
+/// #5519 — `decode_to_pcm(f, r, c, s, d)` vaut EXACTEMENT
+/// `adapter_pcm(decode_natif(f, r, c, s, d)?, r, c)` : c'est sa définition.
+/// L'analyse ReplayGain s'en sert pour tirer l'empreinte et son premier
+/// segment d'UN seul décodage, au bit près.
+pub(crate) fn adapter_pcm(
+    decoded: DecodedAudio,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+) -> Result<DecodedAudio, String> {
+    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+}
+
+/// Le décodage de [`decode_to_pcm`] AVANT l'adaptation : cadence et canaux du
+/// fichier (sauf DSD, dont le décodeur vise directement `target_sample_rate`).
+pub(crate) fn decode_natif(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
     if target_sample_rate == Some(0) {
         return Err("requested PCM sample rate must be greater than zero".into());
     }
@@ -1462,7 +1496,7 @@ pub fn decode_to_pcm(
         );
     }
 
-    adapt_decoded_audio(decoded, target_sample_rate, target_channels)
+    Ok(decoded)
 }
 
 /// Sniff whether an Ogg stream carries Opus (`OpusHead`) rather than Vorbis.

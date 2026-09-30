@@ -21,6 +21,7 @@ mod premium_audio_host;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
+pub mod diag_qobuz;
 pub mod digest;
 pub mod discogs;
 pub mod eq_pro;
@@ -433,7 +434,12 @@ pub fn router_with_plugins(
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())
-        .nest("/streaming", streaming::router())
+        // #5530 — sonde de diagnostic, réservée à l'administrateur : l'arbre
+        // des clés de `album/get` / `track/get`, sans leurs valeurs.
+        .nest(
+            "/streaming",
+            streaming::router().route("/qobuz/debug/raw-keys", get(diag_qobuz::cles_brutes)),
+        )
         .nest("/profiles", profiles::router())
         .nest("/tags", tags::router())
         .nest("/metadata", metadata::router())

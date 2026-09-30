@@ -7055,6 +7055,9 @@ mod cadence_du_flux_compresse;
 mod decodage_en_continu;
 #[cfg(test)]
 mod decodage_en_continu_5439;
+// #5550 — le même chemin, sur une source 24 bits : bit-perfect jusqu'au puits.
+#[cfg(test)]
+mod decodage_en_continu_24bits_5550;
 #[cfg(test)]
 mod flux_compresse_a_la_cadence_source_5439;
 

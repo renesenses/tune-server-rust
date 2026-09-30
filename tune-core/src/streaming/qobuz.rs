@@ -16,6 +16,14 @@ const REMOTE_CONFIG_URL: &str = "https://mozaiklabs.fr/storage/api/v1/streaming-
 /// affiche déjà : une page de plus est une page qu'on voit apparaître.
 const QOBUZ_TAILLE_DE_PAGE: &str = "50";
 
+/// Les deux ressources que la sonde de diagnostic peut demander à Qobuz
+/// (#5530) — voir [`QobuzService::reponse_brute_de_diagnostic`].
+#[derive(Clone, Copy, Debug)]
+pub enum RessourceBrute<'a> {
+    Album(&'a str),
+    Piste(&'a str),
+}
+
 pub struct QobuzService {
     client: Client,
     app_id: String,
@@ -824,6 +832,34 @@ impl QobuzService {
                 None => Err(e),
             },
         }
+    }
+
+    /// La réponse BRUTE de `/album/get` ou `/track/get`, pour la sonde de
+    /// diagnostic `GET /streaming/qobuz/debug/raw-keys` (#5530).
+    ///
+    /// Deux ressources seulement, fixées ici : la route ne peut pas servir de
+    /// relais vers un chemin Qobuz arbitraire. Pas de cache — on veut ce que
+    /// Qobuz rend maintenant — et l'album est borné à 100 pistes, ce qui suffit
+    /// à voir l'union de leurs clés.
+    ///
+    /// En cas d'échec, seul le code HTTP remonte : le message d'erreur de
+    /// `reqwest` porte l'URL complète, `app_id` compris, et la sonde promet de
+    /// ne rendre aucune URL.
+    pub async fn reponse_brute_de_diagnostic(
+        &self,
+        ressource: RessourceBrute<'_>,
+    ) -> Result<serde_json::Value, Option<u16>> {
+        let resultat = match ressource {
+            RessourceBrute::Album(id) => {
+                self.api_get_avec_statut("/album/get", &[("album_id", id), ("limit", "100")])
+                    .await
+            }
+            RessourceBrute::Piste(id) => {
+                self.api_get_avec_statut("/track/get", &[("track_id", id)])
+                    .await
+            }
+        };
+        resultat.map_err(|(statut, _message)| statut)
     }
 
     /// La réponse de `/album/get` pour cet album — une seule fois par album.

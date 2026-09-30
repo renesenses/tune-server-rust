@@ -3601,10 +3601,8 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
     );
     // #4800 — l'en-tête de ce fichier se lit, et une trame le suit : le
     // conteneur est réécrit sans décodage, et l'écran le dit.
-    assert!(
-        transcoder["detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("trames copiées telles quelles")),
+    assert_eq!(
+        transcoder["detail"], DETAIL_FLAC_ENTETE_NEUF,
         "{transcoder}"
     );
     assert!(
@@ -3612,6 +3610,33 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
         "le résumé ne doit plus annoncer un passthrough : {sp}"
     );
     assert_eq!(verdict(&sp), Some(true), "aucun échantillon touché : {sp}");
+}
+
+/// Le détail nomme-t-il ffmpeg, sous l'un de ses noms ?
+fn nomme_ffmpeg(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    d.contains("ffmpeg") || d.contains("lavf")
+}
+
+/// #5525 — Tune ne lance aucun ffmpeg pour servir ce FLAC : il refait
+/// l'en-tête en Rust. Le chemin du signal ne doit donc pas le nommer — sinon
+/// il se lit « Tune a réécrit le FLAC avec ffmpeg » (réunion Yves, 30/09).
+#[test]
+fn le_conteneur_reecrit_ne_nomme_pas_ffmpeg_5525() {
+    for detail in [DETAIL_FLAC_ENTETE_NEUF, DETAIL_FLAC_REENCODE] {
+        assert!(!nomme_ffmpeg(detail), "le détail nomme ffmpeg : {detail}");
+        assert!(
+            detail.contains("Tune"),
+            "le détail doit dire qui réécrit : {detail}"
+        );
+    }
+    // Contre-épreuve : l'ancien texte, lui, est bien attrapé.
+    for ancien in [
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles",
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte",
+    ] {
+        assert!(nomme_ffmpeg(ancien), "la garde doit attraper : {ancien}");
+    }
 }
 
 /// Les contre-épreuves : ce qui ne part PAS ré-encodé ne doit pas l'annoncer.
@@ -4304,5 +4329,113 @@ fn entree_audio_en_direct_dit_sa_compensation_et_ne_revendique_pas_le_bit_perfec
 
     for sid in ["ea-0", "ea-2", "ea-r"] {
         tune_core::source_pcm::retirer_direct(sid);
+    }
+}
+
+// ── #5524 — « Fréquence max par zone » : même famille sous le plafond ──
+//
+// Yves Corbat, Ruark Audio R5 (DLNA) : la zone doit pouvoir être limitée à
+// 44,1 kHz. Le réglage `max_sample_rate` existait ; la cadence servie était
+// le plafond LUI-MÊME. Elle est désormais la plus haute cadence de la
+// famille de la source (44,1 ou 48) qui tient sous le plafond, et le plafond
+// quand aucune ne tient. La VRAIE décision de l'orchestrateur et le panneau
+// du chemin du signal sont lus sur la même base, la même zone, la même piste.
+
+/// Joue une piste FLAC `source_hz`/24 bits sur une zone DLNA plafonnée à
+/// `plafond` et rend (décision, chemin du signal).
+async fn plafond_5524(
+    source_hz: i32,
+    plafond: Option<u32>,
+) -> (tune_core::orchestrator::ResolvedQueueItem, Value) {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_max_sample_rate(zone_id, plafond).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        zone.max_sample_rate, plafond,
+        "témoin : le réglage est persisté"
+    );
+    let track_id = piste_flac(&backend, source_hz, 24);
+    let r = decision(&backend, zone_id, track_id).await;
+    let sp = build_signal_path(
+        &en_lecture(track_id, "flac", source_hz as u32, 24),
+        &zone,
+        &backend,
+        Some("Ruark R5"),
+        "",
+        None,
+    )
+    .unwrap();
+    (r, sp)
+}
+
+fn resampler_to_hz(sp: &Value) -> Option<u64> {
+    sp.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Resampler"))
+        .and_then(|s| s.get("to_hz").and_then(Value::as_u64))
+}
+
+#[tokio::test]
+async fn frequence_max_5524_les_cas_de_la_demande() {
+    for (source, plafond, attendu) in [
+        (96_000, 44_100, 44_100),
+        (88_200, 44_100, 44_100),
+        (192_000, 96_000, 96_000),
+        (48_000, 44_100, 44_100),
+    ] {
+        let (r, sp) = plafond_5524(source, Some(plafond)).await;
+        assert_eq!(
+            r.sample_rate,
+            Some(attendu),
+            "{source} Hz sous {plafond} Hz : cadence servie"
+        );
+        assert_eq!(
+            r.mime_type, "audio/flac",
+            "{source}/{plafond} : le sans-perte reste FLAC"
+        );
+        assert_eq!(
+            r.bit_depth,
+            Some(24),
+            "{source}/{plafond} : profondeur conservée"
+        );
+        assert_eq!(
+            resampler_to_hz(&sp),
+            Some(attendu as u64),
+            "{source}/{plafond} : le chemin du signal nomme la cadence servie : {sp}"
+        );
+        assert_eq!(
+            verdict(&sp),
+            Some(false),
+            "rééchantillonné : pas bit-perfect"
+        );
+    }
+}
+
+/// La règle de famille elle-même : 176,4 sous 96 part en 88,2 (÷2), et non
+/// en 96 comme le faisait `out_sr = max_sr`.
+#[tokio::test]
+async fn frequence_max_5524_reste_dans_la_famille_de_la_source() {
+    for (source, plafond, attendu) in [(176_400, 96_000, 88_200), (192_000, 88_200, 48_000)] {
+        let (r, sp) = plafond_5524(source, Some(plafond)).await;
+        assert_eq!(r.sample_rate, Some(attendu), "{source} sous {plafond}");
+        assert_eq!(r.bit_depth, Some(24));
+        assert_eq!(resampler_to_hz(&sp), Some(attendu as u64), "{sp}");
+        assert_eq!(
+            step_desc(&sp, "Resampler").as_deref(),
+            Some(format!("{}kHz \u{2192} {}kHz", source / 1000, attendu / 1000).as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn frequence_max_5524_auto_ne_change_rien() {
+    for source in [44_100, 48_000, 96_000, 192_000] {
+        let (r, sp) = plafond_5524(source, None).await;
+        assert_eq!(r.sample_rate, Some(source as u32), "Auto, {source}");
+        assert_eq!(r.bit_depth, Some(24));
+        assert_eq!(step_desc(&sp, "Resampler"), None, "Auto, {source} : {sp}");
     }
 }

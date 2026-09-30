@@ -192,6 +192,9 @@ pub async fn run_with(opts: RunOptions) {
         .expect("Failed to install rustls CryptoProvider");
 
     let config = TuneConfig::load();
+    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
+    // pas la configuration sous la main.
+    crate::chemins_de_donnees::retenir(&config);
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
 
@@ -357,8 +360,9 @@ pub async fn run_with(opts: RunOptions) {
         settings.set("server_last_alive_at", &now.to_string()).ok();
     }
 
-    // Auto-scan music directories at startup
-    let scan_done = if config.auto_scan {
+    // Auto-scan music directories at startup — et, même sans `auto_scan`,
+    // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
+    let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
         Some(crate::auto_scan::spawn_auto_scan(
             state.backend.clone(),
             state.event_bus.clone(),

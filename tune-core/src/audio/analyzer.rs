@@ -311,6 +311,31 @@ impl DrAccumulator {
     }
 }
 
+/// Somme des carrés des `n` premiers échantillons de la file, DANS L'ORDRE.
+///
+/// #5519 — même valeur, au bit près, que
+/// `buf.iter().take(n).map(|s| s * s).sum::<f64>()` : la même suite
+/// d'additions, de gauche à droite, sur les deux tranches contiguës de la file
+/// au lieu de son itérateur. Seul le coût change.
+fn somme_des_carres(buf: &std::collections::VecDeque<f64>, n: usize) -> f64 {
+    let (a, b) = buf.as_slices();
+    let (a, b) = if a.len() >= n {
+        (&a[..n], &b[..0])
+    } else {
+        (a, &b[..(n - a.len()).min(b.len())])
+    };
+    // `-0.0`, comme `Iterator::sum` pour `f64` : sans quoi une file vide
+    // rendrait `+0.0` au lieu de `-0.0`, un bit de différence.
+    let mut somme = -0.0_f64;
+    for s in a {
+        somme += s * s;
+    }
+    for s in b {
+        somme += s * s;
+    }
+    somme
+}
+
 /// Streaming EBU R128 (BS.1770-4) integrated-loudness + sample-peak accumulator.
 ///
 /// Feed interleaved, normalized (`[-1, 1]`) f64 samples in any chunking — the
@@ -413,12 +438,8 @@ impl LoudnessAccumulator {
         while self.bufs[0].len() >= self.block_frames {
             let mut power_sum = 0.0;
             for c in 0..self.channels {
-                let ms: f64 = self.bufs[c]
-                    .iter()
-                    .take(self.block_frames)
-                    .map(|s| s * s)
-                    .sum::<f64>()
-                    / self.block_frames as f64;
+                let ms: f64 =
+                    somme_des_carres(&self.bufs[c], self.block_frames) / self.block_frames as f64;
                 power_sum += ms; // channel weight = 1.0 (mono/stereo)
             }
             self.block_powers.push(power_sum);
@@ -552,6 +573,126 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64
 /// que ses canaux n'ont pas deux pics de bloc distincts — jamais une valeur
 /// inventée.
 pub async fn mesurer_intensite_et_plage(file_path: &str) -> Option<(f64, f64, f64, Option<u32>)> {
+    mesurer_a_partir_de(file_path, None).await
+}
+
+/// Une mesure, suivie de l'empreinte que son décodage a permis de tirer.
+pub struct MesureEtEmpreinte {
+    /// Ce que rendrait [`mesurer_intensite_et_plage`], au bit près.
+    pub mesure: Option<(f64, f64, f64, Option<u32>)>,
+    /// Ce que rendrait `empreinte::empreinte_du_fichier`, au bit près — ou
+    /// `None` quand ce décodage ne permet pas de la tirer (format hors du
+    /// chemin partagé, tâche interrompue) : l'appelant la calcule alors à part,
+    /// comme avant.
+    pub empreinte: Option<Result<Option<super::empreinte::Empreinte>, String>>,
+}
+
+/// Les formats que décode `decode_symphonia`, dont le décodage de tête est un
+/// PRÉFIXE exact d'un décodage plus long (même paquets, troncature au même
+/// échantillon). Mesuré sur 40 FLAC réels (#5519, banc étage E : préfixe exact
+/// 40/40). Tout le reste (DSD, dont le décodeur vise la cadence demandée ;
+/// AIFF, APE, WavPack, Opus, Ogg, Matroska…) garde ses deux décodages.
+fn empreinte_partageable(file_path: &str) -> bool {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "flac" | "wav" | "mp3" | "m4a")
+}
+
+/// Les `secondes` premières d'un décodage natif, découpées EXACTEMENT comme
+/// `decode_symphonia` tronque un décodage borné à `secondes`.
+fn tete_du_decodage(
+    natif: &super::decode::DecodedAudio,
+    secondes: f64,
+) -> super::decode::DecodedAudio {
+    let max = (secondes * natif.sample_rate as f64 * natif.channels as f64) as usize;
+    let samples = natif.samples_i32[..max.min(natif.samples_i32.len())].to_vec();
+    let frames = samples.len() as f64 / natif.channels.max(1) as f64;
+    super::decode::DecodedAudio {
+        duration_s: if natif.sample_rate > 0 {
+            frames / natif.sample_rate as f64
+        } else {
+            0.0
+        },
+        samples_i32: samples,
+        bit_depth: natif.bit_depth,
+        sample_rate: natif.sample_rate,
+        channels: natif.channels,
+        integrite: Default::default(),
+    }
+}
+
+/// [`mesurer_intensite_et_plage`] ET l'empreinte du contenu, sur UN décodage
+/// de tête au lieu de deux (#5519).
+///
+/// La passe ReplayGain décodait la tête de chaque fichier deux fois : 30 s pour
+/// le premier segment de la mesure, puis 90 s pour l'empreinte. Ici, la tête
+/// de 90 s est décodée UNE fois : l'empreinte en est tirée exactement comme
+/// `empreinte_du_fichier` la tirerait, et le premier segment de la mesure en
+/// est le préfixe de 30 s. Les segments suivants, eux, sont décodés comme
+/// avant, par `seek` : ils ne sont PAS la suite exacte d'un décodage d'un seul
+/// tenant (seek grossier, banc étage E : 0/40), les prendre dans la tête
+/// changerait le gain.
+///
+/// Gardé par `la_mesure_partagee_rend_les_memes_valeurs_au_bit_pres`.
+pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEmpreinte {
+    const SEG_SECONDS: f64 = 30.0;
+    if !empreinte_partageable(file_path) {
+        return MesureEtEmpreinte {
+            mesure: mesurer_intensite_et_plage(file_path).await,
+            empreinte: None,
+        };
+    }
+    let path = file_path.to_string();
+    let tete = tokio::task::spawn_blocking(move || {
+        let natif = super::decode::decode_natif(
+            &path,
+            Some(super::empreinte::TAUX),
+            Some(1),
+            0.0,
+            super::empreinte::FENETRE_DECODEE_S,
+        );
+        match natif {
+            Err(e) => (Err(e.clone()), Err(e)),
+            Ok(natif) => {
+                let segment = super::decode::adapter_pcm(
+                    tete_du_decodage(&natif, SEG_SECONDS),
+                    None,
+                    Some(2),
+                );
+                let empreinte = super::empreinte::empreinte_d_un_decodage_natif(natif);
+                (segment, empreinte)
+            }
+        }
+    })
+    .await;
+    let Ok((segment, empreinte)) = tete else {
+        // Tâche interrompue : ni mesure ni empreinte de ce décodage-ci.
+        return MesureEtEmpreinte {
+            mesure: None,
+            empreinte: None,
+        };
+    };
+    let mesure = match segment {
+        Ok(premier) => mesurer_a_partir_de(file_path, Some(premier)).await,
+        // Même issue que `mesurer_intensite_et_plage` sur un premier segment
+        // qui ne se décode pas.
+        Err(_) => None,
+    };
+    MesureEtEmpreinte {
+        mesure,
+        empreinte: Some(empreinte),
+    }
+}
+
+/// Le corps de [`mesurer_intensite_et_plage`]. `premier` : le premier segment
+/// déjà décodé (seek 0, 30 s, stéréo), ou `None` pour le décoder ici.
+async fn mesurer_a_partir_de(
+    file_path: &str,
+    mut premier: Option<super::decode::DecodedAudio>,
+) -> Option<(f64, f64, f64, Option<u32>)> {
     // Analyse in bounded time segments and stream them through the accumulator,
     // so memory never scales with track length. Decoding a whole long 24/192
     // track into RAM cost several GB and OOM-killed the server in a crash-loop
@@ -574,13 +715,18 @@ pub async fn mesurer_intensite_et_plage(file_path: &str) -> Option<(f64, f64, f6
             warn!(file = file_path, seek, "loudness_analysis_seek_cap_hit");
             break;
         }
-        let path = file_path.to_string();
-        let decoded = tokio::task::spawn_blocking(move || {
-            super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
-        })
-        .await
-        .ok()?
-        .ok()?;
+        let decoded = match premier.take() {
+            Some(d) => d,
+            None => {
+                let path = file_path.to_string();
+                tokio::task::spawn_blocking(move || {
+                    super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
+                })
+                .await
+                .ok()?
+                .ok()?
+            }
+        };
 
         let sample_rate = decoded.sample_rate as usize;
         let channels = decoded.channels as usize;
@@ -816,6 +962,131 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un WAV 16 bits stéréo à 44,1 kHz dont l'enveloppe varie (l'empreinte
+    /// a donc quelque chose à dire), plus long que la fenêtre d'empreinte.
+    fn ecrire_wav_module(path: &std::path::Path, secondes: usize) {
+        const HZ: usize = 44_100;
+        let frames = HZ * secondes;
+        let mut donnees = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            let t = i as f64 / HZ as f64;
+            let enveloppe =
+                0.2 + 0.7 * (0.5 + 0.5 * (t * 1.3).sin()) * (0.5 + 0.5 * (t * 0.17).cos());
+            let g = (enveloppe * (t * 440.0 * std::f64::consts::TAU).sin() * 30_000.0) as i16;
+            let d = (enveloppe * (t * 660.0 * std::f64::consts::TAU).sin() * 20_000.0) as i16;
+            donnees.extend_from_slice(&g.to_le_bytes());
+            donnees.extend_from_slice(&d.to_le_bytes());
+        }
+        let mut w = Vec::with_capacity(donnees.len() + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&(HZ as u32).to_le_bytes());
+        w.extend_from_slice(&((HZ * 4) as u32).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(path, w).unwrap();
+    }
+
+    fn bits(m: Option<(f64, f64, f64, Option<u32>)>) -> Option<(u64, u64, u64, Option<u32>)> {
+        m.map(|(a, b, c, d)| (a.to_bits(), b.to_bits(), c.to_bits(), d))
+    }
+
+    /// #5519 — la mesure partagée (un décodage de tête pour la mesure ET
+    /// l'empreinte) rend les MÊMES valeurs, au bit près, que les deux appels
+    /// séparés d'avant — sur une piste plus longue que la fenêtre d'empreinte
+    /// (le préfixe et les segments suivants comptent) et sur une piste plus
+    /// courte qu'un segment.
+    #[tokio::test]
+    async fn la_mesure_partagee_rend_les_memes_valeurs_au_bit_pres() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for secondes in [95usize, 20] {
+            let f = dir.path().join(format!("module_{secondes}.wav"));
+            ecrire_wav_module(&f, secondes);
+            let chemin = f.to_str().unwrap();
+
+            let avant_mesure = mesurer_intensite_et_plage(chemin).await;
+            let avant_empreinte = crate::audio::empreinte::empreinte_du_fichier(chemin);
+            assert!(
+                avant_mesure.is_some(),
+                "{secondes} s : la mesure de référence existe"
+            );
+            assert!(
+                matches!(avant_empreinte, Ok(Some(_))),
+                "{secondes} s : l'empreinte de référence existe"
+            );
+
+            let partagee = mesurer_intensite_plage_et_empreinte(chemin).await;
+            assert_eq!(
+                bits(partagee.mesure),
+                bits(avant_mesure),
+                "{secondes} s : la mesure partagée diffère de la mesure séparée"
+            );
+            assert_eq!(
+                partagee.empreinte,
+                Some(avant_empreinte),
+                "{secondes} s : l'empreinte partagée diffère de empreinte_du_fichier"
+            );
+        }
+    }
+
+    /// Un format hors du chemin partagé garde ses deux décodages : pas
+    /// d'empreinte tirée d'ici, l'appelant la calcule à part.
+    #[test]
+    fn le_dsd_n_est_pas_sur_le_chemin_partage() {
+        assert!(!empreinte_partageable("/m/a.dsf"));
+        assert!(!empreinte_partageable("/m/a.ape"));
+        assert!(!empreinte_partageable("/m/a.opus"));
+        assert!(empreinte_partageable("/m/a.FLAC"));
+    }
+
+    /// #5519 — la somme des carrés par tranches rend la valeur de l'ancienne
+    /// forme AU BIT PRÈS, y compris quand la file fait le tour de son tampon
+    /// (deux tranches) et quand `n` ne prend qu'une partie de la seconde.
+    /// Une accélération qui changerait le dernier bit changerait, sur une
+    /// valeur arrondie au dixième, le gain d'une piste de temps en temps.
+    #[test]
+    fn la_somme_des_carres_par_tranches_est_identique_au_bit_pres() {
+        let mut graine: u64 = 0x5519;
+        let mut suivant = || {
+            graine = graine
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((graine >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let mut file: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(64);
+        let mut tours_avec_deux_tranches = 0;
+        for tour in 0..2_000 {
+            file.push_back(suivant());
+            if file.len() > 48 {
+                file.drain(..(tour % 7 + 1).min(file.len()));
+            }
+            if !file.as_slices().1.is_empty() {
+                tours_avec_deux_tranches += 1;
+            }
+            for n in [0, 1, file.len() / 2, file.len()] {
+                let attendu: f64 = file.iter().take(n).map(|s| s * s).sum::<f64>();
+                let obtenu = somme_des_carres(&file, n);
+                assert_eq!(
+                    attendu.to_bits(),
+                    obtenu.to_bits(),
+                    "tour {tour}, n = {n} : {attendu:e} ≠ {obtenu:e}"
+                );
+            }
+        }
+        assert!(
+            tours_avec_deux_tranches > 100,
+            "la file doit avoir fait le tour de son tampon, sinon la seconde tranche n'est pas éprouvée"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Biquad filter tests

@@ -2042,11 +2042,14 @@ impl PlaybackOrchestrator {
         // Apply zone max_sample_rate cap
         if let Some(max_sr) = zone_max_sample_rate {
             if out_sr > max_sr {
+                // #5524 — la cadence servie reste dans la famille de la source
+                // (176,4 sous 96 → 88,2), le plafond n'est qu'une borne.
+                let cible = crate::audio::formats::cadence_sous_plafond(out_sr, Some(max_sr));
                 // #3973 — le site « plafond de zone » de la règle bit-perfect :
                 // strict ⇒ refuser plutôt que transcoder vers le plafond.
                 if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
                     out_sr,
-                    max_sr,
+                    cible,
                     crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
                 )
                 .refus()
@@ -2063,9 +2066,10 @@ impl PlaybackOrchestrator {
                     zone_id = req.zone_id,
                     source_rate = out_sr,
                     max_rate = max_sr,
+                    target_rate = cible,
                     "zone_max_sample_rate_cap_applied"
                 );
-                out_sr = max_sr;
+                out_sr = cible;
             }
         }
         let out_bd: u16 = if local_needs_wav {

@@ -399,6 +399,13 @@ dst = ["dep:dst-decoder"]
 # `[dev-dependencies]` de tune-server (resolver 2) : aucun binaire publié ne
 # la compile.
 journal-de-test = []
+# #5512 : dit a `tune-server` que la construction en cours est une construction
+# de TESTS, integration comprise — ou `cfg(test)` de sa lib ne vaut rien. Il en
+# isole alors les chemins relatifs (`tune.db`, `artwork_cache`, le rapport de
+# scan) dans un dossier temporaire. Allumee SEULEMENT par les
+# `[dev-dependencies]` de tune-server, comme `journal-de-test` : aucun binaire
+# publie ne la compile.
+isolement-disque-de-test = []
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
