@@ -32,13 +32,18 @@
 //! passe dans le même binaire rendrait ces témoins intermittents. Les tests
 //! d'ici se sérialisent d'ailleurs entre eux, pour la même raison.
 //!
-//! ## Pourquoi PAS `start_paused`
+//! ## Où tombe la pause, et pourquoi ce n'est plus une course
 //!
-//! La première propriété se joue sur une course RÉELLE : un lot en cours, une
-//! pause posée par un autre fil pendant qu'il travaille. L'horloge virtuelle de
-//! tokio rendrait les 400 ms de pause entre fichiers gratuites, le lot entier
-//! se jouerait avant que la pause n'arrive, et le témoin ne garderait plus
-//! rien.
+//! La première propriété exige une pause posée PENDANT le lot. Elle se jouait
+//! sur une course réelle : un fil guettait le premier témoin toutes les 5 ms,
+//! et la pause fixe de 400 ms entre deux fichiers lui laissait le temps
+//! d'arriver. #5519 a retiré cette pause : des fichiers indécodables passent
+//! alors en quelques microsecondes, le lot entier se jouait parfois avant que
+//! le guetteur ne se réveille (« 8 pistes traitées sur 8 », 2 échecs sur 6).
+//!
+//! La pause est donc posée DANS l'écriture du premier témoin `rg_analyzed`
+//! ([`PauseAuPremierTemoin`]) : même instant — une piste finie, le lot en
+//! plein travail —, plus aucune course.
 
 use std::sync::Arc;
 
@@ -46,7 +51,7 @@ use tune_core::audio::replaygain::{
     TourDeCascade, analyze_track_batch, compter_les_candidats_replaygain, progression,
     un_tour_de_cascade,
 };
-use tune_core::db::backend::DbBackend;
+use tune_core::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::taches_de_fond::{
@@ -127,6 +132,79 @@ fn comptees(backend: &Arc<dyn DbBackend>, clef: &str) -> i64 {
         .unwrap_or(-1)
 }
 
+/// Une base qui met le ReplayGain en pause dans l'écriture même du premier
+/// témoin `rg_analyzed`. Tout le reste passe tel quel à la base réelle.
+struct PauseAuPremierTemoin {
+    interne: Arc<dyn DbBackend>,
+    posee: std::sync::atomic::AtomicBool,
+}
+
+impl PauseAuPremierTemoin {
+    fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
+        Arc::new(Self {
+            interne,
+            posee: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn apres_ecriture(&self) {
+        if self.posee.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if comptees(&self.interne, "rg_analyzed") >= 1 {
+            self.posee.store(true, std::sync::atomic::Ordering::SeqCst);
+            mettre_en_pause(&self.interne, Tache::ReplayGain).expect("poser la pause");
+        }
+    }
+}
+
+impl DbBackend for PauseAuPremierTemoin {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        self.interne.engine()
+    }
+    fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        let r = self.interne.execute(sql, p);
+        if sql.contains("track_metadata") {
+            self.apres_ecriture();
+        }
+        r
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.interne.last_insert_rowid()
+    }
+    fn query_one(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.interne.query_one(sql, p)
+    }
+    fn query_many(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.interne.query_many(sql, p)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let r = self.interne.write_tx(f);
+        self.apres_ecriture();
+        r
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.interne.execute_batch(sql)
+    }
+    fn query_one_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.interne.query_one_strong(sql, p)
+    }
+    fn query_many_strong(
+        &self,
+        sql: &str,
+        p: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.interne.query_many_strong(sql, p)
+    }
+}
+
 /// Remettre le mécanisme à neuf entre deux témoins du même binaire.
 fn a_neuf() {
     oublier_pour_les_essais();
@@ -152,21 +230,17 @@ async fn une_pause_en_plein_lot_s_arrete_a_une_frontiere_et_ne_perd_rien() {
     let tmp = tempfile::tempdir().expect("dossier temporaire");
     let backend = bibliotheque(tmp.path());
 
-    let pour_le_lot = backend.clone();
+    // La pause tombe au moment où la PREMIÈRE piste est estampillée : le lot
+    // travaille, d'autres pistes peuvent être en vol (#5519, plusieurs
+    // fichiers à la fois), aucune ne doit plus partir.
+    let guetteur = PauseAuPremierTemoin::poser(backend.clone());
+    let pour_le_lot = guetteur.clone();
     let lot = tokio::spawn(async move { analyze_track_batch(&pour_le_lot).await });
-
-    // Attendre qu'UNE piste soit effectivement sortie du balayage : la pause
-    // doit tomber sur une passe qui travaille, pas sur une passe qui n'a pas
-    // encore démarré.
-    let mut tours = 0;
-    while comptees(&backend, "rg_analyzed") < 1 {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        tours += 1;
-        assert!(tours < 2_000, "le lot n'a jamais traité la moindre piste");
-    }
-    mettre_en_pause(&backend, Tache::ReplayGain).expect("poser la pause");
-
     let pendant = lot.await.expect("le lot ne doit pas paniquer") as i64;
+    assert!(
+        est_en_pause(Tache::ReplayGain),
+        "le lot n'a jamais traité la moindre piste : la pause n'a pas été posée"
+    );
 
     // — il s'est arrêté —
     assert!(
