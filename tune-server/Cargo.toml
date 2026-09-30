@@ -257,6 +257,12 @@ path = "tests/pistes_bibliotheque_lentes_5138.rs"
 name = "collection_intelligente_sans_micro_coupure_5438"
 path = "tests/collection_intelligente_sans_micro_coupure_5438.rs"
 
+# Coupure de lecture DLNA pendant une grosse collection intelligente
+# (Yves Corbat, 0.9.168, 30/09/2026, suite de #5438).
+[[test]]
+name = "lecture_sans_famine_collection_intelligente"
+path = "tests/lecture_sans_famine_collection_intelligente.rs"
+
 # #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
 # sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
 # jamais compilé.
