@@ -33,6 +33,11 @@ pub mod health;
 pub mod health_monitor;
 pub mod http;
 pub mod interface_web;
+/// Capture de journal `tracing` fiable dans les tests de la lib — voir le
+/// module pour le pourquoi (#5440 : un point d'appel figé à `never` par un
+/// test voisin qui l'atteint le premier sur un autre fil).
+#[cfg(test)]
+pub(crate) mod journal_de_test;
 pub mod library;
 pub mod license;
 pub mod lyrics;
