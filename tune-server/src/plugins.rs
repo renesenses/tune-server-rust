@@ -300,7 +300,11 @@ pub async fn init(
 
 /// Apply a drained [`PluginRegistrations`]: outputs into the registry, zones
 /// into the DB, routers handed back to the caller.
-async fn install(state: &AppState, registrations: PluginRegistrations) -> PluginRouters {
+///
+/// Also called after a successful `POST /plugins/{name}/retry` (#5403): the
+/// outputs and zones go live at once, but the routers can only be mounted by
+/// the next start — the caller says so with `restart_required`.
+pub(crate) async fn install(state: &AppState, registrations: PluginRegistrations) -> PluginRouters {
     // `routers` exists unconditionally here: tune-server always enables
     // tune-core's `plugin-http` feature (see its Cargo.toml).
     let PluginRegistrations {

@@ -159,3 +159,108 @@ async fn chaque_greffon_laisse_une_ligne_de_journal_avec_sa_duree() {
         "le greffon rapide ne doit pas être signalé lent :\n{texte}"
     );
 }
+
+/// La valeur numérique d'un champ `cle=` dans une ligne de journal.
+fn champ(ligne: &str, cle: &str) -> Option<u64> {
+    let prefixe = format!("{cle}=");
+    ligne
+        .split_whitespace()
+        .find_map(|mot| mot.strip_prefix(prefixe.as_str()))
+        .and_then(|v| v.parse().ok())
+}
+
+/// #5403 × #5370 — la résolution du conflit de `setup_all` garde les DEUX
+/// comportements : la borne coupe le greffon qui pend (#5403), et la mesure de
+/// #5370 vaut pour tous, coupé compris. La durée est mesurée dans tous les
+/// cas, la lenteur signalée au-delà du seuil, et la coupure journalisée AVEC
+/// sa durée. Le greffon coupé reste enfin dans le rapport du gestionnaire.
+#[tokio::test]
+async fn une_coupure_est_mesuree_signalee_lente_et_journalisee_avec_sa_duree_5403() {
+    let journal = JournalCapture::default();
+    let abonne = tracing_subscriber::fmt()
+        .with_writer(journal.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _garde = tracing::subscriber::set_default(abonne);
+
+    let dir = tempfile::tempdir().unwrap();
+    let loader = PluginLoader::new(dir.path().to_path_buf())
+        .with_slow_setup_threshold(Duration::from_millis(100))
+        .with_setup_timeout(Duration::from_millis(400));
+    for (nom, attente) in [
+        ("rapide", Duration::ZERO),
+        ("pendu", Duration::from_secs(3600)),
+        ("lent", Duration::from_millis(250)),
+    ] {
+        loader
+            .register(Box::new(GreffonMesure { nom, attente }))
+            .await;
+    }
+
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(60),
+        loader.setup_all("http://localhost:8888"),
+    )
+    .await
+    .expect("la borne de #5403 doit couper « pendu »");
+    assert_eq!(
+        loaded,
+        vec!["rapide", "lent"],
+        "le démarrage continue après la coupure"
+    );
+
+    let texte = journal.texte();
+    let pendu = lignes_de(&texte, "pendu");
+    let coupure = pendu
+        .iter()
+        .find(|l| l.contains("plugin_setup_timed_out"))
+        .unwrap_or_else(|| {
+            panic!("aucun plugin_setup_timed_out pour « pendu » (#5403) :\n{texte}")
+        });
+    assert_eq!(champ(coupure, "timeout_ms"), Some(400), "{coupure}");
+    let duree = champ(coupure, "duration_ms")
+        .unwrap_or_else(|| panic!("la coupure doit porter sa durée (#5370) :\n{coupure}"));
+    assert!(duree >= 400, "durée {duree} ms < borne : {coupure}");
+    let lente = pendu
+        .iter()
+        .find(|l| l.contains("plugin_setup_slow"))
+        .unwrap_or_else(|| {
+            panic!("la coupure dépasse le seuil : plugin_setup_slow attendu (#5370) :\n{texte}")
+        });
+    assert!(
+        lente.contains("timed_out"),
+        "l'alerte doit dire le sort : {lente}"
+    );
+    assert!(
+        !pendu.iter().any(|l| l.contains("plugin_loaded")),
+        "{texte}"
+    );
+
+    // #5370 intact pour les autres.
+    for nom in ["rapide", "lent"] {
+        assert!(
+            lignes_de(&texte, nom)
+                .iter()
+                .any(|l| l.contains("plugin_loaded") && champ(l, "duration_ms").is_some()),
+            "plugin_loaded avec sa durée attendu pour {nom} :\n{texte}"
+        );
+    }
+    assert!(
+        lignes_de(&texte, "lent")
+            .iter()
+            .any(|l| l.contains("plugin_setup_slow"))
+    );
+    assert!(
+        !lignes_de(&texte, "rapide")
+            .iter()
+            .any(|l| l.contains("plugin_setup_slow"))
+    );
+
+    // #5403 — visible dans le gestionnaire, avec la même durée que le journal.
+    let rapport = loader.setup_report().lock().unwrap().clone();
+    assert_eq!(rapport.errors.len(), 1, "{:?}", rapport.errors);
+    assert_eq!(rapport.errors[0].name, "pendu");
+    assert_eq!(rapport.errors[0].reason.as_str(), "setup_timeout");
+    assert_eq!(rapport.errors[0].duration_ms, duree);
+}
