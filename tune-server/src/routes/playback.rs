@@ -714,13 +714,25 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             Some(sid) => state.streamer.stream_output_wire(sid).await,
             None => None,
         };
-        // #5353 — le backend de la sortie de CETTE zone.
-        let audio_backend = crate::routes::zones::backend_affiche_de_la_zone(
+        // #5353 — le backend de la sortie de CETTE zone, et le signalement
+        // d'une sortie hors du backend choisi : le client remplace son objet
+        // zone par cette réponse (`syncZone`), le champ doit donc y être.
+        let backend_sortie = crate::routes::zones::backend_de_la_sortie_de_la_zone(
             state,
             zone.output_device_id.as_deref(),
-            audio_backend,
         )
         .await;
+        let audio_backend = crate::routes::zones::backend_affiche_pour_la_sortie(
+            audio_backend,
+            backend_sortie.as_deref(),
+        );
+        if let Some(obj) = v.as_object_mut() {
+            crate::routes::zones::injecter_backend_de_sortie(
+                obj,
+                &state.effective_audio_backend(),
+                backend_sortie.as_deref(),
+            );
+        }
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &zone_state,
             zone,
