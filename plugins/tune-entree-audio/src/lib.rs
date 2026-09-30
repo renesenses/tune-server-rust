@@ -95,7 +95,7 @@ impl TunePlugin for EntreeAudioPlugin {
         "entree-audio"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Capter une entrée audio (USB, S/PDIF, optique) et la diffuser en direct vers une zone"

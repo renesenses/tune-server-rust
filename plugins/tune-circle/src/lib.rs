@@ -104,7 +104,7 @@ impl TunePlugin for CirclePlugin {
         "circle"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance est Premium."

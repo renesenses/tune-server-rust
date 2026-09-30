@@ -81,7 +81,7 @@ impl TunePlugin for KaraokePlugin {
         PLUGIN_NAME
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Paroles synchronisées façon karaoké (réutilise tune-core::lyrics)"
@@ -192,7 +192,7 @@ fn current_line_index(lines: &[lyrics::LyricLine], position_ms: i64) -> i64 {
 async fn status() -> Json<Value> {
     Json(json!({
         "name": PLUGIN_NAME,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": tune_core::version(),
         "enabled": true,
     }))
 }
