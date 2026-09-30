@@ -434,6 +434,16 @@ pub mod sql {
         )
     }
 
+    /// #5463 — le code-barres d'un album, que seule une feuille CUE
+    /// (`CATALOG`) fournit au scan.
+    pub fn force_update_barcode<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET barcode = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
@@ -2541,6 +2551,14 @@ impl AlbumRepo {
     /// feuille CUE EST la source de métadonnées de l'album qu'elle décrit,
     /// c'est tout son objet. Ailleurs, deux titres en désaccord désignent deux
     /// éditions et ne se tranchent pas ici.
+    /// Pose le code-barres de l'album (#5463). `Album::update` ne l'écrit pas.
+    pub fn force_update_barcode(&self, album_id: i64, barcode: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::force_update_barcode, sql::force_update_barcode);
+        let params: [&dyn ToSqlValue; 2] = [&barcode, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn force_update_title(&self, album_id: i64, title: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_title, sql::force_update_title);
         let params: [&dyn ToSqlValue; 2] = [&title, &album_id];

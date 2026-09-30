@@ -46,6 +46,12 @@ pub struct PisteCue {
     pub numero: u32,
     pub titre: Option<String>,
     pub interprete: Option<String>,
+    /// `ISRC` de la piste, tel que la feuille l'écrit (#5463).
+    pub isrc: Option<String>,
+    /// `SONGWRITER` de la piste (#5463).
+    pub compositeur: Option<String>,
+    /// `REM COMMENT` de la piste (#5463).
+    pub commentaire: Option<String>,
     /// Début dans `media`, en millisecondes.
     pub debut_ms: u64,
     /// Fin dans `media`, ou `None` si la piste court jusqu'au bout du fichier.
@@ -61,6 +67,12 @@ pub struct AlbumCue {
     pub interprete: Option<String>,
     pub genre: Option<String>,
     pub annee: Option<String>,
+    /// `SONGWRITER` de l'album (#5463).
+    pub compositeur: Option<String>,
+    /// `CATALOG` : le code-barres UPC/EAN du disque (#5463).
+    pub catalogue: Option<String>,
+    /// `REM COMMENT` de l'album (#5463).
+    pub commentaire: Option<String>,
     pub pistes: Vec<PisteCue>,
 }
 
@@ -414,6 +426,11 @@ fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
     // on prend la première qui en porte, plutôt que d'imposer la face A.
     let genre = groupe.iter().find_map(|f| f.feuille.album_genre.clone());
     let annee = groupe.iter().find_map(|f| f.feuille.album_date.clone());
+    let compositeur = groupe
+        .iter()
+        .find_map(|f| f.feuille.album_songwriter.clone());
+    let catalogue = groupe.iter().find_map(|f| f.feuille.catalog.clone());
+    let commentaire = groupe.iter().find_map(|f| f.feuille.album_comment.clone());
 
     let mut pistes = Vec::new();
     let mut feuilles = Vec::new();
@@ -439,6 +456,9 @@ fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
                 numero: piste.number,
                 titre: piste.title.clone(),
                 interprete: piste.performer.clone(),
+                isrc: piste.isrc.clone(),
+                compositeur: piste.songwriter.clone(),
+                commentaire: piste.comment.clone(),
                 debut_ms: piste.start_ms,
                 fin_ms: piste.end_ms,
             });
@@ -451,6 +471,9 @@ fn album_depuis(mut groupe: Vec<FeuilleResolue>) -> AlbumCue {
         interprete,
         genre,
         annee,
+        compositeur,
+        catalogue,
+        commentaire,
         pistes,
     }
 }
