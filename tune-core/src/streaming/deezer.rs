@@ -690,6 +690,14 @@ impl DeezerService {
         }
     }
 
+    /// La réponse de `/artist/{id}/related`, sans les entrées sans identifiant.
+    fn artistes_proches(data: &serde_json::Value) -> Vec<StreamArtist> {
+        Self::collect_data(data, Self::map_artist)
+            .into_iter()
+            .filter(|a| a.id != "0" && !a.name.is_empty())
+            .collect()
+    }
+
     fn collect_data<T>(data: &serde_json::Value, mapper: fn(&serde_json::Value) -> T) -> Vec<T> {
         data["data"]
             .as_array()
@@ -996,6 +1004,26 @@ impl StreamingService for DeezerService {
             .api_get(&format!("/artist/{artist_id}/top?limit=20"))
             .await?;
         Ok(Self::collect_data(&data, Self::map_track))
+    }
+
+    /// `GET /artist/{id}/related` — l'API publique de Deezer rend les artistes
+    /// proches (`{"data":[{"id","name","picture_big",…}],"total"}` ; mesuré le
+    /// 29/09/2026 sur l'artiste 27, sans jeton). Sert la radio artiste (#5395).
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let data = self
+            .api_get(&format!("/artist/{artist_id}/related?limit={limit}"))
+            .await?;
+        Ok(Self::artistes_proches(&data))
+    }
+
+    /// `get_similar_artists` ci-dessus : « Plus comme ça » s'ouvre aussi à ce
+    /// service (#5395, décision de Bertrand du 29/09/2026).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
     }
 
     // ── playlist ─────────────────────────────────────────────────────
@@ -1506,6 +1534,31 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].title, "A");
         assert_eq!(tracks[1].title, "B");
+    }
+
+    #[test]
+    fn artistes_proches_de_related() {
+        // La forme mesurée le 29/09/2026 sur `GET /artist/27/related`.
+        let data = json!({
+            "data": [
+                {"id": 6404, "name": "Justice", "picture_big": "https://x/500.jpg", "type": "artist"},
+                {"id": 2049, "name": "Cassius", "type": "artist"},
+                {"name": "sans identifiant"}
+            ],
+            "total": 3
+        });
+        let v = DeezerService::artistes_proches(&data);
+        let noms: Vec<(&str, &str)> = v.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect();
+        assert_eq!(noms, vec![("6404", "Justice"), ("2049", "Cassius")]);
+        assert_eq!(v[0].image_path.as_deref(), Some("https://x/500.jpg"));
+        assert!(DeezerService::artistes_proches(&json!({"error": {}})).is_empty());
+    }
+
+    /// #5395 — « Plus comme ça » est ouvert à Deezer : la route ne lui répond
+    /// plus 501.
+    #[test]
+    fn deezer_declare_ses_artistes_similaires() {
+        assert!(DeezerService::new().propose_des_artistes_similaires());
     }
 
     #[test]

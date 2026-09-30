@@ -65,6 +65,16 @@ impl PositionPoller {
         device_id: Option<&str>,
     ) {
         use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
+        // #5395 — une radio artiste en cours passe AVANT le réglage d'auto-
+        // lecture : elle est sans fin par décision, et c'est l'auditeur qui l'a
+        // lancée. Sans contexte de radio, ou si la file ne s'achève pas sur un
+        // titre de son dernier lot, rien ne change ci-dessous.
+        if self
+            .continuer_la_radio_artiste(zone_id, zone_state, device_id)
+            .await
+        {
+            return;
+        }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
         match mode {
             AutoplayMode::RandomAlbum
@@ -297,6 +307,83 @@ impl PositionPoller {
             "queue_ended"
         );
         self.orchestrator.stop(zone_id, device_id).await;
+    }
+
+    /// #5395 — recharge une radio artiste quand la file s'achève sur l'un de
+    /// ses titres : un nouveau lot est ajouté en fin de file et joué. Rend
+    /// vrai quand la fin de file est traitée (lecture partie, ou arrêt après
+    /// un échec de lecture) ; faux pour laisser l'auto-lecture habituelle
+    /// décider.
+    async fn continuer_la_radio_artiste(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        device_id: Option<&str>,
+    ) -> bool {
+        use crate::playback::radio_artiste;
+        let Some(np) = zone_state.now_playing.as_ref() else {
+            return false;
+        };
+        let mut identites = Vec::new();
+        if let Some(id) = np.track_id {
+            identites.push(radio_artiste::identite_locale(id));
+        }
+        if let Some(ref sid) = np.source_id
+            && !np.source.is_empty()
+        {
+            identites.push(radio_artiste::identite_service(&np.source, sid));
+        }
+        if identites.is_empty() {
+            return false;
+        }
+        let services = self.orchestrator.services.clone();
+        let Some(lot) = radio_artiste::continuer(&self.db, &services, zone_id, &identites).await
+        else {
+            return false;
+        };
+        let items: Vec<crate::db::play_queue_repo::QueueInput> = lot
+            .candidats
+            .iter()
+            .map(radio_artiste::Candidat::en_entree_de_file)
+            .collect();
+        let queue = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
+        let position = match queue.insert_at_bilan(zone_id, &items, None) {
+            Ok(bilan) => bilan.start,
+            Err(e) => {
+                warn!(zone_id, error = %e, "radio_artiste_ajout_echoue");
+                None
+            }
+        };
+        let Some(position) = position else {
+            return false;
+        };
+        if let Some(ref bus) = self.event_bus {
+            let tracks: Vec<serde_json::Value> = lot
+                .candidats
+                .iter()
+                .map(radio_artiste::Candidat::en_json)
+                .collect();
+            bus.emit(
+                "playback.autoplay_tracks_added",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "radio_artiste": true,
+                    "count": items.len(),
+                    "tracks": tracks,
+                }),
+            );
+        }
+        info!(
+            zone_id,
+            position,
+            count = items.len(),
+            "radio_artiste_rechargee"
+        );
+        if let Err(e) = self.orchestrator.play_from_queue(zone_id, position).await {
+            warn!(zone_id, error = %e, "radio_artiste_lecture_echouee");
+            self.orchestrator.stop(zone_id, device_id).await;
+        }
+        true
     }
 
     async fn continuer_aleatoirement(

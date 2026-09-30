@@ -641,7 +641,8 @@ pub trait StreamingService: Send + Sync {
     /// radio d'autoplay, qui se tait en silence ; il ne suffit pas à une route
     /// qu'on interroge : un service sans similarité y rendrait une liste vide,
     /// indiscernable d'un artiste isolé. La capacité se DIT donc ici, et la
-    /// route répond 501 à qui ne l'a pas. Seul Qobuz la déclare aujourd'hui.
+    /// route répond 501 à qui ne l'a pas. Qobuz, TIDAL et Deezer la déclarent
+    /// (les deux derniers depuis #5395).
     fn propose_des_artistes_similaires(&self) -> bool {
         false
     }

@@ -792,6 +792,11 @@ path = "tests/album_en_cours_1361.rs"
 [[test]]
 name = "plus_comme_ca_qobuz_fil1906"
 path = "tests/plus_comme_ca_qobuz_fil1906.rs"
+# #5395 — la radio artiste à la demande : la route remplit la file et écrit
+# le contexte que l'auto-lecture relit pour recharger.
+[[test]]
+name = "radio_artiste_5395"
+path = "tests/radio_artiste_5395.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
