@@ -204,6 +204,13 @@ path = "tests/album_lecture_en_double.rs"
 name = "dr_liste_albums_4521"
 path = "tests/dr_liste_albums_4521.rs"
 
+# #5469 — une passe d'enrichissement coupée par un arrêt repart au démarrage,
+# et « Reprendre » relance une passe que l'arrêt a tuée. Cible à part : les
+# pauses sont un état global du processus, aucun autre essai ne doit y toucher.
+[[test]]
+name = "reprise_des_passes_5469"
+path = "tests/reprise_des_passes_5469.rs"
+
 # #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
 # Les sept points (aléatoire, smart playlists, file, titre en cours,
 # débannir, local ≠ service, par profil) par les routes montées. `autotests =

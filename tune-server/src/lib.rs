@@ -38,6 +38,7 @@ pub mod plugins;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins_host;
 pub mod premium_guard;
+pub mod reprise_des_passes;
 pub mod routes;
 pub mod scan_import;
 /// L'echelle de dialectes CIFS, partagee par la route de montage et par le
