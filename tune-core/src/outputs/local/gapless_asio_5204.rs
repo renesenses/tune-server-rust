@@ -46,10 +46,8 @@ fn le_bras_asio_annonce_l_enchainement_interne_5204() {
          interne — sinon le sondeur n'arme pas le gapless et chaque piste \
          ferme puis rouvre le pilote au même format"
     );
-    assert!(
-        !BrasDeLecture::CoreAudioExclusif.sait_enchainer(),
-        "CoreAudio « hog » sort encore à l'EOF sans consommer la suivante"
-    );
+    // #5451 : CoreAudio « hog » enchaîne aussi, par la même poursuite —
+    // voir `gapless_coreaudio_5451.rs`.
 }
 
 // ─── La chaîne de la route native ───────────────────────────────────────────
@@ -121,19 +119,20 @@ impl Zone {
     }
 }
 
-/// Les témoins que la boucle commune consulte.
-struct Temoins {
-    arret: AtomicBool,
+/// Les témoins que la boucle commune consulte. Partagés avec
+/// `gapless_coreaudio_5451.rs` (#5451), qui juge la même poursuite.
+pub(super) struct Temoins {
+    pub(super) arret: AtomicBool,
     disparu: AtomicBool,
-    position: AtomicU64,
+    pub(super) position: AtomicU64,
     duree: AtomicU64,
-    constat: std::sync::Mutex<Option<String>>,
+    pub(super) constat: std::sync::Mutex<Option<String>>,
     _tx: mpsc::Sender<()>,
     rx: mpsc::Receiver<()>,
 }
 
 impl Temoins {
-    fn neufs() -> Self {
+    pub(super) fn neufs() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             arret: AtomicBool::new(false),
@@ -146,7 +145,7 @@ impl Temoins {
         }
     }
 
-    fn boucle(&self, role: RoleDeLaBoucle) -> BoucleProducteur<'_> {
+    pub(super) fn boucle(&self, role: RoleDeLaBoucle) -> BoucleProducteur<'_> {
         BoucleProducteur {
             role,
             backend: "ASIO",
@@ -165,7 +164,7 @@ impl Temoins {
 }
 
 /// Un WAV PCM entier canonique, en-tête de 44 octets puis `pcm`.
-fn wav(cadence: u32, bits: u16, canaux: u16, pcm: &[u8]) -> Vec<u8> {
+pub(super) fn wav(cadence: u32, bits: u16, canaux: u16, pcm: &[u8]) -> Vec<u8> {
     let block_align = canaux * bits / 8;
     let mut w = Vec::new();
     w.extend_from_slice(b"RIFF");
@@ -185,21 +184,21 @@ fn wav(cadence: u32, bits: u16, canaux: u16, pcm: &[u8]) -> Vec<u8> {
     w
 }
 
-fn pcm(octets: usize, graine: usize) -> Vec<u8> {
+pub(super) fn pcm(octets: usize, graine: usize) -> Vec<u8> {
     (0..octets)
         .map(|i| (i * 31 + graine * 7 + 3) as u8)
         .collect()
 }
 
-fn spec(cadence: u32, profondeur: ProfondeurPcm, canaux: u16) -> AudioSpec {
+pub(super) fn spec(cadence: u32, profondeur: ProfondeurPcm, canaux: u16) -> AudioSpec {
     AudioSpec::nouvelle(cadence, profondeur, canaux).unwrap()
 }
 
 /// La réserve de `set_next_media`, en mémoire.
 #[derive(Default)]
-struct ReserveFactice {
-    reserve: VecDeque<Vec<u8>>,
-    enchainements: u32,
+pub(super) struct ReserveFactice {
+    pub(super) reserve: VecDeque<Vec<u8>>,
+    pub(super) enchainements: u32,
 }
 
 impl ReserveDeLaChaine for ReserveFactice {

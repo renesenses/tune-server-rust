@@ -40,7 +40,8 @@ use crate::outputs::traits::{CaptureOutputNatif, ProfondeurPcm};
 /// test y rougit. Sous Windows, c'est le bras WASAPI (qui enchaîne depuis
 /// #5204) ; sous Linux, l'exclusif n'existe pas et `play_url` prend le bras
 /// cpal partagé, qui a toujours enchaîné — la capacité mentait donc aussi là.
-/// macOS est exclu : son bras exclusif (CoreAudio « hog ») n'enchaîne pas.
+/// macOS est exclu parce que « wasapi » n'y existe pas : son bras exclusif est
+/// CoreAudio « hog », qui enchaîne depuis #5451 (`gapless_coreaudio_5451.rs`).
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn une_sortie_exclusive_wasapi_annonce_l_enchainement_interne_5204() {
@@ -92,7 +93,11 @@ fn le_bras_emprunte_decide_de_la_capacite_5204() {
         "#5204 (seconde tranche) : ASIO exclusif enchaîne à format égal sur \
          sa route native — voir `gapless_asio_5204.rs`"
     );
-    assert!(!CoreAudioExclusif.sait_enchainer());
+    assert!(
+        CoreAudioExclusif.sait_enchainer(),
+        "#5451 : CoreAudio exclusif enchaîne à format égal — voir \
+         `gapless_coreaudio_5451.rs`"
+    );
 }
 
 // ─── 2. La règle de la frontière ────────────────────────────────────────────
