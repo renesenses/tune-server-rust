@@ -116,6 +116,11 @@ struct ConvertJob {
     /// du MP3 ou de l'AAC déjà compressés, `zip` ne gagne quasiment rien, donc
     /// l'écart se compte en pour mille.
     output_bytes: u64,
+    /// #5481 — les formats RÉELLEMENT écrits, relus sur les fichiers produits
+    /// (fréquence, profondeur), dédoublonnés dans l'ordre d'apparition.
+    /// L'écran les affiche au lieu de deviner ce que « d'origine » a donné —
+    /// pour un DSD, il n'y a pas d'origine au sens PCM.
+    formats_ecrits: Vec<dsd::FormatEcrit>,
     /// Le travail a-t-il été rangé dans un dossier du serveur choisi par
     /// l'appelant (#2944) ? Dans ce cas il n'y a pas d'archive à télécharger :
     /// les fichiers sont déjà à leur place, et les zipper reviendrait à
@@ -490,6 +495,7 @@ async fn start_job(
         errors: Vec::new(),
         output_dir: output_dir.clone(),
         output_bytes: 0,
+        formats_ecrits: Vec::new(),
         destination_serveur,
         started_at_ms: maintenant_ms(),
     }));
@@ -698,6 +704,8 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
         "converted": job.completed,
         "download_size": taille_lisible(job.output_bytes),
         "error": error,
+        // #5481 — les fréquences et profondeurs réellement écrites.
+        "output_formats": dsd::formats_en_json(&job.formats_ecrits),
         // #2944 — où le résultat est rangé, et s'il y a une archive au bout.
         // L'écran n'a pas à déduire d'un champ de la requête ce que le serveur
         // a réellement fait : il le lit.
@@ -837,7 +845,12 @@ async fn list_presets() -> Json<Value> {
             "format": "flac",
             "quality": "5",
             "sample_rate": null,
-            "bit_depth": 24
+            "bit_depth": 24,
+            // #5481 — `sample_rate: null` veut dire « d'origine » pour du PCM ;
+            // un DSD n'en a pas au sens PCM et sort à cette fréquence-ci.
+            "dsd_sample_rate": dsd::FREQUENCE_DSD_PAR_DEFAUT,
+            // Les fréquences que l'écran peut proposer à la place de « Auto ».
+            "sample_rate_choices": dsd::FREQUENCES_PROPOSEES
         },
         {
             "id": "mp3-320",
@@ -1027,10 +1040,17 @@ async fn run_conversion(
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
+                // #5481 — ce qui a vraiment été écrit, relu sur le fichier.
+                let format_ecrit = dsd::format_ecrit(&out_path);
 
                 let mut j = job.lock().await;
                 j.completed += 1;
                 j.output_bytes += ecrits;
+                if let Some(f) = format_ecrit
+                    && !j.formats_ecrits.contains(&f)
+                {
+                    j.formats_ecrits.push(f);
+                }
             }
             Err(e) => {
                 error!(
@@ -1826,11 +1846,20 @@ fn convertible_input(path: &str) -> bool {
 /// sinon (WMA/ASF) via le ffmpeg résolu. `target_sr` n'est honoré que par
 /// les décodeurs natifs qui le supportent — les appelants rééchantillonnent
 /// de toute façon quand `decoded.sample_rate` ne correspond pas.
+// #5481 — la fréquence de sortie d'une source DSD, propre au convertisseur.
+#[path = "convertisseur_dsd.rs"]
+mod dsd;
+
 pub(super) fn decode_for_convert(
     input: &str,
     target_sr: Option<u32>,
 ) -> Result<tune_core::audio::decode::DecodedAudio, String> {
     if can_decode_native(input) {
+        // #5481 — un DSD ne se décode jamais à un rapport fractionnaire, et
+        // sort par défaut en 176,4 kHz (voir `convertisseur_dsd.rs`).
+        if let Some(frequence) = dsd::frequence_dsd(input) {
+            return dsd::decoder_un_dsd(input, frequence, target_sr);
+        }
         return decode_to_pcm(input, target_sr, None, 0.0, f64::MAX);
     }
     decode_via_converter_ffmpeg(input)
@@ -2522,6 +2551,7 @@ Conversion failed!"#;
             errors: Vec::new(),
             output_dir: convert_output_root().join("temoin"),
             output_bytes: 128_400_000,
+            formats_ecrits: Vec::new(),
             destination_serveur: false,
             started_at_ms: 1_000,
         }
