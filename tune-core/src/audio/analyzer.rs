@@ -311,6 +311,31 @@ impl DrAccumulator {
     }
 }
 
+/// Somme des carrés des `n` premiers échantillons de la file, DANS L'ORDRE.
+///
+/// #5519 — même valeur, au bit près, que
+/// `buf.iter().take(n).map(|s| s * s).sum::<f64>()` : la même suite
+/// d'additions, de gauche à droite, sur les deux tranches contiguës de la file
+/// au lieu de son itérateur. Seul le coût change.
+fn somme_des_carres(buf: &std::collections::VecDeque<f64>, n: usize) -> f64 {
+    let (a, b) = buf.as_slices();
+    let (a, b) = if a.len() >= n {
+        (&a[..n], &b[..0])
+    } else {
+        (a, &b[..(n - a.len()).min(b.len())])
+    };
+    // `-0.0`, comme `Iterator::sum` pour `f64` : sans quoi une file vide
+    // rendrait `+0.0` au lieu de `-0.0`, un bit de différence.
+    let mut somme = -0.0_f64;
+    for s in a {
+        somme += s * s;
+    }
+    for s in b {
+        somme += s * s;
+    }
+    somme
+}
+
 /// Streaming EBU R128 (BS.1770-4) integrated-loudness + sample-peak accumulator.
 ///
 /// Feed interleaved, normalized (`[-1, 1]`) f64 samples in any chunking — the
@@ -413,12 +438,8 @@ impl LoudnessAccumulator {
         while self.bufs[0].len() >= self.block_frames {
             let mut power_sum = 0.0;
             for c in 0..self.channels {
-                let ms: f64 = self.bufs[c]
-                    .iter()
-                    .take(self.block_frames)
-                    .map(|s| s * s)
-                    .sum::<f64>()
-                    / self.block_frames as f64;
+                let ms: f64 =
+                    somme_des_carres(&self.bufs[c], self.block_frames) / self.block_frames as f64;
                 power_sum += ms; // channel weight = 1.0 (mono/stereo)
             }
             self.block_powers.push(power_sum);
@@ -816,6 +837,47 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5519 — la somme des carrés par tranches rend la valeur de l'ancienne
+    /// forme AU BIT PRÈS, y compris quand la file fait le tour de son tampon
+    /// (deux tranches) et quand `n` ne prend qu'une partie de la seconde.
+    /// Une accélération qui changerait le dernier bit changerait, sur une
+    /// valeur arrondie au dixième, le gain d'une piste de temps en temps.
+    #[test]
+    fn la_somme_des_carres_par_tranches_est_identique_au_bit_pres() {
+        let mut graine: u64 = 0x5519;
+        let mut suivant = || {
+            graine = graine
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((graine >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let mut file: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(64);
+        let mut tours_avec_deux_tranches = 0;
+        for tour in 0..2_000 {
+            file.push_back(suivant());
+            if file.len() > 48 {
+                file.drain(..(tour % 7 + 1).min(file.len()));
+            }
+            if !file.as_slices().1.is_empty() {
+                tours_avec_deux_tranches += 1;
+            }
+            for n in [0, 1, file.len() / 2, file.len()] {
+                let attendu: f64 = file.iter().take(n).map(|s| s * s).sum::<f64>();
+                let obtenu = somme_des_carres(&file, n);
+                assert_eq!(
+                    attendu.to_bits(),
+                    obtenu.to_bits(),
+                    "tour {tour}, n = {n} : {attendu:e} ≠ {obtenu:e}"
+                );
+            }
+        }
+        assert!(
+            tours_avec_deux_tranches > 100,
+            "la file doit avoir fait le tour de son tampon, sinon la seconde tranche n'est pas éprouvée"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Biquad filter tests
