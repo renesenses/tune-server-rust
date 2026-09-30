@@ -2634,10 +2634,17 @@ pub(super) async fn update_install(
 
         let settings = SettingsRepo::with_backend(state.backend.clone());
         let mut relance_par_le_paquet: Option<std::path::PathBuf> = None;
+        // #5461 — le chemin à relancer est fixé AVANT tout remplacement, jamais
+        // relu après : sous Linux, `current_exe()` suit le renommage du binaire
+        // en cours et rendait `<exe>.old` — la relance ré-exécutait l'ancien.
+        let chemin_a_relancer: Option<std::path::PathBuf>;
         'installation: {
             // --- Paquet macOS complet (#5141) ---
             if let Some(app) = paquet_cible.clone() {
                 set_phase("installing_bundle");
+                chemin_a_relancer = std::env::current_exe()
+                    .ok()
+                    .map(|exe| crate::binaire_installe::chemin_d_installation(&exe));
                 match installer_le_paquet_depuis_dmg(&app, &version, &archive_bytes).await {
                     Ok((motifs, verification)) => {
                         let motif = motifs
@@ -2788,15 +2795,6 @@ pub(super) async fn update_install(
                 }
             }
 
-            let current_exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&tmp_dir);
-                    set_phase(&format!("failed: Cannot determine current exe: {e}"));
-                    return;
-                }
-            };
-
             // Install (swap the binary + web/). This is synchronous, blocking
             // filesystem work. Wrap it in `catch_unwind` so a panic surfaces as a
             // `failed` phase instead of vanishing: the update runs in a spawned task,
@@ -2805,16 +2803,22 @@ pub(super) async fn update_install(
             // re-offering the update (JP Borderies, Windows: install never completed,
             // no `restarting`, no error). `install_windows` now logs each step too,
             // so a genuine hang is pinpointed by the last step logged.
-            info!(exe = %current_exe.display(), "update_install_starting");
             let install_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if cfg!(windows) {
-                    install_windows(&current_exe, &new_binary, &tmp_dir)
+                    let current_exe = std::env::current_exe()
+                        .map_err(|e| format!("Cannot determine current exe: {e}"))?;
+                    info!(exe = %current_exe.display(), "update_install_starting");
+                    install_windows(&current_exe, &new_binary, &tmp_dir).map(|()| current_exe)
                 } else {
-                    install_unix(&current_exe, &new_binary, &tmp_dir)
+                    installer_unix_et_designer_la_relance(
+                        &std::env::current_exe,
+                        &new_binary,
+                        &tmp_dir,
+                    )
                 }
             }));
             match install_outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(relance)) => chemin_a_relancer = Some(relance),
                 Ok(Err(e)) => {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     set_phase(&format!("failed: Install failed: {e}"));
@@ -2840,14 +2844,12 @@ pub(super) async fn update_install(
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
-        // Le chemin de l'exécutable, pour la relance : le même, que le paquet
-        // entier ou le seul binaire ait été remplacé.
-        let current_exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                set_phase(&format!("failed: Cannot determine current exe: {e}"));
-                return;
-            }
+        // Le chemin de l'exécutable, pour la relance : celui fixé AVANT le
+        // remplacement, que le paquet entier ou le seul binaire ait été
+        // remplacé (#5461 : jamais relu ici).
+        let Some(current_exe) = chemin_a_relancer else {
+            set_phase("failed: Cannot determine current exe");
+            return;
         };
 
         info!(
@@ -3339,17 +3341,48 @@ fn extract_zip(data: &[u8], dest: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Installe sous Unix et rend le chemin à relancer (#5461).
+///
+/// `lire_exe` (en production `std::env::current_exe`) n'est lu qu'UNE fois,
+/// AVANT le renommage. Sous Linux il lit `/proc/self/exe`, qui suit le fichier
+/// en cours : relu après, il rendrait `<exe>.old` et la relance ré-exécuterait
+/// l'ancien binaire (FabienM, 0.9.167 → 0.9.168). Le chemin rendu est le nom
+/// d'installation, jamais `.old`, même si ce processus tourne depuis `.old`.
+fn installer_unix_et_designer_la_relance(
+    lire_exe: &dyn Fn() -> std::io::Result<std::path::PathBuf>,
+    new_binary: &std::path::Path,
+    tmp_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let exe_lu = lire_exe().map_err(|e| format!("Cannot determine current exe: {e}"))?;
+    let binaire = crate::binaire_installe::chemin_d_installation(&exe_lu);
+    let en_cours = crate::binaire_installe::sans_marque_de_suppression(&exe_lu);
+    info!(
+        exe = %binaire.display(),
+        en_cours = %en_cours.display(),
+        "update_install_starting"
+    );
+    install_unix(&binaire, &en_cours, new_binary, tmp_dir)?;
+    Ok(binaire)
+}
+
 /// Unix install: rename current binary to .old, put new one in place, update web/.
+///
+/// `binaire` : le chemin d'installation (jamais `.old`) ; `en_cours` : le
+/// fichier qui tourne. #5461 — quand la sauvegarde `<binaire>.old` EST le
+/// binaire qui tourne (processus relancé depuis `.old` par une version
+/// affectée), on n'y touche pas : ni suppression, ni renommage par-dessus.
+/// Le neuf remplace `binaire`, qui ne tourne pas, sans sauvegarde.
 fn install_unix(
-    current_exe: &std::path::Path,
+    binaire: &std::path::Path,
+    en_cours: &std::path::Path,
     new_binary: &std::path::Path,
     tmp_dir: &std::path::Path,
 ) -> Result<(), String> {
-    let exe_dir = current_exe
+    let exe_dir = binaire
         .parent()
         .ok_or_else(|| "Cannot determine binary directory".to_string())?;
 
-    let old_exe = current_exe.with_extension("old");
+    let old_exe = crate::binaire_installe::chemin_de_sauvegarde(binaire);
 
     #[cfg(unix)]
     {
@@ -3358,17 +3391,30 @@ fn install_unix(
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
-    let staging = current_exe.with_extension("new");
+    let staging = binaire.with_extension("new");
     std::fs::copy(new_binary, &staging).map_err(|e| format!("copy new binary: {e}"))?;
 
-    if old_exe.exists() {
-        std::fs::remove_file(&old_exe).ok();
-    }
-    std::fs::rename(current_exe, &old_exe).map_err(|e| format!("rename current to .old: {e}"))?;
+    let sauvegarde_en_cours = old_exe == en_cours;
+    let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
+        warn!(
+            binaire = %binaire.display(),
+            en_cours = %en_cours.display(),
+            "update_install_sans_sauvegarde — la sauvegarde est le binaire qui tourne, ou rien a sauvegarder (#5461)"
+        );
+        false
+    } else {
+        if old_exe.exists() {
+            std::fs::remove_file(&old_exe).ok();
+        }
+        std::fs::rename(binaire, &old_exe).map_err(|e| format!("rename current to .old: {e}"))?;
+        true
+    };
 
-    if let Err(e) = std::fs::rename(&staging, current_exe) {
+    if let Err(e) = std::fs::rename(&staging, binaire) {
         error!(error = %e, "rename_new_to_current_failed, rolling back");
-        std::fs::rename(&old_exe, current_exe).ok();
+        if sauvegarde_faite {
+            std::fs::rename(&old_exe, binaire).ok();
+        }
         return Err(format!("rename .new to current: {e}"));
     }
 
@@ -6691,5 +6737,152 @@ mod docker_update_hint_tests {
         let corps = docker_update_result();
         assert_eq!(corps["status"], "docker");
         assert_eq!(corps["message"], DOCKER_UPDATE_HINT);
+    }
+}
+
+/// #5461 — deux mises à jour de suite sur une installation factice, avec un
+/// `current_exe()` qui se comporte comme `/proc/self/exe` sous Linux : il
+/// désigne le FICHIER en cours et suit donc ses renommages.
+#[cfg(all(test, unix))]
+mod relance_apres_installation_5461 {
+    use super::installer_unix_et_designer_la_relance;
+    use std::cell::RefCell;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    /// Le processus simulé : l'inode qu'il exécute, et son dernier nom connu.
+    struct Processus {
+        dossier: PathBuf,
+        inode: u64,
+        dernier_nom: PathBuf,
+    }
+
+    impl Processus {
+        fn lance(chemin: &Path) -> RefCell<Self> {
+            RefCell::new(Self {
+                dossier: chemin.parent().unwrap().to_path_buf(),
+                inode: std::fs::metadata(chemin).unwrap().ino(),
+                dernier_nom: chemin.to_path_buf(),
+            })
+        }
+
+        /// Ce que rendrait `/proc/self/exe` : le nom ACTUEL de l'inode
+        /// exécuté, ou le dernier nom suffixé de ` (deleted)`.
+        fn exe(&self) -> PathBuf {
+            for e in std::fs::read_dir(&self.dossier).unwrap().flatten() {
+                if std::fs::symlink_metadata(e.path()).map(|m| m.ino()).ok() == Some(self.inode) {
+                    return e.path();
+                }
+            }
+            PathBuf::from(format!("{} (deleted)", self.dernier_nom.display()))
+        }
+    }
+
+    fn archive(racine: &Path, version: &str) -> (PathBuf, PathBuf) {
+        let extraction = racine.join(format!("extraction-{version}"));
+        std::fs::create_dir_all(&extraction).unwrap();
+        let binaire = extraction.join("tune-server");
+        std::fs::write(&binaire, version).unwrap();
+        (binaire, extraction)
+    }
+
+    fn installer(p: &RefCell<Processus>, racine: &Path, version: &str) -> Result<PathBuf, String> {
+        let (neuf, extraction) = archive(racine, version);
+        let lire = || -> std::io::Result<PathBuf> { Ok(p.borrow().exe()) };
+        installer_unix_et_designer_la_relance(&lire, &neuf, &extraction)
+    }
+
+    /// La relance fait un `exec` : le processus exécute désormais ce fichier.
+    fn relancer(p: &RefCell<Processus>, chemin: &Path) {
+        *p.borrow_mut() = Processus::lance(chemin).into_inner();
+    }
+
+    fn lire(chemin: &Path) -> String {
+        std::fs::read_to_string(chemin).unwrap()
+    }
+
+    #[test]
+    fn deux_mises_a_jour_de_suite_relancent_le_binaire_installe() {
+        let racine = tempfile::tempdir().unwrap();
+        let opt = racine.path().join("opt");
+        std::fs::create_dir_all(&opt).unwrap();
+        let installe = opt.join("tune-server");
+        std::fs::write(&installe, "0.9.167").unwrap();
+        let p = Processus::lance(&installe);
+
+        // Première mise à jour.
+        let relance = installer(&p, racine.path(), "0.9.168").expect("première mise à jour");
+        assert_eq!(
+            relance,
+            installe,
+            "la relance doit viser le binaire installé, pas la sauvegarde : {}",
+            relance.display()
+        );
+        assert_eq!(
+            lire(&relance),
+            "0.9.168",
+            "la relance ré-exécuterait l'ancienne version"
+        );
+        relancer(&p, &relance);
+
+        // Seconde mise à jour : c'est elle qui échouait en ENOENT.
+        let relance = installer(&p, racine.path(), "0.9.169").expect("seconde mise à jour");
+        assert_eq!(relance, installe);
+        assert_eq!(lire(&installe), "0.9.169");
+        assert_eq!(lire(&opt.join("tune-server.old")), "0.9.168");
+        relancer(&p, &relance);
+        assert_eq!(p.borrow().exe(), installe);
+    }
+
+    /// Une installation déjà touchée : le processus tourne depuis `.old`
+    /// (l'ancienne version), le neuf est déjà posé sous le nom normal. La mise
+    /// à jour réussit, ne supprime pas le binaire qui tourne et relance le nom
+    /// normal.
+    #[test]
+    fn demarre_depuis_old_la_mise_a_jour_reussit_sans_supprimer_le_binaire_en_cours() {
+        let racine = tempfile::tempdir().unwrap();
+        let opt = racine.path().join("opt");
+        std::fs::create_dir_all(&opt).unwrap();
+        let installe = opt.join("tune-server");
+        let sauvegarde = opt.join("tune-server.old");
+        std::fs::write(&sauvegarde, "0.9.167").unwrap();
+        std::fs::write(&installe, "0.9.168").unwrap();
+        let p = Processus::lance(&sauvegarde);
+        assert_eq!(p.borrow().exe(), sauvegarde);
+
+        let relance = installer(&p, racine.path(), "0.9.169").expect("mise à jour depuis .old");
+        assert_eq!(relance, installe);
+        assert_eq!(lire(&installe), "0.9.169");
+        assert_eq!(
+            p.borrow().exe(),
+            sauvegarde,
+            "le binaire qui tourne a été supprimé ou renommé"
+        );
+        assert_eq!(lire(&sauvegarde), "0.9.167");
+    }
+
+    /// Même cas, le binaire en cours déjà supprimé (` (deleted)`) et aucun
+    /// binaire sous le nom normal : l'installation le recrée.
+    #[test]
+    fn demarre_depuis_old_supprime_la_mise_a_jour_repose_le_nom_normal() {
+        let racine = tempfile::tempdir().unwrap();
+        let opt = racine.path().join("opt");
+        std::fs::create_dir_all(&opt).unwrap();
+        let installe = opt.join("tune-server");
+        let sauvegarde = opt.join("tune-server.old");
+        std::fs::write(&sauvegarde, "0.9.167").unwrap();
+        let p = Processus::lance(&sauvegarde);
+        std::fs::remove_file(&sauvegarde).unwrap();
+        assert!(
+            p.borrow()
+                .exe()
+                .to_string_lossy()
+                .ends_with(".old (deleted)")
+        );
+
+        let relance =
+            installer(&p, racine.path(), "0.9.169").expect("mise à jour depuis .old supprimé");
+        assert_eq!(relance, installe);
+        assert_eq!(lire(&installe), "0.9.169");
     }
 }

@@ -14,6 +14,9 @@ pub mod background;
 pub mod background_tasks;
 #[cfg(feature = "bandcamp")]
 pub mod bandcamp_sweep;
+/// #5461 — le binaire installé, distinct de celui qui tourne (relance après
+/// mise à jour, lancement depuis `<exe>.old`).
+pub mod binaire_installe;
 pub mod boot_status;
 pub mod bootstrap;
 /// L'adresse de première connexion, imprimée au démarrage (#1272).

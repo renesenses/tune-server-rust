@@ -195,6 +195,12 @@ pub async fn run_with(opts: RunOptions) {
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
 
+    // #5461 — lancé depuis `<exe>.old` par une version affectée ? Le dire, et
+    // relancer sur place le binaire installé quand c'est sûr. Avant tout fil,
+    // avant le port et la base : l'`exec` ne laisse rien derrière lui.
+    #[cfg(unix)]
+    crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
+
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
     // ptrace ni sudo. Les relevés vont à côté du journal.
     {
