@@ -533,6 +533,15 @@ pub struct PositionPoller {
     /// #4970 — zones masquées en lecture déjà signalées au journal
     /// (`zone_masquee_en_lecture`), pour ne le dire qu'une fois par lecture.
     zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5522 — la relance automatique d'un démarrage figé à 0, par zone : la
+    /// ligne de file relancée et l'instant. Vit HORS de ZonePollState pour la
+    /// même raison que `relances_demarrage_mort` : la relance recrée l'état de
+    /// sondage, et une note posée dedans bouclerait.
+    relances_demarrage_fige: std::sync::Mutex<std::collections::HashMap<i64, (i64, Instant)>>,
+    /// #5522 — zones réseau dont la sortie a déjà rapporté une position non
+    /// nulle : seules celles-là peuvent être dites « figées à 0 ». Certains
+    /// renderers rendent 0 en permanence tout en jouant.
+    zones_a_position_prouvee: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 impl PositionPoller {
@@ -553,6 +562,8 @@ impl PositionPoller {
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
+            relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
+            zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -942,6 +953,14 @@ mod fin_de_piste;
 pub(crate) mod refus_de_piste;
 
 mod tick;
+
+/// #5522 — piste « en lecture » dont la position reste à 0 : une relance,
+/// puis l'arrêt avec bandeau.
+mod demarrage_fige_5522;
+
+/// #5522 — le banc : vrai sondeur, sortie factice figée à 0.
+#[cfg(test)]
+mod demarrage_fige_5522_tests;
 
 #[cfg(test)]
 mod tests;

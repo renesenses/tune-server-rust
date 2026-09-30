@@ -1761,6 +1761,9 @@ impl PositionPoller {
             let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
             let mut force_stop_demarrage_mort = false;
+            // #5522 — verdict du démarrage figé à 0, décidé dans le bras
+            // `Playing` et exécuté au site de coupure.
+            let mut demarrage_fige = demarrage_fige_5522::Verdict::Attendre;
             // #4645 — la mesure du décrochage, capturée au site de décision
             // pour être relue au site de coupure : (position atteinte, durée
             // de la piste, octets servis, octets attendus). `ZonePollState`
@@ -1776,6 +1779,17 @@ impl PositionPoller {
             let tune_is_playing =
                 zone_state.state == PlayState::Playing || zone_state.state == PlayState::Paused;
             let tune_has_track = zone_state.now_playing.is_some();
+
+            // #5522 — hors de `Playing`/`Transitioning` (pause, arrêt),
+            // l'horloge du démarrage figé repart de zéro : une pause volontaire
+            // ne compte jamais comme un démarrage qui n'a pas eu lieu.
+            if !matches!(
+                status.state,
+                TransportState::Playing | TransportState::Transitioning
+            ) {
+                ps.fige_a_zero_depuis = None;
+                ps.octets_du_demarrage = None;
+            }
 
             match status.state {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
@@ -3200,6 +3214,69 @@ impl PositionPoller {
                         );
                     }
 
+                    // #5522 — une piste « en lecture » dont la position n'a
+                    // jamais quitté 0. Le chien de garde #2116 ci-dessous
+                    // exige 5 s de position atteinte : il ne la voit pas.
+                    if status.position_ms > 0 {
+                        if let Ok(mut z) = self.zones_a_position_prouvee.lock() {
+                            z.insert(zone_id);
+                        }
+                        if let Ok(mut r) = self.relances_demarrage_fige.lock() {
+                            r.remove(&zone_id);
+                        }
+                        ps.fige_a_zero_depuis = None;
+                        ps.octets_du_demarrage = None;
+                    } else if !track_ended {
+                        let octets = match zone_state
+                            .now_playing
+                            .as_ref()
+                            .and_then(|np| np.stream_id.as_deref())
+                        {
+                            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+                            None => None,
+                        };
+                        let octets_progressent = matches!(
+                            (ps.octets_du_demarrage, octets),
+                            (Some(avant), Some(apres)) if apres > avant
+                        );
+                        ps.octets_du_demarrage = octets;
+                        let position_prouvee = device_id.starts_with("local:")
+                            || self
+                                .zones_a_position_prouvee
+                                .lock()
+                                .map(|z| z.contains(&zone_id))
+                                .unwrap_or(false);
+                        let constat = demarrage_fige_5522::Constat {
+                            tune_joue: zone_state.state == PlayState::Playing,
+                            sortie_joue: true,
+                            temps_reel: status.realtime,
+                            radio: source_est_radio,
+                            en_grace_deplacement: in_seek_grace,
+                            position_ms: status.position_ms,
+                            position_max_ms: ps.peak_position_ms,
+                            position_prouvee,
+                            octets_progressent,
+                        };
+                        let maintenant = Instant::now();
+                        let deja_relancee = self
+                            .relances_demarrage_fige
+                            .lock()
+                            .map(|r| {
+                                demarrage_fige_5522::relance_encore_valide(
+                                    r.get(&zone_id).copied(),
+                                    zone_state.queue_position,
+                                    maintenant,
+                                )
+                            })
+                            .unwrap_or(false);
+                        demarrage_fige = demarrage_fige_5522::verdict(
+                            &constat,
+                            &mut ps.fige_a_zero_depuis,
+                            maintenant,
+                            deja_relancee,
+                        );
+                    }
+
                     // #2116: a renderer can acknowledge Play forever while
                     // producing no more sound. Only stop after two independent
                     // progress signals (renderer position and bytes served by
@@ -3304,7 +3381,11 @@ impl PositionPoller {
                 },
             );
 
-            if force_stop {
+            if demarrage_fige != demarrage_fige_5522::Verdict::Attendre {
+                poll_states.remove(&zone_id);
+                self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
+                    .await;
+            } else if force_stop {
                 poll_states.remove(&zone_id);
                 let device_id_ref = self.get_zone_device_id(zone_id);
                 let relance = force_stop_demarrage_mort && {
