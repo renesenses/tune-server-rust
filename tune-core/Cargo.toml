@@ -394,6 +394,11 @@ audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:to
 # son README). L'allumer demande un arbitrage juridique de Bertrand. Garde :
 # tests/dst_desarmee_4378.rs.
 dst = ["dep:dst-decoder"]
+# #5453 : expose `journal_de_test::fiabiliser_la_capture()` aux tests des
+# caisses qui dépendent de tune-core. Allumée SEULEMENT par les
+# `[dev-dependencies]` de tune-server (resolver 2) : aucun binaire publié ne
+# la compile.
+journal-de-test = []
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.

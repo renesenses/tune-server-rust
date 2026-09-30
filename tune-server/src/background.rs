@@ -4763,6 +4763,7 @@ mod compteurs_ssdp_du_demarrage_5226 {
     /// fin de passe doit écrire `serveurs=1`, et garder `total=0` distinct.
     #[test]
     fn la_fin_de_passe_nomme_les_serveurs_multimedia() {
+        tune_core::journal_de_test::fiabiliser_la_capture();
         let journal = Journal::default();
         let abonne = tracing_subscriber::fmt()
             .with_writer(journal.clone())

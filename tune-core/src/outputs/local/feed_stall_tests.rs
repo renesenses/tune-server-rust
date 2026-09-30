@@ -137,6 +137,7 @@ fn une_cadence_nulle_ne_divise_pas_par_zero() {
 /// Le nom du diagnostic ne doit pas attribuer le chemin f32 generique a ASIO.
 #[test]
 fn i4046_la_trace_de_blocage_du_chemin_generique_ne_dit_pas_asio() {
+    crate::journal_de_test::fiabiliser_la_capture();
     // Other tests hit this same tracing callsite without a subscriber.
     // Isolate its first registration and interest cache in a child test process,
     // rather than relying on the scheduling of the surrounding parallel suite.

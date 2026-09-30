@@ -171,6 +171,10 @@ image = { workspace = true }
 # temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
 # que dans les cibles de test : le binaire publié ne le compile pas.
 tokio = { workspace = true, features = ["test-util"] }
+# Test-only (#5453) : `tune_core::journal_de_test::fiabiliser_la_capture()`
+# pour les tests qui capturent le journal par `set_default`/`with_default`.
+# Comme `test-util` ci-dessus, la feature n'entre que dans les cibles de test.
+tune-core = { path = "../tune-core", default-features = false, features = ["journal-de-test"] }
 
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.

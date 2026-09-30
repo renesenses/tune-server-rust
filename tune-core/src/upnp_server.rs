@@ -5428,6 +5428,7 @@ mod tests {
 
     #[test]
     fn un_refus_content_directory_nomme_action_et_objet_sans_accuser_les_actions_valides() {
+        crate::journal_de_test::fiabiliser_la_capture();
         let state = test_state();
         let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
         let journal = JournalCapture::default();
