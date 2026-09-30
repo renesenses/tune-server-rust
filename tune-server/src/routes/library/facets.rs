@@ -85,6 +85,31 @@ pub(super) fn build_conditions(
     (conds, params)
 }
 
+/// Faire tourner les lectures synchrones d'une route de bibliothèque HORS
+/// des fils de l'exécuteur async — #5438.
+///
+/// Un clic sur un raccourci vers une collection intelligente lance d'un coup
+/// plusieurs de ces routes (`/library/facets`, `/library/albums-detailed`,
+/// `/library/folder-facet`, `/library/collections`…), et chacune résout sa
+/// collection par [`smart_collection_track_ids`] : un `SELECT DISTINCT t.id`
+/// sur toute la bibliothèque. Posées sur les fils de l'exécuteur, elles les
+/// tenaient tous à la fois et le flux vers le renderer se taisait — la
+/// micro-coupure constatée chez Yves Corbat (58 359 pistes). Même remède que
+/// `list_albums` (#4800) et `list_tracks` (#5138) : le pool de fils bloquants
+/// de Tokio, où une lecture longue ne retient qu'elle-même.
+///
+/// Une tâche perdue (panique) rend 500 et le journal dit quelle route.
+pub(super) async fn hors_executeur<T, F>(route: &'static str, travail: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(travail).await.map_err(|e| {
+        tracing::error!(route, error = %e, "route_bibliotheque_tache_bloquante_perdue");
+        AppError::internal(format!("{route} : lecture interrompue"))
+    })
+}
+
 /// L'ensemble désigné par une sélection `collection`, résolu UNE fois par
 /// [`resolve_collection`] — le MIROIR exact des deux champs que `TrackFilter`
 /// porte de son côté (`collection_ids` / `collection_track_ids`).
@@ -462,6 +487,15 @@ pub(super) async fn library_facets(
     // `FacetQuery::hydrate`. Sans cet appel, `sel` reste vide et plus rien ne
     // filtre.
     let q = q.hydrate(raw.as_deref())?;
+    // #5438 — la résolution de la collection et les requêtes de chaque
+    // facette sont synchrones : hors de l'exécuteur.
+    hors_executeur("library_facets", move || compter_les_facettes(&state, q))
+        .await
+        .map(Json)
+}
+
+/// Le corps de `GET /library/facets`, exécuté HORS de l'exécuteur async.
+fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
     // `limit <= 0` means "no limit" (show every facet value); otherwise clamp to
     // a sane ceiling. Absent → the historical default of 200.
     let limit: Option<i64> = match q.limit {
@@ -485,7 +519,7 @@ pub(super) async fn library_facets(
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| resolve_collection(&state, name));
+        .map(|name| resolve_collection(state, name));
     let mut out = serde_json::Map::new();
     for field in requested {
         // Conditions narrow the count by the OTHER active facets (cumulative).
@@ -493,37 +527,37 @@ pub(super) async fn library_facets(
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
-            "genre" => genre_facet(&state, limit, &conds, &params),
-            "label" => column_facet(&state, "label", limit, &conds, &params),
+            "genre" => genre_facet(state, limit, &conds, &params),
+            "label" => column_facet(state, "label", limit, &conds, &params),
             // Le classique se navigue par compositeur avant de se naviguer par
             // artiste : colonne `tracks` directe, donc même facette de colonne.
-            "composer" => column_facet(&state, "composer", limit, &conds, &params),
-            "year" => column_facet(&state, "year", limit, &conds, &params),
-            "artist" => artist_facet(&state, limit, &conds, &params),
+            "composer" => column_facet(state, "composer", limit, &conds, &params),
+            "year" => column_facet(state, "year", limit, &conds, &params),
+            "artist" => artist_facet(state, limit, &conds, &params),
             // Technical dimensions an audiophile browses by (Bertrand): direct
             // `tracks` columns, so a plain column facet — like genre/year.
-            "format" => column_facet(&state, "format", limit, &conds, &params),
-            "sample_rate" => column_facet(&state, "sample_rate", limit, &conds, &params),
-            "bit_depth" => column_facet(&state, "bit_depth", limit, &conds, &params),
-            "country" => kv_facet(&state, "release_country", limit, &conds, &params),
-            "mood" => kv_facet(&state, "mood", limit, &conds, &params),
-            "source" => kv_facet(&state, "source_media", limit, &conds, &params),
-            "rating" => rating_facet(&state, limit, &conds, &params),
-            "collection" => collection_facet(&state, &q, engine),
-            "original_year" => original_year_facet(&state, limit, &conds, &params),
+            "format" => column_facet(state, "format", limit, &conds, &params),
+            "sample_rate" => column_facet(state, "sample_rate", limit, &conds, &params),
+            "bit_depth" => column_facet(state, "bit_depth", limit, &conds, &params),
+            "country" => kv_facet(state, "release_country", limit, &conds, &params),
+            "mood" => kv_facet(state, "mood", limit, &conds, &params),
+            "source" => kv_facet(state, "source_media", limit, &conds, &params),
+            "rating" => rating_facet(state, limit, &conds, &params),
+            "collection" => collection_facet(state, &q, engine),
+            "original_year" => original_year_facet(state, limit, &conds, &params),
             // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
             // bibliothèque non taguée elle est vide, et une facette morte dans
             // le rail coûte une requête pour ne rien montrer. Un client la
             // demande explicitement (`fields=…,dr`).
-            "dr" => dr_facet(&state, engine, limit, &conds, &params),
+            "dr" => dr_facet(state, engine, limit, &conds, &params),
             // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
             // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
             // tant que les crédits ne sont pas là, un client la demande
             // explicitement (`fields=…,instrument`).
-            "instrument" => instrument_facet(&state, engine, limit, &conds, &params),
-            "favorite" => favorite_facet(&state, &conds, &params),
-            "playlist" => playlist_facet(&state, limit, &conds, &params),
-            "untagged" => untagged_facet(&state, &conds, &params),
+            "instrument" => instrument_facet(state, engine, limit, &conds, &params),
+            "favorite" => favorite_facet(state, &conds, &params),
+            "playlist" => playlist_facet(state, limit, &conds, &params),
+            "untagged" => untagged_facet(state, &conds, &params),
             _ => continue,
         };
         let arr: Vec<Value> = rows
@@ -532,7 +566,7 @@ pub(super) async fn library_facets(
             .collect();
         out.insert(field, Value::Array(arr));
     }
-    Ok(Json(Value::Object(out)))
+    Value::Object(out)
 }
 
 /// Une entrée `{ value, count }` du rail, enrichie pour les deux facettes
