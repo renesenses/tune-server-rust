@@ -18,12 +18,20 @@
 //!    dans le MÊME puits : le flux reste ouvert, aucun blanc ;
 //! 4. sinon la chaîne rend la main — la piste courante se termine et la fin
 //!    naturelle rouvre le périphérique au nouveau format, comme en 0.9.165.
+//!
+//! #5451 — la réserve ([`ReserveDeLaChaine`], [`ReserveHttp`]) et la frontière
+//! ([`accepter_la_suivante`], générique sur [`FrontiereExclusive`]) servent
+//! aussi le bras CoreAudio exclusif de macOS, qui n'a pas d'étage natif : ce
+//! module est donc compilé sous macOS, et seule la boucle propre de WASAPI
+//! (qui lit par `EtageNatif`) reste sous le `cfg` de `etage_natif.rs`.
 
 use std::io::Read;
 
-use super::enchainement_exclusif::EnteteEnchainee;
+use super::enchainement_exclusif::{EnchainementNatif, EnteteEnchainee};
+#[cfg(any(target_os = "windows", test))]
 use super::etage_natif::{EcritureNative, EtageNatif};
 use super::*;
+#[cfg(any(target_os = "windows", test))]
 use crate::outputs::traits::PuitsNatif;
 
 /// Ce que [`HoteDeChaineNative::preparer_la_suivante`] a trouvé.
@@ -37,18 +45,16 @@ pub(super) enum Suivante<R> {
     Prete { lecteur: R, entete: EnteteEnchainee },
 }
 
-/// Ce que la chaîne emprunte au bras : les témoins d'arrêt, la publication
-/// vers la zone, et la réserve de la piste suivante.
-pub(super) trait HoteDeChaineNative {
+/// La réserve de la piste suivante, vue par une chaîne : ce qu'il faut pour
+/// décider d'un enchaînement, quel que soit le bras qui lit les pistes.
+///
+/// Séparée de [`HoteDeChaineNative`] pour le bras ASIO (#5204), qui lit ses
+/// pistes par la boucle commune (`BoucleProducteur::tourner`) : il n'emprunte
+/// à la chaîne que la réserve et la frontière, pas la lecture.
+pub(super) trait ReserveDeLaChaine {
     type Lecteur: Read;
-    /// Un ordre d'arrêt est-il arrivé ? (consomme le message, comme le bras.)
-    fn arret_recu(&mut self) -> bool;
     /// Le silence forcé par `stop()` / un `play_url` plus récent.
     fn silence_force(&self) -> bool;
-    /// Après chaque poussée : l'état DoP, le volume qui le suit, le verdict
-    /// bit-perfect du chemin de signal.
-    fn publier_le_verdict(&mut self, dop: bool, bit_perfect: bool);
-    fn publier_la_position(&mut self, position_ms: u64);
     /// Retire la suivante de sa réserve, ouvre son flux, lit son en-tête.
     fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur>;
     /// L'enchaînement est acquis : publier le morceau suivant (adresse, titre,
@@ -57,8 +63,22 @@ pub(super) trait HoteDeChaineNative {
     fn piste_enchainee(&mut self);
 }
 
+/// Ce que la chaîne emprunte au bras WASAPI : la réserve, plus les témoins
+/// d'arrêt et la publication vers la zone que sa boucle de lecture consulte.
+#[cfg(any(target_os = "windows", test))]
+pub(super) trait HoteDeChaineNative: ReserveDeLaChaine {
+    /// Un ordre d'arrêt est-il arrivé ? (consomme le message, comme le bras.)
+    fn arret_recu(&mut self) -> bool;
+    /// Après chaque poussée : l'état DoP, le volume qui le suit, le verdict
+    /// bit-perfect du chemin de signal.
+    fn publier_le_verdict(&mut self, dop: bool, bit_perfect: bool);
+    fn publier_la_position(&mut self, position_ms: u64);
+}
+
 /// Pourquoi la chaîne s'est arrêtée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `LectureEchouee` n'est construite que par la boucle propre de WASAPI.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub(super) enum FinDeChaine {
     /// Arrêt demandé, ou silence forcé.
     Interrompue,
@@ -86,6 +106,7 @@ pub(super) struct IssueDeLaChaine {
     pub(super) pistes_enchainees: u32,
 }
 
+#[cfg(any(target_os = "windows", test))]
 enum LectureDePiste {
     FinDeFlux,
     Interrompue,
@@ -93,6 +114,7 @@ enum LectureDePiste {
 }
 
 /// Décode `octets`, pousse, publie le verdict ; rend les trames consommées.
+#[cfg(any(target_os = "windows", test))]
 fn pousser<H: HoteDeChaineNative>(
     hote: &mut H,
     etage: &mut EtageNatif<'_>,
@@ -120,6 +142,7 @@ fn pousser<H: HoteDeChaineNative>(
 }
 
 /// La boucle de lecture d'UNE piste, telle que le bras WASAPI l'écrivait.
+#[cfg(any(target_os = "windows", test))]
 fn lire_la_piste<H: HoteDeChaineNative>(
     hote: &mut H,
     lecteur: &mut H::Lecteur,
@@ -166,6 +189,7 @@ fn lire_la_piste<H: HoteDeChaineNative>(
 /// la première piste. Ni la queue du DSP, ni le signal de fin naturelle, ni le
 /// vidage ne sont faits ici : ils appartiennent à la FIN de la chaîne, et le
 /// bras les fait au retour.
+#[cfg(any(target_os = "windows", test))]
 pub(super) fn jouer_la_chaine_native<H: HoteDeChaineNative>(
     hote: &mut H,
     premier: H::Lecteur,
@@ -205,57 +229,97 @@ pub(super) fn jouer_la_chaine_native<H: HoteDeChaineNative>(
             LectureDePiste::FinDeFlux => forcer_le_reliquat(etage, puits, &mut trames),
         }
 
-        if hote.silence_force() {
-            return issue(FinDeChaine::Interrompue, true, trames, pistes_enchainees);
-        }
-        let (suivant, entete) = match hote.preparer_la_suivante() {
-            Suivante::Aucune => {
-                return issue(FinDeChaine::RienEnReserve, true, trames, pistes_enchainees);
-            }
-            Suivante::Refusee => {
-                return issue(
-                    FinDeChaine::SuivanteRefusee,
-                    true,
-                    trames,
-                    pistes_enchainees,
-                );
-            }
-            Suivante::Prete { lecteur, entete } => (lecteur, entete),
+        let (suivant, entete) = match accepter_la_suivante(hote, etage) {
+            Ok(acceptee) => acceptee,
+            Err(fin) => return issue(fin, true, trames, pistes_enchainees),
         };
-        if etage.enchainer_la_piste(entete.spec).is_err() {
-            info!(
-                prev_sr = etage.spec().cadence(),
-                prev_bd = etage.spec().profondeur().bits_declares(),
-                prev_ch = etage.spec().canaux(),
-                new_sr = entete.spec.cadence(),
-                new_bd = entete.spec.profondeur().bits_declares(),
-                new_ch = entete.spec.canaux(),
-                "local_audio_exclusive_gapless_format_change_reopen"
-            );
-            return issue(
-                FinDeChaine::FormatDifferent,
-                true,
-                trames,
-                pistes_enchainees,
-            );
-        }
-        hote.piste_enchainee();
         pistes_enchainees += 1;
         seek_offset = 0;
         trames = pousser(hote, etage, puits, entete.amorce());
         lecteur = suivant;
-        info!(
-            sample_rate = entete.spec.cadence(),
-            bit_depth = entete.spec.profondeur().bits_declares(),
-            channels = entete.spec.canaux(),
-            "local_audio_exclusive_gapless_chained"
-        );
     }
+}
+
+/// L'étage vu par la frontière d'une piste enchaînée en mode exclusif : le
+/// format de la piste qui se termine, et le geste qui fait entrer la suivante
+/// dans le flux ouvert — ou le refuse.
+///
+/// Un transport exclusif ouvre le périphérique AU FORMAT SOURCE et ne
+/// convertit rien : la règle est [`decider_l_enchainement_natif`] pour tous
+/// les implémenteurs. Deux étages l'implémentent : l'étage natif des bras
+/// Windows ([`EtageNatif`]), et l'étage flottant au format identité du bras
+/// CoreAudio (#5451, dans `chaine_par_la_boucle.rs`).
+///
+/// [`decider_l_enchainement_natif`]: super::enchainement_exclusif::decider_l_enchainement_natif
+pub(super) trait FrontiereExclusive {
+    /// Le format de la piste courante (celle qui se termine).
+    fn spec_courante(&self) -> AudioSpec;
+    /// À format égal, prépare l'étage pour la suivante (rien n'est écrit au
+    /// puits) ; sinon `Err(Rouvrir)` et l'étage n'est pas touché.
+    fn enchainer_a_format_egal(&mut self, suivante: AudioSpec) -> Result<(), EnchainementNatif>;
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl FrontiereExclusive for EtageNatif<'_> {
+    fn spec_courante(&self) -> AudioSpec {
+        self.spec()
+    }
+
+    fn enchainer_a_format_egal(&mut self, suivante: AudioSpec) -> Result<(), EnchainementNatif> {
+        self.enchainer_la_piste(suivante)
+    }
+}
+
+/// LA frontière d'une piste enchaînée sur un transport natif exclusif, commune
+/// aux bras WASAPI et ASIO : la piste courante vient d'atteindre sa fin de
+/// flux (son reliquat est déjà parti).
+///
+/// `Ok` : la suivante est acquise — son flux est ouvert, son en-tête lu, son
+/// format est celui du flux ouvert ([`EtageNatif::enchainer_la_piste`]), et
+/// elle est publiée à la zone. Il reste à l'appelant à pousser son amorce et
+/// à lire son flux dans le MÊME puits.
+///
+/// `Err` : on n'enchaîne pas, et la raison. La piste courante se termine ; la
+/// fin naturelle prend le relais (et rouvre au nouveau format s'il change).
+pub(super) fn accepter_la_suivante<R: ReserveDeLaChaine, F: FrontiereExclusive + ?Sized>(
+    reserve: &mut R,
+    etage: &mut F,
+) -> Result<(R::Lecteur, EnteteEnchainee), FinDeChaine> {
+    if reserve.silence_force() {
+        return Err(FinDeChaine::Interrompue);
+    }
+    let (suivant, entete) = match reserve.preparer_la_suivante() {
+        Suivante::Aucune => return Err(FinDeChaine::RienEnReserve),
+        Suivante::Refusee => return Err(FinDeChaine::SuivanteRefusee),
+        Suivante::Prete { lecteur, entete } => (lecteur, entete),
+    };
+    if etage.enchainer_a_format_egal(entete.spec).is_err() {
+        let courante = etage.spec_courante();
+        info!(
+            prev_sr = courante.cadence(),
+            prev_bd = courante.profondeur().bits_declares(),
+            prev_ch = courante.canaux(),
+            new_sr = entete.spec.cadence(),
+            new_bd = entete.spec.profondeur().bits_declares(),
+            new_ch = entete.spec.canaux(),
+            "local_audio_exclusive_gapless_format_change_reopen"
+        );
+        return Err(FinDeChaine::FormatDifferent);
+    }
+    reserve.piste_enchainee();
+    info!(
+        sample_rate = entete.spec.cadence(),
+        bit_depth = entete.spec.profondeur().bits_declares(),
+        channels = entete.spec.canaux(),
+        "local_audio_exclusive_gapless_chained"
+    );
+    Ok((suivant, entete))
 }
 
 /// Moins de 32 trames 24 bits initiales ne se classent pas, mais l'anneau
 /// entier peut les porter : elles partent brutes et à l'unité plutôt que
 /// devinées PCM (ce que le bras faisait à l'EOF).
+#[cfg(any(target_os = "windows", test))]
 fn forcer_le_reliquat(etage: &mut EtageNatif<'_>, puits: &mut dyn PuitsNatif, trames: &mut u64) {
     if let Some(reliquat) = etage.vider(puits) {
         *trames += reliquat.trames;
@@ -264,5 +328,84 @@ fn forcer_le_reliquat(etage: &mut EtageNatif<'_>, puits: &mut dyn PuitsNatif, tr
             bytes = reliquat.octets,
             "windows_exclusive_short_24bit_stream_forced_raw"
         );
+    }
+}
+
+/// La réserve réelle des bras exclusifs (WASAPI, ASIO, et CoreAudio depuis
+/// #5451) : la piste que `set_next_media` a préparée, son flux HTTP, et ce
+/// qu'il faut publier à la zone quand elle est enchaînée. Un seul exemplaire
+/// pour les trois bras (#5204) : c'était le corps de `HoteWasapi`.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(super) struct ReserveHttp<'a> {
+    pub(super) force_silent: &'a Arc<AtomicBool>,
+    pub(super) position_ms: &'a AtomicU64,
+    pub(super) next_media: &'a std::sync::Mutex<Option<PendingNextMedia>>,
+    /// La suivante retirée de la réserve, en attente de la décision de format.
+    pub(super) en_cours: Option<PendingNextMedia>,
+    pub(super) current_uri: &'a std::sync::Mutex<Option<String>>,
+    pub(super) track_title: &'a std::sync::Mutex<Option<String>>,
+    pub(super) track_artist: &'a std::sync::Mutex<Option<String>>,
+    pub(super) duration_ms: &'a AtomicU64,
+    pub(super) seek_offset_ms: &'a AtomicU64,
+    pub(super) track_ended_naturally: &'a AtomicBool,
+    pub(super) track_ended_generation: &'a AtomicU64,
+    pub(super) dop_active: &'a AtomicBool,
+    pub(super) volume: &'a Arc<AtomicU32>,
+    pub(super) user_volume: &'a Arc<AtomicU32>,
+    pub(super) rg_factor: &'a Arc<AtomicU32>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl ReserveDeLaChaine for ReserveHttp<'_> {
+    type Lecteur = super::LecteurHttpAnnulable;
+
+    fn silence_force(&self) -> bool {
+        self.force_silent.load(Ordering::Relaxed)
+    }
+
+    fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
+        use super::enchainement_exclusif::{lire_l_entete_enchainee, ouvrir_la_piste_suivante};
+        let Some(suivante) = self.next_media.lock().unwrap().take() else {
+            return Suivante::Aucune;
+        };
+        info!(
+            next_title = ?suivante.title,
+            next_url = %suivante.url,
+            "local_audio_gapless_chaining_next_track"
+        );
+        let Some(mut lecteur) = ouvrir_la_piste_suivante(&suivante.url, self.force_silent) else {
+            return Suivante::Refusee;
+        };
+        match lire_l_entete_enchainee(&mut lecteur, self.force_silent) {
+            Ok(entete) => {
+                self.en_cours = Some(suivante);
+                Suivante::Prete { lecteur, entete }
+            }
+            Err(_) => Suivante::Refusee,
+        }
+    }
+
+    /// Même bascule que le chemin partagé, une fois l'enchaînement acquis :
+    /// le morceau suivant est publié, la position repart de zéro — le sondeur
+    /// y lit une transition interne et avance la file sans `play`. La
+    /// décision DoP de la nouvelle piste repart de zéro, comme en début de
+    /// piste : elle n'hérite pas de l'état DoP/volume de la précédente.
+    fn piste_enchainee(&mut self) {
+        let Some(suivante) = self.en_cours.take() else {
+            return;
+        };
+        self.track_ended_naturally.store(false, Ordering::SeqCst);
+        self.track_ended_generation.store(0, Ordering::SeqCst);
+        *self.current_uri.lock().unwrap() = Some(suivante.url);
+        *self.track_title.lock().unwrap() = suivante.title;
+        *self.track_artist.lock().unwrap() = suivante.artist;
+        if let Some(duree) = suivante.duration_ms {
+            self.duration_ms.store(duree, Ordering::SeqCst);
+        }
+        self.seek_offset_ms.store(0, Ordering::SeqCst);
+        self.position_ms.store(0, Ordering::SeqCst);
+        if self.dop_active.swap(false, Ordering::SeqCst) {
+            sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, false);
+        }
     }
 }

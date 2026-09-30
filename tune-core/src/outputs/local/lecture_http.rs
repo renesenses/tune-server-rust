@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const PAS_ANNULATION: Duration = Duration::from_millis(25);
+pub(super) const PAS_ANNULATION: Duration = Duration::from_millis(25);
 
-fn interrompue() -> io::Error {
+pub(super) fn interrompue() -> io::Error {
     // Interrupted est une erreur transitoire que Read::read_exact/read_to_end
     // retentent : Stop doit au contraire terminer aussi ces consommateurs.
     io::Error::new(
@@ -55,12 +55,37 @@ impl Drop for Moteur {
 }
 
 pub(super) struct LecteurHttpAnnulable {
+    corps: Corps,
+}
+
+/// #5439 — ce que la sortie lit : le corps HTTP tel quel, ou le même corps
+/// décodé au fil de l'eau en WAV (`super::decodage_en_continu`).
+enum Corps {
+    Http(CorpsHttp),
+    Decode(super::decodage_en_continu::FluxDecode),
+}
+
+pub(super) struct CorpsHttp {
     // Ordre de destruction : le corps HTTP est rendu avant son executant.
     response: reqwest::Response,
     tampon: Vec<u8>,
     position: usize,
     arret: Arc<AtomicBool>,
     moteur: Moteur,
+}
+
+impl CorpsHttp {
+    /// Remplace le témoin d'arrêt observé par les attentes HTTP. Le fil de
+    /// décodage en continu (#5439) lit ce corps sous SON témoin, que le
+    /// lecteur lève à l'arrêt comme à l'abandon.
+    pub(super) fn observer(&mut self, arret: Arc<AtomicBool>) {
+        self.arret = arret;
+    }
+
+    /// Le témoin d'arrêt observé jusqu'ici (`force_silent` de la lecture).
+    pub(super) fn arret_courant(&self) -> Arc<AtomicBool> {
+        self.arret.clone()
+    }
 }
 
 impl LecteurHttpAnnulable {
@@ -78,20 +103,57 @@ impl LecteurHttpAnnulable {
             attendre(&arret, client.get(url).send()).await
         })?;
         Ok(Self {
-            response,
-            tampon: Vec::new(),
-            position: 0,
-            arret,
-            moteur,
+            corps: Corps::Http(CorpsHttp {
+                response,
+                tampon: Vec::new(),
+                position: 0,
+                arret,
+                moteur,
+            }),
         })
     }
 
     pub(super) fn status(&self) -> reqwest::StatusCode {
-        self.response.status()
+        match &self.corps {
+            Corps::Http(http) => http.response.status(),
+            // Le statut a été jugé avant la conversion.
+            Corps::Decode(_) => reqwest::StatusCode::OK,
+        }
+    }
+
+    /// #5439 — la suite de ce flux compressé se lit décodée au fil de l'eau :
+    /// un en-tête WAV, puis le PCM, dès les premiers paquets. `prefixe` est ce
+    /// qui a déjà été lu du corps (l'en-tête sondé par `play_url`).
+    pub(super) fn decoder_en_continu(self, prefixe: Vec<u8>, extension: &'static str) -> Self {
+        match self.corps {
+            Corps::Http(http) => Self {
+                corps: Corps::Decode(super::decodage_en_continu::FluxDecode::lancer(
+                    http, prefixe, extension,
+                )),
+            },
+            deja @ Corps::Decode(_) => Self { corps: deja },
+        }
+    }
+
+    /// L'échec du décodeur en continu, s'il a rendu la main sur une erreur.
+    pub(super) fn echec_du_decodage(&self) -> Option<String> {
+        match &self.corps {
+            Corps::Http(_) => None,
+            Corps::Decode(flux) => flux.echec(),
+        }
     }
 }
 
 impl Read for LecteurHttpAnnulable {
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+        match &mut self.corps {
+            Corps::Http(http) => http.read(destination),
+            Corps::Decode(flux) => flux.read(destination),
+        }
+    }
+}
+
+impl Read for CorpsHttp {
     fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
         if destination.is_empty() {
             return Ok(0);

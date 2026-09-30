@@ -434,6 +434,16 @@ pub mod sql {
         )
     }
 
+    /// #5463 — le code-barres d'un album, que seule une feuille CUE
+    /// (`CATALOG`) fournit au scan.
+    pub fn force_update_barcode<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET barcode = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET cover_path = {}, cover_source = {}, cover_source_path = NULL, cover_source_stamp = NULL WHERE id = {}",
@@ -2541,6 +2551,14 @@ impl AlbumRepo {
     /// feuille CUE EST la source de métadonnées de l'album qu'elle décrit,
     /// c'est tout son objet. Ailleurs, deux titres en désaccord désignent deux
     /// éditions et ne se tranchent pas ici.
+    /// Pose le code-barres de l'album (#5463). `Album::update` ne l'écrit pas.
+    pub fn force_update_barcode(&self, album_id: i64, barcode: &str) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::force_update_barcode, sql::force_update_barcode);
+        let params: [&dyn ToSqlValue; 2] = [&barcode, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn force_update_title(&self, album_id: i64, title: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_title, sql::force_update_title);
         let params: [&dyn ToSqlValue; 2] = [&title, &album_id];
@@ -3344,6 +3362,55 @@ impl AlbumRepo {
         )
     }
 
+    /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
+    /// a.year`), dans l'ordre alphabétique du serveur média (#4956) :
+    ///
+    /// - par titre : la clé du titre, puis l'identifiant ;
+    /// - par artiste : la clé du nom de l'artiste, puis l'année (sans année
+    ///   d'abord, comme `ORDER BY a.year ASC` sur SQLite), la clé du titre,
+    ///   l'identifiant.
+    ///
+    /// `desc` ne renverse que la clé principale, comme le `{dir}` du SQL
+    /// qu'elle remplace : les départages restent croissants, et l'ordre reste
+    /// total dans les deux sens.
+    fn ids_en_ordre_alphabetique(
+        &self,
+        sql: &str,
+        valeurs: &[&dyn ToSqlValue],
+        par_artiste: bool,
+        desc: bool,
+    ) -> Result<Vec<i64>, TuneError> {
+        use crate::upnp_server::{CleAlphabetique, cle_alphabetique};
+        let lignes = self.db.query_many(sql, valeurs)?;
+        let mut cles: Vec<(CleAlphabetique, Option<i64>, Option<CleAlphabetique>, i64)> = lignes
+            .iter()
+            .filter_map(|r| {
+                let id = r.first().and_then(|v| v.as_i64())?;
+                let titre = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                Some(if par_artiste {
+                    let artiste = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                    let annee = r.get(3).and_then(|v| v.as_i64());
+                    (
+                        cle_alphabetique(&artiste),
+                        annee,
+                        Some(cle_alphabetique(&titre)),
+                        id,
+                    )
+                } else {
+                    (cle_alphabetique(&titre), None, None, id)
+                })
+            })
+            .collect();
+        cles.sort_by(|a, b| {
+            let principal = a.0.cmp(&b.0);
+            if desc { principal.reverse() } else { principal }
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        Ok(cles.into_iter().map(|(_, _, _, id)| id).collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lister_filtre(
         &self,
@@ -3459,20 +3526,13 @@ impl AlbumRepo {
             bind_values.push(SqlValue::Text(fmt.to_string()));
             next_ph += 1;
         }
-        match quality {
-            Some("dsd") => {
-                wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format IN ('dsd','dsf','dff'))".to_string());
-            }
-            Some("hires") => {
-                wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE sample_rate > 44100 OR bit_depth > 16)".to_string());
-            }
-            Some("cd") => {
-                wheres.push("(a.sample_rate = 44100 AND a.bit_depth = 16)".to_string());
-            }
-            Some("lossy") => {
-                wheres.push("a.format IN ('mp3','aac','ogg','opus','wma')".to_string());
-            }
-            _ => {}
+        // #5413 : chaque filtre de qualité rend EXACTEMENT les albums qui
+        // portent le badge correspondant — le prédicat est dérivé de la règle
+        // de `Album::quality()`, sur les mêmes champs d'album. Avant, `hires`
+        // gardait tout album dont UNE piste dépassait 44,1 kHz (DSD compris)
+        // et `cd` exigeait 44,1 kHz / 16 bits pile.
+        if let Some(pred) = quality.and_then(|q| Album::quality_sql(q, "a")) {
+            wheres.push(pred);
         }
         // `COALESCE` : une base migrée depuis SQLite peut porter des NULL, et
         // `NULL = 0` vaut NULL — sans lui, « tout sauf les compilations »
@@ -3579,28 +3639,54 @@ impl AlbumRepo {
         } else {
             format!("SELECT a.id{colonne_total} FROM albums a {joins}")
         };
-        let sql = format!(
-            "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
-        );
+        let (ordered_ids, total) = if matches!(sort, "title" | "artist") {
+            // #4956 — les deux tris ALPHABÉTIQUES (les seuls où le client web
+            // offre le rail A–Z) suivent l'ordre du serveur média, calculé en
+            // Rust : `LOWER(a.title)` / `LOWER(ar.name)` ne repliaient que
+            // l'ASCII sur SQLite (« Été indien » après « Zoo ») et suivaient
+            // la collation de la base sur PostgreSQL. Même `WHERE`, mêmes
+            // jointures, mêmes valeurs liées que le 1er temps de #1269 ; on
+            // lit l'ensemble filtré en lignes étroites (id, titre, artiste,
+            // année), on le trie, on découpe. Le total est la taille de
+            // l'ensemble trié : il ne peut pas diverger de la page.
+            let sql = format!(
+                "SELECT a.id, a.title, ar.name, a.year FROM albums a {joins}{where_clause}"
+            );
+            let refs: Vec<&dyn ToSqlValue> =
+                bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
+            let ids =
+                self.ids_en_ordre_alphabetique(&sql, &refs, sort == "artist", dir == "DESC")?;
+            let total = avec_total.then_some(ids.len() as i64);
+            (
+                super::ordre_alphabetique::tranche(ids, limit, offset),
+                total,
+            )
+        } else {
+            let sql = format!(
+                "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
+            );
 
-        bind_values.push(SqlValue::Int(limit));
-        bind_values.push(SqlValue::Int(offset));
+            bind_values.push(SqlValue::Int(limit));
+            bind_values.push(SqlValue::Int(offset));
 
-        let refs: Vec<&dyn ToSqlValue> = bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
-        let rows = self.db.query_many(&sql, &refs)?;
-        let ordered_ids: Vec<i64> = rows
-            .iter()
-            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
-            .collect();
+            let refs: Vec<&dyn ToSqlValue> =
+                bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
+            let rows = self.db.query_many(&sql, &refs)?;
+            let ordered_ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect();
+            // Le total est le même sur toutes les lignes : la première suffit.
+            let total = if avec_total {
+                rows.first().and_then(|r| r.last()).and_then(|v| v.as_i64())
+            } else {
+                None
+            };
+            (ordered_ids, total)
+        };
         if ordered_ids.is_empty() {
             return Ok((Vec::new(), None));
         }
-        // Le total est le même sur toutes les lignes : la première suffit.
-        let total = if avec_total {
-            rows.first().and_then(|r| r.last()).and_then(|v| v.as_i64())
-        } else {
-            None
-        };
 
         // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
         // TOUS les tris. Avant, elle n'était extraite que du 1er temps du tri
@@ -4278,7 +4364,7 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use super::*;
     use crate::db::artist_repo::ArtistRepo;
@@ -5505,6 +5591,198 @@ mod tests {
         let json = a.to_json();
         assert_eq!(json["quality"], "hi-res");
         assert_eq!(json["title"], "Test");
+    }
+
+    /// #5413 (Rhorn, fil 2032) — chaque filtre `quality` de la liste
+    /// d'albums rend EXACTEMENT les albums qui portent le badge
+    /// correspondant (`Album::quality()`), ni plus ni moins.
+    ///
+    /// Quatre albums, chacun piégeant l'ancien filtre `hires` (« une piste
+    /// au-delà de 44,1 kHz ou de 16 bits suffit ») d'une façon différente :
+    /// - un 96 kHz / 24 bits — hi-res, le seul attendu ;
+    /// - un DSF — badge DSD, que l'ancien filtre rendait sous hi-res ;
+    /// - un MP3 à 48 kHz — badge lossy, rendu sous hi-res (seuil 44,1 kHz) ;
+    /// - une compilation 44,1 kHz / 16 bits dont UNE piste est en 96 kHz —
+    ///   badge cd, rendue sous hi-res par sa seule piste.
+    ///
+    /// Le badge est lu sur les albums RELUS de la base, pas sur les valeurs
+    /// écrites : c'est ce que la route sérialise. Le même scénario tourne sur
+    /// PostgreSQL (`postgres_e2e::pg_5413_filtres_de_qualite_suivent_le_badge`).
+    pub(crate) fn scenario_filtres_de_qualite_5413(db: Arc<dyn DbBackend>) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        use std::collections::BTreeSet;
+        let aid = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste 5413".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db);
+        type Piste = (&'static str, Option<i32>, Option<i32>);
+        type Cas = (
+            &'static str,
+            &'static str,
+            Option<i32>,
+            Option<i32>,
+            bool,
+            Vec<Piste>,
+        );
+        let cas: Vec<Cas> = vec![
+            (
+                "Hi-Res 96-24",
+                "flac",
+                Some(96000),
+                Some(24),
+                false,
+                vec![("flac", Some(96000), Some(24)); 2],
+            ),
+            (
+                "DSF 2,8 MHz",
+                "dsf",
+                Some(2_822_400),
+                Some(1),
+                false,
+                vec![("dsf", Some(2_822_400), Some(1)); 2],
+            ),
+            (
+                "MP3 48 kHz",
+                "mp3",
+                Some(48000),
+                None,
+                false,
+                vec![("mp3", Some(48000), None); 2],
+            ),
+            (
+                "Compilation CD une piste 96",
+                "flac",
+                Some(44100),
+                Some(16),
+                true,
+                vec![
+                    ("flac", Some(44100), Some(16)),
+                    ("flac", Some(44100), Some(16)),
+                    ("flac", Some(96000), Some(24)),
+                ],
+            ),
+        ];
+        for (titre, format, sr, bd, compil, ps) in &cas {
+            let mut a = Album::new((*titre).into());
+            a.artist_id = Some(aid);
+            a.format = Some((*format).into());
+            a.sample_rate = *sr;
+            a.bit_depth = *bd;
+            a.is_compilation = *compil;
+            let album_id = albums.create(&a).unwrap();
+            for (n, (pf, psr, pbd)) in ps.iter().enumerate() {
+                let mut t = Track::new(format!("{titre} {n}"));
+                t.album_id = Some(album_id);
+                t.artist_id = Some(aid);
+                t.track_number = n as i32 + 1;
+                t.duration_ms = 1000;
+                t.file_path = Some(format!("/music/5413/{titre}/{n}.{pf}"));
+                t.format = Some((*pf).into());
+                t.sample_rate = *psr;
+                t.bit_depth = *pbd;
+                pistes.create(&t).unwrap();
+            }
+        }
+        let lister = |q: Option<&str>| -> Vec<Album> {
+            albums
+                .list_filtered(100, 0, "id", "asc", None, q, None, false, None)
+                .unwrap()
+        };
+        let tous = lister(None);
+        assert_eq!(tous.len(), 4, "les quatre albums doivent être listés");
+        let attendus = [
+            ("dsd", "dsd", "DSF 2,8 MHz"),
+            ("hires", "hi-res", "Hi-Res 96-24"),
+            ("hi-res", "hi-res", "Hi-Res 96-24"),
+            ("lossy", "lossy", "MP3 48 kHz"),
+            ("cd", "cd", "Compilation CD une piste 96"),
+        ];
+        for (filtre, badge, seul) in attendus {
+            let portent_le_badge: BTreeSet<String> = tous
+                .iter()
+                .filter(|a| a.quality().as_deref() == Some(badge))
+                .map(|a| a.title.clone())
+                .collect();
+            // Témoin : chaque badge est porté par UN album — l'égalité qui
+            // suit ne peut pas être vraie « contre rien ».
+            assert_eq!(
+                portent_le_badge,
+                BTreeSet::from([seul.to_string()]),
+                "badge `{badge}` : le scénario doit en porter exactement un"
+            );
+            let rendus = lister(Some(filtre));
+            let filtres: BTreeSet<String> = rendus.iter().map(|a| a.title.clone()).collect();
+            assert_eq!(
+                filtres, portent_le_badge,
+                "?quality={filtre} doit rendre exactement les albums badgés `{badge}`"
+            );
+            // Et l'album rendu ne s'ouvre pas VIDE sous le même filtre : la
+            // fiche (`GET /library/albums/{id}/tracks?quality=…`) filtre ses
+            // pistes par la même règle.
+            for a in &rendus {
+                let vues = pistes
+                    .list_by_album_filtered(a.id.unwrap(), None, Some(filtre))
+                    .unwrap();
+                assert!(
+                    !vues.is_empty(),
+                    "« {} » rendu sous ?quality={filtre} doit montrer au moins une piste",
+                    a.title
+                );
+            }
+        }
+        // La piste 96 kHz de la compilation est hi-res, les deux autres cd :
+        // la fiche sous `cd` n'en montre que deux (Sergio : un filtre ne doit
+        // pas révéler les pistes d'une autre qualité).
+        let compil = tous
+            .iter()
+            .find(|a| a.title == "Compilation CD une piste 96")
+            .and_then(|a| a.id)
+            .unwrap();
+        assert_eq!(
+            pistes
+                .list_by_album_filtered(compil, None, Some("cd"))
+                .unwrap()
+                .len(),
+            2
+        );
+        // Cinquième album, posé APRÈS les égalités ci-dessus : un FLAC
+        // 48 kHz / 16 bits porte le badge `cd`, donc sort sous ?quality=cd
+        // — et sa fiche, sous ce même filtre, doit montrer ses pistes
+        // (l'ancien filtre de pistes exigeait 44,1 kHz pile : fiche VIDE).
+        let mut a48 = Album::new("FLAC 48-16".into());
+        a48.artist_id = Some(aid);
+        a48.format = Some("flac".into());
+        a48.sample_rate = Some(48000);
+        a48.bit_depth = Some(16);
+        let id48 = albums.create(&a48).unwrap();
+        let mut t = Track::new("FLAC 48-16 0".into());
+        t.album_id = Some(id48);
+        t.artist_id = Some(aid);
+        t.track_number = 1;
+        t.duration_ms = 1000;
+        t.file_path = Some("/music/5413/FLAC 48-16/0.flac".into());
+        t.format = Some("flac".into());
+        t.sample_rate = Some(48000);
+        t.bit_depth = Some(16);
+        pistes.create(&t).unwrap();
+        assert_eq!(a48.quality().as_deref(), Some("cd"));
+        assert!(lister(Some("cd")).iter().any(|a| a.id == Some(id48)));
+        assert!(!lister(Some("hires")).iter().any(|a| a.id == Some(id48)));
+        assert_eq!(
+            pistes
+                .list_by_album_filtered(id48, None, Some("cd"))
+                .unwrap()
+                .len(),
+            1,
+            "la fiche d'un album rendu sous ?quality=cd ne doit pas s'ouvrir vide"
+        );
+    }
+
+    #[test]
+    fn i5413_les_filtres_de_qualite_suivent_le_badge() {
+        scenario_filtres_de_qualite_5413(Arc::new(test_db()));
     }
 
     #[test]

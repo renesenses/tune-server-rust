@@ -94,7 +94,7 @@ impl TunePlugin for CdPlugin {
         "cd"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Lecture directe d'un CD audio vers une zone, sans extraction (Linux, macOS et Windows)"

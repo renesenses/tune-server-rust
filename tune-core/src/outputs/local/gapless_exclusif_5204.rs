@@ -20,7 +20,9 @@
 use std::collections::VecDeque;
 use std::io::Cursor;
 
-use super::chaine_native::{FinDeChaine, HoteDeChaineNative, Suivante, jouer_la_chaine_native};
+use super::chaine_native::{
+    FinDeChaine, HoteDeChaineNative, ReserveDeLaChaine, Suivante, jouer_la_chaine_native,
+};
 use super::enchainement_exclusif::{
     BrasDeLecture, EnchainementNatif, RefusDEnchainement, bras_de_lecture,
     decider_l_enchainement_natif, lire_l_entete_enchainee,
@@ -38,7 +40,8 @@ use crate::outputs::traits::{CaptureOutputNatif, ProfondeurPcm};
 /// test y rougit. Sous Windows, c'est le bras WASAPI (qui enchaîne depuis
 /// #5204) ; sous Linux, l'exclusif n'existe pas et `play_url` prend le bras
 /// cpal partagé, qui a toujours enchaîné — la capacité mentait donc aussi là.
-/// macOS est exclu : son bras exclusif (CoreAudio « hog ») n'enchaîne pas.
+/// macOS est exclu parce que « wasapi » n'y existe pas : son bras exclusif est
+/// CoreAudio « hog », qui enchaîne depuis #5451 (`gapless_coreaudio_5451.rs`).
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn une_sortie_exclusive_wasapi_annonce_l_enchainement_interne_5204() {
@@ -86,11 +89,15 @@ fn le_bras_emprunte_decide_de_la_capacite_5204() {
     );
     assert!(CpalPartage.sait_enchainer());
     assert!(
-        !AsioExclusif.sait_enchainer(),
-        "le bras ASIO sort encore à l'EOF sans consommer la suivante : \
-         l'annoncer enchaînable figerait l'album (DEvir, Fireface)"
+        AsioExclusif.sait_enchainer(),
+        "#5204 (seconde tranche) : ASIO exclusif enchaîne à format égal sur \
+         sa route native — voir `gapless_asio_5204.rs`"
     );
-    assert!(!CoreAudioExclusif.sait_enchainer());
+    assert!(
+        CoreAudioExclusif.sait_enchainer(),
+        "#5451 : CoreAudio exclusif enchaîne à format égal — voir \
+         `gapless_coreaudio_5451.rs`"
+    );
 }
 
 // ─── 2. La règle de la frontière ────────────────────────────────────────────
@@ -195,20 +202,12 @@ struct HoteFactice {
     enchainements: u32,
 }
 
-impl HoteDeChaineNative for HoteFactice {
+impl ReserveDeLaChaine for HoteFactice {
     type Lecteur = Cursor<Vec<u8>>;
-
-    fn arret_recu(&mut self) -> bool {
-        false
-    }
 
     fn silence_force(&self) -> bool {
         false
     }
-
-    fn publier_le_verdict(&mut self, _dop: bool, _bit_perfect: bool) {}
-
-    fn publier_la_position(&mut self, _position_ms: u64) {}
 
     fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
         let Some(octets) = self.reserve.pop_front() else {
@@ -224,6 +223,16 @@ impl HoteDeChaineNative for HoteFactice {
     fn piste_enchainee(&mut self) {
         self.enchainements += 1;
     }
+}
+
+impl HoteDeChaineNative for HoteFactice {
+    fn arret_recu(&mut self) -> bool {
+        false
+    }
+
+    fn publier_le_verdict(&mut self, _dop: bool, _bit_perfect: bool) {}
+
+    fn publier_la_position(&mut self, _position_ms: u64) {}
 }
 
 /// Ce que `play_url` fait avant le bras : lire l'en-tête de la première

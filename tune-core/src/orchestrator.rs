@@ -146,6 +146,7 @@ pub struct ContexteEcoute<'a> {
 }
 
 mod regles;
+mod trace_des_niveaux;
 pub use regles::*;
 
 /// Pas d'attente pendant les phases pause / pré-démarrage du forwarder de
@@ -224,17 +225,27 @@ fn spawn_paced_levels_forwarder(
         // encore décrire la piste PRÉCÉDENTE, et rien ne se jette sur sa foi.
         // Voir [`attendre_que_la_sortie_joue`].
         let mut horloge_de_cette_piste = false;
-        while let Some(raw) = rx.recv().await {
+        // #5104 — de quoi dire, à la mort du forwarder, qu'il n'a rien publié
+        // et pourquoi. Chaque sortie de la boucle pose son motif.
+        let mut arret = trace_des_niveaux::ArretDuForwarder::FluxClos;
+        let mut trames_publiees: u64 = 0;
+        let mut fenetres_recues: u64 = 0;
+        let mut fenetres_sautees: u64 = 0;
+        'forwarder: while let Some(raw) = rx.recv().await {
+            fenetres_recues += 1;
             // La boucle RAPPORTE la position lue au moment où la zone est
             // effectivement en lecture : c'est cette valeur-là, et aucune autre,
             // qui sert au rattrapage plus bas. Un `0` initial n'était jamais lu
             // (toute sortie de boucle passe par une affectation), et le déclarer
             // laissait croire à un repli qui n'existe pas.
             let reported_position_ms: i64 = loop {
-                if playback.current_play_seq(zone_id).await != play_seq
-                    || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
-                {
-                    return;
+                if playback.current_play_seq(zone_id).await != play_seq {
+                    arret = trace_des_niveaux::ArretDuForwarder::PlaySeqChange;
+                    break 'forwarder;
+                }
+                if gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn {
+                    arret = trace_des_niveaux::ArretDuForwarder::GenerationChangee;
+                    break 'forwarder;
                 }
                 let zone_state = playback.get_state(zone_id).await;
                 let reported_position_ms = zone_state.position_ms;
@@ -249,12 +260,16 @@ fn spawn_paced_levels_forwarder(
                         started = true;
                         break reported_position_ms;
                     }
-                    PlayState::Stopped if started => return,
+                    PlayState::Stopped if started => {
+                        arret = trace_des_niveaux::ArretDuForwarder::ZoneArretee;
+                        break 'forwarder;
+                    }
                     // Pause, ou lecture pas encore démarrée (résolution /
                     // transcode en cours) : on gèle l'horloge d'émission.
                     _ => {
                         if !started && tokio::time::Instant::now() > startup_deadline {
-                            return;
+                            arret = trace_des_niveaux::ArretDuForwarder::DelaiDeDemarrage;
+                            break 'forwarder;
                         }
                         tokio::time::sleep(LEVELS_HOLD).await;
                         next_emit += LEVELS_HOLD;
@@ -299,6 +314,7 @@ fn spawn_paced_levels_forwarder(
                 if horloge_de_cette_piste && debut_fenetre_ms + FENETRE_DEJA_ENTENDUE_MS < audible {
                     // Déjà entendue depuis longtemps : même règle que le
                     // rattrapage ci-dessous, on ne l'émet pas.
+                    fenetres_sautees += 1;
                     position += raw.window;
                     next_emit = now;
                     continue;
@@ -316,7 +332,11 @@ fn spawn_paced_levels_forwarder(
                 {
                     AttenteDeSortie::Jouee => {}
                     AttenteDeSortie::HorlogeIncoherente => horloge_de_sortie_fiable = false,
-                    AttenteDeSortie::LectureRemplacee => return,
+                    AttenteDeSortie::LectureRemplacee => {
+                        arret =
+                            trace_des_niveaux::ArretDuForwarder::RemplaceePendantLAttenteDeSortie;
+                        break 'forwarder;
+                    }
                 }
                 next_emit = tokio::time::Instant::now();
             } else {
@@ -333,6 +353,7 @@ fn spawn_paced_levels_forwarder(
                     // rafale inondait le bus : « broadcast lagged, skipped
                     // 2000 messages ») et on garde l'horloge au présent.
                     if (position.as_millis() as i64) + 2_000 < reported_position_ms {
+                        fenetres_sautees += 1;
                         position += raw.window;
                         next_emit = now;
                         continue;
@@ -494,9 +515,19 @@ fn spawn_paced_levels_forwarder(
                     "spectrum_resolved": &*lvl.spectrum_resolved,
                 }),
             );
+            trames_publiees += 1;
             next_emit += window;
             position += window;
         }
+        trace_des_niveaux::arret_du_forwarder(
+            zone_id,
+            play_seq,
+            gen_at_spawn,
+            arret,
+            trames_publiees,
+            fenetres_recues,
+            fenetres_sautees,
+        );
     });
     tx
 }
@@ -752,8 +783,10 @@ fn spawn_local_file_levels_decode(
         })
         .await;
         match result {
-            Err(e) => debug!(zone_id, error = %e, "gapless_levels_task_panic"),
-            Ok(Err(e)) => debug!(zone_id, error = %e, "gapless_levels_decode_failed"),
+            // #5104 — en INFO : une fois par décodage, donc par piste au
+            // plus, et c'est un des motifs d'une piste restée sans niveaux.
+            Err(e) => info!(zone_id, play_seq, error = %e, "gapless_levels_task_panic"),
+            Ok(Err(e)) => info!(zone_id, play_seq, error = %e, "gapless_levels_decode_failed"),
             Ok(Ok(_)) => {}
         }
     });
@@ -1812,6 +1845,10 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
+/// le Seek de reprise détaché.
+#[cfg(test)]
+mod seek_de_reprise_caduc_5476;
 /// #5050 — le Seek d'après reprise DLNA/OpenHome n'est plus envoyé qu'à un
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]

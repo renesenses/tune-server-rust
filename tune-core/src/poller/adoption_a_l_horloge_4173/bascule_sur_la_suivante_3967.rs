@@ -318,6 +318,7 @@ impl JournalDuRepli {
     }
     /// INFO : le niveau d'un export de terrain, pas TRACE.
     fn abonner(&self) -> tracing::subscriber::DefaultGuard {
+        crate::journal_de_test::fiabiliser_la_capture();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
@@ -334,6 +335,10 @@ impl JournalDuRepli {
 /// porter le verdict d'armement.
 #[tokio::test]
 async fn track_end_gap_nomme_le_verdict_d_armement() {
+    // #5440 — sans les témoins, un test voisin qui atteint le premier
+    // `track_end_gap` sur un autre fil fige ce point d'appel à `never` et la
+    // capture ci-dessous reste vide. Posés dès le début, bien avant l'abonné.
+    crate::journal_de_test::fiabiliser_la_capture();
     let mut banc = Banc::monter().await;
     let (flux, _) = banc.armer().await;
     assert_eq!(

@@ -238,9 +238,11 @@ fn contenu_audio_trie_les_extensions_et_la_pochette() {
                 "Album A/01 - Une piste au nom bien trop long pour ISO.flac"
             ),
             chemin_virtuel(&image, "Album B/Disque 2/02 - Autre.mp3"),
+            // #5299 — le DSF se lit désormais dans l'image : il devient piste.
+            chemin_virtuel(&image, "Album C/piste.dsf"),
         ]
     );
-    assert_eq!(c.ecartes, vec![chemin_virtuel(&image, "Album C/piste.dsf")]);
+    assert!(c.ecartes.is_empty(), "{:?}", c.ecartes);
     let pochette = chemin_de_pochette(Path::new(&pistes[0])).expect("cover.jpg d'Album A");
     assert_eq!(
         pochette.to_string_lossy(),

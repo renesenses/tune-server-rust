@@ -8,7 +8,7 @@ use tune_core::db::backend::{SqlValue, ToSqlValue};
 use tune_core::db::engine::Engine;
 use tune_core::db::track_repo::folder_like_pattern;
 
-use super::facets::{FacetQuery, build_conditions};
+use super::facets::{FacetQuery, build_conditions, hors_executeur};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -48,6 +48,17 @@ pub(super) async fn folder_facet(
     // Facettes multi-valeurs (#2168) : elles narrowent aussi les effectifs des
     // dossiers enfants.
     let filters = filters.hydrate(raw.as_deref())?;
+    // #5438 — la résolution de la collection et les comptes par dossier sont
+    // des lectures synchrones : hors de l'exécuteur, comme le rail.
+    hors_executeur("folder_facet", move || {
+        lire_les_dossiers(&state, filters, p)
+    })
+    .await
+    .map(Json)
+}
+
+/// Le corps de `GET /library/folder-facet`, exécuté HORS de l'exécuteur.
+fn lire_les_dossiers(state: &AppState, filters: FacetQuery, p: FolderPathQuery) -> Value {
     let engine = state.backend.engine();
     // Cumulative narrowing by the OTHER facets. exclude="folder" so the caller's
     // own folder selection isn't double-applied — this endpoint scopes by the
@@ -58,7 +69,7 @@ pub(super) async fn folder_facet(
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| super::facets::resolve_collection(&state, name));
+        .map(|name| super::facets::resolve_collection(state, name));
     let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref());
 
     let path = p
@@ -75,10 +86,8 @@ pub(super) async fn folder_facet(
     };
 
     match path {
-        None => Ok(Json(folder_roots(&state, engine, &conds, &params))),
-        Some(prefix) => Ok(Json(folder_children(
-            &state, engine, &prefix, &conds, &params, limit,
-        ))),
+        None => folder_roots(state, engine, &conds, &params),
+        Some(prefix) => folder_children(state, engine, &prefix, &conds, &params, limit),
     }
 }
 

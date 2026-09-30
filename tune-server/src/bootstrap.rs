@@ -93,7 +93,7 @@ pub async fn run_with(opts: RunOptions) {
     // demander sa version au binaire, l'écran ne pouvait que répéter une valeur
     // figée. Cf tune-os#27.
     if version_requested(std::env::args().skip(1)) {
-        println!("tune-server {}", env!("CARGO_PKG_VERSION"));
+        println!("tune-server {}", tune_core::version());
         std::process::exit(0);
     }
 
@@ -129,7 +129,7 @@ pub async fn run_with(opts: RunOptions) {
             &startup_log,
             format!(
                 "tune-server {} starting\npid: {}\nexe: {:?}\ncwd: {:?}\n",
-                env!("CARGO_PKG_VERSION"),
+                tune_core::version(),
                 std::process::id(),
                 std::env::current_exe().ok(),
                 std::env::current_dir().ok(),
@@ -194,6 +194,12 @@ pub async fn run_with(opts: RunOptions) {
     let config = TuneConfig::load();
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
+
+    // #5461 — lancé depuis `<exe>.old` par une version affectée ? Le dire, et
+    // relancer sur place le binaire installé quand c'est sûr. Avant tout fil,
+    // avant le port et la base : l'`exec` ne laisse rien derrière lui.
+    #[cfg(unix)]
+    crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
     // ptrace ni sudo. Les relevés vont à côté du journal.
@@ -324,6 +330,18 @@ pub async fn run_with(opts: RunOptions) {
 
     crate::boot_status::set_phase("configuration");
     state.restore_tokens().await;
+    // #5427 — anciennes copies de l'ARL, et `TUNE_DEEZER_ARL`. En tâche de
+    // fond : l'essai interroge Deezer, il ne doit pas retenir le démarrage.
+    {
+        let state = state.clone();
+        // Lue ici, dans l'environnement : le champ `deezer_arl` de
+        // `tune-core/src/config.rs` appartient à une configuration que rien
+        // ne construit, et l'ARL n'a rien à faire dans `tune.toml`.
+        let arl_env = std::env::var("TUNE_DEEZER_ARL").ok();
+        tokio::spawn(async move {
+            crate::routes::service_tokens::amorcer_arl_deezer(&state, arl_env.as_deref()).await;
+        });
+    }
 
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
@@ -1011,6 +1029,7 @@ mod tests {
     /// dépendances bavardes doit tenir.
     #[test]
     fn le_niveau_demande_couvre_toutes_les_caisses_du_depot() {
+        tune_core::journal_de_test::fiabiliser_la_capture();
         let journal = JournalCapture::default();
         let abonne = tracing_subscriber::fmt()
             .with_writer(journal.clone())

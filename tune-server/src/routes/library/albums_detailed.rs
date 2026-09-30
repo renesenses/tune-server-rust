@@ -19,7 +19,7 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use crate::error::AppError;
 use crate::state::AppState;
 
-use super::facets::{FacetQuery, build_conditions, resolve_collection};
+use super::facets::{FacetQuery, build_conditions, hors_executeur, resolve_collection};
 
 /// Une piste sans `album_id` n'est pas un album : elle n'a ni pochette, ni
 /// numéro de disque fiable, et regrouper toutes les orphelines sous une carte
@@ -60,6 +60,15 @@ pub(super) async fn albums_detailed(
     // Même lecture des facettes multi-valeurs que le rail (#2168) : les cartes
     // doivent compter exactement ce que le rail annonce.
     let q = q.hydrate(raw.as_deref())?;
+    // #5438 — la résolution de la collection, le total et la page sont des
+    // lectures synchrones : hors de l'exécuteur, comme le rail.
+    hors_executeur("albums_detailed", move || lire_les_cartes(&state, q))
+        .await
+        .map(Json)
+}
+
+/// Le corps de `GET /library/albums-detailed`, exécuté HORS de l'exécuteur.
+fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
     let engine = state.backend.engine();
     // Même résolution que le rail ET que la liste (#1864) : le nom d'une
     // collection manuelle vit dans un JSON de réglages, celui d'une collection
@@ -68,7 +77,7 @@ pub(super) async fn albums_detailed(
         .collection
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|name| resolve_collection(&state, name));
+        .map(|name| resolve_collection(state, name));
 
     // `exclude` vide : ici AUCUNE facette n'est exclue. Le rail exclut la
     // facette qu'il compte pour garder ses alternatives visibles ; une liste
@@ -167,12 +176,12 @@ pub(super) async fn albums_detailed(
         })
         .collect();
 
-    Ok(Json(json!({
+    json!({
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
-    })))
+    })
 }
 
 #[cfg(test)]

@@ -146,6 +146,49 @@ pub(crate) fn message_de_refus_de_zone(
     }
 }
 
+/// #5464 — le refus quand la sortie vivante du même nom appartient déjà à une
+/// autre zone : deux zones ne peuvent pas partager une sortie
+/// (`idx_zones_output_device_id`), donc le rebond de #1287 n'a pas lieu.
+///
+/// Trois formes, parce que le geste utile n'est pas le même :
+/// - l'autre zone porte le MÊME nom (le cas de Lulu, #3738) : la nommer par
+///   son nom ne distinguerait rien, on dit « une autre zone nommée elle aussi » ;
+/// - l'autre zone a un autre nom : on la nomme, c'est là qu'il faut lancer ;
+/// - l'autre zone est SUPPRIMÉE (masquée) : on ne propose pas d'y lancer la
+///   lecture, l'auditeur ne la voit plus.
+pub(crate) fn message_de_sortie_deja_tenue(
+    zone_name: &str,
+    sortie: &str,
+    autre_zone: &str,
+    autre_supprimee: bool,
+) -> String {
+    const SENTINELLE: &str = "zone_output_unavailable:";
+    let appareil = nom_lisible_de_l_appareil(sortie).unwrap_or_else(|| zone_name.to_string());
+    let debut = format!(
+        "{SENTINELLE}La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
+         est bien présente, mais"
+    );
+    if autre_supprimee {
+        format!(
+            "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
+             zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
+             réglages de la zone « {zone_name} »."
+        )
+    } else if autre_zone.eq_ignore_ascii_case(zone_name) {
+        format!(
+            "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
+             zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
+             zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+        )
+    } else {
+        format!(
+            "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
+             partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
+             autre sortie dans les réglages de la zone « {zone_name} »."
+        )
+    }
+}
+
 /// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
 ///
 /// Les deux travaux de la soirée se rencontrent ici, et ils COEXISTENT :
@@ -442,11 +485,32 @@ impl PlaybackOrchestrator {
         // output carrying the same name (#1287).
         if let Some((new_id, new_type)) = self.find_rebind_target(&zone.name).await {
             let repo = ZoneRepo::with_backend(self.db.clone());
+            // 🔴 #5464 — la sortie vivante du même nom peut déjà être CELLE
+            // d'une autre zone : deux zones homonymes (#3738, Lulu), l'une
+            // tenant le DAC, l'autre pointant une sortie disparue. L'index
+            // unique partiel `idx_zones_output_device_id` refuse alors
+            // l'`UPDATE`, et l'erreur SQL brute (`execute: UNIQUE constraint
+            // failed: zones.output_device_id`) remontait par `?` jusqu'au
+            // toast, à chaque clic Lecture. Ni rebond ni vol : un refus nommé.
+            if let Some(msg) = self.refus_sortie_deja_tenue(&repo, zone_id, zone, dev_id, &new_id) {
+                return Err(msg);
+            }
             // Persist so the rebind is sticky — the point is that the user never
             // has to think about this again. `output_type` must follow the id:
             // leaving a zone typed `dlna` while pointing at a `local:` output
             // would take the wrong branch everywhere downstream.
-            repo.update_output_device(zone_id, &new_id)?;
+            if let Err(e) = repo.update_output_device(zone_id, &new_id) {
+                // #5464 — une autre zone a pu prendre la sortie entre la lecture
+                // ci-dessus et l'écriture (découverte en tâche de fond). On relit
+                // l'occupant plutôt que de reconnaître le texte de l'erreur, qui
+                // diffère entre SQLite et PostgreSQL.
+                if let Some(msg) =
+                    self.refus_sortie_deja_tenue(&repo, zone_id, zone, dev_id, &new_id)
+                {
+                    return Err(msg);
+                }
+                return Err(e);
+            }
             repo.update_output_type(zone_id, &new_type)?;
             repo.update_online(zone_id, true)?;
             info!(
@@ -586,6 +650,51 @@ impl PlaybackOrchestrator {
             bus.emit("zone.playback_error", charge);
         }
         Err(msg)
+    }
+
+    /// #5464 — `Some(refus)` quand `sortie` est déjà l'`output_device_id`
+    /// d'une AUTRE zone que `zone_id`, visible ou supprimée (une zone masquée
+    /// garde sa ligne, et l'index unique la compte).
+    ///
+    /// Émet `zone.playback_error` comme le refus ordinaire (phrase sans
+    /// sentinelle, `fatal`), pour que l'auditeur lise la même chose par les
+    /// deux canaux.
+    fn refus_sortie_deja_tenue(
+        &self,
+        repo: &ZoneRepo,
+        zone_id: i64,
+        zone: &crate::db::zone_repo::Zone,
+        dev_id: &str,
+        sortie: &str,
+    ) -> Option<String> {
+        let occupante = repo
+            .get_by_device_id(sortie)
+            .ok()
+            .flatten()
+            .filter(|z| z.id.is_some_and(|id| id != zone_id))?;
+        let supprimee = repo.is_device_hidden(sortie);
+        let msg = message_de_sortie_deja_tenue(&zone.name, sortie, &occupante.name, supprimee);
+        warn!(
+            zone_id,
+            zone_name = %zone.name,
+            stale_device_id = dev_id,
+            target_device_id = sortie,
+            holder_zone_id = occupante.id.unwrap_or_default(),
+            holder_hidden = supprimee,
+            "zone_rebind_target_held_by_other_zone"
+        );
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": phrase_sans_sentinelle(&msg),
+                    "code": "zone_output_unavailable",
+                    "fatal": true,
+                }),
+            );
+        }
+        Some(msg)
     }
 
     pub(super) async fn play_inner(
@@ -2136,11 +2245,12 @@ impl PlaybackOrchestrator {
         ) {
             return;
         }
-
+        let seq_au_depart = self.playback.current_transport_seq(zone_id).await;
         self.detacher_le_seek_apres_reprise(
             zone_id,
             did.to_string(),
             position_ms,
+            seq_au_depart,
             std::time::Duration::from_millis(REPLAY_OUTPUT_SEEK_SETTLE_MS),
             "relecture",
             // Flux NEUF : la session repart de l'octet 0, le renderer aussi —
@@ -2152,29 +2262,39 @@ impl PlaybackOrchestrator {
 
     /// Le seek qui suit une reprise ou une relecture sur un renderer réseau
     /// part en tâche détachée : la réponse à l'appelant n'attend plus le temps
-    /// de pose (LAT-P2). La tâche capture la génération de lecture au départ
-    /// et abandonne si un stop, un next ou une nouvelle lecture est intervenu
-    /// pendant la pose — sinon elle seekerait la piste suivante.
+    /// de pose (LAT-P2). La tâche abandonne si une commande de transport est
+    /// intervenue depuis `seq_au_depart` — sinon elle seekerait la piste
+    /// suivante, ou écraserait un déplacement de l'utilisateur.
+    ///
+    /// `seq_au_depart` (#5476) est la génération des commandes de transport
+    /// ([`crate::playback::PlaybackManager::current_transport_seq`]) prise
+    /// par l'appelant : pour une reprise, À SON ENTRÉE, avant le `Play`. Un
+    /// Seek de l'utilisateur arrivé pendant ce `Play` (8 s sur le Devialet de
+    /// FabienM, fil 2037) rend donc la tâche caduque, même s'il attend encore
+    /// le verrou de la sortie quand elle démarre. Elle relit la génération
+    /// après la pose, puis une seconde fois sortie en main, juste avant le
+    /// Seek : c'est là qu'elle a pu attendre la commande qui la rend caduque.
     ///
     /// `seulement_si_decale` (#5050) : la tâche lit d'abord où l'appareil en
     /// est ([`crate::outputs::OutputTarget::position_mesuree_ms`]) et n'envoie
     /// le Seek que s'il n'est pas à `position_ms`, à
     /// [`ECART_TOLERE_APRES_REPRISE_MS`] près. Position illisible : Seek.
+    #[allow(clippy::too_many_arguments)]
     async fn detacher_le_seek_apres_reprise(
         &self,
         zone_id: i64,
         device_id: String,
         position_ms: u64,
+        seq_au_depart: u64,
         pose: std::time::Duration,
         motif: &'static str,
         seulement_si_decale: bool,
     ) {
-        let seq_au_depart = self.playback.current_play_seq(zone_id).await;
         let outputs = self.outputs.clone();
         let playback = self.playback.clone();
         tokio::spawn(async move {
             tokio::time::sleep(pose).await;
-            let seq_courante = playback.current_play_seq(zone_id).await;
+            let seq_courante = playback.current_transport_seq(zone_id).await;
             if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
                 info!(
                     zone_id,
@@ -2218,6 +2338,23 @@ impl PlaybackOrchestrator {
                     motif,
                     "seek_apres_reprise_renderer_decale"
                 );
+            }
+            // #5476 — seconde lecture de la génération, sortie en main : la
+            // tâche a pu attendre le verrou derrière un Seek de l'utilisateur
+            // (ou une pause), puis mesurer une position qui est la SIENNE, pas
+            // un décalage. Une commande survenue depuis la reprise rend ce
+            // Seek caduc.
+            let seq_courante = playback.current_transport_seq(zone_id).await;
+            if !reprise_toujours_la_notre(seq_au_depart, seq_courante) {
+                info!(
+                    zone_id,
+                    position_ms,
+                    motif,
+                    seq_au_depart,
+                    seq_courante,
+                    "seek_apres_reprise_abandonne_commande_survenue"
+                );
+                return;
             }
             match sortie.checked_seek(position_ms).await {
                 Ok(()) => {
@@ -2325,6 +2462,8 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        // #5476 — rend caduc un Seek de reprise détaché encore en attente.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         if let Some(did) = device_id {
             // Le backend confirme la commande AVANT que la copie mémoire et
             // la base annoncent Paused.
@@ -2453,6 +2592,9 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
+        // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
+        let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
@@ -2697,6 +2839,7 @@ impl PlaybackOrchestrator {
                 zone_id,
                 did.to_string(),
                 position_ms,
+                seq_de_la_reprise,
                 std::time::Duration::from_millis(RESUME_OUTPUT_SEEK_SETTLE_MS),
                 "reprise",
                 // #5050 — seulement si l'appareil n'a pas repris en place.
@@ -2727,6 +2870,8 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        // #5476 — rend caduc un Seek de reprise détaché encore en attente.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
@@ -2824,6 +2969,10 @@ impl PlaybackOrchestrator {
         mut position_ms: u64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #5476 — compté à l'ENTRÉE, avant d'attendre la sortie : un Seek de
+        // reprise détaché qui attend le même verrou doit savoir qu'il est
+        // caduc quand il l'obtiendra.
+        self.playback.marquer_commande_de_transport(zone_id).await;
         let seek_start = std::time::Instant::now();
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {

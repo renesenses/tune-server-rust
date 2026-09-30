@@ -53,12 +53,20 @@ impl BrasDeLecture {
     /// - cpal partagé : oui, depuis toujours ;
     /// - WASAPI exclusif : oui depuis #5204, à format égal (sinon il rend la
     ///   main et la fin naturelle rouvre) ;
-    /// - ASIO et CoreAudio exclusifs : **non**, leurs bras sortent encore à
-    ///   l'EOF sans consommer la suivante. Les déclarer enchaînables ferait
-    ///   armer le gapless par le sondeur, qui attendrait une transition qui ne
-    ///   vient jamais (DEvir, ASIO Fireface : album figé après chaque piste).
+    /// - ASIO exclusif : oui depuis #5204 (seconde tranche), à format égal,
+    ///   sur la route native (`chaine_par_la_boucle.rs`). Sa route traitée
+    ///   (anneau flottant) n'enchaîne pas : le bras lève `chain_exhausted` dès
+    ///   l'ouverture, et la sonde de la sortie retombe à « non » avant que le
+    ///   sondeur arme — sans quoi il attendrait une transition qui ne vient
+    ///   jamais (DEvir, ASIO Fireface : album figé après chaque piste) ;
+    /// - CoreAudio exclusif : oui depuis #5451, à format égal, par la même
+    ///   poursuite qu'ASIO (`chaine_par_la_boucle.rs`) ; sinon il rend la main
+    ///   et la fin naturelle rouvre le périphérique au nouveau format.
     pub(crate) fn sait_enchainer(self) -> bool {
-        matches!(self, Self::CpalPartage | Self::WasapiExclusif)
+        matches!(
+            self,
+            Self::CpalPartage | Self::WasapiExclusif | Self::AsioExclusif | Self::CoreAudioExclusif
+        )
     }
 }
 
@@ -103,10 +111,13 @@ pub(crate) fn bras_de_cette_plateforme(exclusive_mode: bool, audio_backend: &str
     )
 }
 
-/// Ce que la frontière d'une piste enchaînée décide sur un transport natif
-/// exclusif (WASAPI), qui ouvre le périphérique AU FORMAT SOURCE et ne
-/// convertit rien.
-#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+/// Ce que la frontière d'une piste enchaînée décide sur un transport
+/// exclusif (WASAPI, ASIO, CoreAudio), qui ouvre le périphérique AU FORMAT
+/// SOURCE et ne convertit rien.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", test)),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnchainementNatif {
     /// Même cadence, même profondeur, mêmes canaux : les mots de la suivante
@@ -125,7 +136,10 @@ pub(crate) enum EnchainementNatif {
 /// périphérique a accepté. Un transport exclusif n'a ni rééchantillonneur ni
 /// adaptation de canaux : le moindre écart de cadence, de profondeur ou de
 /// canaux impose de rouvrir.
-#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", test)),
+    allow(dead_code)
+)]
 pub(crate) fn decider_l_enchainement_natif(
     source: AudioSpec,
     ouvert: FormatOuvert,

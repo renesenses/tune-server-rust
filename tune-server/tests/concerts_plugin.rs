@@ -383,7 +383,10 @@ impl Drop for NuageSimule {
 }
 
 /// Un nuage minimal : `POST /location` rend la localisation retenue,
-/// `GET /upcoming` rend une date et le périmètre. Lit la requête ENTIÈRE avant
+/// `GET /upcoming` rend une date et le périmètre. Il répond comme
+/// site-mozaiklabs#242 : la page (`total`, `limit`, `offset`, `has_more`), le
+/// périmètre appliqué (`applied_scope`, `located`) et, à la localisation,
+/// `ambiguous` — vrai pour « Valence » sans code postal. Lit la requête ENTIÈRE avant
 /// de répondre (un banc qui répond sans lire fait émettre un RST, #1358).
 async fn nuage_simule() -> NuageSimule {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -438,14 +441,27 @@ async fn nuage_simule() -> NuageSimule {
                     "country": corps["country"],
                     "radius_km": corps["radius_km"],
                     "located": true,
+                    "ambiguous": corps["city"] == "Valence" && corps["postal_code"].is_null(),
                 })
             } else {
+                // La page demandée, relue dans la ligne de requête.
+                let lire = |cle: &str| {
+                    ligne
+                        .split(['?', '&', ' '])
+                        .find_map(|p| p.strip_prefix(&format!("{cle}=")))
+                        .and_then(|v| v.parse::<u64>().ok())
+                };
+                let limit = lire("limit").unwrap_or(1000);
+                let offset = lire("offset").unwrap_or(0);
                 serde_json::json!({
                     "concerts": [{
                         "artist_name": "Superbus", "event_date": "2026-11-02",
                         "venue": "La Vapeur", "city": "Dijon", "country": "FR",
                     }],
-                    "scope": "radius", "radius_km": 50,
+                    "total": 187, "limit": limit, "offset": offset,
+                    "has_more": offset + 1 < 187,
+                    "scope": "radius", "applied_scope": "radius", "located": true,
+                    "radius_km": 50,
                     "city": "Dijon", "country": "FR",
                 })
             }
@@ -543,6 +559,95 @@ async fn la_localisation_fait_l_aller_retour_et_upcoming_rend_le_perimetre() {
         ligne.starts_with("GET /upcoming?") && ligne.contains(INSTANCE),
         "la lecture porte l'identité de l'instance : {ligne}"
     );
+}
+
+/// ⭐ #5369 : la page et le périmètre appliqué traversent le greffon. Le
+/// nuage coupait à 100 dates sans le dire ; il dit maintenant le `total` et
+/// s'il en reste, et l'écran peut demander la suite — à condition que le
+/// greffon relaie les deux sens. Il relayait une liste fermée de champs, et
+/// n'envoyait que l'identité de l'instance.
+#[tokio::test]
+async fn la_page_part_au_nuage_et_le_total_revient_a_l_ecran() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", INSTANCE)
+        .unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+
+    let (statut, page) = requete(&app, "GET", "/upcoming?limit=100&offset=100", None).await;
+    assert_eq!(statut, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 187);
+    assert_eq!(page["limit"], 100);
+    assert_eq!(page["offset"], 100);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["applied_scope"], "radius");
+    assert_eq!(page["located"], true);
+
+    // Un paramètre illisible ne fait pas refuser la lecture : il ne part pas,
+    // et le nuage applique sa page par défaut.
+    let (statut, defaut) = requete(&app, "GET", "/upcoming?limit=abc&offset=-3", None).await;
+    assert_eq!(statut, StatusCode::OK, "{defaut}");
+    assert_eq!(defaut["limit"], 1000);
+    assert_eq!(defaut["offset"], 0);
+
+    let recues = nuage.recues.lock().unwrap();
+    let (premiere, _) = &recues[0];
+    assert!(
+        premiere.contains("limit=100") && premiere.contains("offset=100"),
+        "la page demandée part au nuage : {premiere}"
+    );
+    let (seconde, _) = &recues[1];
+    assert!(
+        !seconde.contains("limit=") && !seconde.contains("offset="),
+        "un paramètre illisible ne part pas : {seconde}"
+    );
+}
+
+/// ⭐ #5368 : une commune ambiguë est dite à l'écran, et gardée pour
+/// `GET /location` avec le reste de la localisation.
+#[tokio::test]
+async fn une_commune_ambigue_est_dite_a_l_ecran() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", INSTANCE)
+        .unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+
+    let (statut, rendu) = requete(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Valence","country":"FR","scope":"radius","radius_km":100}"#),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{rendu}");
+    assert_eq!(rendu["located"], true);
+    assert_eq!(rendu["ambiguous"], true);
+
+    let (_, lue) = requete(&app, "GET", "/location", None).await;
+    assert_eq!(lue["ambiguous"], true, "{lue}");
+
+    // Contre-épreuve : avec le code postal, rien d'ambigu.
+    let (_, precise) = requete(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Valence","postal_code":"26000","country":"FR","scope":"radius","radius_km":100}"#),
+    )
+    .await;
+    assert_eq!(precise["ambiguous"], false, "{precise}");
 }
 
 /// Une demande hors des règles du nuage est refusée ICI, en 422 et en nommant

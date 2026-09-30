@@ -136,6 +136,7 @@ fn assert_pair(log: &str, action: &str, outcome: &str) {
 
 #[tokio::test]
 async fn pause_logs_start_before_reply_and_measures_soap_delay() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let request_seen = Arc::new(tokio::sync::Notify::new());
     let reply_gate = Arc::new(tokio::sync::Notify::new());
     let renderer = controlled_renderer(
@@ -185,6 +186,7 @@ async fn pause_logs_start_before_reply_and_measures_soap_delay() {
 
 #[tokio::test]
 async fn resume_logs_its_acknowledgement_without_extra_request() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let renderer = renderer(StatusCode::OK, "<u:PlayResponse/>", Duration::ZERO).await;
     let capture = Capture::default();
     let _guard = capture.subscribe();
@@ -198,6 +200,7 @@ async fn resume_logs_its_acknowledgement_without_extra_request() {
 
 #[tokio::test]
 async fn pause_and_resume_propagate_soap_faults_instead_of_false_success() {
+    crate::journal_de_test::fiabiliser_la_capture();
     for action in ["Pause", "Play"] {
         let renderer = renderer(StatusCode::INTERNAL_SERVER_ERROR, FAULT, Duration::ZERO).await;
         let capture = Capture::default();
@@ -229,6 +232,7 @@ async fn pause_and_resume_propagate_soap_faults_instead_of_false_success() {
 
 #[tokio::test]
 async fn namespaced_fault_in_http_200_is_not_an_acknowledgement() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let renderer = renderer(StatusCode::OK, "<soap:Fault xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><faultstring>refused</faultstring></soap:Fault>", Duration::ZERO).await;
     let capture = Capture::default();
     let _guard = capture.subscribe();
@@ -241,6 +245,7 @@ async fn namespaced_fault_in_http_200_is_not_an_acknowledgement() {
 
 #[tokio::test]
 async fn http_failure_is_logged_and_returned_without_false_acknowledgement() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let renderer = renderer(StatusCode::INTERNAL_SERVER_ERROR, "", Duration::ZERO).await;
     let capture = Capture::default();
     let _guard = capture.subscribe();
@@ -251,6 +256,7 @@ async fn http_failure_is_logged_and_returned_without_false_acknowledgement() {
 
 #[tokio::test]
 async fn raw_play_fault_is_preserved_for_existing_recovery_and_polling_stays_quiet() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let renderer = renderer(StatusCode::INTERNAL_SERVER_ERROR, FAULT, Duration::ZERO).await;
     let capture = Capture::default();
     let _guard = capture.subscribe();
@@ -278,6 +284,7 @@ async fn raw_play_fault_is_preserved_for_existing_recovery_and_polling_stays_qui
 
 #[tokio::test]
 async fn concurrent_commands_keep_distinct_ids_and_matching_results() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let renderer = renderer(StatusCode::OK, "<Response/>", Duration::from_millis(10)).await;
     let capture = Capture::default();
     let _guard = capture.subscribe();

@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "d4c99567f8b82bf3fc46432c593ec30911f55d07",
+    "web_sha": "b6ef6c8c8a7e83c78369a84b2a111027f52720b1",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -138,7 +138,9 @@
       ],
       "champs_optionnels": [
         "download_size",
-        "error"
+        "error",
+        "archive_name",
+        "output_formats"
       ]
     },
     {
@@ -388,6 +390,22 @@
     {
       "route": "/eq/presets",
       "methode": "POST",
+      "type": "EqProPreset",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "eq_type",
+        "bands"
+      ],
+      "champs_optionnels": [
+        "zone_id",
+        "created_at"
+      ]
+    },
+    {
+      "route": "/eq/presets/{}",
+      "methode": "PUT",
       "type": "EqProPreset",
       "liste": false,
       "champs_obligatoires": [
@@ -2481,6 +2499,9 @@
         "enabled",
         "installed_version",
         "error_message",
+        "error_reason",
+        "setup_duration_ms",
+        "setup_timeout_ms",
         "source",
         "min_tune_version",
         "max_tune_version",
@@ -2558,6 +2579,9 @@
         "enabled",
         "installed_version",
         "error_message",
+        "error_reason",
+        "setup_duration_ms",
+        "setup_timeout_ms",
         "source",
         "min_tune_version",
         "max_tune_version",
@@ -2604,6 +2628,21 @@
         "restart_required"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/plugins/{}/retry",
+      "methode": "POST",
+      "type": "(retour de fonction)",
+      "liste": false,
+      "champs_obligatoires": [
+        "name",
+        "status"
+      ],
+      "champs_optionnels": [
+        "error_reason",
+        "setup_duration_ms",
+        "restart_required"
+      ]
     },
     {
       "route": "/plugins/{}/update",
@@ -2952,6 +2991,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -4633,6 +4675,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -4700,6 +4745,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -4833,6 +4881,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -4900,6 +4951,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5088,6 +5142,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5167,6 +5224,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5270,6 +5330,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5379,6 +5442,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5493,6 +5559,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -5560,6 +5629,9 @@
         "repeat",
         "queue_position",
         "can_skip_next",
+        "session_context_type",
+        "session_context_id",
+        "session_context_source",
         "signal_path",
         "stereo_pair_id",
         "stereo_channel",
@@ -6393,7 +6465,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 318,
+    "routes_cartographiees": 320,
     "appels_non_resolus": 157
   }
 }

@@ -1410,8 +1410,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts/creer-alias-actifs-release.sh
+          sparse-checkout: |
+            scripts/creer-alias-actifs-release.sh
+            scripts/canal-de-release.sh
+            .release/
           sparse-checkout-cone-mode: false
+
+      # Pre-version ou « Latest » ? Jusqu'a la 1.0.0-rc1, un `-` dans le tag
+      # suffisait : toute RC etait une pre-version, hors du creneau Latest.
+      # Le 29/09/2026, Bertrand decide que la 1.0.0-rc1 part chez TOUT LE
+      # MONDE : Latest, Docker :latest, Homebrew, .deb. Un workflow declenche
+      # par un tag n'a pas d'entree ; c'est donc le MANIFESTE du train, fige
+      # sur le commit tague et revu en PR, qui porte le choix :
+      # `"prerelease": false`. Sans ce champ, la regle d'avant s'applique.
+      - name: Pre-version ou Latest (manifeste du train)
+        id: canal
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Affectation d'abord : un `echo "$(...)"` avalerait l'echec du script.
+          PRE="$(bash scripts/canal-de-release.sh "$GITHUB_REF_NAME" ".release/${GITHUB_REF_NAME}.json")"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "$GITHUB_REF_NAME : prerelease=$PRE"
 
       - uses: actions/download-artifact@v4
         with:
@@ -1542,11 +1562,12 @@ jobs:
             artifacts/**/*.exe
             SHA256SUMS*
           generate_release_notes: true
-          # Pre-release tags carry a suffix (e.g. v0.9.0-rc2); stable tags are
-          # plain vX.Y.Z. Mark suffixed tags as pre-releases and keep them off
-          # the "Latest" slot so stable clients' auto-update never picks up an RC.
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ !contains(github.ref_name, '-') }}
+          # Tranche par `scripts/canal-de-release.sh` (etape « canal » plus
+          # haut) : le champ `prerelease` du manifeste s'il existe, sinon un
+          # `-` dans le tag. Une pre-version reste hors du creneau Latest, pour
+          # que la mise a jour des clients en canal stable ne la prenne pas.
+          prerelease: ${{ steps.canal.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.canal.outputs.prerelease != 'true' }}
 
   # ─── Release autonomy phase 4 — Homebrew + forum auto-publish ──────
   # Docker Hub publication is handled separately by docker.yml on the

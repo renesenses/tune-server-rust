@@ -443,9 +443,20 @@ mod etage_natif;
 // (partagée avec le chemin cpal). Pur, compilé partout.
 mod enchainement_exclusif;
 // #5204 — la boucle d'un bras natif exclusif et son enchaînement, générique
-// sur la source : jugée sur Shrek avec des pistes en mémoire.
-#[cfg(any(target_os = "windows", test))]
+// sur la source : jugée sur Shrek avec des pistes en mémoire. #5451 : sa
+// réserve et sa frontière servent aussi le bras CoreAudio (macOS).
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod chaine_native;
+// #5204 — la route native du bras ASIO et son enchaînement par la boucle
+// commune, sortis de `bras_asio.rs` (que seule l'étape « ASIO » de la CI
+// compile) pour être jugés sur Shrek. #5451 : la même poursuite enchaîne les
+// pistes du bras CoreAudio exclusif (macOS).
+#[cfg(any(
+    all(target_os = "windows", feature = "asio"),
+    target_os = "macos",
+    test
+))]
+mod chaine_par_la_boucle;
 
 // REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
 // partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
@@ -4479,10 +4490,11 @@ impl OutputTarget for LocalOutput {
 
     /// La capacité suit le BRAS que `play_url` emprunte réellement
     /// ([`bras_de_lecture`]) : le chemin cpal partagé et, depuis #5204, WASAPI
-    /// exclusif enchaînent la piste préparée sans refermer le périphérique.
-    /// ASIO et CoreAudio exclusifs sortent encore à l'EOF sans consommer
-    /// `next_media` : ils ne peuvent pas enchaîner, et le sondeur doit
-    /// retomber sur l'avance de fin naturelle. Avant #5204 la réponse était
+    /// et ASIO exclusifs enchaînent la piste préparée sans refermer le
+    /// périphérique (ASIO sur sa route native ; sa route traitée lève
+    /// `chain_exhausted` dès l'ouverture). CoreAudio exclusif aussi depuis
+    /// #5451, à format égal (sinon il rend la main et la fin naturelle
+    /// rouvre le périphérique au nouveau format). Avant #5204 la réponse était
     /// `!exclusive_mode` : WASAPI exclusif perdait le gapless même entre deux
     /// pistes de même format (Jean Valjean, fil 1890).
     ///
@@ -4851,6 +4863,9 @@ impl OutputTarget for LocalOutput {
             // instead of waiting forever on a ring buffer nobody drains.
             let device_gone = Arc::new(AtomicBool::new(false));
 
+            // #5439 — un flux décodé en continu repart du début de la piste :
+            // son seek passe par le saut d'octets du chemin PCM.
+            let mut pre_seeked = pre_seeked;
             let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
             {
@@ -4862,6 +4877,48 @@ impl OutputTarget for LocalOutput {
                     "local_audio_wav_header_parsed"
                 );
                 parsed
+            } else if let Some(extension) =
+                decodage_en_continu::extension_decodable_en_continu(&header_buf)
+            {
+                // #5439 — FLAC ou MP3 servi tel quel (serveur multimédia) :
+                // le décodeur des fichiers locaux le rend en WAV au fil de
+                // l'eau, et la suite est le chemin PCM — décision de cadence,
+                // rééchantillonneur en flux, seek, enchaînement, arrêt. Plus
+                // rien n'attend la fin du téléchargement.
+                info!(
+                    format = extension,
+                    "local_audio_flux_compresse_decode_en_continu"
+                );
+                reader = reader.decoder_en_continu(std::mem::take(&mut header_buf), extension);
+                pre_seeked = false;
+                match decodage_en_continu::lire_l_entete_decodee(&mut reader, &force_silent) {
+                    decodage_en_continu::EnteteDecodee::Pret { octets, format } => {
+                        header_buf = octets;
+                        info!(
+                            channels = format.0,
+                            sample_rate = format.1,
+                            bit_depth = format.2,
+                            data_offset = format.3,
+                            "local_audio_wav_header_parsed"
+                        );
+                        format
+                    }
+                    decodage_en_continu::EnteteDecodee::Interrompu => {
+                        debug!("local_audio_header_read_aborted");
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    decodage_en_continu::EnteteDecodee::Echec => {
+                        let motif = decodage_en_continu::motif_de_l_echec(
+                            reader.echec_du_decodage().as_deref(),
+                        );
+                        record_compressed_decode_failure(motif, &device_name, &open_failure);
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
             } else {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
@@ -4960,9 +5017,11 @@ impl OutputTarget for LocalOutput {
                 #[cfg(target_os = "linux")]
                 let pcm_ouvert = opened_endpoint_id.clone();
 
-                // Prefer device's default rate and resample if needed.
-                // Same rationale as the WAV path: opening at the source
-                // rate in shared mode is unreliable on macOS/Windows.
+                // #5439 — la cadence se décide comme sur le chemin PCM
+                // (`BackendCpal::ouvrir`) : le défaut de cpal n'est pas la
+                // cadence du DAC (sur ALSA il vaut 44 100 Hz dès que la plage
+                // le contient), et le prendre tel quel convertissait un FLAC
+                // 48 kHz en 44,1 kHz sur un `hw:` qui sait ouvrir 48 kHz.
                 let output_config = {
                     let default_cfg = match device.default_output_config() {
                         Ok(c) => Some(c.config()),
@@ -4988,19 +5047,46 @@ impl OutputTarget for LocalOutput {
                         }
                     };
                     let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
-                    if default_sr == Some(dec_sr) {
-                        default_cfg.unwrap()
-                    } else if let Some(cfg) = default_cfg {
-                        info!(
-                            source_sr = dec_sr,
-                            device_sr = cfg.sample_rate,
-                            "local_audio_compressed_rate_mismatch_will_resample"
-                        );
-                        cfg
+                    // Comme le chemin PCM : l'énumération n'est interrogée que
+                    // si le périphérique n'est pas déjà à la bonne cadence.
+                    let enumeree = if default_sr == Some(dec_sr) {
+                        None
                     } else {
                         find_matching_config(&device, dec_ch, dec_sr)
-                            .unwrap_or_else(|| config_de_flux(dec_ch, dec_sr))
+                            .filter(|c| c.sample_rate == dec_sr)
+                    };
+                    let preuve = sample_rate_evidence_for_device(
+                        host.id().name(),
+                        &opened_endpoint_id,
+                        true,
+                    );
+                    let (cfg, decision) =
+                        cadence_du_flux_compresse::choisir_la_config_du_flux_compresse(
+                            dec_sr,
+                            default_cfg,
+                            enumeree,
+                            preuve,
+                            || {
+                                find_matching_config(&device, dec_ch, dec_sr)
+                                    .unwrap_or_else(|| config_de_flux(dec_ch, dec_sr))
+                            },
+                        );
+                    cadence_du_flux_compresse::journaliser_la_cadence_du_flux_compresse(
+                        decision,
+                        dec_sr,
+                        cfg.sample_rate,
+                        host.id().name(),
+                        &opened_endpoint_id,
+                        preuve,
+                    );
+                    #[cfg(target_os = "macos")]
+                    if decision == LocalRateOpening::AtSourceRateMeasured {
+                        cadence_du_flux_compresse::caler_la_cadence_nominale_coreaudio(
+                            &device_name,
+                            cfg.sample_rate,
+                        );
                     }
+                    cfg
                 };
                 // #3632 — même règle que le chemin PCM (`BackendCpal::ouvrir`) :
                 // un flux compressé multicanal (FLAC 5.1 servi tel quel par un
@@ -5260,20 +5346,15 @@ impl OutputTarget for LocalOutput {
                 );
                 samples.extend_from_slice(&queue);
 
-                // Adapt channels and resample if needed (using rubato
-                // sinc resampler for high-quality rate conversion)
-                if dec_ch != output_ch {
-                    samples = adapt_channels(&samples, dec_ch, output_ch);
-                }
-                //
-                // Piste entiere en memoire : `rubato_resample_track` retire le
-                // delai de groupe du sinc et rend exactement
-                // `round(trames × ratio)`. La variante en flux le conservait,
-                // et la duree/position calculees juste en dessous heritaient du
-                // surplus a CHAQUE piste (#2246).
-                if dec_sr != output_sr {
-                    samples = rubato_resample_track(&samples, dec_sr, output_sr, output_ch);
-                }
+                // Adapt channels and resample if needed (rubato sinc, piste
+                // entière : délai de groupe retiré, #2246). #5439 : la même
+                // fonction que joue le témoin, sans carte son.
+                let samples = cadence_du_flux_compresse::conformer_la_piste_decodee(
+                    samples,
+                    dec_sr,
+                    dec_ch,
+                    FormatOuvert::new(output_sr, output_ch),
+                );
 
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
@@ -5517,6 +5598,15 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     dop_active,
+                    // #5451 — le bras consomme la réserve et enchaîne à
+                    // format égal, sans rouvrir le périphérique.
+                    next_media: next_media_ref,
+                    chain_exhausted: chain_exhausted_ref,
+                    current_uri: uri_ref,
+                    track_title: title_ref,
+                    track_artist: artist_ref,
+                    duration_ms: duration_ms_arc,
+                    seek_offset_ms: seek_offset_arc,
                 });
                 return;
             }
@@ -5561,6 +5651,15 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     dop_active,
+                    // #5204 — la route native consomme la réserve et enchaîne
+                    // à format égal, sans refermer le pilote.
+                    next_media: next_media_ref,
+                    chain_exhausted: chain_exhausted_ref,
+                    current_uri: uri_ref,
+                    track_title: title_ref,
+                    track_artist: artist_ref,
+                    duration_ms: duration_ms_arc,
+                    seek_offset_ms: seek_offset_arc,
                 });
                 return;
             }
@@ -6948,6 +7047,17 @@ fn drain_deadline_for(
 mod resolution;
 pub use resolution::*;
 
+// #5439 — la cadence d'ouverture du chemin compressé (serveur multimédia,
+// radio décodée), décidée comme celle du chemin PCM.
+mod cadence_du_flux_compresse;
+// #5439 — FLAC et MP3 servis tels quels, décodés au fil de l'eau par le
+// décodeur des fichiers locaux, puis joués par le chemin PCM.
+mod decodage_en_continu;
+#[cfg(test)]
+mod decodage_en_continu_5439;
+#[cfg(test)]
+mod flux_compresse_a_la_cadence_source_5439;
+
 /// Simple linear-interpolation resampler for rate conversion.
 /// Kept as a fallback — the main path now uses rubato sinc resampling.
 /// Implementation lives in `crate::audio`; only this file's tests still
@@ -6990,6 +7100,15 @@ mod gapless_pure_reechantillonne_5416;
 // refermer le flux ; sinon elle rouvre le périphérique.
 #[cfg(test)]
 mod gapless_exclusif_5204;
+
+// #5204, seconde tranche — ASIO exclusif : la route native enchaîne à format
+// égal par la boucle commune, sans refermer le pilote.
+#[cfg(test)]
+mod gapless_asio_5204;
+// #5451 — CoreAudio exclusif (macOS) : à format égal, la piste suivante entre
+// dans l'anneau ouvert par la même boucle, sans rouvrir le périphérique.
+#[cfg(test)]
+mod gapless_coreaudio_5451;
 
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans

@@ -212,6 +212,10 @@ const SEEK_GRACE_SECS: u64 = 3;
 /// stream session and re-sends SetAVTransportURI+Play+Seek — the renderer
 /// may report Stopped for several seconds while buffering the new stream.
 /// During this window the poller must not accumulate stopped_ticks.
+///
+/// #5498 — la position, elle, n'attend pas la fin de ces 10 s : un
+/// échantillon cohérent avec la cible du déplacement se publie
+/// ([`decisions::echantillon_posterieur_au_deplacement`]).
 const SEEK_STREAMING_GRACE_SECS: u64 = 10;
 /// After this many consecutive Stopped ticks without enough playback,
 /// treat as playback failure and stop the zone (don't advance).
@@ -1216,6 +1220,11 @@ mod lire_ensuite_dans_la_fenetre_gapless;
 #[cfg(test)]
 mod suivante_bannie_5143;
 
+/// #5395 — la radio artiste se recharge par la vraie fin de file, et une file
+/// qui s'achève hors radio rend la main au réglage d'auto-lecture de la zone.
+#[cfg(test)]
+mod radio_artiste_5395;
+
 /// #5327 — une file dont un greffon fournit l'URL de chaque piste au moment
 /// de la jouer : une demande par piste, piste refusée sautée, arrêt de la
 /// file sur demande de la source, aucune URL gardée.
@@ -1276,6 +1285,10 @@ mod temoins_de_transitions_ref9;
 #[cfg(test)]
 mod position_de_la_piste_precedente_954;
 
+/// #5498 — pendant la grâce de déplacement, les positions d'après le Seek
+/// se publient ; celle d'avant reste écartée.
+#[cfg(test)]
+mod position_apres_un_deplacement_5498;
 /// #4666 — une reprise après pause (sur place ou par rétablissement de
 /// session) est vue par le sondeur : l'état neuf ne part plus d'une horloge
 /// à zéro qui ferait prendre la position de reprise pour un fantôme.

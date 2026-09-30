@@ -1,5 +1,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+// L'horloge de tokio, et non celle de `std` : hors test elles ne diffèrent
+// pas, mais sous `start_paused` seule la première voit passer les 30 s d'un
+// `setup()` coupé — la durée publiée par le gestionnaire doit les compter.
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -436,6 +441,122 @@ pub trait TunePlugin: Send + Sync {
     }
 }
 
+/// Durée maximale du `setup()` d'UN greffon au démarrage (#5403).
+///
+/// Sans borne, un greffon qui attend le réseau (un appareil éteint, un service
+/// qui ne répond pas) tenait l'étape « greffons » du démarrage indéfiniment, et
+/// avec elle tous les greffons suivants. Au-delà de cette durée, le greffon est
+/// journalisé (`plugin_setup_timed_out`, avec sa durée) et n'est pas chargé ;
+/// le démarrage continue. Il n'est pas oublié pour autant : il reste visible
+/// dans le gestionnaire, en erreur « démarrage trop long »
+/// ([`PluginSetupErrorReason::SetupTimeout`]), et
+/// [`PluginLoader::retry_setup`] relance son `setup()` sous la même borne.
+/// Trente secondes : la même
+/// patience que la sonde de chargement d'un greffon WASM
+/// (`tune-server/src/plugins_host.rs`), et des milliers de fois ce que coûte
+/// un `setup()` sain, qui ne fait qu'enregistrer des sorties, des routes et des
+/// zones.
+///
+/// Limite : la borne ne coupe qu'un `setup()` qui rend la main à l'exécuteur
+/// (une attente `async`). Un `setup()` qui bloque le fil lui-même (appel
+/// bloquant, `std::thread::sleep`) n'est pas interruptible de l'extérieur.
+pub const PLUGIN_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Au-delà de cette durée, le chargement d'UN greffon est signalé par
+/// `plugin_setup_slow` (#5370).
+///
+/// Un `setup()` sain ne fait qu'enregistrer des sorties, des routes et des
+/// zones, et lire deux réglages : il se compte en millisecondes. Cinq secondes,
+/// c'est plus de mille fois ce budget — assez large pour qu'un greffon qui
+/// interroge un appareil du réseau local, sur un réseau lent ou une base
+/// occupée par le scan, ne crie pas au loup — et assez court pour que la page
+/// d'attente, qui se rafraîchit toutes les 3 s, ait déjà montré deux fois le
+/// même greffon : c'est le moment où le testeur commence à se demander si Tune
+/// est bloqué, et donc celui où le journal doit pouvoir lui répondre.
+pub const PLUGIN_SETUP_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// Pourquoi un greffon compilé est resté en erreur (#5403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSetupErrorReason {
+    /// `setup()` a dépassé [`PLUGIN_SETUP_TIMEOUT`] : « démarrage trop long ».
+    SetupTimeout,
+    /// `setup()` a rendu une erreur, au démarrage ou lors d'un nouvel essai
+    /// ([`PluginLoader::retry_setup`]). Le message du greffon suit, passé par
+    /// [`public_setup_message`].
+    SetupFailed,
+}
+
+impl PluginSetupErrorReason {
+    /// Le code rendu par l'API du gestionnaire (`error_reason`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SetupTimeout => "setup_timeout",
+            Self::SetupFailed => "setup_failed",
+        }
+    }
+}
+
+/// Un greffon compilé dont le `setup()` n'a pas abouti, et qu'on peut
+/// réessayer (#5403).
+///
+/// Avant, un greffon coupé à [`PLUGIN_SETUP_TIMEOUT`] disparaissait du
+/// gestionnaire exactement comme un greffon en échec : rien ne disait qu'il
+/// existait, ni pourquoi il ne tournait pas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSetupError {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub config_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_feature: Option<String>,
+    pub reason: PluginSetupErrorReason,
+    /// Durée du dernier essai, mesurée comme `plugin_loaded` (#5370).
+    pub duration_ms: u64,
+    /// La borne appliquée à cet essai.
+    pub timeout_ms: u64,
+    /// Le message d'un `setup()` en échec, tronqué et expurgé
+    /// ([`public_setup_message`]) ; absent pour une coupure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// L'état des `setup()` que le gestionnaire doit pouvoir lire à tout moment.
+///
+/// Partagé par [`PluginLoader::setup_report`] : l'hôte le lit SANS prendre le
+/// verrou du chargeur, qu'un nouvel essai tient jusqu'à la borne.
+#[derive(Debug, Clone, Default)]
+pub struct PluginSetupReport {
+    /// Greffons en erreur, dans l'ordre d'enregistrement.
+    pub errors: Vec<PluginSetupError>,
+    /// Greffons chargés après coup par un nouvel essai réussi : ils
+    /// n'étaient pas dans l'instantané publié au démarrage.
+    pub loaded_after_retry: Vec<PluginInfo>,
+}
+
+/// Ce que rend [`PluginLoader::retry_setup`].
+pub enum PluginRetryOutcome {
+    /// Aucun greffon de ce nom n'est en erreur.
+    NotInError,
+    /// Un essai est déjà en cours pour ce greffon.
+    InProgress,
+    /// Chargé. Ce qu'il a enregistré revient à l'hôte, qui l'installe.
+    Loaded {
+        duration_ms: u64,
+        registrations: PluginRegistrations,
+    },
+    /// Toujours en erreur, avec le motif et la durée de ce nouvel essai.
+    StillInError(PluginSetupError),
+}
+
+/// L'issue d'UN `setup()`, borné et mesuré.
+enum SetupRun {
+    Loaded(PluginRegistrations, u64),
+    Failed(String, u64),
+    TimedOut(u64),
+}
+
 pub struct PluginLoader {
     plugins: Arc<tokio::sync::Mutex<Vec<Box<dyn TunePlugin>>>>,
     data_root: PathBuf,
@@ -449,6 +570,17 @@ pub struct PluginLoader {
     /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
     /// disabled), kept so the plugin manager can still surface them.
     unloaded: StdMutex<Vec<AvailablePluginInfo>>,
+    /// Borne du `setup()` de chaque greffon ; [`PLUGIN_SETUP_TIMEOUT`] sauf en test.
+    setup_timeout: Duration,
+    /// Seuil de `plugin_setup_slow` ; [`PLUGIN_SETUP_SLOW_THRESHOLD`] sauf en test.
+    slow_setup_threshold: Duration,
+    /// Greffons coupés à la borne, gardés pour un nouvel essai (#5403). Hors
+    /// du jeu résident : ils ne reçoivent aucun événement.
+    parked: StdMutex<Vec<Box<dyn TunePlugin>>>,
+    /// Voir [`PluginSetupReport`].
+    setup_report: Arc<StdMutex<PluginSetupReport>>,
+    /// L'adresse passée à `setup_all`, reprise par un nouvel essai.
+    api_base_url: StdMutex<String>,
 }
 
 impl PluginLoader {
@@ -462,7 +594,30 @@ impl PluginLoader {
             event_dispatch_handle: None,
             registrations: StdMutex::new(PluginRegistrations::default()),
             unloaded: StdMutex::new(Vec::new()),
+            setup_timeout: PLUGIN_SETUP_TIMEOUT,
+            slow_setup_threshold: PLUGIN_SETUP_SLOW_THRESHOLD,
+            parked: StdMutex::new(Vec::new()),
+            setup_report: Arc::new(StdMutex::new(PluginSetupReport::default())),
+            api_base_url: StdMutex::new(String::new()),
         }
+    }
+
+    /// Change la borne du `setup()` de chaque greffon (#5403).
+    pub fn with_setup_timeout(mut self, timeout: Duration) -> Self {
+        self.set_setup_timeout(timeout);
+        self
+    }
+
+    /// [`with_setup_timeout`](Self::with_setup_timeout) sur un chargeur déjà
+    /// rangé dans l'état de l'hôte (les tests du serveur ne dorment pas 30 s).
+    pub fn set_setup_timeout(&mut self, timeout: Duration) {
+        self.setup_timeout = timeout;
+    }
+
+    /// Change le seuil de `plugin_setup_slow` (les tests ne dorment pas 5 s).
+    pub fn with_slow_setup_threshold(mut self, threshold: Duration) -> Self {
+        self.slow_setup_threshold = threshold;
+        self
     }
 
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
@@ -486,13 +641,37 @@ impl PluginLoader {
     }
 
     pub async fn setup_all(&self, api_base_url: &str) -> Vec<String> {
+        self.setup_all_observed(api_base_url, &|_| {}).await
+    }
+
+    /// [`setup_all`](Self::setup_all), en annonçant chaque greffon à
+    /// `on_plugin` AVANT de le charger.
+    ///
+    /// #5370 — la page d'attente du démarrage ne disait que « greffons », sans
+    /// dire lequel ; l'hôte s'en sert pour nommer le greffon en cours. Chaque
+    /// greffon laisse en outre une ligne de journal portant sa durée
+    /// (`duration_ms`), et un avertissement `plugin_setup_slow` au-delà de
+    /// [`PLUGIN_SETUP_SLOW_THRESHOLD`] : c'est ce qui manquait pour savoir
+    /// lequel avait pris le temps.
+    pub async fn setup_all_observed(
+        &self,
+        api_base_url: &str,
+        on_plugin: &(dyn Fn(&str) + Send + Sync),
+    ) -> Vec<String> {
         let mut loaded = Vec::new();
         let mut unloaded: Vec<AvailablePluginInfo> = Vec::new();
+        let mut errors: Vec<PluginSetupError> = Vec::new();
         std::fs::create_dir_all(&self.data_root).ok();
+        *self.api_base_url.lock().unwrap_or_else(|e| e.into_inner()) = api_base_url.to_string();
 
         let mut plugins = self.plugins.lock().await;
         for plugin in plugins.iter_mut() {
             let name = plugin.name().to_string();
+            on_plugin(&name);
+            // Mesuré DEPUIS la lecture des réglages : si la base est occupée
+            // (scan en cours sur une grande bibliothèque), c'est là que le
+            // temps passe, et il doit se voir dans la durée du greffon.
+            let started = Instant::now();
 
             // Enable / install gate. A compiled-in plugin can be turned off
             // without recompiling (`plugin_{name}_enabled=false`, review #907).
@@ -516,7 +695,8 @@ impl PluginLoader {
                 let opt_in = !plugin.default_enabled();
                 let dormant = enabled.as_deref() == Some("false") || (opt_in && !installed);
                 if dormant {
-                    info!(plugin_name = %name, opt_in, "plugin_dormant_not_loaded");
+                    let duration_ms = self.measure_setup(&name, started, "dormant");
+                    info!(plugin_name = %name, opt_in, duration_ms, "plugin_dormant_not_loaded");
                     // Hors catalogue : le greffon reste compilé, testé et
                     // chargeable à la main, mais le gestionnaire ne le propose
                     // pas. Proposer d'installer une chose qu'aucun écran ne
@@ -563,45 +743,36 @@ impl PluginLoader {
                 continue;
             }
 
-            let data_dir = self.data_root.join(&name);
-            std::fs::create_dir_all(&data_dir).ok();
+            let ctx = self.plugin_context(api_base_url, &name);
 
-            let mut ctx = PluginContext::new(api_base_url, data_dir).with_plugin_name(&name);
-            if let Some(bus) = &self.event_bus {
-                ctx = ctx.with_event_bus(bus.clone());
-            }
-            if let Some(db) = &self.db {
-                ctx = ctx.with_db(Arc::clone(db));
-            }
-            if let Some(license) = &self.license {
-                ctx = ctx.with_license(Arc::clone(license));
-            }
-
-            match plugin.setup(&ctx).await {
-                Ok(()) => {
-                    let reg = ctx.take_registrations();
-                    #[cfg(feature = "plugin-http")]
-                    let router_count = reg.routers.len();
-                    #[cfg(not(feature = "plugin-http"))]
-                    let router_count = 0usize;
-                    info!(
-                        plugin_name = %name,
-                        version = %plugin.version(),
-                        outputs = reg.outputs.len(),
-                        routers = router_count,
-                        zones = reg.zones.len(),
-                        "plugin_loaded"
-                    );
+            // #5403 et #5370 ensemble : chaque `setup()` est borné ET mesuré.
+            // La durée part dans le journal quel que soit le sort du greffon,
+            // la lenteur est signalée au-delà du seuil, et une coupure est
+            // journalisée avec sa durée — voir `run_setup`.
+            match self.run_setup(plugin, &ctx, &name, started).await {
+                SetupRun::Loaded(reg, _duration_ms) => {
                     if let Ok(mut acc) = self.registrations.lock() {
                         acc.absorb(reg);
                     }
                     loaded.push(name);
                 }
-                Err(e) => {
-                    // Deliberately not draining ctx here: a plugin that failed
-                    // halfway may have registered an output backed by
-                    // half-initialised state. Dropping it is the safe move.
-                    warn!(plugin_name = %name, error = %e, "plugin_setup_failed");
+                // #5403 (décision du 29/09) — un échec reste visible lui aussi,
+                // avec le message du greffon, et se réessaie.
+                SetupRun::Failed(message, duration_ms) => {
+                    errors.push(self.setup_error(
+                        &**plugin,
+                        PluginSetupErrorReason::SetupFailed,
+                        duration_ms,
+                        Some(message),
+                    ));
+                }
+                SetupRun::TimedOut(duration_ms) => {
+                    errors.push(self.setup_error(
+                        &**plugin,
+                        PluginSetupErrorReason::SetupTimeout,
+                        duration_ms,
+                        None,
+                    ));
                 }
             }
         }
@@ -610,13 +781,229 @@ impl PluginLoader {
         // would otherwise show up as loaded in /api/v1/plugins and keep
         // receiving every event via on_event on half-built state — the very
         // hazard setup registrations are dropped for (review #907).
-        plugins.retain(|p| loaded.iter().any(|n| n == p.name()));
+        //
+        // #5403 — un greffon COUPÉ à la borne, ou dont le `setup()` a échoué,
+        // quitte le jeu résident (même danger), mais il n'est pas détruit : il
+        // attend un nouvel essai.
+        let mut parked = Vec::new();
+        for plugin in std::mem::take(&mut *plugins) {
+            if loaded.iter().any(|n| n == plugin.name()) {
+                plugins.push(plugin);
+            } else if errors.iter().any(|e| e.name == plugin.name()) {
+                parked.push(plugin);
+            }
+        }
+        *self.parked.lock().unwrap_or_else(|e| e.into_inner()) = parked;
+        *self.setup_report.lock().unwrap_or_else(|e| e.into_inner()) = PluginSetupReport {
+            errors,
+            loaded_after_retry: Vec::new(),
+        };
 
         if let Ok(mut slot) = self.unloaded.lock() {
             *slot = unloaded;
         }
 
         loaded
+    }
+
+    /// La durée d'un greffon depuis `started`, en millisecondes, avec
+    /// l'avertissement `plugin_setup_slow` au-delà du seuil (#5370).
+    fn measure_setup(&self, name: &str, started: Instant, outcome: &str) -> u64 {
+        let elapsed = started.elapsed();
+        let slow_threshold = self.slow_setup_threshold;
+        if elapsed > slow_threshold {
+            warn!(
+                plugin_name = %name,
+                duration_ms = elapsed.as_millis() as u64,
+                threshold_ms = slow_threshold.as_millis() as u64,
+                outcome,
+                "plugin_setup_slow"
+            );
+        }
+        elapsed.as_millis() as u64
+    }
+
+    /// Le contexte remis au `setup()` du greffon `name`.
+    fn plugin_context(&self, api_base_url: &str, name: &str) -> PluginContext {
+        let data_dir = self.data_root.join(name);
+        std::fs::create_dir_all(&data_dir).ok();
+
+        let mut ctx = PluginContext::new(api_base_url, data_dir).with_plugin_name(name);
+        if let Some(bus) = &self.event_bus {
+            ctx = ctx.with_event_bus(bus.clone());
+        }
+        if let Some(db) = &self.db {
+            ctx = ctx.with_db(Arc::clone(db));
+        }
+        if let Some(license) = &self.license {
+            ctx = ctx.with_license(Arc::clone(license));
+        }
+        ctx
+    }
+
+    /// UN `setup()`, borné par [`PLUGIN_SETUP_TIMEOUT`] (#5403) et mesuré
+    /// depuis `started` (#5370). Sert au démarrage et au nouvel essai : les
+    /// deux chemins écrivent les mêmes lignes de journal.
+    async fn run_setup(
+        &self,
+        plugin: &mut Box<dyn TunePlugin>,
+        ctx: &PluginContext,
+        name: &str,
+        started: Instant,
+    ) -> SetupRun {
+        match tokio::time::timeout(self.setup_timeout, plugin.setup(ctx)).await {
+            Err(_elapsed) => {
+                // Même précaution qu'un échec : ctx n'est pas vidé, ce que le
+                // greffon a enregistré à moitié est abandonné.
+                let duration_ms = self.measure_setup(name, started, "timed_out");
+                warn!(
+                    plugin_name = %name,
+                    duration_ms,
+                    timeout_ms = self.setup_timeout.as_millis() as u64,
+                    "plugin_setup_timed_out"
+                );
+                SetupRun::TimedOut(duration_ms)
+            }
+            Ok(Ok(())) => {
+                let duration_ms = self.measure_setup(name, started, "loaded");
+                let reg = ctx.take_registrations();
+                #[cfg(feature = "plugin-http")]
+                let router_count = reg.routers.len();
+                #[cfg(not(feature = "plugin-http"))]
+                let router_count = 0usize;
+                info!(
+                    plugin_name = %name,
+                    version = %plugin.version(),
+                    outputs = reg.outputs.len(),
+                    routers = router_count,
+                    zones = reg.zones.len(),
+                    duration_ms,
+                    "plugin_loaded"
+                );
+                SetupRun::Loaded(reg, duration_ms)
+            }
+            Ok(Err(e)) => {
+                // Deliberately not draining ctx here: a plugin that failed
+                // halfway may have registered an output backed by
+                // half-initialised state. Dropping it is the safe move.
+                let duration_ms = self.measure_setup(name, started, "failed");
+                warn!(plugin_name = %name, error = %e, duration_ms, "plugin_setup_failed");
+                SetupRun::Failed(e, duration_ms)
+            }
+        }
+    }
+
+    fn setup_error(
+        &self,
+        plugin: &dyn TunePlugin,
+        reason: PluginSetupErrorReason,
+        duration_ms: u64,
+        message: Option<String>,
+    ) -> PluginSetupError {
+        PluginSetupError {
+            name: plugin.name().to_string(),
+            version: plugin.version().to_string(),
+            description: plugin.description().to_string(),
+            config_schema: plugin.config_schema(),
+            required_feature: plugin
+                .required_feature()
+                .map(|f| f.display_name().to_string()),
+            reason,
+            duration_ms,
+            timeout_ms: self.setup_timeout.as_millis() as u64,
+            message: message.map(|m| public_setup_message(&m)),
+        }
+    }
+
+    /// L'état des `setup()` en erreur, partagé avec l'hôte (#5403).
+    ///
+    /// Le même `Arc` pour toute la vie du chargeur : l'hôte peut le prendre
+    /// une fois, à la construction, et le lire sans jamais verrouiller le
+    /// chargeur.
+    pub fn setup_report(&self) -> Arc<StdMutex<PluginSetupReport>> {
+        Arc::clone(&self.setup_report)
+    }
+
+    /// Relance le `setup()` d'un greffon en erreur, sous la même borne
+    /// ([`PLUGIN_SETUP_TIMEOUT`]) et avec la même mesure que le démarrage
+    /// (#5403).
+    ///
+    /// Réussi, le greffon rejoint le jeu résident (il reçoit désormais les
+    /// événements) et ce qu'il a enregistré revient à l'appelant, qui
+    /// l'installe. Sinon il reste en erreur, avec le motif et la durée de ce
+    /// nouvel essai.
+    ///
+    /// Le greffon quitte la réserve pendant l'essai : un second appel
+    /// simultané rend [`PluginRetryOutcome::InProgress`]. Un appelant qui
+    /// abandonnerait le futur en cours de route perdrait donc le greffon
+    /// jusqu'au prochain démarrage — l'hôte le fait tourner dans une tâche à
+    /// part pour cette raison.
+    pub async fn retry_setup(&self, name: &str) -> PluginRetryOutcome {
+        let mut plugin = {
+            let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+            match parked.iter().position(|p| p.name() == name) {
+                Some(i) => parked.remove(i),
+                None => {
+                    let report = self.setup_report.lock().unwrap_or_else(|e| e.into_inner());
+                    return if report.errors.iter().any(|e| e.name == name) {
+                        PluginRetryOutcome::InProgress
+                    } else {
+                        PluginRetryOutcome::NotInError
+                    };
+                }
+            }
+        };
+
+        info!(plugin_name = %name, "plugin_setup_retry");
+        let api_base_url = self
+            .api_base_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ctx = self.plugin_context(&api_base_url, name);
+        let started = Instant::now();
+        let run = self.run_setup(&mut plugin, &ctx, name, started).await;
+
+        let (reason, duration_ms, message) = match run {
+            SetupRun::Loaded(registrations, duration_ms) => {
+                let info = plugin_info_of(&*plugin);
+                self.plugins.lock().await.push(plugin);
+                let mut report = self.setup_report.lock().unwrap_or_else(|e| e.into_inner());
+                report.errors.retain(|e| e.name != name);
+                report.loaded_after_retry.push(info);
+                return PluginRetryOutcome::Loaded {
+                    duration_ms,
+                    registrations,
+                };
+            }
+            SetupRun::Failed(e, duration_ms) => {
+                (PluginSetupErrorReason::SetupFailed, duration_ms, Some(e))
+            }
+            SetupRun::TimedOut(duration_ms) => {
+                (PluginSetupErrorReason::SetupTimeout, duration_ms, None)
+            }
+        };
+
+        let error = self.setup_error(&*plugin, reason, duration_ms, message);
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(plugin);
+        let mut report = self.setup_report.lock().unwrap_or_else(|e| e.into_inner());
+        match report.errors.iter_mut().find(|e| e.name == name) {
+            Some(slot) => *slot = error.clone(),
+            None => report.errors.push(error.clone()),
+        }
+        PluginRetryOutcome::StillInError(error)
+    }
+
+    /// Démarre la distribution des événements si elle ne tourne pas encore :
+    /// l'hôte ne la lance au démarrage que si un greffon a chargé, et un
+    /// nouvel essai réussi peut être le premier (#5403).
+    pub fn ensure_event_dispatch(&mut self) {
+        if self.event_dispatch_handle.is_none() {
+            self.start_event_dispatch();
+        }
     }
 
     /// Compiled-in plugins `setup_all` skipped (opt-in-not-installed or
@@ -695,14 +1082,7 @@ impl PluginLoader {
             .lock()
             .await
             .iter()
-            .map(|p| PluginInfo {
-                name: p.name().to_string(),
-                version: p.version().to_string(),
-                description: p.description().to_string(),
-                enabled: true,
-                config_schema: p.config_schema(),
-                required_feature: p.required_feature().map(|f| f.display_name().to_string()),
-            })
+            .map(|p| plugin_info_of(&**p))
             .collect()
     }
 
@@ -730,6 +1110,58 @@ impl PluginLoader {
             .iter()
             .map(|p| p.name().to_string())
             .collect()
+    }
+}
+
+/// Longueur maximale, en caractères, du message d'échec publié (#5403).
+pub const PLUGIN_SETUP_MESSAGE_MAX_CHARS: usize = 200;
+
+/// Le message d'un `setup()` en échec, tel que le gestionnaire peut le montrer
+/// (#5403).
+///
+/// Le texte vient du greffon et part vers l'écran de quiconque ouvre le
+/// gestionnaire : il ne doit porter ni secret ni pavé. Sont remplacés par
+/// `***` les identifiants d'une URL (`scheme://user:pass@`) et la valeur qui
+/// suit un mot-clé sensible (`token`, `password`, `secret`, `api_key`,
+/// `authorization`, `bearer`…). Les retours à la ligne et les contrôles
+/// deviennent des espaces, puis le tout est coupé à
+/// [`PLUGIN_SETUP_MESSAGE_MAX_CHARS`] caractères.
+pub fn public_setup_message(raw: &str) -> String {
+    use std::sync::LazyLock;
+    static URL_CREDENTIALS: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@").unwrap());
+    static SENSITIVE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)(access[_-]?token|refresh[_-]?token|token|password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|authorization|bearer|cookie)(\s*[=:]\s*|\s+)((?:(?:bearer|basic)\s+)?(?:"[^"]*"|'[^']*'|[^\s,;&]+))"#,
+        )
+        .unwrap()
+    });
+
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = URL_CREDENTIALS.replace_all(&flat, "${1}***@");
+    let flat = SENSITIVE.replace_all(&flat, "${1}${2}***");
+    if flat.chars().count() > PLUGIN_SETUP_MESSAGE_MAX_CHARS {
+        let mut cut: String = flat.chars().take(PLUGIN_SETUP_MESSAGE_MAX_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        flat.into_owned()
+    }
+}
+
+/// La fiche d'un greffon résident, telle que le gestionnaire la liste.
+fn plugin_info_of(p: &dyn TunePlugin) -> PluginInfo {
+    PluginInfo {
+        name: p.name().to_string(),
+        version: p.version().to_string(),
+        description: p.description().to_string(),
+        enabled: true,
+        config_schema: p.config_schema(),
+        required_feature: p.required_feature().map(|f| f.display_name().to_string()),
     }
 }
 
@@ -862,6 +1294,324 @@ mod tests {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "test-plugin");
         assert_eq!(loader.plugin_count().await, 1);
+    }
+
+    /// Greffon dont le `setup()` attend quelque chose qui ne vient jamais
+    /// (un appareil du réseau éteint, un service muet) — #5403.
+    struct HangingPlugin;
+
+    #[async_trait]
+    impl TunePlugin for HangingPlugin {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+        fn version(&self) -> &str {
+            "0.0.1"
+        }
+        fn description(&self) -> &str {
+            "Never finishes its setup"
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// #5403 — un `setup()` qui ne rend jamais la main est coupé à
+    /// [`PLUGIN_SETUP_TIMEOUT`] : le démarrage continue, le greffon suivant se
+    /// charge, et celui qui pendait n'est pas résident.
+    ///
+    /// Horloge en pause : les 30 s passent sans qu'on les attende. La borne
+    /// extérieure (une heure) ne sert qu'à rendre un ROUGE lisible au lieu d'un
+    /// test qui pend quand la borne du chargeur manque.
+    #[tokio::test(start_paused = true)]
+    async fn un_setup_qui_pend_est_coupe_et_le_demarrage_continue_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(HangingPlugin)).await;
+        loader.register(Box::new(TestPlugin::new())).await;
+
+        let debut = tokio::time::Instant::now();
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(3600),
+            loader.setup_all("http://localhost:8888"),
+        )
+        .await
+        .expect("setup_all doit rendre la main malgré un setup() qui pend (#5403)");
+        let ecoule = debut.elapsed();
+
+        assert_eq!(loaded, vec!["test-plugin"]);
+        assert_eq!(loader.plugin_count().await, 1);
+        assert!(
+            ecoule >= PLUGIN_SETUP_TIMEOUT && ecoule < PLUGIN_SETUP_TIMEOUT * 2,
+            "coupé à la borne, pas avant ni bien après : {ecoule:?}"
+        );
+    }
+
+    /// Greffon qui pend à ses `bloquants` premiers `setup()`, puis charge :
+    /// l'appareil du réseau qui finit par répondre (#5403).
+    struct PendPuisCharge {
+        essais: Arc<std::sync::atomic::AtomicUsize>,
+        bloquants: usize,
+    }
+
+    #[async_trait]
+    impl TunePlugin for PendPuisCharge {
+        fn name(&self) -> &str {
+            "pend-puis-charge"
+        }
+        fn version(&self) -> &str {
+            "0.2.0"
+        }
+        fn description(&self) -> &str {
+            "Hangs, then loads"
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            let n = self
+                .essais
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.bloquants {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn rapport(loader: &PluginLoader) -> PluginSetupReport {
+        loader.setup_report().lock().unwrap().clone()
+    }
+
+    /// #5403 — un greffon coupé à la borne ne disparaît plus : il reste dans
+    /// le rapport, en erreur « démarrage trop long », avec sa durée et la
+    /// borne. Il n'est pas résident pour autant.
+    #[tokio::test(start_paused = true)]
+    async fn un_greffon_coupe_reste_en_erreur_avec_sa_duree_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(HangingPlugin)).await;
+        loader.register(Box::new(FailingPlugin)).await;
+        loader.register(Box::new(TestPlugin::new())).await;
+
+        let loaded = loader.setup_all("http://localhost:8888").await;
+        assert_eq!(loaded, vec!["test-plugin"]);
+        assert_eq!(
+            loader.plugin_count().await,
+            1,
+            "le greffon coupé n'est pas résident"
+        );
+
+        let r = rapport(&loader);
+        assert_eq!(
+            r.errors.len(),
+            2,
+            "le greffon coupé ET le greffon en échec doivent rester visibles : {:?}",
+            r.errors
+        );
+        let e = &r.errors[0];
+        assert_eq!(e.name, "hanging");
+        assert_eq!(e.reason, PluginSetupErrorReason::SetupTimeout);
+        assert_eq!(e.reason.as_str(), "setup_timeout");
+        assert_eq!(e.timeout_ms, PLUGIN_SETUP_TIMEOUT.as_millis() as u64);
+        assert!(
+            e.duration_ms >= e.timeout_ms,
+            "la durée mesurée doit compter la coupure : {} ms",
+            e.duration_ms
+        );
+        assert!(e.message.is_none());
+        assert!(r.loaded_after_retry.is_empty());
+    }
+
+    /// Échoue à ses `echecs` premiers `setup()`, avec un secret dans le
+    /// message, puis charge.
+    struct EchoueNFois {
+        essais: Arc<std::sync::atomic::AtomicUsize>,
+        echecs: usize,
+    }
+
+    #[async_trait]
+    impl TunePlugin for EchoueNFois {
+        fn name(&self) -> &str {
+            "echoue"
+        }
+        fn version(&self) -> &str {
+            "0.3.0"
+        }
+        fn description(&self) -> &str {
+            "Fails, then loads"
+        }
+        async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+            let n = self
+                .essais
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.echecs {
+                return Err(format!(
+                    "appareil injoignable\nhttp://admin:hunter2@192.168.1.9/api token=abc123 {}",
+                    "x".repeat(400)
+                ));
+            }
+            Ok(())
+        }
+        async fn teardown(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// #5403 (décision du 29/09) — un `setup()` qui ÉCHOUE au démarrage reste
+    /// visible lui aussi : `setup_failed`, avec le message du greffon, tronqué
+    /// et sans secret. Réessayer le recharge.
+    #[tokio::test]
+    async fn un_greffon_en_echec_reste_visible_et_se_reessaie_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let essais = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader
+            .register(Box::new(EchoueNFois {
+                essais: Arc::clone(&essais),
+                echecs: 1,
+            }))
+            .await;
+
+        assert!(loader.setup_all("http://localhost:8888").await.is_empty());
+        assert_eq!(
+            loader.plugin_count().await,
+            0,
+            "pas résident après un échec"
+        );
+        let r = rapport(&loader);
+        assert_eq!(
+            r.errors.len(),
+            1,
+            "l'échec doit rester visible : {:?}",
+            r.errors
+        );
+        let e = &r.errors[0];
+        assert_eq!(e.name, "echoue");
+        assert_eq!(e.reason, PluginSetupErrorReason::SetupFailed);
+        assert_eq!(e.reason.as_str(), "setup_failed");
+        let m = e.message.as_deref().expect("le message du greffon");
+        assert!(m.starts_with("appareil injoignable http://"), "{m}");
+        assert!(
+            !m.contains("hunter2") && !m.contains("abc123"),
+            "secret publié : {m}"
+        );
+        assert!(
+            m.chars().count() <= PLUGIN_SETUP_MESSAGE_MAX_CHARS + 1,
+            "tronqué : {} caractères",
+            m.chars().count()
+        );
+
+        assert!(matches!(
+            loader.retry_setup("echoue").await,
+            PluginRetryOutcome::Loaded { .. }
+        ));
+        assert_eq!(loader.plugin_count().await, 1);
+        assert!(rapport(&loader).errors.is_empty());
+    }
+
+    #[test]
+    fn le_message_publie_est_expurge_et_borne_5403() {
+        assert_eq!(public_setup_message("ok\n  court"), "ok court");
+        assert_eq!(
+            public_setup_message("GET https://u:p4ss@h.example/x refusé"),
+            "GET https://***@h.example/x refusé"
+        );
+        for (brut, secret) in [
+            ("password=s3cr3t", "s3cr3t"),
+            ("api_key: \"k-123\"", "k-123"),
+            ("Authorization: Bearer eyJhbGciOi", "eyJhbGciOi"),
+            ("my_token=zz9", "zz9"),
+            ("client_secret 'qq'", "qq"),
+        ] {
+            let m = public_setup_message(brut);
+            assert!(!m.contains(secret), "{brut} → {m}");
+            assert!(m.contains("***"), "{brut} → {m}");
+        }
+        let long = public_setup_message(&"é".repeat(500));
+        assert_eq!(long.chars().count(), PLUGIN_SETUP_MESSAGE_MAX_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
+
+    /// #5403 — Réessayer relance le `setup()` sous la même borne : le greffon
+    /// qui répond enfin rejoint le jeu résident et quitte les erreurs.
+    #[tokio::test(start_paused = true)]
+    async fn reessayer_charge_le_greffon_qui_repond_enfin_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let essais = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader
+            .register(Box::new(PendPuisCharge {
+                essais: Arc::clone(&essais),
+                bloquants: 1,
+            }))
+            .await;
+
+        assert!(loader.setup_all("http://localhost:8888").await.is_empty());
+        assert_eq!(rapport(&loader).errors.len(), 1);
+
+        match loader.retry_setup("pend-puis-charge").await {
+            PluginRetryOutcome::Loaded { .. } => {}
+            _ => panic!("le nouvel essai devait charger le greffon"),
+        }
+        assert_eq!(essais.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(loader.plugin_count().await, 1, "résident après l'essai");
+        let r = rapport(&loader);
+        assert!(r.errors.is_empty(), "plus en erreur : {:?}", r.errors);
+        assert_eq!(r.loaded_after_retry.len(), 1);
+        assert_eq!(r.loaded_after_retry[0].name, "pend-puis-charge");
+        assert_eq!(r.loaded_after_retry[0].version, "0.2.0");
+
+        assert!(matches!(
+            loader.retry_setup("pend-puis-charge").await,
+            PluginRetryOutcome::NotInError
+        ));
+        assert!(matches!(
+            loader.retry_setup("inconnu").await,
+            PluginRetryOutcome::NotInError
+        ));
+    }
+
+    /// #5403 — un nouvel essai qui pend encore est coupé à la MÊME borne, et
+    /// le greffon reste en erreur, réessayable.
+    #[tokio::test(start_paused = true)]
+    async fn reessayer_un_greffon_qui_pend_encore_le_laisse_en_erreur_5403() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PluginLoader::new(dir.path().to_path_buf());
+        loader.register(Box::new(HangingPlugin)).await;
+        loader.setup_all("http://localhost:8888").await;
+
+        let debut = tokio::time::Instant::now();
+        let issue = tokio::time::timeout(Duration::from_secs(3600), loader.retry_setup("hanging"))
+            .await
+            .expect("le nouvel essai doit être borné (#5403)");
+        let ecoule = debut.elapsed();
+        match issue {
+            PluginRetryOutcome::StillInError(e) => {
+                assert_eq!(e.reason, PluginSetupErrorReason::SetupTimeout);
+                assert!(e.duration_ms >= PLUGIN_SETUP_TIMEOUT.as_millis() as u64);
+            }
+            _ => panic!("un greffon qui pend encore doit rester en erreur"),
+        }
+        assert!(
+            ecoule >= PLUGIN_SETUP_TIMEOUT && ecoule < PLUGIN_SETUP_TIMEOUT * 2,
+            "même borne qu'au démarrage : {ecoule:?}"
+        );
+        assert_eq!(loader.plugin_count().await, 0);
+        assert_eq!(
+            rapport(&loader).errors.len(),
+            1,
+            "une seule fiche, mise à jour"
+        );
+        // Rendu à la réserve : un troisième essai est possible.
+        assert!(matches!(
+            loader.retry_setup("hanging").await,
+            PluginRetryOutcome::StillInError(_)
+        ));
     }
 
     /// Opt-in plugin: dormant until explicitly installed (like DJ/Karaoke).

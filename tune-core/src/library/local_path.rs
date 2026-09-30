@@ -196,7 +196,7 @@ fn merite_un_parcours(stored: &str) -> bool {
 ///
 /// `None` pour tout ce qui n'est pas absolu, `C:Musique` (relatif au
 /// répertoire courant du lecteur) compris.
-fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
+pub(crate) fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
     if let Some(reste) = stored.strip_prefix('/') {
         return Some(("/".to_string(), reste, '/'));
     }
@@ -221,6 +221,84 @@ fn racine_et_reste(stored: &str) -> Option<(String, &str, char)> {
         return Some((format!("{lettre}:\\"), reste, '\\'));
     }
     None
+}
+
+/// Le chemin stocké est-il écrit à la Windows (lettre de lecteur ou UNC) ?
+///
+/// C'est [`racine_et_reste`] qui tranche, indépendamment de l'hôte qui
+/// compile : seul un chemin Windows coupe aussi sur `\`. Sous POSIX, la barre
+/// inverse est un caractère de nom légal (`/m/AC\DC/…`) et ne découpe rien.
+fn chemin_windows(chemin: &str) -> bool {
+    matches!(racine_et_reste(chemin), Some((_, _, '\\')))
+}
+
+/// Coupe un chemin STOCKÉ en `(dossier, nom)` au dernier séparateur.
+///
+/// 🔴 #5318 — les coffrets automatiques coupaient sur `/` seul, alors que
+/// `tracks.file_path` porte des antislashs sous Windows
+/// (`scanner/walker.rs`, `normalize_path`). `D:\Musique\X\CD1\01.flac` ne
+/// rendait AUCUN dossier : tout album d'un serveur Windows était écarté de la
+/// passe, et l'onglet « Coffrets » ne voyait aucun coffret rangé disque par
+/// disque.
+///
+/// | chemin | rendu |
+/// |---|---|
+/// | `/m/X/CD1/01.flac` | `("/m/X/CD1", "01.flac")` — inchangé |
+/// | `/01.flac` | `("", "01.flac")` — inchangé |
+/// | `C:\Musique\X\CD1\01.flac`, `C:/Musique\X\…` | `("C:\Musique\X\CD1", "01.flac")` |
+/// | `C:\01.flac` | `("C:", "01.flac")` — comme `/01.flac` |
+/// | `\\NAS\Musique\X\01.flac` | `("\\NAS\Musique\X", "01.flac")` |
+/// | `\\NAS\Musique`, `C:\` | `None` — une racine n'a pas de parent |
+///
+/// Hors chemin Windows, le comportement est celui de `rsplit_once('/')`,
+/// à l'octet près.
+pub(crate) fn dossier_et_nom(chemin: &str) -> Option<(&str, &str)> {
+    let Some((_, reste, '\\')) = racine_et_reste(chemin) else {
+        return chemin.rsplit_once('/');
+    };
+    if reste.is_empty() {
+        return None;
+    }
+    // `reste` est la fin de `chemin` : la racine en est le début.
+    let debut = chemin.len() - reste.len();
+    match reste.rfind(['\\', '/']) {
+        Some(i) => Some((&chemin[..debut + i], &reste[i + 1..])),
+        None => Some((chemin[..debut].trim_end_matches(['\\', '/']), reste)),
+    }
+}
+
+/// `C:` seul — ce que [`dossier_et_nom`] rend pour un fichier posé à la
+/// racine d'un lecteur (`C:\01.flac`).
+fn lecteur_nu(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// La forme d'un dossier stocké qui se COMPARE : sous Windows, lettre de
+/// lecteur en capitale et séparateurs unifiés en `\` — `c:/Musique\X` et
+/// `C:\Musique\X` sont le même dossier. Un chemin POSIX est rendu tel quel.
+pub(crate) fn dossier_comparable(dossier: &str) -> std::borrow::Cow<'_, str> {
+    if !chemin_windows(dossier) && !lecteur_nu(dossier) {
+        return std::borrow::Cow::Borrowed(dossier);
+    }
+    let mut s = dossier.replace('/', "\\");
+    if s.as_bytes().get(1) == Some(&b':') {
+        // Une lettre ASCII (vérifiée par `racine_et_reste`) : l'indice 1 est
+        // une frontière de caractère.
+        let lettre = s[..1].to_ascii_uppercase();
+        s.replace_range(..1, &lettre);
+    }
+    std::borrow::Cow::Owned(s)
+}
+
+/// `chemin` vit-il SOUS `dossier` (strictement) ? Les deux sont des chemins
+/// stockés ; la comparaison se fait sur [`dossier_comparable`].
+///
+/// Hors Windows, c'est exactement `chemin.starts_with(&format!("{dossier}/"))`.
+pub(crate) fn sous_le_dossier_stocke(chemin: &str, dossier: &str) -> bool {
+    let (c, d) = (dossier_comparable(chemin), dossier_comparable(dossier));
+    let sep = if chemin_windows(chemin) { '\\' } else { '/' };
+    c.strip_prefix(&*d).is_some_and(|r| r.starts_with(sep))
 }
 
 /// Nombre d'entrées lues au plus dans un répertoire pendant la descente.
@@ -864,5 +942,89 @@ mod tests {
         // Plafond dépassé : abandon, quelle que soit la place de l'entrée dans
         // l'ordre — non déterministe — rendu par `read_dir`.
         assert_eq!(entree_equivalente_plafonnee(&racine, cherche, 3), None);
+    }
+
+    // -----------------------------------------------------------------
+    // #5318 — coupe d'un chemin stocké, Windows compris.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dossier_et_nom_coupe_un_chemin_windows_a_lettre_de_lecteur() {
+        assert_eq!(
+            dossier_et_nom(r"D:\Musique\Handel - Messiah, Gardiner (Philips 2CD)\CD1\CDImage1.ape"),
+            Some((
+                r"D:\Musique\Handel - Messiah, Gardiner (Philips 2CD)\CD1",
+                "CDImage1.ape"
+            ))
+        );
+        // Racine déclarée avec `/`, jointe ensuite par `\` : chemin mixte.
+        assert_eq!(
+            dossier_et_nom(r"D:/Musique\X\CD2\01.flac"),
+            Some((r"D:/Musique\X\CD2", "01.flac"))
+        );
+        assert_eq!(dossier_et_nom(r"C:\01.flac"), Some(("C:", "01.flac")));
+        assert_eq!(dossier_et_nom(r"C:\"), None, "la racine n'a pas de parent");
+    }
+
+    #[test]
+    fn dossier_et_nom_coupe_un_partage_reseau_sans_entamer_sa_racine() {
+        assert_eq!(
+            dossier_et_nom(r"\\NAS\Musique\Bach\CD1\01.flac"),
+            Some((r"\\NAS\Musique\Bach\CD1", "01.flac"))
+        );
+        assert_eq!(
+            dossier_et_nom(r"\\NAS\Musique\CD1"),
+            Some((r"\\NAS\Musique", "CD1"))
+        );
+        // `\\NAS` n'est pas un dossier parent atteignable : le partage est une
+        // racine, comme `C:\`.
+        assert_eq!(dossier_et_nom(r"\\NAS\Musique"), None);
+    }
+
+    #[test]
+    fn dossier_et_nom_ne_change_rien_sous_posix() {
+        // La barre inverse est un caractère de nom légal sous POSIX.
+        assert_eq!(
+            dossier_et_nom(r"/m/AC\DC/CD1/a\b.flac"),
+            Some((r"/m/AC\DC/CD1", r"a\b.flac"))
+        );
+        for c in [
+            "/m/X/CD1/01.flac",
+            "/01.flac",
+            "relatif/a.flac",
+            "sans_separateur",
+            "",
+        ] {
+            assert_eq!(dossier_et_nom(c), c.rsplit_once('/'), "{c}");
+        }
+    }
+
+    #[test]
+    fn dossier_comparable_ignore_la_casse_du_lecteur_et_le_separateur() {
+        assert_eq!(dossier_comparable(r"c:/Musique\X"), r"C:\Musique\X");
+        assert_eq!(dossier_comparable(r"C:\Musique\X"), r"C:\Musique\X");
+        assert_eq!(dossier_comparable("d:"), "D:");
+        assert_eq!(dossier_comparable(r"\\NAS\Musique/X"), r"\\NAS\Musique\X");
+        // POSIX : rendu tel quel, casse et barres inverses comprises.
+        assert_eq!(dossier_comparable(r"/m/c:\X"), r"/m/c:\X");
+    }
+
+    #[test]
+    fn sous_le_dossier_stocke_suit_les_deux_ecritures() {
+        assert!(sous_le_dossier_stocke(r"C:\M\X\CD2\01.flac", r"c:\M\X\CD2"));
+        assert!(sous_le_dossier_stocke(r"C:/M/X/CD2/01.flac", r"C:\M\X\CD2"));
+        assert!(sous_le_dossier_stocke(r"C:\01.flac", "C:"));
+        assert!(!sous_le_dossier_stocke(
+            r"C:\M\X\CD20\01.flac",
+            r"C:\M\X\CD2"
+        ));
+        assert!(sous_le_dossier_stocke(
+            r"\\NAS\M\CD2\01.flac",
+            r"\\NAS\M\CD2"
+        ));
+        // POSIX : `{dossier}/` exactement, comme avant.
+        assert!(sous_le_dossier_stocke("/m/X/CD2/01.flac", "/m/X/CD2"));
+        assert!(!sous_le_dossier_stocke(r"/m/X/CD2\01.flac", "/m/X/CD2"));
+        assert!(!sous_le_dossier_stocke("/m/X/CD20/01.flac", "/m/X/CD2"));
     }
 }

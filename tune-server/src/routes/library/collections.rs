@@ -156,6 +156,34 @@ fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
         .collect()
 }
 
+/// Les pochettes de la mosaïque d'un dossier — #5438.
+///
+/// Le client les composait en demandant `/collections/{id}/albums` pour CHAQUE
+/// dossier sans `covers`, dans l'ordre par défaut de cette route (artiste
+/// croissant), puis en y prenant quatre pochettes distinctes. Même ordre, même
+/// règle ([`tune_core::library::mosaique::quatre_distinctes`]) : la mosaïque
+/// ne change pas, et l'écran n'a plus à lancer une requête par dossier.
+///
+/// Un album illisible est simplement sauté : une vignette n'a pas à faire
+/// échouer la liste des dossiers.
+fn pochettes_du_dossier(repo: &AlbumRepo, vivants: &[i64]) -> Vec<String> {
+    let mut albums: Vec<tune_core::db::models::Album> = vivants
+        .iter()
+        .filter_map(|&id| repo.get(id).ok().flatten())
+        .collect();
+    sort_albums(
+        &mut albums,
+        CollectionSort::parse(None),
+        CollectionOrder::parse(None),
+    );
+    tune_core::library::mosaique::quatre_distinctes(
+        albums
+            .iter()
+            .map(|a| (Some(a.title.as_str()), a.cover_path.as_deref())),
+        4,
+    )
+}
+
 /// Rend un dossier tel qu'il est SERVI : `album_ids` réduit aux albums encore
 /// présents, et les identifiants morts dits à voix haute.
 ///
@@ -176,6 +204,7 @@ fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
 /// que personne l'ait demandé. On signale, on ne détruit pas.
 fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError> {
     let (vivants, morts) = partager_ids(repo, &ids_stockes(collection))?;
+    let covers = pochettes_du_dossier(repo, &vivants);
     if !morts.is_empty() {
         tracing::warn!(
             "dossier {:?}: {} identifiant(s) d'album sans album en base: {morts:?} (#3285)",
@@ -191,6 +220,7 @@ fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError
         obj.insert("orphan_album_count".into(), json!(morts.len()));
         obj.insert("orphan_albums".into(), json!(manquants));
         obj.insert("album_ids".into(), json!(vivants));
+        obj.insert("covers".into(), json!(covers));
         // Les étiquettes sont une RÉSERVE, pas une donnée d'écran : un
         // dossier de 2 000 albums doublerait la réponse pour rien.
         obj.remove(ETIQUETTES);
@@ -289,12 +319,17 @@ pub(crate) fn dossiers_servis_parmi(state: &AppState, ids: &[i64]) -> Result<Vec
 pub(super) async fn list_collections(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let data = dossiers_stockes(&state);
-    let album_repo = AlbumRepo::with_backend(state.backend.clone());
-    let servis = data
-        .iter()
-        .map(|c| dossier_servi(&album_repo, c))
-        .collect::<Result<Vec<Value>, AppError>>()?;
+    // #5438 — demandée avec la liste des collections intelligentes à chaque
+    // ouverture de l'écran (raccourci compris) : ses lectures d'albums sont
+    // synchrones, hors de l'exécuteur.
+    let servis = super::facets::hors_executeur("list_collections", move || {
+        let data = dossiers_stockes(&state);
+        let album_repo = AlbumRepo::with_backend(state.backend.clone());
+        data.iter()
+            .map(|c| dossier_servi(&album_repo, c))
+            .collect::<Result<Vec<Value>, AppError>>()
+    })
+    .await??;
     Ok(Json(json!(servis)))
 }
 
@@ -448,7 +483,25 @@ pub(super) async fn collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(query): Query<CollectionAlbumsQuery>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // #5438 — l'écran des collections la demande pour CHAQUE dossier sans
+    // pochette, en parallèle : une lecture par album, hors de l'exécuteur.
+    match super::facets::hors_executeur("collection_albums", move || {
+        lire_les_albums_du_dossier(&state, id, query)
+    })
+    .await
+    {
+        Ok(reponse) => reponse,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Le corps de `GET /library/collections/{id}/albums`, HORS de l'exécuteur.
+fn lire_les_albums_du_dossier(
+    state: &AppState,
+    id: i64,
+    query: CollectionAlbumsQuery,
+) -> axum::response::Response {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let collections: Vec<Value> = settings
         .get("collections")

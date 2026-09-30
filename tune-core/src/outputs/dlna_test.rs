@@ -1178,6 +1178,7 @@ mod tests {
     /// avait fait. Même mesure que `Play`/`Pause`, mêmes champs.
     #[tokio::test]
     async fn dlna_seek_laisse_son_issue_dans_le_journal() {
+        crate::journal_de_test::fiabiliser_la_capture();
         let state = MockState::default();
         let (base, handle) = start_mock(state.clone()).await;
         let output = make_dlna(&base);

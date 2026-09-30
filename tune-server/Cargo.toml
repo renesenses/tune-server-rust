@@ -150,6 +150,12 @@ snow = { version = "0.10", default-features = false, features = [
     "std",
 ] }
 base64 = "0.22"
+# Test-only : signer un paquet de greffon comme minisign (Ed25519 sur un
+# prédigest BLAKE2b-512) pour le catalogue factice de
+# `catalogue_greffons_audio`. Les deux sont déjà dans Cargo.lock (rustls,
+# argon2) : aucune nouvelle dépendance n'entre dans l'arbre.
+ring = "0.17"
+blake2 = "0.10"
 # Test-only : fabriquer des horodatages passés pour rejouer une machine restée
 # hors ligne (tests/licence_grace_visible.rs, #1999).
 chrono = { workspace = true }
@@ -165,6 +171,10 @@ image = { workspace = true }
 # temps-là pour de vrai (routes/library/artwork.rs, #2073). `test-util` n'entre
 # que dans les cibles de test : le binaire publié ne le compile pas.
 tokio = { workspace = true, features = ["test-util"] }
+# Test-only (#5453) : `tune_core::journal_de_test::fiabiliser_la_capture()`
+# pour les tests qui capturent le journal par `set_default`/`with_default`.
+# Comme `test-util` ci-dessus, la feature n'entre que dans les cibles de test.
+tune-core = { path = "../tune-core", default-features = false, features = ["journal-de-test"] }
 
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
@@ -198,6 +208,13 @@ path = "tests/album_lecture_en_double.rs"
 name = "dr_liste_albums_4521"
 path = "tests/dr_liste_albums_4521.rs"
 
+# #5469 — une passe d'enrichissement coupée par un arrêt repart au démarrage,
+# et « Reprendre » relance une passe que l'arrêt a tuée. Cible à part : les
+# pauses sont un état global du processus, aucun autre essai ne doit y toucher.
+[[test]]
+name = "reprise_des_passes_5469"
+path = "tests/reprise_des_passes_5469.rs"
+
 # #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
 # Les sept points (aléatoire, smart playlists, file, titre en cours,
 # débannir, local ≠ service, par profil) par les routes montées. `autotests =
@@ -218,6 +235,20 @@ path = "tests/titres_de_service_bannis_4806.rs"
 [[test]]
 name = "pistes_bibliotheque_lentes_5138"
 path = "tests/pistes_bibliotheque_lentes_5138.rs"
+
+# #5438 — un clic sur une collection intelligente ne coupe pas le flux : le
+# vrai routeur sur une vraie socket, 58 359 pistes, 4 fils d'exécuteur.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "collection_intelligente_sans_micro_coupure_5438"
+path = "tests/collection_intelligente_sans_micro_coupure_5438.rs"
+
+# #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
+# sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "doublons_metadonnees_5455"
+path = "tests/doublons_metadonnees_5455.rs"
 
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
@@ -786,6 +817,11 @@ path = "tests/album_en_cours_1361.rs"
 [[test]]
 name = "plus_comme_ca_qobuz_fil1906"
 path = "tests/plus_comme_ca_qobuz_fil1906.rs"
+# #5395 — la radio artiste à la demande : la route remplit la file et écrit
+# le contexte que l'auto-lecture relit pour recharger.
+[[test]]
+name = "radio_artiste_5395"
+path = "tests/radio_artiste_5395.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -829,6 +865,21 @@ path = "tests/serveur_media_didl_hors_auth_3933.rs"
 [[test]]
 name = "serveur_media_criteres_canoniques"
 path = "tests/serveur_media_criteres_canoniques.rs"
+
+# #4956 — l'ordre alphabétique naturel des rayons Genres, Artists, Albums et
+# Playlists du serveur média (signes de tête, accents et casse ignorés), lu
+# sur la vraie route `POST /ContentDirectory/control`, en Browse et en Search.
+[[test]]
+name = "serveur_media_ordre_alphabetique_4956"
+path = "tests/serveur_media_ordre_alphabetique_4956.rs"
+
+# #4956, suite — l'API REST de la bibliothèque (mode paginé du client web)
+# trie artistes, albums (titre, artiste) et listes de lecture dans l'ordre du
+# serveur média : ordre, pages sans perte ni doublon, saut par lettre. SQLite
+# et PostgreSQL (`TUNE_TEST_PG_URL`, étape de test-postgres.yml).
+[[test]]
+name = "bibliotheque_rest_ordre_alphabetique_4956"
+path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
@@ -988,6 +1039,11 @@ path = "tests/bug_report_captures_4564.rs"
 [[test]]
 name = "bug_report_limite_5068"
 path = "tests/bug_report_limite_5068.rs"
+
+# #5428 — le rapport porte l'identité du compte (Bearer, sinon clé de licence).
+[[test]]
+name = "bug_report_identite_5428"
+path = "tests/bug_report_identite_5428.rs"
 
 # Les étiquettes — types admis, playlists, et depuis le 22/09/2026 le refus
 # d'un `item_id` nul. Le fichier existait, mais `autotests = false` plus haut le

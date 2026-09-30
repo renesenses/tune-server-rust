@@ -1511,16 +1511,26 @@ mod piste_entiere_tests {
             .next()
             .expect("pre-remplissage introuvable");
 
+        // #5439 : la branche appelle `conformer_la_piste_decodee`, et c'est
+        // elle qui rééchantillonne. On lit donc les deux textes.
+        let mise_au_format = include_str!("../outputs/local/cadence_du_flux_compresse.rs");
         assert!(
-            avant_tampon.contains("rubato_resample_track("),
+            avant_tampon.contains("conformer_la_piste_decodee("),
+            "la branche compressee ne met plus la piste au format ouvert par \
+             `conformer_la_piste_decodee` (#5439)"
+        );
+        for texte in [avant_tampon, mise_au_format] {
+            assert!(
+                !texte.contains("rubato_resample_batch("),
+                "le chemin compresse appelle encore rubato_resample_batch : \
+                 delai de groupe et queue conserves a chaque piste (#2246)."
+            );
+        }
+        assert!(
+            mise_au_format.contains("rubato_resample_track("),
             "le chemin compresse detient la piste entiere : il doit appeler \
              rubato_resample_track, qui retire le delai de groupe. La \
              variante en flux ajoute ~2×delay trames A CHAQUE PISTE (#2246)."
-        );
-        assert!(
-            !avant_tampon.contains("rubato_resample_batch("),
-            "le chemin compresse appelle encore rubato_resample_batch : \
-             delai de groupe et queue conserves a chaque piste (#2246)."
         );
     }
 }

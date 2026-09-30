@@ -770,3 +770,119 @@ pub(crate) fn scenario_marqueur_de_tete(db: &Arc<dyn DbBackend>) {
 fn marqueur_de_tete_sur_sqlite() {
     scenario_marqueur_de_tete(&sqlite());
 }
+
+// ---------------------------------------------------------------------------
+// #5318 — serveur Windows : `tracks.file_path` porte des antislashs.
+// ---------------------------------------------------------------------------
+
+/// Un disque aux chemins Windows : `n` pistes `{dossier}\NN.flac`.
+fn disque_windows(
+    db: &Arc<dyn DbBackend>,
+    titre: &str,
+    artiste: i64,
+    dossier: &str,
+    n: i32,
+) -> i64 {
+    let id = album(db, titre, artiste, dossier);
+    for k in 1..=n {
+        piste(db, id, artiste, k, 1, &format!("{dossier}\\{k:02}.flac"));
+    }
+    id
+}
+
+/// 🔴 #5318 — la passe, l'onglet et « défaire » sur des chemins Windows
+/// réels : lettre de lecteur, partage réseau, casse du lecteur mêlée.
+///
+/// Avant le correctif, `dossier_de` coupait sur `/` seul : aucun de ces
+/// chemins n'avait de dossier, la passe sautait TOUT, et l'onglet ne voyait
+/// pas l'album rangé disque par disque.
+pub(crate) fn scenario_windows(db: &Arc<dyn DbBackend>) {
+    nettoyer_les_magasins(db);
+    let handel = artiste(db, "G. F. Handel");
+    let bach = artiste(db, "J. S. Bach");
+    let floyd = artiste(db, "Pink Floyd");
+
+    // Lettre de lecteur — le rangement du testeur (fil 2009).
+    let m = r"D:\Musique\Handel - Messiah, Gardiner (Philips 2CD)";
+    let cd1 = disque_windows(db, "Messiah, CD1", handel, &format!(r"{m}\CD1"), 2);
+    let cd2 = disque_windows(db, "Messiah, CD2", handel, &format!(r"{m}\CD2"), 3);
+    // Partage réseau UNC.
+    let g = r"\\NAS\Musique\Bach - Gardiner Vol 21";
+    let g1 = disque_windows(
+        db,
+        "Gardiner Vol 21, Disc 1",
+        bach,
+        &format!(r"{g}\Disc 1"),
+        2,
+    );
+    let g2 = disque_windows(
+        db,
+        "Gardiner Vol 21, Disc 2",
+        bach,
+        &format!(r"{g}\Disc 2"),
+        2,
+    );
+
+    // Un ancien coffret SANS marqueur, rangé disque par disque : l'onglet le
+    // doit par son second critère (deux disques, deux dossiers).
+    let a = r"E:\Musique\Pink Floyd\Pulse";
+    let ancien = album(db, "Pulse", floyd, &format!(r"{a}\CD1"));
+    piste(db, ancien, floyd, 1, 1, &format!(r"{a}\CD1\01.flac"));
+    piste(db, ancien, floyd, 1, 2, &format!(r"{a}\CD2\01.flac"));
+    // Un double album dans UN dossier, dont une piste porte le lecteur en
+    // minuscule (`c:`) : ce n'est PAS un coffret, et la casse ne doit pas en
+    // fabriquer deux dossiers.
+    let d = r"C:\Musique\Pink Floyd\The Wall";
+    let wall = album(db, "The Wall", floyd, d);
+    piste(db, wall, floyd, 1, 1, &format!(r"{d}\1-01.flac"));
+    piste(
+        db,
+        wall,
+        floyd,
+        1,
+        2,
+        r"c:\Musique\Pink Floyd\The Wall\2-01.flac",
+    );
+
+    let r = passe(db).unwrap();
+    assert_eq!(r.reunis, 2, "Messiah (D:) et Gardiner (UNC) : {r:?}");
+    assert!(!existe(db, cd2), "le disque 2 du Messiah n'est pas absorbé");
+    assert!(!existe(db, g2), "le disque 2 du partage n'est pas absorbé");
+    assert_eq!(titre(db, cd1), "Messiah");
+    assert_eq!(titre(db, g1), "Gardiner Vol 21");
+    assert_eq!(pistes_du_disque(db, cd1, 2), 3);
+    assert!(existe(db, ancien) && existe(db, wall));
+
+    // L'ONGLET.
+    let l: Vec<i64> = lister(db).unwrap().iter().map(|c| c.album_id).collect();
+    for id in [cd1, g1, ancien] {
+        assert!(l.contains(&id), "coffret {id} absent de la liste {l:?}");
+    }
+    assert!(
+        !l.contains(&wall),
+        "un double album d'UN dossier (casse du lecteur mêlée) listé : {l:?}"
+    );
+
+    // DÉFAIRE : le disque 2 retrouve ses pistes `D:\…\CD2\…`.
+    let recrees = defaire(db, cd1).unwrap();
+    assert_eq!(recrees.len(), 1, "{recrees:?}");
+    assert_eq!(titre(db, recrees[0]), "Messiah, CD2");
+    assert_eq!(
+        compte(
+            db,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = {p1}",
+            recrees[0]
+        ),
+        3,
+        "les pistes du disque 2 ne sont pas rendues à leur album"
+    );
+    assert_eq!(
+        compte(db, "SELECT COUNT(*) FROM tracks WHERE album_id = {p1}", cd1),
+        2
+    );
+}
+
+#[test]
+fn chemins_windows_sur_sqlite() {
+    scenario_windows(&sqlite());
+}

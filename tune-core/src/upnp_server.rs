@@ -22,6 +22,11 @@ use crate::discovery::ssdp;
 /// Parcours par dossiers (#4318) — le rayon « Folders ».
 mod dossiers;
 
+/// L'ordre alphabétique du serveur média, partagé avec les listes paginées de
+/// l'API REST de la bibliothèque (#4956) : un même rayon se lit dans le même
+/// ordre sur un lecteur DLNA et dans le client web.
+pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
+
 // ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
@@ -1506,17 +1511,19 @@ fn search_containers_in_container(
         // Traitees par `search_tracks_in_container`, qui pagine en base.
         CibleRecherche::Pistes => None,
         CibleRecherche::Artistes => {
-            let artistes = ArtistRepo::with_backend(state.backend.clone())
+            let mut artistes = ArtistRepo::with_backend(state.backend.clone())
                 .list(MAX_CANDIDATS_CONTENEURS, 0)
                 .unwrap_or_default();
+            trier_artistes(&mut artistes);
             let retenus = retenir(artistes, filtre, champ_d_artiste);
             let (page, total) = paginer(retenus, start, count);
             Some(didl_artistes(state, &page, "artists", total))
         }
         CibleRecherche::Albums => {
-            let albums = AlbumRepo::with_backend(state.backend.clone())
+            let mut albums = AlbumRepo::with_backend(state.backend.clone())
                 .list(MAX_CANDIDATS_CONTENEURS, 0)
                 .unwrap_or_default();
+            trier_albums(&mut albums);
             let retenus = retenir(albums, filtre, champ_d_album);
             let (page, total) = paginer(retenus, start, count);
             let mut didl = didl_albums_under(&page, "albums", &base_url);
@@ -2450,13 +2457,19 @@ fn didl_listes(listes: &[crate::db::playlist_repo::Playlist]) -> DidlResult {
 /// le `childCount` du conteneur racine et la liste qu'il ouvre appliquent le
 /// MÊME filtre — annoncer 9 listes et n'en ouvrir que 7 serait pire que de
 /// n'annoncer aucun nombre.
+///
+/// #4956 — rangées dans l'ordre alphabétique naturel
+/// ([`dossiers::comparer_alphabetique`]) : le `ORDER BY LOWER(p.name)` de la
+/// base met « Été » après « Zen » sur SQLite et « (Soirée) » en tête.
 fn lire_listes_publiables(state: &UpnpState) -> Vec<crate::db::playlist_repo::Playlist> {
-    PlaylistRepo::with_backend(state.backend.clone())
+    let mut listes: Vec<_> = PlaylistRepo::with_backend(state.backend.clone())
         .list(UPNP_PROFILE_ID, PLAYLIST_FETCH_CAP, 0)
         .unwrap_or_default()
         .into_iter()
         .filter(|liste| liste.track_count > 0 && liste.id.is_some())
-        .collect()
+        .collect();
+    listes.sort_by(|a, b| dossiers::comparer_alphabetique(&a.name, &b.name).then(a.id.cmp(&b.id)));
+    listes
 }
 
 /// Les pistes d'une liste de lecture, **dans l'ordre de la liste**.
@@ -2615,11 +2628,59 @@ fn browse_root(state: &UpnpState) -> DidlResult {
     }
 }
 
+/// Le rayon « Artists », page par page.
+///
+/// #4956 — l'ordre est l'ordre alphabétique naturel ([`trier_artistes`]), pas
+/// celui du `ORDER BY LOWER(COALESCE(sort_name, name))` de la base : sur
+/// SQLite, `LOWER` ne replie que l'ASCII, et « Édith Piaf » passait après
+/// « ZZ Top », « (hed) p.e. » en tête. Le tri se fait donc ici, sur la
+/// rubrique entière, avant la page — trier la page seule rendrait deux pages
+/// qui se recouvrent.
 fn browse_artists(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let repo = ArtistRepo::with_backend(state.backend.clone());
-    let total = repo.count().unwrap_or(0) as u64;
-    let artists = repo.list(count as i64, start as i64).unwrap_or_default();
-    didl_artistes(state, &artists, "artists", total)
+    let mut artistes = ArtistRepo::with_backend(state.backend.clone())
+        .list(TOUTE_LA_RUBRIQUE, 0)
+        .unwrap_or_default();
+    trier_artistes(&mut artistes);
+    let (page, total) = tranche(artistes, start, count);
+    didl_artistes(state, &page, "artists", total)
+}
+
+/// Toute une rubrique, pour la trier avant de la paginer (#4956). Même borne
+/// que `RequestedCount = 0` ([`UNLIMITED_BROWSE_COUNT`]) : c'est déjà ce que
+/// ces rubriques demandaient à la base quand un appareil voulait « tout ».
+const TOUTE_LA_RUBRIQUE: i64 = UNLIMITED_BROWSE_COUNT as i64;
+
+/// La page `[start, start + count)` d'une rubrique triée, et son total réel.
+///
+/// Sans plafond de page, contrairement à [`paginer`] : `Browse` rendait
+/// jusqu'ici toute la page demandée par la base, et un appareil qui demande
+/// « tout » sans paginer ensuite perdrait ce qu'un plafond couperait.
+fn tranche<T>(items: Vec<T>, start: u64, count: u64) -> (Vec<T>, u64) {
+    let total = items.len() as u64;
+    let debut = usize::try_from(start).unwrap_or(usize::MAX);
+    let demande = usize::try_from(count).unwrap_or(usize::MAX);
+    (items.into_iter().skip(debut).take(demande).collect(), total)
+}
+
+/// #4956 — l'ordre alphabétique naturel des artistes
+/// ([`dossiers::comparer_alphabetique`]), sur la même clé que la base : le nom
+/// de tri s'il est renseigné (« Beatles, The »), sinon le nom. À clé égale,
+/// l'identifiant départage : l'ordre reste le même d'une page à l'autre.
+fn trier_artistes(artistes: &mut [crate::db::models::Artist]) {
+    fn cle(a: &crate::db::models::Artist) -> &str {
+        a.sort_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&a.name)
+    }
+    artistes.sort_by(|a, b| dossiers::comparer_alphabetique(cle(a), cle(b)).then(a.id.cmp(&b.id)));
+}
+
+/// #4956 — l'ordre alphabétique naturel des albums, par titre ; à titre égal,
+/// l'identifiant départage.
+fn trier_albums(albums: &mut [crate::db::models::Album]) {
+    albums
+        .sort_by(|a, b| dossiers::comparer_alphabetique(&a.title, &b.title).then(a.id.cmp(&b.id)));
 }
 
 /// Le DIDL d'une liste d'artistes. `Browse` et `Search` passent tous deux par
@@ -2666,10 +2727,14 @@ fn didl_artistes(
     }
 }
 
+/// Le rayon « Albums », page par page — même règle que [`browse_artists`]
+/// (#4956) : `ORDER BY LOWER(a.title)` rangeait « Été indien » après « Zoo ».
 fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
-    let repo = AlbumRepo::with_backend(state.backend.clone());
-    let total = repo.count().unwrap_or(0) as u64;
-    let albums = repo.list(count as i64, start as i64).unwrap_or_default();
+    let mut albums = AlbumRepo::with_backend(state.backend.clone())
+        .list(TOUTE_LA_RUBRIQUE, 0)
+        .unwrap_or_default();
+    trier_albums(&mut albums);
+    let (albums, total) = tranche(albums, start, count);
 
     // `didl_albums_under` emet exactement ce conteneur — createur, pochette,
     // nombre de pistes. Seul le total differe : ici c'est la table entiere,
@@ -2799,13 +2864,17 @@ fn didl_genres(genres: &[(String, u64)]) -> DidlResult {
 /// [`browse_genre_albums`] publie en tête (fil 1916). Le compter ici, à la
 /// source, garde la liste, `BrowseMetadata` et `Search` d'accord entre eux.
 ///
-/// #4956 — l'ORDRE est celui des noms du serveur média
-/// ([`dossiers::comparer_naturel`] : sans casse ni accents, nombres par leur
-/// valeur, égalité départagée par le texte brut). `genre_counts` rend l'ordre
-/// des octets de la clé en minuscules : « Électronique » après « World »,
-/// « 10s » avant « 9s ». Un appareil qui affiche l'ordre reçu (Marantz ND8006)
-/// montrait une liste « sans ordre défini au début ». L'ordre est total, donc
-/// stable d'une page à l'autre.
+/// #4956 — l'ORDRE est l'ordre alphabétique naturel
+/// ([`dossiers::comparer_alphabetique`] : sans casse ni accents, nombres par
+/// leur valeur, ponctuation et espaces de tête ignorés, égalité départagée
+/// par le texte brut). `genre_counts` rend l'ordre des octets de la clé en
+/// minuscules : « Électronique » après « World », « 10s » avant « 9s ». Un
+/// appareil qui affiche l'ordre reçu (Marantz ND8006) montrait une liste
+/// « sans ordre défini au début ». La 0.9.165 avait réglé les accents et les
+/// nombres ; restaient en tête les genres à signe (« (Hip-Hop) », « 'Jazz »)
+/// et les jetons que `genre_counts` rend avec leur espace (« Rock, Blues »
+/// donne « Blues » précédé d'une espace). L'ordre est total, donc stable
+/// d'une page à l'autre.
 fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
     let mut genres: Vec<(String, u64)> = AlbumRepo::with_backend(state.backend.clone())
         .genre_counts()
@@ -2817,7 +2886,7 @@ fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
                 .map(|nb| (genre, nb + NB_ENSEMBLES_DU_GENRE))
         })
         .collect();
-    genres.sort_by(|a, b| dossiers::comparer_naturel(&a.0, &b.0));
+    genres.sort_by(|a, b| dossiers::comparer_alphabetique(&a.0, &b.0));
     genres
 }
 
@@ -2834,7 +2903,9 @@ fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
 /// ensembles n'existent que là où il y a des albums.
 fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlResult {
     let repo = AlbumRepo::with_backend(state.backend.clone());
-    let albums = repo.list_by_genre(genre).unwrap_or_default();
+    let mut albums = repo.list_by_genre(genre).unwrap_or_default();
+    // #4956 — même ordre que le rayon « Albums ».
+    trier_albums(&mut albums);
     let parent_id = format!("genre/{}", urlencoding::encode(genre));
     if albums.is_empty() {
         return didl_albums_under(&albums, &parent_id, base_url);
@@ -2920,7 +2991,9 @@ fn lire_annees(state: &UpnpState) -> Vec<i64> {
 /// Les albums d'une année — le même rendu que ceux d'un genre.
 fn browse_year_albums(state: &UpnpState, annee: i64, base_url: &str) -> DidlResult {
     let repo = AlbumRepo::with_backend(state.backend.clone());
-    let albums = repo.list_by_year(annee).unwrap_or_default();
+    let mut albums = repo.list_by_year(annee).unwrap_or_default();
+    // #4956 — même ordre que le rayon « Albums ».
+    trier_albums(&mut albums);
     didl_albums_under(&albums, &format!("year/{annee}"), base_url)
 }
 
@@ -5355,6 +5428,7 @@ mod tests {
 
     #[test]
     fn un_refus_content_directory_nomme_action_et_objet_sans_accuser_les_actions_valides() {
+        crate::journal_de_test::fiabiliser_la_capture();
         let state = test_state();
         let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
         let journal = JournalCapture::default();

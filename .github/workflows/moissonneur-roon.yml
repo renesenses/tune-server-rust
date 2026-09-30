@@ -178,14 +178,28 @@ jobs:
       # Le tag `moissonneur-<tag serveur>` est neuf à chaque version, ne porte
       # aucun fichier `tune-server*`, et n'est donc jamais consulté par un
       # serveur qui cherche sa mise à jour.
+      #
+      # 🔴 PRÉ-VERSION, et un titre qui ne ressemble pas à une version de Tune
+      # (#5477). Publiée comme release STABLE « Moissonneur Roon vX.Y.Z », elle
+      # était ingérée par le webhook du site mozaiklabs comme une version de
+      # Tune : le semver était extrait du tag, les archives rangées parmi les
+      # binaires, et la ligne de release créée sous ce nom. Partie environ deux
+      # heures avant la release du serveur, elle occupait la ligne, et la vraie
+      # `v0.9.168` ne faisait plus que l'enrichir : /download affichait
+      # « Moissonneur Roon v0.9.168 » le 29/09/2026. Avec `moissonneur-v1.0.0-rc1`,
+      # le motif « version majeure » du site aurait écrit à tous les inscrits.
+      # Le site filtre désormais lui-même ses tags ; ceci est la seconde garde,
+      # côté source. Le tag reste `moissonneur-<tag serveur>` : le site et
+      # `notes-de-version-watch.sh` le reconnaissent et l'écartent.
       - name: Publier sur la release du moissonneur
         run: |
           ls -l archives
           RELEASE="moissonneur-$TAG"
           if ! gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" \
-              --title "Moissonneur Roon $TAG" \
-              --notes "Outil du testeur, publié à part du serveur : une archive \`moissonneur-roon-*\` sur la release de Tune était prise pour l'archive du serveur par la mise à jour automatique (17/09/2026)." \
+              --title "moissonneur-roon (outil du testeur Roon, hors Tune) — build du tag serveur $TAG" \
+              --notes "Outil du testeur, publié à part du serveur : une archive \`moissonneur-roon-*\` sur la release de Tune était prise pour l'archive du serveur par la mise à jour automatique (17/09/2026). Publié en pré-version, pour qu'aucun consommateur des releases (site, mise à jour) ne le prenne pour une version de Tune (#5477)." \
+              --prerelease \
               --latest=false
           fi
           gh release upload "$RELEASE" --repo "$GITHUB_REPOSITORY" --clobber archives/*

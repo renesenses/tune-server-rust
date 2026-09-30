@@ -135,12 +135,19 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             Some(sid) => state.streamer.stream_output_wire(sid).await,
             None => None,
         };
+        // #5353 — le backend de la sortie de CETTE zone.
+        let audio_backend_de_la_zone = crate::routes::zones::backend_affiche_de_la_zone(
+            state,
+            z.output_device_id.as_deref(),
+            audio_backend,
+        )
+        .await;
         let signal_path = crate::routes::zones::build_signal_path_pub(
             &ps,
             z,
             &state.backend,
             renderer_label,
-            audio_backend,
+            audio_backend_de_la_zone,
             wire.as_ref(),
         );
         let output_capabilities =

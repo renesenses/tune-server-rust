@@ -68,8 +68,9 @@
 //! Le service est lu par SON `search_page` — celui que sert déjà
 //! `/streaming/{service}/search` — : sa pagination et son plafond sont les
 //! siens. Qobuz pagine (pages de 50 par requête, 500 par catégorie au plus) ;
-//! les autres services n'ont aujourd'hui qu'une page (50 au plus), et un
-//! décalage au-delà rend une page vide SANS appel réseau.
+//! les autres services n'ont aujourd'hui qu'une page — à la limite du chemin
+//! non paginé, `has_more` toujours faux (décision de Bertrand, 29/09/2026) —,
+//! et un décalage au-delà rend une page vide SANS appel réseau.
 //!
 //! La fusion n'est pas réinventée : une page de curseur est la même réponse,
 //! assemblée par la même route et le même [`recherches_concurrentes`]. Le
@@ -178,6 +179,7 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::streaming::traits::PLAFOND_LIMITE_RECHERCHE;
 use tune_core::streaming::traits::{SearchResults, StreamTrack, StreamingService};
 
 use crate::routes::filtre_sources::FiltreSources;
@@ -261,8 +263,15 @@ const LIMITE_PAR_DEFAUT: i64 = 20;
 /// Retomber sur `0` serait pire encore : `0` EST le « Tous » de Qobuz. Le
 /// repli est donc le défaut de la route — la seule valeur dont on sait qu'elle
 /// a été voulue par quelqu'un.
+///
+/// #4803 (décision de Bertrand, 29/09/2026) : bornée en haut par
+/// [`PLAFOND_LIMITE_RECHERCHE`], la borne du `search_page` par défaut — la
+/// première page d'un service est ainsi la même avec ou sans `paged=true`.
+/// `0` n'est pas touché : il reste le « Tous » que chaque service traduit.
 fn limite_pour_les_services(limit: i64) -> usize {
-    usize::try_from(limit).unwrap_or(LIMITE_PAR_DEFAUT as usize)
+    usize::try_from(limit)
+        .unwrap_or(LIMITE_PAR_DEFAUT as usize)
+        .min(PLAFOND_LIMITE_RECHERCHE)
 }
 
 /// #4441 — la règle de #4367, appliquée aux pistes venues d'un SERVICE.
@@ -704,8 +713,8 @@ async fn federated_search(
                 };
                 // #4803 — la page du service, par SON `search_page` : la
                 // pagination et le plafond sont les siens (Qobuz : 500 par
-                // catégorie ; un service sans pagination : une page de 50,
-                // puis rien).
+                // catégorie ; un service sans pagination : une page à la
+                // limite du chemin non paginé, puis rien).
                 let page = svc.search_page(&requete, demandee, decalage).await.ok()?;
                 let servie = svc.limite_de_page_recherche(demandee);
                 let mut results = page.results;
@@ -897,8 +906,16 @@ mod tests_limite_services {
     /// y compris le `0` explicite, qui reste le « Tous » documenté.
     #[test]
     fn une_limite_valide_traverse_intacte() {
-        for demandee in [0i64, 1, 20, 50, 200, 5_000] {
+        for demandee in [0i64, 1, 20, 50, 200, 500] {
             assert_eq!(limite_pour_les_services(demandee), demandee as usize);
+        }
+    }
+
+    /// #4803 — au-delà du plafond haut, la limite est ramenée à 500.
+    #[test]
+    fn une_limite_extravagante_est_ramenee_au_plafond() {
+        for demandee in [501i64, 5_000, 100_000, i64::MAX] {
+            assert_eq!(limite_pour_les_services(demandee), PLAFOND_LIMITE_RECHERCHE);
         }
     }
 }

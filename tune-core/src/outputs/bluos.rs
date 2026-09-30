@@ -830,6 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn le_refus_gapless_nomme_l_url_envoyee_comme_le_fait_play_media() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // LA contre-epreuve de #1874 sur la soeur oubliee par #1870.
         //
         // Le Node accepte l'appel gapless et laisse sa file vide — exactement la
@@ -893,6 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn un_add_refuse_par_code_http_nomme_aussi_l_url_envoyee() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // L'autre facon de refuser : le Node repond 404. Rien n'etait journalise
         // du tout — l'`Err` remonte a l'utilisateur, jamais au diagnostic.
         let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -952,6 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn un_clear_refuse_par_le_node_est_ecrit_dans_le_journal() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // Le Node repond 500 au Clear : ses pistes restent en file, et
         // `/Play?id=0` va jouer l'entree 0 — celle de l'album precedent.
         // C'etait un silence COMPLET : `let _ =` jetait l'`Err`.
@@ -976,6 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn un_clear_acquitte_sans_vider_la_file_est_signale() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // Acquitte n'est pas applique : 200, et `length="3"`. Rien n'echoue au
         // sens HTTP, et pourtant l'entree 0 n'est plus la notre.
         let (issue, log, _) = jouer_sur_bouchon(NodeBouchon {
@@ -993,6 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn l_add_ne_part_pas_avant_que_le_clear_ait_rendu() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // Le bouchon n'inscrit le `/Clear` qu'apres 150 ms. Un `Add` lance sans
         // attendre la reponse s'inscrirait donc en premier.
         let (issue, _, appels) = jouer_sur_bouchon(NodeBouchon {
@@ -1010,6 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn le_temoin_un_node_nominal_ne_change_pas_de_conduite() {
+        crate::journal_de_test::fiabiliser_la_capture();
         // Contre-epreuve : quand tout se passe bien, RIEN ne doit s'ecrire en
         // WARN, et les trois memes appels partent, dans le meme ordre qu'avant.
         let (issue, log, appels) = jouer_sur_bouchon(NodeBouchon::default()).await;

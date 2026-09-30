@@ -23,6 +23,8 @@ use super::negociation_format_exclusif_3837::{
     CandidatFormat, ResultatSonde, message_peripherique_occupe, negocier_format_exclusif,
 };
 #[cfg(target_os = "windows")]
+use super::reveil_en_retard_4357::{Reveil, SuiviDesReveils, microsecondes, tache_mmcss_utf16};
+#[cfg(target_os = "windows")]
 use super::reveil_rendu_4357::{ATTENTE_RENDU_MS, ReveilRendu, reveil_rendu};
 
 #[cfg(target_os = "windows")]
@@ -183,6 +185,18 @@ mod ffi {
         /// #4357 — signale l'événement d'arrêt de la boucle de rendu.
         pub fn SetEvent(hEvent: HANDLE) -> i32;
         pub fn CloseHandle(hObject: HANDLE) -> i32;
+        /// #4357 — le code d'erreur d'un refus MMCSS.
+        pub fn GetLastError() -> u32;
+        /// #4357 — l'horloge des réveils de la boucle de rendu.
+        pub fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
+        pub fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> i32;
+    }
+
+    // #4357 — MMCSS : le fil de rendu passe dans la tâche « Pro Audio ».
+    #[link(name = "avrt")]
+    unsafe extern "system" {
+        pub fn AvSetMmThreadCharacteristicsW(TaskName: *const u16, TaskIndex: *mut u32) -> HANDLE;
+        pub fn AvRevertMmThreadCharacteristics(AvrtHandle: HANDLE) -> i32;
     }
 
     /// Helper to call a COM vtable method by index.
@@ -443,10 +457,20 @@ pub struct WasapiExclusiveOutput {
     stop_event: ffi::HANDLE,
     #[cfg(target_os = "windows")]
     buffer_frame_count: u32,
+    /// #4357 — la période retenue à l'`Initialize`, en 100 ns : c'est elle
+    /// que la boucle de rendu compare à l'écart entre deux réveils.
+    #[cfg(target_os = "windows")]
+    period_100ns: i64,
     running: Arc<AtomicBool>,
     underruns: Arc<AtomicU64>,
     deadline_misses: Arc<AtomicU64>,
     callback_errors: Arc<AtomicU64>,
+    /// #4357 — réveils par l'événement du pilote arrivés plus d'une période
+    /// et demie après le précédent. Ni `underruns` ni `deadline_misses` ne
+    /// les voient : l'anneau était plein, l'attente n'a pas expiré.
+    late_wakeups: Arc<AtomicU64>,
+    /// #4357 — le plus grand écart mesuré entre deux réveils, en µs.
+    max_wakeup_gap_us: Arc<AtomicU64>,
     render_thread: Option<std::thread::JoinHandle<()>>,
     resources_released: bool,
     #[cfg(target_os = "windows")]
@@ -768,10 +792,13 @@ impl WasapiExclusiveOutput {
                 event_handle: event,
                 stop_event,
                 buffer_frame_count,
+                period_100ns: selected_period,
                 running: Arc::new(AtomicBool::new(false)),
                 underruns: Arc::new(AtomicU64::new(0)),
                 deadline_misses: Arc::new(AtomicU64::new(0)),
                 callback_errors: Arc::new(AtomicU64::new(0)),
+                late_wakeups: Arc::new(AtomicU64::new(0)),
+                max_wakeup_gap_us: Arc::new(AtomicU64::new(0)),
                 render_thread: None,
                 resources_released: false,
                 _com_apartment: com_apartment,
@@ -849,6 +876,9 @@ impl WasapiExclusiveOutput {
         let underruns = self.underruns.clone();
         let deadline_misses = self.deadline_misses.clone();
         let callback_errors = self.callback_errors.clone();
+        let late_wakeups = self.late_wakeups.clone();
+        let max_wakeup_gap_us = self.max_wakeup_gap_us.clone();
+        let period_100ns = self.period_100ns;
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
@@ -873,6 +903,38 @@ impl WasapiExclusiveOutput {
 
             info!("wasapi_exclusive_render_thread_started");
 
+            // #4357 — MMCSS « Pro Audio » AVANT la première période : un fil
+            // de priorité normale peut être réveillé au-delà de la période du
+            // pilote (10 ms), et la période est alors perdue sans que l'anneau
+            // ni l'attente ne le voient. Un refus ne coûte que la ligne de
+            // journal : le rendu continue exactement comme avant.
+            let tache = tache_mmcss_utf16();
+            let mut indice_tache: u32 = 0;
+            let mmcss =
+                unsafe { ffi::AvSetMmThreadCharacteristicsW(tache.as_ptr(), &mut indice_tache) };
+            if mmcss.is_null() {
+                let code = unsafe { ffi::GetLastError() };
+                warn!(
+                    tache = "Pro Audio",
+                    code,
+                    "wasapi_exclusive_mmcss_refuse — le fil de rendu reste en priorité normale (#4357)"
+                );
+            } else {
+                info!(
+                    tache = "Pro Audio",
+                    indice_tache, "wasapi_exclusive_mmcss_obtenu (#4357)"
+                );
+            }
+
+            // #4357 — l'horloge des réveils. Sans fréquence lisible, pas de
+            // mesure : la lecture, elle, ne dépend jamais de ce suivi.
+            let mut frequence: i64 = 0;
+            let mut suivi = if unsafe { ffi::QueryPerformanceFrequency(&mut frequence) } != 0 {
+                SuiviDesReveils::nouveau(period_100ns, frequence)
+            } else {
+                None
+            };
+
             while running.load(Ordering::SeqCst) {
                 let wait_result =
                     unsafe { WaitForMultipleObjects(2, poignees.as_ptr(), 0, ATTENTE_RENDU_MS) };
@@ -880,9 +942,40 @@ impl WasapiExclusiveOutput {
                     ReveilRendu::Arreter => break,
                     ReveilRendu::EcheanceManquee => {
                         deadline_misses.fetch_add(1, Ordering::Relaxed);
+                        if let Some(suivi) = suivi.as_mut() {
+                            suivi.oublier_le_dernier();
+                        }
                         continue;
                     }
                     ReveilRendu::Rendre => {}
+                }
+
+                // #4357 — l'instant du réveil, comparé au précédent. La ligne
+                // de journal éventuelle attend que le tampon soit rendu.
+                let mut retard_a_journaliser: Option<u64> = None;
+                if let Some(suivi) = suivi.as_mut() {
+                    let mut maintenant: i64 = 0;
+                    if unsafe { ffi::QueryPerformanceCounter(&mut maintenant) } != 0 {
+                        match suivi.observer(maintenant as u64) {
+                            Reveil::Premier | Reveil::AHeure => {}
+                            Reveil::EnRetard { .. } => {
+                                late_wakeups.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Reveil::TresEnRetard {
+                                ecart_ticks,
+                                journaliser,
+                            } => {
+                                late_wakeups.fetch_add(1, Ordering::Relaxed);
+                                if journaliser {
+                                    retard_a_journaliser = Some(ecart_ticks);
+                                }
+                            }
+                        }
+                        max_wakeup_gap_us.store(
+                            microsecondes(suivi.ecart_max_ticks(), frequence),
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
 
                 if paused.load(Ordering::SeqCst) {
@@ -949,6 +1042,22 @@ impl WasapiExclusiveOutput {
                         callback_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+
+                // #4357 — journalisé APRÈS le tampon rendu, jamais avant.
+                if let (Some(ecart_ticks), Some(suivi)) = (retard_a_journaliser, suivi.as_ref()) {
+                    warn!(
+                        ecart_us = microsecondes(ecart_ticks, frequence),
+                        periode_us = microsecondes(suivi.periode_ticks(), frequence),
+                        reveils_en_retard = suivi.reveils_en_retard(),
+                        "wasapi_exclusive_reveil_tres_en_retard — plus de deux périodes entre deux réveils du fil de rendu (#4357)"
+                    );
+                }
+            }
+
+            // #4357 — rendre la promotion MMCSS depuis le fil qui l'a obtenue.
+            if !mmcss.is_null() && unsafe { ffi::AvRevertMmThreadCharacteristics(mmcss) } == 0 {
+                let code = unsafe { ffi::GetLastError() };
+                warn!(code, "wasapi_exclusive_mmcss_revert_failed");
             }
 
             info!("wasapi_exclusive_render_thread_stopped");
@@ -1018,6 +1127,9 @@ impl WasapiExclusiveOutput {
             underruns = self.underrun_count(),
             deadline_misses = self.deadline_miss_count(),
             callback_errors = self.callback_error_count(),
+            reveils_en_retard = self.late_wakeup_count(),
+            ecart_max_us = self.max_wakeup_gap_us.load(Ordering::Relaxed),
+            periode_100ns = self.period_100ns,
             "wasapi_exclusive_stopped"
         );
     }
@@ -1063,6 +1175,12 @@ impl WasapiExclusiveOutput {
 
     pub fn callback_error_count(&self) -> u64 {
         self.callback_errors.load(Ordering::Relaxed)
+    }
+
+    /// #4357 — réveils du fil de rendu arrivés plus d'une période et demie
+    /// après le précédent.
+    pub fn late_wakeup_count(&self) -> u64 {
+        self.late_wakeups.load(Ordering::Relaxed)
     }
 }
 

@@ -560,6 +560,10 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 
+// #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
+mod backend_de_la_sortie_5353;
+pub(crate) use backend_de_la_sortie_5353::backend_affiche_de_la_zone;
+
 #[cfg(test)]
 mod debit_de_zone_tests;
 

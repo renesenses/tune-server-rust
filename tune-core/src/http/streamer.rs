@@ -280,6 +280,19 @@ pub struct StreamSession {
     /// position du tuyau, pas celle des octets livrés — ceux qu'une connexion
     /// avortée a emportés dans son tampon de coalescence sont bien consommés.
     pub octets_du_canal: std::sync::atomic::AtomicU64,
+    /// #5426 — les derniers octets TIRÉS du canal, gardés pour une reprise.
+    ///
+    /// Un navigateur (zone « Cet ordinateur », Firefox 140) ferme sa connexion
+    /// et revient avec `Range: bytes=N-` où N est ce que SON cache a reçu —
+    /// 6 à 18 Mo EN DEÇÀ de ce que le serveur a déjà tiré du tuyau : les
+    /// octets en vol dans les tampons de la connexion morte sont perdus pour
+    /// lui. Le tuyau ne rejoue rien ; sans cette retenue, la reprise recevait
+    /// la suite du tuyau étiquetée N (un saut), ou — le canal déjà vidé —
+    /// un 206 sans un octet : le lecteur se tait, l'horloge de la zone avance.
+    ///
+    /// Alimentée sous le verrou du récepteur (`recv_chunk_retenu`), donc dans
+    /// l'ordre exact du canal ; bornée par `fenetre_de_retenue`.
+    retenue: std::sync::Mutex<RetenueDuCanal>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
@@ -289,6 +302,20 @@ pub struct StreamSession {
     /// musique restant audible dessous. Compté par session pour que le
     /// journal en dise la première et n'en répète pas cent.
     pub ranges_hors_trame: std::sync::atomic::AtomicU32,
+    /// #5050 — longueur TOTALE du flux d'une session mandataire, telle que le
+    /// CDN l'a dite sur un `GET` relayé (`Content-Length` d'un 200, total du
+    /// `Content-Range` d'un 206). `0` = pas encore connue.
+    ///
+    /// Le `HEAD` d'une session mandataire ne connaissait AUCUNE longueur
+    /// (`file_size=None` dans chaque `stream_head_request` du Beosound Stage de
+    /// FabienM) tout en annonçant `Accept-Ranges: bytes` et `DLNA.ORG_OP=01`,
+    /// alors que le `GET` recopiait celle du CDN. Aucune requête amont n'est
+    /// ajoutée pour la connaître : le premier `GET` relayé (la sonde des
+    /// VU-mètres, `agent="-"`, part à la création de la session) la rapporte.
+    pub longueur_amont: std::sync::atomic::AtomicU64,
+    /// #5050 — nombre de `GET` relayés par cette session : borne le débit de
+    /// la ligne de diagnostic `proxy_get_amont` (voir `diagnostic_mandataire_a_journaliser`).
+    pub requetes_mandataire: std::sync::atomic::AtomicU32,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -477,6 +504,26 @@ impl StreamSession {
         info
     }
 
+    /// #5050 — retient la longueur totale du flux amont, dès qu'un `GET`
+    /// relayé l'a apprise du CDN. Une longueur nulle ne dit rien : ignorée.
+    pub fn noter_longueur_amont(&self, total: u64) {
+        if total > 0 {
+            self.longueur_amont
+                .store(total, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// #5050 — la longueur totale du flux amont, si un `GET` relayé l'a apprise.
+    pub fn longueur_amont(&self) -> Option<u64> {
+        match self
+            .longueur_amont
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         let keep_alive = tx.clone();
@@ -503,9 +550,12 @@ impl StreamSession {
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
             octets_du_canal: std::sync::atomic::AtomicU64::new(0),
+            retenue: std::sync::Mutex::new(RetenueDuCanal::default()),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
+            longueur_amont: std::sync::atomic::AtomicU64::new(0),
+            requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
@@ -526,6 +576,109 @@ impl StreamSession {
 
     pub async fn recv_chunk(&self) -> Option<Vec<u8>> {
         self.rx.lock().await.recv().await
+    }
+
+    /// #5426 — tire un bloc du canal, le POSITIONNE et le RETIENT, sous le
+    /// verrou du récepteur.
+    ///
+    /// Rend `(position du bloc dans le flux, bloc)`, ou `None` à la fin du
+    /// canal — la fin est alors notée (`fin_du_canal`). Tout se fait sans
+    /// point d'attente entre la réception et la retenue : deux connexions ne
+    /// peuvent pas se voir attribuer des positions dans le désordre, et la
+    /// retenue contient toujours tout ce que le tuyau a rendu jusqu'à
+    /// `octets_du_canal`.
+    ///
+    /// `preparer` voit le bloc à sa position avant qu'il soit retenu (la
+    /// correction de l'en-tête d'un WAV long, #4016) : ce qu'une reprise
+    /// relira est exactement ce qui est parti.
+    pub async fn recv_chunk_retenu(
+        &self,
+        preparer: impl FnOnce(u64, &mut Vec<u8>),
+    ) -> Option<(u64, Vec<u8>)> {
+        let mut rx = self.rx.lock().await;
+        match rx.recv().await {
+            Some(bloc) => Some(self.retenir_sous_verrou(bloc, preparer)),
+            None => {
+                self.noter_fin_sous_verrou();
+                None
+            }
+        }
+    }
+
+    /// #5426 — si le canal est déjà FERMÉ par son producteur, en tire tout
+    /// ce qui reste dans la retenue et note la fin. Rend la fin si elle est
+    /// désormais connue.
+    ///
+    /// Ne bloque jamais : si une connexion tient le récepteur (garée dans un
+    /// `recv`, donc sur un canal encore ouvert), on n'attend pas.
+    pub fn vider_si_ferme(&self, preparer: impl Fn(u64, &mut Vec<u8>)) -> Option<u64> {
+        if let Ok(mut rx) = self.rx.try_lock()
+            && rx.is_closed()
+        {
+            loop {
+                match rx.try_recv() {
+                    Ok(bloc) => {
+                        self.retenir_sous_verrou(bloc, &preparer);
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.noter_fin_sous_verrou();
+                        break;
+                    }
+                    // Fermé mais pas encore vide côté émetteur : rien de sûr.
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+        }
+        self.fin_du_canal()
+    }
+
+    fn retenir_sous_verrou(
+        &self,
+        mut bloc: Vec<u8>,
+        preparer: impl FnOnce(u64, &mut Vec<u8>),
+    ) -> (u64, Vec<u8>) {
+        let debut = self
+            .octets_du_canal
+            .load(std::sync::atomic::Ordering::SeqCst);
+        preparer(debut, &mut bloc);
+        self.octets_du_canal
+            .fetch_add(bloc.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        let fenetre = self.info.fenetre_de_retenue();
+        if let Ok(mut r) = self.retenue.lock() {
+            r.ajouter(debut, bloc.clone(), fenetre);
+        }
+        (debut, bloc)
+    }
+
+    fn noter_fin_sous_verrou(&self) {
+        let fin = self
+            .octets_du_canal
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut r) = self.retenue.lock() {
+            r.fin = Some(fin);
+        }
+    }
+
+    /// Position, dans le flux, de la fin du canal — connue seulement une fois
+    /// qu'une connexion (ou `vider_si_ferme`) l'a atteinte.
+    pub fn fin_du_canal(&self) -> Option<u64> {
+        self.retenue.lock().ok().and_then(|r| r.fin)
+    }
+
+    /// Les octets retenus à partir de `position`, au plus `max`.
+    pub fn relire(&self, position: u64, max: usize) -> Relecture {
+        match self.retenue.lock() {
+            Ok(r) => r.relire(position, max),
+            Err(_) => Relecture::AuBout,
+        }
+    }
+
+    /// `[début, fin)` de ce que la retenue peut rejouer.
+    pub fn etendue_retenue(&self) -> (u64, u64) {
+        self.retenue
+            .lock()
+            .map(|r| (r.debut, r.debut + r.taille))
+            .unwrap_or((0, 0))
     }
 
     /// Register a new HTTP consumer of the single-consumer PCM channel and
@@ -703,6 +856,92 @@ impl StreamSession {
             return None;
         }
         (!self.abandon_alert_emitted.swap(true, Relaxed)).then_some(attente)
+    }
+}
+
+/// #5426 — ce que rend [`StreamSession::relire`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Relecture {
+    /// Les octets retenus à partir de la position demandée.
+    Octets(Vec<u8>),
+    /// La position est au bout de la retenue : la suite est encore dans le
+    /// canal (ou n'existe pas).
+    AuBout,
+    /// La position est sortie de la fenêtre : la retenue commence plus loin.
+    Evincee { debut: u64 },
+}
+
+/// #5426 — fenêtre glissante des derniers blocs tirés du canal.
+#[derive(Default)]
+struct RetenueDuCanal {
+    /// Position dans le flux du premier octet retenu.
+    debut: u64,
+    blocs: std::collections::VecDeque<Vec<u8>>,
+    taille: u64,
+    fin: Option<u64>,
+}
+
+impl RetenueDuCanal {
+    fn ajouter(&mut self, position: u64, bloc: Vec<u8>, fenetre: u64) {
+        if position != self.debut + self.taille {
+            // Un bloc tiré hors de la retenue (autre voie de lecture) : la
+            // continuité est rompue, on repart de celui-ci.
+            self.blocs.clear();
+            self.debut = position;
+            self.taille = 0;
+        }
+        self.taille += bloc.len() as u64;
+        self.blocs.push_back(bloc);
+        while self.blocs.len() > 1 && self.taille > fenetre {
+            if let Some(ancien) = self.blocs.pop_front() {
+                self.debut += ancien.len() as u64;
+                self.taille -= ancien.len() as u64;
+            }
+        }
+    }
+
+    fn relire(&self, position: u64, max: usize) -> Relecture {
+        let fin = self.debut + self.taille;
+        if position >= fin {
+            return Relecture::AuBout;
+        }
+        if position < self.debut {
+            return Relecture::Evincee { debut: self.debut };
+        }
+        let mut sortie = Vec::with_capacity(max.min((fin - position) as usize));
+        let mut cursor = self.debut;
+        for bloc in &self.blocs {
+            let bout = cursor + bloc.len() as u64;
+            if bout > position {
+                let depuis = position.max(cursor) - cursor;
+                let reste = max - sortie.len();
+                let tranche = &bloc[depuis as usize..];
+                sortie.extend_from_slice(&tranche[..tranche.len().min(reste)]);
+                if sortie.len() >= max {
+                    break;
+                }
+            }
+            cursor = bout;
+        }
+        Relecture::Octets(sortie)
+    }
+}
+
+/// #5426 — ce que la retenue garde au plus : 180 s d'audio au débit nominal
+/// du flux, jamais moins de 8 Mio ni plus de 64 Mio.
+///
+/// Mesuré chez le testeur (Firefox 140, WAV 44,1 kHz / 16 bits) : la reprise
+/// tombait de 6,6 à 17,7 Mo en deçà de ce que le serveur avait déjà envoyé,
+/// soit 37 à 100 s d'audio. 180 s en CD font 31,8 Mo.
+pub const RETENUE_SECONDES: u64 = 180;
+pub const RETENUE_MIN_OCTETS: u64 = 8 * 1024 * 1024;
+pub const RETENUE_MAX_OCTETS: u64 = 64 * 1024 * 1024;
+
+impl StreamInfo {
+    /// Taille de la fenêtre de retenue de ce flux — voir [`RETENUE_SECONDES`].
+    pub fn fenetre_de_retenue(&self) -> u64 {
+        let debit = self.sample_rate as u64 * self.channels as u64 * (self.bit_depth as u64 / 8);
+        (debit * RETENUE_SECONDES).clamp(RETENUE_MIN_OCTETS, RETENUE_MAX_OCTETS)
     }
 }
 

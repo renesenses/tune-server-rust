@@ -484,7 +484,7 @@ async fn mark_read(
 /// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
 /// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
 /// (#2916).
-fn base_url(state: &AppState) -> Option<String> {
+pub(crate) fn base_url(state: &AppState) -> Option<String> {
     SettingsRepo::with_backend(state.backend.clone())
         .get("mozaik_base_url")
         .ok()
@@ -492,17 +492,22 @@ fn base_url(state: &AppState) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
-/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
-/// 412 seulement si NI l'un NI l'autre n'est disponible.
-fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
+/// Les identifiants que ce serveur peut présenter à mozaiklabs, dans l'ordre
+/// où les essayer : le token OAuth premium (SSO), puis la clé de licence
+/// (premium par clé, sans SSO — la majorité des testeurs). Vide quand il n'y a
+/// ni l'un ni l'autre. Partagé avec l'installation de greffons audio depuis le
+/// catalogue (`catalogue_greffons_audio`), qui essaie la clé quand le compte
+/// SSO est refusé, et avec le rapport de bug envoyé au forum
+/// (`routes/system/diagnostics.rs::envoyer_le_rapport`, #5428), qui prend le
+/// premier et part aussi SANS identité.
+pub(crate) fn identifiants_mozaiklabs(settings: &SettingsRepo) -> Vec<support::SupportAuth> {
+    let mut identifiants = Vec::new();
 
     // Chemin 1 : token OAuth premium (login SSO dans Tune).
     if let Some(token) = settings.get("mozaik_access_token").ok().flatten()
         && !token.is_empty()
     {
-        return Ok(support::SupportAuth::Bearer(token));
+        identifiants.push(support::SupportAuth::Bearer(token));
     }
 
     // Chemin 2 : clé de licence. mozaiklabs vérifie la licence premium et
@@ -516,7 +521,17 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
             .flatten()
             .filter(|f| !f.is_empty())
             .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
-        return Ok(support::SupportAuth::License { key, fingerprint });
+        identifiants.push(support::SupportAuth::License { key, fingerprint });
+    }
+    identifiants
+}
+
+/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
+/// la clé de licence. 412 seulement si NI l'un NI l'autre n'est disponible.
+fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Some(premier) = identifiants_mozaiklabs(&settings).into_iter().next() {
+        return Ok(premier);
     }
 
     Err((

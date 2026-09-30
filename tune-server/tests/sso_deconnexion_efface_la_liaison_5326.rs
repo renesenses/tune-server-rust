@@ -174,6 +174,7 @@ fn aucun_jeton_dans(journal: &str) {
 
 #[tokio::test]
 async fn la_deconnexion_delie_le_serveur_chez_le_cloud_puis_efface_le_jeton() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let (base, recus) = faux_cloud(StatusCode::OK).await;
     let (state, _dir) = serveur_lie_a(&base);
 
@@ -198,6 +199,7 @@ async fn la_deconnexion_delie_le_serveur_chez_le_cloud_puis_efface_le_jeton() {
 
 #[tokio::test]
 async fn un_refus_du_cloud_n_empeche_pas_la_deconnexion() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     for refus in [
         StatusCode::NOT_FOUND,
         StatusCode::UNAUTHORIZED,
@@ -220,6 +222,7 @@ async fn un_refus_du_cloud_n_empeche_pas_la_deconnexion() {
 
 #[tokio::test]
 async fn un_cloud_injoignable_n_empeche_pas_la_deconnexion() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let base = adresse_morte().await;
     let (state, _dir) = serveur_lie_a(&base);
     let (statut, journal) = se_deconnecter(&state).await;
@@ -231,6 +234,7 @@ async fn un_cloud_injoignable_n_empeche_pas_la_deconnexion() {
 
 #[tokio::test]
 async fn sans_jeton_de_liaison_rien_ne_part() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let (base, recus) = faux_cloud(StatusCode::OK).await;
     let (state, _dir) = serveur_lie_a(&base);
     SettingsRepo::with_backend(state.backend.clone())
@@ -288,6 +292,7 @@ async fn faux_sync() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
 /// seulement ce qui changera ensuite.
 #[tokio::test]
 async fn apres_une_deliaison_reussie_la_reconnexion_repousse_toute_la_bibliotheque() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     let (base, _recus) = faux_cloud(StatusCode::OK).await;
     let (state, _dir) = serveur_lie_a(&base);
     bibliotheque_deja_poussee(&state);
@@ -350,6 +355,7 @@ async fn apres_une_deliaison_reussie_la_reconnexion_repousse_toute_la_bibliotheq
 /// chez le cloud — le journal et la date de synchro ne bougent pas.
 #[tokio::test]
 async fn un_echec_de_deliaison_ne_touche_pas_au_journal() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     for refus in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
         let (base, _recus) = faux_cloud(refus).await;
         let (state, _dir) = serveur_lie_a(&base);

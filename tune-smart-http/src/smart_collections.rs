@@ -198,10 +198,43 @@ pub(crate) fn compte_albums_ventile(
     (en_base, en_service)
 }
 
+/// Faire tourner les lectures synchrones d'une route de collection
+/// intelligente HORS des fils de l'exécuteur async — #5438.
+///
+/// Un clic sur un raccourci vers une collection intelligente ouvre l'écran des
+/// collections : `GET /library/smart-collections` (deux `COUNT(DISTINCT …)`
+/// sur toute la bibliothèque PAR collection), puis `GET …/{id}/albums` pour
+/// chacune, en parallèle. Posées sur les fils de l'exécuteur, ces lectures
+/// les tenaient tous à la fois et le flux vers le renderer se taisait — la
+/// micro-coupure constatée chez Yves Corbat (58 359 pistes). Même remède que
+/// `list_albums` (#4800) : le pool de fils bloquants de Tokio.
+///
+/// Une tâche perdue (panique) rend 500 et le journal dit quelle route.
+async fn hors_executeur<T, F>(route: &'static str, travail: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(travail).await.map_err(|e| {
+        tracing::error!(route, error = %e, "collection_intelligente_tache_bloquante_perdue");
+        AppError::internal(format!("{route} : lecture interrompue"))
+    })
+}
+
 async fn list_collections(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
 ) -> Result<Json<Value>, AppError> {
+    let profile_id = profile.id();
+    hors_executeur("smart_collections_list", move || {
+        lister_les_collections(&state, profile_id)
+    })
+    .await?
+    .map(Json)
+}
+
+/// Le corps de `GET /library/smart-collections`, exécuté HORS de l'exécuteur.
+fn lister_les_collections(state: &SmartHttpState, profile_id: i64) -> Result<Value, AppError> {
     let rows = state
         .backend
         .query_many(
@@ -213,7 +246,7 @@ async fn list_collections(
         .map_err(AppError::internal)?;
 
     let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
+    let ctx = RefCtx::root(&resolver, Some(profile_id));
     let items: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -222,65 +255,55 @@ async fn list_collections(
                 .get(2)
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into());
-            // Count with the SAME album-query engine as resolve_albums so the
-            // count is always produced and matches the album view. The old
-            // SmartCollection::compile_sql path silently failed to deserialize
-            // richer rule operators (>=, <=, in, is_null…) and then dropped
-            // album_count entirely, so a collection using those showed no count
-            // (Jean Marie). build_album_query inlines escaped values → no bound
-            // params (mirrors execute_album_query). max_limit=None reports the
-            // full membership, not the capped view.
-            let match_mode = col["match_mode"].as_str().unwrap_or("all");
-            let sort_by = col["sort_by"].as_str().unwrap_or("title");
-            let sort_order = col["sort_order"].as_str().unwrap_or("asc");
-            let (where_clause, _order, _limit) =
-                build_album_query(&rules_str, match_mode, sort_by, sort_order, None, &ctx);
-
-            let album_count_sql = format!(
-                "SELECT COUNT(DISTINCT al.id) FROM albums al \
-                 LEFT JOIN artists ar ON al.artist_id = ar.id \
-                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-            );
-            let (albums_en_base, albums_de_service) = compte_albums_ventile(
-                &*state.backend,
-                &album_count_sql,
-                &rules_str,
-                match_mode,
-                profile.id(),
-            );
-            col["album_count"] = json!(albums_en_base + albums_de_service);
-            // 🔴 #4466 — `track_count` ne compte QUE la base. Tant que les
-            // favoris de service n'entrent pas dans la collection, c'est le
-            // compte complet et il se rend. Dès qu'ils y entrent, il ne
-            // couvre plus qu'une part du contenu — et une collection faite de
-            // 3 albums favoris Qobuz affichait « 3 albums · 0 piste ».
-            //
-            // Il n'y a rien à additionner : `streaming_favorites` ne porte
-            // aucun nombre de pistes. On ne rend donc PAS le champ, ce que le
-            // corps de l'issue demandait explicitement à défaut du compte
-            // complet — « un 0 sur une collection pleine est pire qu'une
-            // absence de compte ». Le client teste déjà `track_count != null`
-            // (`SmartCollectionsView.svelte`) : la mention de pistes
-            // disparaît, le nombre d'albums reste.
-            let compte_complet = albums_de_service == 0;
-            if compte_complet {
-                let track_count_sql = format!(
-                    "SELECT COUNT(DISTINCT t.id) FROM albums al \
-                     LEFT JOIN artists ar ON al.artist_id = ar.id \
-                     LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-                );
-                if let Ok(rs) = state.backend.query_many(&track_count_sql, &[]) {
-                    col["track_count"] = json!(
-                        rs.first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0)
-                    );
+            // #5438 — les deux comptes et les pochettes, en cache tant que la
+            // bibliothèque ne bouge pas, pour les seules règles qui ne
+            // dépendent que d'elle (`comptes::regles_cachables`).
+            let criteres = crate::comptes::Cle {
+                profile_id,
+                rules: rules_str.clone(),
+                match_mode: r
+                    .get(3)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "all".into()),
+                sort_by: r
+                    .get(4)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "title".into()),
+                sort_order: r
+                    .get(5)
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| "asc".into()),
+                max_limit: r.get(6).and_then(|v| v.as_i64()),
+            };
+            let cache = state
+                .comptes
+                .as_ref()
+                .filter(|_| crate::comptes::regles_cachables(&rules_str));
+            let (en_cache, generation) = match cache {
+                Some(c) => c.lire(&criteres),
+                None => (None, 0),
+            };
+            let comptes = match en_cache {
+                Some(c) => c,
+                None => {
+                    let c = calculer_les_comptes(state, &ctx, &col, &criteres);
+                    let complet = c.partiel || c.track_count.is_some();
+                    if let Some(cache) = cache.filter(|_| complet) {
+                        cache.poser(criteres.clone(), c.clone(), generation);
+                    }
+                    c
                 }
-            } else {
+            };
+            col["album_count"] = json!(comptes.album_count);
+            if comptes.partiel {
                 // Et on DIT pourquoi, plutôt que de laisser un champ
-                // manquant s'expliquer tout seul.
+                // manquant s'expliquer tout seul (#4466).
                 col["track_count_partiel"] = json!(true);
+            } else if let Some(n) = comptes.track_count {
+                col["track_count"] = json!(n);
+            }
+            if let Some(covers) = comptes.covers {
+                col["covers"] = json!(covers);
             }
             // #4473, arbitrage 2 : le catalogue n'est PAS compté (un appel
             // réseau par collection et par affichage), mais la liste le dit,
@@ -289,7 +312,143 @@ async fn list_collections(
             col
         })
         .collect();
-    Ok(Json(json!(items)))
+    Ok(json!(items))
+}
+
+/// Les comptes et les pochettes d'une ligne de `GET /library/smart-collections`.
+///
+/// Les comptes : voir les commentaires ci-dessous (#4466, Jean Marie). Les
+/// pochettes (#5438) : celles que le client composait lui-même en demandant
+/// `/{id}/albums` pour CHAQUE collection — mêmes albums, même ordre, même
+/// règle ([`tune_core::library::mosaique::quatre_distinctes`]).
+fn calculer_les_comptes(
+    state: &SmartHttpState,
+    ctx: &RefCtx,
+    col: &Value,
+    criteres: &crate::comptes::Cle,
+) -> crate::comptes::Comptes {
+    // Count with the SAME album-query engine as resolve_albums so the
+    // count is always produced and matches the album view. The old
+    // SmartCollection::compile_sql path silently failed to deserialize
+    // richer rule operators (>=, <=, in, is_null…) and then dropped
+    // album_count entirely, so a collection using those showed no count
+    // (Jean Marie). build_album_query inlines escaped values → no bound
+    // params (mirrors execute_album_query). max_limit=None reports the
+    // full membership, not the capped view.
+    let rules_str = criteres.rules.as_str();
+    let match_mode = col["match_mode"].as_str().unwrap_or("all");
+    let sort_by = col["sort_by"].as_str().unwrap_or("title");
+    let sort_order = col["sort_order"].as_str().unwrap_or("asc");
+    let (where_clause, _order, _limit) =
+        build_album_query(rules_str, match_mode, sort_by, sort_order, None, ctx);
+
+    let album_count_sql = format!(
+        "SELECT COUNT(DISTINCT al.id) FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    );
+    let (albums_en_base, albums_de_service) = compte_albums_ventile(
+        &*state.backend,
+        &album_count_sql,
+        rules_str,
+        match_mode,
+        criteres.profile_id,
+    );
+    // 🔴 #4466 — `track_count` ne compte QUE la base. Tant que les
+    // favoris de service n'entrent pas dans la collection, c'est le
+    // compte complet et il se rend. Dès qu'ils y entrent, il ne
+    // couvre plus qu'une part du contenu — et une collection faite de
+    // 3 albums favoris Qobuz affichait « 3 albums · 0 piste ».
+    //
+    // Il n'y a rien à additionner : `streaming_favorites` ne porte
+    // aucun nombre de pistes. On ne rend donc PAS le champ, ce que le
+    // corps de l'issue demandait explicitement à défaut du compte
+    // complet — « un 0 sur une collection pleine est pire qu'une
+    // absence de compte ». Le client teste déjà `track_count != null`
+    // (`SmartCollectionsView.svelte`) : la mention de pistes
+    // disparaît, le nombre d'albums reste.
+    let compte_complet = albums_de_service == 0;
+    let track_count = if compte_complet {
+        let track_count_sql = format!(
+            "SELECT COUNT(DISTINCT t.id) FROM albums al \
+             LEFT JOIN artists ar ON al.artist_id = ar.id \
+             LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+        );
+        state
+            .backend
+            .query_many(&track_count_sql, &[])
+            .ok()
+            .map(|rs| {
+                rs.first()
+                    .and_then(|r| r.first())
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+            })
+    } else {
+        None
+    };
+    crate::comptes::Comptes {
+        album_count: albums_en_base + albums_de_service,
+        track_count,
+        partiel: !compte_complet,
+        covers: pochettes_de_la_liste(state, ctx, criteres),
+    }
+}
+
+/// Au plus quatre pochettes, cherchées parmi les premiers albums de la
+/// collection dans SON ordre : la fenêtre de seize fois la cible laisse la
+/// place aux albums sans pochette et aux disques éclatés (un coffret, treize
+/// lignes d'album).
+const FENETRE_DES_POCHETTES: i64 = 64;
+
+/// Les pochettes de la mosaïque d'une collection, comme le client les tirait
+/// de `/{id}/albums` : albums de la bibliothèque puis albums de service, dans
+/// l'ordre et sous la borne de la collection. `None` si la collection tire
+/// aussi un CATALOGUE distant et que la bibliothèque n'en donne pas quatre :
+/// le client va alors les chercher lui-même, comme avant.
+fn pochettes_de_la_liste(
+    state: &SmartHttpState,
+    ctx: &RefCtx,
+    c: &crate::comptes::Cle,
+) -> Option<Vec<String>> {
+    let fenetre = c
+        .max_limit
+        .filter(|n| *n > 0)
+        .map_or(FENETRE_DES_POCHETTES, |n| n.min(FENETRE_DES_POCHETTES));
+    let (where_clause, order, limit_clause) = build_album_query(
+        &c.rules,
+        &c.match_mode,
+        &c.sort_by,
+        &c.sort_order,
+        Some(fenetre),
+        ctx,
+    );
+    let albums = execute_album_query(state, &where_clause, &order, &limit_clause).ok()?;
+    let albums = avec_albums_de_service(
+        state,
+        albums,
+        &c.rules,
+        &c.match_mode,
+        c.profile_id,
+        &c.sort_by,
+        &c.sort_order,
+        c.max_limit,
+    )
+    .ok()?;
+    let covers = tune_core::library::mosaique::quatre_distinctes(
+        albums
+            .iter()
+            .map(|a| (a["title"].as_str(), a["cover_path"].as_str())),
+        4,
+    );
+    let catalogue = !matches!(
+        catalogue::lire(&c.rules, catalogue::Objet::Album),
+        catalogue::Lecture::Aucune
+    );
+    if catalogue && covers.len() < 4 {
+        return None;
+    }
+    Some(covers)
 }
 
 /// La borne `max_limit` d'une collection intelligente, ou 400.
@@ -1128,15 +1287,37 @@ async fn albums_de_la_collection(
     id: i64,
     profile_id: i64,
 ) -> Result<Option<Vec<Value>>, AppError> {
+    // #5438 — les critères, la requête d'albums et les albums de service sont
+    // des lectures synchrones : hors de l'exécuteur. Seul le catalogue (appel
+    // réseau, async) reste ici.
+    let lu = hors_executeur("smart_collection_albums", {
+        let state = state.clone();
+        move || albums_de_la_bibliotheque(&state, id, profile_id)
+    })
+    .await??;
+    let Some((albums, rules_json, max_limit)) = lu else {
+        return Ok(None);
+    };
+    let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
+    Ok(Some(albums))
+}
+
+/// Albums locaux et de service, règles et borne — de quoi joindre ensuite le
+/// catalogue.
+type AlbumsDeLaBibliotheque = (Vec<Value>, String, Option<i64>);
+
+/// Les albums locaux et de service de la collection `id`, et de quoi y
+/// joindre le catalogue (règles, borne). Synchrone : HORS de l'exécuteur.
+fn albums_de_la_bibliotheque(
+    state: &SmartHttpState,
+    id: i64,
+    profile_id: i64,
+) -> Result<Option<AlbumsDeLaBibliotheque>, AppError> {
     let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
         load_collection_criteria(state, id)?
     else {
         return Ok(None);
     };
-
-    // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
-    // doivent mourir avant le `.await` du catalogue, sinon le futur n'est plus
-    // `Send` et axum refuse le handler.
     let (where_clause, order, limit_clause) = {
         let resolver = DbRefResolver::new(&state.backend);
         let ctx = RefCtx::root(&resolver, Some(profile_id));
@@ -1160,8 +1341,7 @@ async fn albums_de_la_collection(
         &sort_order,
         max_limit,
     )?;
-    let albums = avec_albums_de_catalogue(state, albums, &rules_json, max_limit).await?;
-    Ok(Some(albums))
+    Ok(Some((albums, rules_json, max_limit)))
 }
 
 /// Un album d'une collection intelligente, vu par qui la PARTAGE avec un
@@ -1248,39 +1428,47 @@ async fn preview_albums(
     // pas reproduire (#2732).
     borne_valide(body.max_limit)?;
     let rules_json = body.rules.to_string();
-    let match_mode = body.match_mode.as_deref().unwrap_or("all");
-    let sort_by = body.sort_by.as_deref().unwrap_or("title");
-    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+    let max_limit = body.max_limit;
+    let profile_id = profile.id();
 
-    // Les références à l'état meurent avant le `.await` du catalogue (voir
-    // `resolve_albums`).
-    let (where_clause, order, limit_clause) = {
-        let resolver = DbRefResolver::new(&state.backend);
-        let ctx = RefCtx::root(&resolver, Some(profile.id()));
-        build_album_query(
-            &rules_json,
-            match_mode,
-            sort_by,
-            sort_order,
-            body.max_limit,
-            &ctx,
-        )
-    };
-    let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
-    let albums = avec_albums_de_service(
-        &state,
-        albums,
-        &rules_json,
-        match_mode,
-        profile.id(),
-        sort_by,
-        sort_order,
-        body.max_limit,
-    )?;
+    // #5438 — la requête d'albums et les albums de service sont des lectures
+    // synchrones : hors de l'exécuteur, comme la collection enregistrée.
+    let albums = hors_executeur("smart_collection_preview", {
+        let (state, rules_json) = (state.clone(), rules_json.clone());
+        move || {
+            let match_mode = body.match_mode.as_deref().unwrap_or("all");
+            let sort_by = body.sort_by.as_deref().unwrap_or("title");
+            let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+            let (where_clause, order, limit_clause) = {
+                let resolver = DbRefResolver::new(&state.backend);
+                let ctx = RefCtx::root(&resolver, Some(profile_id));
+                build_album_query(
+                    &rules_json,
+                    match_mode,
+                    sort_by,
+                    sort_order,
+                    max_limit,
+                    &ctx,
+                )
+            };
+            let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+            avec_albums_de_service(
+                &state,
+                albums,
+                &rules_json,
+                match_mode,
+                profile_id,
+                sort_by,
+                sort_order,
+                max_limit,
+            )
+        }
+    })
+    .await??;
     // 🔴 #4473 — l'aperçu de l'éditeur est ce que la collection rendra : sans
     // cet appel, une règle « catalogue » s'y montrait VIDE et sans refus, puis
     // la collection enregistrée rendait des albums, ou un 400.
-    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, body.max_limit).await?;
+    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }

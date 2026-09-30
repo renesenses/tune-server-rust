@@ -2944,6 +2944,15 @@ async fn envoyer_le_rapport(
     // Build the diagnostics + logs report (same content as the preview/markdown).
     let backend = state.backend.clone();
     let url = bug_report_url(&state);
+    // #5428 — l'identité du compte (jeton SSO, sinon clé de licence), lue
+    // AVANT que l'état ne soit consommé. Absente, le rapport part quand même,
+    // sans en-tête, comme avant : pas de 412 ici, contrairement au support.
+    // Forme du catalogue (`identifiants_mozaiklabs`) : le premier identifiant.
+    let identite = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
+        state.backend.clone(),
+    ))
+    .into_iter()
+    .next();
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {
@@ -3057,6 +3066,14 @@ async fn envoyer_le_rapport(
             .post(&url)
             .header(reqwest::header::ACCEPT, "application/json")
             .multipart(form)
+    };
+
+    // #5428 — les DEUX branches (JSON et multipart) passent ici : l'en-tête
+    // d'identité est posé une fois, par la fonction du support. Ni jeton ni
+    // clé ne sont journalisés.
+    let requete = match &identite {
+        Some(auth) => auth.apply(requete),
+        None => requete,
     };
 
     match requete.send().await {

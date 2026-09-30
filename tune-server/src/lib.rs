@@ -14,6 +14,9 @@ pub mod background;
 pub mod background_tasks;
 #[cfg(feature = "bandcamp")]
 pub mod bandcamp_sweep;
+/// #5461 — le binaire installé, distinct de celui qui tourne (relance après
+/// mise à jour, lancement depuis `<exe>.old`).
+pub mod binaire_installe;
 pub mod boot_status;
 pub mod bootstrap;
 /// L'adresse de première connexion, imprimée au démarrage (#1272).
@@ -28,6 +31,7 @@ pub mod gel_executeur;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
+mod lecture_bornee;
 pub mod lien_de_partage;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
@@ -38,6 +42,7 @@ pub mod plugins;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins_host;
 pub mod premium_guard;
+pub mod reprise_des_passes;
 pub mod routes;
 pub mod scan_import;
 /// L'echelle de dialectes CIFS, partagee par la route de montage et par le
@@ -51,6 +56,8 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod isolement_disque_tests_5467;
+#[cfg(test)]
 mod labels_albums_4836_tests;
 
 /// The whole server startup, so out-of-tree binaries can compose it with their
@@ -60,4 +67,5 @@ pub use bootstrap::run;
 mod premium_audio_plugins;
 
 mod audio_job_journal;
+mod catalogue_greffons_audio;
 mod native_audio;
