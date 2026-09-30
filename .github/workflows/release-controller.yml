@@ -74,7 +74,10 @@ jobs:
             echo "::error::le controleur doit etre lance depuis main, pas $GITHUB_REF"
             exit 1
           fi
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          # Une pre-version (1.0.0-rc1) est un train comme un autre : le
+          # suffixe vit sur le tag, les fichiers restent en X.Y.Z (release.yml,
+          # « Verify workspace version matches release tag »).
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::version invalide: $VERSION"
             exit 1
           fi
@@ -83,9 +86,13 @@ jobs:
             exit 1
           }
 
+          # `prerelease` est FACULTATIF. Absent, release.yml deduit le drapeau
+          # du tag (un `-` : pre-version). Present, il tranche, et il doit etre
+          # un booleen : la chaine "false" passerait pour vraie en shell.
           jq -e --arg version "$VERSION" '
             .version == $version and
             (.ready | type == "boolean") and
+            ((has("prerelease") | not) or (.prerelease | type == "boolean")) and
             (.components | keys | sort == ["os", "server", "universal", "web"]) and
             .components.server.repository == "renesenses/tune-server-rust" and
             .components.server.sha == "self" and
