@@ -194,3 +194,60 @@ async fn reessayer_un_greffon_qui_pend_encore_le_laisse_en_erreur_5403() {
     let (status, _) = post(&app, "/api/v1/plugins/aucun-5403/retry").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Échoue à son premier `setup()`, avec un secret dans le message, puis charge.
+struct EchoueUneFois {
+    essais: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TunePlugin for EchoueUneFois {
+    fn name(&self) -> &str {
+        "echoue-5403"
+    }
+    fn version(&self) -> &str {
+        "5.4.3"
+    }
+    fn description(&self) -> &str {
+        "greffon dont le premier setup() échoue"
+    }
+    async fn setup(&mut self, _ctx: &PluginContext) -> Result<(), String> {
+        if self.essais.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err("service injoignable (password=hunter2)".into());
+        }
+        Ok(())
+    }
+    async fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// #5403 (décision du 29/09) — un greffon dont le `setup()` ÉCHOUE au
+/// démarrage est visible aussi, en `setup_failed`, avec le message du greffon
+/// expurgé, et Réessayer le charge.
+#[tokio::test]
+async fn un_greffon_en_echec_reste_visible_avec_son_message_puis_se_reessaie_5403() {
+    let essais = Arc::new(AtomicUsize::new(0));
+    let (_state, app) = demarrer(vec![Box::new(EchoueUneFois {
+        essais: Arc::clone(&essais),
+    })])
+    .await;
+
+    let avant = fiches(&app, "echoue-5403").await;
+    assert_eq!(avant.len(), 1, "l'échec doit rester visible : {avant:?}");
+    let f = &avant[0];
+    assert_eq!(f["status"], "error", "{f}");
+    assert_eq!(f["error_reason"], "setup_failed", "{f}");
+    assert_eq!(f["loaded"], false, "{f}");
+    let message = f["error_message"].as_str().unwrap_or_else(|| panic!("{f}"));
+    assert!(message.starts_with("service injoignable"), "{message}");
+    assert!(!message.contains("hunter2"), "secret publié : {message}");
+
+    let (status, reponse) = post(&app, "/api/v1/plugins/echoue-5403/retry").await;
+    assert_eq!(status, StatusCode::OK, "{reponse}");
+    assert_eq!(reponse["status"], "loaded", "{reponse}");
+    assert_eq!(essais.load(Ordering::SeqCst), 2);
+    let apres = fiches(&app, "echoue-5403").await;
+    assert_eq!(apres.len(), 1, "{apres:?}");
+    assert_ne!(apres[0]["status"], "error", "{}", apres[0]);
+}

@@ -374,9 +374,10 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
     assert_eq!(body, "pong");
 }
 
-/// A plugin whose setup failed must not be advertised as installed and enabled.
-/// `setup_all` drops it from the loader, and the snapshot `plugins::init`
-/// publishes inherits that — this pins both halves down together.
+/// A plugin whose setup failed must not be advertised as loaded. `setup_all`
+/// drops it from the resident set, and the snapshot `plugins::init` publishes
+/// inherits that — this pins both halves down together. Depuis #5403, il
+/// reste visible, mais comme fiche en erreur (`setup_failed`).
 #[tokio::test]
 async fn rest_reports_only_plugins_that_actually_loaded() {
     use_scratch_plugin_data_dir();
@@ -388,13 +389,11 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
         vec![Box::new(Loads), Box::new(FailsSetup)],
     )
     .await;
-    // Ni « loads » ni « failssetup » ne monte de routeur ; on ne peut pas
+    // Ni « loads » ni « fails » ne monte de routeur ; on ne peut pas
     // exiger la liste vide, car dj et karaoke — compilés dans le jeu livré —
     // en contribuent quand ils sont installés.
     assert!(
-        !routers
-            .iter()
-            .any(|(n, _)| n == "loads" || n == "failssetup"),
+        !routers.iter().any(|(n, _)| n == "loads" || n == "fails"),
         "aucun de ces deux greffons n'enregistre de routeur"
     );
 
@@ -407,7 +406,7 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
         .collect();
     assert!(names.contains(&"loads"), "loads doit être chargé");
     assert!(
-        !names.contains(&"failssetup"),
+        !names.contains(&"fails"),
         "a failed setup must not be reported (chargés : {names:?})"
     );
 
@@ -425,10 +424,15 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
         .unwrap_or_else(|| panic!("« loads » absent de /api/v1/plugins : {entries:?}"));
     assert_eq!(loads["version"], "1.2.3");
     assert_eq!(loads["url"], "/api/v1/ext/loads");
-    assert!(
-        !entries.iter().any(|p| p["name"] == "failssetup"),
-        "un setup en échec ne doit pas être publié"
-    );
+    // Le nom était écrit « failssetup » alors que le greffon s'appelle
+    // « fails » : les deux « absent » plus haut passaient contre rien.
+    // #5403 (décision du 29/09) — un setup en échec n'est plus caché : il est
+    // publié, mais seulement comme fiche EN ERREUR, jamais comme chargé.
+    let echecs: Vec<&Value> = entries.iter().filter(|p| p["name"] == "fails").collect();
+    assert_eq!(echecs.len(), 1, "{echecs:?}");
+    assert_eq!(echecs[0]["status"], "error", "{}", echecs[0]);
+    assert_eq!(echecs[0]["error_reason"], "setup_failed", "{}", echecs[0]);
+    assert_eq!(echecs[0]["loaded"], false, "{}", echecs[0]);
 }
 
 /// An opt-in plugin (like DJ/Karaoke): compiled in but dormant until the user
