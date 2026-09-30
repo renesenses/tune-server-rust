@@ -93,7 +93,7 @@ impl TunePlugin for BandcampPlugin {
         "bandcamp"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Bandcamp : recherche, découverte, tags et lecture (mp3-128)"

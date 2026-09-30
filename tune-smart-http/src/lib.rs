@@ -6,6 +6,7 @@ use tune_core::db::backend::DbBackend;
 
 pub mod catalogue;
 pub mod collections_par_defaut;
+pub mod comptes;
 mod etiquettes_streaming;
 pub(crate) mod regles_sql;
 pub mod smart_ai;
@@ -28,6 +29,10 @@ pub struct SmartHttpState {
     /// est alors REFUSÉE, jamais silencieusement vide : c'est la leçon de
     /// #4469, où une règle non traduite valait « vrai pour tout ».
     pub(crate) catalogue: Option<Arc<dyn catalogue::CatalogueDistant>>,
+    /// Les comptes et pochettes de la liste des collections, en cache jusqu'au
+    /// prochain changement de la bibliothèque (#5438). `None` : tout est
+    /// recalculé à chaque liste, comme avant.
+    pub(crate) comptes: Option<Arc<comptes::CacheDesComptes>>,
 }
 
 impl SmartHttpState {
@@ -35,7 +40,14 @@ impl SmartHttpState {
         Self {
             backend,
             catalogue: None,
+            comptes: None,
         }
+    }
+
+    /// Le même état, muni du cache des comptes de la liste (#5438).
+    pub fn avec_comptes(mut self, c: Arc<comptes::CacheDesComptes>) -> Self {
+        self.comptes = Some(c);
+        self
     }
 
     /// Le même état, muni de quoi interroger les catalogues.

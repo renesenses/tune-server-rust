@@ -770,8 +770,11 @@ jobs:
       # parce que la licence de `dst-decoder` n'est pas tranchée
       # (Apache-2.0 déclarée contre en-tête ISO/Philips). Garde :
       # tune-core/tests/dst_desarmee_4378.rs.
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio -- -D clippy::correctness
+      # #5453 : `journal-de-test` (tune-core) n'expose qu'un utilitaire de test ;
+      # le nommer ici fait linter le module hors `cfg(test)`, tel que le voient
+      # les tests de tune-server. Garde : toute_feature_declaree_est_activee_par_une_porte_clippy.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio -- -D clippy::correctness
 
   audit:
     name: Security Audit

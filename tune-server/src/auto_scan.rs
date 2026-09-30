@@ -496,7 +496,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 a_scanner: &files_to_scan,
                 ecartes: &files_ecartes,
             },
-        );
+        )
+        .avec_pochettes_differees();
+        // #5202 — les métadonnées étendues se relisent AVANT la transaction du
+        // lot, chaque fichier sous délai, comme dans le scan manuel.
+        let lecteur_etendu: crate::lecture_bornee::LecteurMetadonnees =
+            Arc::new(tune_core::metadata::read_extended_metadata);
         let mut inserted = 0u64;
         let mut updated = 0u64;
         // `db_insert_failed` / `db_update_failed` sont désormais agrégés par le
@@ -547,6 +552,28 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 let mut a_adopter: Vec<i64> = Vec::new();
                 let mut exemplaires_du_lot =
                     crate::routes::system::scan::ExemplairesDuLot::default();
+
+                // #5202 — relues HORS transaction, sous délai : un fichier qui
+                // ne rend pas la main est sauté et journalisé, il ne fige plus
+                // le lot ni ne retient la connexion d'écriture.
+                let chemins_etendus: Vec<String> = batch
+                    .iter()
+                    .filter(|sf| sf.metadata.is_some())
+                    .map(|sf| sf.path.clone())
+                    .collect();
+                let Some(mut metadonnees_lues) = crate::lecture_bornee::lire_metadonnees_du_lot(
+                    &chemins_etendus,
+                    &lecteur_etendu,
+                    crate::lecture_bornee::DELAI_LECTURE_DISQUE,
+                    crate::routes::system::scan::scan_cancel_requested,
+                    &event_bus,
+                    batch_idx,
+                    (inserted + updated + skipped) as i64,
+                    scan_total,
+                ) else {
+                    // Arrêté avant d'écrire : rien présenté, rien refusé.
+                    return tune_core::scanner::walker::EcrituresDuLot::SANS_PERTE;
+                };
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
@@ -750,27 +777,20 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     // n'entrait en base. Le défaut est invisible sur une base
                     // `:memory:`, où les connexions de lecture sont des clones
                     // de celle d'écriture.
-                    let chemins: Vec<String> = batch
-                        .iter()
-                        .filter(|sf| sf.metadata.is_some())
-                        .map(|sf| sf.path.clone())
-                        .collect();
+                    let chemins = &chemins_etendus;
                     let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
-                        &db, &chemins,
+                        &db, chemins,
                     )
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "auto_scan_ids_des_metadonnees_etendues_echec");
                         std::collections::HashMap::new()
                     });
-                    for chemin in &chemins {
+                    for chemin in chemins {
                         let Some(track_id) = ids.get(chemin).copied() else {
                             continue;
                         };
-                        // Relire les balises coûte une E/S par fichier : céder ici aussi.
-                        db.ceder_aux_ecrivains();
-                        let ext = tune_core::metadata::read_extended_metadata(
-                            std::path::Path::new(chemin),
-                        );
+                        // Lues avant `BEGIN` (#5202) : plus aucune E/S ici.
+                        let ext = metadonnees_lues.remove(chemin).unwrap_or_default();
                         if !ext.is_empty() {
                             meta_entries.push((track_id, ext));
                         }
@@ -799,6 +819,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     tune_core::db::tx_holder::liberer();
                 }
                 drop(sqlite_write_guard);
+
+                // #5202 — les pochettes du lot relisent le disque : APRÈS le
+                // COMMIT, chaque lecture sous délai, arrêt compris.
+                {
+                    let arret = crate::routes::system::scan::scan_cancel_requested;
+                    let mut lectures = crate::lecture_bornee::LecturesBornees::new(
+                        crate::lecture_bornee::DELAI_LECTURE_DISQUE,
+                        &arret,
+                    );
+                    let a_poser =
+                        importer.traiter_les_pochettes_differees(&mut lectures, batch_idx);
+                    crate::scan_import::poser_les_pochettes_de_piste(&db, &a_poser);
+                }
 
                 // Emit scan progress after each batch (throttled every other
                 // batch or 2s), mirroring the manual scan's payload/phase.
@@ -1920,6 +1953,13 @@ pub(crate) fn reimporter_fichier_surveillant(
             }
         }
 
+        // #5454 — la pochette de l'album AVANT cette piste : si la piste la
+        // change, l'album est tranché par la majorité de ses pistes une fois
+        // la piste rangée (une jaquette retouchée n'est suivie que si elle
+        // devient majoritaire).
+        let pochette_avant = album_id
+            .and_then(|aid| album_repo.etat_pochette(aid).ok().flatten())
+            .and_then(|e| e.cover_path);
         if let Some(aid) = album_id {
             // #5034 — la même règle que le scan : pochette posée si l'album
             // n'en a pas, RETIRÉE quand cette piste portait la jaquette de
@@ -1943,7 +1983,48 @@ pub(crate) fn reimporter_fichier_surveillant(
         // part avec les orphelins en fin de lot).
         let ancien_album = ancienne.as_ref().and_then(|a| a.album_id);
         track.id = ancienne.as_ref().and_then(|a| a.id);
-        if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
+        let rangee = ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id);
+        // #5454 — l'album est tranché par la majorité quand cette piste a
+        // CHANGÉ sa pochette, ou quand sa jaquette s'écarte d'une pochette
+        // tirée du disque (le single retouché garde alors la sienne, #4650).
+        let en_desaccord = album_id.is_some_and(|aid| {
+            let apres = album_repo.etat_pochette(aid).ok().flatten();
+            let pochette_apres = apres.as_ref().and_then(|e| e.cover_path.clone());
+            if pochette_avant.is_some() && pochette_apres != pochette_avant {
+                return true;
+            }
+            let Some(pochette) = pochette_apres.filter(|_| {
+                apres
+                    .as_ref()
+                    .and_then(|e| e.source)
+                    .is_some_and(|s| s.vient_du_disque())
+            }) else {
+                return false;
+            };
+            let relue;
+            let jaquette = match sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref()) {
+                Some(j) => Some(j),
+                None => {
+                    relue = tune_core::library::artwork::extract_cover_art(std::path::Path::new(
+                        &sf.path,
+                    ));
+                    relue.as_ref()
+                }
+            };
+            jaquette.is_some_and(|j| tune_core::library::artwork::content_hash(&j.0) != pochette)
+        });
+        if let Some(aid) = album_id
+            && en_desaccord
+        {
+            let tranche = tune_core::library::pochette_disque::trancher_par_la_majorite(
+                db,
+                aid,
+                &crate::routes::library::artwork_cache_dir(),
+                false,
+            );
+            tracing::debug!(album_id = aid, ?tranche, "watcher_pochette_majoritaire");
+        }
+        if rangee {
             // #5346 — comme le scan, relire aussi ReplayGain, crédits, etc.
             // La lecture forte retrouve également l'identifiant d'une piste
             // neuve. L'upsert conserve les clés absentes du fichier (mesures
@@ -1956,8 +2037,24 @@ pub(crate) fn reimporter_fichier_surveillant(
                 let id = ids.get(&sf.path).copied().ok_or_else(|| {
                     "piste enregistrée introuvable pour ses métadonnées étendues".to_string()
                 })?;
-                let ext =
-                    tune_core::metadata::read_extended_metadata(std::path::Path::new(&sf.path));
+                // #5202 — sous délai : un fichier qui ne rend pas la main ne
+                // fige plus le surveillant.
+                let chemin = std::path::PathBuf::from(&sf.path);
+                let ext = match crate::lecture_bornee::lire_avec_delai(
+                    "credits",
+                    move || tune_core::metadata::read_extended_metadata(&chemin),
+                    crate::lecture_bornee::DELAI_LECTURE_DISQUE,
+                    &|| false,
+                ) {
+                    crate::lecture_bornee::Lecture::Lue(ext) => ext,
+                    crate::lecture_bornee::Lecture::Expiree => {
+                        return Err(format!(
+                            "la relecture des crédits n'a pas rendu la main en {} s",
+                            crate::lecture_bornee::DELAI_LECTURE_DISQUE.as_secs()
+                        ));
+                    }
+                    _ => return Err("la relecture des crédits a échoué".to_string()),
+                };
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
                     .set_batch(id, &ext)
             })();
@@ -3158,6 +3255,10 @@ mod scan_feuille_cue_tests_5108;
 mod pochettes_disque_tests_5034;
 
 #[cfg(test)]
+#[path = "pochettes_majorite_tests_5454.rs"]
+mod pochettes_majorite_tests_5454;
+
+#[cfg(test)]
 #[path = "iso_donnees_tests_5299.rs"]
 mod iso_donnees_tests_5299;
 
@@ -3176,3 +3277,7 @@ mod surveillant_metadonnees_tests_5346;
 #[cfg(test)]
 #[path = "compteur_demarrage_tests_5371.rs"]
 mod compteur_demarrage_tests_5371;
+
+#[cfg(test)]
+#[path = "coffret_manuel_scan_tests_5319.rs"]
+mod coffret_manuel_scan_tests_5319;

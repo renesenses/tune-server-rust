@@ -267,6 +267,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // drifted to TEXT (SQLite→PG migrated databases).
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS track_number BIGINT",
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS disc_number BIGINT",
+    // #5478 — date du dépôt dans une étiquette (PG 077). Ici AUSSI : une base
+    // de bascule enregistre `schema_version = 99` et ne rejouera jamais la
+    // 077, alors que `tag_item` nomme la colonne. TEXT comme côté SQLite, NULL
+    // pour l'existant.
+    "ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT",
 ];
 
 #[derive(Clone)]

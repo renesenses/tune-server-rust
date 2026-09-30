@@ -65,6 +65,11 @@ const ETAGE_NATIF_RS: &str = include_str!("../../tune-core/src/outputs/local/eta
 // convertir », que cette garde doit nommer, et dont elle prouve l'ABSENCE sur
 // la route native (le DoP y est porté, jamais refusé).
 const BRAS_ASIO_RS: &str = include_str!("../../tune-core/src/outputs/local/bras_asio.rs");
+// #5204 — l'étage de la route native d'ASIO (`EtageNatifAsio`) et la chaîne
+// qui enchaîne ses pistes vivent désormais dans `local/chaine_par_la_boucle.rs`,
+// jugé sur Linux ; le bras l'appelle.
+const CHAINE_PAR_LA_BOUCLE_RS: &str =
+    include_str!("../../tune-core/src/outputs/local/chaine_par_la_boucle.rs");
 
 /// La production seule : `local.rs` se termine par `#[cfg(test)] mod tests`,
 /// dont le texte citerait nos propres motifs et rendrait la garde complaisante.
@@ -369,12 +374,36 @@ fn la_route_traitee_d_asio_refuse_tout_porteur_et_la_native_n_en_refuse_aucun() 
          avec \"ASIO\""
     );
     // La route native, vue par le trait : elle décode et pousse, ne consulte
-    // jamais la fermeture, et ne rend jamais `PorteurDopRefuse`.
-    let native = source
+    // jamais la fermeture, et ne rend jamais `PorteurDopRefuse`. #5204 : son
+    // étage vit dans `chaine_par_la_boucle.rs`, avec la chaîne des pistes
+    // enchaînées — qui, elle aussi, ne passe que la fermeture qui ne refuse rien.
+    let chaine = sans_commentaires_ni_blancs(CHAINE_PAR_LA_BOUCLE_RS)
+        .replace(",}", "}")
+        .replace(",)", ")");
+    assert!(
+        source.contains("usesuper::chaine_par_la_boucle::"),
+        "#5204 — le bras ASIO n'emprunte plus son étage natif à `chaine_par_la_boucle.rs`"
+    );
+    let native = chaine
         .split("implEtageforEtageNatifAsio<'_>{")
         .nth(1)
-        .and_then(|s| s.split("enumRoute<'a>{").next())
+        .and_then(|s| {
+            s.split("pub(super)fnpoursuivre_la_chaine_par_la_boucle<")
+                .next()
+        })
         .expect("l'étage natif d'ASIO (`impl Etage for EtageNatifAsio`) doit rester identifiable");
+    let poursuite = chaine
+        .split("pub(super)fnpoursuivre_la_chaine_par_la_boucle<")
+        .nth(1)
+        .expect("#5204 — la chaîne de la route native d'ASIO doit rester identifiable");
+    assert!(
+        poursuite.contains("letmutne_rien_refuser=|_:bool,_:u32,_:u16|false;")
+            && poursuite.contains("etage.pousser(&mut*puits,&mutne_rien_refuser,")
+            && poursuite.contains("&mut*puits,&mutne_rien_refuser,&mutcompteurs,")
+            && !poursuite.contains("|dop:bool,_:u32,_:u16|dop"),
+        "#5204/#3233 — la piste enchaînée de la route native d'ASIO doit, comme la \
+         piste initiale, passer à l'étage et à la boucle la fermeture qui ne refuse rien"
+    );
     assert!(
         native.contains("self.etage.decoder_et_pousser(")
             && !native.contains("PorteurDopRefuse")

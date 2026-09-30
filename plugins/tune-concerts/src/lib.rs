@@ -19,8 +19,8 @@
 //!
 //! | Route | 200 |
 //! |---|---|
-//! | `GET /upcoming` | `{concerts, scope?, radius_km?, city?, country?, code?}` |
-//! | `POST /location` | `{scope, city, country, radius_km, located}` |
+//! | `GET /upcoming[?limit=&offset=]` | `{concerts, total?, limit?, offset?, has_more?, scope?, applied_scope?, located?, radius_km?, city?, country?, code?}` |
+//! | `POST /location` | `{scope, city, country, radius_km, located, ambiguous?}` |
 //! | `GET /location` | la dernière localisation enregistrée, même forme |
 //!
 //! Le périmètre de `/upcoming` est celui que le NUAGE a appliqué : il le garde
@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -136,6 +136,40 @@ pub const LOT: usize = 200;
 /// part » côté utilisateur.
 pub const PLAFOND: usize = 5_000;
 
+/// La plus grande page que le nuage accepte pour `/upcoming`
+/// (`PerimetreConcerts::PAGE_MAX`, site-mozaiklabs#242) — et sa page par
+/// défaut. Une valeur au-delà n'est pas refusée ici : elle part telle quelle
+/// et le nuage la plafonne, en disant la limite appliquée (`limit`).
+pub const PAGE_MAX: u32 = 1_000;
+
+/// La page demandée par l'écran (`?limit=&offset=`), relayée au nuage.
+///
+/// Un paramètre absent ou illisible n'est PAS relayé, et la route ne refuse
+/// rien : le nuage applique alors sa page par défaut, comme pour un écran
+/// ancien qui n'envoie rien (#5369).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Page {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+impl Page {
+    /// Lit `limit` et `offset` dans la chaîne de requête, sans jamais échouer.
+    pub fn depuis_requete(requete: Option<&str>) -> Self {
+        let mut page = Page::default();
+        for paire in requete.unwrap_or_default().split('&') {
+            let (cle, valeur) = paire.split_once('=').unwrap_or((paire, ""));
+            let nombre = valeur.parse::<u32>().ok();
+            match cle {
+                "limit" => page.limit = nombre.filter(|n| *n >= 1),
+                "offset" => page.offset = nombre,
+                _ => {}
+            }
+        }
+        page
+    }
+}
+
 /// Services de l'hôte remis au plugin à la construction.
 ///
 /// Passés explicitement plutôt que tirés du [`PluginContext`], comme
@@ -172,7 +206,7 @@ impl TunePlugin for ConcertsPlugin {
         "concerts"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous"
@@ -369,7 +403,10 @@ fn client_du_nuage() -> Result<reqwest::Client, reqwest::Error> {
 /// (`{"concerts": [], "error": "concerts: HTTP 500"}`) qu'une interface
 /// traduite en 11 langues aurait affichée telle quelle. On rend désormais un
 /// **code stable**, traduisible côté client, et le détail part au journal.
-async fn concerts_a_venir(State(etat): State<EtatConcerts>) -> Response {
+async fn concerts_a_venir(
+    State(etat): State<EtatConcerts>,
+    RawQuery(requete): RawQuery,
+) -> Response {
     if let Some(refus) = etat.refus().await {
         return refus;
     }
@@ -387,7 +424,8 @@ async fn concerts_a_venir(State(etat): State<EtatConcerts>) -> Response {
         }
     };
 
-    match recuperer_concerts_depuis(&etat.racine, &client, &instance_id).await {
+    let page = Page::depuis_requete(requete.as_deref());
+    match recuperer_concerts_depuis(&etat.racine, &client, &instance_id, page).await {
         Ok(corps) => Json(corps).into_response(),
         Err(e) => {
             warn!(error = %e, retry_after = ?e.retry_after(), "concerts_fetch_failed");
@@ -844,16 +882,25 @@ pub async fn envoyer_abonnements(
 /// garde son délai (`Retry-After`, à défaut `X-RateLimit-Reset`) et le texte du
 /// distant, que [`reponse_de_refus`] fait ressortir jusqu'au client.
 ///
-/// Seule l'identité de l'instance part : le périmètre est gardé et appliqué
-/// par le nuage lui-même (`concert_locations`), qui le rend dans sa réponse.
+/// Seule l'identité de l'instance part, avec la page demandée : le périmètre
+/// est gardé et appliqué par le nuage lui-même (`concert_locations`), qui le
+/// rend dans sa réponse.
 pub async fn recuperer_concerts_depuis(
     racine: &str,
     http_client: &reqwest::Client,
     instance_id: &str,
+    page: Page,
 ) -> Result<Value, CloudError> {
+    let mut requete = vec![("instance_id", instance_id.to_string())];
+    if let Some(limit) = page.limit {
+        requete.push(("limit", limit.to_string()));
+    }
+    if let Some(offset) = page.offset {
+        requete.push(("offset", offset.to_string()));
+    }
     let resp = http_client
         .get(format!("{racine}/upcoming"))
-        .query(&[("instance_id", instance_id)])
+        .query(&requete)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
@@ -868,14 +915,54 @@ pub async fn recuperer_concerts_depuis(
     let corps = corps_a_venir(&data);
     info!(
         count = corps["concerts"].as_array().map_or(0, Vec::len),
+        total = ?corps.get("total"),
+        has_more = ?corps.get("has_more"),
         scope = ?corps.get("scope"),
+        applied_scope = ?corps.get("applied_scope"),
         "upcoming_concerts_fetched"
     );
     Ok(corps)
 }
 
+/// Les champs de `/upcoming` relayés à l'écran, en plus de `concerts`. Liste
+/// FERMÉE : c'est le contrat de ce serveur (`ConcertsAVenir`).
+pub const CHAMPS_A_VENIR: [&str; 10] = [
+    "total",
+    "limit",
+    "offset",
+    "has_more",
+    "scope",
+    "applied_scope",
+    "located",
+    "radius_km",
+    "city",
+    "country",
+];
+
+/// Les champs de `POST /location` relayés à l'écran. `ambiguous` : le nom de
+/// la commune en désigne plusieurs et aucun code postal n'a tranché (#5368).
+pub const CHAMPS_LOCALISATION: [&str; 6] = [
+    "scope",
+    "city",
+    "country",
+    "radius_km",
+    "located",
+    "ambiguous",
+];
+
 /// Le corps rendu à l'écran : la liste, et le périmètre que le nuage a
 /// APPLIQUÉ (`scope`, `radius_km`, `city`, `country`, site-mozaiklabs#186).
+///
+/// Depuis site-mozaiklabs#242 (#5369, #5368), aussi :
+/// - la page : `total`, `limit`, `offset`, `has_more`. Le nuage coupait à 100
+///   dates sans le dire ; l'écran peut désormais écrire « 100 sur 187 » et
+///   proposer la suite ;
+/// - `applied_scope` et `located` : un rayon demandé sans commune localisée
+///   retombe sur le pays. `scope` reste le CHOIX (le formulaire le
+///   pré-remplit), `applied_scope` ce qui a vraiment filtré la liste.
+///
+/// Un nuage plus ancien ne les envoie pas : ils sont alors absents, jamais
+/// fabriqués — l'écran se comporte comme avant.
 ///
 /// Champs nommés un à un plutôt que le corps du nuage relayé tel quel : ce que
 /// l'écran reçoit est le contrat de CE serveur (`ConcertsAVenir`,
@@ -890,7 +977,7 @@ pub fn corps_a_venir(data: &Value) -> Value {
             .cloned()
             .unwrap_or_else(|| json!([])),
     );
-    for champ in ["scope", "radius_km", "city", "country"] {
+    for champ in CHAMPS_A_VENIR {
         if let Some(v) = data.get(champ).filter(|v| !v.is_null()) {
             corps.insert(champ.into(), v.clone());
         }
@@ -911,7 +998,7 @@ pub enum EchecLocalisation {
 
 /// Enregistre la commune SAISIE et le périmètre auprès du nuage
 /// (`POST {racine}/location`). Rend ce que le nuage a retenu :
-/// `{scope, city, country, radius_km, located}`.
+/// `{scope, city, country, radius_km, located, ambiguous?}`.
 ///
 /// ⚠️ L'`instance_id` est IMPOSÉ ici, par-dessus la demande : c'est celui de
 /// CE serveur, jamais celui qu'un client prétendrait — sinon n'importe qui
@@ -955,7 +1042,7 @@ pub async fn enregistrer_localisation_vers(
         .await
         .map_err(|e| EchecLocalisation::Nuage(format!("parse: {e}").into()))?;
     let mut rendu = Map::new();
-    for champ in ["scope", "city", "country", "radius_km", "located"] {
+    for champ in CHAMPS_LOCALISATION {
         if let Some(v) = data.get(champ) {
             rendu.insert(champ.into(), v.clone());
         }
@@ -1392,10 +1479,14 @@ mod essais {
     async fn un_429_du_nuage_arrive_en_refus_limite_avec_son_delai() {
         let banc = banc(vec![(429, r#"{"message":"Too Many Attempts."}"#, Some(42))]).await;
 
-        let err =
-            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-1")
-                .await
-                .unwrap_err();
+        let err = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            Page::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.is_rate_limited(), "un 429 doit rester un 429 : {err:?}");
         assert_eq!(
@@ -1412,10 +1503,14 @@ mod essais {
     async fn contre_epreuve_un_refus_ordinaire_ne_fabrique_aucun_delai() {
         let banc = banc(vec![(500, r#"{"message":"boum"}"#, Some(42))]).await;
 
-        let err =
-            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-1")
-                .await
-                .unwrap_err();
+        let err = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            Page::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             !err.is_rate_limited(),
@@ -1439,10 +1534,14 @@ mod essais {
         )])
         .await;
 
-        let corps =
-            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
-                .await
-                .unwrap();
+        let corps = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(corps["concerts"].as_array().unwrap().len(), 3);
         let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
@@ -1470,10 +1569,14 @@ mod essais {
         )])
         .await;
 
-        let corps =
-            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
-                .await
-                .unwrap();
+        let corps = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(corps["scope"], "radius");
         assert_eq!(corps["radius_km"], 100);
@@ -1493,12 +1596,150 @@ mod essais {
     async fn contre_epreuve_aucun_perimetre_n_est_fabrique() {
         let banc = banc(vec![(200, r#"{"concerts":[],"radius_km":null}"#, None)]).await;
 
-        let corps =
-            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
-                .await
-                .unwrap();
+        let corps = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(corps, json!({"concerts": []}));
+    }
+
+    // -----------------------------------------------------------------------
+    // La page et le périmètre appliqué (#5369, #5368, site-mozaiklabs#242)
+    // -----------------------------------------------------------------------
+
+    /// ⭐ #5369 : le total et « il en reste » arrivent à l'écran. Avant, la
+    /// liste fermée des champs relayés les arrêtait ici — le nuage aurait pu
+    /// dire « 100 sur 187 », l'écran n'en aurait rien su.
+    #[tokio::test]
+    async fn la_lecture_relaie_la_page_et_le_perimetre_applique() {
+        let banc = banc(vec![(
+            200,
+            r#"{"concerts":[{"id":1}],"total":187,"limit":100,"offset":0,"has_more":true,
+                "scope":"radius","applied_scope":"country","located":false,
+                "radius_km":100,"city":"31700","country":"FR","interne":"non"}"#,
+            None,
+        )])
+        .await;
+
+        let corps = recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(corps["total"], 187);
+        assert_eq!(corps["limit"], 100);
+        assert_eq!(corps["offset"], 0);
+        assert_eq!(corps["has_more"], true);
+        assert_eq!(corps["scope"], "radius", "le CHOIX, pour le formulaire");
+        assert_eq!(
+            corps["applied_scope"], "country",
+            "ce qui a vraiment filtré"
+        );
+        assert_eq!(corps["located"], false);
+        assert!(corps.get("interne").is_none());
+    }
+
+    /// ⭐ La page demandée par l'écran part au nuage.
+    #[tokio::test]
+    async fn la_page_demandee_part_au_nuage() {
+        let banc = banc(vec![(200, r#"{"concerts":[]}"#, None)]).await;
+
+        recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page {
+                limit: Some(50),
+                offset: Some(150),
+            },
+        )
+        .await
+        .unwrap();
+
+        let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
+        assert!(
+            cible.contains("instance_id=inst-7")
+                && cible.contains("limit=50")
+                && cible.contains("offset=150"),
+            "{cible}"
+        );
+    }
+
+    /// Contre-épreuve : sans page demandée, rien d'autre que l'identité ne
+    /// part — le nuage applique sa page par défaut, comme pour un écran ancien.
+    #[tokio::test]
+    async fn contre_epreuve_sans_page_seule_l_identite_part() {
+        let banc = banc(vec![(200, r#"{"concerts":[]}"#, None)]).await;
+
+        recuperer_concerts_depuis(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-7",
+            Page::default(),
+        )
+        .await
+        .unwrap();
+
+        let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
+        assert!(
+            !cible.contains("limit=") && !cible.contains("offset="),
+            "{cible}"
+        );
+    }
+
+    #[test]
+    fn la_page_se_lit_sans_jamais_refuser() {
+        assert_eq!(
+            Page::depuis_requete(Some("limit=40&offset=80")),
+            Page {
+                limit: Some(40),
+                offset: Some(80)
+            }
+        );
+        assert_eq!(Page::depuis_requete(None), Page::default());
+        assert_eq!(
+            Page::depuis_requete(Some("limit=abc&offset=-1&x=2")),
+            Page::default()
+        );
+        assert_eq!(
+            Page::depuis_requete(Some("limit=0")),
+            Page::default(),
+            "une page de zéro ligne ne se demande pas"
+        );
+    }
+
+    /// ⭐ #5368 : `ambiguous` revient de la localisation.
+    #[tokio::test]
+    async fn la_localisation_relaie_l_ambiguite() {
+        let banc = banc(vec![(
+            200,
+            r#"{"scope":"radius","city":"Valence","country":"FR","radius_km":100,
+                "located":true,"ambiguous":true}"#,
+            None,
+        )])
+        .await;
+        let demande =
+            json!({"city": "Valence", "country": "FR", "scope": "radius", "radius_km": 100});
+
+        let rendu = enregistrer_localisation_vers(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-9",
+            &demande,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rendu["ambiguous"], true, "{rendu}");
     }
 
     /// ⭐ L'aller de la localisation : la demande part telle quelle, sauf

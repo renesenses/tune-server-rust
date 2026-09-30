@@ -21,6 +21,13 @@ pub struct CueTrack {
     pub title: Option<String>,
     /// Interprète de la piste, ou celui de l'album à défaut.
     pub performer: Option<String>,
+    /// `ISRC` de la piste (#5463) : il désigne CET enregistrement, et lui seul.
+    pub isrc: Option<String>,
+    /// `SONGWRITER` de la piste (#5463) — le compositeur, dans le vocabulaire
+    /// du CD-Text.
+    pub songwriter: Option<String>,
+    /// `REM COMMENT` écrit sous la piste (#5463).
+    pub comment: Option<String>,
     /// Le `FILE` qui porte l'`INDEX 01` de cette piste, tel qu'écrit dans la
     /// feuille. Une feuille peut en enchaîner plusieurs — un `.cue` par face de
     /// vinyle est le cas courant, mais le format autorise aussi plusieurs
@@ -62,6 +69,16 @@ pub struct CueSheet {
     pub album_genre: Option<String>,
     /// `REM DATE …`. Idem — l'année de l'album, absente du CUE standard.
     pub album_date: Option<String>,
+    /// `SONGWRITER` écrit avant le premier `TRACK` : le compositeur de l'album
+    /// (#5463).
+    pub album_songwriter: Option<String>,
+    /// `CATALOG` — le « Media Catalog Number » du disque, c'est-à-dire son
+    /// code-barres UPC/EAN à 13 chiffres (#5463). Ce n'est PAS la référence
+    /// catalogue de l'éditeur.
+    pub catalog: Option<String>,
+    /// `REM COMMENT` écrit avant le premier `TRACK` (#5463) — EAC y signe
+    /// souvent sa version.
+    pub album_comment: Option<String>,
     /// Les pistes AUDIO de la feuille. Une piste de données (`MODE1/2352`,
     /// `MODE2/2352`, `MODE1/2048`…) d'un CD mixte n'y figure pas : elle n'a
     /// rien d'audible, et la jouer comme du PCM rendrait un bruit blanc à
@@ -162,6 +179,9 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
         album_performer: None,
         album_genre: None,
         album_date: None,
+        album_songwriter: None,
+        catalog: None,
+        album_comment: None,
         tracks: Vec::new(),
         file_types: Vec::new(),
         pistes_de_donnees: Vec::new(),
@@ -227,6 +247,12 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     match sous_kw.as_str() {
                         "GENRE" => sheet.album_genre = unquote(valeur),
                         "DATE" => sheet.album_date = unquote(valeur),
+                        // #5463 — même règle de position que `TITLE` : sous
+                        // une piste il est à elle, avant il est à l'album.
+                        "COMMENT" => match sheet.tracks.last_mut() {
+                            Some(t) if in_track => t.comment = unquote(valeur),
+                            _ => sheet.album_comment = unquote(valeur),
+                        },
                         _ => {}
                     }
                 }
@@ -245,6 +271,9 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     number,
                     title: None,
                     performer: None,
+                    isrc: None,
+                    songwriter: None,
+                    comment: None,
                     audio_file: fichier_courant.clone(),
                     start_ms: 0,
                     end_ms: None,
@@ -270,6 +299,23 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     sheet.album_performer = unquote(rest);
                 }
             }
+            // #5463 — trois champs que le format porte et que Tune jetait :
+            // `ISRC` n'existe que sous une piste, `CATALOG` que pour le disque.
+            "ISRC" => {
+                if in_track && let Some(t) = sheet.tracks.last_mut() {
+                    t.isrc = unquote(rest);
+                }
+            }
+            "SONGWRITER" => {
+                if in_track {
+                    if let Some(t) = sheet.tracks.last_mut() {
+                        t.songwriter = unquote(rest);
+                    }
+                } else {
+                    sheet.album_songwriter = unquote(rest);
+                }
+            }
+            "CATALOG" => sheet.catalog = unquote(rest),
             "INDEX" => {
                 // `INDEX 00` est le pré-gap (souvent le silence avant la
                 // piste) ; `INDEX 01` est le vrai début. Ne retenir que 01,
@@ -463,6 +509,46 @@ FILE "gould.ape" WAVE
         assert_eq!(s.album_date.as_deref(), Some("1984"));
         // Les autres `REM` restent ignorés, sans casser la lecture.
         assert_eq!(s.album_title.as_deref(), Some("Stationary Traveller"));
+    }
+
+    /// #5463 — la feuille du fil 2038 (EAC) : `CATALOG`, `ISRC`, `SONGWRITER`
+    /// et `REM COMMENT` étaient lus puis jetés. Chacun se range là où la
+    /// POSITION le met : avant le premier `TRACK` pour le disque, dessous pour
+    /// la piste.
+    #[test]
+    fn lit_isrc_songwriter_catalog_et_commentaire_5463() {
+        let s = parse_cue_sheet(concat!(
+            "REM GENRE \"Rock\"\nREM COMMENT \"ExactAudioCopy v1.0b4\"\n",
+            "CATALOG 0600753562390\nPERFORMER \"Rick Wakeman\"\n",
+            "SONGWRITER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\n",
+            "FILE \"image.flac\" WAVE\n",
+            "  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n",
+            "    ISRC USAM17302204\n    SONGWRITER \"R. Wakeman\"\n",
+            "    REM COMMENT \"piste 1\"\n    INDEX 01 00:00:00\n",
+            "  TRACK 02 AUDIO\n    TITLE \"Anne of Cleves\"\n    INDEX 01 03:45:00\n",
+        ));
+        assert_eq!(s.catalog.as_deref(), Some("0600753562390"));
+        assert_eq!(s.album_songwriter.as_deref(), Some("Rick Wakeman"));
+        assert_eq!(s.album_comment.as_deref(), Some("ExactAudioCopy v1.0b4"));
+        let (un, deux) = (&s.tracks[0], &s.tracks[1]);
+        assert_eq!(
+            un.isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — l'ISRC de la piste 01 doit être lu"
+        );
+        assert_eq!(un.songwriter.as_deref(), Some("R. Wakeman"));
+        assert_eq!(un.comment.as_deref(), Some("piste 1"));
+        // Rien ne déborde sur la piste suivante, ni ne remonte à l'album.
+        assert_eq!(
+            (deux.isrc.as_deref(), deux.songwriter.as_deref()),
+            (None, None)
+        );
+        assert_eq!(deux.comment, None);
+        assert_eq!(
+            s.album_title.as_deref(),
+            Some("The Six Wives of Henry VIII")
+        );
+        assert_eq!(un.title.as_deref(), Some("Catherine of Aragon"));
     }
 
     /// Une feuille qui enchaîne deux `FILE` ne doit pas rattacher toutes ses

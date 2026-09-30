@@ -84,13 +84,33 @@ fi
 # Une version Debian doit commencer par un chiffre : `v0.9.126` est refusé par
 # dpkg-deb, `0.9.126` passe. On tolère donc les deux en entrée.
 if [[ -z "$VERSION" ]]; then
-    VERSION="$(basename "$TARBALL" | sed -n 's/^tune-server-v\{0,1\}\([0-9][^-]*\)-linux.*/\1/p')"
+    # `.*` et non `[^-]*` : une pré-version (`tune-server-v1.0.0-rc1-linux-…`)
+    # garde son suffixe.
+    VERSION="$(basename "$TARBALL" | sed -n 's/^tune-server-v\{0,1\}\([0-9].*\)-linux-.*/\1/p')"
 fi
 VERSION="${VERSION#v}"
 [[ -n "$VERSION" ]] || die "version indéterminée — passez --version"
 [[ "$VERSION" =~ ^[0-9] ]] || die "version Debian invalide (doit commencer par un chiffre) : $VERSION"
 
-echo "--- tune-server ${VERSION} (${ARCH}) depuis $(basename "$TARBALL") ---"
+# Version DEBIAN, distincte de la version semver (29/09/2026, 1.0.0-rc1).
+#
+# Pour dpkg, `1.0.0-rc1` se lit « amont 1.0.0, révision Debian rc1 » : elle
+# passe APRÈS `1.0.0`, qui n'a pas de révision. apt ne proposerait donc jamais
+# la 1.0.0 finale à qui a installé la rc1. Le tilde est l'opérateur Debian
+# « avant tout » : `1.0.0~rc1 < 1.0.0`. Le premier `-` devient `~`, les
+# suivants (`1.0.0-rc0-test`) un `.` pour ne pas recréer de révision.
+#
+# Seul le champ `Version:` change. Le NOM du fichier garde la version semver
+# (`tune-server_1.0.0-rc1_amd64.deb`) : GitHub réécrit les caractères
+# spéciaux des noms d'actifs, et deb.yml comme attacher-deb-release.sh
+# retrouvent le paquet par ce nom.
+DEB_VERSION="$VERSION"
+if [[ "$DEB_VERSION" == *-* ]]; then
+    DEB_VERSION="${DEB_VERSION%%-*}~$(printf '%s' "${VERSION#*-}" | tr '-' '.')"
+fi
+[[ "$DEB_VERSION" =~ ^[0-9][0-9A-Za-z.+~]*$ ]] || die "version Debian invalide : $DEB_VERSION"
+
+echo "--- tune-server ${VERSION} (Debian ${DEB_VERSION}, ${ARCH}) depuis $(basename "$TARBALL") ---"
 
 # --- Arborescence ------------------------------------------------------------
 
@@ -151,7 +171,7 @@ INSTALLED_KB="$(du -sk "${STAGE}" | cut -f1)"
 
 cat > "${STAGE}/DEBIAN/control" <<EOF
 Package: tune-server
-Version: ${VERSION}
+Version: ${DEB_VERSION}
 Architecture: ${ARCH}
 Maintainer: Mozaiklabs <contact@mozaiklabs.fr>
 Installed-Size: ${INSTALLED_KB}

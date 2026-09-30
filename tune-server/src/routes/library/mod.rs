@@ -22,6 +22,9 @@ mod duplicates;
 mod edition;
 mod edition_balises;
 mod enrich;
+// #5469 — les passes que `crate::reprise_des_passes` sait relancer.
+pub(crate) use artwork::{demarrer_images_artistes, demarrer_pochettes_albums};
+pub(crate) use enrich::demarrer_enrich_all;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
 mod facets;
@@ -186,6 +189,12 @@ pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
         return std::path::PathBuf::from(v);
+    }
+    // #5467 — en build de test, jamais le chemin relatif `artwork_cache` (qui
+    // tombait dans l'arbre source) ni le vrai dossier macOS de l'utilisateur.
+    #[cfg(test)]
+    if let Some(dossier) = crate::isolement_disque_tests_5467::dossier_illustrations() {
+        return dossier;
     }
 
     // On Windows, resolve relative artwork_cache to %LOCALAPPDATA%\TuneServer\
@@ -353,6 +362,11 @@ pub fn router() -> Router<AppState> {
         // le geste qui défait un coffret automatique (GO du 25/09/2026).
         .route("/coffrets", get(albums::lister_coffrets))
         .route("/coffrets/{id}/defaire", post(albums::defaire_coffret))
+        // Défaire un coffret composé À LA MAIN (#5319, décision du 29/09).
+        .route(
+            "/coffrets/{id}/defaire-manuel",
+            post(edition::defaire_coffret_manuel),
+        )
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
@@ -379,6 +393,7 @@ pub fn router() -> Router<AppState> {
             "/albums/{id}/edition/write-tags",
             post(edition_balises::ecrire_balises),
         )
+        .route("/albums/{id}/edition/retablir", post(edition::retablir))
         .route("/albums/{id}/discs/attach", post(edition::attacher))
         .route(
             "/albums/{id}/discs/{number}/detach",
@@ -731,7 +746,10 @@ mod routage_tests {
     fn chaque_gestionnaire_de_la_bibliotheque_est_branche() {
         let dossier = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/library");
         let routeur = std::fs::read_to_string(dossier.join("mod.rs")).unwrap();
-        let routeur = routeur.split("#[cfg(test)]").next().unwrap();
+        // Coupe au MODULE de test, pas au premier attribut `#[cfg(test)]` :
+        // `artwork_cache_dir()` en porte un (#5467) au milieu du code de
+        // production, et couper là masquait tout le routeur.
+        let routeur = routeur.split("\n#[cfg(test)]\nmod ").next().unwrap();
         let mut orphelins = Vec::new();
         let mut branches = 0usize;
         for entree in std::fs::read_dir(&dossier).unwrap() {

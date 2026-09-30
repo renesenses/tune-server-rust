@@ -2,6 +2,7 @@ pub mod auto_dj;
 pub mod dj_player;
 pub mod gapless;
 pub mod queue;
+pub mod radio_artiste;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.
@@ -301,6 +302,19 @@ pub struct ZoneState {
     /// one (slow resolve) and skip sending a second, overlapping stream.
     #[serde(default)]
     pub play_seq: u64,
+    /// #5476 — génération des COMMANDES DE TRANSPORT de la zone : lecture,
+    /// suivant, précédent, arrêt, pause, reprise, déplacement. Plus large que
+    /// `play_seq`, qui ne bouge qu'à une nouvelle lecture et garde ce sens
+    /// (supplantation d'une résolution, niveaux, préemption du transcodage).
+    ///
+    /// Sert au `Seek` détaché d'après reprise : il n'a de sens que si aucune
+    /// commande n'est arrivée depuis la reprise qui l'a lancé. FabienM
+    /// (Devialet, fil 2037) : une avance à 74 s demandée pendant le `Play` de
+    /// reprise (8 s sur cet appareil) était écrasée 5 s plus tard par le Seek
+    /// vers la position de la pause, 33,7 s — `play_seq` n'avait pas bougé.
+    /// Interne : jamais sérialisé.
+    #[serde(skip)]
+    pub transport_seq: u64,
     /// Timestamp of the last seek operation.  The poller checks this and
     /// suppresses stale position updates from the output for a brief grace
     /// period so the UI doesn't snap back to the pre-seek position.
@@ -563,6 +577,7 @@ impl Default for ZoneState {
             shuffle_index: -1,
             track_generation: 0,
             play_seq: 0,
+            transport_seq: 0,
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,
@@ -1136,7 +1151,35 @@ impl PlaybackManager {
         });
         state.track_generation = state.track_generation.wrapping_add(1);
         state.play_seq = state.play_seq.wrapping_add(1);
+        // Une nouvelle lecture est aussi une commande de transport (#5476).
+        state.transport_seq = state.transport_seq.wrapping_add(1);
         state.play_seq
+    }
+    /// #5476 — compter une commande de transport (pause, reprise, arrêt,
+    /// déplacement) sur la zone, et rendre la génération qui en résulte.
+    ///
+    /// L'orchestrateur l'appelle à l'ENTRÉE de la commande, avant d'attendre
+    /// la sortie : un Seek de reprise détaché qui attend le verrou de la
+    /// sortie pendant qu'un Seek de l'utilisateur s'exécute doit déjà savoir
+    /// qu'il est caduc. Les nouvelles lectures passent par
+    /// [`bump_generation`](Self::bump_generation), qui compte aussi.
+    pub async fn marquer_commande_de_transport(&self, zone_id: i64) -> u64 {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.transport_seq = state.transport_seq.wrapping_add(1);
+        state.transport_seq
+    }
+    /// #5476 — génération courante des commandes de transport (0 si aucune).
+    pub async fn current_transport_seq(&self, zone_id: i64) -> u64 {
+        self.zones
+            .lock()
+            .await
+            .get(&zone_id)
+            .map(|s| s.transport_seq)
+            .unwrap_or(0)
     }
 
     /// Défait un [`bump_generation`](Self::bump_generation) dont la lecture
@@ -2099,6 +2142,7 @@ mod tests {
             shuffle_index: -1,
             track_generation: 7,
             play_seq: 0,
+            transport_seq: 0,
             paused_at: None,
             last_seek_at: None,
             last_volume_set_at: None,

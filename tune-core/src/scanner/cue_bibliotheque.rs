@@ -29,12 +29,20 @@
 //!    construction. Sans [`elaguer_les_pistes_cue`] elles resteraient en base
 //!    pour toujours.
 //!
+//! 4. **Les balises du fichier image complètent la feuille, sans jamais la
+//!    contredire** (#5463). La feuille reste la source première : son `TITLE`,
+//!    ses `PERFORMER`, son `REM GENRE`, son `REM DATE` l'emportent. Mais le
+//!    format CUE ne sait pas tout dire, et l'usage est de ranger le reste dans
+//!    les balises du fichier qui l'accompagne — `DISCSUBTITLE` en tête (Gros
+//!    Bidon, fil 2038). Voir [`completer_par_les_balises`].
+//!
 //! ## Ce qu'il ne fait pas
 //!
-//! Il ne lit pas les balises du fichier image (une feuille CUE EST la source de
-//! métadonnées, c'est tout son objet). Les albums écrits sont retenus dans le
-//! bilan : l'appelant réévalue leurs pochettes avec le cache et la politique
-//! de sa passe, même si l'album a déjà une image de dossier (#5222).
+//! Il ne prend pas au fichier image ce qui désigne UNE piste (titre,
+//! interprète, numéro) : sur une image découpée, ces balises parlent du
+//! fichier, pas de chaque tranche. Les albums écrits sont retenus dans le
+//! bilan : l'appelant réévalue leurs pochettes — jaquette intégrée à l'image
+//! comprise — avec le cache et la politique de sa passe (#5222).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,9 +51,11 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::cue_album::{AlbumCue, InventaireCue, PisteCue, PlanCue, inventorier_avec};
+use crate::db::album_metadata_repo::AlbumMetadataRepo;
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::backend::DbBackend;
+use crate::db::edition_album::Tenues;
 use crate::db::models::Track;
 use crate::db::track_repo::TrackRepo;
 
@@ -161,6 +171,114 @@ fn sonder_image(image: &Path) -> SondeImage {
     }
 }
 
+/// Ce que les balises du fichier image apprennent, une seule fois par image
+/// (#5463).
+///
+/// Seuls des champs que le lecteur tire des BALISES, jamais du chemin : le
+/// titre, l'interprète et l'album de [`crate::metadata::TrackMetadata`] peuvent
+/// être fabriqués depuis le nom de fichier ou de dossier, et ne sont donc pas
+/// retenus ici — la feuille les porte de toute façon.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct BalisesImage {
+    // Valent pour l'ALBUM : elles décrivent toutes les tranches de l'image.
+    nom_du_disque: Option<String>,
+    genre: Option<String>,
+    genres: Vec<String>,
+    annee: Option<i32>,
+    label: Option<String>,
+    compositeur: Option<String>,
+    // Désignent UN enregistrement : réservées à la piste qui occupe le
+    // fichier entier.
+    isrc: Option<String>,
+    mbid_enregistrement: Option<String>,
+    bpm: Option<f64>,
+    commentaire: Option<String>,
+}
+
+impl BalisesImage {
+    fn depuis(m: crate::metadata::TrackMetadata) -> Self {
+        // Une trame présente mais vide vaut « je ne sais pas » : elle ne doit
+        // pas passer pour une valeur qui comble un trou.
+        let texte = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+        BalisesImage {
+            nom_du_disque: texte(m.disc_subtitle),
+            genre: texte(m.genre),
+            genres: m.genres,
+            annee: m.year.map(|a| a as i32).filter(|a| *a > 0),
+            label: texte(m.label),
+            compositeur: texte(
+                m.credits
+                    .into_iter()
+                    .find(|c| c.role == "composer")
+                    .map(|c| c.name),
+            ),
+            isrc: texte(m.isrc),
+            mbid_enregistrement: texte(m.musicbrainz_recording_id),
+            bpm: m.bpm.filter(|b| *b > 0.0),
+            commentaire: texte(m.comment),
+        }
+    }
+}
+
+/// Lit les balises du fichier image. Muet sur une image de CD brute, qui n'en
+/// porte pas (#5298), et sur un fichier illisible : la feuille suffit alors.
+fn lire_balises_image(image: &Path) -> BalisesImage {
+    if crate::audio::image_cdda::est_image_cdda(image) {
+        return BalisesImage::default();
+    }
+    match crate::metadata::try_read_metadata(image) {
+        Ok(m) => BalisesImage::depuis(m),
+        Err(e) => {
+            debug!(image = %image.display(), error = %e, "cue_balises_image_non_lues");
+            BalisesImage::default()
+        }
+    }
+}
+
+/// Complète une ligne CUE par les balises de son fichier image (#5463).
+///
+/// 🔴 **La feuille prime ; le fichier ne comble que ce qu'elle laisse vide.**
+/// Un champ que [`piste_en_ligne`] a rempli depuis la feuille n'est jamais
+/// touché. C'est la règle arrêtée pour #5463 : le format CUE ne porte ni nom de
+/// disque, ni label, ni compositeur d'album, et l'usage — Gros Bidon, fil
+/// 2038 — est de les mettre dans les balises du FLAC qui accompagne la feuille.
+/// Tune les ignorait : `DISCSUBTITLE = Remastered Album` n'arrivait jamais en
+/// base.
+///
+/// Deux portées :
+///
+/// - ce qui vaut pour l'album (nom du disque, genre, année, label,
+///   compositeur) complète TOUTES les tranches de l'image ;
+/// - ce qui désigne un enregistrement (ISRC, MBID d'enregistrement, tempo,
+///   commentaire) ne complète que la piste qui occupe le fichier ENTIER. Sur
+///   une image découpée, un ISRC du fichier recopié sur quinze tranches
+///   fabriquerait quinze fausses identités.
+fn completer_par_les_balises(t: &mut Track, b: &BalisesImage, fichier_entier: bool) {
+    fn combler<T: Clone>(champ: &mut Option<T>, valeur: &Option<T>) {
+        if champ.is_none() {
+            champ.clone_from(valeur);
+        }
+    }
+    combler(&mut t.disc_subtitle, &b.nom_du_disque);
+    if t.genre.is_none() && b.genre.is_some() {
+        t.genre.clone_from(&b.genre);
+        // La liste suit le genre retenu : jamais une liste du fichier sous le
+        // genre de la feuille.
+        if !b.genres.is_empty() {
+            t.genres = serde_json::to_string(&b.genres).ok();
+        }
+    }
+    combler(&mut t.year, &b.annee);
+    combler(&mut t.label, &b.label);
+    combler(&mut t.composer, &b.compositeur);
+    if fichier_entier {
+        combler(&mut t.isrc, &b.isrc);
+        combler(&mut t.musicbrainz_recording_id, &b.mbid_enregistrement);
+        combler(&mut t.bpm, &b.bpm);
+        combler(&mut t.comments, &b.commentaire);
+    }
+}
+
 /// Cette piste occupe-t-elle un fichier ENTIER, à elle seule ?
 ///
 /// Vrai quand elle est la seule tranche de son fichier, qu'elle démarre à zéro
@@ -256,6 +374,17 @@ fn piste_en_ligne(
     }
     t.genre = album.genre.clone();
     t.year = album.annee.as_deref().and_then(annee_en_nombre);
+    // #5463 — ce que la feuille dit de la piste, puis de l'album. Posés ICI,
+    // avant `completer_par_les_balises` : la feuille prime sur le fichier.
+    t.isrc = piste.isrc.clone();
+    t.composer = piste
+        .compositeur
+        .clone()
+        .or_else(|| album.compositeur.clone());
+    t.comments = piste
+        .commentaire
+        .clone()
+        .or_else(|| album.commentaire.clone());
     t.cue_media_path = Some(piste.media.to_string_lossy().into_owned());
     t.cue_start_ms = Some(piste.debut_ms as i64);
     t.cue_end_ms = piste.fin_ms.map(|f| f as i64);
@@ -290,8 +419,13 @@ fn duree_de_la_tranche(piste: &PisteCue, sonde: SondeImage) -> i64 {
 /// souvent enrichie depuis des mois.
 ///
 /// On ne reprend jamais un champ que la feuille a rempli : le `TITLE` de la
-/// feuille reste le titre, c'est toute la raison d'être du module.
+/// feuille reste le titre, c'est toute la raison d'être du module. Ni un champ
+/// que les balises de l'image viennent de combler ([`completer_par_les_balises`],
+/// appelé AVANT) : une balise présente gagne, comme au scan ordinaire.
 fn reprendre_l_acquis(neuve: &mut Track, existante: &Track) {
+    if neuve.disc_subtitle.is_none() {
+        neuve.disc_subtitle = existante.disc_subtitle.clone();
+    }
     if neuve.audio_hash.is_none() {
         neuve.audio_hash = existante.audio_hash.clone();
     }
@@ -333,6 +467,29 @@ fn annee_en_nombre(brut: &str) -> Option<i32> {
     chiffres.parse::<i32>().ok().filter(|a| *a > 0)
 }
 
+/// Ce dont [`ecrire_album`] a besoin, construit une fois par passe.
+struct Depots {
+    artistes: ArtistRepo,
+    albums: AlbumRepo,
+    pistes: TrackRepo,
+    metadonnees: AlbumMetadataRepo,
+    /// Ce que l'utilisateur a tenu à la main (#5319).
+    tenues: Tenues,
+}
+
+impl Depots {
+    fn pour(db: &Arc<dyn DbBackend>) -> Self {
+        Self {
+            artistes: ArtistRepo::with_backend(db.clone()),
+            albums: AlbumRepo::with_backend(db.clone()),
+            pistes: TrackRepo::with_backend(db.clone()),
+            metadonnees: AlbumMetadataRepo::with_backend(db.clone()),
+            // Une lecture par passe, comme au scan ordinaire (`TrackImporter`).
+            tenues: Tenues::charger(db),
+        }
+    }
+}
+
 /// Ce qu'un album qui ne vient pas d'une feuille CUE impose à ses lignes.
 ///
 /// Une image SACD (#5297) décrit elle-même ses propriétés audio : la sonde
@@ -348,36 +505,29 @@ struct Imposition<'a> {
 fn ecrire_album(
     dossier: &Path,
     album: &AlbumCue,
-    artist_repo: &ArtistRepo,
-    album_repo: &AlbumRepo,
-    track_repo: &TrackRepo,
+    depots: &Depots,
     bilan: &mut BilanCue,
     images_couvertes: &mut HashSet<PathBuf>,
 ) {
-    ecrire_album_avec(
-        dossier,
-        album,
-        artist_repo,
-        album_repo,
-        track_repo,
-        bilan,
-        images_couvertes,
-        None,
-    );
+    ecrire_album_avec(dossier, album, depots, bilan, images_couvertes, None);
 }
 
 /// [`ecrire_album`], avec ce qu'impose une source autre qu'une feuille.
-#[allow(clippy::too_many_arguments)]
 fn ecrire_album_avec(
     dossier: &Path,
     album: &AlbumCue,
-    artist_repo: &ArtistRepo,
-    album_repo: &AlbumRepo,
-    track_repo: &TrackRepo,
+    depots: &Depots,
     bilan: &mut BilanCue,
     images_couvertes: &mut HashSet<PathBuf>,
     imposition: Option<&Imposition<'_>>,
 ) {
+    let Depots {
+        artistes: artist_repo,
+        albums: album_repo,
+        pistes: track_repo,
+        metadonnees: tenues_meta,
+        tenues,
+    } = depots;
     if album.pistes.is_empty() {
         return;
     }
@@ -411,7 +561,27 @@ fn ecrire_album_avec(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "Album".to_string());
-    let annee = album.annee.as_deref().and_then(annee_en_nombre);
+    // Les balises de chaque image, lues une fois (#5463). Pas pour une image
+    // SACD : son Master TOC a déjà tout dit, et lofty n'y lit rien.
+    let mut balises: HashMap<PathBuf, BalisesImage> = HashMap::new();
+    if imposition.is_none() {
+        for piste in &album.pistes {
+            if !balises.contains_key(&piste.media) {
+                balises.insert(piste.media.clone(), lire_balises_image(&piste.media));
+            }
+        }
+    }
+    let annee = album
+        .annee
+        .as_deref()
+        .and_then(annee_en_nombre)
+        .or_else(|| {
+            album
+                .pistes
+                .first()
+                .and_then(|p| balises.get(&p.media))
+                .and_then(|b| b.annee)
+        });
     let ligne = match (
         artist_id,
         album_repo.get_or_create_for_folder(
@@ -449,7 +619,23 @@ fn ecrire_album_avec(
     // On n'écrase QUE si la feuille porte un vrai `TITLE` : `titre_album`
     // retombe sinon sur le nom du dossier, et remplacer un titre par un repli
     // serait une régression.
-    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref()) {
+    //
+    // 🔴 #5319 — SAUF sur un album que l'utilisateur a composé ou disposé à la
+    // main (un coffret réunissant plusieurs feuilles : la feuille de CE
+    // dossier ne décrit plus l'album entier), ni sur un titre qu'il a
+    // lui-même tenu (`edition_manuelle`, la règle de
+    // `AlbumRepo::realigner_sur_les_balises`).
+    let titre_tenu = |id: i64| {
+        tenues.albums_disposes().contains(&id)
+            || tenues_meta
+                .champs_edites_a_la_main(id)
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c == "title")
+    };
+    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref())
+        && !titre_tenu(id)
+    {
         let titre_feuille = titre_feuille.trim();
         if !titre_feuille.is_empty() && ligne.title != titre_feuille {
             match album_repo.force_update_title(id, titre_feuille) {
@@ -467,11 +653,26 @@ fn ecrire_album_avec(
         }
     }
 
+    // #5463 — `CATALOG` : le code-barres du disque. La feuille prime, comme
+    // pour le titre ; aucune autre source du scan ne le pose.
+    if let (Some(id), Some(code)) = (ligne_album, album.catalogue.as_deref()) {
+        let code = code.trim();
+        if !code.is_empty()
+            && ligne.barcode.as_deref() != Some(code)
+            && let Err(e) = album_repo.force_update_barcode(id, code)
+        {
+            warn!(album_id = id, error = %e, "cue_code_barres_non_ecrit");
+        }
+    }
+
     // Une sonde par IMAGE, pas par piste : un vinyle en deux faces sonde deux
     // fichiers pour dix pistes.
     let mut sondes: std::collections::HashMap<PathBuf, SondeImage> =
         std::collections::HashMap::new();
     let mut ecrites = 0usize;
+    // Les albums que les tenues désignent à la place de celui du dossier : un
+    // disque rattaché à la main à un coffret y reste (#5319).
+    let mut albums_tenus: HashSet<i64> = HashSet::new();
     let tranches = tranches_par_fichier(album);
     // Les fichiers réellement DÉCOUPÉS — eux seuls doivent sortir du scan
     // ordinaire. Un fichier occupé en entier par une seule piste garde son
@@ -516,6 +717,19 @@ fn ecrire_album_avec(
         );
         if let Some(i) = imposition {
             (i.retoucher)(piste, &mut ligne);
+        }
+        if let Some(b) = balises.get(&piste.media) {
+            completer_par_les_balises(&mut ligne, b, fichier_entier);
+        }
+        // L'édition manuelle prime sur la feuille, comme sur les balises au
+        // scan ordinaire (`TrackImporter::import`) : album, disque, numéro,
+        // titre et artiste que l'utilisateur a tenus, par chemin ou par
+        // identité CUE (#5319).
+        if tenues.appliquer(&mut ligne)
+            && let Some(tenu) = ligne.album_id
+            && Some(tenu) != ligne_album
+        {
+            albums_tenus.insert(tenu);
         }
         let media = ligne.cue_media_path.clone().unwrap_or_default();
         let debut = ligne.cue_start_ms.unwrap_or(0);
@@ -605,6 +819,9 @@ fn ecrire_album_avec(
         images_couvertes.extend(images_decoupees);
         if let Some(id) = ligne_album {
             bilan.albums_ecrits.insert(id);
+            let _ = album_repo.update_track_count(id);
+        }
+        for id in albums_tenus {
             let _ = album_repo.update_track_count(id);
         }
     }
@@ -775,23 +992,13 @@ fn ecrire_les_dossiers(
     dossiers: &[PathBuf],
     mut observer: impl FnMut(&Path, &PlanCue),
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
-    let artist_repo = ArtistRepo::with_backend(db.clone());
-    let album_repo = AlbumRepo::with_backend(db.clone());
-    let track_repo = TrackRepo::with_backend(db.clone());
+    let depots = Depots::pour(db);
     let mut bilan = BilanCue::default();
     let mut images_couvertes: HashSet<PathBuf> = HashSet::new();
 
     let inventaire = inventorier_avec(dossiers, |dossier: &Path, plan: &PlanCue| {
         for album in &plan.albums {
-            ecrire_album(
-                dossier,
-                album,
-                &artist_repo,
-                &album_repo,
-                &track_repo,
-                &mut bilan,
-                &mut images_couvertes,
-            );
+            ecrire_album(dossier, album, &depots, &mut bilan, &mut images_couvertes);
         }
         observer(dossier, plan);
     });
@@ -839,6 +1046,9 @@ fn album_de_l_iso(
         interprete: d.artiste().map(str::to_string),
         genre: None,
         annee: d.annee.map(|a| a.to_string()),
+        compositeur: None,
+        catalogue: None,
+        commentaire: None,
         pistes: zone
             .pistes
             .iter()
@@ -847,6 +1057,9 @@ fn album_de_l_iso(
                 numero: p.numero,
                 titre: p.titre.clone(),
                 interprete: p.interprete.clone(),
+                isrc: None,
+                compositeur: None,
+                commentaire: None,
                 // La piste est une tranche de la zone, sur son horloge :
                 // c'est ce que la lecture rejoue (`audio::sacd::ouvrir_lecture`).
                 debut_ms: p.debut_ms(),
@@ -872,9 +1085,9 @@ pub fn ecrire_les_iso_sacd(
     if isos.is_empty() {
         return;
     }
-    let artist_repo = ArtistRepo::with_backend(db.clone());
-    let album_repo = AlbumRepo::with_backend(db.clone());
-    let track_repo = TrackRepo::with_backend(db.clone());
+    // Les tenues aussi : une image SACD est désignée par `(image, début)`
+    // comme une tranche de feuille (#5319).
+    let depots = Depots::pour(db);
     let mut couvertes: HashSet<PathBuf> = HashSet::new();
     let avant = bilan.pistes_creees + bilan.pistes_mises_a_jour;
     for iso in isos {
@@ -909,9 +1122,7 @@ pub fn ecrire_les_iso_sacd(
         ecrire_album_avec(
             &identite,
             &album,
-            &artist_repo,
-            &album_repo,
-            &track_repo,
+            &depots,
             bilan,
             &mut couvertes,
             Some(&imposition),
@@ -1762,6 +1973,251 @@ mod tests {
         assert_eq!(annee_en_nombre("1981-03-12"), Some(1981));
         assert_eq!(annee_en_nombre("inconnue"), None);
         assert_eq!(annee_en_nombre(""), None);
+    }
+
+    /// Un vrai FLAC (le gabarit du dépôt, 1 s), étiqueté comme le fait Mp3tag.
+    fn flac_etiquete(chemin: &Path, balises: &[(&str, &str)]) {
+        use lofty::config::{ParseOptions, WriteOptions};
+        use lofty::file::AudioFile;
+        use lofty::flac::FlacFile;
+        use lofty::ogg::VorbisComments;
+        let gabarit = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        fs::copy(&gabarit, chemin).unwrap();
+        let mut fh = fs::File::open(chemin).unwrap();
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).unwrap();
+        drop(fh);
+        let mut vc = VorbisComments::default();
+        for (cle, valeur) in balises {
+            vc.insert((*cle).to_string(), (*valeur).to_string());
+        }
+        flac.set_vorbis_comments(vc);
+        flac.save_to_path(chemin, WriteOptions::default()).unwrap();
+    }
+
+    /// Les balises du FLAC du fil 2038, et de quoi prouver qu'elles ne
+    /// délogent rien : un titre et un interprète qui ne sont PAS ceux de la
+    /// feuille, un ISRC qui ne désigne qu'un enregistrement.
+    const BALISES_DU_FLAC: &[(&str, &str)] = &[
+        ("DISCSUBTITLE", "Remastered Album"),
+        ("GENRE", "Progressive Rock"),
+        ("DATE", "2015"),
+        ("LABEL", "A&M Records"),
+        ("COMPOSER", "Rick Wakeman"),
+        ("ISRC", "GBAAA1500001"),
+        ("TITLE", "Titre du fichier"),
+        ("ARTIST", "Artiste du fichier"),
+    ];
+
+    /// Écrit un dossier CUE sur un FLAC étiqueté, le scanne, rend les pistes
+    /// dans l'ordre de leurs débuts.
+    fn scanner_flac_et_feuille(feuille: &str) -> Vec<Track> {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        let image = dossier.join("image.flac");
+        flac_etiquete(&image, BALISES_DU_FLAC);
+        fs::write(dossier.join("album.cue"), feuille).unwrap();
+        let db = base();
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), &[dossier], &racines(d.path()));
+        assert_eq!(bilan.echecs, 0, "bilan : {bilan:?}");
+        let repo = TrackRepo::with_backend(db);
+        let media = image.to_string_lossy().to_string();
+        let mut pistes: Vec<Track> = repo
+            .tranches_cue_du_media(&media)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, debut)| repo.get_by_cue_identity(&media, debut).unwrap())
+            .collect();
+        pistes.sort_by_key(|t| t.cue_start_ms);
+        pistes
+    }
+
+    const DEUX_TRANCHES_SANS_REM: &str = "PERFORMER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    TITLE \"Anne of Cleves\"\n    INDEX 01 00:00:37\n";
+
+    /// 🔴 #5463 (Gros Bidon, fil 2038) — `DISCSUBTITLE`, que le format CUE ne
+    /// sait pas porter, est dans le FLAC qui accompagne la feuille. Tune ne
+    /// lisait jamais les balises de l'image : le nom du disque n'arrivait pas
+    /// en base, ni le genre, l'année, le label ou le compositeur que la feuille
+    /// ne dit pas.
+    #[test]
+    fn les_balises_de_l_image_completent_la_feuille_5463() {
+        let pistes = scanner_flac_et_feuille(DEUX_TRANCHES_SANS_REM);
+        assert_eq!(pistes.len(), 2, "pistes : {pistes:?}");
+        for t in &pistes {
+            assert_eq!(
+                t.disc_subtitle.as_deref(),
+                Some("Remastered Album"),
+                "#5463 — le DISCSUBTITLE du FLAC doit compléter chaque tranche de la feuille"
+            );
+            assert_eq!(t.genre.as_deref(), Some("Progressive Rock"));
+            assert_eq!(t.year, Some(2015));
+            assert_eq!(t.label.as_deref(), Some("A&M Records"));
+            assert_eq!(t.composer.as_deref(), Some("Rick Wakeman"));
+            // Ce qui désigne UNE piste reste à la feuille…
+            assert_eq!(t.artist_name.as_deref(), Some("Rick Wakeman"));
+            // … et un identifiant d'enregistrement n'est pas recopié sur des
+            // tranches : il n'en désignerait aucune.
+            assert_eq!(
+                t.isrc, None,
+                "l'ISRC d'une image découpée ne vaut pour aucune de ses tranches"
+            );
+        }
+        assert_eq!(pistes[0].title, "Catherine of Aragon");
+        assert_eq!(pistes[1].title, "Anne of Cleves");
+    }
+
+    /// LA CONTRE-ÉPREUVE DE PRIORITÉ — ce que la feuille dit, le fichier ne le
+    /// remplace pas. `REM GENRE` et `REM DATE` l'emportent sur `GENRE` et
+    /// `DATE` du FLAC ; le nom du disque, que la feuille ne dit pas, vient
+    /// toujours du fichier.
+    #[test]
+    fn la_feuille_prime_sur_les_balises_de_l_image_5463() {
+        let feuille = format!("REM GENRE \"Rock\"\nREM DATE 1973\n{DEUX_TRANCHES_SANS_REM}");
+        let pistes = scanner_flac_et_feuille(&feuille);
+        assert_eq!(pistes.len(), 2, "pistes : {pistes:?}");
+        for t in &pistes {
+            assert_eq!(
+                t.genre.as_deref(),
+                Some("Rock"),
+                "#5463 — le REM GENRE de la feuille doit primer sur le GENRE du fichier"
+            );
+            assert_eq!(
+                t.year,
+                Some(1973),
+                "#5463 — le REM DATE de la feuille doit primer sur la DATE du fichier"
+            );
+            assert_eq!(
+                t.genres, None,
+                "une liste de genres du fichier sous le genre de la feuille"
+            );
+            assert_eq!(t.disc_subtitle.as_deref(), Some("Remastered Album"));
+        }
+    }
+
+    /// Une piste qui occupe le fichier ENTIER est cet enregistrement : son
+    /// ISRC lui revient, que la feuille n'a pas dit. Le titre reste celui de
+    /// la feuille.
+    #[test]
+    fn la_piste_du_fichier_entier_prend_aussi_ses_identifiants_5463() {
+        const UNE_PISTE: &str = "PERFORMER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n    INDEX 01 00:00:00\n";
+        let pistes = scanner_flac_et_feuille(UNE_PISTE);
+        assert_eq!(pistes.len(), 1, "pistes : {pistes:?}");
+        let t = &pistes[0];
+        assert!(
+            t.file_path.is_some(),
+            "montage : la piste doit occuper le fichier entier"
+        );
+        assert_eq!(
+            t.isrc.as_deref(),
+            Some("GBAAA1500001"),
+            "#5463 — la piste du fichier entier doit prendre l'ISRC de son fichier"
+        );
+        assert_eq!(t.title, "Catherine of Aragon");
+        assert_eq!(t.disc_subtitle.as_deref(), Some("Remastered Album"));
+    }
+
+    /// #5463, suite — l'`ISRC`, le `SONGWRITER` et le `REM COMMENT` de la
+    /// FEUILLE primaient en principe, mais l'analyseur les jetait : sur la
+    /// piste du fichier entier, c'est l'ISRC et le compositeur du FICHIER qui
+    /// passaient. La feuille dit, le fichier se tait.
+    #[test]
+    fn la_feuille_prime_sur_le_fichier_pour_isrc_et_compositeur_5463() {
+        const FEUILLE_COMPLETE: &str = "REM COMMENT \"ExactAudioCopy v1.0b4\"\nPERFORMER \"Rick Wakeman\"\nTITLE \"The Six Wives of Henry VIII\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Catherine of Aragon\"\n    ISRC USAM17302204\n    SONGWRITER \"R. Wakeman\"\n    INDEX 01 00:00:00\n";
+        let pistes = scanner_flac_et_feuille(FEUILLE_COMPLETE);
+        assert_eq!(pistes.len(), 1, "pistes : {pistes:?}");
+        let t = &pistes[0];
+        assert!(
+            t.file_path.is_some(),
+            "montage : la piste occupe le fichier entier"
+        );
+        assert_eq!(
+            t.isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — l'ISRC de la feuille doit primer sur celui du fichier"
+        );
+        assert_eq!(
+            t.composer.as_deref(),
+            Some("R. Wakeman"),
+            "#5463 — le SONGWRITER de la feuille doit primer sur le COMPOSER du fichier"
+        );
+        assert_eq!(t.comments.as_deref(), Some("ExactAudioCopy v1.0b4"));
+        // Ce que la feuille ne dit pas vient toujours du fichier.
+        assert_eq!(t.label.as_deref(), Some("A&M Records"));
+    }
+
+    /// #5463 — `CATALOG` est le code-barres UPC/EAN du disque : il va sur
+    /// l'album, et y reprend la main sur une valeur plus ancienne.
+    #[test]
+    fn le_catalog_de_la_feuille_devient_le_code_barres_de_l_album_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        flac_etiquete(&dossier.join("image.flac"), BALISES_DU_FLAC);
+        fs::write(
+            dossier.join("album.cue"),
+            format!("CATALOG 0600753562390\n{DEUX_TRANCHES_SANS_REM}"),
+        )
+        .unwrap();
+        let db = base();
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        let media = dossier.join("image.flac").to_string_lossy().to_string();
+        let album_id = TrackRepo::with_backend(db.clone())
+            .get_by_cue_identity(&media, 0)
+            .unwrap()
+            .and_then(|t| t.album_id)
+            .expect("la piste 1 et son album doivent exister");
+        let album = AlbumRepo::with_backend(db).get(album_id).unwrap().unwrap();
+        assert_eq!(
+            album.barcode.as_deref(),
+            Some("0600753562390"),
+            "#5463 — le CATALOG de la feuille doit devenir le code-barres de l'album"
+        );
+    }
+
+    /// #5463 — une feuille RETOUCHÉE (un ISRC ajouté) doit atteindre la base
+    /// au rescan : la ligne existe déjà, c'est `TrackRepo::update` qui
+    /// l'écrit — et il n'écrivait pas la colonne `isrc`.
+    #[test]
+    fn une_feuille_retouchee_pose_son_isrc_au_rescan_5463() {
+        let d = tempfile::TempDir::new().unwrap();
+        let dossier = d.path().join("Rick Wakeman - The Six Wives");
+        fs::create_dir_all(&dossier).unwrap();
+        let image = dossier.join("image.flac");
+        flac_etiquete(&image, BALISES_DU_FLAC);
+        let cue = dossier.join("album.cue");
+        fs::write(&cue, DEUX_TRANCHES_SANS_REM).unwrap();
+        let db = base();
+        let dossiers = std::slice::from_ref(&dossier);
+        inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+
+        fs::write(
+            &cue,
+            DEUX_TRANCHES_SANS_REM.replace(
+                "    INDEX 01 00:00:00\n",
+                "    ISRC USAM17302204\n    INDEX 01 00:00:00\n",
+            ),
+        )
+        .unwrap();
+        let (_, bilan, _) = inventorier_et_ecrire(db.clone(), dossiers, &racines(d.path()));
+        assert_eq!(bilan.pistes_mises_a_jour, 2, "bilan : {bilan:?}");
+
+        let repo = TrackRepo::with_backend(db);
+        let media = image.to_string_lossy().to_string();
+        let une = repo.get_by_cue_identity(&media, 0).unwrap().unwrap();
+        assert_eq!(
+            une.isrc.as_deref(),
+            Some("USAM17302204"),
+            "#5463 — l'ISRC ajouté à la feuille doit atteindre la ligne déjà en base"
+        );
+        let deux = repo.get_by_cue_identity(&media, 493).unwrap().unwrap();
+        assert_eq!(
+            deux.isrc, None,
+            "l'ISRC d'une piste ne déborde pas sur l'autre"
+        );
     }
 
     /// #5297 — une image SACD lue nativement devient un album de TRANCHES :

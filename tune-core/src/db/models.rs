@@ -92,6 +92,17 @@ pub struct Album {
     pub release_type: Option<String>,
 }
 
+/// Règle du badge de qualité d'album — seule source de [`Album::quality`] et
+/// de [`Album::quality_sql`] (#5413). Un format qui CONTIENT l'un de ces
+/// marqueurs est du DSD, prioritaire sur tout le reste.
+const BADGE_DSD_MARQUEURS: [&str; 3] = ["dsf", "dff", "dsd"];
+/// Hi-res : fréquence STRICTEMENT au-delà de 48 kHz, ou profondeur
+/// strictement au-delà de 16 bits.
+const BADGE_HIRES_SAMPLE_RATE_AU_DELA: i32 = 48000;
+const BADGE_HIRES_BIT_DEPTH_AU_DELA: i32 = 16;
+/// Formats avec perte, comparés à l'égalité exacte.
+const BADGE_FORMATS_LOSSY: [&str; 5] = ["mp3", "ogg", "opus", "wma", "aac"];
+
 impl Album {
     pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
@@ -101,21 +112,71 @@ impl Album {
         v
     }
 
+    /// Le badge de qualité de l'album. LA règle est écrite dans les
+    /// constantes `BADGE_*` ci-dessous, et nulle part ailleurs : le filtre
+    /// `GET /library/albums?quality=…` la lit par [`Self::quality_sql`].
     pub fn quality(&self) -> Option<String> {
         let fmt = self.format.as_deref().unwrap_or("");
         let sr = self.sample_rate.unwrap_or(0);
         let bd = self.bit_depth.unwrap_or(0);
-        if fmt.contains("dsf") || fmt.contains("dff") || fmt.contains("dsd") {
+        if BADGE_DSD_MARQUEURS.iter().any(|m| fmt.contains(m)) {
             Some("dsd".into())
-        } else if sr > 48000 || bd > 16 {
+        } else if sr > BADGE_HIRES_SAMPLE_RATE_AU_DELA || bd > BADGE_HIRES_BIT_DEPTH_AU_DELA {
             Some("hi-res".into())
-        } else if fmt == "mp3" || fmt == "ogg" || fmt == "opus" || fmt == "wma" || fmt == "aac" {
+        } else if BADGE_FORMATS_LOSSY.contains(&fmt) {
             Some("lossy".into())
         } else if !fmt.is_empty() {
             Some("cd".into())
         } else {
             None
         }
+    }
+
+    /// Le prédicat SQL qui garde exactement les albums dont
+    /// [`Self::quality`] vaut le badge demandé (#5413), sur les colonnes
+    /// `format`, `sample_rate` et `bit_depth` de l'album d'alias `alias`.
+    ///
+    /// Clés acceptées : celles du paramètre `quality` de la route (`dsd`,
+    /// `hires`, `cd`, `lossy`) et le badge lui-même (`hi-res`). `None` pour
+    /// toute autre valeur : pas de filtre, comme avant.
+    ///
+    /// Jusqu'au 29/09/2026, le filtre `hires` suivait sa propre règle — UNE
+    /// piste au-delà de 44,1 kHz ou de 16 bits suffisait, DSD compris — et
+    /// rendait sous « Hi-Res » des albums sans badge et des DSD (Rhorn,
+    /// fil 2032). Le prédicat est donc DÉRIVÉ des mêmes constantes que le
+    /// badge, dans le même ordre de priorité (DSD, puis hi-res, puis lossy,
+    /// puis cd).
+    ///
+    /// Portable SQLite et PostgreSQL sans marqueur lié : `COALESCE` rend à
+    /// `NULL` la valeur que `unwrap_or` lui donne en Rust (`''` et `0`), et
+    /// `REPLACE(f, 'dsf', '') <> f` est le `contains` SENSIBLE À LA CASSE
+    /// des deux moteurs — `LIKE` ne l'est pas sous SQLite.
+    pub fn quality_sql(badge: &str, alias: &str) -> Option<String> {
+        let fmt = format!("COALESCE({alias}.format, '')");
+        let dsd = BADGE_DSD_MARQUEURS
+            .iter()
+            .map(|m| format!("REPLACE({fmt}, '{m}', '') <> {fmt}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let hires = format!(
+            "COALESCE({alias}.sample_rate, 0) > {BADGE_HIRES_SAMPLE_RATE_AU_DELA} \
+             OR COALESCE({alias}.bit_depth, 0) > {BADGE_HIRES_BIT_DEPTH_AU_DELA}"
+        );
+        let lossy = format!(
+            "{fmt} IN ({})",
+            BADGE_FORMATS_LOSSY
+                .iter()
+                .map(|f| format!("'{f}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Some(match badge {
+            "dsd" => format!("({dsd})"),
+            "hires" | "hi-res" => format!("(NOT ({dsd}) AND ({hires}))"),
+            "lossy" => format!("(NOT ({dsd}) AND NOT ({hires}) AND {lossy})"),
+            "cd" => format!("(NOT ({dsd}) AND NOT ({hires}) AND NOT ({lossy}) AND {fmt} <> '')"),
+            _ => return None,
+        })
     }
 
     pub fn new(title: String) -> Self {

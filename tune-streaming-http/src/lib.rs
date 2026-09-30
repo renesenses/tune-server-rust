@@ -1276,7 +1276,7 @@ fn borne_plus_comme_ca(limit: Option<usize>) -> usize {
 /// Réponses :
 ///  - 404 : service inconnu (comme toutes les routes `/{service}/…`) ;
 ///  - 501 : le service ne connaît pas ses artistes similaires — aujourd'hui,
-///    tous sauf Qobuz. Un refus DIT, pas une liste vide qui laisserait croire
+///    tous sauf Qobuz, TIDAL et Deezer (#5395). Un refus DIT, pas une liste vide qui laisserait croire
 ///    à un artiste sans voisin ;
 ///  - 502 : le titre source n'a pas pu être lu chez le service ;
 ///  - 200 `[]` : aucun voisin trouvé — une réponse, pas une panne.

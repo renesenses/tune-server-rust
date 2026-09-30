@@ -62,7 +62,7 @@ impl TunePlugin for DjPlugin {
         "dj"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "DJ mode: crossfade, decks, waveform and BPM analysis"

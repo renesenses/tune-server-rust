@@ -3123,6 +3123,7 @@ mod tests {
     /// recensement qui recompterait `devices` sous les deux noms serait rouge.
     #[test]
     fn le_recensement_periodique_nomme_les_serveurs_multimedia() {
+        crate::journal_de_test::fiabiliser_la_capture();
         let mut st = ScannerState::new();
         st.media_servers.insert(
             "uuid:freebox".into(),
@@ -3188,6 +3189,7 @@ mod tests {
     /// l'instruction de #3575.
     #[test]
     fn la_relance_rapide_nomme_les_serveurs_multimedia() {
+        crate::journal_de_test::fiabiliser_la_capture();
         let mut st = ScannerState::new();
         st.media_servers.insert(
             "uuid:freebox".into(),
@@ -3279,6 +3281,7 @@ mod tests {
 
     #[tokio::test]
     async fn l_echec_de_creation_nomme_la_location_fautive() {
+        crate::journal_de_test::fiabiliser_la_capture();
         use tracing::instrument::WithSubscriber;
 
         const CHEMIN: &str = "/upnp/description.xml";
@@ -3337,6 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn une_location_intermittente_est_identique_sur_l_echec_et_le_succes() {
+        crate::journal_de_test::fiabiliser_la_capture();
         use tracing::instrument::WithSubscriber;
 
         let addr = spawn_location_scenario_server(LocationScenario::Intermittent).await;
@@ -3387,6 +3391,7 @@ mod tests {
 
     #[tokio::test]
     async fn deux_locations_du_meme_uuid_restent_distinctes_dans_les_traces() {
+        crate::journal_de_test::fiabiliser_la_capture();
         use tracing::instrument::WithSubscriber;
 
         let addr = spawn_location_scenario_server(LocationScenario::DeuxLocations).await;
@@ -3446,6 +3451,7 @@ mod tests {
     // défaut, même correction : l'URL est sous la main, elle doit sortir.
     #[tokio::test]
     async fn la_perte_d_un_appareil_nomme_la_location_devenue_muette() {
+        crate::journal_de_test::fiabiliser_la_capture();
         use tracing::instrument::WithSubscriber;
 
         // Un port qu'on ouvre puis qu'on referme : l'adresse est plausible et

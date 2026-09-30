@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "scan_import_progress.rs"]
 mod import_progress;
-use import_progress::{LecteurMetadonnees, lire_metadonnees_du_lot};
+use import_progress::{DELAI_LECTURE_CREDITS, LecteurMetadonnees, lire_metadonnees_du_lot};
 
 const SCAN_ACTIVE: u64 = 1;
 const SCAN_CANCELLED: u64 = 2;
@@ -1436,6 +1436,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         purge_confirmee,
         targeted_req,
         std::sync::Arc::new(tune_core::metadata::read_extended_metadata),
+        DELAI_LECTURE_CREDITS,
     )
     .await
 }
@@ -1446,6 +1447,7 @@ async fn spawn_library_scan_avec_lecteur(
     purge_confirmee: Option<u64>,
     targeted_req: Option<String>,
     lecteur_metadonnees: LecteurMetadonnees,
+    delai_credits: std::time::Duration,
 ) -> bool {
     let Some(scan_lease) = try_begin_scan() else {
         tracing::warn!("scan_start_rejected_already_running");
@@ -1925,7 +1927,8 @@ async fn spawn_library_scan_avec_lecteur(
                 ecartes: &files_ecartes,
             },
         )
-        .with_force_artwork(force);
+        .with_force_artwork(force)
+        .avec_pochettes_differees();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
@@ -1997,9 +2000,12 @@ async fn spawn_library_scan_avec_lecteur(
 
                 // La relecture des crédits ne tient plus la transaction SQLite (#5202).
                 // Les identifiants des pistes neuves seront résolus après l'écriture.
+                // Chaque lecture est bornée : un fichier qui ne rend pas la main
+                // est sauté et journalisé, il ne fige plus le lot (#5202).
                 let Some(mut metadonnees_lues) = lire_metadonnees_du_lot(
                     &extended_meta_paths,
-                    &*lecteur_metadonnees,
+                    &lecteur_metadonnees,
+                    delai_credits,
                     scan_cancel_requested,
                     &event_bus,
                     batch_idx,
@@ -2287,6 +2293,17 @@ async fn spawn_library_scan_avec_lecteur(
                     }
                 }
                 drop(sqlite_write_guard);
+
+                // #5202 — les pochettes du lot relisent le disque : APRÈS le
+                // COMMIT, chaque lecture sous délai, arrêt compris.
+                {
+                    let mut lectures = crate::lecture_bornee::LecturesBornees::new(
+                        delai_credits,
+                        &scan_cancel_requested,
+                    );
+                    let a_poser = importer.traiter_les_pochettes_differees(&mut lectures, batch_idx);
+                    crate::scan_import::poser_les_pochettes_de_piste(&db, &a_poser);
+                }
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;

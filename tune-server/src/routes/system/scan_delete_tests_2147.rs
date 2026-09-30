@@ -91,15 +91,18 @@ fn verifier_suppressions(refuses: &[usize]) {
 
 #[test]
 fn toutes_les_suppressions_reussissent() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     verifier_suppressions(&[]);
 }
 
 #[test]
 fn un_refus_n_empeche_pas_la_suppression_suivante() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     verifier_suppressions(&[0, 2]);
 }
 
 #[test]
 fn tous_les_refus_restent_visibles() {
+    tune_core::journal_de_test::fiabiliser_la_capture();
     verifier_suppressions(&[0, 1, 2]);
 }

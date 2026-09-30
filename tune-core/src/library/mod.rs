@@ -18,6 +18,7 @@ pub mod ingest;
 pub mod local_path;
 pub mod lyrics_pass;
 pub mod m3u_parser;
+pub mod mosaique;
 pub mod playlist_scan;
 /// La pochette d'un album face au disque : retrait et suivi (#5034).
 pub mod pochette_disque;

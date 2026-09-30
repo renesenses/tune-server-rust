@@ -2917,7 +2917,10 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            if let Ok(exe) = std::env::current_exe() {
+            // #5461 — jamais `<exe>.old` : sous Linux, `current_exe()` suit le
+            // renommage fait par une mise à jour, et « Redémarrer » relançait
+            // l'ANCIENNE version. On relance le binaire installé.
+            if let Ok(exe) = crate::binaire_installe::chemin_de_relance_du_processus() {
                 let args: Vec<String> = std::env::args().skip(1).collect();
                 // Ne pas rouvrir le navigateur au redémarrage : l'onglet existant
                 // se reconnecte tout seul (Jean, forum #1236 — deux onglets).

@@ -244,7 +244,18 @@ pub(crate) async fn reprendre_tache(
         return inconnue(&id).into_response();
     };
     match tune_core::taches_de_fond::reprendre(&state.backend, tache) {
-        Ok(()) => reponse(&state),
+        Ok(()) => {
+            // #5469 — lever le drapeau ne suffit pas quand la passe n'existe
+            // plus : un arrêt du serveur l'a tuée, et « Reprendre » n'avait
+            // plus rien à reprendre. Le bouton en relance une.
+            let relancees = crate::reprise_des_passes::relancer_pour(
+                &state,
+                tache,
+                crate::reprise_des_passes::Origine::Reprendre,
+            )
+            .await;
+            reponse_avec_relances(&state, relancees)
+        }
         Err(e) => echec(e).into_response(),
     }
 }
@@ -264,7 +275,21 @@ pub(crate) async fn tout_suspendre(State(state): State<AppState>) -> impl IntoRe
 /// `POST /system/background-tasks/resume-all` — tout reprendre.
 pub(crate) async fn tout_reprendre(State(state): State<AppState>) -> impl IntoResponse {
     match tune_core::taches_de_fond::tout_reprendre(&state.backend) {
-        Ok(()) => reponse(&state),
+        Ok(()) => {
+            // #5469 — même règle que la reprise d'UN traitement.
+            let mut relancees = Vec::new();
+            for tache in Tache::TOUTES {
+                relancees.extend(
+                    crate::reprise_des_passes::relancer_pour(
+                        &state,
+                        tache,
+                        crate::reprise_des_passes::Origine::Reprendre,
+                    )
+                    .await,
+                );
+            }
+            reponse_avec_relances(&state, relancees)
+        }
         Err(e) => echec(e).into_response(),
     }
 }
@@ -273,6 +298,22 @@ pub(crate) async fn tout_reprendre(State(state): State<AppState>) -> impl IntoRe
 /// émet déjà, pour que les autres onglets ouverts se redessinent sans sondage.
 fn reponse(state: &AppState) -> axum::response::Response {
     let corps = instantane(state);
+    state
+        .event_bus
+        .emit("system.background_tasks", corps.clone());
+    (StatusCode::OK, Json(corps)).into_response()
+}
+
+/// La réponse des deux routes de reprise : l'instantané, plus `relaunched`,
+/// les passes que le clic a relancées faute de les trouver vivantes (#5469).
+/// Une liste vide veut dire qu'aucune passe n'était morte, ou qu'aucune n'avait
+/// de travail interrompu à reprendre.
+fn reponse_avec_relances(
+    state: &AppState,
+    relancees: Vec<&'static str>,
+) -> axum::response::Response {
+    let mut corps = instantane(state);
+    corps["relaunched"] = json!(relancees);
     state
         .event_bus
         .emit("system.background_tasks", corps.clone());

@@ -617,8 +617,10 @@ struct DsfHeaderInfo {
 fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, &'static str> {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path))
-        .map_err(|_| "ouverture_impossible")?;
+    // #5299 — un `.dsf` rangé dans une image ISO s'ouvre dans l'image.
+    let mut f =
+        crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+            .map_err(|_| "ouverture_impossible")?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
     f.read_exact(&mut header)
         .map_err(|_| "entete_dsd_trop_court")?;
@@ -1293,15 +1295,17 @@ fn read_dsf_id3v2_raw(
         }
         return None;
     };
-    let mut f = match std::fs::File::open(&*crate::library::artwork::extended_path(path)) {
-        Ok(f) => f,
-        Err(e) => {
-            rejet("ouverture_impossible", e.to_string());
-            return None;
-        }
-    };
-    let file_len = match f.metadata() {
-        Ok(m) => m.len(),
+    let mut f =
+        match crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                rejet("ouverture_impossible", e.to_string());
+                return None;
+            }
+        };
+    let file_len = match f.longueur() {
+        Ok(n) => n,
         Err(e) => {
             rejet("taille_illisible", e.to_string());
             return None;
@@ -1427,7 +1431,7 @@ fn read_dsf_id3v2_raw(
 /// Rend `None` quand le parcours ne serait pas fiable — l'appelant retombe alors
 /// sur un préfixe plutôt que sur rien.
 fn read_id3v2_selected_frames(
-    f: &mut std::fs::File,
+    f: &mut crate::audio::iso9660::FichierSource,
     header: &[u8; 10],
     tag_offset: u64,
     file_len: u64,
@@ -1733,7 +1737,9 @@ fn dsf_dff_fallback_complete(
 
     let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
         .ok()
-        .map(|m| m.len());
+        .map(|m| m.len())
+        // #5299 — fichier rangé dans une image ISO : sa taille propre.
+        .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t));
 
     let (sample_rate, channels, duration_ms, metadata_offset) = if ext == "dsf" {
         match parse_dsf_header_full(path) {
@@ -2251,6 +2257,43 @@ fn label_du_tag(get: &dyn Fn(lofty::tag::ItemKey) -> Option<String>) -> Option<S
         .or_else(|| non_vide(get(lofty::tag::ItemKey::Publisher)))
 }
 
+/// Une balise « utile » porte au moins un champ qui décrit la musique — tout
+/// champ non vide autre que l'identification de l'encodeur — ou une image.
+///
+/// #4412 (Marco Polo, fil 1836) — un Ogg Vorbis sans aucune balise garde son
+/// en-tête de commentaires, obligatoire, avec la seule chaîne du vendeur
+/// (`Xiph.Org libVorbis I 20040629`), que lofty rend comme une balise
+/// `EncoderSoftware`. Le fichier passait donc pour balisé, `tagless_fallback`
+/// ne s'appliquait pas, et l'artiste restait vide alors qu'un WAV rangé au
+/// même endroit le recevait de l'arborescence. Même cas pour un Opus, ou un
+/// FLAC dont le bloc Vorbis est vide. Décision de Bertrand du 29/09/2026 : un
+/// tel fichier prend le MÊME repli qu'un fichier sans balise.
+///
+/// Un fichier qui ne porte QU'UN genre, un label ou un drapeau de compilation
+/// reste balisé : ces champs ne vivent que sur le chemin nominal.
+fn balise_utile(tag: &lofty::tag::Tag, path: &Path) -> bool {
+    use lofty::tag::{ItemKey, ItemValue};
+    tag.items().any(|item| {
+        !matches!(
+            item.key(),
+            ItemKey::EncoderSoftware | ItemKey::EncoderSettings | ItemKey::EncodedBy
+        ) && match item.value() {
+            ItemValue::Text(t) | ItemValue::Locator(t) => !t.trim().is_empty(),
+            ItemValue::Binary(b) => !b.is_empty(),
+        }
+    }) || !tag.pictures().is_empty()
+        // Trames ID3v2 que lofty ne rend pas alors qu'elles sont valides (MP3,
+        // WAV+ID3 : voir la relecture du chemin nominal). Sonde bornée, payée
+        // seulement par un fichier dont lofty n'a rien tiré.
+        || read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false)
+            .and_then(|raw| parse_id3v2_tag(&raw))
+            .is_some_and(|id3| {
+                [id3.title(), id3.artist(), id3.album()]
+                    .into_iter()
+                    .any(|v| v.is_some_and(|s| !s.trim().is_empty()))
+            })
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -2275,7 +2318,7 @@ pub(crate) fn album_artiste_du_chemin(
     {
         return (
             Some(format!("{titre} ({})", variante.trim())),
-            nom(edition.and_then(|p| p.parent())),
+            edition.and_then(artiste_au_dessus_de),
             None,
         );
     }
@@ -2285,9 +2328,105 @@ pub(crate) fn album_artiste_du_chemin(
     };
     (
         nom(dossier_album),
-        nom(dossier_album.and_then(|p| p.parent())),
+        dossier_album.and_then(artiste_au_dessus_de),
         disque,
     )
+}
+
+/// L'artiste que l'arborescence donne au-dessus du dossier d'album : le
+/// premier dossier parent dont le nom n'est ni générique ni un volume (voir
+/// [`dossier_muet_pour_l_artiste`]). `None` à la racine du système de
+/// fichiers, jamais la racine elle-même (#4412).
+///
+/// Le chemin est découpé comme une CHAÎNE, par
+/// [`crate::library::local_path::racine_et_reste`], et non par
+/// `Path::parent` : `Z:\Musique\750GB\Musique\<album>` (Marco Polo, fil 1836)
+/// se découpe alors de la même façon quel que soit l'hôte qui compile, ce qui
+/// rend le cas Windows vérifiable sur la CI Linux.
+fn artiste_au_dessus_de(dossier_album: &Path) -> Option<String> {
+    let texte = dossier_album.to_str()?;
+    let composants: Vec<&str> = match crate::library::local_path::racine_et_reste(texte) {
+        Some((_, reste, '\\')) => reste.split(['\\', '/']).collect(),
+        Some((_, reste, _)) => reste.split('/').collect(),
+        // Relatif : aucune racine à écarter, les composants tels quels.
+        None => dossier_album
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => n.to_str(),
+                _ => None,
+            })
+            .collect(),
+    };
+    let mut composants: Vec<&str> = composants.into_iter().filter(|c| !c.is_empty()).collect();
+    // Le dernier composant est le dossier d'album lui-même.
+    composants.pop()?;
+    composants
+        .into_iter()
+        .rev()
+        .find(|n| !dossier_muet_pour_l_artiste(n))
+        .map(str::to_string)
+}
+
+/// Vrai quand un nom de dossier ne dit RIEN de l'artiste : dossier générique
+/// (`Musique`, `Music`, `Downloads`…) ou nom de volume (`750GB`, `NAS`,
+/// `share`, lettre de lecteur, `Volumes`, `mnt`, `media`). Décision de
+/// Bertrand du 29/09/2026 (#4412) : on remonte au-dessus, et à défaut
+/// l'artiste reste vide — un artiste « Musique » ou « 750GB » regroupe à tort
+/// toute une bibliothèque sans balises.
+pub(crate) fn dossier_muet_pour_l_artiste(nom: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let n: String = nom.trim().nfc().collect::<String>().to_lowercase();
+    const MUETS: &[&str] = &[
+        // Génériques.
+        "musique",
+        "musiques",
+        "ma musique",
+        "music",
+        "my music",
+        "audio",
+        "musik",
+        "música",
+        "musica",
+        "downloads",
+        "download",
+        "téléchargements",
+        "telechargements",
+        // Volumes.
+        "nas",
+        "share",
+        "public",
+        "volumes",
+        "mnt",
+        "media",
+    ];
+    if MUETS.contains(&n.as_str()) {
+        return true;
+    }
+    // Lettre de lecteur : `Z`, `Z:`.
+    let lettre = n.strip_suffix(':').unwrap_or(&n);
+    if lettre.len() == 1 && lettre.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return true;
+    }
+    capacite_de_volume(&n)
+}
+
+/// `^\d+(\.\d+)?\s?(GB|TB|Go|To|G|T)$`, insensible à la casse (reçoit du
+/// minuscule) : `750GB`, `2 To`, `1.5TB`, `500G`.
+fn capacite_de_volume(n: &str) -> bool {
+    let Some(unite) = ["gb", "tb", "go", "to", "g", "t"]
+        .into_iter()
+        .find(|u| n.ends_with(u))
+    else {
+        return false;
+    };
+    let nombre = &n[..n.len() - unite.len()];
+    let nombre = nombre.strip_suffix(' ').unwrap_or(nombre);
+    let (entier, decimale) = match nombre.split_once('.') {
+        Some((e, d)) => (e, Some(d)),
+        None => (nombre, None),
+    };
+    let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    chiffres(entier) && decimale.is_none_or(chiffres)
 }
 
 /// Check if a file has a known audio extension (used to decide whether to
@@ -2920,7 +3059,7 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let mut data = Vec::new();
     {
         use std::io::Read;
-        std::fs::File::open(path)
+        crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
             .take(HEADER_BYTES)
             .read_to_end(&mut data)
@@ -2930,13 +3069,30 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// Find one field in an already-read Vorbis header.
+///
+/// #5397 — le motif finit toujours par `=`, octet qu'aucune casse ne change :
+/// une position `i` ne peut convenir que si `data[i + nlen - 1]` vaut `=`. On
+/// saute donc d'un `=` au suivant au lieu de comparer `nlen` octets à CHAQUE
+/// position. Mêmes positions retenues, dans le même ordre, donc même résultat ;
+/// seul le coût change. Mesuré sur Shrek (5 champs cherchés par fichier, tête
+/// de 1 Mio) : 25 ms → 5,8 ms par fichier en `--release`, 808 → 41 ms en
+/// profil de test — où le témoin de #3816 (relecture de 501 pistes) passait
+/// ici 6,5 s sur 9 et dépassait son délai de 30 s sous charge.
 fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
     let needle = format!("{}=", field_name.to_ascii_uppercase());
     let nlen = needle.len();
     if data.len() <= nlen {
         return None;
     }
-    for i in 4..=data.len() - nlen {
+    // `fin` parcourt les positions du `=` final : i = fin + 1 - nlen, i >= 4.
+    let mut fin = nlen + 3;
+    while let Some(pas) = data
+        .get(fin..)
+        .and_then(|reste| reste.iter().position(|&b| b == b'='))
+    {
+        fin += pas;
+        let i = fin + 1 - nlen;
+        fin += 1;
         if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
             continue;
         }
@@ -3027,7 +3183,7 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let mut data = Vec::new();
     {
         use std::io::Read;
-        std::fs::File::open(path)
+        crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
             .take(HEADER_BYTES)
             .read_to_end(&mut data)
@@ -3237,7 +3393,9 @@ fn ogg_fallback_has_audio(path: &Path) -> Option<bool> {
         io::{MediaSourceStream, ReadOnlySource},
         meta::MetadataOptions,
     };
-    let Ok(file) = std::fs::File::open(&*crate::library::artwork::extended_path(path)) else {
+    let Ok(file) =
+        crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+    else {
         return Some(false);
     };
     let mut bytes = Vec::new();
@@ -3324,6 +3482,9 @@ fn has_valid_ogg_bos_page(bytes: &[u8]) -> bool {
 mod ogg_fallback_tests_4412;
 
 #[cfg(test)]
+mod sans_balise_tests_4412;
+
+#[cfg(test)]
 mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
@@ -3394,7 +3555,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             // still appears in the library rather than being silently skipped.
             // Only apply the fallback if the file actually exists (a missing
             // file should still return Err).
-            if is_known_audio_ext(path) && path.exists() {
+            if is_known_audio_ext(path)
+                && (path.exists() || crate::audio::iso9660::taille_et_mtime(path).is_some())
+            {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ["ogg", "oga", "opus"]
                     .iter()
@@ -3414,8 +3577,13 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         }
     };
     let props = tagged.properties();
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+    let tag = match tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .filter(|t| balise_utile(t, path))
+    {
         Some(t) => t,
+        // Aucune balise, OU une balise qui ne dit rien (#4412) : même repli.
         None => {
             if let Some(meta) = dsf_dff_fallback(path) {
                 return Ok(meta);
@@ -3811,7 +3979,11 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // MEDIA (Vorbis) / TMED (ID3v2) via ItemKey::OriginalMediaType, with the
     // legacy Vorbis `SOURCE` tag as a fallback for files tagged before the
     // switch (D. Pamingle : « nommer MEDIA, ID3v2 TMED, aligné sur MusicBrainz »).
-    if let Some(v) = get(ItemKey::OriginalMediaType).or_else(|| raw_vorbis_comment(path, "SOURCE"))
+    // La tête Vorbis est lue UNE fois, pour `SOURCE` comme pour les quatre
+    // graphies du DR plus bas (#5397) : `raw_vorbis_comment` la relisait.
+    let header = read_vorbis_header(path);
+    if let Some(v) = get(ItemKey::OriginalMediaType)
+        .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
     {
         meta.insert("source_media".into(), v);
     }
@@ -3832,7 +4004,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // `ALBUM DR` / `DR` are accepted as secondary spellings. The header is read
     // ONCE for all four: a file without any of them — the common case — would
     // otherwise pay four separate 1 MB reads per scan.
-    if let Some(header) = read_vorbis_header(path) {
+    if let Some(header) = header {
         if let Some(v) = find_vorbis_comment(&header, "ALBUM DYNAMIC RANGE")
             .or_else(|| find_vorbis_comment(&header, "ALBUM DR"))
         {
@@ -4251,6 +4423,66 @@ mod dynamic_range_tests {
         let data = comment_block(&[("album dynamic range", "9")]);
         assert_eq!(
             find_vorbis_comment(&data, "ALBUM DYNAMIC RANGE").as_deref(),
+            Some("9")
+        );
+    }
+
+    /// #5397 — le saut d'un `=` au suivant doit retenir exactement ce que
+    /// retenait la comparaison à chaque position : même valeur, y compris
+    /// sur du bruit binaire (les trames audio que la tête de 1 Mio embarque),
+    /// avec un commentaire à la première position admise (4) et un en fin.
+    #[test]
+    fn le_saut_sur_egal_retient_ce_que_retenait_le_balayage_complet_5397() {
+        fn balayage_complet(data: &[u8], field_name: &str) -> Option<String> {
+            let needle = format!("{}=", field_name.to_ascii_uppercase());
+            let nlen = needle.len();
+            if data.len() <= nlen {
+                return None;
+            }
+            for i in 4..=data.len() - nlen {
+                if !data[i..i + nlen].eq_ignore_ascii_case(needle.as_bytes()) {
+                    continue;
+                }
+                let len = u32::from_le_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]])
+                    as usize;
+                if len < nlen || i + len > data.len() {
+                    continue;
+                }
+                if let Ok(value) = std::str::from_utf8(&data[i + nlen..i + len])
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut bruit: Vec<u8> = (0..65_536)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // Beaucoup de `=` et de lettres : le cas le plus dur pour le saut.
+                [b'=', b'D', b'r', b'R', 0, 7][(x % 6) as usize]
+            })
+            .collect();
+        let mut poser = |off: usize, entree: &str| {
+            bruit[off - 4..off].copy_from_slice(&(entree.len() as u32).to_le_bytes());
+            bruit[off..off + entree.len()].copy_from_slice(entree.as_bytes());
+        };
+        poser(4, "dr=12");
+        poser(30_000, "DYNAMIC RANGE=9");
+        poser(65_536 - 9, "SOURCE=CD");
+        for champ in ["DR", "DYNAMIC RANGE", "ALBUM DR", "SOURCE", "R", "ABSENT"] {
+            assert_eq!(
+                find_vorbis_comment(&bruit, champ),
+                balayage_complet(&bruit, champ),
+                "{champ}"
+            );
+        }
+        assert_eq!(find_vorbis_comment(&bruit, "SOURCE").as_deref(), Some("CD"));
+        assert_eq!(
+            find_vorbis_comment(&bruit, "DYNAMIC RANGE").as_deref(),
             Some("9")
         );
     }

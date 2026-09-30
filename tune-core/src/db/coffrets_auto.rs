@@ -52,6 +52,7 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::settings_repo::SettingsRepo;
 use super::track_repo::sql::chemin_ouvrable;
 use crate::TuneError;
+use crate::library::local_path::{dossier_comparable, dossier_et_nom, sous_le_dossier_stocke};
 use crate::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
 
 /// Clé, dans `album_metadata`, du marqueur de coffret. Valeur : un
@@ -84,9 +85,21 @@ pub struct Marqueur {
     /// Identité stable du coffret (vide pour un coffret manuel).
     #[serde(default)]
     pub cle: String,
-    /// Les disques d'origine, par numéro croissant (vide pour un manuel).
+    /// Les disques d'origine, par numéro croissant. Pour un coffret manuel,
+    /// ceux que la composition a réunis (vide pour un coffret composé avant
+    /// #5319, ou par « attacher »).
     #[serde(default)]
     pub disques: Vec<DisqueRetenu>,
+    /// Coffret manuel : le titre que la COMPOSITION lui a donné (#5319).
+    /// « Défaire » ne rend son titre d'origine à l'album que s'il porte
+    /// encore celui-là — un titre changé depuis est celui de l'utilisateur.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titre_compose: Option<String>,
+    /// Coffret manuel : le titre de l'album cible était DÉJÀ tenu à la main
+    /// (`edition_manuelle`) avant la composition. « Défaire » ne retire
+    /// alors pas ce marquage, qui n'est pas le sien.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub titre_tenu_avant: bool,
 }
 
 impl Marqueur {
@@ -95,7 +108,13 @@ impl Marqueur {
             origine: ORIGINE_MANUEL.into(),
             cle: String::new(),
             disques: vec![],
+            titre_compose: None,
+            titre_tenu_avant: false,
         }
+    }
+
+    pub fn est_manuel(&self) -> bool {
+        self.origine == ORIGINE_MANUEL
     }
 
     fn est_auto(&self) -> bool {
@@ -121,8 +140,21 @@ fn artiste_de_compilation(nom: &str) -> bool {
     l == "various artists" || l == "various" || l == "va" || l == "compilations"
 }
 
+/// Le dossier d'un chemin stocké, `/` et `\` confondus sous Windows (#5318).
+///
+/// 🔴 `rsplit_once('/')` seul ne trouvait RIEN dans `D:\Musique\X\CD1\01.flac`
+/// — `tracks.file_path` porte des antislashs sous Windows : la passe sautait
+/// tous les albums, et l'onglet « Coffrets » n'en voyait aucun rangé disque
+/// par disque. La coupe est celle de [`dossier_et_nom`], qui s'appuie sur la
+/// reconnaissance des racines de `library::local_path` (lecteur, UNC, POSIX).
 fn dossier_de(chemin: &str) -> Option<&str> {
-    chemin.rsplit_once('/').map(|(d, _)| d)
+    dossier_et_nom(chemin).map(|(d, _)| d)
+}
+
+/// Deux dossiers stockés désignent-ils le même ? Casse du lecteur et
+/// séparateurs Windows ne comptent pas ([`dossier_comparable`]).
+fn meme_dossier(a: Option<&str>, b: Option<&str>) -> bool {
+    a.map(dossier_comparable) == b.map(dossier_comparable)
 }
 
 fn placeholders(db: &Arc<dyn DbBackend>) -> (String, String) {
@@ -198,7 +230,7 @@ pub fn inventaire(db: &Arc<dyn DbBackend>) -> Result<Inventaire, TuneError> {
         let Some(dossier) = dossier_de(&premier) else {
             continue;
         };
-        if dossier_de(&dernier) != Some(dossier) {
+        if !meme_dossier(dossier_de(&dernier), Some(dossier)) {
             plusieurs_dossiers.insert(id);
         }
         albums.push(AlbumAGrouper {
@@ -298,7 +330,7 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
         }
     }
     disques.sort_by_key(|d| d.n);
-    disques.dedup_by(|a, b| a.dossier == b.dossier);
+    disques.dedup_by(|a, b| meme_dossier(Some(&a.dossier), Some(&b.dossier)));
 
     for &(n, id) in &c.disques {
         if inv.plusieurs_dossiers.contains(&id) {
@@ -334,6 +366,8 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
         origine: ORIGINE_AUTO.into(),
         cle: c.cle.clone(),
         disques,
+        titre_compose: None,
+        titre_tenu_avant: false,
     };
     let json = serde_json::to_string(&marqueur).unwrap_or_default();
     if let Err(e) = meta.set(cible, CLE_COFFRET, &json) {
@@ -497,10 +531,12 @@ pub fn defaire(db: &Arc<dyn DbBackend>, cible: i64) -> Result<Vec<i64>, RefusDef
     let (p1, p2) = placeholders(db);
     let mut recrees = Vec::new();
     for d in marqueur.disques.iter().skip(1) {
-        let prefixe = format!("{}/", d.dossier);
+        // `…/CD2/` en dur ne reconnaissait aucune piste de `C:\…\CD2\` : sous
+        // Windows le disque restait DANS le coffret alors que le refus était
+        // retenu (#5318).
         let siennes: Vec<i64> = pistes
             .iter()
-            .filter(|(_, chemin)| chemin.starts_with(&prefixe))
+            .filter(|(_, chemin)| sous_le_dossier_stocke(chemin, &d.dossier))
             .map(|(id, _)| *id)
             .collect();
         if siennes.is_empty() {
@@ -588,7 +624,8 @@ pub fn lister(db: &Arc<dyn DbBackend>) -> Result<Vec<CoffretListe>, TuneError> {
         let premier = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
         let dernier = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
         let origine = marques.get(&id).map(|m| m.origine.clone());
-        let range_disque_par_disque = disques >= 2 && dossier_de(&premier) != dossier_de(&dernier);
+        let range_disque_par_disque =
+            disques >= 2 && !meme_dossier(dossier_de(&premier), dossier_de(&dernier));
         if origine.is_some() || range_disque_par_disque {
             rendu.push(CoffretListe {
                 album_id: id,

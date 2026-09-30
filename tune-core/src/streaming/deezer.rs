@@ -29,6 +29,29 @@ impl std::fmt::Display for ArlAuthenticationError {
     }
 }
 
+/// #5427 — début du message d'erreur quand Deezer REFUSE un ARL. La route
+/// d'Accès et jetons s'y fie pour dire `etat: "refuse"` au client.
+pub const ARL_REFUSE: &str = "deezer: ARL refusé par Deezer";
+/// #5427 — début du message quand Deezer n'a pas pu être interrogé : l'ARL
+/// est gardé, rien n'est établi sur sa validité (`etat: "injoignable"`).
+pub const ARL_INJOIGNABLE: &str = "deezer: ARL non vérifié, Deezer injoignable";
+
+/// #5427 — clé du marqueur PERSISTANT de déconnexion volontaire, posée dans
+/// la ligne `auth_tokens_deezer` (table `settings`) par `save_tokens` après
+/// un `logout`. Tant qu'il est là, `TUNE_DEEZER_ARL` n'est plus relue au
+/// démarrage. Une nouvelle authentification (ARL saisi) l'efface : la ligne
+/// suivante porte l'ARL et plus le marqueur.
+pub const MARQUEUR_DECONNEXION_VOLONTAIRE: &str = "deconnexion_volontaire";
+
+/// La ligne `auth_tokens_deezer` porte-t-elle le marqueur de déconnexion
+/// volontaire ?
+pub fn deconnexion_volontaire(ligne: &serde_json::Value) -> bool {
+    ligne
+        .get(MARQUEUR_DECONNEXION_VOLONTAIRE)
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
 pub struct DeezerService {
     client: Client,
     access_token: Option<String>,
@@ -60,6 +83,10 @@ pub struct DeezerService {
     /// repart VRAIMENT dans l'appel suivant — et pas seulement qu'une
     /// fonction sait le mettre en forme.
     gw_url: String,
+    /// Racine de l'API publique. Vaut [`API_BASE`] partout ailleurs ; seuls
+    /// les témoins de pagination de la recherche (#4803) la déplacent vers un
+    /// serveur factice.
+    api_url: String,
     arl_rejected: bool,
     /// Cet ARL-ci a-t-il DÉJÀ authentifié dans ce processus ?
     ///
@@ -71,6 +98,11 @@ pub struct DeezerService {
     /// Nombre de réponses `USER_ID: 0` CONSÉCUTIVES depuis la dernière
     /// authentification réussie. Remis à zéro par tout succès.
     arl_zero_user_streak: u8,
+    /// #5427 — l'utilisateur s'est DÉCONNECTÉ. `save_tokens` rend alors une
+    /// ligne sans identifiant, qui ÉCRASE `auth_tokens_deezer` : sans elle,
+    /// la ligne de la session précédente (ARL compris) survivait à la
+    /// déconnexion et revenait au démarrage suivant.
+    deconnecte: bool,
     /// La langue du COMPTE Deezer, telle que la passerelle l'a nommée.
     ///
     /// 🔴 Fuites de français. [`DeezerService::gw_api_call`] portait
@@ -204,9 +236,11 @@ impl DeezerService {
             proxy_base_url: None,
             sid: std::sync::Mutex::new(None),
             gw_url: DEEZER_GW.to_string(),
+            api_url: API_BASE.to_string(),
             arl_rejected: false,
             arl_authenticated_once: false,
             arl_zero_user_streak: 0,
+            deconnecte: false,
             langue_du_compte: None,
         }
     }
@@ -300,6 +334,7 @@ impl DeezerService {
             ));
         }
         self.arl = Some(arl.into());
+        self.deconnecte = false;
         self.license_token = None;
         self.api_token = None;
         // Une authentification neuve ouvre une session neuve : un `sid`
@@ -384,6 +419,23 @@ impl DeezerService {
             "deezer_arl_authenticated"
         );
         Ok(true)
+    }
+
+    /// #5427 — l'ARL éprouvé auprès de Deezer, et une erreur qui dit
+    /// laquelle des deux choses s'est produite : Deezer a REFUSÉ l'ARL (il
+    /// faut en recoller un), ou Deezer n'a pas pu être interrogé (l'ARL est
+    /// gardé, le rafraîchisseur réessaiera). La valeur de l'ARL n'entre
+    /// jamais dans le message.
+    async fn authentifier_par_arl(&mut self, arl: &str) -> Result<AuthStatus, TuneError> {
+        match self.authenticate_arl_checked(arl).await {
+            Ok(_) => Ok(self.auth_status().await),
+            Err(ArlAuthenticationError::Rejected(raison)) => {
+                Err(format!("{ARL_REFUSE} ({raison})").into())
+            }
+            Err(ArlAuthenticationError::Unavailable(raison)) => {
+                Err(format!("{ARL_INJOIGNABLE} ({raison})").into())
+            }
+        }
     }
 
     pub async fn authenticate_arl(&mut self, arl: &str) -> Result<bool, String> {
@@ -518,7 +570,7 @@ impl DeezerService {
     /// Generic GET against the Deezer public API.
     /// Appends `access_token` query parameter when authenticated.
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
-        let mut url = format!("{API_BASE}{path}");
+        let mut url = format!("{}{path}", self.api_url);
         if let Some(ref token) = self.access_token {
             let sep = if url.contains('?') { '&' } else { '?' };
             url = format!("{url}{sep}access_token={token}");
@@ -644,6 +696,55 @@ impl DeezerService {
     }
 
     /// Collect items from a Deezer paginated `data` array.
+    /// La page `depart` des quatre réponses de recherche — pistes, albums,
+    /// artistes, playlists, dans cet ordre (#4803).
+    ///
+    /// `has_more` suit `next`, le signal de Deezer lui-même : il manque à la
+    /// dernière page. Une page vide n'annonce jamais de suite. `total` peut
+    /// promettre plus que ce que `next` sert encore : la page le dit alors
+    /// par `truncated`, sans inventer de suite.
+    fn page_de_recherche(reponses: [&serde_json::Value; 4], depart: usize) -> SearchPage {
+        let [tracks, albums, artists, playlists] = reponses;
+        let total = |r: &serde_json::Value| r["total"].as_u64().unwrap_or(0) as usize;
+        let results = SearchResults {
+            tracks: Self::collect_data(tracks, Self::map_track),
+            albums: Self::collect_data(albums, Self::map_album),
+            artists: Self::collect_data(artists, Self::map_artist),
+            playlists: Self::collect_data(playlists, Self::map_playlist),
+        };
+        let par_categorie = [
+            (tracks, results.tracks.len()),
+            (albums, results.albums.len()),
+            (artists, results.artists.len()),
+            (playlists, results.playlists.len()),
+        ];
+        let suite = |r: &serde_json::Value, rendu: usize| rendu > 0 && r["next"].is_string();
+        let has_more = par_categorie.iter().any(|&(r, rendu)| suite(r, rendu));
+        let truncated = par_categorie
+            .iter()
+            .any(|&(r, rendu)| !suite(r, rendu) && depart + rendu < total(r));
+        SearchPage {
+            results,
+            offset: depart,
+            totals: SearchTotals {
+                tracks: total(tracks),
+                albums: total(albums),
+                artists: total(artists),
+                playlists: total(playlists),
+            },
+            has_more,
+            truncated,
+        }
+    }
+
+    /// La réponse de `/artist/{id}/related`, sans les entrées sans identifiant.
+    fn artistes_proches(data: &serde_json::Value) -> Vec<StreamArtist> {
+        Self::collect_data(data, Self::map_artist)
+            .into_iter()
+            .filter(|a| a.id != "0" && !a.name.is_empty())
+            .collect()
+    }
+
     fn collect_data<T>(data: &serde_json::Value, mapper: fn(&serde_json::Value) -> T) -> Vec<T> {
         data["data"]
             .as_array()
@@ -679,17 +780,46 @@ impl StreamingService for DeezerService {
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
         // Path 1: ARL token (full streaming with decrypt proxy)
+        //
+        // #5427 — l'erreur dit laquelle des deux choses s'est produite :
+        // Deezer a REFUSÉ l'ARL (il faut en recoller un), ou Deezer n'a pas
+        // pu être interrogé (l'ARL est gardé, le rafraîchisseur réessaiera).
+        // La valeur de l'ARL n'entre jamais dans le message.
         if let Some(arl) = credentials["arl"].as_str() {
-            self.authenticate_arl(arl).await?;
-            return Ok(self.auth_status().await);
+            return self.authentifier_par_arl(arl.trim()).await;
         }
 
         // Path 2: pre-existing access token (testing / manual setup)
         if let Some(token) = credentials["access_token"].as_str() {
             self.access_token = Some(token.into());
+            self.deconnecte = false;
             self.fetch_user_profile().await?;
             info!(username = ?self.username, "deezer_authenticated_token");
             return Ok(self.auth_status().await);
+        }
+
+        // #5427 — « Se connecter » sur la carte Streaming poste un corps vide
+        // (le serveur y lit `{"device_flow": true}`), et un sondage d'état
+        // poste `{"poll": true}`. Aucun des deux n'est un échange OAuth :
+        // Deezer n'a pas de flot par code d'appareil. On tombait pourtant
+        // dans le chemin 3, qui répondait « deezer: app_id required » — un
+        // message qui parle d'un identifiant que l'utilisateur n'a pas, au
+        // lieu de l'ARL qu'il doit fournir (fil 2035).
+        if credentials.get("app_id").is_none() && credentials.get("code").is_none() {
+            // Un sondage ne fait qu'observer : il rend l'état courant.
+            if credentials.get("poll").is_some()
+                && (self.arl.is_some() || self.access_token.is_some())
+            {
+                return Ok(self.auth_status().await);
+            }
+            // Un ARL est déjà connu (enregistré, restauré) : on le
+            // ré-éprouve, c'est ce que « Se connecter » veut dire.
+            if let Some(arl) = self.arl.clone() {
+                return self.authentifier_par_arl(&arl).await;
+            }
+            return Err("deezer: aucun ARL enregistré — collez votre ARL dans \
+                        Réglages ▸ Accès et jetons ▸ Deezer"
+                .into());
         }
 
         // Path 3: OAuth code exchange (server-side flow)
@@ -725,6 +855,7 @@ impl StreamingService for DeezerService {
             .as_str()
             .ok_or("deezer: no access_token in response")?;
         self.access_token = Some(token.into());
+        self.deconnecte = false;
         self.fetch_user_profile().await?;
         info!(username = ?self.username, "deezer_authenticated_oauth");
         Ok(self.auth_status().await)
@@ -743,6 +874,19 @@ impl StreamingService for DeezerService {
         self.access_token = None;
         self.username = None;
         self.user_id = None;
+        // #5427 — se déconnecter efface l'ARL. Il restait en mémoire (le
+        // service se disait toujours connecté) et dans `auth_tokens_deezer`.
+        self.arl = None;
+        self.license_token = None;
+        self.api_token = None;
+        if let Ok(mut guard) = self.sid.lock() {
+            *guard = None;
+        }
+        self.arl_rejected = false;
+        self.arl_authenticated_once = false;
+        self.arl_zero_user_streak = 0;
+        self.deconnecte = true;
+        info!("deezer_deconnecte_arl_efface");
         Ok(())
     }
 
@@ -776,6 +920,52 @@ impl StreamingService for DeezerService {
             artists: Self::collect_data(&artists_data, Self::map_artist),
             playlists: Self::collect_data(&playlists_data, Self::map_playlist),
         })
+    }
+
+    /// La page de [`Self::search_page`] : 50, `0` (« Tous ») compris (#4803).
+    /// Explicite, et non hérité : le défaut du trait suit la limite du chemin
+    /// non paginé depuis la PR de la limite de #4803, et ce n'est pas la
+    /// page de ce service.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_sans_pagination(limit)
+    }
+
+    /// Une PAGE de la recherche Deezer (#4803) : `index` et `limit`, les deux
+    /// paramètres de pagination de l'API publique. Chaque réponse de
+    /// `/search`, `/search/album`, `/search/artist` et `/search/playlist`
+    /// porte `data`, `total` et, tant qu'il en reste, `next` — l'URL de la page
+    /// suivante (`…&index=52` après `index=50&limit=2`, mesuré le 29/09/2026).
+    ///
+    /// Pages de 50 ([`limite_sans_pagination`]), et
+    /// [`Self::limite_de_page_recherche`] le dit à la route, pour que son
+    /// curseur avance sans trou.
+    ///
+    /// Contrairement à [`Self::search`], qui tait l'échec des trois requêtes
+    /// secondaires, une page échoue ENTIÈRE si l'une échoue : une catégorie
+    /// vidée par un refus (quota, code 4) annoncerait `has_more: false`, soit
+    /// la fin d'un catalogue qui continue. Les refus sont ceux
+    /// d'[`Self::api_get`] (objet `error` de la réponse).
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchPage, TuneError> {
+        let encoded = urlencoding::encode(query);
+        let borne = limite_sans_pagination(limit);
+        let fenetre = format!("q={encoded}&index={offset}&limit={borne}");
+        let [pistes, albums, artistes, listes] = ["", "/album", "/artist", "/playlist"]
+            .map(|categorie| format!("/search{categorie}?{fenetre}"));
+        let (tracks, albums, artists, playlists) = tokio::try_join!(
+            self.api_get(&pistes),
+            self.api_get(&albums),
+            self.api_get(&artistes),
+            self.api_get(&listes),
+        )?;
+        Ok(Self::page_de_recherche(
+            [&tracks, &albums, &artists, &playlists],
+            offset,
+        ))
     }
 
     // ── track ────────────────────────────────────────────────────────
@@ -904,6 +1094,26 @@ impl StreamingService for DeezerService {
             .api_get(&format!("/artist/{artist_id}/top?limit=20"))
             .await?;
         Ok(Self::collect_data(&data, Self::map_track))
+    }
+
+    /// `GET /artist/{id}/related` — l'API publique de Deezer rend les artistes
+    /// proches (`{"data":[{"id","name","picture_big",…}],"total"}` ; mesuré le
+    /// 29/09/2026 sur l'artiste 27, sans jeton). Sert la radio artiste (#5395).
+    async fn get_similar_artists(
+        &self,
+        artist_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamArtist>, TuneError> {
+        let data = self
+            .api_get(&format!("/artist/{artist_id}/related?limit={limit}"))
+            .await?;
+        Ok(Self::artistes_proches(&data))
+    }
+
+    /// `get_similar_artists` ci-dessus : « Plus comme ça » s'ouvre aussi à ce
+    /// service (#5395, décision de Bertrand du 29/09/2026).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
     }
 
     // ── playlist ─────────────────────────────────────────────────────
@@ -1145,6 +1355,15 @@ impl StreamingService for DeezerService {
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
         if self.access_token.is_none() && self.arl.is_none() {
+            // Après une déconnexion, une ligne SANS identifiant remplace
+            // celle de la session close (#5427). `restore_tokens` la relit
+            // comme « rien à restaurer ».
+            if self.deconnecte {
+                return Some(serde_json::json!({
+                    "quality": self.quality,
+                    MARQUEUR_DECONNEXION_VOLONTAIRE: true,
+                }));
+            }
             return None;
         }
         Some(serde_json::json!({
@@ -1158,6 +1377,9 @@ impl StreamingService for DeezerService {
 
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
         let mut restored = false;
+        // Le marqueur survit aux redémarrages : relu ici, il est réécrit par
+        // le prochain `save_tokens` tant qu'aucun ARL n'a été saisi.
+        self.deconnecte = deconnexion_volontaire(tokens);
         if let Some(t) = tokens["access_token"].as_str() {
             self.access_token = Some(t.into());
             restored = true;
@@ -1414,6 +1636,31 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].title, "A");
         assert_eq!(tracks[1].title, "B");
+    }
+
+    #[test]
+    fn artistes_proches_de_related() {
+        // La forme mesurée le 29/09/2026 sur `GET /artist/27/related`.
+        let data = json!({
+            "data": [
+                {"id": 6404, "name": "Justice", "picture_big": "https://x/500.jpg", "type": "artist"},
+                {"id": 2049, "name": "Cassius", "type": "artist"},
+                {"name": "sans identifiant"}
+            ],
+            "total": 3
+        });
+        let v = DeezerService::artistes_proches(&data);
+        let noms: Vec<(&str, &str)> = v.iter().map(|a| (a.id.as_str(), a.name.as_str())).collect();
+        assert_eq!(noms, vec![("6404", "Justice"), ("2049", "Cassius")]);
+        assert_eq!(v[0].image_path.as_deref(), Some("https://x/500.jpg"));
+        assert!(DeezerService::artistes_proches(&json!({"error": {}})).is_empty());
+    }
+
+    /// #5395 — « Plus comme ça » est ouvert à Deezer : la route ne lui répond
+    /// plus 501.
+    #[test]
+    fn deezer_declare_ses_artistes_similaires() {
+        assert!(DeezerService::new().propose_des_artistes_similaires());
     }
 
     #[test]
@@ -1934,5 +2181,377 @@ mod tests {
             "http://192.168.1.10:8888/deezer-proxy/deezer/92720184.flac"
         );
         assert_eq!(stream.mime_type, "audio/flac");
+    }
+
+    // ── #5427 : « Se connecter » sans ARL, et l'ARL déjà connu ─────────
+
+    /// Fil 2035 : « Se connecter » sur la carte Streaming poste un corps vide,
+    /// que la route lit `{"device_flow": true}`. On tombait dans l'échange
+    /// OAuth et l'écran affichait « deezer: app_id required ». L'erreur doit
+    /// dire ce qui manque vraiment : l'ARL, et où le coller.
+    #[tokio::test]
+    async fn se_connecter_sans_arl_nomme_l_arl_et_non_app_id() {
+        let mut svc = DeezerService::new();
+        let erreur = svc
+            .authenticate(&json!({ "device_flow": true }))
+            .await
+            .expect_err("aucun ARL connu : la connexion ne peut pas réussir")
+            .to_string();
+        assert!(
+            !erreur.contains("app_id"),
+            "« Se connecter » sans ARL ne doit plus répondre app_id (#5427) : {erreur}"
+        );
+        assert!(erreur.contains("ARL"), "{erreur}");
+    }
+
+    /// Un ARL déjà connu du service (enregistré, restauré) : « Se connecter »
+    /// le ré-éprouve auprès de la passerelle — ici un faux Deezer local.
+    #[tokio::test]
+    async fn se_connecter_reeprouve_l_arl_deja_connu() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string()],
+        ));
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        svc.arl = Some("a".repeat(192));
+
+        let status = svc
+            .authenticate(&json!({ "device_flow": true }))
+            .await
+            .expect("l'ARL connu doit être éprouvé, pas l'échange OAuth");
+        assert!(status.authenticated);
+        assert_eq!(status.username.as_deref(), Some("testeur"));
+        assert_eq!(svc.license_token.as_deref(), Some("LIC"));
+        let requetes = serveur.await.expect("faux serveur");
+        assert!(
+            requetes[0].contains("deezer.getUserData"),
+            "{}",
+            requetes[0]
+        );
+    }
+
+    /// Un ARL que la passerelle refuse (`USER_ID: 0`) : l'erreur le nomme, et
+    /// la valeur de l'ARL n'y apparaît jamais.
+    #[tokio::test]
+    async fn un_arl_refuse_est_nomme_sans_etre_recopie() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":0},"checkForm":"CF"}}"#.to_string()],
+        ));
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        let arl = "z".repeat(192);
+
+        let erreur = svc
+            .authenticate(&json!({ "arl": arl }))
+            .await
+            .expect_err("USER_ID 0 : ARL refusé")
+            .to_string();
+        serveur.await.expect("faux serveur");
+        assert!(erreur.contains("ARL refusé par Deezer"), "{erreur}");
+        assert!(
+            !erreur.contains(&arl),
+            "l'erreur ne doit pas recopier l'ARL"
+        );
+        assert!(!svc.auth_status().await.authenticated);
+    }
+
+    /// Bertrand, 29/09 (#5427) : se déconnecter de Deezer efface l'ARL — en
+    /// mémoire, et dans la ligne persistée qui revenait au démarrage.
+    #[tokio::test]
+    async fn se_deconnecter_efface_l_arl_et_la_ligne_persistee() {
+        let arl = "d".repeat(192);
+        let mut svc = DeezerService::new();
+        assert!(svc.restore_tokens(&json!({ "arl": arl, "username": "testeur" })));
+        assert!(svc.auth_status().await.authenticated);
+
+        svc.logout().await.unwrap();
+
+        assert!(
+            !svc.auth_status().await.authenticated,
+            "après déconnexion, Deezer ne doit plus se dire connecté"
+        );
+        let ligne = svc
+            .save_tokens()
+            .expect("une ligne sans identifiant doit remplacer l'ancienne");
+        assert!(
+            !ligne.to_string().contains(&arl),
+            "la ligne persistée porte encore l'ARL : {ligne}"
+        );
+        let mut relu = DeezerService::new();
+        assert!(
+            !relu.restore_tokens(&ligne),
+            "la ligne écrite après déconnexion ne doit rien restaurer"
+        );
+    }
+
+    /// #5427 (Bertrand, 29/09 au soir) — la déconnexion pose un marqueur
+    /// PERSISTANT, relu au démarrage et effacé par une nouvelle saisie.
+    #[tokio::test]
+    async fn la_deconnexion_pose_un_marqueur_persistant_qu_une_saisie_efface() {
+        let mut svc = DeezerService::new();
+        svc.restore_tokens(&json!({ "arl": "d".repeat(192) }));
+        svc.logout().await.unwrap();
+        let ligne = svc.save_tokens().expect("ligne après déconnexion");
+        assert!(deconnexion_volontaire(&ligne), "marqueur absent : {ligne}");
+
+        // Redémarrage : le marqueur est relu, et réécrit tel quel.
+        let mut relu = DeezerService::new();
+        relu.restore_tokens(&ligne);
+        assert!(deconnexion_volontaire(
+            &relu.save_tokens().expect("ligne relue")
+        ));
+
+        // Nouvelle saisie : la ligne porte l'ARL et plus le marqueur.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string()],
+        ));
+        relu.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        relu.authenticate(&json!({ "arl": "e".repeat(192) }))
+            .await
+            .unwrap();
+        serveur.await.unwrap();
+        assert!(!deconnexion_volontaire(&relu.save_tokens().unwrap()));
+    }
+}
+
+/*
+| #4803 — la recherche Deezer pagine : `index` et `limit` de l'API publique.
+|
+| Un serveur factice sur la boucle locale sert, sur les quatre routes de
+| recherche, un catalogue de `total` éléments dont il ne sert que les `servi`
+| premiers (`next` s'arrête là), et NOTE chaque requête reçue. Les témoins
+| lisent ce qui est parti sur le fil : un `index` calculé et jamais envoyé
+| rendrait la page 1 à chaque appel.
+*/
+#[cfg(test)]
+mod pagination_recherche_i4803 {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    type Journal = Arc<Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+    #[derive(Clone)]
+    struct Catalogue {
+        journal: Journal,
+        total: usize,
+        servi: usize,
+    }
+
+    async fn faux_deezer(total: usize, servi: usize) -> (DeezerService, Journal) {
+        use axum::extract::{Query, State};
+        use axum::http::Uri;
+        use axum::routing::get;
+
+        async fn recherche(
+            State(c): State<Catalogue>,
+            uri: Uri,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::Json<serde_json::Value> {
+            let route = uri.path().to_string();
+            c.journal.lock().unwrap().push((route.clone(), q.clone()));
+            if q.get("q").map(String::as_str) == Some("quota") && route == "/search/album" {
+                return axum::Json(json!({"error": {"type": "Exception",
+                    "message": "Quota limit exceeded", "code": 4}}));
+            }
+            let index: usize = q.get("index").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
+            let fin = (index + limit).min(c.servi).min(c.total);
+            let data: Vec<_> = (index..fin.max(index))
+                .map(|i| {
+                    json!({"id": i + 1, "title": format!("n{}", i + 1),
+                    "name": format!("n{}", i + 1), "artist": {"name": "X"}, "album": {}})
+                })
+                .collect();
+            let mut corps = json!({"data": data, "total": c.total});
+            if fin < c.total.min(c.servi) {
+                corps["next"] = json!(format!(
+                    "https://api.deezer.com{route}?q=x&limit={limit}&index={fin}"
+                ));
+            }
+            axum::Json(corps)
+        }
+
+        let journal: Journal = Arc::default();
+        let etat = Catalogue {
+            journal: journal.clone(),
+            total,
+            servi,
+        };
+        let app = axum::Router::new()
+            .route("/search", get(recherche))
+            .route("/search/album", get(recherche))
+            .route("/search/artist", get(recherche))
+            .route("/search/playlist", get(recherche))
+            .with_state(etat);
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let mut svc = DeezerService::new();
+        svc.api_url = format!("http://{adresse}");
+        (svc, journal)
+    }
+
+    /// Ce que la route `route` a reçu en `cle`, pour chacun de ses appels.
+    fn envoye(journal: &Journal, route: &str, cle: &str) -> Vec<Option<String>> {
+        journal
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == route)
+            .map(|(_, q)| q.get(cle).cloned())
+            .collect()
+    }
+
+    fn ids(page: &SearchPage) -> Vec<String> {
+        page.results.tracks.iter().map(|t| t.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn la_premiere_page_envoie_index_zero_et_annonce_la_suite() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 0).await.expect("page 1");
+
+        for route in [
+            "/search",
+            "/search/album",
+            "/search/artist",
+            "/search/playlist",
+        ] {
+            assert_eq!(
+                envoye(&journal, route, "index"),
+                vec![Some("0".into())],
+                "{route}"
+            );
+            assert_eq!(
+                envoye(&journal, route, "limit"),
+                vec![Some("50".into())],
+                "{route}"
+            );
+        }
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(page.results.albums.len(), 50);
+        assert_eq!(ids(&page)[0], "1");
+        assert_eq!(
+            page.totals.tracks, 120,
+            "le total de l'API, pas la longueur"
+        );
+        assert_eq!(page.totals.playlists, 120);
+        assert!(page.has_more);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn la_deuxieme_page_transmet_son_index_a_l_api() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 50).await.expect("page 2");
+
+        assert_eq!(
+            envoye(&journal, "/search", "index"),
+            vec![Some("50".into())],
+            "sans index envoyé, Deezer rend la page 1 une deuxième fois"
+        );
+        assert_eq!(
+            envoye(&journal, "/search/artist", "index"),
+            vec![Some("50".into())]
+        );
+        assert_eq!(ids(&page).first().map(String::as_str), Some("51"));
+        assert_eq!(ids(&page).last().map(String::as_str), Some("100"));
+        assert_eq!(page.offset, 50);
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn la_derniere_page_n_annonce_plus_rien() {
+        let (svc, _) = faux_deezer(120, usize::MAX).await;
+        let page = svc.search_page("coltrane", 50, 100).await.expect("page 3");
+
+        assert_eq!(page.results.tracks.len(), 20);
+        assert_eq!(ids(&page).last().map(String::as_str), Some("120"));
+        assert!(!page.has_more, "pas de `next` : plus de « Charger plus »");
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn un_total_que_next_ne_sert_plus_est_une_page_tronquee() {
+        let (svc, _) = faux_deezer(5000, 300).await;
+        let page = svc.search_page("love", 50, 250).await.expect("page 6");
+        assert_eq!(page.results.tracks.len(), 50);
+        assert_eq!(page.totals.tracks, 5000);
+        assert!(!page.has_more, "Deezer ne donne plus de `next`");
+        assert!(page.truncated, "le total promet plus que ce qui est servi");
+
+        let au_dela = svc.search_page("love", 50, 300).await.expect("au-delà");
+        assert!(au_dela.results.tracks.is_empty());
+        assert!(!au_dela.has_more, "une page vide n'annonce jamais de suite");
+    }
+
+    #[tokio::test]
+    async fn tous_et_les_limites_extravagantes_valent_une_page_de_50() {
+        let (svc, journal) = faux_deezer(500, usize::MAX).await;
+        svc.search_page("x", 0, 0).await.expect("Tous");
+        svc.search_page("x", 100_000, 0).await.expect("énorme");
+        assert_eq!(
+            envoye(&journal, "/search", "limit"),
+            vec![Some("50".into()), Some("50".into())]
+        );
+        assert_eq!(
+            svc.limite_de_page_recherche(0),
+            50,
+            "le curseur avance de 50"
+        );
+        assert_eq!(
+            svc.limite_de_page_recherche(100),
+            50,
+            "100 demandés, 50 servis : le curseur avance de 50, sans trou"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_quota_depasse_est_une_erreur_pas_une_fin_de_catalogue() {
+        let (svc, _) = faux_deezer(120, usize::MAX).await;
+        let err = svc.search_page("quota", 50, 50).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Quota limit exceeded"),
+            "des albums vidés par un refus diraient has_more=false : {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_recherche_sans_page_part_comme_avant_sans_index() {
+        let (svc, journal) = faux_deezer(120, usize::MAX).await;
+        let res = svc.search("coltrane", 30).await.expect("search");
+        assert_eq!(res.tracks.len(), 30);
+        for route in [
+            "/search",
+            "/search/album",
+            "/search/artist",
+            "/search/playlist",
+        ] {
+            assert_eq!(envoye(&journal, route, "limit"), vec![Some("30".into())]);
+            assert_eq!(
+                envoye(&journal, route, "index"),
+                vec![None],
+                "sans paged=true, la requête d'avant #4803, intacte ({route})"
+            );
+        }
     }
 }

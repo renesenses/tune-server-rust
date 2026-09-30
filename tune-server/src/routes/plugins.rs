@@ -28,6 +28,8 @@ pub fn router() -> Router<AppState> {
         .route("/{name}/enable", post(enable_plugin))
         .route("/{name}/disable", post(disable_plugin))
         .route("/{name}/install", post(install_plugin))
+        // #5403 — relancer le `setup()` d'un greffon resté en erreur.
+        .route("/{name}/retry", post(retry_plugin))
         .route("/{name}/update", post(update_plugin));
 
     // P2 of the plugin ABI (RFC §3.5): a single catch-all that dispatches
@@ -279,7 +281,14 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     // Read from the snapshot `plugins::init` published, never from the loader:
     // event dispatch holds the loader's lock across every plugin's `on_event`,
     // so reaching for it here would let one slow plugin hang this endpoint.
-    for info in plugin_snapshot(&state) {
+    //
+    // #5403 — plus ceux qu'un nouvel essai a chargés depuis : ils n'étaient
+    // pas dans l'instantané du démarrage.
+    let report = setup_report_snapshot(&state);
+    for info in plugin_snapshot(&state)
+        .iter()
+        .chain(report.loaded_after_retry.iter())
+    {
         let mut card = serde_json::json!({
             "name": info.name,
             "display_name": info.name,
@@ -357,6 +366,15 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         plugins.push(card);
     }
 
+    // #5403 — les greffons compilés dont le `setup()` a dépassé la borne ou
+    // a échoué. Ils ne tournent pas, mais ils ne disparaissent plus : statut
+    // « error », motif `setup_timeout` (« démarrage trop long ») ou
+    // `setup_failed` (avec le message expurgé du greffon), durée, et la route
+    // Réessayer.
+    for error in &report.errors {
+        plugins.push(carte_en_erreur(&settings, error));
+    }
+
     // Wasm plugins installed on disk (marketplace installs or bundled).
     // Scanned from the plugins dir rather than the loaded registry so a
     // disabled plugin — or one installed since the last restart — still shows
@@ -412,6 +430,134 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     }
 
     Json(json!(plugins))
+}
+
+/// Les `setup()` en erreur et les greffons chargés par un nouvel essai
+/// (#5403), copiés hors du verrou.
+fn setup_report_snapshot(state: &AppState) -> tune_core::plugin_sdk::PluginSetupReport {
+    state
+        .plugin_setup_report
+        .lock()
+        .map(|r| r.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// La fiche d'un greffon compilé resté en erreur (#5403).
+///
+/// `status: "error"` et `error_reason` sont le contrat de l'écran : un client
+/// qui ne les connaît pas voit une fiche SDK installée et non chargée, comme
+/// une fiche dormante — rien ne casse chez lui.
+fn carte_en_erreur(
+    settings: &SettingsRepo,
+    error: &tune_core::plugin_sdk::PluginSetupError,
+) -> Value {
+    let mut card = json!({
+        "name": error.name,
+        "display_name": error.name,
+        "description": error.description,
+        "version": error.version,
+        "type": "sdk",
+        "installed": true,
+        "enabled": true,
+        "loaded": false,
+        "status": "error",
+        "error_reason": error.reason.as_str(),
+        "error_message": error.message,
+        "setup_duration_ms": error.duration_ms,
+        "setup_timeout_ms": error.timeout_ms,
+        "retry_url": format!("/api/v1/plugins/{}/retry", error.name),
+        "url": format!("/api/v1/ext/{}", error.name),
+        "config_schema": error.config_schema,
+        "premium": tune_core::audio::premium_plugins::requires_premium(&error.name)
+            || error.required_feature.is_some(),
+        "required_feature": error.required_feature,
+        "activation_error": tune_plugin_native::failure(&error.name),
+        // Compilé dans CE binaire et passé par la porte d'ABI : seul son
+        // `setup()` n'a pas abouti.
+        "compatible": true,
+    });
+    crate::premium_audio_plugins::annotate(settings, &error.name, &mut card);
+    card
+}
+
+/// #5403 — Réessayer : relance le `setup()` d'un greffon resté en erreur,
+/// sous la même borne ([`tune_core::plugin_sdk::PLUGIN_SETUP_TIMEOUT`]) et
+/// avec la même mesure qu'au démarrage.
+///
+/// Aucune route de rechargement n'existait : la porte de `setup_all` ne
+/// s'ouvre qu'au démarrage (voir [`enable_plugin`]). Celle-ci ne rouvre que
+/// le greffon en erreur, rien d'autre.
+///
+/// Réussi, le greffon reçoit aussitôt les événements, et ses sorties et zones
+/// sont installées ; ses routes HTTP, elles, ne se montent qu'au démarrage
+/// suivant — `restart_required` le dit. Toujours en erreur, la réponse est la
+/// fiche en erreur, avec la durée de ce nouvel essai.
+///
+/// L'essai tourne dans une tâche à part : un client qui ferme la connexion
+/// pendant les 30 s ne doit pas emporter le greffon avec le futur abandonné.
+async fn retry_plugin(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use tune_core::plugin_sdk::PluginRetryOutcome;
+
+    let plugins = state.plugins.clone();
+    let nom = name.clone();
+    let essai = tokio::spawn(async move {
+        let mut loader = plugins.lock().await;
+        let outcome = loader.retry_setup(&nom).await;
+        if matches!(outcome, PluginRetryOutcome::Loaded { .. }) {
+            loader.ensure_event_dispatch();
+        }
+        outcome
+    })
+    .await;
+
+    match essai {
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "plugin_retry_failed", "message": e.to_string() })),
+        )
+            .into_response(),
+        Ok(PluginRetryOutcome::NotInError) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "plugin_not_in_error", "name": name })),
+        )
+            .into_response(),
+        Ok(PluginRetryOutcome::InProgress) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "plugin_retry_in_progress", "name": name })),
+        )
+            .into_response(),
+        Ok(PluginRetryOutcome::Loaded {
+            duration_ms,
+            registrations,
+        }) => {
+            let routers = crate::plugins::install(&state, registrations).await;
+            let restart_required = !routers.is_empty();
+            tracing::info!(
+                plugin_name = %name,
+                duration_ms,
+                routers = routers.len(),
+                restart_required,
+                "plugin_setup_retry_loaded"
+            );
+            Json(json!({
+                "name": name,
+                "status": "loaded",
+                "loaded": true,
+                "setup_duration_ms": duration_ms,
+                "restart_required": restart_required,
+            }))
+            .into_response()
+        }
+        Ok(PluginRetryOutcome::StillInError(error)) => {
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let mut card = carte_en_erreur(&settings, &error);
+            card["restart_required"] = Value::Bool(false);
+            Json(card).into_response()
+        }
+    }
 }
 
 /// The plugins `plugins::init` loaded, or an empty slice before it has run.
@@ -495,7 +641,15 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(info) = plugin_snapshot(&state).iter().find(|p| p.name == name) {
+    let report = setup_report_snapshot(&state);
+    if let Some(error) = report.errors.iter().find(|e| e.name == name) {
+        return Json(carte_en_erreur(&settings, error));
+    }
+    if let Some(info) = plugin_snapshot(&state)
+        .iter()
+        .chain(report.loaded_after_retry.iter())
+        .find(|p| p.name == name)
+    {
         let mut card = json!({
             "name": info.name,
             "description": info.description,
@@ -593,7 +747,12 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
 /// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
 /// `disable` taisait celui qu'il faut pour le décharger (#5112).
 fn greffon_charge(state: &AppState, name: &str) -> bool {
-    plugin_snapshot(state).iter().any(|p| p.name == name) || wasm_charge(state, name)
+    plugin_snapshot(state).iter().any(|p| p.name == name)
+        || setup_report_snapshot(state)
+            .loaded_after_retry
+            .iter()
+            .any(|p| p.name == name)
+        || wasm_charge(state, name)
 }
 
 /// Le greffon wasm `name` est-il dans le registre publié au démarrage ?

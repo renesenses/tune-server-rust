@@ -273,53 +273,208 @@ pub fn distance_grossiere(a: &Empreinte, b: &Empreinte) -> Option<f64> {
     Some(somme / compte as f64)
 }
 
+/// Trames par bloc du minorant de [`peut_etre_meme_contenu`].
+const TRAMES_PAR_BLOC: usize = 10;
+
+/// Les sommes cumulées des deux octets d'une empreinte : la somme de
+/// n'importe quelle plage de trames en deux soustractions.
+struct Cumuls {
+    energie: Vec<i64>,
+    passages: Vec<i64>,
+}
+
+impl Cumuls {
+    fn de(e: &Empreinte) -> Self {
+        let mut energie = Vec::with_capacity(e.trames.len() + 1);
+        let mut passages = Vec::with_capacity(e.trames.len() + 1);
+        let (mut se, mut sz) = (0i64, 0i64);
+        energie.push(0);
+        passages.push(0);
+        for [t_e, t_z] in &e.trames {
+            se += *t_e as i64;
+            sz += *t_z as i64;
+            energie.push(se);
+            passages.push(sz);
+        }
+        Self { energie, passages }
+    }
+    fn longueur(&self) -> usize {
+        self.energie.len() - 1
+    }
+}
+
+/// Un MINORANT de [`distance`], sans parcourir les trames — #5455.
+///
+/// Pour chaque décalage que [`distance`] essaie (mêmes bornes, même
+/// recouvrement minimal), la somme des écarts absolus trame à trame est au
+/// moins la somme, bloc par bloc de [`TRAMES_PAR_BLOC`] trames, des écarts
+/// absolus des SOMMES du bloc (inégalité triangulaire). Si ce minorant dépasse
+/// [`SEUIL_MEME_CONTENU`] pour tous les décalages, [`meme_contenu`] est faux :
+/// `false` est alors une certitude, `true` seulement une possibilité.
+/// Environ cinq fois moins d'opérations que [`distance`].
+fn peut_etre_meme_contenu(a: &Cumuls, b: &Cumuls) -> bool {
+    let (la, lb) = (a.longueur(), b.longueur());
+    if la == 0 || lb == 0 {
+        return false;
+    }
+    let plus_courte = la.min(lb);
+    // Une marge contre l'arrondi : le minorant est exact (entiers), la
+    // distance est une somme de flottants.
+    let seuil = SEUIL_MEME_CONTENU + 1e-9;
+    for decalage in -(DECALAGE_MAX as isize)..=(DECALAGE_MAX as isize) {
+        let (ia, ib) = if decalage >= 0 {
+            (decalage as usize, 0usize)
+        } else {
+            (0usize, (-decalage) as usize)
+        };
+        let n = la.saturating_sub(ia).min(lb.saturating_sub(ib));
+        if (n as f64) < (plus_courte as f64 * RECOUVREMENT_MIN) {
+            continue;
+        }
+        let mut somme = 0i64;
+        let mut debut = 0usize;
+        while debut < n {
+            let fin = (debut + TRAMES_PAR_BLOC).min(n);
+            let bloc = |c: &[i64], o: usize| c[o + fin] - c[o + debut];
+            somme += (bloc(&a.energie, ia) - bloc(&b.energie, ib)).abs()
+                + (bloc(&a.passages, ia) - bloc(&b.passages, ib)).abs();
+            debut = fin;
+        }
+        if somme as f64 / 510.0 / n as f64 <= seuil {
+            return true;
+        }
+    }
+    false
+}
+
+/// La tolérance sur la DURÉE RÉELLE des deux pistes, en millisecondes : la
+/// même seconde que [`TOLERANCE_DUREE_TRAMES`] (dix trames de 100 ms).
+///
+/// 🔴 #5455 — la tolérance en trames ne borne RIEN au-delà d'une minute :
+/// l'empreinte s'arrête à [`FENETRE_S`], et toute piste de plus d'une minute
+/// et demie a exactement 600 trames. « Durées à une seconde près » ne triait
+/// donc plus rien, et le regroupement comparait chaque piste à toutes les
+/// autres — mesuré le 29/09/2026 sur Shrek : 347 s pour 2 000 pistes
+/// empreintées, un temps qui quadruple quand la bibliothèque double.
+pub const TOLERANCE_DUREE_MS: i64 = 1_000;
+
 /// Regroupe des pistes par contenu : les paires dont les durées utiles sont à
 /// [`TOLERANCE_DUREE_TRAMES`] près, qui passent le préfiltre grossier puis
 /// [`meme_contenu`], sont réunies (union-find). Rend les groupes d'au moins
 /// deux identifiants, les plus grands d'abord, identifiants croissants.
+///
+/// Sans durée réelle : voir [`grouper_par_contenu_avec_durees`].
 pub fn grouper_par_contenu(empreintes: &[(i64, Empreinte)]) -> Vec<Vec<i64>> {
+    grouper_par_contenu_avec_durees(empreintes, &[])
+}
+
+/// [`grouper_par_contenu`], où deux pistes dont les durées RÉELLES
+/// (`durees_ms[i]`, en millisecondes) sont connues ne se comparent que si
+/// elles sont à [`TOLERANCE_DUREE_MS`] près — #5455. Une durée absente, nulle
+/// ou négative ne borne rien : la piste se compare comme avant.
+///
+/// Le résultat est EXACTEMENT celui de la double boucle d'origine, prédicat
+/// de durée ajouté : les paires « même contenu » sont d'abord cherchées dans un
+/// index (longueur d'empreinte, puis durée), puis rejouées dans l'ordre même
+/// de la double boucle — la liaison complète en dépend.
+pub fn grouper_par_contenu_avec_durees(
+    empreintes: &[(i64, Empreinte)],
+    durees_ms: &[Option<i64>],
+) -> Vec<Vec<i64>> {
+    use std::collections::BTreeMap;
+    let longueur = |i: usize| empreintes[i].1.trames.len();
+    let duree = |i: usize| durees_ms.get(i).copied().flatten().filter(|d| *d > 0);
+    let cumuls: Vec<Cumuls> = empreintes.iter().map(|(_, e)| Cumuls::de(e)).collect();
     // LIAISON COMPLÈTE, pas transitive : une piste n'entre dans un groupe que
     // si elle est « même contenu » avec CHACUN de ses membres, et deux groupes
     // ne fusionnent jamais. L'union-find d'avant chaînait les arêtes : sur le
     // banc réel, une seule paire douteuse suffisait à souder Coltrane,
     // Gainsbourg et Nougaro dans un groupe de cent pistes.
     let meme = |i: usize, j: usize| {
+        if let (Some(a), Some(b)) = (duree(i), duree(j))
+            && (a - b).abs() > TOLERANCE_DUREE_MS
+        {
+            return false;
+        }
         let (a, b) = (&empreintes[i].1, &empreintes[j].1);
-        distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER) && meme_contenu(a, b)
+        distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER)
+            && peut_etre_meme_contenu(&cumuls[i], &cumuls[j])
+            && meme_contenu(a, b)
     };
     let mut ordre: Vec<usize> = (0..empreintes.len()).collect();
-    ordre.sort_by_key(|&i| empreintes[i].1.trames.len());
+    ordre.sort_by_key(|&i| longueur(i));
+    let mut rang = vec![0usize; empreintes.len()];
+    for (k, &i) in ordre.iter().enumerate() {
+        rang[i] = k;
+    }
+    // L'index : par longueur d'empreinte, les pistes de durée connue triées
+    // par durée, et celles sans durée à part.
+    type Case = (Vec<(i64, usize)>, Vec<usize>);
+    let mut par_longueur: BTreeMap<usize, Case> = BTreeMap::new();
+    for &i in &ordre {
+        let case = par_longueur.entry(longueur(i)).or_default();
+        match duree(i) {
+            Some(d) => case.0.push((d, i)),
+            None => case.1.push(i),
+        }
+    }
+    for case in par_longueur.values_mut() {
+        case.0.sort_unstable();
+    }
+    // Les paires « même contenu » que la double boucle d'origine aurait
+    // rencontrées : `j` après `i` dans `ordre`, longueur à la tolérance près.
+    let mut paires: Vec<(usize, usize)> = Vec::new();
+    for &i in &ordre {
+        let li = longueur(i);
+        for (connues, sans_duree) in par_longueur
+            .range(li..=li + TOLERANCE_DUREE_TRAMES)
+            .map(|(_, c)| c)
+        {
+            let mut examiner = |j: usize| {
+                if rang[j] > rang[i] && meme(i, j) {
+                    paires.push((rang[i], rang[j]));
+                }
+            };
+            match duree(i) {
+                Some(d) => {
+                    let debut = connues.partition_point(|&(dj, _)| dj < d - TOLERANCE_DUREE_MS);
+                    for &(dj, j) in &connues[debut..] {
+                        if dj > d + TOLERANCE_DUREE_MS {
+                            break;
+                        }
+                        examiner(j);
+                    }
+                }
+                None => connues.iter().for_each(|&(_, j)| examiner(j)),
+            }
+            sans_duree.iter().for_each(|&j| examiner(j));
+        }
+    }
+    // Rejouées dans l'ordre de la double boucle : `i` croissant, puis `j`.
+    paires.sort_unstable();
     let mut groupe_de: Vec<Option<usize>> = vec![None; empreintes.len()];
     let mut groupes: Vec<Vec<usize>> = Vec::new();
-    for (k, &i) in ordre.iter().enumerate() {
-        let li = empreintes[i].1.trames.len();
-        for &j in &ordre[k + 1..] {
-            if empreintes[j].1.trames.len() > li + TOLERANCE_DUREE_TRAMES {
-                break;
+    for (ri, rj) in paires {
+        let (i, j) = (ordre[ri], ordre[rj]);
+        match (groupe_de[i], groupe_de[j]) {
+            (None, None) => {
+                groupes.push(vec![i, j]);
+                groupe_de[i] = Some(groupes.len() - 1);
+                groupe_de[j] = Some(groupes.len() - 1);
             }
-            if !meme(i, j) {
-                continue;
+            (Some(g), None) => {
+                if groupes[g].iter().all(|&m| m == i || meme(m, j)) {
+                    groupes[g].push(j);
+                    groupe_de[j] = Some(g);
+                }
             }
-            match (groupe_de[i], groupe_de[j]) {
-                (None, None) => {
-                    groupes.push(vec![i, j]);
-                    groupe_de[i] = Some(groupes.len() - 1);
-                    groupe_de[j] = Some(groupes.len() - 1);
+            (None, Some(g)) => {
+                if groupes[g].iter().all(|&m| m == j || meme(m, i)) {
+                    groupes[g].push(i);
+                    groupe_de[i] = Some(g);
                 }
-                (Some(g), None) => {
-                    if groupes[g].iter().all(|&m| m == i || meme(m, j)) {
-                        groupes[g].push(j);
-                        groupe_de[j] = Some(g);
-                    }
-                }
-                (None, Some(g)) => {
-                    if groupes[g].iter().all(|&m| m == j || meme(m, i)) {
-                        groupes[g].push(i);
-                        groupe_de[i] = Some(g);
-                    }
-                }
-                (Some(_), Some(_)) => {}
             }
+            (Some(_), Some(_)) => {}
         }
     }
     let mut sortie: Vec<Vec<i64>> = groupes
@@ -523,5 +678,182 @@ mod tests {
         assert!(meme_contenu(&a, &b) && meme_contenu(&b, &c) && !meme_contenu(&a, &c));
         let groupes = grouper_par_contenu(&[(1, a), (2, b), (3, c)]);
         assert_eq!(groupes, vec![vec![1, 2]], "{groupes:?}");
+    }
+
+    /// #5455 — l'ancienne double boucle, prédicat de durée ajouté : la
+    /// RÉFÉRENCE que l'index doit reproduire exactement.
+    fn reference_double_boucle(
+        empreintes: &[(i64, Empreinte)],
+        durees_ms: &[Option<i64>],
+    ) -> Vec<Vec<i64>> {
+        let duree = |i: usize| durees_ms.get(i).copied().flatten().filter(|d| *d > 0);
+        // LIAISON COMPLÈTE, pas transitive : une piste n'entre dans un groupe que
+        // si elle est « même contenu » avec CHACUN de ses membres, et deux groupes
+        // ne fusionnent jamais. L'union-find d'avant chaînait les arêtes : sur le
+        // banc réel, une seule paire douteuse suffisait à souder Coltrane,
+        // Gainsbourg et Nougaro dans un groupe de cent pistes.
+        let meme = |i: usize, j: usize| {
+            if let (Some(a), Some(b)) = (duree(i), duree(j))
+                && (a - b).abs() > TOLERANCE_DUREE_MS
+            {
+                return false;
+            }
+            let (a, b) = (&empreintes[i].1, &empreintes[j].1);
+            distance_grossiere(a, b).is_some_and(|d| d <= SEUIL_GROSSIER) && meme_contenu(a, b)
+        };
+        let mut ordre: Vec<usize> = (0..empreintes.len()).collect();
+        ordre.sort_by_key(|&i| empreintes[i].1.trames.len());
+        let mut groupe_de: Vec<Option<usize>> = vec![None; empreintes.len()];
+        let mut groupes: Vec<Vec<usize>> = Vec::new();
+        for (k, &i) in ordre.iter().enumerate() {
+            let li = empreintes[i].1.trames.len();
+            for &j in &ordre[k + 1..] {
+                if empreintes[j].1.trames.len() > li + TOLERANCE_DUREE_TRAMES {
+                    break;
+                }
+                if !meme(i, j) {
+                    continue;
+                }
+                match (groupe_de[i], groupe_de[j]) {
+                    (None, None) => {
+                        groupes.push(vec![i, j]);
+                        groupe_de[i] = Some(groupes.len() - 1);
+                        groupe_de[j] = Some(groupes.len() - 1);
+                    }
+                    (Some(g), None) => {
+                        if groupes[g].iter().all(|&m| m == i || meme(m, j)) {
+                            groupes[g].push(j);
+                            groupe_de[j] = Some(g);
+                        }
+                    }
+                    (None, Some(g)) => {
+                        if groupes[g].iter().all(|&m| m == j || meme(m, i)) {
+                            groupes[g].push(i);
+                            groupe_de[i] = Some(g);
+                        }
+                    }
+                    (Some(_), Some(_)) => {}
+                }
+            }
+        }
+        let mut sortie: Vec<Vec<i64>> = groupes
+            .into_iter()
+            .filter(|g| g.len() >= 2)
+            .map(|g| {
+                let mut ids: Vec<i64> = g.into_iter().map(|i| empreintes[i].0).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .collect();
+        sortie.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+        sortie
+    }
+
+    /// Des empreintes de 600 trames (toute piste de plus d'une minute et
+    /// demie), en familles de variantes proches pour que la liaison complète
+    /// ait des choix à faire, et des durées en partie absentes.
+    fn banc_aleatoire(n: usize, graine: u64) -> (Vec<(i64, Empreinte)>, Vec<Option<i64>>) {
+        let mut g = graine;
+        let mut alea = move |borne: u64| {
+            g = g
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (g >> 33) % borne
+        };
+        let mut empreintes = Vec::new();
+        let mut durees = Vec::new();
+        for k in 0..n {
+            let famille = alea(12);
+            let longueur = if alea(10) == 0 {
+                590 + alea(20) as usize
+            } else {
+                600
+            };
+            let trames = (0..longueur)
+                .map(|t| {
+                    let base = 120 + (famille as usize * 7 + t / 50) % 40;
+                    [
+                        (base + alea(14) as usize) as u8,
+                        (base + alea(14) as usize) as u8,
+                    ]
+                })
+                .collect();
+            empreintes.push((
+                (k as i64) * 3 + 1,
+                Empreinte {
+                    version: VERSION.to_string(),
+                    trames,
+                },
+            ));
+            durees.push(match alea(8) {
+                0 => None,
+                1 => Some(0),
+                _ => Some(200_000 + famille as i64 * 700 + alea(2_500) as i64),
+            });
+        }
+        (empreintes, durees)
+    }
+
+    #[test]
+    fn l_index_rend_exactement_ce_que_rendait_la_double_boucle() {
+        for graine in [1_u64, 7, 5_455, 42_424] {
+            let (empreintes, durees) = banc_aleatoire(160, graine);
+            let attendu = reference_double_boucle(&empreintes, &durees);
+            assert!(
+                attendu.iter().any(|g| g.len() >= 3),
+                "le banc doit exercer la liaison complète : {attendu:?}"
+            );
+            assert_eq!(
+                grouper_par_contenu_avec_durees(&empreintes, &durees),
+                attendu,
+                "graine {graine}"
+            );
+            // Sans durées : le comportement d'avant #5455, à l'identique.
+            assert_eq!(
+                grouper_par_contenu(&empreintes),
+                reference_double_boucle(&empreintes, &[]),
+                "graine {graine}, sans durées"
+            );
+        }
+    }
+
+    #[test]
+    fn le_minorant_ne_rejette_jamais_une_paire_que_distance_accepterait() {
+        let (empreintes, _) = banc_aleatoire(120, 99);
+        let cumuls: Vec<Cumuls> = empreintes.iter().map(|(_, e)| Cumuls::de(e)).collect();
+        let mut rejets = 0;
+        for i in 0..empreintes.len() {
+            for j in 0..empreintes.len() {
+                let possible = peut_etre_meme_contenu(&cumuls[i], &cumuls[j]);
+                if let Some(d) = distance(&empreintes[i].1, &empreintes[j].1) {
+                    let minorant_viole = !possible && d <= SEUIL_MEME_CONTENU;
+                    assert!(!minorant_viole, "paire ({i}, {j}) : distance {d}");
+                }
+                rejets += usize::from(!possible);
+            }
+        }
+        assert!(
+            rejets > 0,
+            "le minorant doit écarter des paires, sinon il ne sert à rien"
+        );
+    }
+
+    #[test]
+    fn deux_copies_du_meme_contenu_mais_de_durees_eloignees_ne_se_regroupent_plus() {
+        let plate = Empreinte {
+            version: VERSION.to_string(),
+            trames: vec![[150, 150]; 600],
+        };
+        let e = [(1, plate.clone()), (2, plate.clone()), (3, plate)];
+        assert_eq!(
+            grouper_par_contenu_avec_durees(&e, &[Some(240_000), Some(240_900), Some(300_000)]),
+            vec![vec![1, 2]],
+            "à 0,9 s près : même contenu ; à une minute : deux morceaux"
+        );
+        assert_eq!(
+            grouper_par_contenu_avec_durees(&e, &[Some(240_000), None, Some(300_000)]),
+            vec![vec![1, 2]],
+            "une durée inconnue ne borne rien, la liaison complète écarte le troisième"
+        );
     }
 }

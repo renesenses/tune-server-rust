@@ -320,7 +320,9 @@ if plancher is not None and plancher > reference - fenetre:
 # ecarte. Une troisieme famille de tags apparaitra un jour ; elle sera ignoree,
 # mais pas en silence — les tags ecartes sont dits sur la sortie d'erreur, pour
 # qu'un nouveau venu se remarque au lieu de disparaitre.
-TAG_DE_TUNE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+# Une pre-version publiee en « Latest » (la 1.0.0-rc1, 29/09/2026) est une
+# version de Tune comme une autre : elle doit avoir son fil.
+TAG_DE_TUNE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
 
 
 def annoncee(tag):
@@ -332,7 +334,9 @@ def annoncee(tag):
     denses : « Tune v0.9.103 et v0.9.104 — Notes de version ».
     """
     numero = tag[1:] if tag.startswith("v") else tag
-    motif = re.compile(r"(?<![0-9.])" + re.escape(numero) + r"(?![0-9.])")
+    # `-[0-9A-Za-z]` a droite : le fil « Tune v1.0.0-rc1 » n'annonce pas la
+    # 1.0.0 finale, et celui de la rc1 n'annonce pas la rc10.
+    motif = re.compile(r"(?<![0-9.])" + re.escape(numero) + r"(?![0-9.]|-[0-9A-Za-z]|[0-9A-Za-z])")
     return any(motif.search(titre) for titre in titres)
 
 
@@ -399,7 +403,7 @@ FORME_KO=""
 CANDIDATES=$(jq -r --arg depuis "$FORME_DEPUIS" '
   .[]
   | select((.isDraft | not) and (.isPrerelease | not))
-  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"))
   | select((.publishedAt // "") >= $depuis)
   | .tagName
 ' "$RELEASES" 2>/dev/null | head -n "${FORME_COMBIEN:-5}")

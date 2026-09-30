@@ -524,6 +524,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
 /// l'effacer.
 #[tokio::test]
 async fn un_rappel_arrete_atteint_le_journal_par_un_vrai_tick() {
+    crate::journal_de_test::fiabiliser_la_capture();
     let journal = JournalCapture::default();
     let abonne = tracing_subscriber::fmt()
         .with_writer(journal.clone())

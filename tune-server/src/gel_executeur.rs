@@ -190,7 +190,7 @@ pub fn rapport(age_battement: Duration) -> String {
         horodatage(),
         age_battement.as_millis(),
         std::process::id(),
-        env!("CARGO_PKG_VERSION"),
+        tune_core::version(),
     );
     let _ = writeln!(s, "\n== verrou d'écriture SQLite ==");
     let releves = tune_core::db::verrou_ecriture::Sentinelle::globale().releves();

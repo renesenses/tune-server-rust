@@ -35,7 +35,12 @@ pub struct ConvertSource {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartJobRequest {
+    #[serde(default)]
     pub sources: Vec<ConvertSource>,
+    /// #5483 — des pistes choisies une à une, en plus de `sources`. Une piste
+    /// déjà couverte par un album de `sources` n'est convertie qu'une fois.
+    #[serde(default)]
+    pub track_ids: Vec<i64>,
     pub format: String,
     pub quality: Option<String>,
     pub sample_rate: Option<u32>,
@@ -101,6 +106,9 @@ struct JobError {
 
 struct ConvertJob {
     cancellation: Arc<std::sync::atomic::AtomicBool>,
+    /// #5482 — le nom de l'archive téléchargée, « Artiste - Album (FORMAT).zip »,
+    /// fixé au lancement depuis les pistes résolues.
+    nom_archive: String,
     status: JobStatus,
     total: usize,
     completed: usize,
@@ -116,11 +124,20 @@ struct ConvertJob {
     /// du MP3 ou de l'AAC déjà compressés, `zip` ne gagne quasiment rien, donc
     /// l'écart se compte en pour mille.
     output_bytes: u64,
+    /// #5481 — les formats RÉELLEMENT écrits, relus sur les fichiers produits
+    /// (fréquence, profondeur), dédoublonnés dans l'ordre d'apparition.
+    /// L'écran les affiche au lieu de deviner ce que « d'origine » a donné —
+    /// pour un DSD, il n'y a pas d'origine au sens PCM.
+    formats_ecrits: Vec<dsd::FormatEcrit>,
     /// Le travail a-t-il été rangé dans un dossier du serveur choisi par
     /// l'appelant (#2944) ? Dans ce cas il n'y a pas d'archive à télécharger :
     /// les fichiers sont déjà à leur place, et les zipper reviendrait à
     /// empaqueter le dossier de l'utilisateur.
     destination_serveur: bool,
+    /// Instant de lancement (ms depuis l'époque Unix). Il ordonne la liste de
+    /// `GET /converter/jobs` (#5480) : l'écran range les tâches dans l'ordre
+    /// où l'utilisateur les a lancées, et un `HashMap` n'en garde aucun.
+    started_at_ms: u64,
 }
 
 type JobStore = Arc<Mutex<HashMap<String, Arc<Mutex<ConvertJob>>>>>;
@@ -230,6 +247,10 @@ fn job_store() -> JobStore {
         .clone()
 }
 
+// #5483 — résolution des sources (albums, pistes, dossiers) sans doublon.
+#[path = "convertisseur_pistes.rs"]
+mod pistes;
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -241,7 +262,16 @@ pub fn router() -> Router<AppState> {
         .route("/download/{job_id}", get(download_job))
         .route("/presets", get(list_presets))
         .route("/capabilities", get(capabilities))
+        .route("/jobs", get(list_jobs))
         .route("/jobs/{job_id}", delete(cancel_job))
+}
+
+/// Millisecondes depuis l'époque Unix ; 0 si l'horloge est avant 1970.
+fn maintenant_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -379,51 +409,11 @@ async fn start_job(
         )));
     }
 
-    // Resolve all source paths
+    // Resolve all source paths — #5483 : `sources` puis `track_ids`, sans
+    // doublon, dans l'ordre de la demande.
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let mut file_paths: Vec<PathBuf> = Vec::new();
-
-    for src in &body.sources {
-        if let Some(track_id) = src.track_id {
-            match repo.get(track_id) {
-                Ok(Some(track)) => {
-                    if let Some(ref fp) = track.file_path {
-                        file_paths.push(PathBuf::from(fp));
-                    } else {
-                        warn!(track_id, "converter_skip_no_file_path");
-                    }
-                }
-                Ok(None) => {
-                    warn!(track_id, "converter_skip_track_not_found");
-                }
-                Err(e) => {
-                    warn!(track_id, error = %e, "converter_skip_track_lookup_error");
-                }
-            }
-        } else if let Some(album_id) = src.album_id {
-            match repo.list_by_album(album_id) {
-                Ok(tracks) => {
-                    for t in tracks {
-                        if let Some(ref fp) = t.file_path {
-                            file_paths.push(PathBuf::from(fp));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(album_id, error = %e, "converter_skip_album_lookup_error");
-                }
-            }
-        } else if let Some(ref path) = src.path {
-            let p = PathBuf::from(path);
-            if p.is_dir() {
-                collect_audio_files(&p, &mut file_paths);
-            } else if p.is_file() && convertible_input(path) {
-                file_paths.push(p);
-            } else {
-                warn!(path, "converter_skip_not_audio_or_missing");
-            }
-        }
-    }
+    let resolues = pistes::resoudre_les_sources(&repo, &body.sources, &body.track_ids);
+    let file_paths: Vec<PathBuf> = resolues.iter().map(|p| p.chemin.clone()).collect();
 
     if file_paths.is_empty() {
         return Err(AppError::bad_request("no audio files found in sources"));
@@ -468,8 +458,21 @@ async fn start_job(
         );
     }
 
+    // #5482 — le nom de l'archive, tant que l'on sait encore d'où viennent
+    // les fichiers.
+    let nom_archive = archive::nom_de_l_archive(
+        &resolues,
+        &archive::libelle_du_format(
+            &format,
+            body.quality.as_deref(),
+            body.sample_rate,
+            body.bit_depth,
+        ),
+    );
+
     let job = Arc::new(Mutex::new(ConvertJob {
         cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        nom_archive,
         status: JobStatus::Running,
         total,
         completed: 0,
@@ -477,7 +480,9 @@ async fn start_job(
         errors: Vec::new(),
         output_dir: output_dir.clone(),
         output_bytes: 0,
+        formats_ecrits: Vec::new(),
         destination_serveur,
+        started_at_ms: maintenant_ms(),
     }));
 
     crate::audio_job_journal::write("converter", &job_id, "running", total, 0)
@@ -672,6 +677,8 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
 
     json!({
         "job_id": job_id,
+        // #5482 — le nom sous lequel l'archive sera téléchargée.
+        "archive_name": job.nom_archive,
         // Forme historique — conservée telle quelle.
         "status": job.status.as_str(),
         "total": job.total,
@@ -684,11 +691,15 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
         "converted": job.completed,
         "download_size": taille_lisible(job.output_bytes),
         "error": error,
+        // #5481 — les fréquences et profondeurs réellement écrites.
+        "output_formats": dsd::formats_en_json(&job.formats_ecrits),
         // #2944 — où le résultat est rangé, et s'il y a une archive au bout.
         // L'écran n'a pas à déduire d'un champ de la requête ce que le serveur
         // a réellement fait : il le lit.
         "destination": job.destination_serveur.then(|| job.output_dir.display().to_string()),
         "zip_download_available": !job.destination_serveur,
+        // #5480 — l'ordre de lancement, pour la liste `GET /converter/jobs`.
+        "started_at": job.started_at_ms,
     })
 }
 
@@ -710,8 +721,54 @@ async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
 }
 
 // ---------------------------------------------------------------------------
+// GET /jobs — every job this server still knows (#5480)
+// ---------------------------------------------------------------------------
+
+/// Les tâches que ce serveur connaît encore, en cours ou terminées.
+///
+/// #5480 (Xavier Joly, 0.9.168) : « Lors d'un encodage il ne faut surtout pas
+/// quitter la page sans quoi le job a disparu quand on revient dessus. » La
+/// conversion, elle, continuait : `start_job` la lance en tâche de fond et la
+/// range dans `job_store()`. Mais seul l'écran qui l'avait lancée en
+/// connaissait l'identifiant ; l'écran démonté, plus rien ne permettait de la
+/// retrouver, ni de télécharger son archive.
+///
+/// Chaque élément est EXACTEMENT le corps de `GET /status/{id}`
+/// (`payload_statut`) : l'écran n'a qu'une forme à lire. Ordre : lancement le
+/// plus ancien d'abord. Une tâche annulée a quitté le magasin
+/// (`cancel_job`) : elle n'y figure donc pas.
+async fn list_jobs() -> Json<Value> {
+    Json(Value::Array(lister_les_taches(&job_store()).await))
+}
+
+async fn lister_les_taches(store: &JobStore) -> Vec<Value> {
+    // On copie les poignées puis on relâche le verrou du magasin : ne pas
+    // tenir la carte entière pendant qu'on verrouille chaque tâche, que le
+    // travailleur de fond verrouille lui aussi à chaque piste.
+    let taches: Vec<(String, Arc<Mutex<ConvertJob>>)> = store
+        .lock()
+        .await
+        .iter()
+        .map(|(id, job)| (id.clone(), job.clone()))
+        .collect();
+    let mut corps = Vec::with_capacity(taches.len());
+    for (id, job) in taches {
+        let job = job.lock().await;
+        corps.push((job.started_at_ms, id.clone(), payload_statut(&id, &job)));
+    }
+    // L'identifiant départage deux lancements dans la même milliseconde : la
+    // liste reste stable d'un sondage à l'autre.
+    corps.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    corps.into_iter().map(|(_, _, c)| c).collect()
+}
+
+// ---------------------------------------------------------------------------
 // GET /download/{job_id} — stream a ZIP of the converted files
 // ---------------------------------------------------------------------------
+
+// #5482 — le nom de l'archive et son `Content-Disposition`.
+#[path = "convertisseur_archive.rs"]
+mod archive;
 
 async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoResponse, AppError> {
     let store = job_store();
@@ -737,6 +794,7 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
     }
 
     let output_dir = job.output_dir.clone();
+    let nom_archive = job.nom_archive.clone();
     drop(job);
     drop(map);
 
@@ -748,12 +806,17 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/zip"));
+    // #5482 — « Artiste - Album (FORMAT).zip », repli ASCII et nom UTF-8.
     headers.insert(
         "Content-Disposition",
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"tune-convert-{job_id}.zip\""
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+        HeaderValue::from_str(&archive::content_disposition(&nom_archive))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+    );
+    // Le web télécharge par `fetch` : sans cette ligne, un client servi
+    // depuis une autre origine ne pourrait pas lire l'en-tête.
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Content-Disposition"),
     );
 
     Ok((StatusCode::OK, headers, Body::from(zip_bytes)))
@@ -779,7 +842,12 @@ async fn list_presets() -> Json<Value> {
             "format": "flac",
             "quality": "5",
             "sample_rate": null,
-            "bit_depth": 24
+            "bit_depth": 24,
+            // #5481 — `sample_rate: null` veut dire « d'origine » pour du PCM ;
+            // un DSD n'en a pas au sens PCM et sort à cette fréquence-ci.
+            "dsd_sample_rate": dsd::FREQUENCE_DSD_PAR_DEFAUT,
+            // Les fréquences que l'écran peut proposer à la place de « Auto ».
+            "sample_rate_choices": dsd::FREQUENCES_PROPOSEES
         },
         {
             "id": "mp3-320",
@@ -919,7 +987,14 @@ async fn run_conversion(
         }
 
         let ext = output_extension(format);
-        let out_path = output_dir.join(format!("{filename}.{ext}"));
+        // #5483 — dans une archive, deux pistes homonymes (CD1/01.flac,
+        // CD2/01.flac) ne visent plus le même fichier. Le mode « dossier de
+        // travail » garde sa règle : un fichier présent reste intact.
+        let out_path = if destination_serveur {
+            output_dir.join(format!("{filename}.{ext}"))
+        } else {
+            pistes::sortie_libre(output_dir, &filename, ext)
+        };
 
         // ON N'ÉCRASE JAMAIS (#2944). Dans le dossier de l'utilisateur, un
         // fichier déjà présent est soit une conversion précédente, soit — si
@@ -969,10 +1044,17 @@ async fn run_conversion(
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
+                // #5481 — ce qui a vraiment été écrit, relu sur le fichier.
+                let format_ecrit = dsd::format_ecrit(&out_path);
 
                 let mut j = job.lock().await;
                 j.completed += 1;
                 j.output_bytes += ecrits;
+                if let Some(f) = format_ecrit
+                    && !j.formats_ecrits.contains(&f)
+                {
+                    j.formats_ecrits.push(f);
+                }
             }
             Err(e) => {
                 error!(
@@ -1350,6 +1432,13 @@ async fn encode_with_external(
     target_sr: Option<u32>,
     target_bd: Option<u16>,
 ) -> Result<(), String> {
+    // #5480 — le MP3 n'existe qu'aux fréquences MPEG (8 à 48 kHz). Le
+    // greffon demande la fréquence de la SOURCE : 176,4 ou 352,8 kHz pour un
+    // DSF décodé, 96 kHz pour un FLAC hi-res. On la ramène AVANT d'écrire le
+    // WAV intermédiaire, pour que le rééchantillonnage reste le nôtre (rubato)
+    // et que l'encodeur externe reçoive déjà ce qu'il sait encoder.
+    let target_sr = frequence_pour_encodeur_externe(format, target_sr);
+
     // First, try to decode to a temporary WAV that external tools can read.
     // Many external encoders only accept WAV input.
     let tmp_wav = output.with_extension("_tmp.wav");
@@ -1383,6 +1472,116 @@ async fn encode_with_external(
     result
 }
 
+/// Les fréquences d'échantillonnage du MP3 (MPEG-1, -2 et -2.5 Layer III),
+/// exactement celles que `libmp3lame` annonce dans « Supported sample rates ».
+const FREQUENCES_MP3: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+
+/// La fréquence MP3 à produire pour une fréquence demandée (#5480).
+///
+/// Une fréquence MPEG est gardée telle quelle. Au-delà, on reste dans la
+/// famille de la source : 44,1 kHz pour les multiples de 11 025 Hz (88,2,
+/// 176,4, 352,8 kHz — tout ce que sort le décodage DSD), 48 kHz pour les
+/// autres (96, 192 kHz). Jamais de fréquence refusée : c'est elle qui faisait
+/// échouer `libmp3lame` en `exit -22` (EINVAL) sur les trois préréglages MP3.
+fn frequence_mp3(demandee: u32) -> u32 {
+    if FREQUENCES_MP3.contains(&demandee) {
+        demandee
+    } else if demandee.is_multiple_of(11_025) {
+        44_100
+    } else {
+        48_000
+    }
+}
+
+/// La fréquence à laquelle écrire le WAV intermédiaire d'un encodeur externe
+/// (#5480) : ramenée à 44,1 ou 48 kHz pour le MP3 et l'AAC, inchangée sinon.
+fn frequence_pour_encodeur_externe(format: &str, target_sr: Option<u32>) -> Option<u32> {
+    if format == "mp3" || format == "aac" {
+        target_sr.map(frequence_mp3)
+    } else {
+        target_sr
+    }
+}
+
+/// Arguments de `lame` pour un encodage MP3. Séparés pour être éprouvés sans
+/// l'outil (#5480).
+fn arguments_lame_mp3(
+    input: &str,
+    output: &str,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    match quality.unwrap_or("320") {
+        "v0" => {
+            args.push("-V".into());
+            args.push("0".into());
+        }
+        "v2" => {
+            args.push("-V".into());
+            args.push("2".into());
+        }
+        q => {
+            args.push("-b".into());
+            args.push(q.into());
+        }
+    }
+
+    if let Some(sr) = target_sr.map(frequence_mp3) {
+        args.push("--resample".into());
+        args.push(format!("{}", sr as f64 / 1000.0));
+    }
+
+    args.push(input.into());
+    args.push(output.into());
+    args
+}
+
+/// Arguments de `ffmpeg … -codec:a libmp3lame` (#5480).
+///
+/// `-hide_banner` : sans lui, les 500 premiers caractères de stderr — seuls
+/// remontés jusqu'à l'écran — étaient la bannière de version et la ligne
+/// `configuration:`, jamais la cause de l'échec.
+fn arguments_ffmpeg_mp3(
+    input: &str,
+    output: &str,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".into(),
+        "-i".into(),
+        input.into(),
+        "-codec:a".into(),
+        "libmp3lame".into(),
+    ];
+
+    match quality.unwrap_or("320") {
+        "v0" => {
+            args.push("-q:a".into());
+            args.push("0".into());
+        }
+        "v2" => {
+            args.push("-q:a".into());
+            args.push("2".into());
+        }
+        q => {
+            args.push("-b:a".into());
+            args.push(format!("{q}k"));
+        }
+    }
+
+    if let Some(sr) = target_sr.map(frequence_mp3) {
+        args.push("-ar".into());
+        args.push(sr.to_string());
+    }
+
+    args.push(output.into());
+    args
+}
+
 async fn encode_mp3_external(
     input: &str,
     output: &str,
@@ -1391,66 +1590,20 @@ async fn encode_mp3_external(
 ) -> Result<(), String> {
     // Try lame first
     if let Some(lame) = resolve_tool("lame") {
-        let mut args: Vec<String> = Vec::new();
-
-        match quality.unwrap_or("320") {
-            "v0" => {
-                args.push("-V".into());
-                args.push("0".into());
-            }
-            "v2" => {
-                args.push("-V".into());
-                args.push("2".into());
-            }
-            q => {
-                args.push("-b".into());
-                args.push(q.into());
-            }
-        }
-
-        if let Some(sr) = target_sr {
-            args.push("--resample".into());
-            args.push(format!("{}", sr as f64 / 1000.0));
-        }
-
-        args.push(input.into());
-        args.push(output.into());
-
-        return run_command(&lame, &args).await;
+        return run_command(
+            &lame,
+            &arguments_lame_mp3(input, output, quality, target_sr),
+        )
+        .await;
     }
 
     // Fallback to ffmpeg
     if let Some(ffmpeg) = resolve_tool("ffmpeg") {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "libmp3lame".into(),
-        ];
-
-        match quality.unwrap_or("320") {
-            "v0" => {
-                args.push("-q:a".into());
-                args.push("0".into());
-            }
-            "v2" => {
-                args.push("-q:a".into());
-                args.push("2".into());
-            }
-            q => {
-                args.push("-b:a".into());
-                args.push(format!("{q}k"));
-            }
-        }
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-
-        args.push(output.into());
-        return run_command(&ffmpeg, &args).await;
+        return run_command(
+            &ffmpeg,
+            &arguments_ffmpeg_mp3(input, output, quality, target_sr),
+        )
+        .await;
     }
 
     Err("mp3 encoding requires lame or ffmpeg (bundled with the release or on PATH)".into())
@@ -1462,29 +1615,48 @@ async fn encode_aac_external(
     quality: Option<&str>,
     target_sr: Option<u32>,
 ) -> Result<(), String> {
-    let bitrate = quality.unwrap_or("256");
-
     if let Some(ffmpeg) = resolve_tool("ffmpeg") {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".into(),
-            input.into(),
-            "-codec:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{bitrate}k"),
-        ];
-
-        if let Some(sr) = target_sr {
-            args.push("-ar".into());
-            args.push(sr.to_string());
-        }
-
-        args.push(output.into());
-        return run_command(&ffmpeg, &args).await;
+        return run_command(
+            &ffmpeg,
+            &arguments_ffmpeg_aac(input, output, quality, target_sr),
+        )
+        .await;
     }
 
     Err("aac encoding requires ffmpeg (bundled with the release or on PATH)".into())
+}
+
+/// Arguments de `ffmpeg … -codec:a aac` (#5480, suite).
+///
+/// Même défaut que le MP3 : `-ar` recevait la fréquence de la source décodée
+/// (176,4 / 352,8 kHz depuis du DSD), que l'encodeur `aac` de ffmpeg refuse
+/// (il plafonne à 96 kHz). Même règle que le MP3 : 44,1 kHz pour la famille
+/// 44,1, 48 kHz pour les autres — les fréquences que lit tout lecteur AAC.
+fn arguments_ffmpeg_aac(
+    input: &str,
+    output: &str,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+) -> Vec<String> {
+    let bitrate = quality.unwrap_or("256");
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".into(),
+        "-i".into(),
+        input.into(),
+        "-codec:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        format!("{bitrate}k"),
+    ];
+
+    if let Some(sr) = target_sr.map(frequence_mp3) {
+        args.push("-ar".into());
+        args.push(sr.to_string());
+    }
+
+    args.push(output.into());
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,8 +1713,88 @@ async fn run_command(program: &Path, args: &[String]) -> Result<(), String> {
             "{} failed (exit {}): {}",
             program.display(),
             output.status.code().unwrap_or(-1),
-            stderr.chars().take(500).collect::<String>()
+            cause_utile(&stderr)
         ))
+    }
+}
+
+/// Ce qu'un outil externe dit de son échec, sans son bavardage (#5480).
+///
+/// On recopiait les 500 PREMIERS caractères de stderr. Pour ffmpeg, c'est la
+/// bannière — version, compilateur, la longue ligne `configuration:` — et la
+/// cause, écrite à la fin, n'arrivait jamais à l'écran : Xavier Joly a lu
+/// « ffmpeg.exe failed (exit -22): ffmpeg version 8.1… --enable-libzmq
+/// --enable- », coupé net.
+///
+/// On garde donc les lignes qui DISENT l'échec (« not supported », « Error »,
+/// « Invalid »…), débarrassées de leur préfixe `[composant @ 0x…]`,
+/// dédoublonnées, dans leur ordre, et seulement les trois PREMIÈRES : ffmpeg
+/// écrit la cause d'abord, puis ses conséquences en cascade (« Task finished
+/// with error code: -22 » sur chaque fil). À défaut, les trois dernières
+/// lignes non vides. Toujours bornée à 500 caractères.
+fn cause_utile(stderr: &str) -> String {
+    const INDICES: [&str; 8] = [
+        "error",
+        "not supported",
+        "invalid",
+        "unable",
+        "failed",
+        "no such",
+        "unsupported",
+        "cannot",
+    ];
+    // Le prologue de ffmpeg : bannière, bibliothèques, description des flux.
+    const BAVARDAGE: [&str; 12] = [
+        "ffmpeg version",
+        "built with",
+        "configuration:",
+        "lib",
+        "Input #",
+        "Output #",
+        "Metadata:",
+        "Duration:",
+        "Stream",
+        "Press [q]",
+        "size=",
+        "encoder ",
+    ];
+    // « [libmp3lame @ 0x79b742ca80] [enc:libmp3lame @ 0x…] Specified … » →
+    // « Specified … » : l'adresse change à chaque exécution et ne dit rien.
+    let sans_prefixe = |l: &str| {
+        let mut t = l.trim();
+        while t.starts_with('[') {
+            match t.find(']') {
+                Some(fin) => t = t[fin + 1..].trim_start(),
+                None => break,
+            }
+        }
+        t.to_string()
+    };
+    let lignes: Vec<String> = stderr
+        .lines()
+        .map(sans_prefixe)
+        .filter(|l| !l.is_empty() && !BAVARDAGE.iter().any(|b| l.starts_with(b)))
+        .collect();
+    let mut retenues: Vec<&str> = Vec::new();
+    for l in &lignes {
+        let bas = l.to_ascii_lowercase();
+        if INDICES.iter().any(|i| bas.contains(i)) && !retenues.contains(&l.as_str()) {
+            retenues.push(l);
+            if retenues.len() == 3 {
+                break;
+            }
+        }
+    }
+    if retenues.is_empty() {
+        let debut = lignes.len().saturating_sub(3);
+        retenues = lignes[debut..].iter().map(String::as_str).collect();
+    }
+    let texte = retenues.join(" | ");
+    if texte.chars().count() <= 500 {
+        texte
+    } else {
+        let debut: String = texte.chars().take(499).collect();
+        format!("{debut}…")
     }
 }
 
@@ -1598,11 +1850,20 @@ fn convertible_input(path: &str) -> bool {
 /// sinon (WMA/ASF) via le ffmpeg résolu. `target_sr` n'est honoré que par
 /// les décodeurs natifs qui le supportent — les appelants rééchantillonnent
 /// de toute façon quand `decoded.sample_rate` ne correspond pas.
+// #5481 — la fréquence de sortie d'une source DSD, propre au convertisseur.
+#[path = "convertisseur_dsd.rs"]
+mod dsd;
+
 pub(super) fn decode_for_convert(
     input: &str,
     target_sr: Option<u32>,
 ) -> Result<tune_core::audio::decode::DecodedAudio, String> {
     if can_decode_native(input) {
+        // #5481 — un DSD ne se décode jamais à un rapport fractionnaire, et
+        // sort par défaut en 176,4 kHz (voir `convertisseur_dsd.rs`).
+        if let Some(frequence) = dsd::frequence_dsd(input) {
+            return dsd::decoder_un_dsd(input, frequence, target_sr);
+        }
         return decode_to_pcm(input, target_sr, None, 0.0, f64::MAX);
     }
     decode_via_converter_ffmpeg(input)
@@ -2034,9 +2295,260 @@ mod tests {
             .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // #5480 — DSF → MP3 en `exit -22`, message illisible, tâches introuvables
+    // -----------------------------------------------------------------------
+
+    /// Le DSF de référence du dépôt (DSD64 stéréo).
+    const DSF_DSD64: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+    );
+
+    /// La fréquence que le greffon demande pour un DSF : celle de la source
+    /// DÉCODÉE. C'est elle qui arrivait jusqu'à `-ar`.
+    #[test]
+    fn un_dsf_decode_pour_le_convertisseur_sort_a_176_4_khz() {
+        let d = decode_for_convert(DSF_DSD64, None).expect("DSF de référence décodable");
+        assert_eq!(
+            d.sample_rate, 176_400,
+            "un DSD64 décodé sort à 176,4 kHz (choose_output_rate) : c'est la fréquence \
+             que le greffon demande au MP3, et que le Hi-Res produit"
+        );
+        assert!(
+            !FREQUENCES_MP3.contains(&d.sample_rate),
+            "176,4 kHz n'est pas une fréquence MP3 : sans correctif, libmp3lame refuse"
+        );
+    }
+
+    /// Ce que produit RÉELLEMENT le préréglage Hi-Res (« FLAC 24-bit, original
+    /// sample rate ») depuis un DSD64, par le chemin complet du greffon : la
+    /// fréquence que l'écran doit annoncer (#5480, volet web).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_hi_res_depuis_un_dsd64_sort_en_flac_24_bits_176_4_khz() {
+        tokio::task::spawn_blocking(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let sortie = dir.path().join("hires.flac");
+            super::super::premium_audio_host::run(
+                &tune_plugin_converter::Converter,
+                Path::new(DSF_DSD64),
+                &sortie,
+                &json!({"format": "flac", "quality": "5", "sample_rate": null, "bit_depth": 24}),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .expect("DSF → FLAC Hi-Res");
+            let b = std::fs::read(&sortie).unwrap();
+            assert_eq!(&b[..4], b"fLaC");
+            // STREAMINFO : 20 bits de fréquence à l'octet 18, puis canaux et bits.
+            let frequence =
+                (u32::from(b[18]) << 12) | (u32::from(b[19]) << 4) | (u32::from(b[20]) >> 4);
+            let bits = (((b[20] & 1) << 4) | (b[21] >> 4)) + 1;
+            assert_eq!((bits, frequence), (24, 176_400), "Hi-Res depuis DSD64");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn la_frequence_mp3_est_toujours_une_frequence_mpeg() {
+        // Au-delà de 48 kHz : famille 44,1 → 44,1 ; famille 48 → 48.
+        for (demandee, attendue) in [
+            (2_822_400, 44_100), // DSD64 brut
+            (352_800, 44_100),   // DSD128 décodé
+            (176_400, 44_100),   // DSD64 décodé
+            (88_200, 44_100),
+            (192_000, 48_000),
+            (96_000, 48_000),
+            (64_000, 48_000),
+        ] {
+            assert_eq!(
+                frequence_mp3(demandee),
+                attendue,
+                "{demandee} Hz doit devenir {attendue} Hz pour le MP3"
+            );
+        }
+        // Une fréquence MPEG est gardée telle quelle.
+        for f in FREQUENCES_MP3 {
+            assert_eq!(frequence_mp3(f), f, "{f} Hz est une fréquence MP3 valide");
+        }
+        // Le WAV intermédiaire suit ; les autres formats ne sont pas touchés.
+        assert_eq!(
+            frequence_pour_encodeur_externe("mp3", Some(176_400)),
+            Some(44_100)
+        );
+        assert_eq!(frequence_pour_encodeur_externe("mp3", None), None);
+        assert_eq!(
+            frequence_pour_encodeur_externe("aac", Some(176_400)),
+            Some(44_100)
+        );
+        assert_eq!(
+            frequence_pour_encodeur_externe("flac", Some(176_400)),
+            Some(176_400)
+        );
+    }
+
+    /// Même règle pour l'AAC externe (Windows, Linux) : aucun préréglage AAC
+    /// n'est servi, on éprouve donc la commande elle-même.
+    #[test]
+    fn la_commande_ffmpeg_aac_porte_44_1_ou_48_khz_selon_la_famille() {
+        for (source, attendue) in [
+            (352_800, "44100"),
+            (176_400, "44100"),
+            (88_200, "44100"),
+            (44_100, "44100"),
+            (192_000, "48000"),
+            (96_000, "48000"),
+            (48_000, "48000"),
+        ] {
+            let args = arguments_ffmpeg_aac("in.wav", "out.m4a", Some("256"), Some(source));
+            let i = args
+                .iter()
+                .position(|a| a == "-ar")
+                .expect("la fréquence est fixée explicitement");
+            assert_eq!(
+                args[i + 1],
+                attendue,
+                "source {source} Hz : `-ar` doit valoir {attendue} — args {args:?}"
+            );
+            assert_eq!(args[0], "-hide_banner");
+            assert!(args.windows(2).any(|w| w == ["-codec:a", "aac"]));
+            assert!(args.windows(2).any(|w| w == ["-b:a", "256k"]));
+        }
+        let sans = arguments_ffmpeg_aac("in.wav", "out.m4a", None, None);
+        assert!(
+            !sans.iter().any(|a| a == "-ar"),
+            "pas de fréquence demandée : pas de -ar"
+        );
+        assert!(sans.windows(2).any(|w| w == ["-b:a", "256k"]));
+    }
+
+    /// Les arguments réellement passés à ffmpeg pour les trois préréglages MP3
+    /// servis par `/presets`, depuis un DSF (176,4 et 352,8 kHz) et un FLAC
+    /// 24/96 : `-ar` ne porte JAMAIS une fréquence que libmp3lame refuse.
+    #[test]
+    fn ffmpeg_ne_recoit_jamais_une_frequence_refusee_par_libmp3lame() {
+        for qualite in ["320", "v0", "192"] {
+            for source in [176_400, 352_800, 96_000, 44_100] {
+                let args = arguments_ffmpeg_mp3("in.wav", "out.mp3", Some(qualite), Some(source));
+                let i = args
+                    .iter()
+                    .position(|a| a == "-ar")
+                    .expect("la fréquence est fixée explicitement");
+                let ar: u32 = args[i + 1].parse().expect("-ar numérique");
+                assert!(
+                    FREQUENCES_MP3.contains(&ar),
+                    "préréglage {qualite}, source {source} Hz : `-ar {ar}` est refusé par \
+                     libmp3lame (exit -22) — args {args:?}"
+                );
+                assert_eq!(args[0], "-hide_banner", "la bannière masquait la cause");
+            }
+        }
+        let lame = arguments_lame_mp3("in.wav", "out.mp3", Some("320"), Some(176_400));
+        let i = lame.iter().position(|a| a == "--resample").unwrap();
+        assert_eq!(lame[i + 1], "44.1", "lame : même règle que ffmpeg");
+    }
+
+    /// Le stderr RÉEL de ffmpeg 9 pour la commande d'avant correctif
+    /// (`-ar 176400` sur un WAV issu du DSF de référence), relevé sur macOS.
+    const STDERR_LIBMP3LAME_176400: &str = r#"Input #0, wav, from 't176400.wav':
+  Metadata:
+    encoder         : Lavf63.1.102
+  Duration: 00:00:00.03, bitrate: 8499 kb/s
+  Stream #0:0: Audio: pcm_s24le ([1][0][0][0] / 0x0001), 176400 Hz, stereo, s32 (24 bit), 8467 kb/s
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s24le (native) -> mp3 (libmp3lame))
+Press [q] to stop, [?] for help
+[libmp3lame @ 0x79b742ca80] Specified sample rate 176400 is not supported by the libmp3lame encoder
+[libmp3lame @ 0x79b742ca80] Supported sample rates:
+[libmp3lame @ 0x79b742ca80]   44100
+[libmp3lame @ 0x79b742ca80]   48000
+[libmp3lame @ 0x79b742ca80]   32000
+[libmp3lame @ 0x79b742ca80]   22050
+[libmp3lame @ 0x79b742ca80]   24000
+[libmp3lame @ 0x79b742ca80]   16000
+[libmp3lame @ 0x79b742ca80]   11025
+[libmp3lame @ 0x79b742ca80]   12000
+[libmp3lame @ 0x79b742ca80]   8000
+[aost#0:0/libmp3lame @ 0x79b7014000] [enc:libmp3lame @ 0x79b6808230] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[af#0:0 @ 0x79b7018000] Error sending frames to consumers: Invalid argument
+[af#0:0 @ 0x79b7018000] Task finished with error code: -22 (Invalid argument)
+[af#0:0 @ 0x79b7018000] Terminating thread with return code -22 (Invalid argument)
+[aost#0:0/libmp3lame @ 0x79b7014000] [enc:libmp3lame @ 0x79b6808230] Could not open encoder before EOF
+[aost#0:0/libmp3lame @ 0x79b7014000] Task finished with error code: -22 (Invalid argument)
+[aost#0:0/libmp3lame @ 0x79b7014000] Terminating thread with return code -22 (Invalid argument)
+[out#0/mp3 @ 0x79b700c180] Nothing was written into output file, because at least one of its streams received no packets.
+size=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:00.03    
+Conversion failed!"#;
+
+    #[test]
+    fn l_erreur_remonte_la_cause_et_non_la_banniere() {
+        let cause = cause_utile(STDERR_LIBMP3LAME_176400);
+        assert!(
+            cause.starts_with(
+                "Specified sample rate 176400 is not supported by the libmp3lame encoder"
+            ),
+            "la cause doit venir en tête : {cause}"
+        );
+        assert!(cause.contains("Invalid argument"), "{cause}");
+        assert!(
+            !cause.contains("0x"),
+            "les adresses sont du bruit : {cause}"
+        );
+
+        // Ce qu'a lu Xavier : bannière et configuration en tête de stderr.
+        let avec_banniere = format!(
+            "ffmpeg version 8.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers\n  \
+             built with gcc 15.2.0 (Rev11, Built by MSYS2 project)\n  \
+             configuration: --enable-gpl --enable-version3 --enable-shared --disable-w32threads\n  \
+             libavutil      60.  8.100 / 60.  8.100\n{STDERR_LIBMP3LAME_176400}"
+        );
+        let cause = cause_utile(&avec_banniere);
+        assert!(!cause.contains("ffmpeg version"), "{cause}");
+        assert!(!cause.contains("configuration"), "{cause}");
+        assert!(cause.contains("176400 is not supported"), "{cause}");
+        assert!(cause.chars().count() <= 500);
+
+        // Sans ligne d'erreur reconnaissable : les dernières lignes, pas rien.
+        assert_eq!(cause_utile("a\nb\n\nc\nd\n"), "b | c | d");
+    }
+
+    #[tokio::test]
+    async fn la_liste_des_taches_rend_chaque_tache_dans_l_ordre_de_lancement() {
+        let store: JobStore = Arc::new(Mutex::new(HashMap::new()));
+        let mut premiere = job_temoin(JobStatus::Completed, 4);
+        premiere.started_at_ms = 1_000;
+        let mut seconde = job_temoin(JobStatus::Running, 1);
+        seconde.started_at_ms = 2_000;
+        {
+            let mut map = store.lock().await;
+            // Insérées à rebours : l'ordre rendu ne doit rien au HashMap.
+            map.insert("bbbb".into(), Arc::new(Mutex::new(seconde)));
+            map.insert("aaaa".into(), Arc::new(Mutex::new(premiere)));
+        }
+        let liste = lister_les_taches(&store).await;
+        assert_eq!(
+            liste.len(),
+            2,
+            "une tâche terminée reste listée : {liste:?}"
+        );
+        assert_eq!(liste[0]["job_id"], "aaaa");
+        assert_eq!(liste[0]["state"], "done");
+        assert_eq!(liste[0]["zip_download_available"], true);
+        assert_eq!(liste[1]["job_id"], "bbbb");
+        assert_eq!(liste[1]["state"], "converting");
+        // Même corps que `/status/{id}` : l'écran n'a qu'une forme à lire.
+        for champ in champs_exiges_par_le_web() {
+            assert!(
+                liste[0].get(&champ).is_some(),
+                "champ `{champ}` absent de la liste"
+            );
+        }
+    }
+
     fn job_temoin(status: JobStatus, completed: usize) -> ConvertJob {
         ConvertJob {
             cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            nom_archive: "Nico - Chelsea Girl (FLAC 16-44.1).zip".into(),
             status,
             total: 4,
             completed,
@@ -2044,8 +2556,53 @@ mod tests {
             errors: Vec::new(),
             output_dir: convert_output_root().join("temoin"),
             output_bytes: 128_400_000,
+            formats_ecrits: Vec::new(),
             destination_serveur: false,
+            started_at_ms: 1_000,
         }
+    }
+
+    /// #5482 — l'écran lit le nom de l'archive dans le statut.
+    #[test]
+    fn le_statut_porte_le_nom_de_l_archive() {
+        let statut = payload_statut("j", &job_temoin(JobStatus::Completed, 4));
+        assert_eq!(
+            statut["archive_name"],
+            "Nico - Chelsea Girl (FLAC 16-44.1).zip"
+        );
+    }
+
+    /// #5482 — la route de téléchargement nomme l'archive d'après l'album,
+    /// en ASCII ET en UTF-8, et laisse le web lire l'en-tête.
+    #[tokio::test]
+    async fn l_archive_se_telecharge_sous_le_nom_de_l_album() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("01 - Orbits.flac"), b"fLaC").unwrap();
+        let mut job = job_temoin(JobStatus::Completed, 4);
+        job.nom_archive = "Beyoncé - Lemonade (FLAC 24).zip".into();
+        job.output_dir = dir.path().to_path_buf();
+        let id = format!("essai-5482-{}", uuid::Uuid::new_v4());
+        job_store()
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(job)));
+
+        let reponse = download_job(AxumPath(id.clone()))
+            .await
+            .map_err(|e| e.message)
+            .unwrap()
+            .into_response();
+        job_store().lock().await.remove(&id);
+        let en_tetes = reponse.headers();
+        assert_eq!(
+            en_tetes["Content-Disposition"],
+            "attachment; filename=\"Beyonce - Lemonade (FLAC 24).zip\"; \
+             filename*=UTF-8''Beyonc%C3%A9%20-%20Lemonade%20%28FLAC%2024%29.zip"
+        );
+        assert_eq!(
+            en_tetes["Access-Control-Expose-Headers"],
+            "Content-Disposition"
+        );
     }
 
     #[test]

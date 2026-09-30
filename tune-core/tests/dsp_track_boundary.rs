@@ -39,6 +39,16 @@ fn bras(nom: &str) -> String {
     })
 }
 
+/// #5204 — l'étage de la route native d'ASIO (`EtageNatifAsio`, sorti de
+/// `bras_asio.rs`) et la chaîne de ses pistes enchaînées :
+/// `local/chaine_par_la_boucle.rs`. Il n'a pas de `mod tests`. Chemin en clair,
+/// comme `bras`.
+fn chaine_par_la_boucle() -> String {
+    std::fs::read_to_string(Path::new("src/outputs/local/chaine_par_la_boucle.rs")).expect(
+        "src/outputs/local/chaine_par_la_boucle.rs doit être lisible depuis la racine du crate",
+    )
+}
+
 /// L'étage natif des bras Windows (REF-8, #2219) : `local/etage_natif.rs`,
 /// coupé à son `mod tests`. C'est lui qui prépare (`prepare_windows_native_pcm`)
 /// et qui draine (`flush_local_dsp`) pour WASAPI ; le bras ne fait plus que
@@ -113,6 +123,7 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let bras_asio = bras("asio");
     let bras_wasapi = bras("wasapi");
     let etage_natif = etage_natif();
+    let chaine_asio = chaine_par_la_boucle();
 
     // R6 bis (#2219) : la définition et les deux drainages du chemin cpal
     // partagé (transition gapless, fin de chaîne) restent dans `local.rs` ;
@@ -127,6 +138,7 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let drainages = prod.matches("flush_local_dsp(").count() - 1 // moins la définition
         + bras_coreaudio.matches("etage.rendre_la_queue_du_dsp(").count()
         + bras_asio.matches("flush_local_dsp(").count()
+        + chaine_asio.matches("flush_local_dsp(").count()
         + bras_wasapi.matches("flush_local_dsp(").count()
         + etage_natif.matches("flush_local_dsp(").count();
     assert!(
@@ -230,7 +242,8 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
             && bras_asio.contains("EtageDeConversion {")
             && bras_asio.matches(".tourner(").count() >= 2
             && bras_asio.matches("etage.rendre_la_queue_du_dsp(").count() >= 2
-            && bras_asio.contains("self.etage.rendre_la_queue(puits)"),
+            // #5204 : l'enveloppe `EtageNatifAsio` vit dans `chaine_par_la_boucle.rs`.
+            && chaine_asio.contains("self.etage.rendre_la_queue(puits)"),
         "ASIO doit monter l'étage conforme au pilote (natif ou R1) puis drainer sa fin de \
          piste sur les DEUX routes (REF-8, #2219)"
     );

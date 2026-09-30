@@ -386,6 +386,40 @@ pub(super) fn comparer_naturel(a: &str, b: &str) -> Ordering {
     ka.cmp(&kb).then_with(|| a.cmp(b))
 }
 
+/// Ordre alphabétique naturel des rubriques du serveur média — genres,
+/// artistes, albums, listes de lecture (#4956, décision de Bertrand du
+/// 29/09/2026) : celui de [`comparer_naturel`] (sans casse ni accents, nombres
+/// par leur valeur), où la ponctuation, les symboles et les espaces de TÊTE
+/// ne comptent pas. « (Hip-Hop) » se range à H, « 'Jazz » à J, et le « Blues »
+/// que `genre_counts` rend avec son espace de tête (« Rock, Blues ») à B.
+///
+/// Égalité départagée par le texte brut, comme `comparer_naturel` : l'ordre
+/// est total, donc le même d'une requête et d'une page à l'autre.
+///
+/// Les dossiers gardent [`comparer_naturel`] : un nom de dossier se lit tel
+/// qu'il est écrit sur le disque.
+pub(super) fn comparer_alphabetique(a: &str, b: &str) -> Ordering {
+    cle_alphabetique(a).cmp(&cle_alphabetique(b))
+}
+
+/// La clé de [`comparer_alphabetique`], calculée une fois : deux clés se
+/// comparent EXACTEMENT comme `comparer_alphabetique` compare leurs textes
+/// (ex æquo départagés par le texte brut compris).
+///
+/// C'est ce que les listes paginées de l'API REST de la bibliothèque trient
+/// (#4956, suite) : `sort_by_cached_key` la bâtit une fois par élément, là où
+/// `sort_by(comparer_alphabetique)` la rebâtirait à chaque comparaison.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CleAlphabetique(Vec<Morceau>, String);
+
+pub(crate) fn cle_alphabetique(s: &str) -> CleAlphabetique {
+    CleAlphabetique(cle_naturelle(sans_signes_de_tete(s)), s.to_owned())
+}
+
+fn sans_signes_de_tete(s: &str) -> &str {
+    s.trim_start_matches(|c: char| !c.is_alphanumeric())
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Morceau {
     // Les nombres passent avant le texte, comme dans un explorateur.
@@ -807,5 +841,34 @@ mod tests {
         let mut v = vec!["CD10", "cd2", "CD1", "Émile", "Eric", "007", "8"];
         v.sort_by(|a, b| comparer_naturel(a, b));
         assert_eq!(v, ["007", "8", "CD1", "cd2", "CD10", "Émile", "Eric"]);
+    }
+
+    /// #4956 — l'ordre des rubriques ignore les signes de tête ; les dossiers,
+    /// eux, gardent l'ordre naturel tel qu'écrit.
+    #[test]
+    fn l_ordre_alphabetique_ignore_les_signes_de_tete_4956() {
+        let mut v = vec![
+            "(Hip-Hop)",
+            " Blues",
+            "'Jazz",
+            "Électro",
+            "electro",
+            "Ambient",
+        ];
+        v.sort_by(|a, b| comparer_alphabetique(a, b));
+        assert_eq!(
+            v,
+            [
+                "Ambient",
+                " Blues",
+                "electro",
+                "Électro",
+                "(Hip-Hop)",
+                "'Jazz"
+            ]
+        );
+        let mut d = vec!["(Hip-Hop)", "Ambient"];
+        d.sort_by(|a, b| comparer_naturel(a, b));
+        assert_eq!(d, ["(Hip-Hop)", "Ambient"]);
     }
 }

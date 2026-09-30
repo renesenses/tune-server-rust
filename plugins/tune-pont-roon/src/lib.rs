@@ -72,7 +72,7 @@ impl TunePlugin for PontRoonPlugin {
         "pont-roon"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Pont Roon (Premium) : crédits, images d'artistes et pochettes récoltés sur un Core Roon"

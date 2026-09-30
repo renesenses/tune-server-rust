@@ -259,7 +259,15 @@ pub async fn init(
         return Vec::new();
     }
 
-    let loaded = loader.setup_all(api_base_url).await;
+    // #5370 — la page d'attente du démarrage nomme le greffon en cours ; le
+    // chargeur, lui, journalise la durée de chacun (`plugin_loaded`,
+    // `plugin_setup_slow`).
+    let loaded = loader
+        .setup_all_observed(api_base_url, &|name| {
+            crate::boot_status::set_current(Some(name))
+        })
+        .await;
+    crate::boot_status::set_current(None);
 
     // Publish the dormant set first, and unconditionally: opt-in plugins
     // (DJ/Karaoke) are the whole reason `loaded` can be empty while there is
@@ -292,7 +300,11 @@ pub async fn init(
 
 /// Apply a drained [`PluginRegistrations`]: outputs into the registry, zones
 /// into the DB, routers handed back to the caller.
-async fn install(state: &AppState, registrations: PluginRegistrations) -> PluginRouters {
+///
+/// Also called after a successful `POST /plugins/{name}/retry` (#5403): the
+/// outputs and zones go live at once, but the routers can only be mounted by
+/// the next start — the caller says so with `restart_required`.
+pub(crate) async fn install(state: &AppState, registrations: PluginRegistrations) -> PluginRouters {
     // `routers` exists unconditionally here: tune-server always enables
     // tune-core's `plugin-http` feature (see its Cargo.toml).
     let PluginRegistrations {

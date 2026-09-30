@@ -4539,6 +4539,108 @@ async fn a_single_local_output_wins_over_other_same_name_candidates() {
     );
 }
 
+/// L'index que `startup.rs::deduplicate_zones` pose au démarrage — et que la
+/// base de test, montée par `init_schema` + migrations, n'a PAS. Sans lui la
+/// collision de #5464 ne peut pas se produire ici, et l'épreuve ne mesurerait
+/// rien.
+fn poser_l_index_unique_des_zones(orch: &PlaybackOrchestrator) {
+    orch.db
+        .execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id \
+             ON zones(output_device_id) WHERE output_device_id IS NOT NULL;",
+        )
+        .unwrap();
+}
+
+/// 🔴 #5464 — Lulu (0.9.168 Windows, fil 2039) : au clic Lecture, le toast
+/// affichait `execute: UNIQUE constraint failed: zones.output_device_id`.
+///
+/// Deux zones « audio-gd USB audio » (#3738, même testeur) : B tient la sortie
+/// locale `local:audio-gd USB audio`, A pointe une sortie disparue. Le rebond
+/// de #1287 re-liait A à la seule sortie vivante du même nom — celle de B — et
+/// l'`UPDATE` violait l'index unique partiel ; l'erreur SQL brute remontait
+/// par `?` jusqu'à l'écran, à chaque clic.
+///
+/// Attendu : aucun rebond, un refus NOMMÉ (sentinelle 409), et aucune des deux
+/// zones touchée en base.
+#[tokio::test]
+async fn le_rebond_vers_une_sortie_deja_tenue_par_une_autre_zone_refuse_sans_erreur_sql_5464() {
+    let orch = test_orchestrator();
+    poser_l_index_unique_des_zones(&orch);
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone_b = repo
+        .create(
+            "audio-gd USB audio",
+            Some("local"),
+            Some("local:audio-gd USB audio"),
+        )
+        .unwrap();
+    let zone_a = stale_network_zone(&orch, "audio-gd USB audio");
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:audio-gd USB audio", "audio-gd USB audio").with_type("local"),
+    ));
+
+    let zone = repo.get(zone_a).unwrap().unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_a, &zone)
+        .await
+        .expect_err("la sortie du même nom appartient à une autre zone : pas de rebond");
+    assert!(
+        !err.contains("UNIQUE constraint"),
+        "l'erreur SQL brute ne doit jamais atteindre l'auditeur : {err}"
+    );
+    assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+    assert!(
+        err.contains("déjà") && err.contains("audio-gd USB audio"),
+        "le refus doit dire que la sortie est prise, et laquelle : {err}"
+    );
+
+    let a = repo.get(zone_a).unwrap().unwrap();
+    assert_eq!(a.output_device_id.as_deref(), Some("dlna-vanished-host"));
+    assert_eq!(a.output_type.as_deref(), Some("dlna"));
+    assert!(!a.online, "un rebond refusé ne remet pas la zone en ligne");
+    let b = repo.get(zone_b).unwrap().unwrap();
+    assert_eq!(
+        b.output_device_id.as_deref(),
+        Some("local:audio-gd USB audio"),
+        "la zone qui tient la sortie n'est pas dépossédée"
+    );
+}
+
+/// #5464 — même collision, mais la sortie est retenue par une zone SUPPRIMÉE
+/// (masquée : sa ligne garde `output_device_id`, l'index la compte). Le refus
+/// ne doit pas inviter à lancer la lecture sur une zone que l'auditeur ne
+/// voit plus.
+#[tokio::test]
+async fn le_rebond_vers_une_sortie_tenue_par_une_zone_supprimee_le_dit_5464() {
+    let orch = test_orchestrator();
+    poser_l_index_unique_des_zones(&orch);
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone_b = repo
+        .create("Ancien DAC", Some("local"), Some("local:Salon"))
+        .unwrap();
+    repo.delete(zone_b).unwrap();
+    let zone_a = stale_network_zone(&orch, "Salon");
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:Salon", "Salon").with_type("local"),
+    ));
+
+    let zone = repo.get(zone_a).unwrap().unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_a, &zone)
+        .await
+        .expect_err("sortie retenue par une zone supprimée : pas de rebond");
+    assert!(!err.contains("UNIQUE constraint"), "err = {err}");
+    assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+    assert!(err.contains("supprimée"), "err = {err}");
+    assert!(
+        !err.contains("Lancez la lecture"),
+        "une zone supprimée n'est pas un endroit où lancer la lecture : {err}"
+    );
+    let a = repo.get(zone_a).unwrap().unwrap();
+    assert_eq!(a.output_device_id.as_deref(), Some("dlna-vanished-host"));
+}
+
 #[tokio::test]
 async fn no_matching_output_gives_an_actionable_error_not_a_curt_offline() {
     let orch = test_orchestrator();

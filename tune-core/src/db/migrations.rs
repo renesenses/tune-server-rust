@@ -2183,6 +2183,26 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "zones_motif_masquage",
         up: "",
     },
+
+    // #5478 (web#1802, « Écouter plus tard ») — la date du DÉPÔT d'un objet
+    // local dans une étiquette. `streaming_item_tags` la portait depuis la 97 ;
+    // `item_tags` n'en avait aucune, et l'écran ne pouvait pas trier par
+    // « ajouté récemment ».
+    //
+    // NULL pour toutes les lignes existantes, jamais now() : dater de la mise
+    // à jour un dépôt fait il y a trois mois le ferait passer pour le plus
+    // récent — exactement le mensonge que ce tri doit éviter. Même règle que
+    // la 95 et la 112. La colonne est remplie à l'étiquetage
+    // (`tag_repo::sql::tag_item`), jamais réécrite (`DO NOTHING`).
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 077 (la
+    // 076 n'a pas de jumelle SQLite).
+    Migration {
+        version: 113,
+        name: "item_tags_created_at",
+        up: "",
+    },
 ];
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
@@ -3164,6 +3184,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "zones", "motif_masquage", "TEXT");
             add_column_if_missing(db, "zones", "masquee_le", "TEXT");
         }
+        if migration.version == 113 {
+            // Date du dépôt dans une étiquette (#5478). Sans défaut : NULL =
+            // INCONNUE, et c'est ce que reçoit toute pose existante.
+            add_column_if_missing(db, "item_tags", "created_at", "TEXT");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3665,6 +3690,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // remplissage est le travail de la migration 104, qui ne tourne qu'une
     // fois. PG : migration 067.
     add_column_if_missing(db, "streaming_favorites", "first_seen_at", "TEXT");
+    // Date du dépôt dans une étiquette (migration 113, #5478) — posée ICI
+    // aussi, pour la même raison : `tag_item` et `items_by_tag_dated` la
+    // NOMMENT, et une base arrivée sans elle ne pourrait plus rien étiqueter.
+    // PG : migration 077.
+    add_column_if_missing(db, "item_tags", "created_at", "TEXT");
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4377,6 +4407,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         76,
         "tracks_path_terms",
         include_str!("../../migrations/postgres/076_tracks_path_terms.sql"),
+    ),
+    // Jumelle de la SQLite 113 (#5478) : `item_tags.created_at`, la date du
+    // dépôt dans une étiquette, NULL pour l'existant.
+    (
+        77,
+        "item_tags_created_at",
+        include_str!("../../migrations/postgres/077_item_tags_created_at.sql"),
     ),
 ];
 
@@ -6975,7 +7012,10 @@ mod tests {
         // 76 : `tracks_path_terms` (#5192), SANS jumelle SQLite : la colonne
         // calculée des termes de chemin, que lisent le texte libre d'Oxygen et
         // la recherche de pistes sous PostgreSQL.
-        assert_eq!(pg_latest_version(), 76, "latest PG migration must be 76");
+        // 77 : `item_tags_created_at` (#5478), jumelle de la SQLite 113. Pose
+        // `item_tags.created_at`, que `tag_item` et `items_by_tag_dated`
+        // NOMMENT.
+        assert_eq!(pg_latest_version(), 77, "latest PG migration must be 77");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

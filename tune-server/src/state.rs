@@ -49,6 +49,11 @@ pub struct AppState {
     /// lecteurs pendant chaque balayage réseau (#1432).
     pub scanner: Arc<SsdpScanner>,
     pub event_bus: Arc<EventBus>,
+    /// Les comptes et pochettes de la liste des collections intelligentes, en
+    /// cache jusqu'au prochain événement de bibliothèque (#5438). Tenu ici et
+    /// non en `static` : chaque état a sa base, et un test ne pollue pas le
+    /// suivant.
+    pub comptes_collections: Arc<tune_smart_http::comptes::CacheDesComptes>,
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
@@ -159,6 +164,13 @@ pub struct AppState {
     /// `POST /plugins/{name}/install` checks a name against, so it can refuse
     /// one that names nothing this binary carries (#2132).
     pub plugin_names: Arc<OnceLock<Vec<String>>>,
+    /// Les `setup()` en erreur (#5403) — un greffon coupé à la borne reste
+    /// listé par le gestionnaire, en erreur « démarrage trop long », et
+    /// `POST /plugins/{name}/retry` le relance. Le même `Arc` que tient le
+    /// chargeur ([`tune_core::plugin_sdk::PluginLoader::setup_report`]),
+    /// pris à la construction : les routes le lisent sans verrouiller
+    /// [`Self::plugins`], qu'un nouvel essai tient jusqu'à la borne.
+    pub plugin_setup_report: Arc<std::sync::Mutex<tune_core::plugin_sdk::PluginSetupReport>>,
     /// Loaded WASM plugins (P2 of the plugin ABI). Published once by
     /// [`crate::plugins_host::load_wasm_plugins`] at startup and read by the
     /// `/api/v1/plugins/{id}/…` route mount. Gated behind `plugins-wasm`, so
@@ -195,9 +207,11 @@ impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
         // #4473 — le module des règles ne connaît aucun service ; c'est ici,
         // où le registre existe, qu'on lui donne de quoi interroger un
         // catalogue. La frontière de crate reste fermée.
-        Self::new(state.backend.clone()).avec_catalogue(std::sync::Arc::new(
-            crate::catalogue_services::CatalogueDuRegistre::new(state.services.clone()),
-        ))
+        Self::new(state.backend.clone())
+            .avec_catalogue(std::sync::Arc::new(
+                crate::catalogue_services::CatalogueDuRegistre::new(state.services.clone()),
+            ))
+            .avec_comptes(state.comptes_collections.clone())
     }
 }
 
@@ -332,6 +346,11 @@ impl AppState {
     }
 
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
+        // #5467 — en build de test, les chemins relatifs de la configuration
+        // (`tune.db`, `artwork_cache`) ne se résolvent plus depuis le répertoire
+        // courant, c'est-à-dire l'arbre source. Sans effet en production.
+        #[cfg(test)]
+        let tune_config = crate::isolement_disque_tests_5467::isoler_config(tune_config);
         // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
         // default to SQLite.
         let selected_engine = tune_config
@@ -488,11 +507,14 @@ impl AppState {
         ));
         skin_manager.ensure_dirs();
 
-        let plugins = Arc::new(Mutex::new(crate::plugins::build_loader(
-            &event_bus,
-            backend.clone(),
-            license.clone(),
-        )));
+        let loader = crate::plugins::build_loader(&event_bus, backend.clone(), license.clone());
+        let plugin_setup_report = loader.setup_report();
+        let plugins = Arc::new(Mutex::new(loader));
+
+        // Abonné AVANT que rien ne soit émis : aucune invalidation manquée.
+        let comptes_collections = Arc::new(tune_smart_http::comptes::CacheDesComptes::new(
+            event_bus.subscribe(),
+        ));
 
         Ok(Self {
             db: sqlite_db,
@@ -504,6 +526,7 @@ impl AppState {
             orchestrator,
             scanner,
             event_bus,
+            comptes_collections,
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             upnp: Some(upnp),
@@ -535,6 +558,7 @@ impl AppState {
             plugin_info: Arc::new(OnceLock::new()),
             plugin_available: Arc::new(OnceLock::new()),
             plugin_names: Arc::new(OnceLock::new()),
+            plugin_setup_report,
             #[cfg(feature = "plugins-wasm")]
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]

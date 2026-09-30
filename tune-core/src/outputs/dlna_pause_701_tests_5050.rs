@@ -260,3 +260,100 @@ async fn la_position_mesuree_ne_prend_qu_un_rel_time_lisible() {
     r.etat.lock().unwrap().rel_time = Some("0:00:00");
     assert_eq!(r.output.position_mesuree_ms().await, Some(0));
 }
+
+/// Capture du journal, abonné LOCAL au fil du test (`set_default`) : le
+/// runtime `#[tokio::test]` tourne sur ce seul fil, le renderer factice aussi.
+#[derive(Clone, Default)]
+struct Journal(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Journal {
+    fn write(&mut self, octets: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(octets);
+        Ok(octets.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+    type Writer = Journal;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Journal {
+    fn texte(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+    fn abonner(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+}
+
+/// #5050 (diagnostic, décision du 29/09) — au refus 701, le journal dit la
+/// position que le renderer annonce ET l'état de son transport. C'est la
+/// mesure qui manquait aux journaux de FabienM : figé à la cible du Seek, ou
+/// en lecture ? Deux refus rapprochés n'écrivent qu'une ligne.
+///
+/// Contre-épreuve : retirer l'appel à `journaliser_position_au_refus_701`
+/// dans `pause_apres_refus_701` fait tomber ce test (aucune ligne).
+#[tokio::test]
+async fn un_refus_701_journalise_la_position_et_l_etat_du_transport() {
+    let journal = Journal::default();
+    let _garde = journal.abonner();
+    let r = renderer(Scenario::Fige("TRANSITIONING")).await;
+    r.etat.lock().unwrap().rel_time = Some("0:00:56");
+
+    let evenement = ["dlna", "pause", "701", "position", "lue"].join("_");
+    let premier = r.output.pause().await;
+    assert!(premier.is_err(), "figé en transition : refus");
+
+    let texte = journal.texte();
+    let lignes: Vec<&str> = texte.lines().filter(|l| l.contains(&evenement)).collect();
+    assert_eq!(lignes.len(), 1, "une ligne par refus :\n{texte}");
+    let ligne = lignes[0];
+    assert!(ligne.contains("etat=\"TRANSITIONING\""), "{ligne}");
+    assert!(ligne.contains("position_ms=Some(56000)"), "{ligne}");
+    assert!(ligne.contains("rel_time=\"0:00:56\""), "{ligne}");
+    assert!(ligne.contains("duree_piste=\"0:05:00\""), "{ligne}");
+    assert!(
+        !ligne.contains("http"),
+        "aucune URL dans la ligne : {ligne}"
+    );
+    assert_eq!(r.compte("GetPositionInfo"), 1);
+}
+
+/// Le débit est borné par renderer : deux refus à moins de
+/// `DIAG_701_INTERVALLE` n'écrivent qu'une ligne. Le budget d'attente est
+/// ici réduit pour que les deux refus tombent dans le même intervalle.
+#[tokio::test]
+async fn deux_refus_rapproches_n_ecrivent_qu_une_ligne_de_position() {
+    let journal = Journal::default();
+    let _garde = journal.abonner();
+    let r = renderer(Scenario::Fige("TRANSITIONING")).await;
+    let refus = FAUTE_701.to_string();
+    let budget = Duration::from_millis(50);
+    let pas = Duration::from_millis(10);
+    let _ = r
+        .output
+        .pause_apres_refus_701(refus.clone(), budget, pas)
+        .await;
+    let _ = r.output.pause_apres_refus_701(refus, budget, pas).await;
+
+    let evenement = ["dlna", "pause", "701", "position", "lue"].join("_");
+    let n = journal
+        .texte()
+        .lines()
+        .filter(|l| l.contains(&evenement))
+        .count();
+    assert_eq!(n, 1, "débit non borné :\n{}", journal.texte());
+    assert_eq!(r.compte("GetPositionInfo"), 1);
+}

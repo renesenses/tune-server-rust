@@ -599,27 +599,12 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                     // resolved/set we fall through to today's behavior (no
                     // regression). Cyrille: iFi Neo iDSD / FiiO K3, DSD128+
                     // silent.
+                    // #5439 — le même réglage sert le chemin compressé.
                     #[cfg(target_os = "macos")]
-                    {
-                        use coreaudio::audio_unit::macos_helpers;
-                        if let Some(dev_id) =
-                            macos_helpers::get_device_id_from_name(&device_name, false)
-                        {
-                            let want = cfg.sample_rate as f64;
-                            match macos_helpers::set_device_sample_rate(dev_id, want) {
-                                Ok(_) => info!(
-                                    device = %device_name,
-                                    to = cfg.sample_rate,
-                                    "local_audio_coreaudio_nominal_rate_set_shared"
-                                ),
-                                Err(e) => warn!(
-                                    error = %e,
-                                    wanted = cfg.sample_rate,
-                                    "local_audio_coreaudio_set_rate_failed"
-                                ),
-                            }
-                        }
-                    }
+                    super::cadence_du_flux_compresse::caler_la_cadence_nominale_coreaudio(
+                        &device_name,
+                        cfg.sample_rate,
+                    );
                     (cfg, sample_rate, None)
                 }
                 // On refuse la cadence de la source : rubato convertit. Une
