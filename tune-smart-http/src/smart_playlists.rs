@@ -421,7 +421,16 @@ pub(crate) fn build_smart_query_rapport(
         // historique d'écoute, date du fichier, crédits. #5547 : les trois
         // derniers venaient des collections, qui les traduisent à l'album ;
         // ici, à la PISTE.
-        let cond = if let Some(c) = condition_hors_colonne(field, op, value, value_raw) {
+        let cond = if field == "rating" {
+            // #5547 — la note de l'album de la piste, pour le profil actif.
+            match regles_sql::condition_note("t.album_id", op, value_raw, ctx.profile_id) {
+                Some(c) => c,
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if let Some(c) = condition_hors_colonne(field, op, value, value_raw) {
             if c == regles_sql::FAUX {
                 refusees.push(format!("{field} {op}"));
             }
@@ -1729,5 +1738,52 @@ mod catalogue_de_service {
             panic!("demande valide")
         };
         assert_eq!(titres(&r).len(), 2, "le profil 2 n'a rien banni");
+    }
+}
+
+/// #5547 — l'APERÇU réel de la route, avec une règle « Note » : il rendait une
+/// erreur 500 (`no such column: t.rating`) sur le .18 en 0.9.169.
+#[cfg(test)]
+mod apercu_note_5547 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    async fn apercu(regles: &str, profil: i64) -> serde_json::Value {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let r = super::preview_smart_collection(
+            axum::extract::State(SmartHttpState::new(backend)),
+            tune_http_types::ActiveProfile(profil),
+            axum::Json(super::PreviewRequest {
+                rules: serde_json::from_str(regles).expect("json"),
+                match_mode: None,
+                sort_by: None,
+                sort_order: None,
+                max_tracks: None,
+            }),
+        )
+        .await;
+        match r {
+            Ok(axum::Json(v)) => v,
+            Err(e) => panic!(
+                "l'aperçu échoue au lieu de répondre : statut {}",
+                axum::response::IntoResponse::into_response(e).status()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn l_apercu_d_une_regle_note_repond_sans_erreur() {
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 1).await;
+        assert_eq!(
+            v["tracks"].as_array().map(|a| a.len()),
+            v["total"].as_u64().map(|n| n as usize)
+        );
+        let attendu = if "tracks" == "tracks" { 2 } else { 1 };
+        assert_eq!(v["total"], attendu, "{v}");
+        // Le profil 2 n'a noté que Giant Steps.
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
+        assert_eq!(v["total"], 1, "{v}");
     }
 }

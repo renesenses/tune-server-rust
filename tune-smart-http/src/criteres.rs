@@ -153,17 +153,11 @@ pub(crate) const CRITERES: &[Critere] = &[
 /// décision, qui se lit dans la revue.
 pub(crate) const PROPRES_AUX_PISTES: &[&str] = &["title", "comments"];
 
-/// Les critères CASSÉS dans les deux moteurs, trouvés par la garde (#5547).
-///
-/// `rating` (« Note ») compile en `t.rating`, et la table `tracks` n'a pas de
-/// colonne `rating` : la requête échoue (`no such column: t.rating`), et
-/// l'aperçu rend une erreur 500 — mesuré sur le .18 en 0.9.169, aux
-/// collections comme aux playlists. Les notes vivent dans `album_ratings`,
-/// par album ET par profil ; choisir comment une piste en hérite est une
-/// décision, rendue à Bertrand dans #5547. D'ici là, le client ne propose plus
-/// ce critère, et la garde vérifie qu'il est toujours cassé : le jour où il
-/// sera réparé, elle échouera pour qu'on le retire d'ici.
-pub(crate) const CASSES: &[&str] = &["rating"];
+// « Note » (`rating`) a été la seule entrée d'une liste `CASSES` : les deux
+// moteurs compilaient `t.rating`, colonne absente, et l'aperçu rendait une
+// erreur 500. Réparée par décision de Bertrand (30/09/2026, #5547) : la note
+// de l'ALBUM pour le profil actif (`regles_sql::condition_note`). La liste a
+// disparu avec son dernier cas ; la garde joue désormais TOUS les critères.
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -221,6 +215,8 @@ pub(crate) mod tests {
              INSERT INTO tags (id, name) VALUES (7,'J''adore'),(8,'Album'),(9,'Artiste'); \
              INSERT INTO item_tags (tag_id, item_type, item_id) VALUES \
                (7,'track',1),(8,'album',2),(9,'artist',3); \
+             INSERT INTO album_ratings (album_id, profile_id, rating) VALUES \
+               (1,1,5),(2,1,2),(2,2,5); \
              INSERT INTO track_credits (track_id, artist_name, role) VALUES (1,'Teo Macero','producer'); \
              INSERT INTO listen_history (track_id, title, listened_at) VALUES \
                (1,'Blue in Green','2024-06-01T10:00:00Z'), \
@@ -290,9 +286,6 @@ pub(crate) mod tests {
         let db = bibliotheque();
         let mut essais = 0;
         for c in CRITERES {
-            if c.piste.is_some_and(|n| CASSES.contains(&n)) {
-                continue;
-            }
             for op in c.famille.operateurs() {
                 let v = valeur(c.famille, op);
                 if let Some(nom) = c.piste {
@@ -308,30 +301,98 @@ pub(crate) mod tests {
         assert!(essais > 200, "la garde ne joue presque rien : {essais}");
     }
 
-    /// Voir [`CASSES`] : ce test échoue le jour où la « Note » est réparée.
+    /// Ce test vérifiait que la « Note » était cassée des DEUX côtés (`no such
+    /// column: t.rating`) et devait échouer le jour de sa réparation. Adapté,
+    /// et non supprimé (#5547) : la même requête, dans les deux moteurs, doit
+    /// maintenant s'exécuter ET rendre la note de l'album pour le profil actif.
+    ///
+    /// Notes de la bibliothèque : Kind of Blue 5 (profil 1) ; Giant Steps 2
+    /// (profil 1) et 5 (profil 2) ; Seul, aucune.
     #[test]
-    fn la_note_est_toujours_cassee_des_deux_cotes() {
+    fn la_note_de_l_album_marche_des_deux_cotes() {
         let db = bibliotheque();
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let r = regle("rating", ">=", json!(3));
-        let (w, _o, _l, _) = build_smart_query_rapport(&r, "all", "title", "asc", None, &ctx);
+        let (w, _o, _l, refusees) =
+            build_smart_query_rapport(&r, "all", "title", "asc", None, &ctx);
+        assert!(refusees.is_empty(), "{refusees:?}");
         let sql = format!(
             "SELECT t.id FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
-             LEFT JOIN artists ar ON t.artist_id = ar.id {w}"
+             LEFT JOIN artists ar ON t.artist_id = ar.id {w} ORDER BY t.id"
         );
-        assert!(
-            db.query_many(&sql, &[]).is_err(),
-            "la note des playlists marche : retirez-la de CASSES"
-        );
+        let lignes = db
+            .query_many(&sql, &[])
+            .unwrap_or_else(|e| panic!("la note des playlists est cassée : {e}\n{sql}"));
+        let ids: Vec<i64> = lignes.iter().map(|l| l[0].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2], "les pistes de l'album noté 5");
         let (w, _o, _l) = build_album_query(&r, "all", "title", "asc", None, &ctx);
         let sql = format!(
             "SELECT al.id FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id \
-             LEFT JOIN tracks t ON t.album_id = al.id {w} GROUP BY al.id"
+             LEFT JOIN tracks t ON t.album_id = al.id {w} GROUP BY al.id ORDER BY al.id"
         );
-        assert!(
-            db.query_many(&sql, &[]).is_err(),
-            "la note des collections marche : retirez-la de CASSES"
+        let lignes = db
+            .query_many(&sql, &[])
+            .unwrap_or_else(|e| panic!("la note des collections est cassée : {e}\n{sql}"));
+        let ids: Vec<i64> = lignes.iter().map(|l| l[0].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1], "l'album noté 5");
+    }
+
+    /// Les pistes d'une règle de playlist, pour un PROFIL donné.
+    fn pistes_du_profil(db: &SqliteDb, regles: &str, profil: i64) -> Vec<i64> {
+        let ctx = RefCtx::root(&EmptyResolver, Some(profil));
+        let (w, _o, _l, _) = build_smart_query_rapport(regles, "all", "title", "asc", None, &ctx);
+        let sql = format!(
+            "SELECT t.id FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id {w} ORDER BY t.id"
         );
+        db.query_many(&sql, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+            .iter()
+            .map(|r| r[0].as_i64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn la_note_est_celle_du_profil_actif() {
+        let db = bibliotheque();
+        let r = regle("rating", ">=", json!(4));
+        assert_eq!(pistes_du_profil(&db, &r, 1), vec![1, 2]);
+        // Le profil 2 n'a noté que Giant Steps, 5.
+        assert_eq!(pistes_du_profil(&db, &r, 2), vec![3]);
+        // Un profil sans note ne retient rien.
+        assert!(pistes_du_profil(&db, &r, 9).is_empty());
+    }
+
+    #[test]
+    fn un_album_sans_note_ne_passe_aucune_comparaison() {
+        // « Seul » (piste 4) n'a pas de note : ni « ≥ », ni « < », ni « ≠ »,
+        // ni « entre ». La famille numérique n'a pas de « n'est pas noté ».
+        let db = bibliotheque();
+        assert_eq!(pistes(&db, &regle("rating", "<", json!(3))), vec![3]);
+        assert_eq!(pistes(&db, &regle("rating", "!=", json!(5))), vec![3]);
+        assert_eq!(
+            pistes(&db, &regle("rating", "between", json!([1, 5]))),
+            vec![1, 2, 3]
+        );
+        assert_eq!(pistes(&db, &regle("rating", "=", json!("5"))), vec![1, 2]);
+        assert_eq!(albums(&db, &regle("rating", "<", json!(3))), vec![2]);
+        assert_eq!(
+            albums(&db, &regle("rating", "between", json!([1, 5]))),
+            vec![1, 2]
+        );
+        assert!(!Famille::Nombre.operateurs().contains(&"is_null"));
+    }
+
+    #[test]
+    fn sans_profil_la_note_ne_retient_rien() {
+        let db = bibliotheque();
+        let ctx = RefCtx::root(&EmptyResolver, None);
+        let r = regle("rating", ">=", json!(1));
+        let (w, _o, _l, _) = build_smart_query_rapport(&r, "all", "title", "asc", None, &ctx);
+        assert!(w.contains("1 = 0"), "{w}");
+        let (w, _o, _l) = build_album_query(&r, "all", "title", "asc", None, &ctx);
+        assert!(w.contains("1 = 0"), "{w}");
+        let _ = db;
     }
 
     #[test]

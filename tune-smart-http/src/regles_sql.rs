@@ -91,7 +91,6 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "track_number" => nombre("t.track_number"),
         "disc_number" => nombre("t.disc_number"),
         "bpm" => nombre("t.bpm"),
-        "rating" => nombre("t.rating"),
         // #5547 — deux critères d'ALBUM que les collections offraient et que
         // les playlists refusaient (condition FAUSSE). Au niveau de la piste,
         // c'est l'album de la piste qui répond : « albums de 12 pistes » rend
@@ -396,6 +395,47 @@ pub(crate) fn condition_valeur(
         }
         _ => condition(col, op, &texte_de(valeur)),
     }
+}
+
+/// La NOTE d'un album pour le profil actif — « Note » (`rating`), #5547.
+///
+/// Les deux moteurs compilaient `t.rating`, colonne qui n'existe pas : la
+/// requête échouait (`no such column: t.rating`) et l'aperçu rendait une
+/// erreur 500, aux collections comme aux playlists (.18, 0.9.169). Les notes
+/// vivent dans `album_ratings`, une ligne par album ET par profil.
+///
+/// Décision de Bertrand (30/09/2026) : la note de l'ALBUM pour le profil
+/// actif ; dans une playlist, celle de l'album de chaque piste. `album` est
+/// donc `al.id` (collections) ou `t.album_id` (playlists).
+///
+/// Opérateurs de la famille numérique. Un album SANS note donne `NULL` : il ne
+/// passe aucune comparaison — ni « ≥ N », ni « ≠ N », ni « entre ». La famille
+/// n'a pas d'opérateur « n'est pas noté », et aucun n'est ajouté.
+///
+/// `None` : opérateur hors de la famille. Sans profil, rien ne passe (`FAUX`),
+/// comme pour les favoris : sans profil, la note est inconnue.
+pub(crate) fn condition_note(
+    album: &str,
+    op: &str,
+    valeur: Option<&serde_json::Value>,
+    profile_id: Option<i64>,
+) -> Option<String> {
+    let entier = || texte_de(valeur).trim().parse::<i64>().unwrap_or(0);
+    let comparaison = match op {
+        "=" | "!=" | ">=" | ">" | "<=" | "<" => format!("{op} {}", entier()),
+        "between" => {
+            let (lo, hi) = bornes_de_nombres(valeur)?;
+            format!("BETWEEN {lo} AND {hi}")
+        }
+        _ => return None,
+    };
+    let Some(pid) = profile_id else {
+        return Some(FAUX.to_string());
+    };
+    Some(format!(
+        "(SELECT arn.rating FROM album_ratings arn \
+         WHERE arn.album_id = {album} AND arn.profile_id = {pid}) {comparaison}"
+    ))
 }
 
 /// La condition à poser quand rien ne se traduit : FAUX.
