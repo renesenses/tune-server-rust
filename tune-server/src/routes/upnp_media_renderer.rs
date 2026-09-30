@@ -47,6 +47,8 @@ struct NextItem {
     title: Option<String>,
     artist: Option<String>,
     duration_ms: Option<i64>,
+    /// `NextURIMetaData` reçu, rendu tel quel par `GetMediaInfo` (#5304).
+    metadata: String,
 }
 
 fn sessions() -> &'static Mutex<HashMap<i64, RendererSession>> {
@@ -262,6 +264,15 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         .filter(|d| *d > 0)
         .or(session.duration_ms)
         .unwrap_or(0);
+    // #5304 : la suivante posée, publiée par `GetMediaInfo` (`NextURI`) et
+    // `GetCurrentTransportActions` (`Next`). Une zone reprise par Tune n'a
+    // plus de suivante UPnP à faire valoir.
+    let (next_uri, next_metadata) = session
+        .next
+        .as_ref()
+        .filter(|_| !reprise)
+        .map(|n| (n.uri.clone(), n.metadata.clone()))
+        .unwrap_or_default();
     let muted = ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
@@ -281,6 +292,8 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         position_ms,
         duration_ms,
         uri: session.uri,
+        next_uri,
+        next_metadata,
         volume,
         muted,
     }
@@ -333,6 +346,7 @@ async fn avtransport_control(
             title,
             artist,
             duration_ms,
+            metadata,
         } => {
             if let Ok(mut s) = sessions().lock() {
                 s.entry(zone_id).or_default().next = Some(NextItem {
@@ -340,6 +354,7 @@ async fn avtransport_control(
                     title,
                     artist,
                     duration_ms,
+                    metadata,
                 });
             }
             spawn_gapless_watcher(state.clone(), zone_id);
@@ -475,6 +490,21 @@ async fn avtransport_control(
         }
         RendererCommand::GetMediaInfo => {
             upnp_renderer::media_info_response(&snapshot(&state, zone_id).await)
+        }
+        RendererCommand::GetCurrentTransportActions => {
+            upnp_renderer::transport_actions_response(&snapshot(&state, zone_id).await)
+        }
+        RendererCommand::Next => {
+            // #5304 — la bascule demandée par un contrôleur qui a vu la
+            // suivante tenue (`NextURI` + `Next` déclarés). Même promotion
+            // que le watcher, tout de suite, au lieu d'attendre qu'il
+            // constate l'arrêt : le flux que le contrôleur a armé est celui
+            // qu'on lance, il n'a rien à relancer.
+            match enchainer_la_suivante(&state, zone_id).await {
+                Some(Ok(())) => upnp_renderer::empty_response("Next"),
+                Some(Err(e)) => tune_core::upnp_server::soap_fault(701, &e),
+                None => tune_core::upnp_server::soap_fault(701, "Transition not available"),
+            }
         }
         RendererCommand::Unsupported(name) => {
             debug!(zone_id, action = %name, "upnp_renderer_unsupported_action");
@@ -785,41 +815,56 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                 SuiteDuTour::Promouvoir => {}
             }
             // Fin naturelle : promouvoir la suivante et relancer.
-            let Some(promoted) = promouvoir_la_suivante(zone_id) else {
+            if enchainer_la_suivante(&state, zone_id).await.is_none() {
                 // Effacée entre-temps (Stop commandé) : rien à jouer.
                 if try_release_watcher(zone_id) {
                     return;
                 }
                 continue;
-            };
-            let device_id = ZoneRepo::with_backend(state.backend.clone())
-                .get(zone_id)
-                .ok()
-                .flatten()
-                .and_then(|z| z.output_device_id);
-            let req = tune_core::orchestrator::PlayRequest {
-                zone_id,
-                output_device_id: device_id,
-                source: Some("upnp".into()),
-                source_id: Some(promoted.uri.clone()),
-                title: promoted.title.clone(),
-                artist_name: promoted.artist.clone(),
-                duration_ms: promoted.duration_ms,
-                ..Default::default()
-            };
-            match state.orchestrator.play(req).await {
-                Ok(result) => {
-                    if let Some(error) = result.error {
-                        warn!(zone_id, error, "upnp_renderer_gapless_advance_failed");
-                    } else {
-                        memoriser_lecture_renderer(&state, zone_id, &promoted).await;
-                        info!(zone_id, uri = %promoted.uri, "upnp_renderer_gapless_advance");
-                    }
-                }
-                Err(e) => warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed"),
             }
         }
     });
+}
+
+/// Promeut la suivante et la lance — le geste commun du watcher (fin
+/// naturelle constatée) et de l'action `Next` (#5304, bascule demandée).
+///
+/// `None` : aucune suivante à promouvoir (jamais posée, effacée par un Stop,
+/// ou déjà consommée par l'autre chemin — `promouvoir_la_suivante` la prend
+/// sous le verrou, les deux chemins ne peuvent pas la lancer deux fois).
+async fn enchainer_la_suivante(state: &AppState, zone_id: i64) -> Option<Result<(), String>> {
+    let promoted = promouvoir_la_suivante(zone_id)?;
+    let device_id = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    let req = tune_core::orchestrator::PlayRequest {
+        zone_id,
+        output_device_id: device_id,
+        source: Some("upnp".into()),
+        source_id: Some(promoted.uri.clone()),
+        title: promoted.title.clone(),
+        artist_name: promoted.artist.clone(),
+        duration_ms: promoted.duration_ms,
+        ..Default::default()
+    };
+    Some(match state.orchestrator.play(req).await {
+        Ok(result) => {
+            if let Some(error) = result.error {
+                warn!(zone_id, error = %error, "upnp_renderer_gapless_advance_failed");
+                Err(error)
+            } else {
+                memoriser_lecture_renderer(state, zone_id, &promoted).await;
+                info!(zone_id, uri = %promoted.uri, "upnp_renderer_gapless_advance");
+                Ok(())
+            }
+        }
+        Err(e) => {
+            warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed");
+            Err(e)
+        }
+    })
 }
 
 /// Annonceur SSDP des renderers de zones opt-in. Relit la liste à CHAQUE
@@ -1378,6 +1423,10 @@ mod enchainement_upnp_3967_tests {
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_4324.rs"]
 mod session_4324_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_5304.rs"]
+mod controleur_tune_face_au_renderer_tune_5304_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

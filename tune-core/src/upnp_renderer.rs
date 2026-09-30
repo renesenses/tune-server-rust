@@ -136,12 +136,24 @@ pub fn avtransport_scpd() -> &'static str {
       <argument><name>MediaDuration</name><direction>out</direction><relatedStateVariable>CurrentMediaDuration</relatedStateVariable></argument>
       <argument><name>CurrentURI</name><direction>out</direction><relatedStateVariable>AVTransportURI</relatedStateVariable></argument>
       <argument><name>CurrentURIMetaData</name><direction>out</direction><relatedStateVariable>AVTransportURIMetaData</relatedStateVariable></argument>
+      <argument><name>NextURI</name><direction>out</direction><relatedStateVariable>NextAVTransportURI</relatedStateVariable></argument>
+      <argument><name>NextURIMetaData</name><direction>out</direction><relatedStateVariable>NextAVTransportURIMetaData</relatedStateVariable></argument>
+    </argumentList></action>
+    <action><name>Next</name><argumentList>
+      <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+    </argumentList></action>
+    <action><name>GetCurrentTransportActions</name><argumentList>
+      <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+      <argument><name>Actions</name><direction>out</direction><relatedStateVariable>CurrentTransportActions</relatedStateVariable></argument>
     </argumentList></action>
   </actionList>
   <serviceStateTable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURI</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURIMetaData</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>NextAVTransportURI</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>NextAVTransportURIMetaData</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>CurrentTransportActions</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>TransportPlaySpeed</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_SeekMode</name><dataType>string</dataType>
       <allowedValueList><allowedValue>REL_TIME</allowedValue><allowedValue>TRACK_NR</allowedValue></allowedValueList>
@@ -224,7 +236,14 @@ pub enum RendererCommand {
         title: Option<String>,
         artist: Option<String>,
         duration_ms: Option<i64>,
+        /// Le `NextURIMetaData` reçu, décodé mais tel quel : `GetMediaInfo`
+        /// le rend au point de contrôle (#5304).
+        metadata: String,
     },
+    /// `Next` : passer TOUT DE SUITE à la suivante posée (#5304). C'est la
+    /// consigne qu'un contrôleur Tune envoie à un renderer qui a prouvé la
+    /// tenir (`SuivantePreparee::Tenue`, #3967).
+    Next,
     Play,
     Pause,
     Stop,
@@ -233,6 +252,7 @@ pub enum RendererCommand {
     GetTransportInfo,
     GetPositionInfo,
     GetMediaInfo,
+    GetCurrentTransportActions,
     GetVolume,
     SetVolume(u8),
     GetMute,
@@ -432,8 +452,10 @@ pub fn parse_renderer_command(soap_body: &str) -> RendererCommand {
                 title,
                 artist,
                 duration_ms,
+                metadata: meta,
             }
         }
+        "Next" => RendererCommand::Next,
         "Play" => RendererCommand::Play,
         "Pause" => RendererCommand::Pause,
         "Stop" => RendererCommand::Stop,
@@ -447,6 +469,7 @@ pub fn parse_renderer_command(soap_body: &str) -> RendererCommand {
         "GetTransportInfo" => RendererCommand::GetTransportInfo,
         "GetPositionInfo" => RendererCommand::GetPositionInfo,
         "GetMediaInfo" => RendererCommand::GetMediaInfo,
+        "GetCurrentTransportActions" => RendererCommand::GetCurrentTransportActions,
         "GetVolume" => RendererCommand::GetVolume,
         "SetVolume" => {
             let v = text_of(soap_body, "DesiredVolume")
@@ -505,6 +528,11 @@ pub struct RendererSnapshot {
     pub position_ms: i64,
     pub duration_ms: i64,
     pub uri: String,
+    /// Suivante posée par `SetNextAVTransportURI` et pas encore enchaînée ;
+    /// vide quand il n'y en a pas (#5304).
+    pub next_uri: String,
+    /// Son `NextURIMetaData`, tel que le point de contrôle l'a envoyé.
+    pub next_metadata: String,
     /// Volume 0..100.
     pub volume: u8,
     pub muted: bool,
@@ -543,6 +571,13 @@ pub fn position_info_response(s: &RendererSnapshot) -> String {
     )
 }
 
+/// `GetMediaInfo` — y compris `NextURI` / `NextURIMetaData` (#5304).
+///
+/// Sans `NextURI`, un contrôleur Tune ne peut PAS établir que la suivante
+/// est tenue : son verdict (`SuivantePreparee`, #3967) reste `Inconnue`, il
+/// jette le flux qu'il avait armé à la fin du morceau et relance tout — le
+/// blanc de ~4 s de #5304. Le champ est publié vide quand rien n'est posé,
+/// comme le veut AVTransport:1 (argument de sortie obligatoire).
 pub fn media_info_response(s: &RendererSnapshot) -> String {
     envelope(
         AVTRANSPORT_URN,
@@ -551,10 +586,35 @@ pub fn media_info_response(s: &RendererSnapshot) -> String {
             "<NrTracks>1</NrTracks>\
              <MediaDuration>{}</MediaDuration>\
              <CurrentURI>{}</CurrentURI>\
-             <CurrentURIMetaData></CurrentURIMetaData>",
+             <CurrentURIMetaData></CurrentURIMetaData>\
+             <NextURI>{}</NextURI>\
+             <NextURIMetaData>{}</NextURIMetaData>",
             format_upnp_time(s.duration_ms),
             quick_xml::escape::escape(&s.uri),
+            quick_xml::escape::escape(&s.next_uri),
+            quick_xml::escape::escape(&s.next_metadata),
         ),
+    )
+}
+
+/// Les actions AVTransport que ce renderer sait exécuter MAINTENANT (#5304).
+///
+/// `Next` n'y figure que lorsqu'une suivante est posée : c'est la seule
+/// déclaration de capacité qu'un contrôleur puisse lire, et il ne demande
+/// la bascule qu'à un renderer qui la fait (`SuivantePreparee::Tenue`).
+pub fn current_transport_actions(s: &RendererSnapshot) -> String {
+    let mut actions = String::from("Play,Stop,Pause,Seek");
+    if !s.next_uri.is_empty() {
+        actions.push_str(",Next");
+    }
+    actions
+}
+
+pub fn transport_actions_response(s: &RendererSnapshot) -> String {
+    envelope(
+        AVTRANSPORT_URN,
+        "GetCurrentTransportActions",
+        &format!("<Actions>{}</Actions>", current_transport_actions(s)),
     )
 }
 
@@ -761,6 +821,62 @@ mod tests {
             other => panic!("attendu SetNextUri, obtenu {other:?}"),
         }
         assert!(avtransport_scpd().contains("<name>SetNextAVTransportURI</name>"));
+    }
+
+    /// #5304 — `GetMediaInfo` publie la suivante posée, et
+    /// `GetCurrentTransportActions` ne déclare `Next` que dans ce cas.
+    #[test]
+    fn media_info_et_actions_publient_la_suivante_5304() {
+        assert_eq!(
+            parse_renderer_command(&soap("Next", "<InstanceID>0</InstanceID>")),
+            RendererCommand::Next
+        );
+        assert_eq!(
+            parse_renderer_command(&soap(
+                "GetCurrentTransportActions",
+                "<InstanceID>0</InstanceID>"
+            )),
+            RendererCommand::GetCurrentTransportActions
+        );
+
+        let arme = RendererSnapshot {
+            transport_state: "PLAYING",
+            uri: "http://srv/a.flac".into(),
+            next_uri: "http://srv/b.flac?x=1&y=2".into(),
+            next_metadata: "<DIDL-Lite><item><dc:title>B</dc:title></item></DIDL-Lite>".into(),
+            ..Default::default()
+        };
+        let xml = media_info_response(&arme);
+        assert!(
+            xml.contains("<NextURI>http://srv/b.flac?x=1&amp;y=2</NextURI>"),
+            "NextURI doit nommer la suivante, échappée : {xml}"
+        );
+        assert!(
+            xml.contains("<NextURIMetaData>&lt;DIDL-Lite&gt;"),
+            "NextURIMetaData doit rendre le DIDL reçu, échappé : {xml}"
+        );
+        assert!(
+            current_transport_actions(&arme)
+                .split(',')
+                .any(|a| a == "Next")
+        );
+
+        let rien = RendererSnapshot {
+            transport_state: "PLAYING",
+            uri: "http://srv/a.flac".into(),
+            ..Default::default()
+        };
+        let xml = media_info_response(&rien);
+        assert!(
+            xml.contains("<NextURI></NextURI>"),
+            "sans suivante, NextURI est publié VIDE (argument obligatoire) : {xml}"
+        );
+        assert!(
+            !current_transport_actions(&rien)
+                .split(',')
+                .any(|a| a == "Next"),
+            "sans suivante, Next ne doit pas être déclaré"
+        );
     }
 
     #[test]

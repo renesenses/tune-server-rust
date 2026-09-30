@@ -116,8 +116,9 @@ JPlay retrouve la sortie qu'il avait mémorisée au lieu d'en créer une nouvell
 ### Services publiés
 
 - **AVTransport:1** — `SetAVTransportURI`, `SetNextAVTransportURI`, `Play`,
-  `Pause`, `Stop`, `Seek`, `GetTransportInfo`, `GetPositionInfo`,
-  `GetMediaInfo` ;
+  `Pause`, `Stop`, `Seek`, `Next`, `GetTransportInfo`, `GetPositionInfo`,
+  `GetMediaInfo` (qui rend `NextURI` / `NextURIMetaData` quand une suivante
+  est posée), `GetCurrentTransportActions` ;
 - **RenderingControl:1** — `GetVolume`, `SetVolume`, `GetMute`, `SetMute`
   (canal `Master`) ;
 - **ConnectionManager:1** — `GetProtocolInfo` (le `Sink` liste les formats
@@ -145,9 +146,13 @@ identifiés, pas des pannes.
   point de contrôle qui s'appuierait **uniquement** sur les événements verrait
   un état figé.
 
-- **`Next` / `Previous` ne sont pas implémentés.** Ces actions rendent une
-  faute SOAP `401 Invalid Action`. L'enchaînement se fait par
-  `SetNextAVTransportURI`, que les points de contrôle utilisent en pratique.
+- **`Previous` n'est pas implémenté** (faute SOAP `401 Invalid Action`).
+  **`Next`** ne vaut que pour la suivante posée par `SetNextAVTransportURI` :
+  il y bascule tout de suite, et rend une faute `701` quand rien n'est posé.
+  `GetCurrentTransportActions` ne déclare `Next` que dans ce cas. C'est ce qui
+  permet à un **autre Tune** qui pilote cette zone de reconnaître la suivante
+  comme tenue et de lui demander la bascule, au lieu de jeter son flux armé et
+  de tout relancer (#5304).
 
 - **Enchaînement sans blanc** (`SetNextAVTransportURI`) : disponible depuis la
   **v0.9.80**, pas dans la 0.9.79.
