@@ -606,6 +606,42 @@ pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
     position_ms > wall_elapsed_secs * 1000 + 15_000
 }
 
+/// #5498 — marge autour de la cible d'un déplacement dans laquelle un
+/// échantillon rapporté par la sortie est tenu pour postérieur au déplacement.
+///
+/// 2 s : le `RelTime` DLNA et le `Seconds` d'OpenHome sont tronqués à la
+/// seconde, et un renderer repart souvent un peu avant la cible (trame FLAC,
+/// image clé). Même ordre que `ECART_TOLERE_APRES_REPRISE_MS` (#5050).
+pub const MARGE_AUTOUR_DE_LA_CIBLE_MS: u64 = 2_000;
+
+/// #5498 — pendant la grâce de déplacement, cet échantillon peut-il être
+/// publié ?
+///
+/// La grâce (`SEEK_STREAMING_GRACE_SECS`, 10 s en streaming réseau) écarte la
+/// position d'AVANT le déplacement, que l'appareil rapporte encore tant qu'il
+/// ne l'a pas appliqué : sans elle, le curseur ressauterait en arrière. Mais
+/// elle écartait TOUT, y compris les positions justes d'après. FabienM
+/// (Devialet, fil 2037) : Seek de reprise vers 33 718 ms à 15:41:21, 11,7 s
+/// de lecture, et la position retenue valait encore 33 718 à la Pause ; la
+/// reprise suivante a reculé le lecteur de 41,7 s à 33,7 s.
+///
+/// Un échantillon postérieur au déplacement tombe entre la cible (moins la
+/// marge) et la cible plus le temps écoulé depuis (plus la marge). L'ancienne
+/// position — 46 200 ms pour une cible de 33 718 dans ce journal — tombe
+/// dehors, sauf si le déplacement était plus court que la marge, auquel cas
+/// la publier ne fait rien sauter de visible.
+pub fn echantillon_posterieur_au_deplacement(
+    cible_ms: u64,
+    depuis_le_deplacement_ms: u64,
+    rapporte_ms: u64,
+) -> bool {
+    let bas = cible_ms.saturating_sub(MARGE_AUTOUR_DE_LA_CIBLE_MS);
+    let haut = cible_ms
+        .saturating_add(depuis_le_deplacement_ms)
+        .saturating_add(MARGE_AUTOUR_DE_LA_CIBLE_MS);
+    (bas..=haut).contains(&rapporte_ms)
+}
+
 /// #4666 — l'ancrage d'horloge d'un état de sondage NEUF, créé pour une zone
 /// qui joue déjà au milieu d'une piste.
 ///
