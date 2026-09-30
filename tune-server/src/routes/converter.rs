@@ -35,7 +35,12 @@ pub struct ConvertSource {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartJobRequest {
+    #[serde(default)]
     pub sources: Vec<ConvertSource>,
+    /// #5483 — des pistes choisies une à une, en plus de `sources`. Une piste
+    /// déjà couverte par un album de `sources` n'est convertie qu'une fois.
+    #[serde(default)]
+    pub track_ids: Vec<i64>,
     pub format: String,
     pub quality: Option<String>,
     pub sample_rate: Option<u32>,
@@ -101,6 +106,9 @@ struct JobError {
 
 struct ConvertJob {
     cancellation: Arc<std::sync::atomic::AtomicBool>,
+    /// #5482 — le nom de l'archive téléchargée, « Artiste - Album (FORMAT).zip »,
+    /// fixé au lancement depuis les pistes résolues.
+    nom_archive: String,
     status: JobStatus,
     total: usize,
     completed: usize,
@@ -238,6 +246,10 @@ fn job_store() -> JobStore {
         .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
         .clone()
 }
+
+// #5483 — résolution des sources (albums, pistes, dossiers) sans doublon.
+#[path = "convertisseur_pistes.rs"]
+mod pistes;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -397,51 +409,11 @@ async fn start_job(
         )));
     }
 
-    // Resolve all source paths
+    // Resolve all source paths — #5483 : `sources` puis `track_ids`, sans
+    // doublon, dans l'ordre de la demande.
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let mut file_paths: Vec<PathBuf> = Vec::new();
-
-    for src in &body.sources {
-        if let Some(track_id) = src.track_id {
-            match repo.get(track_id) {
-                Ok(Some(track)) => {
-                    if let Some(ref fp) = track.file_path {
-                        file_paths.push(PathBuf::from(fp));
-                    } else {
-                        warn!(track_id, "converter_skip_no_file_path");
-                    }
-                }
-                Ok(None) => {
-                    warn!(track_id, "converter_skip_track_not_found");
-                }
-                Err(e) => {
-                    warn!(track_id, error = %e, "converter_skip_track_lookup_error");
-                }
-            }
-        } else if let Some(album_id) = src.album_id {
-            match repo.list_by_album(album_id) {
-                Ok(tracks) => {
-                    for t in tracks {
-                        if let Some(ref fp) = t.file_path {
-                            file_paths.push(PathBuf::from(fp));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(album_id, error = %e, "converter_skip_album_lookup_error");
-                }
-            }
-        } else if let Some(ref path) = src.path {
-            let p = PathBuf::from(path);
-            if p.is_dir() {
-                collect_audio_files(&p, &mut file_paths);
-            } else if p.is_file() && convertible_input(path) {
-                file_paths.push(p);
-            } else {
-                warn!(path, "converter_skip_not_audio_or_missing");
-            }
-        }
-    }
+    let resolues = pistes::resoudre_les_sources(&repo, &body.sources, &body.track_ids);
+    let file_paths: Vec<PathBuf> = resolues.iter().map(|p| p.chemin.clone()).collect();
 
     if file_paths.is_empty() {
         return Err(AppError::bad_request("no audio files found in sources"));
@@ -486,8 +458,21 @@ async fn start_job(
         );
     }
 
+    // #5482 — le nom de l'archive, tant que l'on sait encore d'où viennent
+    // les fichiers.
+    let nom_archive = archive::nom_de_l_archive(
+        &resolues,
+        &archive::libelle_du_format(
+            &format,
+            body.quality.as_deref(),
+            body.sample_rate,
+            body.bit_depth,
+        ),
+    );
+
     let job = Arc::new(Mutex::new(ConvertJob {
         cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        nom_archive,
         status: JobStatus::Running,
         total,
         completed: 0,
@@ -692,6 +677,8 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
 
     json!({
         "job_id": job_id,
+        // #5482 — le nom sous lequel l'archive sera téléchargée.
+        "archive_name": job.nom_archive,
         // Forme historique — conservée telle quelle.
         "status": job.status.as_str(),
         "total": job.total,
@@ -779,6 +766,10 @@ async fn lister_les_taches(store: &JobStore) -> Vec<Value> {
 // GET /download/{job_id} — stream a ZIP of the converted files
 // ---------------------------------------------------------------------------
 
+// #5482 — le nom de l'archive et son `Content-Disposition`.
+#[path = "convertisseur_archive.rs"]
+mod archive;
+
 async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoResponse, AppError> {
     let store = job_store();
     let map = store.lock().await;
@@ -803,6 +794,7 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
     }
 
     let output_dir = job.output_dir.clone();
+    let nom_archive = job.nom_archive.clone();
     drop(job);
     drop(map);
 
@@ -814,12 +806,17 @@ async fn download_job(AxumPath(job_id): AxumPath<String>) -> Result<impl IntoRes
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/zip"));
+    // #5482 — « Artiste - Album (FORMAT).zip », repli ASCII et nom UTF-8.
     headers.insert(
         "Content-Disposition",
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"tune-convert-{job_id}.zip\""
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+        HeaderValue::from_str(&archive::content_disposition(&nom_archive))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"converted.zip\"")),
+    );
+    // Le web télécharge par `fetch` : sans cette ligne, un client servi
+    // depuis une autre origine ne pourrait pas lire l'en-tête.
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Content-Disposition"),
     );
 
     Ok((StatusCode::OK, headers, Body::from(zip_bytes)))
@@ -990,7 +987,14 @@ async fn run_conversion(
         }
 
         let ext = output_extension(format);
-        let out_path = output_dir.join(format!("{filename}.{ext}"));
+        // #5483 — dans une archive, deux pistes homonymes (CD1/01.flac,
+        // CD2/01.flac) ne visent plus le même fichier. Le mode « dossier de
+        // travail » garde sa règle : un fichier présent reste intact.
+        let out_path = if destination_serveur {
+            output_dir.join(format!("{filename}.{ext}"))
+        } else {
+            pistes::sortie_libre(output_dir, &filename, ext)
+        };
 
         // ON N'ÉCRASE JAMAIS (#2944). Dans le dossier de l'utilisateur, un
         // fichier déjà présent est soit une conversion précédente, soit — si
@@ -2544,6 +2548,7 @@ Conversion failed!"#;
     fn job_temoin(status: JobStatus, completed: usize) -> ConvertJob {
         ConvertJob {
             cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            nom_archive: "Nico - Chelsea Girl (FLAC 16-44.1).zip".into(),
             status,
             total: 4,
             completed,
@@ -2555,6 +2560,49 @@ Conversion failed!"#;
             destination_serveur: false,
             started_at_ms: 1_000,
         }
+    }
+
+    /// #5482 — l'écran lit le nom de l'archive dans le statut.
+    #[test]
+    fn le_statut_porte_le_nom_de_l_archive() {
+        let statut = payload_statut("j", &job_temoin(JobStatus::Completed, 4));
+        assert_eq!(
+            statut["archive_name"],
+            "Nico - Chelsea Girl (FLAC 16-44.1).zip"
+        );
+    }
+
+    /// #5482 — la route de téléchargement nomme l'archive d'après l'album,
+    /// en ASCII ET en UTF-8, et laisse le web lire l'en-tête.
+    #[tokio::test]
+    async fn l_archive_se_telecharge_sous_le_nom_de_l_album() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("01 - Orbits.flac"), b"fLaC").unwrap();
+        let mut job = job_temoin(JobStatus::Completed, 4);
+        job.nom_archive = "Beyoncé - Lemonade (FLAC 24).zip".into();
+        job.output_dir = dir.path().to_path_buf();
+        let id = format!("essai-5482-{}", uuid::Uuid::new_v4());
+        job_store()
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(job)));
+
+        let reponse = download_job(AxumPath(id.clone()))
+            .await
+            .map_err(|e| e.message)
+            .unwrap()
+            .into_response();
+        job_store().lock().await.remove(&id);
+        let en_tetes = reponse.headers();
+        assert_eq!(
+            en_tetes["Content-Disposition"],
+            "attachment; filename=\"Beyonce - Lemonade (FLAC 24).zip\"; \
+             filename*=UTF-8''Beyonc%C3%A9%20-%20Lemonade%20%28FLAC%2024%29.zip"
+        );
+        assert_eq!(
+            en_tetes["Access-Control-Expose-Headers"],
+            "Content-Disposition"
+        );
     }
 
     #[test]
