@@ -190,10 +190,44 @@ pub fn le_clap_cede_a_la_plage_dynamique() -> bool {
     )
 }
 
+/// Le rang de la cascade qui TRAVAILLE en ce moment : 0 aucun, 1 ReplayGain,
+/// 2 empreintes, 3 plage dynamique (#5519, défaut voisin de
+/// tune-web-client#1828).
+///
+/// La campagne ReplayGain (`progression`) reste OUVERTE tant qu'il reste des
+/// pistes à mesurer, même quand un autre rang passe devant — la plage
+/// dynamique « En premier », par exemple. L'écran lisait « campagne ouverte »
+/// comme « en cours » : la carte ReplayGain affichait « en cours » sur une
+/// jauge figée pendant tout le rattrapage. Ce témoin dit QUI décode.
+static RANG_AU_TRAVAIL: AtomicU8 = AtomicU8::new(0);
+
+/// La cascade note le rang qu'elle essaie (`Some`), ou qu'elle ne décode plus
+/// rien (`None` : repos, suspension, lecture en cours).
+pub fn noter_rang_au_travail(rang: Option<Rang>) {
+    let code = match rang {
+        None => 0,
+        Some(Rang::ReplayGain) => 1,
+        Some(Rang::Empreintes) => 2,
+        Some(Rang::PlageDynamique) => 3,
+    };
+    RANG_AU_TRAVAIL.store(code, Ordering::Relaxed);
+}
+
+/// Le rang qui décode en ce moment, s'il y en a un.
+pub fn rang_au_travail() -> Option<Rang> {
+    match RANG_AU_TRAVAIL.load(Ordering::Relaxed) {
+        1 => Some(Rang::ReplayGain),
+        2 => Some(Rang::Empreintes),
+        3 => Some(Rang::PlageDynamique),
+        _ => None,
+    }
+}
+
 /// Remettre le miroir à neuf, pour les témoins (caisses externes).
 pub fn oublier_pour_les_essais() {
     PRIORITE.store(0, Ordering::Relaxed);
     DR_EN_ATTENTE.store(false, Ordering::Relaxed);
+    RANG_AU_TRAVAIL.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

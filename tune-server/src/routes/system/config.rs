@@ -408,6 +408,13 @@ pub(super) async fn get_config(
         // historique), -0.5 ou -1. Persisté par PATCH /config comme les
         // autres ; honoré dans `gain_factor` (tune-core).
         ("replaygain_true_peak_ceiling_db", json!(0.0)),
+        // #5519 — la vitesse des passes de fond qui décodent : `discreet`
+        // (1 fichier à la fois), `normal` (2, défaut) ou `fast` (jusqu'à 4,
+        // sans dépasser les cœurs moins un). PATCH /config refuse un autre mot.
+        (
+            tune_core::taches_de_fond::vitesse::CLE_REGLAGE,
+            json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
+        ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
         // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
         // normalise en plus la valeur persistée (`"false"` → `false`). Une
@@ -424,6 +431,21 @@ pub(super) async fn get_config(
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
+    }
+    // #5519 — combien de fichiers chaque vitesse décode à la fois SUR CETTE
+    // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
+    // que de promettre quatre pistes à un double cœur.
+    {
+        use tune_core::taches_de_fond::vitesse::{Vitesse, coeurs};
+        let n = coeurs();
+        let largeurs: serde_json::Map<String, Value> = Vitesse::TOUTES
+            .into_iter()
+            .map(|v| (v.id().to_string(), json!(v.largeur(n))))
+            .collect();
+        config.insert(
+            "background_analysis_speed_widths".to_string(),
+            Value::Object(largeurs),
+        );
     }
 
     // Les préférences d'interface DU PROFIL APPELANT, sous leur nom nu.
@@ -1056,6 +1078,31 @@ fn normaliser_plafonds_indexation(
 /// Le contrôle du client web borne déjà la saisie avant d'envoyer
 /// (`bornerFileAleatoire`) : ce refus ne change rien pour lui, il garde les
 /// appels directs à l'API — un script, `curl`, un client tiers.
+/// #5519 — la vitesse des passes de fond : un mot connu, ou 400 qui nomme les
+/// mots admis. Jamais un mot inconnu en base, qui retomberait en silence sur
+/// le défaut à la lecture.
+fn normaliser_vitesse_des_analyses(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use tune_core::taches_de_fond::vitesse::{CLE_REGLAGE, Vitesse};
+    let Some(brut) = values.get(CLE_REGLAGE) else {
+        return Ok(());
+    };
+    let mot = brut.as_str().map(str::trim).unwrap_or_default();
+    let Some(vitesse) = Vitesse::depuis_id(mot) else {
+        let admis: Vec<&str> = Vitesse::TOUTES.iter().map(|v| v.id()).collect();
+        return Err(AppError::bad_request(format!(
+            "{CLE_REGLAGE} : valeur inconnue {brut} ; valeurs admises : {}",
+            admis.join(", ")
+        )));
+    };
+    values.insert(
+        CLE_REGLAGE.to_string(),
+        Value::String(vitesse.id().to_string()),
+    );
+    Ok(())
+}
+
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1122,6 +1169,7 @@ pub(super) async fn update_config(
     // valeur hors bornes ou illisible est REFUSÉE en nommant les bornes, au
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
+    normaliser_vitesse_des_analyses(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -4863,5 +4911,61 @@ mod tests_exclusif_suit_asio_4184 {
             suite_de_l_exclusif("wasapi", "wasapi", true, false),
             SuiteExclusif::Inchange
         );
+    }
+}
+
+#[cfg(test)]
+mod vitesse_des_analyses_5519_tests {
+    use super::{get_config, normaliser_vitesse_des_analyses};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::taches_de_fond::vitesse::{CLE_REGLAGE, Vitesse, coeurs};
+
+    /// #5519 — le réglage est publié avec son défaut `normal`, avec la largeur
+    /// réelle de chaque vitesse sur cette machine.
+    #[tokio::test]
+    async fn la_vitesse_est_publiee_avec_son_defaut_et_ses_largeurs() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_REGLAGE], "normal", "{c}");
+        let largeurs = &c["background_analysis_speed_widths"];
+        assert_eq!(largeurs["discreet"], 1);
+        assert_eq!(
+            largeurs["normal"],
+            json!(Vitesse::Normale.largeur(coeurs()))
+        );
+        assert_eq!(largeurs["fast"], json!(Vitesse::Rapide.largeur(coeurs())));
+    }
+
+    /// Un mot connu passe, un mot inconnu est REFUSÉ au lieu d'être écrit.
+    #[test]
+    fn un_mot_inconnu_est_refuse() {
+        let mut ok: serde_json::Map<String, Value> = json!({ CLE_REGLAGE: " fast " })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(normaliser_vitesse_des_analyses(&mut ok).is_ok());
+        assert_eq!(ok[CLE_REGLAGE], "fast");
+        for mauvais in [json!("turbo"), json!(4), json!(true), json!(null)] {
+            let mut v: serde_json::Map<String, Value> =
+                json!({ CLE_REGLAGE: mauvais }).as_object().unwrap().clone();
+            assert!(
+                normaliser_vitesse_des_analyses(&mut v).is_err(),
+                "{mauvais}"
+            );
+        }
+        // Absent : rien à dire.
+        let mut vide = serde_json::Map::new();
+        assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
+        assert!(vide.is_empty());
     }
 }
