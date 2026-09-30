@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "d4c99567f8b82bf3fc46432c593ec30911f55d07",
+    "web_sha": "32ea4231fe1eb0f8c9ca084bdeff63d6e580960f",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -514,6 +514,7 @@
       ],
       "champs_optionnels": [
         "located",
+        "ambiguous",
         "postal_code",
         "code"
       ]
@@ -531,6 +532,7 @@
       ],
       "champs_optionnels": [
         "located",
+        "ambiguous",
         "postal_code",
         "code"
       ]
@@ -545,6 +547,12 @@
       ],
       "champs_optionnels": [
         "scope",
+        "applied_scope",
+        "located",
+        "total",
+        "limit",
+        "offset",
+        "has_more",
         "radius_km",
         "city",
         "country",
