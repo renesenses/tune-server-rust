@@ -174,7 +174,14 @@ tokio = { workspace = true, features = ["test-util"] }
 # Test-only (#5453) : `tune_core::journal_de_test::fiabiliser_la_capture()`
 # pour les tests qui capturent le journal par `set_default`/`with_default`.
 # Comme `test-util` ci-dessus, la feature n'entre que dans les cibles de test.
-tune-core = { path = "../tune-core", default-features = false, features = ["journal-de-test"] }
+# #5512 : `isolement-disque-de-test` dit à la lib qu'elle est construite pour
+# des TESTS, intégration comprise, et isole ses chemins relatifs dans un
+# dossier temporaire (`src/isolement_disque_tests_5467.rs`). Même principe que
+# `journal-de-test` : la feature n'entre que dans les cibles de test.
+tune-core = { path = "../tune-core", default-features = false, features = [
+    "journal-de-test",
+    "isolement-disque-de-test",
+] }
 
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
@@ -214,6 +221,13 @@ path = "tests/dr_liste_albums_4521.rs"
 [[test]]
 name = "reprise_des_passes_5469"
 path = "tests/reprise_des_passes_5469.rs"
+
+# #5512 — les tests d'intégration n'écrivent plus `artwork_cache/`,
+# `queue_state/` ni `tune-scan-report.json` dans l'arbre. `autotests = false`
+# plus haut : sans cette cible, le témoin ne serait jamais compilé.
+[[test]]
+name = "isolement_disque_integration_5512"
+path = "tests/isolement_disque_integration_5512.rs"
 
 # #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
 # Les sept points (aléatoire, smart playlists, file, titre en cours,

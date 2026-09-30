@@ -3026,9 +3026,7 @@ async fn spawn_library_scan_avec_lecteur(
         if scan_cancel_requested() {
             report["cancelled"] = json!(true);
         }
-        let report_path = std::env::var("TUNE_DB_PATH")
-            .unwrap_or_else(|_| "tune.db".into())
-            .replace(".db", "-scan-report.json");
+        let report_path = chemin_du_rapport_de_scan();
         if let Ok(json) = serde_json::to_string_pretty(&report) {
             std::fs::write(&report_path, json).ok();
         }
@@ -3500,15 +3498,30 @@ fn chrono_now() -> String {
     format!("{now}")
 }
 
+/// Le fichier du rapport de scan : écrit par le scan manuel et par le scan
+/// automatique (`auto_scan.rs`), relu par `GET /scan/report`.
+///
+/// #5512 — la même formule était recopiée à ces trois endroits. Elle vit ici,
+/// une seule fois, et le build de test la détourne vers un dossier temporaire :
+/// sinon `tune-scan-report.json` s'écrivait dans le répertoire courant des
+/// tests, c'est-à-dire la caisse. Le chemin de production est inchangé.
+#[doc(hidden)] // `pub` pour le témoin d'intégration de #5512 seulement.
+pub fn chemin_du_rapport_de_scan() -> String {
+    if let Some(chemin) = crate::isolement_disque_tests_5467::chemin_du_rapport_de_scan() {
+        return chemin.to_string_lossy().into_owned();
+    }
+    std::env::var("TUNE_DB_PATH")
+        .unwrap_or_else(|_| "tune.db".into())
+        .replace(".db", "-scan-report.json")
+}
+
 /// Build a JSON array string for the `genres` column from parsed metadata.
 ///
 /// If the structured `genres` vec is non-empty, serialize it as JSON.
 /// Otherwise, fall back to the primary `genre` string and wrap it as a
 /// single-element array so the column is never NULL when genre data exists.
 pub(super) async fn scan_report() -> impl IntoResponse {
-    let report_path = std::env::var("TUNE_DB_PATH")
-        .unwrap_or_else(|_| "tune.db".into())
-        .replace(".db", "-scan-report.json");
+    let report_path = chemin_du_rapport_de_scan();
     match std::fs::read_to_string(&report_path) {
         Ok(json) => match serde_json::from_str::<Value>(&json) {
             Ok(v) => Json(v).into_response(),

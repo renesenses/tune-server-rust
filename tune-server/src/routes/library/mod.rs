@@ -186,13 +186,14 @@ pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
+#[doc(hidden)] // `pub` pour le témoin d'intégration de #5512 seulement.
+pub fn artwork_cache_dir() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
         return std::path::PathBuf::from(v);
     }
     // #5467 — en build de test, jamais le chemin relatif `artwork_cache` (qui
     // tombait dans l'arbre source) ni le vrai dossier macOS de l'utilisateur.
-    #[cfg(test)]
+    // #5512 : tests d'intégration compris ; `None` dans le binaire publié.
     if let Some(dossier) = crate::isolement_disque_tests_5467::dossier_illustrations() {
         return dossier;
     }

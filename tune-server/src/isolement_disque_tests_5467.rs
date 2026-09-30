@@ -15,10 +15,20 @@
 //!   `~/Library/Application Support/Tune/artwork_cache` de la personne qui lance
 //!   les tests).
 //!
-//! En build de test SEULEMENT (`#[cfg(test)]`), ces deux chemins sont
-//! redirigés vers un répertoire temporaire : un par `AppState` pour la
-//! configuration, un par processus pour `artwork_cache_dir()` (fonction libre,
-//! sans état). Le binaire de production ne voit rien de ce module.
+//! En build de test SEULEMENT, ces deux chemins sont redirigés vers un
+//! répertoire temporaire : un par `AppState` pour la configuration, un par
+//! processus pour `artwork_cache_dir()` (fonction libre, sans état).
+//!
+//! #5512 — « build de test » ne veut plus dire seulement `#[cfg(test)]`. Ce
+//! drapeau ne s'allume que pour la lib testée elle-même ; ses tests
+//! d'intégration (`tune-server/tests/`) la lient construite SANS lui, et
+//! continuaient donc d'écrire `artwork_cache/`, `queue_state/` et
+//! `tune-scan-report.json` dans l'arbre. [`actif`] consulte en plus
+//! `tune_core::test_scratch::ISOLEMENT_DISQUE_DE_TEST`, que seuls les
+//! `[dev-dependencies]` de `tune-server` allument. Le rapport de scan, dont le
+//! chemin ne vient pas de la configuration, est isolé par le même module
+//! ([`chemin_du_rapport_de_scan`]). Dans le binaire publié, [`actif`] vaut
+//! `false` à la compilation et rien de ce module ne s'exécute.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -28,26 +38,60 @@ use crate::config::TuneConfig;
 
 static RACINE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Vrai dans toute construction de TESTS de `tune-server` : ceux de la lib
+/// (`cfg(test)`) comme ceux d'intégration (#5512, la feature
+/// `isolement-disque-de-test` de `tune-core`, allumée par les
+/// `[dev-dependencies]`). Faux, et connu faux dès la compilation, dans le
+/// binaire publié.
+pub(crate) const fn actif() -> bool {
+    cfg!(test) || tune_core::test_scratch::ISOLEMENT_DISQUE_DE_TEST
+}
+
 /// Racine temporaire du processus de test, créée une fois, sous le répertoire
 /// temporaire du système — jamais dans l'arbre source.
 ///
 /// Partagée par tous les tests du binaire, elle ne peut pas vivre dans un
 /// garde à `Drop` (un `static` ne se détruit pas) : elle est supprimée à la
-/// sortie du binaire par [`garde_de_sortie`] (Linux, macOS).
+/// sortie du binaire par un `atexit` posé à sa création (Unix). #5512 : c'est
+/// ce qui la nettoie aussi dans les binaires d'intégration, où `garde_de_sortie`
+/// (compilé sous `cfg(test)`) n'existe pas.
 fn racine() -> &'static Path {
     RACINE.get_or_init(|| {
-        // tmp-autorise: dossier partagé par tout le binaire, supprimé par l'atexit de garde_de_sortie
-        tune_core::test_scratch::scratch_dir("tune-server-lib-5467").renoncer_au_nettoyage()
+        use tune_core::test_scratch::scratch_dir;
+        // tmp-autorise: dossier partagé par tout le binaire, supprimé par l'atexit posé ci-dessous
+        let racine = scratch_dir("tune-server-lib-5467").renoncer_au_nettoyage();
+        #[cfg(unix)]
+        {
+            extern "C" fn supprimer_la_racine() {
+                if let Some(racine) = RACINE.get() {
+                    let _ = std::fs::remove_dir_all(racine);
+                }
+            }
+            // SAFETY: fonction `extern "C"` sans argument qui ne panique pas ;
+            // `atexit` ne fait que l'enregistrer.
+            unsafe {
+                libc::atexit(supprimer_la_racine);
+            }
+        }
+        racine
     })
+}
+
+/// #5512 — le rapport de scan en build de test : `tune-scan-report.json`
+/// sous la racine temporaire du processus, et plus dans le répertoire
+/// courant, c'est-à-dire la caisse.
+///
+/// `None` hors test : l'appelant garde alors le chemin de production.
+pub(crate) fn chemin_du_rapport_de_scan() -> Option<PathBuf> {
+    actif().then(|| racine().join("tune-scan-report.json"))
 }
 
 /// Le cache d'illustrations que voit `artwork_cache_dir()` en build de test,
 /// quand `TUNE_ARTWORK_DIR` n'est pas posé.
 ///
-/// Rend toujours `Some` : la forme `Option` évite un `return` inconditionnel
-/// sous `#[cfg(test)]`, qui rendrait la suite de la fonction inatteignable.
+/// `None` hors test (#5512 : ce module est désormais compilé partout).
 pub(crate) fn dossier_illustrations() -> Option<PathBuf> {
-    Some(racine().join("artwork_cache"))
+    actif().then(|| racine().join("artwork_cache"))
 }
 
 /// Ancre dans un répertoire temporaire propre à cet `AppState` les chemins
@@ -56,7 +100,12 @@ pub(crate) fn dossier_illustrations() -> Option<PathBuf> {
 /// Un chemin absolu (un test qui a déjà son `tempdir`) est laissé tel quel ;
 /// `":memory:"` aussi, parce que des routes le comparent littéralement
 /// (`routes/system/backup.rs`, `routes/system/database.rs`).
+///
+/// Hors test ([`actif`] faux), la configuration est rendue telle quelle.
 pub(crate) fn isoler_config(mut config: TuneConfig) -> TuneConfig {
+    if !actif() {
+        return config;
+    }
     static SUIVANT: AtomicUsize = AtomicUsize::new(0);
     let dossier = racine().join(format!("etat-{}", SUIVANT.fetch_add(1, Ordering::Relaxed)));
     // Créé d'emblée : certains écrivains (le rapport de scan) ne créent pas
@@ -86,16 +135,13 @@ pub(crate) fn isoler_config(mut config: TuneConfig) -> TuneConfig {
 /// Seuls comptent les témoins ABSENTS à l'armement : un reste d'une exécution
 /// antérieure ne fabrique pas de faux rouge. Un témoin apparu fait sortir le
 /// binaire en 101 — le code d'un test échoué — avec la liste des chemins.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod garde_de_sortie {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
-    /// Les deux dossiers de #5467. `tune-scan-report.json` n'y est PAS : son
-    /// chemin vient de `TUNE_DB_PATH` ou du littéral `"tune.db"`
-    /// (`auto_scan.rs`, `routes/system/scan.rs`), pas de la configuration ;
-    /// les tests l'écrivent encore dans l'arbre (fichier ignoré par git).
-    const TEMOINS: [&str; 2] = ["artwork_cache", "queue_state"];
+    /// Les deux dossiers de #5467, et le rapport de scan de #5512.
+    const TEMOINS: [&str; 3] = ["artwork_cache", "queue_state", "tune-scan-report.json"];
 
     static ABSENTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
@@ -158,6 +204,7 @@ mod garde_de_sortie {
 /// Le témoin de #5467 : la forme de test la plus courante,
 /// `AppState::new(":memory:", 0, Default::default())`, ne résout plus ses
 /// chemins depuis le répertoire courant, et `artwork_cache_dir()` non plus.
+#[cfg(test)]
 #[tokio::test]
 async fn un_appstate_de_test_ne_pointe_plus_vers_le_repertoire_courant() {
     let etat = crate::state::AppState::new(":memory:", 0, TuneConfig::default()).unwrap();
