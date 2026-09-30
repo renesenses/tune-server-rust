@@ -1295,9 +1295,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)
         );
 
-        let report_path = std::env::var("TUNE_DB_PATH")
-            .unwrap_or_else(|_| "tune.db".into())
-            .replace(".db", "-scan-report.json");
+        let report_path = crate::routes::system::scan::chemin_du_rapport_de_scan();
         if let Ok(json) = serde_json::to_string_pretty(&report_fichier) {
             std::fs::write(&report_path, json).ok();
         }
