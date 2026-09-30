@@ -236,7 +236,12 @@ pub async fn handle_head(
                 .ok()
                 .map(|m| m.len())
         } else {
-            session.info.wav_content_length()
+            // #5050 — une session mandataire n'a ni fichier ni longueur WAV :
+            // sa longueur est celle que le CDN a dite au premier `GET` relayé.
+            session
+                .info
+                .wav_content_length()
+                .or_else(|| session.longueur_amont())
         }
     };
 
@@ -282,7 +287,7 @@ pub async fn handle_head(
         if let Some(size) = file_size {
             headers.insert("Content-Length", HeaderValue::from(size));
         }
-    } else {
+    } else if let Some(size) = file_size {
         headers.insert(
             "transferMode.dlna.org",
             HeaderValue::from_static("Interactive"),
@@ -294,9 +299,25 @@ pub async fn handle_head(
                 "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
             ),
         );
-        if let Some(size) = file_size {
-            headers.insert("Content-Length", HeaderValue::from(size));
-        }
+        headers.insert("Content-Length", HeaderValue::from(size));
+    } else {
+        // #5050 — longueur encore inconnue (session mandataire dont aucun
+        // `GET` n'a encore rapporté la réponse du CDN). Le Beosound Stage de
+        // FabienM recevait ici `Accept-Ranges: bytes` et `DLNA.ORG_OP=01`
+        // SANS `Content-Length` — une recherche par octets promise sur un flux
+        // dont on ne dit pas la taille. On n'annonce plus que ce qu'on sait :
+        // un flux séquentiel. Aucune requête n'est faite au CDN pour le HEAD :
+        // le démarrage n'attend rien de plus.
+        headers.insert(
+            "transferMode.dlna.org",
+            HeaderValue::from_static("Streaming"),
+        );
+        headers.insert(
+            "contentFeatures.dlna.org",
+            HeaderValue::from_static(
+                "DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            ),
+        );
     }
 
     (StatusCode::OK, headers).into_response()
@@ -2136,6 +2157,85 @@ fn resumable_proxy_body(
     corps_compte(flux, compteur)
 }
 
+/// #5050 — la longueur TOTALE du flux amont, d'après la réponse du CDN.
+///
+/// Un 200 porte le flux entier : son `Content-Length` est la longueur. Un 206
+/// n'en porte qu'une tranche : la longueur est le total de son
+/// `Content-Range` (`bytes a-b/total`), jamais son `Content-Length`. Un total
+/// `*` ou illisible ne dit rien.
+fn longueur_totale_amont(
+    statut: u16,
+    content_length: Option<u64>,
+    content_range: Option<&str>,
+) -> Option<u64> {
+    match statut {
+        200 => content_length.filter(|&n| n > 0),
+        206 => content_range
+            .and_then(|cr| cr.rsplit('/').next())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0),
+        _ => None,
+    }
+}
+
+/// #5050 — faut-il écrire la ligne `proxy_get_amont` du `n`-ième `GET`
+/// relayé d'une session (`n` part de 0) ? Les huit premiers, qui disent le
+/// démarrage et les premières reprises, puis un sur trente-deux : un renderer
+/// Lavf qui mitraille des micro-Range n'inonde pas le journal.
+fn diagnostic_mandataire_a_journaliser(n: u32) -> bool {
+    n < 8 || n % 32 == 0
+}
+
+/// #5050 — ce qu'un `GET` relayé a demandé, ce que le CDN a répondu, et ce
+/// que le renderer a reçu. Aucune URL n'y figure : l'URL amont est signée
+/// (Qobuz `etsp`/`sig`, Tidal), elle ne doit jamais atteindre un journal
+/// partagé sur le forum.
+struct DiagMandataire {
+    range_demande: Option<String>,
+    statut_amont: u16,
+    content_length_amont: Option<u64>,
+    content_range_amont: Option<String>,
+    accept_ranges_amont: Option<String>,
+}
+
+impl DiagMandataire {
+    fn journaliser(
+        &self,
+        session: &tune_core::http::streamer::StreamSession,
+        statut_servi: StatusCode,
+        servi: &HeaderMap,
+    ) {
+        let n = session
+            .requetes_mandataire
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !diagnostic_mandataire_a_journaliser(n) {
+            return;
+        }
+        let entete = |nom: &str| {
+            servi
+                .get(nom)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        info!(
+            stream_id = %session.id,
+            requete = n,
+            range = self.range_demande.as_deref().unwrap_or("-"),
+            statut_amont = self.statut_amont,
+            content_length_amont = ?self.content_length_amont,
+            content_range_amont = self.content_range_amont.as_deref().unwrap_or("-"),
+            accept_ranges_amont = self.accept_ranges_amont.as_deref().unwrap_or("-"),
+            statut_servi = statut_servi.as_u16(),
+            content_length_servi = %entete("Content-Length"),
+            content_range_servi = %entete("Content-Range"),
+            accept_ranges_servi = %entete("Accept-Ranges"),
+            longueur_retenue = ?session.longueur_amont(),
+            "proxy_get_amont"
+        );
+    }
+}
+
 async fn proxy_stream(
     upstream_url: &str,
     info: &StreamInfo,
@@ -2251,6 +2351,27 @@ async fn proxy_stream(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // #5050 — la longueur totale dite par le CDN : c'est elle que le HEAD de
+    // la session annoncera désormais, sans jamais redemander le CDN.
+    if let Some(total) = longueur_totale_amont(
+        upstream_resp.status().as_u16(),
+        content_length,
+        upstream_content_range.as_deref(),
+    ) {
+        session.noter_longueur_amont(total);
+    }
+    let diag = DiagMandataire {
+        range_demande: range_value.clone(),
+        statut_amont: upstream_resp.status().as_u16(),
+        content_length_amont: content_length,
+        content_range_amont: upstream_content_range.clone(),
+        accept_ranges_amont: upstream_resp
+            .headers()
+            .get("Accept-Ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    };
+
     let mut headers = HeaderMap::new();
     // #4958 — l'orthographe annoncée au renderer prime sur celle du CDN :
     // c'est elle que la DIDL porte, et un Sink strict confronte les deux.
@@ -2299,6 +2420,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
         );
+        diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -2341,6 +2463,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
         );
+        diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -2371,6 +2494,7 @@ async fn proxy_stream(
         };
         let body = corps_compte(flux, session.clone());
 
+        diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -2390,6 +2514,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
         );
+        diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -2406,6 +2531,7 @@ async fn proxy_stream(
         reresolve.clone(),
         session.clone(),
     );
+    diag.journaliser(&session, StatusCode::OK, &headers);
     (StatusCode::OK, headers, body).into_response()
 }
 

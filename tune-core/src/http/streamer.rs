@@ -289,6 +289,20 @@ pub struct StreamSession {
     /// musique restant audible dessous. Compté par session pour que le
     /// journal en dise la première et n'en répète pas cent.
     pub ranges_hors_trame: std::sync::atomic::AtomicU32,
+    /// #5050 — longueur TOTALE du flux d'une session mandataire, telle que le
+    /// CDN l'a dite sur un `GET` relayé (`Content-Length` d'un 200, total du
+    /// `Content-Range` d'un 206). `0` = pas encore connue.
+    ///
+    /// Le `HEAD` d'une session mandataire ne connaissait AUCUNE longueur
+    /// (`file_size=None` dans chaque `stream_head_request` du Beosound Stage de
+    /// FabienM) tout en annonçant `Accept-Ranges: bytes` et `DLNA.ORG_OP=01`,
+    /// alors que le `GET` recopiait celle du CDN. Aucune requête amont n'est
+    /// ajoutée pour la connaître : le premier `GET` relayé (la sonde des
+    /// VU-mètres, `agent="-"`, part à la création de la session) la rapporte.
+    pub longueur_amont: std::sync::atomic::AtomicU64,
+    /// #5050 — nombre de `GET` relayés par cette session : borne le débit de
+    /// la ligne de diagnostic `proxy_get_amont` (voir `diagnostic_mandataire_a_journaliser`).
+    pub requetes_mandataire: std::sync::atomic::AtomicU32,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -477,6 +491,26 @@ impl StreamSession {
         info
     }
 
+    /// #5050 — retient la longueur totale du flux amont, dès qu'un `GET`
+    /// relayé l'a apprise du CDN. Une longueur nulle ne dit rien : ignorée.
+    pub fn noter_longueur_amont(&self, total: u64) {
+        if total > 0 {
+            self.longueur_amont
+                .store(total, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// #5050 — la longueur totale du flux amont, si un `GET` relayé l'a apprise.
+    pub fn longueur_amont(&self) -> Option<u64> {
+        match self
+            .longueur_amont
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         let keep_alive = tx.clone();
@@ -506,6 +540,8 @@ impl StreamSession {
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
+            longueur_amont: std::sync::atomic::AtomicU64::new(0),
+            requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
