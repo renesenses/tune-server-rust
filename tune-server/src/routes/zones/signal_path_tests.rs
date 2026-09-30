@@ -3601,10 +3601,8 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
     );
     // #4800 — l'en-tête de ce fichier se lit, et une trame le suit : le
     // conteneur est réécrit sans décodage, et l'écran le dit.
-    assert!(
-        transcoder["detail"]
-            .as_str()
-            .is_some_and(|d| d.contains("trames copiées telles quelles")),
+    assert_eq!(
+        transcoder["detail"], DETAIL_FLAC_ENTETE_NEUF,
         "{transcoder}"
     );
     assert!(
@@ -3612,6 +3610,33 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
         "le résumé ne doit plus annoncer un passthrough : {sp}"
     );
     assert_eq!(verdict(&sp), Some(true), "aucun échantillon touché : {sp}");
+}
+
+/// Le détail nomme-t-il ffmpeg, sous l'un de ses noms ?
+fn nomme_ffmpeg(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    d.contains("ffmpeg") || d.contains("lavf")
+}
+
+/// #5525 — Tune ne lance aucun ffmpeg pour servir ce FLAC : il refait
+/// l'en-tête en Rust. Le chemin du signal ne doit donc pas le nommer — sinon
+/// il se lit « Tune a réécrit le FLAC avec ffmpeg » (réunion Yves, 30/09).
+#[test]
+fn le_conteneur_reecrit_ne_nomme_pas_ffmpeg_5525() {
+    for detail in [DETAIL_FLAC_ENTETE_NEUF, DETAIL_FLAC_REENCODE] {
+        assert!(!nomme_ffmpeg(detail), "le détail nomme ffmpeg : {detail}");
+        assert!(
+            detail.contains("Tune"),
+            "le détail doit dire qui réécrit : {detail}"
+        );
+    }
+    // Contre-épreuve : l'ancien texte, lui, est bien attrapé.
+    for ancien in [
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles",
+        "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte",
+    ] {
+        assert!(nomme_ffmpeg(ancien), "la garde doit attraper : {ancien}");
+    }
 }
 
 /// Les contre-épreuves : ce qui ne part PAS ré-encodé ne doit pas l'annoncer.

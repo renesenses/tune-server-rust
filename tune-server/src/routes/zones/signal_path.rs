@@ -765,6 +765,19 @@ pub(crate) const CODEC_INCONNU: &str = "?";
 /// description nomme un codec inconnu par [`CODEC_INCONNU`].
 pub(crate) const CODE_CODEC_INCONNU: &str = "source_codec_unknown";
 
+/// #5525 — le détail d'une étape `flac_container_rewritten` quand Tune sert
+/// les trames sous un en-tête neuf (#4800). C'est Tune, en Rust, qui refait
+/// l'en-tête : aucun ffmpeg ne tourne. L'ancien texte (« FLAC écrit par
+/// ffmpeg (Lavf) ») décrivait le fichier d'origine, mais se lisait comme
+/// « Tune a réécrit le FLAC avec ffmpeg » (réunion avec Yves Corbat, 30/09).
+pub(crate) const DETAIL_FLAC_ENTETE_NEUF: &str =
+    "Fichier d'origine sans somme MD5 : en-tête FLAC refait par Tune, trames audio intactes";
+
+/// #5525 — le même détail quand l'en-tête n'a pas pu être lu et que Tune
+/// décode puis ré-encode (#4350).
+pub(crate) const DETAIL_FLAC_REENCODE: &str =
+    "Fichier d'origine sans somme MD5 : FLAC ré-encodé sans perte par Tune";
+
 /// #5051 — l'étape « Capture » d'une entrée audio en direct, et si le signal
 /// servi est encore, à l'octet près, celui capté. `None` hors entrée audio.
 pub(super) fn etape_de_capture_en_direct(
@@ -1054,9 +1067,9 @@ fn assembler_les_etapes(
             // décodage, premier son immédiat) ou, si l'en-tête n'a pas pu
             // être lu, le décodage-ré-encodage de #4350.
             etape["detail"] = json!(if conteneur_flac_copie {
-                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles"
+                DETAIL_FLAC_ENTETE_NEUF
             } else {
-                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte"
+                DETAIL_FLAC_REENCODE
             });
         }
         steps.push(etape);
