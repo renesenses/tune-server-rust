@@ -2251,6 +2251,43 @@ fn label_du_tag(get: &dyn Fn(lofty::tag::ItemKey) -> Option<String>) -> Option<S
         .or_else(|| non_vide(get(lofty::tag::ItemKey::Publisher)))
 }
 
+/// Une balise « utile » porte au moins un champ qui décrit la musique — tout
+/// champ non vide autre que l'identification de l'encodeur — ou une image.
+///
+/// #4412 (Marco Polo, fil 1836) — un Ogg Vorbis sans aucune balise garde son
+/// en-tête de commentaires, obligatoire, avec la seule chaîne du vendeur
+/// (`Xiph.Org libVorbis I 20040629`), que lofty rend comme une balise
+/// `EncoderSoftware`. Le fichier passait donc pour balisé, `tagless_fallback`
+/// ne s'appliquait pas, et l'artiste restait vide alors qu'un WAV rangé au
+/// même endroit le recevait de l'arborescence. Même cas pour un Opus, ou un
+/// FLAC dont le bloc Vorbis est vide. Décision de Bertrand du 29/09/2026 : un
+/// tel fichier prend le MÊME repli qu'un fichier sans balise.
+///
+/// Un fichier qui ne porte QU'UN genre, un label ou un drapeau de compilation
+/// reste balisé : ces champs ne vivent que sur le chemin nominal.
+fn balise_utile(tag: &lofty::tag::Tag, path: &Path) -> bool {
+    use lofty::tag::{ItemKey, ItemValue};
+    tag.items().any(|item| {
+        !matches!(
+            item.key(),
+            ItemKey::EncoderSoftware | ItemKey::EncoderSettings | ItemKey::EncodedBy
+        ) && match item.value() {
+            ItemValue::Text(t) | ItemValue::Locator(t) => !t.trim().is_empty(),
+            ItemValue::Binary(b) => !b.is_empty(),
+        }
+    }) || !tag.pictures().is_empty()
+        // Trames ID3v2 que lofty ne rend pas alors qu'elles sont valides (MP3,
+        // WAV+ID3 : voir la relecture du chemin nominal). Sonde bornée, payée
+        // seulement par un fichier dont lofty n'a rien tiré.
+        || read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false)
+            .and_then(|raw| parse_id3v2_tag(&raw))
+            .is_some_and(|id3| {
+                [id3.title(), id3.artist(), id3.album()]
+                    .into_iter()
+                    .any(|v| v.is_some_and(|s| !s.trim().is_empty()))
+            })
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -2275,7 +2312,7 @@ pub(crate) fn album_artiste_du_chemin(
     {
         return (
             Some(format!("{titre} ({})", variante.trim())),
-            nom(edition.and_then(|p| p.parent())),
+            edition.and_then(artiste_au_dessus_de),
             None,
         );
     }
@@ -2285,9 +2322,105 @@ pub(crate) fn album_artiste_du_chemin(
     };
     (
         nom(dossier_album),
-        nom(dossier_album.and_then(|p| p.parent())),
+        dossier_album.and_then(artiste_au_dessus_de),
         disque,
     )
+}
+
+/// L'artiste que l'arborescence donne au-dessus du dossier d'album : le
+/// premier dossier parent dont le nom n'est ni générique ni un volume (voir
+/// [`dossier_muet_pour_l_artiste`]). `None` à la racine du système de
+/// fichiers, jamais la racine elle-même (#4412).
+///
+/// Le chemin est découpé comme une CHAÎNE, par
+/// [`crate::library::local_path::racine_et_reste`], et non par
+/// `Path::parent` : `Z:\Musique\750GB\Musique\<album>` (Marco Polo, fil 1836)
+/// se découpe alors de la même façon quel que soit l'hôte qui compile, ce qui
+/// rend le cas Windows vérifiable sur la CI Linux.
+fn artiste_au_dessus_de(dossier_album: &Path) -> Option<String> {
+    let texte = dossier_album.to_str()?;
+    let composants: Vec<&str> = match crate::library::local_path::racine_et_reste(texte) {
+        Some((_, reste, '\\')) => reste.split(['\\', '/']).collect(),
+        Some((_, reste, _)) => reste.split('/').collect(),
+        // Relatif : aucune racine à écarter, les composants tels quels.
+        None => dossier_album
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => n.to_str(),
+                _ => None,
+            })
+            .collect(),
+    };
+    let mut composants: Vec<&str> = composants.into_iter().filter(|c| !c.is_empty()).collect();
+    // Le dernier composant est le dossier d'album lui-même.
+    composants.pop()?;
+    composants
+        .into_iter()
+        .rev()
+        .find(|n| !dossier_muet_pour_l_artiste(n))
+        .map(str::to_string)
+}
+
+/// Vrai quand un nom de dossier ne dit RIEN de l'artiste : dossier générique
+/// (`Musique`, `Music`, `Downloads`…) ou nom de volume (`750GB`, `NAS`,
+/// `share`, lettre de lecteur, `Volumes`, `mnt`, `media`). Décision de
+/// Bertrand du 29/09/2026 (#4412) : on remonte au-dessus, et à défaut
+/// l'artiste reste vide — un artiste « Musique » ou « 750GB » regroupe à tort
+/// toute une bibliothèque sans balises.
+pub(crate) fn dossier_muet_pour_l_artiste(nom: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    let n: String = nom.trim().nfc().collect::<String>().to_lowercase();
+    const MUETS: &[&str] = &[
+        // Génériques.
+        "musique",
+        "musiques",
+        "ma musique",
+        "music",
+        "my music",
+        "audio",
+        "musik",
+        "música",
+        "musica",
+        "downloads",
+        "download",
+        "téléchargements",
+        "telechargements",
+        // Volumes.
+        "nas",
+        "share",
+        "public",
+        "volumes",
+        "mnt",
+        "media",
+    ];
+    if MUETS.contains(&n.as_str()) {
+        return true;
+    }
+    // Lettre de lecteur : `Z`, `Z:`.
+    let lettre = n.strip_suffix(':').unwrap_or(&n);
+    if lettre.len() == 1 && lettre.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return true;
+    }
+    capacite_de_volume(&n)
+}
+
+/// `^\d+(\.\d+)?\s?(GB|TB|Go|To|G|T)$`, insensible à la casse (reçoit du
+/// minuscule) : `750GB`, `2 To`, `1.5TB`, `500G`.
+fn capacite_de_volume(n: &str) -> bool {
+    let Some(unite) = ["gb", "tb", "go", "to", "g", "t"]
+        .into_iter()
+        .find(|u| n.ends_with(u))
+    else {
+        return false;
+    };
+    let nombre = &n[..n.len() - unite.len()];
+    let nombre = nombre.strip_suffix(' ').unwrap_or(nombre);
+    let (entier, decimale) = match nombre.split_once('.') {
+        Some((e, d)) => (e, Some(d)),
+        None => (nombre, None),
+    };
+    let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    chiffres(entier) && decimale.is_none_or(chiffres)
 }
 
 /// Check if a file has a known audio extension (used to decide whether to
@@ -3324,6 +3457,9 @@ fn has_valid_ogg_bos_page(bytes: &[u8]) -> bool {
 mod ogg_fallback_tests_4412;
 
 #[cfg(test)]
+mod sans_balise_tests_4412;
+
+#[cfg(test)]
 mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
@@ -3414,8 +3550,13 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         }
     };
     let props = tagged.properties();
-    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+    let tag = match tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .filter(|t| balise_utile(t, path))
+    {
         Some(t) => t,
+        // Aucune balise, OU une balise qui ne dit rien (#4412) : même repli.
         None => {
             if let Some(meta) = dsf_dff_fallback(path) {
                 return Ok(meta);
