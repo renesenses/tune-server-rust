@@ -8,7 +8,7 @@
 //! - All standard sample rates
 //! - Range coder + adaptive prediction filters
 
-use std::fs::File;
+use crate::audio::iso9660::{FichierSource, ouvrir_fichier};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use tracing::{debug, warn};
@@ -79,7 +79,7 @@ fn read_u32_le(r: &mut impl Read) -> Result<u32, String> {
 
 /// Parse an APE file header and extract format information without decoding.
 pub fn parse_ape(path: &str) -> Result<ApeInfo, String> {
-    let file = File::open(path).map_err(|e| format!("ape: open: {e}"))?;
+    let file = ouvrir_fichier(path).map_err(|e| format!("ape: open: {e}"))?;
     let mut reader = BufReader::new(file);
 
     // Read magic
@@ -172,7 +172,10 @@ pub fn parse_ape(path: &str) -> Result<ApeInfo, String> {
 }
 
 /// Read the seek table from an APE file.
-fn read_seek_table(reader: &mut BufReader<File>, info: &ApeInfo) -> Result<Vec<u32>, String> {
+fn read_seek_table(
+    reader: &mut BufReader<FichierSource>,
+    info: &ApeInfo,
+) -> Result<Vec<u32>, String> {
     reader
         .seek(SeekFrom::Start(info.seek_table_offset))
         .map_err(|e| format!("ape: seek to seek table: {e}"))?;
@@ -631,7 +634,7 @@ pub fn decode_ape_to_pcm(
         }
     }
 
-    let file = File::open(path).map_err(|e| format!("ape: open: {e}"))?;
+    let file = ouvrir_fichier(path).map_err(|e| format!("ape: open: {e}"))?;
     let mut reader = BufReader::new(file);
 
     // Read seek table

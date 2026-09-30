@@ -10,7 +10,7 @@
 //! All multi-byte values are little-endian.
 //! DSD bit ordering: LSB first within each byte.
 
-use std::fs::File;
+use crate::audio::iso9660::{FichierSource, ouvrir_fichier};
 use std::io::{Read, Seek, SeekFrom};
 
 /// Parsed DSF file header information.
@@ -107,7 +107,7 @@ fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
 
 /// Parse a DSF file header and return metadata needed for decoding.
 pub fn parse_dsf(path: &str) -> Result<DsfInfo, String> {
-    let mut file = File::open(path).map_err(|e| format!("dsf open: {e}"))?;
+    let mut file = ouvrir_fichier(path).map_err(|e| format!("dsf open: {e}"))?;
 
     // --- DSD Chunk (28 bytes) ---
     let mut dsd_chunk = [0u8; 28];
@@ -219,7 +219,7 @@ pub fn parse_dsf(path: &str) -> Result<DsfInfo, String> {
 ///
 /// Each byte contains 8 DSD samples (LSB first in DSF format).
 pub fn read_dsf_blocks(path: &str, info: &DsfInfo) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|e| format!("dsf open: {e}"))?;
+    let mut file = ouvrir_fichier(path).map_err(|e| format!("dsf open: {e}"))?;
     file.seek(SeekFrom::Start(info.data_offset))
         .map_err(|e| format!("dsf seek: {e}"))?;
 
@@ -291,14 +291,14 @@ pub fn read_dsf_blocks(path: &str, info: &DsfInfo) -> Result<Vec<u8>, String> {
 ///
 /// Memory usage: O(block_size * channels) per call, typically ~8-32 KB.
 ///
-/// Générique sur sa SOURCE d'octets : `File` par défaut (le chemin local,
-/// `open`), mais toute source `Read` convient dès qu'elle est positionnée sur
+/// Générique sur sa SOURCE d'octets : un fichier par défaut (le chemin local,
+/// `open`, sur le disque ou dans une image ISO), mais toute source `Read` convient dès qu'elle est positionnée sur
 /// le premier bloc de `data`. C'est ce qui permet de décoder un DSF **au fil
 /// de l'eau** depuis un corps HTTP (`decode::decode_dsf_http_to_pcm_streaming`),
 /// sans fichier temporaire de 300 Mio ni attente de la fin du téléchargement.
 /// Le chunk de métadonnées (ID3, en FIN de fichier) n'est jamais nécessaire
 /// au décodage.
-pub struct DsfStreamReader<R: Read = File> {
+pub struct DsfStreamReader<R: Read = FichierSource> {
     source: R,
     info: DsfInfo,
     block_idx: usize,
@@ -307,10 +307,10 @@ pub struct DsfStreamReader<R: Read = File> {
     super_block_buf: Vec<u8>,
 }
 
-impl DsfStreamReader<File> {
+impl DsfStreamReader<FichierSource> {
     /// Open a DSF file for streaming reading.
     pub fn open(path: &str, info: DsfInfo) -> Result<Self, String> {
-        let mut file = File::open(path).map_err(|e| format!("dsf open: {e}"))?;
+        let mut file = ouvrir_fichier(path).map_err(|e| format!("dsf open: {e}"))?;
         file.seek(SeekFrom::Start(info.data_offset))
             .map_err(|e| format!("dsf seek: {e}"))?;
         Ok(Self::depuis_lecteur(file, info))

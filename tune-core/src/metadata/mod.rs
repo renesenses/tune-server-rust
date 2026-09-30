@@ -617,8 +617,10 @@ struct DsfHeaderInfo {
 fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, &'static str> {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path))
-        .map_err(|_| "ouverture_impossible")?;
+    // #5299 — un `.dsf` rangé dans une image ISO s'ouvre dans l'image.
+    let mut f =
+        crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+            .map_err(|_| "ouverture_impossible")?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
     f.read_exact(&mut header)
         .map_err(|_| "entete_dsd_trop_court")?;
@@ -1293,15 +1295,17 @@ fn read_dsf_id3v2_raw(
         }
         return None;
     };
-    let mut f = match std::fs::File::open(&*crate::library::artwork::extended_path(path)) {
-        Ok(f) => f,
-        Err(e) => {
-            rejet("ouverture_impossible", e.to_string());
-            return None;
-        }
-    };
-    let file_len = match f.metadata() {
-        Ok(m) => m.len(),
+    let mut f =
+        match crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                rejet("ouverture_impossible", e.to_string());
+                return None;
+            }
+        };
+    let file_len = match f.longueur() {
+        Ok(n) => n,
         Err(e) => {
             rejet("taille_illisible", e.to_string());
             return None;
@@ -1427,7 +1431,7 @@ fn read_dsf_id3v2_raw(
 /// Rend `None` quand le parcours ne serait pas fiable — l'appelant retombe alors
 /// sur un préfixe plutôt que sur rien.
 fn read_id3v2_selected_frames(
-    f: &mut std::fs::File,
+    f: &mut crate::audio::iso9660::FichierSource,
     header: &[u8; 10],
     tag_offset: u64,
     file_len: u64,
@@ -1733,7 +1737,9 @@ fn dsf_dff_fallback_complete(
 
     let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
         .ok()
-        .map(|m| m.len());
+        .map(|m| m.len())
+        // #5299 — fichier rangé dans une image ISO : sa taille propre.
+        .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t));
 
     let (sample_rate, channels, duration_ms, metadata_offset) = if ext == "dsf" {
         match parse_dsf_header_full(path) {
@@ -3053,7 +3059,7 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let mut data = Vec::new();
     {
         use std::io::Read;
-        std::fs::File::open(path)
+        crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
             .take(HEADER_BYTES)
             .read_to_end(&mut data)
@@ -3160,7 +3166,7 @@ fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
     let mut data = Vec::new();
     {
         use std::io::Read;
-        std::fs::File::open(path)
+        crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
             .take(HEADER_BYTES)
             .read_to_end(&mut data)
@@ -3370,7 +3376,9 @@ fn ogg_fallback_has_audio(path: &Path) -> Option<bool> {
         io::{MediaSourceStream, ReadOnlySource},
         meta::MetadataOptions,
     };
-    let Ok(file) = std::fs::File::open(&*crate::library::artwork::extended_path(path)) else {
+    let Ok(file) =
+        crate::audio::iso9660::ouvrir_fichier(&*crate::library::artwork::extended_path(path))
+    else {
         return Some(false);
     };
     let mut bytes = Vec::new();
@@ -3530,7 +3538,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             // still appears in the library rather than being silently skipped.
             // Only apply the fallback if the file actually exists (a missing
             // file should still return Err).
-            if is_known_audio_ext(path) && path.exists() {
+            if is_known_audio_ext(path)
+                && (path.exists() || crate::audio::iso9660::taille_et_mtime(path).is_some())
+            {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ["ogg", "oga", "opus"]
                     .iter()

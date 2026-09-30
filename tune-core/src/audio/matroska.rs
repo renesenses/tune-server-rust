@@ -246,7 +246,7 @@ fn ramasser_les_balises(revision: &MetadataRevision, dans: &mut BalisesMatroska)
 /// symphonia sache lire — c'est un fichier ILLISIBLE, pas un format non pris
 /// en charge, et l'appelant doit le compter comme tel.
 pub fn sonder(path: &Path) -> Result<SondeMatroska, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("mkv open: {e}"))?;
+    let file = super::iso9660::ouvrir_fichier(path).map_err(|e| format!("mkv open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {

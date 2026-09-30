@@ -1477,7 +1477,7 @@ pub fn decode_to_pcm(
 fn ogg_stream_is_opus(file_path: &str) -> bool {
     use std::io::Read;
     let mut buf = [0u8; 4096];
-    let Ok(mut f) = File::open(file_path) else {
+    let Ok(mut f) = super::iso9660::ouvrir_fichier(file_path) else {
         return false;
     };
     let n = f.read(&mut buf).unwrap_or(0);
@@ -1512,7 +1512,7 @@ fn decode_opus_to_pcm(
 ) -> Result<DecodedAudio, String> {
     use opus::{Channels, Decoder as OpusDecoder};
 
-    let file = File::open(file_path).map_err(|e| format!("open opus: {e}"))?;
+    let file = super::iso9660::ouvrir_fichier(file_path).map_err(|e| format!("open opus: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
@@ -2793,12 +2793,12 @@ fn ape_open_checked(
     bras: &str,
 ) -> Result<
     (
-        ape_decoder::ApeDecoder<std::io::BufReader<File>>,
+        ape_decoder::ApeDecoder<std::io::BufReader<super::iso9660::FichierSource>>,
         ApeHeaderInfo,
     ),
     String,
 > {
-    let file = File::open(file_path).map_err(|e| format!("open ape: {e}"))?;
+    let file = super::iso9660::ouvrir_fichier(file_path).map_err(|e| format!("open ape: {e}"))?;
     let decoder = ape_decoder::ApeDecoder::new(std::io::BufReader::new(file))
         .map_err(|e| format!("ape open: {e}"))?;
     let info = decoder.info();
@@ -2915,7 +2915,7 @@ fn ape_pcm_to_i32(pcm: &[u8], header: &ApeHeaderInfo, out: &mut Vec<i32>) -> Res
 /// (une trame APE ≈ 6,7 s à 44,1 kHz) : la lecture depuis un point de recherche
 /// s'arrêtait donc au bout de quelques secondes.
 fn ape_start_position(
-    decoder: &mut ape_decoder::ApeDecoder<std::io::BufReader<File>>,
+    decoder: &mut ape_decoder::ApeDecoder<std::io::BufReader<super::iso9660::FichierSource>>,
     header: &ApeHeaderInfo,
     seek_s: f64,
 ) -> Result<(u32, usize), String> {
