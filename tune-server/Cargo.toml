@@ -848,6 +848,13 @@ path = "tests/serveur_media_didl_hors_auth_3933.rs"
 name = "serveur_media_criteres_canoniques"
 path = "tests/serveur_media_criteres_canoniques.rs"
 
+# #4956 — l'ordre alphabétique naturel des rayons Genres, Artists, Albums et
+# Playlists du serveur média (signes de tête, accents et casse ignorés), lu
+# sur la vraie route `POST /ContentDirectory/control`, en Browse et en Search.
+[[test]]
+name = "serveur_media_ordre_alphabetique_4956"
+path = "tests/serveur_media_ordre_alphabetique_4956.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
