@@ -53,10 +53,41 @@ if [ -z "$VERSION" ]; then
     echo "       (e.g. $0 0.9.55)" >&2
     exit 2
 fi
+# Convention A (Bertrand, 29/09/2026) : le suffixe d'une pre-version vit sur
+# le TAG seul. Pour la 1.0.0-rc1 : `bump-all.sh 1.0.0`, puis tag v1.0.0-rc1.
+# Les fichiers restent en X.Y.Z parce que :
+#   - release.yml compare la base X.Y.Z du tag a Cargo.toml et package.json ;
+#   - Apple refuse `1.0.0-rc1` en MARKETING_VERSION, et Flutter le tronque en
+#     `1.0.01` sur iOS — lu 1.0.1 par Apple, plus grand que la future 1.0.0 ;
+#   - le binaire affiche la version du tag (`tune_core::version()` lit
+#     TUNE_VERSION, pose depuis le tag).
+# La rc2, puis la 1.0.0 finale, n'appellent PAS de nouveau bump des fichiers
+# serveur et web : seuls les numeros de build clients avancent.
+if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+    echo "Error: $VERSION porte un suffixe de pre-version." >&2
+    echo "       Le suffixe vit sur le tag seul (convention A) : lancer" >&2
+    echo "         $0 ${VERSION%%-*}" >&2
+    echo "       puis taguer v$VERSION." >&2
+    exit 2
+fi
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "Error: version must be X.Y.Z (got: $VERSION)" >&2
     exit 2
 fi
+
+# Une version DEJA suffixee dans un fichier (`1.0.0-rc1`, posee a la main) doit
+# etre rattrapee, pas sautee en silence. Tous les motifs de reecriture
+# ci-dessous acceptent donc ce suffixe facultatif, et chaque fichier est relu
+# apres coup : un `sed` qui ne trouve rien rend 0.
+PRE='(-[0-9A-Za-z.-]+)?'
+verifier_ecrit() {
+    local fichier="$1" motif="$2"
+    grep -Eq "$motif" "$fichier" || {
+        echo "Error: $fichier ne contient pas « $motif » apres reecriture." >&2
+        echo "       Le motif n'a rien trouve : bump INCOMPLET, verifier ce fichier a la main." >&2
+        exit 1
+    }
+}
 
 DEV="${TUNE_DEV_DIR:-$HOME/DEV}"
 RUST_DIR="$DEV/tune-server-rust"
@@ -203,7 +234,8 @@ if [ -d "$RUST_DIR" ] && command -v cargo &>/dev/null; then
 fi
 
 # 1. Cargo.toml workspace — version = "X.Y.Z"
-sed -i.bak -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$VERSION"'"/' "$CARGO" && rm "$CARGO.bak"
+sed -i.bak -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+'"$PRE"'"/version = "'"$VERSION"'"/' "$CARGO" && rm "$CARGO.bak"
+verifier_ecrit "$CARGO" "^version = \"$VERSION\"\$"
 
 # Cargo.lock must follow, or the build fails on a version mismatch. This is not
 # optional: forgetting it is how you discover the problem at compile time.
@@ -214,7 +246,8 @@ if command -v cargo &>/dev/null; then
 fi
 
 # 2. package.json — "version": "X.Y.Z"
-sed -i.bak -E "s/\"version\": \"[0-9]+\\.[0-9]+\\.[0-9]+\"/\"version\": \"$VERSION\"/" "$WEB" && rm "$WEB.bak"
+sed -i.bak -E "s/\"version\": \"[0-9]+\\.[0-9]+\\.[0-9]+$PRE\"/\"version\": \"$VERSION\"/" "$WEB" && rm "$WEB.bak"
+verifier_ecrit "$WEB" "\"version\": \"$VERSION\""
 
 echo
 echo "Bumped Tune to v$VERSION"
@@ -251,15 +284,23 @@ if [ "$WITH_CLIENTS" -eq 1 ]; then
     # the last five releases went red.
     PUBSPEC_BACKUP="$(mktemp "${TMPDIR:-/tmp}/tune-pubspec.XXXXXX")"
     cp "$FLUTTER" "$PUBSPEC_BACKUP"
-    CUR_BUILD=$(grep -oE "^version: [0-9]+\.[0-9]+\.[0-9]+\+[0-9]+" "$FLUTTER" | head -1 | sed -E 's/.*\+//')
-    if [ -n "$CUR_BUILD" ]; then
-        NEXT_FLUTTER=$((CUR_BUILD + 1))
-        sed -i.bak -E "s/^version: [0-9]+\.[0-9]+\.[0-9]+\+[0-9]+/version: $VERSION+$NEXT_FLUTTER/" "$FLUTTER"
-    else
-        NEXT_FLUTTER=1
-        sed -i.bak -E "s/^version: [0-9]+\.[0-9]+\.[0-9]+.*/version: $VERSION+1/" "$FLUTTER"
+    # `|| true` : sous `pipefail`, un grep sans correspondance faisait sortir
+    # le script EN SILENCE (code 1) ici, Cargo.toml et package.json deja
+    # reecrits — le repli ci-dessous n'etait jamais atteint.
+    CUR_BUILD=$(grep -oE "^version: [0-9]+\.[0-9]+\.[0-9]+$PRE\+[0-9]+" "$FLUTTER" | head -1 | sed -E 's/.*\+//' || true)
+    if [ -z "$CUR_BUILD" ]; then
+        # L'ancien repli ecrivait `version: X.Y.Z+1` : versionCode 1, que
+        # Firebase et le Play Store refusent (513 le 29/09/2026), et un numero
+        # iOS qui recule. Un numero de build se lit, il ne s'invente pas.
+        rm -f "$PUBSPEC_BACKUP"
+        echo "Error: aucun « version: X.Y.Z+N » lisible dans $FLUTTER." >&2
+        echo "       Le numero de build ne peut pas etre deduit ; corriger le fichier a la main." >&2
+        exit 1
     fi
+    NEXT_FLUTTER=$((CUR_BUILD + 1))
+    sed -i.bak -E "s/^version: [0-9]+\.[0-9]+\.[0-9]+$PRE\+[0-9]+/version: $VERSION+$NEXT_FLUTTER/" "$FLUTTER"
     rm "$FLUTTER.bak"
+    verifier_ecrit "$FLUTTER" "^version: $VERSION\+$NEXT_FLUTTER\$"
 
     # Rebuild the three ABIs against the version we have just written into
     # Cargo.toml. build-android.sh refuses to copy a library that does not
@@ -313,7 +354,11 @@ if [ "$WITH_CLIENTS" -eq 1 ]; then
     # project.yml — MARKETING_VERSION everywhere; CURRENT_PROJECT_VERSION += 1
     # everywhere. Every Swift target must move together or TestFlight rejects
     # mismatched build numbers against the same bundle id.
-    sed -i.bak -E "s/MARKETING_VERSION: \"[0-9]+\.[0-9]+\.[0-9]+\"/MARKETING_VERSION: \"$VERSION\"/g" "$IPAD"
+    sed -i.bak -E "s/MARKETING_VERSION: \"[0-9]+\.[0-9]+\.[0-9]+$PRE\"/MARKETING_VERSION: \"$VERSION\"/g" "$IPAD"
+    if grep -Eq 'MARKETING_VERSION: "[^"]*-' "$IPAD"; then
+        echo "Error: $IPAD garde un MARKETING_VERSION suffixe : Apple le refuse." >&2
+        exit 1
+    fi
     CURRENT_BUILD=$(grep -oE "CURRENT_PROJECT_VERSION: [0-9]+" "$IPAD" | head -1 | awk '{print $2}')
     NEXT_BUILD=$((CURRENT_BUILD + 1))
     sed -i.bak -E "s/CURRENT_PROJECT_VERSION: [0-9]+/CURRENT_PROJECT_VERSION: $NEXT_BUILD/g" "$IPAD"

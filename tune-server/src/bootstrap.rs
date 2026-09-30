@@ -93,7 +93,7 @@ pub async fn run_with(opts: RunOptions) {
     // demander sa version au binaire, l'écran ne pouvait que répéter une valeur
     // figée. Cf tune-os#27.
     if version_requested(std::env::args().skip(1)) {
-        println!("tune-server {}", env!("CARGO_PKG_VERSION"));
+        println!("tune-server {}", tune_core::version());
         std::process::exit(0);
     }
 
@@ -129,7 +129,7 @@ pub async fn run_with(opts: RunOptions) {
             &startup_log,
             format!(
                 "tune-server {} starting\npid: {}\nexe: {:?}\ncwd: {:?}\n",
-                env!("CARGO_PKG_VERSION"),
+                tune_core::version(),
                 std::process::id(),
                 std::env::current_exe().ok(),
                 std::env::current_dir().ok(),

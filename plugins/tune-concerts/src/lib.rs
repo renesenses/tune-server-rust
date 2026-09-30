@@ -206,7 +206,7 @@ impl TunePlugin for ConcertsPlugin {
         "concerts"
     }
     fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
+        tune_core::version()
     }
     fn description(&self) -> &str {
         "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous"

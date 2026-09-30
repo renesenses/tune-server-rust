@@ -222,7 +222,7 @@ async fn export_library_manifest(State(state): State<AppState>) -> Result<Json<V
     Ok(Json(json!({
         "tracks": tracks,
         "total": count,
-        "server_version": env!("CARGO_PKG_VERSION"),
+        "server_version": tune_core::version(),
         "exported_at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

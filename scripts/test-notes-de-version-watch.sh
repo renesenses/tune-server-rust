@@ -294,6 +294,43 @@ verifier "etat de sortie 1 (aucun fil de notes)" "1" "$ETAT"
 N=$(printf '%s' "$SORTIE" | grep -c '^| `v0\.9\.160` |')
 verifier "la v0.9.160 est accusee malgre les fils qui la citent" "1" "$N"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. La 1.0.0-rc1 (29/09/2026) part en « Latest » : c'est une version de Tune,
+#    elle doit avoir son fil. Et le fil de la rc1 n'annonce PAS la 1.0.0.
+# ─────────────────────────────────────────────────────────────────────────────
+RELEASES_RC='[
+ {"tagName":"v1.0.0-rc1","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:40:00Z"},
+ {"tagName":"moissonneur-v1.0.0-rc1","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:30:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]'
+
+echo
+echo "7. la v1.0.0-rc1 sans fil — elle est accusee"
+printf '%s' "$RELEASES_RC" | poser_decor rc_sans_fil
+jouer rc_sans_fil
+verifier "etat de sortie 1 (la rc1 n'a pas de fil)" "1" "$ETAT"
+N=$(printf '%s' "$SORTIE" | grep -c '^| `v1\.0\.0-rc1` |')
+verifier "la v1.0.0-rc1 est accusee" "1" "$N"
+N=$(printf '%s' "$SORTIE" | grep -c '^| `moissonneur-v1\.0\.0-rc1` |')
+verifier "le moissonneur-v1.0.0-rc1 n'est pas accuse" "0" "$N"
+
+echo
+echo "7b. la v1.0.0-rc1 avec son fil « Tune v1.0.0-rc1 — Notes de version » — elle a son fil"
+printf '%s' "$RELEASES_RC" | poser_decor rc_avec_fil
+ajouter_fil "$RACINE/rc_avec_fil/fils.json" "Tune v1.0.0-rc1 — Notes de version" discussion
+jouer rc_avec_fil
+verifier "etat de sortie 0 (la rc1 a son fil)" "0" "$ETAT"
+
+echo
+echo "7c. la v1.0.0 finale et le seul fil de la rc1 — la 1.0.0 est accusee"
+printf '%s' '[
+ {"tagName":"v1.0.0","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:45:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]' | poser_decor finale
+ajouter_fil "$RACINE/finale/fils.json" "Tune v1.0.0-rc1 — Notes de version" discussion
+jouer finale
+verifier "etat de sortie 1 (le fil de la rc1 n'annonce pas la 1.0.0)" "1" "$ETAT"
+
 echo
 if [ "$rate" -eq 0 ]; then
   echo "Contre-epreuve #4461 : tout est vert."

@@ -36,6 +36,8 @@ jobs:
       APPLY: ${{ !inputs.dry_run }}
       CONTROLLER_TOKEN: ${{ secrets.RELEASE_CONTROLLER_TOKEN }}
       OS_TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
+    outputs:
+      prerelease: ${{ steps.verifier.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,13 +51,14 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Verifier le train staged et ses quatre tags
+        id: verifier
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::lancer depuis main"; exit 1; }
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version invalide"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::version invalide"; exit 1; }
           [ -f "$PLAN" ] || { echo "::error::manifeste absent"; exit 1; }
           jq -e --arg version "$VERSION" '.version == $version and .ready == true' "$PLAN" >/dev/null \
             || { echo "::error::manifeste non pret"; exit 1; }
@@ -88,6 +91,19 @@ jobs:
           DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
           [ "$DRAFT" = true ] || { [ "$APPLY" = true ] && [ "$DRAFT" = false ]; } \
             || { echo "::error::release serveur absente ou deja publique"; exit 1; }
+
+          # Pre-version ou Latest : meme regle que release.yml, meme script.
+          # Le brouillon doit porter le drapeau que le manifeste annonce ; un
+          # ecart veut dire que le manifeste a change apres le tag, ou que le
+          # brouillon a ete retouche a la main. On ne devine pas lequel.
+          PRERELEASE="$(bash scripts/canal-de-release.sh "$TAG" "$PLAN")"
+          DRAFT_PRE="$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)"
+          [ "$DRAFT_PRE" = "$PRERELEASE" ] || {
+            echo "::error::$TAG : le brouillon porte prerelease=$DRAFT_PRE, le manifeste annonce $PRERELEASE"
+            exit 1
+          }
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "$TAG : prerelease=$PRERELEASE"
           ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
           for asset in \
             "tune-server-$TAG-linux-x86_64.tar.gz" \
@@ -172,22 +188,31 @@ jobs:
           for sha in "$MAC_ARM" "$MAC_X86" "$LIN_ARM" "$LIN_X86"; do
             [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::checksum Homebrew absent"; exit 1; }
           done
+          # L'URL est RECONSTRUITE, pas retouchee par motif. L'ancien
+          # `gsub(/v[0-9]+\.[0-9]+\.[0-9]+/, ...)` laissait le suffixe :
+          # de v1.0.0-rc1 a 1.0.0, il aurait ecrit `v1.0.0-rc1` dans l'URL
+          # avec les sommes de la 1.0.0. Et un motif qui accepte un
+          # suffixe `-[0-9A-Za-z.-]+` avalerait `-macos` dans
+          # `v1.0.0-macos-aarch64` : on ne cherche donc pas, on ecrit.
           awk -v version="$VERSION" -v mac_arm="$MAC_ARM" -v mac_x86="$MAC_X86" \
               -v lin_arm="$LIN_ARM" -v lin_x86="$LIN_X86" '
             /^  version "/ { sub(/"[^"]+"/, "\"" version "\"") }
             /url "/ {
-              gsub(/v[0-9]+\.[0-9]+\.[0-9]+/, "v" version)
-              if ($0 ~ /macos-aarch64/) pending=mac_arm
-              else if ($0 ~ /macos-x86_64/) pending=mac_x86
-              else if ($0 ~ /linux-aarch64/) pending=lin_arm
-              else if ($0 ~ /linux-x86_64/) pending=lin_x86
+              plat=""
+              if ($0 ~ /macos-aarch64/) { pending=mac_arm; plat="macos-aarch64" }
+              else if ($0 ~ /macos-x86_64/) { pending=mac_x86; plat="macos-x86_64" }
+              else if ($0 ~ /linux-aarch64/) { pending=lin_arm; plat="linux-aarch64" }
+              else if ($0 ~ /linux-x86_64/) { pending=lin_x86; plat="linux-x86_64" }
+              if (plat != "") sub(/url "[^"]+"/, "url \"https://github.com/renesenses/tune-server-rust/releases/download/v" version "/tune-server-v" version "-" plat ".tar.gz\"")
             }
             /sha256 "/ && pending != "" { sub(/sha256 "[^"]+"/, "sha256 \"" pending "\""); pending="" }
-            { gsub(/Tune Server v[0-9]+\.[0-9]+\.[0-9]+/, "Tune Server v" version); print }
+            { gsub(/Tune Server v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?/, "Tune Server v" version); print }
           ' "$F" > "$F.new"
           mv "$F.new" "$F"
           grep -q "version \"$VERSION\"" "$F"
           [ "$(grep -c "sha256 \"" "$F")" -eq 4 ]
+          [ "$(grep -cF "releases/download/v$VERSION/tune-server-v$VERSION-" "$F")" -eq 4 ] \
+            || { echo "::error::formule : les quatre URL ne visent pas toutes v$VERSION"; exit 1; }
           git diff --check
           git diff -- "$F" >> "$GITHUB_STEP_SUMMARY"
 
@@ -205,15 +230,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PRERELEASE: ${{ steps.verifier.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
+          [ "$PRERELEASE" = true ] || [ "$PRERELEASE" = false ] \
+            || { echo "::error::drapeau prerelease indetermine : $PRERELEASE"; exit 1; }
 
-          # Aucune reconstruction : les deux tags publics recopient le digest
-          # exact construit sous staging-vX.Y.Z.
-          docker buildx imagetools create \
-            --tag "renesenses/tune:$TAG" --tag renesenses/tune:latest \
-            "renesenses/tune:staging-$TAG"
+          # Aucune reconstruction : les tags publics recopient le digest
+          # exact construit sous staging-vX.Y.Z. Une PRE-VERSION (manifeste
+          # `"prerelease": true`, ou tag suffixe sans ce champ) ne prend PAS
+          # `:latest` : les NAS Docker suivent ce tag. La 1.0.0-rc1, elle,
+          # est declaree `"prerelease": false` et le prend.
+          if [ "$PRERELEASE" = true ]; then
+            docker buildx imagetools create \
+              --tag "renesenses/tune:$TAG" \
+              "renesenses/tune:staging-$TAG"
+          else
+            docker buildx imagetools create \
+              --tag "renesenses/tune:$TAG" --tag renesenses/tune:latest \
+              "renesenses/tune:staging-$TAG"
+          fi
 
           OS_TAG="$(jq -r .components.os.tag "$PLAN")"
 
@@ -257,18 +294,30 @@ jobs:
             fi
           fi
 
-          cd homebrew-tap
-          git config user.email "renesenses-bot@users.noreply.github.com"
-          git config user.name "renesenses-bot"
-          git add Formula/tune-server.rb
-          if ! git diff --cached --quiet; then
-            git commit -m "tune-server v$VERSION"
-            git push origin HEAD
+          # Homebrew n'a qu'un canal : une pre-version n'y entre pas.
+          if [ "$PRERELEASE" = false ]; then
+            cd homebrew-tap
+            git config user.email "renesenses-bot@users.noreply.github.com"
+            git config user.name "renesenses-bot"
+            git add Formula/tune-server.rb
+            if ! git diff --cached --quiet; then
+              git commit -m "tune-server v$VERSION"
+              git push origin HEAD
+            fi
+            cd ..
+          else
+            echo "pre-version : formule Homebrew laissee telle quelle"
           fi
-          cd ..
 
+          # `--latest` sur une pre-version est refuse ou ignore selon les cas
+          # par l'API : on ne le passe qu'a une release stable. Le brouillon
+          # porte deja le bon `prerelease` (verifie plus haut).
           if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
-            gh release edit "$TAG" --draft=false --latest
+            if [ "$PRERELEASE" = false ]; then
+              gh release edit "$TAG" --draft=false --latest
+            else
+              gh release edit "$TAG" --draft=false --latest=false
+            fi
           fi
 
           [ -n "$WEBHOOK_SECRET" ] || { echo "::error::WEBHOOK_SECRET absent"; exit 1; }
@@ -311,8 +360,12 @@ jobs:
             echo
             echo "- GitHub Release serveur publique"
             echo "- release Tune OS publique"
-            echo "- Docker $TAG et latest sur le digest staged"
-            echo "- Homebrew mis a jour"
+            if [ "$PRERELEASE" = false ]; then
+              echo "- Docker $TAG et latest sur le digest staged"
+              echo "- Homebrew mis a jour"
+            else
+              echo "- PRE-VERSION : Docker $TAG seul (latest inchange), Homebrew et .deb inchanges"
+            fi
             echo "- site notifie (release app, puis release Tune OS dans cet ordre)"
             echo "- Android inchange : absent du manifeste a quatre composants"
             echo "- paquet .deb : job \`deb\` de ce meme run"
@@ -335,7 +388,10 @@ jobs:
   deb:
     name: Paquet Debian
     needs: promote
-    if: ${{ !inputs.dry_run }}
+    # Une pre-version ne part pas en .deb : apt n'a qu'un canal. La
+    # 1.0.0-rc1, declaree `"prerelease": false`, y part — en 1.0.0~rc1
+    # (scripts/build-deb.sh), pour que la 1.0.0 finale passe apres.
+    if: ${{ !inputs.dry_run && needs.promote.outputs.prerelease == 'false' }}
     uses: ./.github/workflows/deb.yml
     with:
       tag: v${{ inputs.version }}
