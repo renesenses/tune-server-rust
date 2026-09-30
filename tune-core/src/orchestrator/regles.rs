@@ -626,9 +626,12 @@ pub(super) fn plafond_de_flux_de_service(
     if max == 0 || source_hz <= max {
         return Ok(None);
     }
-    match crate::audio::bitperfect_strict::decision_bitperfect(source_hz, max, strict).refus() {
+    // #5524 — la cadence servie reste dans la famille de la source (192 sous
+    // 88,2 → 48), le plafond n'est qu'une borne.
+    let cible = crate::audio::formats::cadence_sous_plafond(source_hz, Some(max));
+    match crate::audio::bitperfect_strict::decision_bitperfect(source_hz, cible, strict).refus() {
         Some(refus) => Err(refus),
-        None => Ok(Some(max)),
+        None => Ok(Some(cible)),
     }
 }
 
