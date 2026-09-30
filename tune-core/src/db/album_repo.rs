@@ -947,6 +947,90 @@ pub fn sql_combler_les_labels_d_album() -> String {
     )
 }
 
+/// Le format de l'album tel que ses PISTES le disent (#5413, suite) : le plus
+/// fréquent, départagé par ordre alphabétique — un `LIMIT 1` nu rendrait une
+/// ligne quelconque, et le badge d'un dossier mêlant MP3 et FLAC changerait
+/// d'un scan à l'autre. `NULL` quand aucune piste ne porte de format.
+/// Corrélé sur `albums.id`, SQL commun à SQLite et PostgreSQL.
+fn sql_format_des_pistes() -> &'static str {
+    "(SELECT t.format FROM tracks t \
+      WHERE t.album_id = albums.id AND t.format IS NOT NULL AND t.format != '' \
+      GROUP BY t.format ORDER BY COUNT(*) DESC, t.format ASC LIMIT 1)"
+}
+
+/// La plus haute valeur de `tracks.{champ}` de l'album, `0` écarté (une
+/// propriété illisible au scan ne vaut pas « 0 Hz »). `NULL` sans valeur.
+fn sql_max_des_pistes(champ: &str) -> String {
+    format!(
+        "(SELECT MAX(t.{champ}) FROM tracks t \
+          WHERE t.album_id = albums.id AND t.{champ} > 0)"
+    )
+}
+
+/// Les trois colonnes que lit le badge de qualité ([`Album::quality`]) — et
+/// donc le filtre `?quality=` ([`Album::quality_sql`]) — recalculées depuis
+/// les PISTES de l'album (#5413, régression v0.9.169).
+///
+/// Jusqu'à v0.9.169, ces colonnes étaient en comblement seul
+/// (`COALESCE(albums.sample_rate, MAX(pistes))`) : posées au premier passage,
+/// jamais recalculées. Un album dont les fichiers avaient changé depuis (CD
+/// remplacé par sa version 24/96, dossier regroupé autrement) gardait des
+/// valeurs périmées. Tant que le filtre lisait les pistes, cela ne se voyait
+/// que sur le badge ; depuis que le filtre suit le badge (#5430, v0.9.169),
+/// Rhorn (fil 2032) est passé de 151 albums sous « Hi-Res » à UN seul — une
+/// compilation WAV 16/44 aux colonnes figées sur une autre valeur.
+///
+/// Les pistes l'emportent donc désormais ; la valeur de l'album n'est gardée
+/// que si AUCUNE piste n'en porte (album sans piste locale, UPnP ou
+/// streaming indexé sans propriétés). Corrélé sur `albums.id` : il sert tel
+/// quel à la remontée d'un album (`WHERE id = ?`), aux remontées du scan et au
+/// recalage de démarrage. SQL commun à SQLite et PostgreSQL.
+pub fn sql_qualite_reprise_des_pistes() -> String {
+    format!(
+        "format = {}, sample_rate = {}, bit_depth = {}",
+        sql_qualite_calculee("format"),
+        sql_qualite_calculee("sample_rate"),
+        sql_qualite_calculee("bit_depth"),
+    )
+}
+
+/// La valeur que [`sql_qualite_reprise_des_pistes`] écrit dans `champ`.
+fn sql_qualite_calculee(champ: &str) -> String {
+    let des_pistes = match champ {
+        "format" => sql_format_des_pistes().to_string(),
+        _ => sql_max_des_pistes(champ),
+    };
+    format!("COALESCE({des_pistes}, albums.{champ})")
+}
+
+/// Le recalage GLOBAL de la qualité des albums sur leurs pistes (#5413),
+/// borné aux seuls albums dont une des trois colonnes change.
+///
+/// Rejoué à chaque démarrage (`migrations::run_migrations` et
+/// `run_pg_migrations`), comme [`sql_combler_les_labels_d_album`] : une
+/// bibliothèque scannée avant le correctif est rattrapée dès la mise à jour,
+/// sans attendre un scan — et un scan ne suffirait pas sur les albums que le
+/// scan incrémental ne touche pas. Le `WHERE` rend la passe idempotente
+/// jusque dans son bilan : un second passage ne touche aucune ligne, et
+/// PostgreSQL ne réécrit pas toute la table à chaque démarrage.
+pub fn sql_recaler_la_qualite_des_albums() -> String {
+    let change = |champ: &str, neutre: &str| {
+        format!(
+            "COALESCE({}, {neutre}) <> COALESCE(albums.{champ}, {neutre})",
+            sql_qualite_calculee(champ)
+        )
+    };
+    format!(
+        "UPDATE albums SET {} \
+         WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) \
+           AND ({} OR {} OR {})",
+        sql_qualite_reprise_des_pistes(),
+        change("format", "''"),
+        change("sample_rate", "0"),
+        change("bit_depth", "0"),
+    )
+}
+
 /// Le prédicat « ce champ de l'album est tenu par une édition manuelle » (C3),
 /// corrélé sur `albums.id`, pour les passes SQL du scan qui réécrivent un
 /// champ d'album sans passer par le dépôt. SQL commun aux deux moteurs.
@@ -2611,15 +2695,21 @@ impl AlbumRepo {
         Ok(self.db.execute(&sql_combler_les_labels_d_album(), &[])?)
     }
 
+    /// Recale la qualité de TOUS les albums sur leurs pistes — voir
+    /// [`sql_recaler_la_qualite_des_albums`]. Rend le nombre d'albums recalés.
+    pub fn recaler_la_qualite_depuis_les_pistes(&self) -> Result<usize, TuneError> {
+        Ok(self.db.execute(&sql_recaler_la_qualite_des_albums(), &[])?)
+    }
+
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
-        // 7 references to the same album_id parameter. SQLite uses `?`
-        // for each; PG would use $1..$7 — we build the placeholder list
+        // 4 references to the same album_id parameter. SQLite uses `?`
+        // for each; PG would use $1..$4 — we build the placeholder list
         // via the dialect to keep both engines happy.
         let p = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
-        let plist = (1..=7)
+        let plist = (1..=4)
             .map(|i| match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(i),
                 Engine::Postgres => PostgresDialect.placeholder(i),
@@ -2635,20 +2725,23 @@ impl AlbumRepo {
         // the whole catalogue, identical to the cover card — #3 Fabien). NULLIF
         // treats a stored '' as re-fillable and the `!= ''` guard only ever
         // sources a real, non-empty genre. Valid on SQLite and PostgreSQL.
+        // #5413 : format, fréquence et profondeur sont RECALCULÉS depuis les
+        // pistes (plus en comblement seul) — voir
+        // [`sql_qualite_reprise_des_pistes`].
         let sql = format!(
             "UPDATE albums SET
-                format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = {} AND t.format IS NOT NULL LIMIT 1)),
-                sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = {})),
-                bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = {})),
+                {qualite},
                 genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)),
                 genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)),
                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = {}))
             WHERE id = {}",
-            plist[0], plist[1], plist[2], plist[3], plist[4], plist[5], plist[6]
+            plist[0],
+            plist[1],
+            plist[2],
+            plist[3],
+            qualite = sql_qualite_reprise_des_pistes(),
         );
-        let params: [&dyn ToSqlValue; 7] = [
-            &album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id,
-        ];
+        let params: [&dyn ToSqlValue; 4] = [&album_id, &album_id, &album_id, &album_id];
         self.db.execute(&sql, &params)?;
         // #4836 : le label des pistes remonte avec le reste.
         self.update_label_from_tracks(album_id)?;
@@ -5783,6 +5876,200 @@ pub(crate) mod tests {
     #[test]
     fn i5413_les_filtres_de_qualite_suivent_le_badge() {
         scenario_filtres_de_qualite_5413(Arc::new(test_db()));
+    }
+
+    /// Titres de la bibliothèque « ancienne » de
+    /// [`scenario_bibliotheque_ancienne_5413_avant`].
+    const ANCIENNE_ANIMALS: &str = "Animals 24-96 figé en CD";
+    const ANCIENNE_SANS_QUALITE: &str = "Hi-Res sans qualité d'album";
+    const ANCIENNE_WAV: &str = "Compilation WAV 4 CD";
+    const ANCIENNE_MP3: &str = "Soirée MP3";
+    const ANCIENNE_DSF: &str = "SACD";
+    const ANCIENNE_SANS_PISTE: &str = "Hi-Res sans piste locale";
+
+    /// Les titres rendus sous `?quality={q}` (`None` : sans filtre).
+    fn titres_sous_filtre_5413(
+        albums: &AlbumRepo,
+        q: Option<&str>,
+    ) -> std::collections::BTreeSet<String> {
+        albums
+            .list_filtered(100, 0, "id", "asc", None, q, None, false, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect()
+    }
+
+    /// #5413, régression v0.9.169 (Rhorn, fil 2032, réponse 7320) — 1er
+    /// temps : une bibliothèque scannée AVANT le correctif, telle que le
+    /// comblement seul l'a laissée. Colonnes de qualité d'album figées au
+    /// premier passage (Animals remplacé par sa version 24/96, compilation WAV
+    /// figée sur une autre valeur) ou jamais posées (NULL). Constate le
+    /// symptôme : sous « Hi-Res », la compilation WAV 16/44 et rien de ce qui
+    /// est vraiment hi-res.
+    ///
+    /// Partagé avec PostgreSQL (`postgres_e2e::pg_5413_bibliotheque_ancienne`),
+    /// le redémarrage se jouant entre les deux temps.
+    pub(crate) fn scenario_bibliotheque_ancienne_5413_avant(db: Arc<dyn DbBackend>) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        use std::collections::BTreeSet;
+        let aid = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste 5413 ancienne".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db);
+        type Colonnes = (Option<&'static str>, Option<i32>, Option<i32>);
+        let cas: Vec<(&str, Colonnes, Vec<Colonnes>)> = vec![
+            (
+                ANCIENNE_ANIMALS,
+                (Some("flac"), Some(44100), Some(16)),
+                vec![(Some("flac"), Some(96000), Some(24)); 2],
+            ),
+            (
+                ANCIENNE_SANS_QUALITE,
+                (None, None, None),
+                vec![(Some("flac"), Some(192000), Some(24)); 2],
+            ),
+            (
+                ANCIENNE_WAV,
+                (Some("wav"), Some(96000), Some(24)),
+                vec![(Some("wav"), Some(44100), Some(16)); 4],
+            ),
+            (
+                ANCIENNE_MP3,
+                (None, None, None),
+                vec![
+                    (Some("mp3"), Some(44100), None),
+                    (Some("mp3"), Some(44100), None),
+                    (Some("flac"), Some(44100), Some(16)),
+                ],
+            ),
+            (
+                ANCIENNE_DSF,
+                (None, None, None),
+                vec![(Some("dsf"), Some(2_822_400), Some(1)); 2],
+            ),
+            // Aucune piste : la valeur de l'album est la seule source, elle
+            // doit survivre au recalage.
+            (
+                ANCIENNE_SANS_PISTE,
+                (Some("flac"), Some(96000), Some(24)),
+                vec![],
+            ),
+        ];
+        for (titre, (f, sr, bd), ps) in &cas {
+            let mut a = Album::new((*titre).into());
+            a.artist_id = Some(aid);
+            a.format = f.map(Into::into);
+            a.sample_rate = *sr;
+            a.bit_depth = *bd;
+            let album_id = albums.create(&a).unwrap();
+            for (n, (pf, psr, pbd)) in ps.iter().enumerate() {
+                let mut t = Track::new(format!("{titre} {n}"));
+                t.album_id = Some(album_id);
+                t.artist_id = Some(aid);
+                t.track_number = n as i32 + 1;
+                t.duration_ms = 1000;
+                t.file_path = Some(format!("/music/5413-ancienne/{titre}/{n}"));
+                t.format = pf.map(Into::into);
+                t.sample_rate = *psr;
+                t.bit_depth = *pbd;
+                pistes.create(&t).unwrap();
+            }
+        }
+        assert_eq!(titres_sous_filtre_5413(&albums, None).len(), cas.len());
+        // Le symptôme de Rhorn, reproduit : la compilation 16/44 sort sous
+        // « Hi-Res », les vrais hi-res n'y sont pas.
+        assert_eq!(
+            titres_sous_filtre_5413(&albums, Some("hires")),
+            BTreeSet::from([ANCIENNE_WAV.to_string(), ANCIENNE_SANS_PISTE.to_string()]),
+            "bibliothèque ancienne AVANT recalage : le témoin doit montrer le \
+             symptôme de v0.9.169"
+        );
+    }
+
+    /// #5413, 2e temps — après le redémarrage (recalage de
+    /// `run_migrations` / `run_pg_migrations`) : le filtre Hi-Res rend les
+    /// albums hi-res selon leurs pistes, la compilation 16/44 n'y est plus,
+    /// et pour chaque filtre l'ensemble rendu est EXACTEMENT celui des albums
+    /// qui portent le badge. Puis : la passe est idempotente, et la remontée
+    /// du scan (`update_quality_from_tracks`) recalcule aussi, au lieu de
+    /// combler.
+    pub(crate) fn scenario_bibliotheque_ancienne_5413_apres(db: Arc<dyn DbBackend>) {
+        use std::collections::BTreeSet;
+        let albums = AlbumRepo::with_backend(db.clone());
+        let set = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let attendus = [
+            (
+                "hires",
+                "hi-res",
+                set(&[ANCIENNE_ANIMALS, ANCIENNE_SANS_QUALITE, ANCIENNE_SANS_PISTE]),
+            ),
+            ("dsd", "dsd", set(&[ANCIENNE_DSF])),
+            ("lossy", "lossy", set(&[ANCIENNE_MP3])),
+            ("cd", "cd", set(&[ANCIENNE_WAV])),
+        ];
+        let tous = albums
+            .list_filtered(100, 0, "id", "asc", None, None, None, false, None)
+            .unwrap();
+        for (filtre, badge, attendu) in &attendus {
+            let portent_le_badge: BTreeSet<String> = tous
+                .iter()
+                .filter(|a| a.quality().as_deref() == Some(*badge))
+                .map(|a| a.title.clone())
+                .collect();
+            assert_eq!(
+                &portent_le_badge, attendu,
+                "badges après recalage, `{badge}`"
+            );
+            assert_eq!(
+                &titres_sous_filtre_5413(&albums, Some(filtre)),
+                attendu,
+                "?quality={filtre} après recalage : le filtre et le badge \
+                 doivent rendre le même ensemble"
+            );
+        }
+        assert!(
+            !titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV),
+            "la compilation WAV 16/44 ne doit plus sortir sous Hi-Res"
+        );
+        // Idempotence : rejouée, la passe ne touche plus aucune ligne.
+        assert_eq!(albums.recaler_la_qualite_depuis_les_pistes().unwrap(), 0);
+
+        // La remontée par album du scan RECALCULE : on refige la compilation
+        // sur une valeur hi-res, une passe de scan sur cet album la rend à
+        // ses pistes.
+        let wav = tous
+            .iter()
+            .find(|a| a.title == ANCIENNE_WAV)
+            .and_then(|a| a.id)
+            .unwrap();
+        db.execute(
+            &format!("UPDATE albums SET sample_rate = 96000, bit_depth = 24 WHERE id = {wav}"),
+            &[],
+        )
+        .unwrap();
+        assert!(titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV));
+        albums.update_quality_from_tracks(wav).unwrap();
+        let relu = albums.get(wav).unwrap().unwrap();
+        assert_eq!(
+            (relu.format.as_deref(), relu.sample_rate, relu.bit_depth),
+            (Some("wav"), Some(44100), Some(16)),
+            "update_quality_from_tracks doit recalculer, pas seulement combler"
+        );
+        assert!(!titres_sous_filtre_5413(&albums, Some("hires")).contains(ANCIENNE_WAV));
+    }
+
+    /// #5413, régression v0.9.169 — le recalage de DÉMARRAGE rattrape une
+    /// bibliothèque ancienne sous SQLite (`run_migrations`).
+    #[test]
+    fn i5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
+        let sqlite = test_db();
+        let db: Arc<dyn DbBackend> = Arc::new(sqlite.clone());
+        scenario_bibliotheque_ancienne_5413_avant(db.clone());
+        crate::db::migrations::run_migrations(&sqlite).expect("redémarrage");
+        scenario_bibliotheque_ancienne_5413_apres(db);
     }
 
     #[test]

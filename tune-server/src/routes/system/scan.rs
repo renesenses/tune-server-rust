@@ -2270,12 +2270,12 @@ async fn spawn_library_scan_avec_lecteur(
                             "UPDATE albums SET track_count = {compte_visible} \
                              WHERE id IN ({ids_csv});\
                              UPDATE albums SET \
-                             format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
-                             sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
-                             bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                             {qualite}, \
                              genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                              disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)) \
-                             WHERE id IN ({ids_csv})"
+                             WHERE id IN ({ids_csv})",
+                            // #5413 : qualité RECALCULÉE depuis les pistes.
+                            qualite = tune_core::db::album_repo::sql_qualite_reprise_des_pistes()
                         )).ok();
                     }
                 }
@@ -2609,13 +2609,14 @@ async fn spawn_library_scan_avec_lecteur(
             db.ceder_aux_ecrivains();
             if let Err(e) = db.execute(
                 &format!("UPDATE albums SET \
-                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
-                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
-                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                 {}, \
                  genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                  genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)), \
                  disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)), \
                  {}",
+                    // #5413 : qualité RECALCULÉE depuis les pistes, plus en
+                    // comblement seul — même fragment que la remontée par album.
+                    tune_core::db::album_repo::sql_qualite_reprise_des_pistes(),
                     // #4836 : le label des pistes remonte sur l'album, que lit
                     // l'onglet Labels — même fragment que la remontée par album.
                     tune_core::db::album_repo::sql_label_repris_des_pistes()
