@@ -562,7 +562,10 @@ mod presence;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
-pub(crate) use backend_de_la_sortie_5353::backend_affiche_de_la_zone;
+pub(crate) use backend_de_la_sortie_5353::{
+    backend_affiche_de_la_zone, backend_affiche_pour_la_sortie, backend_de_la_sortie_de_la_zone,
+    injecter_backend_de_sortie,
+};
 
 #[cfg(test)]
 mod debit_de_zone_tests;
@@ -577,6 +580,8 @@ mod sante_reseau_de_zone_tests;
 mod zone_masquee_en_lecture_affichee_5077;
 #[cfg(test)]
 mod zone_sans_appareil_guard;
+#[cfg(test)]
+mod zone_supprimee_en_pause_disparait_5322;
 
 pub async fn create_zone_handler(
     state: State<AppState>,

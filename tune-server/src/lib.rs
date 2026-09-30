@@ -24,6 +24,8 @@ pub mod catalogue_services;
 /// Pourquoi un dossier configuré est-il injoignable, et que peut y faire
 /// l'utilisateur. Voir [`chemin_inaccessible`] pour le cas Windows.
 pub mod chemin_inaccessible;
+/// #5513 — les chemins de données retenus au démarrage.
+pub mod chemins_de_donnees;
 pub mod config;
 pub mod discovery_setup;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
@@ -56,6 +58,9 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod aleatoire_selection_5526_tests;
+// #5512 : compilé partout, actif seulement en build de test (lib ET
+// intégration) — voir `isolement_disque_tests_5467::actif`.
 mod isolement_disque_tests_5467;
 #[cfg(test)]
 mod labels_albums_4836_tests;

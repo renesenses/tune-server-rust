@@ -78,6 +78,9 @@ pub mod ordre;
 /// Le rattrapage des rapports `foo_dr.txt`, sans décodage (#5168).
 pub mod rapports_dr;
 
+/// La vitesse des passes qui décodent : fichiers à la fois (#5519).
+pub mod vitesse;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir

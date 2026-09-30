@@ -145,9 +145,11 @@ fn ecrire_la_mesure_de_piste(
     }
 }
 
-/// Pause between per-file analyses (each one fully decodes a track). Keeps the
-/// pass "nice": it must never compete with playback or make the machine hot.
-const PER_FILE_PAUSE_MS: u64 = 400;
+// #5519 — la pause fixe de 400 ms entre deux fichiers (`PER_FILE_PAUSE_MS`)
+// a été RETIRÉE (décision de Bertrand, 30/09/2026) : 21 % du temps de la passe,
+// mesuré sur Shrek. Ce qui garde la machine et la lecture ne dépendait pas
+// d'elle : la priorité à la lecture (#1310, #2495), la garde thermique
+// (#1576) et la vitesse réglée (`taches_de_fond::vitesse`).
 
 /// How long the loop sleeps once there is nothing left to analyse.
 const IDLE_SLEEP_SECS: u64 = 900;
@@ -596,7 +598,9 @@ pub enum TourDeCascade {
 /// EXTERNE, et un test qui recopierait la cascade la répliquerait au lieu de la
 /// garder.
 pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
-    use crate::taches_de_fond::ordre::{Rang, noter_travail_dr, ordre_de_la_cascade, priorite_dr};
+    use crate::taches_de_fond::ordre::{
+        Rang, noter_rang_au_travail, noter_travail_dr, ordre_de_la_cascade, priorite_dr,
+    };
     use crate::taches_de_fond::{Tache, est_en_pause};
 
     let _slot = ANALYSIS_SLOT.lock().await;
@@ -634,8 +638,13 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
                 dr_suspendue = true;
                 continue;
             }
+            noter_rang_au_travail(None);
             return TourDeCascade::Suspendue(tache);
         }
+        // #5519 / web#1828 — dire QUI décode, avant de décoder : l'écran ne
+        // doit pas lire « ReplayGain en cours » pendant que la plage
+        // dynamique, passée devant, tient le créneau.
+        noter_rang_au_travail(Some(rang));
         let n = match rang {
             Rang::ReplayGain => analyze_track_batch(backend).await,
             Rang::Empreintes => empreinter_un_lot(backend).await,
@@ -650,6 +659,7 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
             return TourDeCascade::Travail(n);
         }
     }
+    noter_rang_au_travail(None);
     // Une plage dynamique suspendue n'est pas au repos : le travail est
     // toujours devant elle, la campagne ne doit pas se clore.
     if dr_suspendue {
@@ -714,6 +724,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 progression::au_repos();
             }
             if thermal.should_hold("replaygain") {
+                crate::taches_de_fond::ordre::noter_rang_au_travail(None);
                 tokio::time::sleep(std::time::Duration::from_secs(THERMAL_RETRY_SECS)).await;
                 continue;
             }
@@ -722,6 +733,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             let playing = any_zone_playing(&backend);
             let mut suspendue: Option<crate::taches_de_fond::Tache> = None;
             let did = if playing {
+                // Rien ne décode pendant la lecture (#1310).
+                crate::taches_de_fond::ordre::noter_rang_au_travail(None);
                 0
             } else {
                 match un_tour_de_cascade(&backend).await {
@@ -1008,217 +1021,57 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     let mut done = 0usize;
     let mut deferred = 0usize;
     let mut cedees = 0usize;
-    for r in &rows {
-        // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à 180 s
-        // chacun, c'est plus d'une heure de décodage après un « Désactivé » si
-        // on ne regarde qu'entre deux lots : un réglage qui n'agit qu'au
-        // prochain démarrage n'est pas un réglage (#2496). On relit donc avant
-        // CHAQUE fichier. Le décodage déjà lancé n'est pas annulable — même
-        // contrat que le garde-fou lecture ci-dessous : on s'arrête au fichier
-        // suivant, pas au milieu d'un decode.
-        if !analysis_enabled(backend) {
-            info!("replaygain_analysis_disabled_mid_batch — réglage coupé, arrêt du balayage");
-            break;
-        }
-        // Pause demandée par l'utilisateur, relue au MÊME endroit et pour la
-        // même raison : la frontière propre est ici, entre deux fichiers. Le
-        // décodage en cours n'est pas annulable et la piste déjà mesurée est
-        // écrite avant qu'on n'y revienne — rien ne reste à moitié fait.
-        if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::ReplayGain) {
-            info!("replaygain_pause_utilisateur_mid_batch — arrêt à la frontière de piste");
-            break;
-        }
-        // Playback can start mid-batch; yield at once so a decode never
-        // competes with the audio pipeline (#1310).
-        if any_zone_playing(backend) {
-            debug!("replaygain_yield_to_playback — zone playing, pausing sweep mid-batch");
-            break;
-        }
-        let track_id = match r.first().and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => continue,
-        };
-        let path = match r.get(1).and_then(|v| v.as_string()) {
-            Some(p) if !p.is_empty() => p,
-            _ => continue,
-        };
-
-        // Le chemin de la base est en NFC ; le fichier, lui, peut être écrit
-        // en NFD sur le disque (macOS, SMB/CIFS). On résout AVANT de décider
-        // quoi que ce soit — et surtout avant de poser le moindre témoin
-        // (#1865).
-        let sur_disque = match resolve_local_path(&path) {
-            LocalPath::Found(reel) => reel,
-            LocalPath::Missing => {
-                // Introuvable N'EST PAS indécodable. Aucun `rg_analyzed` ici :
-                // on ne fige pas une piste que le prochain montage rendra. On
-                // pose seulement un report daté, qui périme tout seul.
-                deferred += 1;
-                warn!(
-                    track_id,
-                    path = %path,
-                    "replaygain_path_unresolved — aucune graphie (stockee, NFD, NFC) \
-                     ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
-                );
-                let _ = repo.set(
-                    track_id,
-                    PATH_UNRESOLVED_KEY,
-                    &deferral_stamp(now_epoch_secs() as i64),
-                );
-                // Compté dans `done` : le balayage a bel et bien AVANCÉ (la
-                // ligne ne ressortira pas de la prochaine requête). Sans cela,
-                // un lot entièrement introuvable rendrait 0 et endormirait la
-                // passe 15 minutes à chaque paquet de 25 lignes.
-                done += 1;
-                // #4144 — comptée comme traitée pour la MÊME raison : la ligne
-                // ne ressortira pas de la prochaine requête de candidats.
-                progression::avancer();
-                continue;
+    // #5519 — plusieurs fichiers à la fois, selon la vitesse réglée. Les
+    // gardes (réglage, pause, lecture) restent relues avant CHAQUE fichier
+    // lancé : la frontière propre est toujours « entre deux fichiers ».
+    let largeur = crate::taches_de_fond::vitesse::largeur_courante(backend);
+    en_parallele_borne(
+        largeur,
+        rows.iter(),
+        || {
+            // Le réglage peut basculer EN PLEIN LOT. 25 fichiers à jusqu'à
+            // 180 s chacun, c'est plus d'une heure de décodage après un
+            // « Désactivé » si on ne regarde qu'entre deux lots : un réglage
+            // qui n'agit qu'au prochain démarrage n'est pas un réglage
+            // (#2496). On relit donc avant CHAQUE fichier. Le décodage déjà
+            // lancé n'est pas annulable — même contrat que le garde-fou
+            // lecture ci-dessous : on s'arrête au fichier suivant, pas au
+            // milieu d'un decode.
+            if !analysis_enabled(backend) {
+                info!("replaygain_analysis_disabled_mid_batch — réglage coupé, arrêt du balayage");
+                return false;
             }
-        };
-        // Un report qui traînait n'a plus lieu d'être : le fichier répond.
-        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
-
-        let est = estimated_analysis_bytes(
-            r.get(2).and_then(|v| v.as_i64()),
-            r.get(3).and_then(|v| v.as_i64()),
-            r.get(4).and_then(|v| v.as_i64()),
-        );
-        if est > MAX_ANALYSIS_EST_BYTES {
-            warn!(
-                track_id,
-                path = %path,
-                estimated_mb = est / 1_048_576,
-                "replaygain_skipped_oversized — full-decode analysis would risk \
-                 OOM (#1109); will be analysed once streaming analysis lands"
-            );
-            let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
-            let _ = repo.set(track_id, "rg_skipped_oversized", "1");
-            // #4144 — le témoin `rg_analyzed` vient d'être posé : la piste sort
-            // des candidats, la jauge doit donc avancer. Ce chemin n'incrémente
-            // volontairement pas `done` (c'est le contrat de la boucle, on n'y
-            // touche pas) ; le compteur d'écran, lui, compte des PISTES sorties
-            // du balayage, pas des mesures réussies.
-            progression::avancer();
-            continue;
-        }
-
-        // `sur_disque`, PAS `path` : c'est la graphie que le système a
-        // reconnue. Le chemin de la base reste ce qu'il est — on ne le
-        // réécrit pas, on ne le normalise pas non plus (#1865).
-        //
-        // La course contre la lecture est ici, pas seulement au tour de boucle
-        // au-dessus (#2495) : le contrôle d'entrée ne sert à rien quand UN
-        // fichier monopolise le disque pendant des minutes.
-        let measured = match mesurer_en_cedant_a_la_lecture(
-            backend,
-            crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
-        )
-        .await
-        {
-            Issue::Terminee(m) => m,
-            Issue::CedeeALaLecture => {
+            // Pause demandée par l'utilisateur, relue au MÊME endroit et pour
+            // la même raison.
+            if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::ReplayGain) {
+                info!("replaygain_pause_utilisateur_mid_batch — arrêt à la frontière de piste");
+                return false;
+            }
+            // Playback can start mid-batch; yield at once so a decode never
+            // competes with the audio pipeline (#1310).
+            if any_zone_playing(backend) {
+                debug!("replaygain_yield_to_playback — zone playing, pausing sweep mid-batch");
+                return false;
+            }
+            true
+        },
+        |r| analyser_une_piste(backend, &repo, r),
+        |suite| match suite {
+            SuitePiste::Ignoree | SuitePiste::Ecartee => true,
+            SuitePiste::Avancee { reportee } => {
+                done += 1;
+                if reportee {
+                    deferred += 1;
+                }
+                true
+            }
+            SuitePiste::Cedee => {
                 cedees += 1;
-                // AUCUN `rg_analyzed` ici, et c'est tout l'enjeu : on n'a pas
-                // essayé, on a renoncé. Estampiller sortirait la piste du
-                // balayage pour toujours — le défaut #1865 exactement, mais
-                // déclenché par un simple appui sur « Lecture ».
-                info!(
-                    track_id,
-                    path = %path,
-                    "replaygain_cede_en_cours_d_analyse — lecture demarree, fichier \
-                     abandonne SANS temoin (il sera repris) ; le segment deja parti \
-                     finit dans le vide, il n'est pas annulable (#2495)"
-                );
-                break;
+                false
             }
-        };
-        match measured {
-            Ok(Some((lufs, peak, true_peak, plage))) => {
-                // #4681 — les cinq à sept écritures de la mesure partent HORS
-                // des fils de l'exécuteur : la lecture a pu démarrer pendant
-                // le décodage, et ces fils la servent.
-                let backend_ecriture = backend.clone();
-                crate::taches_de_fond::priorite::hors_du_fil_async(
-                    crate::taches_de_fond::Tache::ReplayGain.id(),
-                    move || {
-                        ecrire_la_mesure_de_piste(
-                            &backend_ecriture,
-                            track_id,
-                            lufs,
-                            peak,
-                            true_peak,
-                            plage,
-                        )
-                    },
-                )
-                .await;
-            }
-            // Le fichier a disparu ENTRE la résolution et le décodage — un
-            // partage qui tombe pendant la passe, exactement le scénario qui a
-            // déjà coûté des pistes. On ne le déclare pas indécodable : on le
-            // reporte, comme un absent de la première heure.
-            Ok(None) if resolve_local_path(&path).is_missing() => {
-                deferred += 1;
-                warn!(
-                    track_id,
-                    path = %path,
-                    "replaygain_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
-                );
-                let _ = repo.set(
-                    track_id,
-                    PATH_UNRESOLVED_KEY,
-                    &deferral_stamp(now_epoch_secs() as i64),
-                );
-                done += 1;
-                progression::avancer(); // #4144
-                continue;
-            }
-            Ok(None) => {
-                // Le fichier est bien là et reste illisible ou silencieux :
-                // là, le témoin est légitime.
-                debug!(track_id, path = %path, "replaygain_measure_none");
-            }
-            Err(_elapsed) => {
-                // The file blocked analysis (pathological decode / dormant NAS
-                // mount) past the per-track bound. Stamp it analysed below so the
-                // sweep ADVANCES instead of looping on it forever (#1155). The
-                // orphaned blocking decode can't be cancelled, but the sentinel
-                // keeps this file out of every future batch, so we hit it once.
-                warn!(
-                    track_id,
-                    path = %path,
-                    timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
-                    "replaygain_measure_timeout — file stalled analysis; skipping so the sweep advances (#1155)"
-                );
-            }
-        }
-        // BIB-B2 : l'empreinte du contenu, dans la meme passe. Le fichier
-        // vient d'etre decode en entier ; 60 s de plus en mono 11 kHz ne
-        // pesent rien, et la piste ne repassera pas par ici.
-        empreinter_la_piste(backend, track_id, &sur_disque).await;
-        // Sentinel = unix seconds, so an album pass can tell a track has been
-        // handled even when it produced no gain. Hors du fil async (#4681).
-        {
-            let repo_temoin = TrackMetadataRepo::with_backend(backend.clone());
-            crate::taches_de_fond::priorite::hors_du_fil_async(
-                crate::taches_de_fond::Tache::ReplayGain.id(),
-                move || {
-                    let _ = repo_temoin.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
-                },
-            )
-            .await;
-        }
-        done += 1;
-        // #4144 — LE point d'avancement nominal. Il est ici, par piste, et non
-        // au retour du lot : un lot de 25 fichiers peut tenir plus d'une heure
-        // (jusqu'à `PER_TRACK_ANALYSIS_TIMEOUT_SECS` chacun), et un compteur
-        // qui ne bougerait qu'entre deux lots serait figé tout ce temps —
-        // c'est-à-dire indiscernable du `IDLE` qu'on corrige.
-        progression::avancer();
-
-        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
-    }
+        },
+    )
+    .await;
 
     // `deferred` est porté par la ligne de journal : sans lui, un lot où tout
     // est introuvable ressemblerait à un lot analysé (#1865). `cedees` dit la
@@ -1226,9 +1079,264 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // un lot rendu à zéro serait indistinguable d'une bibliothèque finie.
     info!(
         analyzed = done - deferred,
-        deferred, cedees, "replaygain_track_batch"
+        deferred, cedees, largeur, "replaygain_track_batch"
     );
     done
+}
+
+/// Ce qu'est devenue UNE piste d'un lot.
+enum SuitePiste {
+    /// Ligne illisible : rien n'a été fait, rien n'est compté.
+    Ignoree,
+    /// Témoin posé sans compter la piste dans le lot (fichier trop gros, #1109 :
+    /// c'est le contrat historique de la boucle, on n'y touche pas).
+    Ecartee,
+    /// La piste a quitté le balayage. `reportee` : fichier introuvable (#1865).
+    Avancee { reportee: bool },
+    /// Abandonnée au profit de la lecture, SANS témoin : elle sera reprise.
+    Cedee,
+}
+
+/// Lancer au plus `largeur` travaux à la fois (#5519).
+///
+/// `peut_lancer` est relu avant CHAQUE lancement : c'est là que vivent les
+/// gardes de réglage, de pause et de lecture. `recu` reçoit chaque issue, dans
+/// l'ordre d'arrivée ; `false` arrête les lancements — ceux déjà en vol vont
+/// à leur terme (leur décodage n'est pas annulable, ils cèdent eux-mêmes à la
+/// lecture). À `largeur = 1`, c'est exactement la boucle séquentielle d'avant.
+///
+/// Les futurs ne sont PAS lancés sur l'exécuteur : ils tournent dans la tâche
+/// de la passe, et le travail lourd de chacun part déjà sur le pool bloquant
+/// (`spawn_blocking` du décodage) — c'est ce qui fait le parallélisme.
+async fn en_parallele_borne<I, R, Fut>(
+    largeur: usize,
+    items: impl IntoIterator<Item = I>,
+    mut peut_lancer: impl FnMut() -> bool,
+    mut lancer: impl FnMut(I) -> Fut,
+    mut recu: impl FnMut(R) -> bool,
+) where
+    Fut: std::future::Future<Output = R>,
+{
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    let largeur = largeur.max(1);
+    let mut items = items.into_iter().peekable();
+    let mut en_vol = FuturesUnordered::new();
+    let mut ouvert = true;
+    loop {
+        while ouvert && en_vol.len() < largeur {
+            // Les gardes ne sont relues que s'il reste de quoi lancer : chacune
+            // coûte une requête, et la veille de lecture (#2495) compte les
+            // siennes.
+            if items.peek().is_none() || !peut_lancer() {
+                ouvert = false;
+                break;
+            }
+            if let Some(item) = items.next() {
+                en_vol.push(lancer(item));
+            }
+        }
+        match en_vol.next().await {
+            Some(r) => {
+                if !recu(r) {
+                    ouvert = false;
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+/// Mesurer UNE piste de la passe nominale : gain, pics, plage dynamique et
+/// empreinte, puis poser le témoin `rg_analyzed`.
+///
+/// Le corps de l'ancienne boucle de [`analyze_track_batch`], inchangé, à deux
+/// différences près (#5519) : l'empreinte est tirée du décodage de la mesure
+/// quand le format le permet (`mesurer_intensite_plage_et_empreinte`, au bit
+/// près), et il n'y a plus de pause fixe de 400 ms après la piste.
+async fn analyser_une_piste(
+    backend: &Arc<dyn DbBackend>,
+    repo: &TrackMetadataRepo,
+    r: &[crate::db::backend::SqlValue],
+) -> SuitePiste {
+    let track_id = match r.first().and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return SuitePiste::Ignoree,
+    };
+    let path = match r.get(1).and_then(|v| v.as_string()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return SuitePiste::Ignoree,
+    };
+
+    // Le chemin de la base est en NFC ; le fichier, lui, peut être écrit
+    // en NFD sur le disque (macOS, SMB/CIFS). On résout AVANT de décider
+    // quoi que ce soit — et surtout avant de poser le moindre témoin
+    // (#1865).
+    let sur_disque = match resolve_local_path(&path) {
+        LocalPath::Found(reel) => reel,
+        LocalPath::Missing => {
+            // Introuvable N'EST PAS indécodable. Aucun `rg_analyzed` ici :
+            // on ne fige pas une piste que le prochain montage rendra. On
+            // pose seulement un report daté, qui périme tout seul.
+            warn!(
+                track_id,
+                path = %path,
+                "replaygain_path_unresolved — aucune graphie (stockee, NFD, NFC) \
+                 ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
+            );
+            let _ = repo.set(
+                track_id,
+                PATH_UNRESOLVED_KEY,
+                &deferral_stamp(now_epoch_secs() as i64),
+            );
+            // Comptée comme AVANCÉE : la ligne ne ressortira pas de la
+            // prochaine requête. Sans cela, un lot entièrement introuvable
+            // rendrait 0 et endormirait la passe 15 minutes à chaque paquet de
+            // 25 lignes. #4144 — la jauge avance pour la même raison.
+            progression::avancer();
+            return SuitePiste::Avancee { reportee: true };
+        }
+    };
+    // Un report qui traînait n'a plus lieu d'être : le fichier répond.
+    let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
+
+    let est = estimated_analysis_bytes(
+        r.get(2).and_then(|v| v.as_i64()),
+        r.get(3).and_then(|v| v.as_i64()),
+        r.get(4).and_then(|v| v.as_i64()),
+    );
+    if est > MAX_ANALYSIS_EST_BYTES {
+        warn!(
+            track_id,
+            path = %path,
+            estimated_mb = est / 1_048_576,
+            "replaygain_skipped_oversized — full-decode analysis would risk \
+             OOM (#1109); will be analysed once streaming analysis lands"
+        );
+        let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
+        let _ = repo.set(track_id, "rg_skipped_oversized", "1");
+        // #4144 — le témoin `rg_analyzed` vient d'être posé : la piste sort
+        // des candidats, la jauge doit donc avancer. Ce chemin n'incrémente
+        // volontairement pas `done` (c'est le contrat de la boucle, on n'y
+        // touche pas) ; le compteur d'écran, lui, compte des PISTES sorties
+        // du balayage, pas des mesures réussies.
+        progression::avancer();
+        return SuitePiste::Ecartee;
+    }
+
+    // `sur_disque`, PAS `path` : c'est la graphie que le système a
+    // reconnue. Le chemin de la base reste ce qu'il est (#1865).
+    //
+    // La course contre la lecture est ici, pas seulement au lancement (#2495) :
+    // le contrôle d'entrée ne sert à rien quand UN fichier monopolise le
+    // disque pendant des minutes.
+    let measured = match mesurer_en_cedant_a_la_lecture(
+        backend,
+        crate::audio::analyzer::mesurer_intensite_plage_et_empreinte(&sur_disque),
+    )
+    .await
+    {
+        Issue::Terminee(m) => m,
+        Issue::CedeeALaLecture => {
+            // AUCUN `rg_analyzed` ici, et c'est tout l'enjeu : on n'a pas
+            // essayé, on a renoncé. Estampiller sortirait la piste du
+            // balayage pour toujours — le défaut #1865 exactement, mais
+            // déclenché par un simple appui sur « Lecture ».
+            info!(
+                track_id,
+                path = %path,
+                "replaygain_cede_en_cours_d_analyse — lecture demarree, fichier \
+                 abandonne SANS temoin (il sera repris) ; le segment deja parti \
+                 finit dans le vide, il n'est pas annulable (#2495)"
+            );
+            return SuitePiste::Cedee;
+        }
+    };
+    let (mesure, empreinte) = match measured {
+        Ok(m) => (Ok(m.mesure), m.empreinte),
+        Err(elapsed) => (Err(elapsed), None),
+    };
+    match mesure {
+        Ok(Some((lufs, peak, true_peak, plage))) => {
+            // #4681 — les cinq à sept écritures de la mesure partent HORS
+            // des fils de l'exécuteur : la lecture a pu démarrer pendant
+            // le décodage, et ces fils la servent.
+            let backend_ecriture = backend.clone();
+            crate::taches_de_fond::priorite::hors_du_fil_async(
+                crate::taches_de_fond::Tache::ReplayGain.id(),
+                move || {
+                    ecrire_la_mesure_de_piste(
+                        &backend_ecriture,
+                        track_id,
+                        lufs,
+                        peak,
+                        true_peak,
+                        plage,
+                    )
+                },
+            )
+            .await;
+        }
+        // Le fichier a disparu ENTRE la résolution et le décodage — un
+        // partage qui tombe pendant la passe, exactement le scénario qui a
+        // déjà coûté des pistes. On ne le déclare pas indécodable : on le
+        // reporte, comme un absent de la première heure.
+        Ok(None) if resolve_local_path(&path).is_missing() => {
+            warn!(
+                track_id,
+                path = %path,
+                "replaygain_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
+            );
+            let _ = repo.set(
+                track_id,
+                PATH_UNRESOLVED_KEY,
+                &deferral_stamp(now_epoch_secs() as i64),
+            );
+            progression::avancer(); // #4144
+            return SuitePiste::Avancee { reportee: true };
+        }
+        Ok(None) => {
+            // Le fichier est bien là et reste illisible ou silencieux :
+            // là, le témoin est légitime.
+            debug!(track_id, path = %path, "replaygain_measure_none");
+        }
+        Err(_elapsed) => {
+            // The file blocked analysis (pathological decode / dormant NAS
+            // mount) past the per-track bound. Stamp it analysed below so the
+            // sweep ADVANCES instead of looping on it forever (#1155).
+            warn!(
+                track_id,
+                path = %path,
+                timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+                "replaygain_measure_timeout — file stalled analysis; skipping so the sweep advances (#1155)"
+            );
+        }
+    }
+    // BIB-B2 : l'empreinte du contenu, dans la même passe. #5519 — tirée du
+    // décodage de la mesure quand il l'a permis ; sinon, décodée à part comme
+    // avant.
+    match empreinte {
+        Some(calcul) => {
+            ecrire_l_empreinte(backend, track_id, &sur_disque, calcul).await;
+        }
+        None => {
+            empreinter_la_piste(backend, track_id, &sur_disque).await;
+        }
+    }
+    // Sentinel = unix seconds, so an album pass can tell a track has been
+    // handled even when it produced no gain. Hors du fil async (#4681).
+    {
+        let repo_temoin = TrackMetadataRepo::with_backend(backend.clone());
+        crate::taches_de_fond::priorite::hors_du_fil_async(
+            crate::taches_de_fond::Tache::ReplayGain.id(),
+            move || {
+                let _ = repo_temoin.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
+            },
+        )
+        .await;
+    }
+    // #4144 — LE point d'avancement nominal, par piste.
+    progression::avancer();
+    SuitePiste::Avancee { reportee: false }
 }
 
 /// BIB-B2 : la marque « pas d'empreinte possible » (silence, fichier
@@ -1247,19 +1355,32 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
         crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
     })
     .await;
+    match calcul {
+        Ok(calcul) => ecrire_l_empreinte(backend, track_id, chemin, calcul).await,
+        Err(e) => {
+            warn!(track_id, path = %chemin, error = %e, "empreinte_tache_interrompue");
+            false
+        }
+    }
+}
+
+/// Poser l'empreinte calculée — ou la marque « pas d'empreinte possible » —
+/// d'une piste. Rend `true` si une valeur a été écrite.
+async fn ecrire_l_empreinte(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    chemin: &str,
+    calcul: Result<Option<crate::audio::empreinte::Empreinte>, String>,
+) -> bool {
     let valeur = match calcul {
-        Ok(Ok(Some(e))) => e.serialiser(),
-        Ok(Ok(None)) => {
+        Ok(Some(e)) => e.serialiser(),
+        Ok(None) => {
             debug!(track_id, path = %chemin, "empreinte_silence — marque posee");
             marque_sans_empreinte()
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             warn!(track_id, path = %chemin, error = %e, "empreinte_decodage_echoue — marque posee");
             marque_sans_empreinte()
-        }
-        Err(e) => {
-            warn!(track_id, path = %chemin, error = %e, "empreinte_tache_interrompue");
-            return false;
         }
     };
     // Hors du fil async (#4681) : c'est une écriture SQLite.
@@ -1373,46 +1494,62 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     }
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
-    for r in &rows {
-        // #5246 : plus de garde sur le réglage ReplayGain ici. Les empreintes
-        // se calculent même ReplayGain coupé ; leur propre pause (ci-dessous)
-        // est le geste qui les arrête.
-        if any_zone_playing(backend) {
-            break;
-        }
-        // Même frontière que la passe nominale : entre deux pistes.
-        if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::Empreintes) {
-            info!("empreinte_pause_utilisateur_mid_lot — arrêt à la frontière de piste");
-            break;
-        }
-        let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        let Some(path) = r
-            .get(1)
-            .and_then(|v| v.as_string())
-            .filter(|p| !p.is_empty())
-        else {
-            continue;
-        };
-        let sur_disque = match resolve_local_path(&path) {
-            LocalPath::Found(reel) => reel,
-            LocalPath::Missing => {
-                warn!(track_id, path = %path, "empreinte_path_unresolved — piste REPORTEE (#1865)");
-                let _ = repo.set(
-                    track_id,
-                    PATH_UNRESOLVED_KEY,
-                    &deferral_stamp(now_epoch_secs() as i64),
-                );
-                done += 1;
-                continue;
+    // #5519 — la même largeur que la passe nominale, les mêmes gardes avant
+    // chaque fichier, plus de pause fixe.
+    let largeur = crate::taches_de_fond::vitesse::largeur_courante(backend);
+    en_parallele_borne(
+        largeur,
+        rows.iter(),
+        || {
+            // #5246 : plus de garde sur le réglage ReplayGain ici. Les
+            // empreintes se calculent même ReplayGain coupé ; leur propre
+            // pause (ci-dessous) est le geste qui les arrête.
+            if any_zone_playing(backend) {
+                return false;
             }
-        };
-        if empreinter_la_piste(backend, track_id, &sur_disque).await {
-            done += 1;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
-    }
+            // Même frontière que la passe nominale : entre deux pistes.
+            if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::Empreintes) {
+                info!("empreinte_pause_utilisateur_mid_lot — arrêt à la frontière de piste");
+                return false;
+            }
+            true
+        },
+        |r| {
+            let repo = &repo;
+            async move {
+                let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
+                    return false;
+                };
+                let Some(path) = r
+                    .get(1)
+                    .and_then(|v| v.as_string())
+                    .filter(|p| !p.is_empty())
+                else {
+                    return false;
+                };
+                let sur_disque = match resolve_local_path(&path) {
+                    LocalPath::Found(reel) => reel,
+                    LocalPath::Missing => {
+                        warn!(track_id, path = %path, "empreinte_path_unresolved — piste REPORTEE (#1865)");
+                        let _ = repo.set(
+                            track_id,
+                            PATH_UNRESOLVED_KEY,
+                            &deferral_stamp(now_epoch_secs() as i64),
+                        );
+                        return true;
+                    }
+                };
+                empreinter_la_piste(backend, track_id, &sur_disque).await
+            }
+        },
+        |avancee| {
+            if avancee {
+                done += 1;
+            }
+            true
+        },
+    )
+    .await;
     info!(empreintes = done, "empreinte_lot");
     done
 }
@@ -1551,143 +1688,165 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     let mut deferred = 0usize;
-    for r in &rows {
-        // Gardes relues AVANT CHAQUE fichier et pas seulement entre deux lots :
-        // 25 fichiers à 180 s, c'est plus d'une heure de décodage après un
-        // appui sur « Pause » ou sur « Lecture » (#1310).
-        //
-        // #5246 : le réglage ReplayGain ne coupe PLUS ce rattrapage. La plage
-        // dynamique se mesure même ReplayGain coupé (décision de Bertrand,
-        // 27/09/2026) ; la pause de la plage dynamique est le geste qui l'arrête.
-        // Même frontière que les deux rangs précédents : entre deux pistes.
-        if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique) {
-            info!("dr_rattrapage_pause_utilisateur_mid_lot — arret a la frontiere de piste");
-            break;
-        }
-        if any_zone_playing(backend) {
-            debug!("dr_rattrapage_cede_a_la_lecture — zone en lecture, pause");
-            break;
-        }
-        let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        let Some(path) = r
-            .get(1)
-            .and_then(|v| v.as_string())
-            .filter(|p| !p.is_empty())
-        else {
-            continue;
-        };
-        // La base est en NFC, le disque peut être en NFD (macOS, SMB/CIFS).
-        let sur_disque = match resolve_local_path(&path) {
-            LocalPath::Found(reel) => reel,
-            LocalPath::Missing => {
-                // AUCUN `dr_indisponible` : un partage démonté redeviendra
-                // lisible, et la marque serait définitive (#1865).
-                deferred += 1;
-                warn!(
-                    track_id,
-                    path = %path,
-                    "dr_path_unresolved — piste REPORTEE, pas marquee indisponible (#1865)"
-                );
-                let _ = repo.set(
-                    track_id,
-                    PATH_UNRESOLVED_KEY,
-                    &deferral_stamp(now_epoch_secs() as i64),
-                );
-                // Compté : la ligne ne ressortira pas de la prochaine requête,
-                // le rattrapage a donc bel et bien avancé.
+    // #5519 — la même largeur que la passe nominale, les mêmes gardes avant
+    // chaque fichier, plus de pause fixe.
+    let largeur = crate::taches_de_fond::vitesse::largeur_courante(backend);
+    en_parallele_borne(
+        largeur,
+        rows.iter(),
+        || {
+            // Gardes relues AVANT CHAQUE fichier et pas seulement entre deux
+            // lots : 25 fichiers à 180 s, c'est plus d'une heure de décodage
+            // après un appui sur « Pause » ou sur « Lecture » (#1310).
+            //
+            // #5246 : le réglage ReplayGain ne coupe PLUS ce rattrapage ; la
+            // pause de la plage dynamique est le geste qui l'arrête.
+            if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique) {
+                info!("dr_rattrapage_pause_utilisateur_mid_lot — arret a la frontiere de piste");
+                return false;
+            }
+            if any_zone_playing(backend) {
+                debug!("dr_rattrapage_cede_a_la_lecture — zone en lecture, pause");
+                return false;
+            }
+            true
+        },
+        |r| rattraper_une_piste(backend, &repo, r),
+        |suite| match suite {
+            SuitePiste::Ignoree | SuitePiste::Ecartee => true,
+            SuitePiste::Avancee { reportee } => {
                 done += 1;
-                continue;
+                if reportee {
+                    deferred += 1;
+                }
+                true
             }
-        };
-        let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
-
-        let est = estimated_analysis_bytes(
-            r.get(2).and_then(|v| v.as_i64()),
-            r.get(3).and_then(|v| v.as_i64()),
-            r.get(4).and_then(|v| v.as_i64()),
-        );
-        if est > MAX_ANALYSIS_EST_BYTES {
-            warn!(
-                track_id,
-                path = %path,
-                estimated_mb = est / 1_048_576,
-                "dr_rattrapage_fichier_trop_gros — decode complet ecarte (#1109)"
-            );
-            let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
-            done += 1;
-            continue;
-        }
-
-        let measured = match mesurer_en_cedant_a_la_lecture(
-            backend,
-            crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
-        )
-        .await
-        {
-            Issue::Terminee(m) => m,
-            Issue::CedeeALaLecture => {
-                // Renoncé, pas essayé : aucune marque, la piste sera reprise.
-                info!(
-                    track_id,
-                    path = %path,
-                    "dr_rattrapage_cede_en_cours — lecture demarree, fichier abandonne SANS temoin"
-                );
-                break;
-            }
-        };
-
-        let mut mesuree = false;
-        match measured {
-            Ok(Some((_lufs, _peak, _true_peak, Some(dr)))) => {
-                mesuree = true;
-                // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les
-                // pistes qui en portaient un, mais un scan a pu en poser un
-                // PENDANT le décodage — jusqu'à 180 s de fenêtre. On relit,
-                // hors du fil async (#4681).
-                let repo_dr = TrackMetadataRepo::with_backend(backend.clone());
-                crate::taches_de_fond::priorite::hors_du_fil_async(
-                    crate::taches_de_fond::Tache::PlageDynamique.id(),
-                    move || ecrire_le_dr_mesure(&repo_dr, track_id, dr),
-                )
-                .await;
-            }
-            // Le fichier a disparu ENTRE la résolution et le décodage : un
-            // partage qui tombe pendant la passe. On reporte, on ne condamne pas.
-            Ok(None) if resolve_local_path(&path).is_missing() => {
-                deferred += 1;
-                warn!(
-                    track_id,
-                    path = %path,
-                    "dr_path_disparu_pendant_analyse — REPORTEE (#1865)"
-                );
-                let _ = repo.set(
-                    track_id,
-                    PATH_UNRESOLVED_KEY,
-                    &deferral_stamp(now_epoch_secs() as i64),
-                );
-                done += 1;
-                continue;
-            }
-            // Présent mais illisible, silencieux, ou plage non calculable.
-            Ok(_) => debug!(track_id, path = %path, "dr_rattrapage_sans_plage"),
-            Err(_elapsed) => warn!(
-                track_id,
-                path = %path,
-                timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
-                "dr_rattrapage_timeout — fichier bloquant, marque pour que le lot AVANCE (#1155)"
-            ),
-        }
-        if !mesuree {
-            let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
-        }
-        done += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
-    }
+            SuitePiste::Cedee => false,
+        },
+    )
+    .await;
 
     info!(rattrapees = done - deferred, deferred, "dr_rattrapage_lot");
     done
+}
+
+/// Rattraper la plage dynamique d'UNE piste — le corps de l'ancienne boucle de
+/// [`rattraper_un_lot_de_dr`], inchangé, sans la pause fixe (#5519).
+async fn rattraper_une_piste(
+    backend: &Arc<dyn DbBackend>,
+    repo: &TrackMetadataRepo,
+    r: &[crate::db::backend::SqlValue],
+) -> SuitePiste {
+    let Some(track_id) = r.first().and_then(|v| v.as_i64()) else {
+        return SuitePiste::Ignoree;
+    };
+    let Some(path) = r
+        .get(1)
+        .and_then(|v| v.as_string())
+        .filter(|p| !p.is_empty())
+    else {
+        return SuitePiste::Ignoree;
+    };
+    // La base est en NFC, le disque peut être en NFD (macOS, SMB/CIFS).
+    let sur_disque = match resolve_local_path(&path) {
+        LocalPath::Found(reel) => reel,
+        LocalPath::Missing => {
+            // AUCUN `dr_indisponible` : un partage démonté redeviendra
+            // lisible, et la marque serait définitive (#1865).
+            warn!(
+                track_id,
+                path = %path,
+                "dr_path_unresolved — piste REPORTEE, pas marquee indisponible (#1865)"
+            );
+            let _ = repo.set(
+                track_id,
+                PATH_UNRESOLVED_KEY,
+                &deferral_stamp(now_epoch_secs() as i64),
+            );
+            // Comptée : la ligne ne ressortira pas de la prochaine requête,
+            // le rattrapage a donc bel et bien avancé.
+            return SuitePiste::Avancee { reportee: true };
+        }
+    };
+    let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
+
+    let est = estimated_analysis_bytes(
+        r.get(2).and_then(|v| v.as_i64()),
+        r.get(3).and_then(|v| v.as_i64()),
+        r.get(4).and_then(|v| v.as_i64()),
+    );
+    if est > MAX_ANALYSIS_EST_BYTES {
+        warn!(
+            track_id,
+            path = %path,
+            estimated_mb = est / 1_048_576,
+            "dr_rattrapage_fichier_trop_gros — decode complet ecarte (#1109)"
+        );
+        let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
+        return SuitePiste::Avancee { reportee: false };
+    }
+
+    let measured = match mesurer_en_cedant_a_la_lecture(
+        backend,
+        crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
+    )
+    .await
+    {
+        Issue::Terminee(m) => m,
+        Issue::CedeeALaLecture => {
+            // Renoncé, pas essayé : aucune marque, la piste sera reprise.
+            info!(
+                track_id,
+                path = %path,
+                "dr_rattrapage_cede_en_cours — lecture demarree, fichier abandonne SANS temoin"
+            );
+            return SuitePiste::Cedee;
+        }
+    };
+
+    let mut mesuree = false;
+    match measured {
+        Ok(Some((_lufs, _peak, _true_peak, Some(dr)))) => {
+            mesuree = true;
+            // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les
+            // pistes qui en portaient un, mais un scan a pu en poser un
+            // PENDANT le décodage — jusqu'à 180 s de fenêtre. On relit,
+            // hors du fil async (#4681).
+            let repo_dr = TrackMetadataRepo::with_backend(backend.clone());
+            crate::taches_de_fond::priorite::hors_du_fil_async(
+                crate::taches_de_fond::Tache::PlageDynamique.id(),
+                move || ecrire_le_dr_mesure(&repo_dr, track_id, dr),
+            )
+            .await;
+        }
+        // Le fichier a disparu ENTRE la résolution et le décodage : un
+        // partage qui tombe pendant la passe. On reporte, on ne condamne pas.
+        Ok(None) if resolve_local_path(&path).is_missing() => {
+            warn!(
+                track_id,
+                path = %path,
+                "dr_path_disparu_pendant_analyse — REPORTEE (#1865)"
+            );
+            let _ = repo.set(
+                track_id,
+                PATH_UNRESOLVED_KEY,
+                &deferral_stamp(now_epoch_secs() as i64),
+            );
+            return SuitePiste::Avancee { reportee: true };
+        }
+        // Présent mais illisible, silencieux, ou plage non calculable.
+        Ok(_) => debug!(track_id, path = %path, "dr_rattrapage_sans_plage"),
+        Err(_elapsed) => warn!(
+            track_id,
+            path = %path,
+            timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+            "dr_rattrapage_timeout — fichier bloquant, marque pour que le lot AVANCE (#1155)"
+        ),
+    }
+    if !mesuree {
+        let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
+    }
+    SuitePiste::Avancee { reportee: false }
 }
 
 /// Compute album ReplayGain for one album whose tracks are all analysed but that
@@ -4346,15 +4505,10 @@ mod tests {
 
     /// Comme [`sweep_db`], mais les fichiers EXISTENT réellement sur le disque.
     ///
-    /// Nécessaire depuis #1865 : un chemin introuvable quitte la boucle par
-    /// `continue` **avant** la pause de [`PER_FILE_PAUSE_MS`]. Un lot
-    /// entièrement introuvable se consomme donc en quelques microsecondes, et
-    /// aucun basculement de réglage ne peut s'y intercaler — le test ne
-    /// mesurerait plus qu'une course perdue d'avance.
-    ///
-    /// Des fichiers présents mais indécodables empruntent la voie normale :
-    /// témoin `rg_analyzed` posé, **puis** pause. C'est précisément la voie que
-    /// ce test doit pouvoir interrompre.
+    /// Nécessaire depuis #1865 : un chemin introuvable quitte la piste AVANT
+    /// tout témoin `rg_analyzed`. Des fichiers présents mais indécodables
+    /// empruntent la voie normale — témoin posé — et c'est précisément la voie
+    /// que les tests de coupure doivent pouvoir interrompre.
     ///
     /// Le `TempDir` est rendu à l'appelant : le lâcher effacerait les fichiers
     /// sous les pieds de la passe.
@@ -4508,53 +4662,240 @@ mod tests {
     /// décodage.
     #[tokio::test]
     async fn switching_off_mid_batch_interrupts_the_running_sweep() {
-        let (_tmp, _db, backend) = sweep_db_fichiers_presents(4);
-        SettingsRepo::with_backend(backend.clone())
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(4);
+        SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
             .unwrap();
+        // Un fichier à la fois : la frontière « entre deux fichiers » est alors
+        // exactement celle d'avant #5519, et le compte se lit au fichier près.
+        SettingsRepo::with_backend(interne.clone())
+            .set(crate::taches_de_fond::vitesse::CLE_REGLAGE, "discreet")
+            .unwrap();
 
-        // On bascule dès que la PREMIÈRE piste est estampillée. La passe dort
-        // alors PER_FILE_PAUSE_MS (400 ms) avant de relire le réglage : marge
-        // sans commune mesure avec les microsecondes que prend l'écriture.
-        let flipper = {
-            let backend = backend.clone();
-            tokio::spawn(async move {
-                let meta = TrackMetadataRepo::with_backend(backend.clone());
-                for _ in 0..2_000 {
-                    let stamped = meta
-                        .get_all(1)
-                        .map(|m| m.contains_key("rg_analyzed"))
-                        .unwrap_or(false);
-                    if stamped {
-                        SettingsRepo::with_backend(backend.clone())
-                            .set(MODE_KEY, "off")
-                            .unwrap();
-                        return true;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                }
-                false
-            })
-        };
-
+        // #5519 — la pause fixe de 400 ms, qui laissait le temps à un fil de
+        // basculer le réglage, n'existe plus. On bascule donc AU MOMENT MÊME où
+        // la première piste est estampillée, dans l'écriture : plus aucune
+        // course, le test dit la même chose à chaque passage.
+        let backend = CoupeAuPremierTemoin::poser(interne.clone());
         let done = analyze_track_batch(&backend).await;
         assert!(
-            flipper.await.unwrap(),
+            SettingsRepo::with_backend(interne.clone())
+                .get(MODE_KEY)
+                .unwrap()
+                .as_deref()
+                == Some("off"),
             "le test n'a jamais réussi à couper le réglage — il ne prouve rien"
         );
-        assert!(
-            done >= 1,
-            "la première piste devait être traitée, done={done}"
+        assert_eq!(
+            done, 1,
+            "un fichier à la fois : seule la première piste devait être traitée, done={done}"
         );
-        assert!(
-            done < 4,
-            "le balayage a traité les {done} pistes du lot malgré la coupure"
-        );
-        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        let meta = TrackMetadataRepo::with_backend(interne.clone());
         assert!(
             !meta.get_all(4).unwrap().contains_key("rg_analyzed"),
             "la dernière piste du lot ne devait jamais être décodée après la coupure"
         );
+    }
+
+    /// Même coupure à la vitesse par défaut (deux fichiers à la fois) : ce qui
+    /// est déjà en vol finit, mais RIEN de neuf ne part après la coupure.
+    #[tokio::test]
+    async fn switching_off_mid_batch_stops_launching_at_normal_speed() {
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(6);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let backend = CoupeAuPremierTemoin::poser(interne.clone());
+        let done = analyze_track_batch(&backend).await;
+        let largeur = crate::taches_de_fond::vitesse::largeur_courante(&interne);
+        assert!(
+            done >= 1 && done <= largeur + 1,
+            "au plus les fichiers déjà en vol, plus celui qui a coupé : done={done}, largeur={largeur}"
+        );
+        let meta = TrackMetadataRepo::with_backend(interne.clone());
+        assert!(!meta.get_all(6).unwrap().contains_key("rg_analyzed"));
+    }
+
+    /// Une base qui passe le mode ReplayGain à « off » dans l'écriture même du
+    /// témoin `rg_analyzed` de la piste 1.
+    struct CoupeAuPremierTemoin {
+        interne: Arc<dyn DbBackend>,
+        coupe: std::sync::atomic::AtomicBool,
+    }
+
+    impl CoupeAuPremierTemoin {
+        fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
+            Arc::new(Self {
+                interne,
+                coupe: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn apres_ecriture(&self) {
+            if self.coupe.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let estampillee = TrackMetadataRepo::with_backend(self.interne.clone())
+                .get_all(1)
+                .map(|m| m.contains_key("rg_analyzed"))
+                .unwrap_or(false);
+            if estampillee {
+                self.coupe.store(true, std::sync::atomic::Ordering::SeqCst);
+                SettingsRepo::with_backend(self.interne.clone())
+                    .set(MODE_KEY, "off")
+                    .unwrap();
+            }
+        }
+    }
+
+    impl DbBackend for CoupeAuPremierTemoin {
+        fn engine(&self) -> crate::db::engine::Engine {
+            self.interne.engine()
+        }
+        fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+            let r = self.interne.execute(sql, p);
+            if sql.contains("track_metadata") {
+                self.apres_ecriture();
+            }
+            r
+        }
+        fn last_insert_rowid(&self) -> i64 {
+            self.interne.last_insert_rowid()
+        }
+        fn query_one(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_one(sql, p)
+        }
+        fn query_many(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many(sql, p)
+        }
+        fn write_tx(
+            &self,
+            f: &mut dyn FnMut(&dyn crate::db::backend::DbTxHandle) -> Result<(), String>,
+        ) -> Result<(), String> {
+            let r = self.interne.write_tx(f);
+            self.apres_ecriture();
+            r
+        }
+        fn execute_batch(&self, sql: &str) -> Result<(), String> {
+            self.interne.execute_batch(sql)
+        }
+        fn query_one_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_one_strong(sql, p)
+        }
+        fn query_many_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many_strong(sql, p)
+        }
+    }
+
+    /// #5519 — plus de pause fixe entre deux fichiers. Dix fichiers présents
+    /// mais indécodables passaient en ≥ 4 s (10 × 400 ms) ; ils doivent passer
+    /// en bien moins d'une seconde, même un à la fois.
+    #[tokio::test]
+    async fn plus_de_pause_fixe_entre_deux_fichiers() {
+        let (_tmp, _db, backend) = sweep_db_fichiers_presents(10);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        SettingsRepo::with_backend(backend.clone())
+            .set(crate::taches_de_fond::vitesse::CLE_REGLAGE, "discreet")
+            .unwrap();
+        let t = std::time::Instant::now();
+        let done = analyze_track_batch(&backend).await;
+        let duree = t.elapsed();
+        assert_eq!(done, 10);
+        assert!(
+            duree < std::time::Duration::from_millis(1_500),
+            "10 fichiers en {duree:?} : une pause fixe entre deux fichiers est revenue"
+        );
+    }
+
+    /// #5519 — le lanceur borné tient EXACTEMENT sa largeur : jamais plus de
+    /// `largeur` travaux en vol, et il la remplit quand il le peut.
+    #[tokio::test]
+    async fn le_lanceur_borne_tient_sa_largeur() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for largeur in [1usize, 2, 4] {
+            let en_vol = AtomicUsize::new(0);
+            let max = AtomicUsize::new(0);
+            let mut recus = 0;
+            en_parallele_borne(
+                largeur,
+                0..10,
+                || true,
+                |_| {
+                    let (en_vol, max) = (&en_vol, &max);
+                    async move {
+                        let n = en_vol.fetch_add(1, Ordering::SeqCst) + 1;
+                        max.fetch_max(n, Ordering::SeqCst);
+                        for _ in 0..5 {
+                            tokio::task::yield_now().await;
+                        }
+                        en_vol.fetch_sub(1, Ordering::SeqCst);
+                    }
+                },
+                |()| {
+                    recus += 1;
+                    true
+                },
+            )
+            .await;
+            assert_eq!(
+                recus, 10,
+                "largeur {largeur} : tous les travaux doivent finir"
+            );
+            assert_eq!(
+                max.load(Ordering::SeqCst),
+                largeur,
+                "largeur {largeur} : nombre maximal de travaux simultanés"
+            );
+        }
+
+        // Une garde fausse, ou un `recu` qui dit stop : plus aucun lancement.
+        let mut lances = 0;
+        let mut autorises = 3;
+        en_parallele_borne(
+            2,
+            0..10,
+            || {
+                autorises -= 1;
+                autorises >= 0
+            },
+            |_| {
+                lances += 1;
+                async {}
+            },
+            |()| true,
+        )
+        .await;
+        assert_eq!(lances, 3);
+        let mut lances = 0;
+        en_parallele_borne(
+            1,
+            0..10,
+            || true,
+            |_| {
+                lances += 1;
+                async {}
+            },
+            |()| false,
+        )
+        .await;
+        assert_eq!(lances, 1, "un `recu` qui dit stop arrête les lancements");
     }
 
     // ---------------------------------------------------------------------

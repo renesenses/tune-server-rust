@@ -186,38 +186,29 @@ pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
+#[doc(hidden)] // `pub` pour le témoin d'intégration de #5512 seulement.
+pub fn artwork_cache_dir() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
         return std::path::PathBuf::from(v);
     }
     // #5467 — en build de test, jamais le chemin relatif `artwork_cache` (qui
     // tombait dans l'arbre source) ni le vrai dossier macOS de l'utilisateur.
-    #[cfg(test)]
+    // #5512 : tests d'intégration compris ; `None` dans le binaire publié.
     if let Some(dossier) = crate::isolement_disque_tests_5467::dossier_illustrations() {
         return dossier;
     }
 
-    // On Windows, resolve relative artwork_cache to %LOCALAPPDATA%\TuneServer\
-    // to avoid writing into read-only Program Files or an unpredictable CWD.
-    #[cfg(target_os = "windows")]
-    {
-        let data_dir = std::env::var("LOCALAPPDATA")
-            .map(|d| format!("{d}\\TuneServer"))
-            .unwrap_or_else(|_| "TuneServer".into());
-        return std::path::PathBuf::from(format!("{data_dir}\\artwork_cache"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let app_support = std::path::PathBuf::from(home)
-                .join("Library/Application Support/Tune/artwork_cache");
-            return app_support;
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    std::path::PathBuf::from("artwork_cache")
+    // #5513 — `TUNE_ARTWORK_DIR`, puis le cache qu'impose la configuration
+    // d'un appareil Tune OS déplacé, sinon le défaut historique de chaque
+    // plateforme (règle et défauts dans `crate::chemins_de_donnees`).
+    use crate::chemins_de_donnees as chemins;
+    chemins::cache_de_pochettes(None, chemins::cache_impose_retenu(), || {
+        chemins::cache_de_pochettes_par_defaut(
+            chemins::Plateforme::courante(),
+            std::env::var_os("HOME").as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+        )
+    })
 }
 
 /// Une réponse de refus uniforme pour les opérations explicites de la
@@ -681,6 +672,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/collections/{id}/albums",
             get(collections::collection_albums),
+        )
+        .route(
+            // #5527, #5528 — les manquants d'un dossier, avec leurs remplaçants.
+            "/collections/{id}/missing",
+            get(collections::collection_missing),
         )
         .route(
             "/collections/{id}/albums/{album_id}",

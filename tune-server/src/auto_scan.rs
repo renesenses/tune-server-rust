@@ -272,6 +272,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         if music_dirs.is_empty() {
             info!("auto_scan_skipped_no_dirs");
+            // Rien à reprendre sans dossier : le repère de #5531 n'a plus
+            // d'objet, il ne doit pas relancer ce scan à chaque démarrage.
+            crate::routes::system::scan::effacer_reprise_du_scan(&db);
             suivi.rien_a_faire(Some("aucun dossier de musique configure"));
             // Mark the scan "done" even on this early exit: the file watcher
             // waits on this flag before it starts watching.
@@ -311,10 +314,20 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         if !exclude_patterns.is_empty() {
             info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
-        let list_result = tune_core::scanner::walker::list_audio_files_with_excludes(
+        // #5552 — « Arrêter » est lu à chaque entrée du parcours. Interrompu,
+        // il ne rend aucune liste, et le scan s'arrête sans rien écrire : une
+        // liste partielle ferait croire à des fichiers disparus.
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
             &music_dirs,
             &exclude_patterns,
-        );
+            tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
+            &mut |_| {},
+            &crate::routes::system::scan::scan_cancel_requested,
+        ) else {
+            scan_de_demarrage_arrete(&event_bus, "parcours");
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        };
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -435,9 +448,34 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // Shared with the manual scan (routes::system::scan) so the two pre-scan
         // skip filters can't diverge on the NFC key again (the "scan
         // interminable" bug: NFD-named files missing the map and re-read over SMB).
+        // #5552 — après « Arrêter », plus aucun `stat` : le reste de la liste
+        // passe pour inchangé, et le scan s'arrête juste après la partition.
+        //
+        // Une date tronquée d'avant #5223, à taille égale, est tenue pour
+        // inchangée et réécrite précise après la partition, sans relecture.
+        let dates_a_preciser = std::sync::Mutex::new(Vec::new());
         let is_changed = |path: &std::path::Path| {
-            crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
-                && crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+            use crate::routes::system::scan::EtatDuFichier;
+            if crate::routes::system::scan::scan_cancel_requested() {
+                return false;
+            }
+            match crate::routes::system::scan::etat_du_fichier(path, &existing_tracks) {
+                EtatDuFichier::Inchange => false,
+                EtatDuFichier::DateAPreciser {
+                    chemin,
+                    mtime,
+                    taille,
+                } => {
+                    dates_a_preciser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((chemin, mtime, taille));
+                    false
+                }
+                EtatDuFichier::ARelire => {
+                    crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+                }
+            }
         };
         // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
         // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
@@ -455,6 +493,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 Some(pool) => pool.install(|| files.into_par_iter().partition(|p| is_changed(p))),
                 None => files.into_iter().partition(|p| is_changed(p)),
             };
+        if crate::routes::system::scan::scan_cancel_requested() {
+            scan_de_demarrage_arrete(&event_bus, "prefiltre");
+            scan_done_clone.store(true, Ordering::Release);
+            return;
+        }
+        crate::routes::system::scan::preciser_les_dates(
+            &db,
+            dates_a_preciser
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         let pre_skipped = total_discovered - files_to_scan.len();
 
         info!(
@@ -534,10 +583,17 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #4896 — les balises lues, par album : voir `BalisesVuesParAlbum`.
         let mut balises_vues = BalisesVuesParAlbum::default();
-        let stats = tune_core::scanner::walker::scan_files_batched(
+        // #5552 — l'arrêt est passé au PARCOURS, comme dans le scan manuel :
+        // après « Arrêter », plus un fichier n'est ouvert. Avec
+        // `scan_files_batched`, seul le rappel du lot le lisait, APRÈS que le
+        // parcours eut lu les balises et l'empreinte des ~500 fichiers du lot,
+        // et ce pour chaque lot restant : une à deux heures de lecture disque
+        // inutile chez LANDES Philippe (fil 2063).
+        let stats = tune_core::scanner::walker::scan_files_batched_avec_arret(
             &files_to_scan,
             true,
             tune_core::scanner::walker::SCAN_BATCH_SIZE,
+            crate::routes::system::scan::scan_cancel_requested,
             |batch, batch_idx, _total_files| {
                 // Cooperative cancellation: once "Arrêter le scan" was pressed,
                 // skip all remaining batches so the startup scan drains quickly
@@ -1221,7 +1277,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             tune_core::library::folder_playlists::sync_folder_playlists(&db);
         }
 
-        let report = serde_json::json!({
+        let arrete = crate::routes::system::scan::scan_cancel_requested();
+        let mut report = serde_json::json!({
             "total_files": stats.total_files,
             "missing_dirs": missing_dirs.clone(),
             "missing_dir_reasons": missing_dir_reasons.clone(),
@@ -1270,6 +1327,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         });
 
+        // Même clé que le scan manuel : le client sait qu'il a été ARRÊTÉ.
+        if arrete {
+            report["cancelled"] = serde_json::json!(true);
+        }
+
         // La liste demandée (#2050) — mêmes clés que le scan manuel, sans quoi
         // le rapport dépendrait de QUEL scan l'a produit. Comme dans
         // `ChiffresDeFinDeScan::rapport_du_fichier`, elle ne sort QUE par le
@@ -1295,9 +1357,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .any(|n| *n >= tune_core::scanner::walker::PLAFOND_CHEMINS_ECARTES)
         );
 
-        let report_path = std::env::var("TUNE_DB_PATH")
-            .unwrap_or_else(|_| "tune.db".into())
-            .replace(".db", "-scan-report.json");
+        let report_path = crate::routes::system::scan::chemin_du_rapport_de_scan();
         if let Ok(json) = serde_json::to_string_pretty(&report_fichier) {
             std::fs::write(&report_path, json).ok();
         }
@@ -1323,9 +1383,45 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         );
         suivi.terminer(verdict, Some(modifies), Some(&detail));
 
+        // #5531 — le scan est allé au bout : s'il reprenait un scan arrêté par
+        // une mise à jour, le repère est levé. Arrêté, il le garde — c'est la
+        // mise à jour forcée qui vient de le poser.
+        if !arrete {
+            crate::routes::system::scan::effacer_reprise_du_scan(&db);
+        }
+
         scan_done_clone.store(true, Ordering::Release);
     });
     scan_done
+}
+
+/// #5552 — le scan de démarrage s'arrête AVANT la lecture des fichiers : rien
+/// n'a été écrit. Le client apprend la fin par le même événement que le scan
+/// manuel arrêté ; `scan_status` retombe à `idle` par `ScanStatusGuard`, à la
+/// sortie de la tâche.
+fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
+    info!(etape, "auto_scan_arrete — rien n'a été écrit");
+    event_bus.emit(
+        "library.scan.completed",
+        serde_json::json!({ "cancelled": true, "auto": true }),
+    );
+}
+
+/// #5531 — le scan de démarrage doit-il tourner ? Oui si l'installation le
+/// demande (`auto_scan`), et aussi, seule exception, quand une mise à jour
+/// forcée a arrêté un scan : il reprend alors en incrémental
+/// (`file_needs_scan` saute les fichiers inchangés).
+pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    if auto_scan {
+        return true;
+    }
+    let reprise = crate::routes::system::scan::reprise_du_scan_demandee(db);
+    if reprise {
+        info!(
+            "auto_scan_reprise_apres_mise_a_jour — scan arrêté par une mise à jour forcée, repris en incrémental"
+        );
+    }
+    reprise
 }
 
 /// Spawn the file watcher that monitors music directories for live changes.
@@ -3281,3 +3377,15 @@ mod compteur_demarrage_tests_5371;
 #[cfg(test)]
 #[path = "coffret_manuel_scan_tests_5319.rs"]
 mod coffret_manuel_scan_tests_5319;
+
+#[cfg(test)]
+#[path = "arret_du_scan_de_demarrage_tests_5552.rs"]
+mod arret_du_scan_de_demarrage_tests_5552;
+
+#[cfg(test)]
+#[path = "mise_a_jour_pendant_un_scan_tests_5531.rs"]
+mod mise_a_jour_pendant_un_scan_tests_5531;
+
+#[cfg(test)]
+#[path = "date_arrondie_tests_5552.rs"]
+mod date_arrondie_tests_5552;

@@ -41,6 +41,9 @@ struct DashPret<'a> {
     bd: u16,
     tmp_path: String,
     dash_did: &'a str,
+    /// #5524 — la cadence servie est celle du plafond de zone, pas celle du
+    /// service : le remux (sans décodage) ne peut pas la servir.
+    plafonnee: bool,
 }
 
 /// Issue du premier temps : tout est prêt pour transcoder, ou la piste est
@@ -430,7 +433,10 @@ impl PlaybackOrchestrator {
         // Décidé ICI, avant la répartition, parce que c'est la même valeur qui
         // doit partir sur le fil ET être annoncée dans `ResolvedStream` : les
         // séparer, c'est fabriquer la contradiction que ce correctif ferme.
-        let cadence_plafonnee = if is_https && !is_dash_file && !is_local_stream && !is_oaat_stream
+        // #5524 — le bras DASH (Tidal) aussi : il décode et ré-encode déjà
+        // tout le fichier, le plafond ne coûte qu'une cadence cible au
+        // décodeur. Il servait jusqu'ici la cadence du service, plafond ou non.
+        let cadence_plafonnee = if (is_https || is_dash_file) && !is_local_stream && !is_oaat_stream
         {
             self.cadence_servie_pour_un_service(req, &stream_data)?
         } else {
@@ -442,7 +448,14 @@ impl PlaybackOrchestrator {
                 .await?
         } else if is_dash_file {
             match self
-                .resoudre_flux_dash(req, source_id, service_name, &stream_data, &mut svc)
+                .resoudre_flux_dash(
+                    req,
+                    source_id,
+                    service_name,
+                    &stream_data,
+                    &mut svc,
+                    cadence_plafonnee,
+                )
                 .await?
             {
                 FluxOuFini::Fini(resolu) => return Ok(resolu),
@@ -594,7 +607,8 @@ impl PlaybackOrchestrator {
                     info!(
                         zone_id = req.zone_id,
                         source_rate = stream_data.quality.sample_rate,
-                        max_rate = hz,
+                        max_rate = ?plafond,
+                        target_rate = hz,
                         "streaming_https_zone_max_sample_rate_cap_applied"
                     );
                 }
@@ -673,11 +687,17 @@ impl PlaybackOrchestrator {
         // server-side error (radio at 44.1/48k on the same zone played fine).
         // decode_to_pcm_streaming_with_levels resamples to `sr`, so capping
         // here downsamples the PCM, not just the WAV header.
-        let zone_max_sample_rate = ZoneRepo::with_backend(self.db.clone())
-            .get(req.zone_id)
-            .ok()
-            .flatten()
-            .and_then(|z| z.max_sample_rate);
+        //
+        // #5524 — le plafond COMBINÉ (zone et catalogue en `min`), comme les
+        // deux autres sites : ce bras lisait la zone seule.
+        let zone_max_sample_rate = crate::device_catalog::combine_max_sample_rate(
+            ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.max_sample_rate),
+            crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
+        );
         let mut sr = stream_data.quality.sample_rate;
         // #5283 — jamais de WAV, de session ni de transcodage à 0 Hz : la
         // cadence est restée inconnue après l'en-tête du flux et le catalogue
@@ -695,11 +715,13 @@ impl PlaybackOrchestrator {
         if let Some(max_sr) = zone_max_sample_rate
             && sr > max_sr
         {
+            // #5524 — même famille que la source sous le plafond.
+            let cible = crate::audio::formats::cadence_sous_plafond(sr, Some(max_sr));
             // #3973 — même plafond de zone, même règle bit-perfect que
             // `resolve_local` : strict ⇒ refuser plutôt que plafonner.
             if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
                 sr,
-                max_sr,
+                cible,
                 crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
             )
             .refus()
@@ -716,9 +738,10 @@ impl PlaybackOrchestrator {
                 zone_id = req.zone_id,
                 source_rate = sr,
                 max_rate = max_sr,
+                target_rate = cible,
                 "streaming_zone_max_sample_rate_cap_applied"
             );
-            sr = max_sr;
+            sr = cible;
         }
         // Local output: 32-bit to avoid 24-bit byte misalignment noise
         // (see local_needs_wav comment in resolve_local_track).
@@ -1081,9 +1104,17 @@ impl PlaybackOrchestrator {
         service_name: &str,
         stream_data: &crate::streaming::StreamUrl,
         svc: &mut Box<dyn crate::streaming::StreamingService>,
+        cadence_plafonnee: Option<u32>,
     ) -> Result<FluxOuFini, String> {
         let p = match self
-            .preparer_le_dash(req, source_id, service_name, stream_data, svc)
+            .preparer_le_dash(
+                req,
+                source_id,
+                service_name,
+                stream_data,
+                svc,
+                cadence_plafonnee,
+            )
             .await?
         {
             DashOuFini::Pret(p) => p,
@@ -1114,7 +1145,14 @@ impl PlaybackOrchestrator {
         service_name: &str,
         stream_data: &crate::streaming::StreamUrl,
         svc: &mut Box<dyn crate::streaming::StreamingService>,
+        cadence_plafonnee: Option<u32>,
     ) -> Result<DashOuFini<'a>, String> {
+        // #5524 — la cadence qui partira sur le fil : celle du service, ou la
+        // cadence de même famille sous le plafond de la zone. Le décodeur
+        // rééchantillonne vers elle (`decode_to_pcm(.., Some(sr), ..)`, rubato),
+        // le traitement de zone se règle sur elle, et la clé du cache chaud la
+        // porte — un transcodage plafonné ne se sert jamais à une zone libre.
+        let sr_servie = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
         // DASH multi-segment fMP4 already assembled on disk by get_track_url().
         // DLNA renderers can't decode fMP4+FLAC directly, and chunked WAV
         // causes noise on many renderers (darTZeel, Eversolo, etc.).
@@ -1139,12 +1177,7 @@ impl PlaybackOrchestrator {
         // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
         // correction de pièce et le ReplayGain y étaient perdus, exactement
         // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
-        let dash_dsp = self.load_streaming_dsp(
-            req.zone_id,
-            req.track_id,
-            stream_data.quality.sample_rate,
-            2,
-        );
+        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr_servie, 2);
         let dash_dsp_active = dash_dsp.is_active();
 
         // Browser (Web Audio) zones pull the stream themselves via <audio> and
@@ -1172,7 +1205,7 @@ impl PlaybackOrchestrator {
         // the whole DASH arm (see dash_enc_format below), so the cache key and
         // the encoded bytes can never disagree.
         let warm: Option<DashWarm> = if dash_warm_cache_enabled() {
-            let wsr = stream_data.quality.sample_rate;
+            let wsr = sr_servie;
             let wbd = stream_data.quality.bit_depth.clamp(16, 24);
             let wdid = req.output_device_id.as_deref().unwrap_or("");
             let wflac = ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
@@ -1231,7 +1264,7 @@ impl PlaybackOrchestrator {
                 let file_info = StreamInfo {
                     format: w.enc_format.into(),
                     mime_type: hit_mime.into(),
-                    sample_rate: stream_data.quality.sample_rate,
+                    sample_rate: sr_servie,
                     bit_depth: w.key_bit_depth,
                     channels: 2,
                     file_size: Some(file_size),
@@ -1292,7 +1325,7 @@ impl PlaybackOrchestrator {
                     cover_url: cover_path,
                     stream_id: Some(session_id),
                     file_size: Some(file_size),
-                    sample_rate: Some(stream_data.quality.sample_rate),
+                    sample_rate: Some(sr_servie),
                     bit_depth: Some(stream_data.quality.bit_depth as u32),
                     channels: Some(2),
                     origin_url: None,
@@ -1307,7 +1340,7 @@ impl PlaybackOrchestrator {
             return Err("DASH file already being decoded".into());
         }
 
-        let sr = stream_data.quality.sample_rate;
+        let sr = sr_servie;
         let bd = stream_data.quality.bit_depth.clamp(16, 24);
 
         // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
@@ -1350,6 +1383,7 @@ impl PlaybackOrchestrator {
             bd,
             tmp_path,
             dash_did,
+            plafonnee: cadence_plafonnee.is_some(),
         }))
     }
 
@@ -1414,6 +1448,7 @@ impl PlaybackOrchestrator {
             ref unique_path,
             sr,
             bd,
+            plafonnee,
             ..
         } = *p;
         // Streaming remux (#1146, opt-in TUNE_DASH_STREAM_REMUX): chunked-stream
@@ -1425,6 +1460,7 @@ impl PlaybackOrchestrator {
         // background download, so playback begins on the first fragments.
         if dash_enc_format == "flac"
             && !dash_dsp_active
+            && !plafonnee
             && std::env::var("TUNE_DASH_STREAM_REMUX")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)

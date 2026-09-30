@@ -243,6 +243,12 @@ pub(super) struct ZonePollState {
     /// Codec amont déjà annoncé pour la radio en cours. Le conteneur WAV de
     /// sortie ne dit rien de la compression de la station (#4346).
     pub(super) radio_source_annonce: (Option<String>, Option<RadioSourceInfo>),
+    /// #5522 — depuis quand la piste est « en lecture » sans que sa position
+    /// ait jamais quitté 0. Voir [`super::demarrage_fige_5522`].
+    pub(super) fige_a_zero_depuis: Option<Instant>,
+    /// #5522 — octets servis relevés au tour précédent, pour dire si le flux
+    /// avance encore (un renderer qui tamponne n'est pas figé).
+    pub(super) octets_du_demarrage: Option<u64>,
 }
 
 impl ZonePollState {
@@ -301,6 +307,8 @@ impl ZonePollState {
             etat: EtatDeLecture::Neuve,
             contrat_annonce: (None, None),
             radio_source_annonce: (None, None),
+            fige_a_zero_depuis: None,
+            octets_du_demarrage: None,
         }
     }
 

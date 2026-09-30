@@ -174,7 +174,14 @@ tokio = { workspace = true, features = ["test-util"] }
 # Test-only (#5453) : `tune_core::journal_de_test::fiabiliser_la_capture()`
 # pour les tests qui capturent le journal par `set_default`/`with_default`.
 # Comme `test-util` ci-dessus, la feature n'entre que dans les cibles de test.
-tune-core = { path = "../tune-core", default-features = false, features = ["journal-de-test"] }
+# #5512 : `isolement-disque-de-test` dit à la lib qu'elle est construite pour
+# des TESTS, intégration comprise, et isole ses chemins relatifs dans un
+# dossier temporaire (`src/isolement_disque_tests_5467.rs`). Même principe que
+# `journal-de-test` : la feature n'entre que dans les cibles de test.
+tune-core = { path = "../tune-core", default-features = false, features = [
+    "journal-de-test",
+    "isolement-disque-de-test",
+] }
 
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
@@ -215,6 +222,13 @@ path = "tests/dr_liste_albums_4521.rs"
 name = "reprise_des_passes_5469"
 path = "tests/reprise_des_passes_5469.rs"
 
+# #5512 — les tests d'intégration n'écrivent plus `artwork_cache/`,
+# `queue_state/` ni `tune-scan-report.json` dans l'arbre. `autotests = false`
+# plus haut : sans cette cible, le témoin ne serait jamais compilé.
+[[test]]
+name = "isolement_disque_integration_5512"
+path = "tests/isolement_disque_integration_5512.rs"
+
 # #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
 # Les sept points (aléatoire, smart playlists, file, titre en cours,
 # débannir, local ≠ service, par profil) par les routes montées. `autotests =
@@ -242,6 +256,12 @@ path = "tests/pistes_bibliotheque_lentes_5138.rs"
 [[test]]
 name = "collection_intelligente_sans_micro_coupure_5438"
 path = "tests/collection_intelligente_sans_micro_coupure_5438.rs"
+
+# Coupure de lecture DLNA pendant une grosse collection intelligente
+# (Yves Corbat, 0.9.168, 30/09/2026, suite de #5438).
+[[test]]
+name = "lecture_sans_famine_collection_intelligente"
+path = "tests/lecture_sans_famine_collection_intelligente.rs"
 
 # #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
 # sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
@@ -891,6 +911,14 @@ path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 name = "artwork_proxy_relais_ferme_4260"
 path = "tests/artwork_proxy_relais_ferme_4260.rs"
 
+# #5214 : la vignette d'un podcast mise en cache à l'abonnement, servie par la
+# liste des abonnements et par l'épisode en lecture. Cible propre : le banc pose
+# `TUNE_ARTWORK_DIR` pour tout son processus. `autotests = false` : sans cette
+# entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "vignette_podcast_en_cache_5214"
+path = "tests/vignette_podcast_en_cache_5214.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
@@ -1175,6 +1203,14 @@ path = "tests/crossfeed_reglable_zone_reseau_2742.rs"
 [[test]]
 name = "collections_albums_manquants_901"
 path = "tests/collections_albums_manquants_901.rs"
+
+# Les manquants d'un dossier « Collections » se résolvent (#5527, #5528,
+# Lulu) : ranger l'album vivant retire ses identifiants morts, `/missing`
+# propose des remplaçants, et le VRAI scan de disques retagués fait suivre le
+# dossier. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "collections_suivi_5527_5528"
+path = "tests/collections_suivi_5527_5528.rs"
 
 # #4805 — le pilote de lot de l'identification. `autotests = false` en tête de
 # ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et le

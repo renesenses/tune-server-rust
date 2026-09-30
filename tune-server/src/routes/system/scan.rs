@@ -238,6 +238,57 @@ pub(crate) fn scan_cancel_requested() -> bool {
     SCAN_GATE.cancel_requested()
 }
 
+/// Un scan tient-il le droit de scanner en ce moment ? C'est la seule preuve
+/// qu'un scan TOURNE : `scan_status` est un réglage, et un réglage peut dire
+/// « idle » pendant que le parcours lit encore (#5552).
+pub(crate) fn droit_de_scanner_tenu() -> bool {
+    SCAN_GATE.is_active()
+}
+
+/// Demande l'arrêt du scan en cours, s'il y en a un. Même geste que
+/// « Arrêter » (`POST /system/scan/cancel`), sans toucher à `scan_status` :
+/// c'est le scan qui l'écrit en s'arrêtant. `false` : aucun scan ne tournait.
+pub(crate) fn demander_l_arret_du_scan() -> bool {
+    SCAN_GATE.request_cancel()
+}
+
+/// #5531 — repère persistant « un scan a été arrêté pour installer une mise
+/// à jour ; le reprendre au démarrage suivant ». Un réglage, parce qu'il doit
+/// survivre au redémarrage que la mise à jour provoque.
+pub(crate) const CLE_SCAN_A_REPRENDRE: &str = "scan_a_reprendre";
+
+pub(crate) fn poser_reprise_du_scan(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    if let Err(e) =
+        SettingsRepo::with_backend(backend.clone()).set(CLE_SCAN_A_REPRENDRE, &chrono_now())
+    {
+        tracing::warn!(error = %e, "scan_reprise_pose_echouee");
+    }
+}
+
+pub(crate) fn reprise_du_scan_demandee(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get(CLE_SCAN_A_REPRENDRE)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+pub(crate) fn effacer_reprise_du_scan(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    if !reprise_du_scan_demandee(backend) {
+        return;
+    }
+    match SettingsRepo::with_backend(backend.clone()).delete(CLE_SCAN_A_REPRENDRE) {
+        Ok(()) => tracing::info!("scan_reprise_effacee"),
+        Err(e) => tracing::warn!(error = %e, "scan_reprise_effacement_echoue"),
+    }
+}
+
 #[cfg(test)]
 mod scan_gate_tests {
     use super::ScanGate;
@@ -699,8 +750,11 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 ///
 /// #5223 : conserver la fraction de seconde ET la comparer sans tolérance.
 /// Une copie préallouée ou une retouche en place peut changer les balises
-/// à taille égale dans la même seconde. Les anciennes dates tronquées sont
-/// relues une fois si la date précise diffère, puis le raccourci s'applique.
+/// à taille égale dans la même seconde. Seule exception (décision du
+/// 30/09/2026) : une date enregistrée sans fraction, égale à la partie
+/// entière de celle du disque, à taille égale, vient d'une version qui
+/// tronquait — elle est tenue pour inchangée et réécrite précise
+/// ([`EtatDuFichier::DateAPreciser`]).
 ///
 /// The lookup key is NFC-normalized because the stored `file_path`s (and the
 /// `discovered_paths` set) are NFC, while a filename on disk may be NFD (a FR
@@ -713,18 +767,84 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// so they can't diverge again — they previously held two copies and only one
 /// received the NFC fix.
 pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
+    matches!(
+        etat_du_fichier(path, existing_tracks),
+        EtatDuFichier::ARelire
+    )
+}
+
+/// Ce que le préfiltre sait d'un fichier sur disque, face à sa ligne en base.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EtatDuFichier {
+    /// Neuf, ou taille/date différentes : relire ses balises.
+    ARelire,
+    /// Taille et date précise identiques : sauter.
+    Inchange,
+    /// Taille identique, et date enregistrée SANS fraction égale à la partie
+    /// entière de la date du disque : une ligne écrite avant #5223 (≤ 0.9.166,
+    /// qui tronquait à la seconde). Tenue pour inchangée, SANS relecture ; la
+    /// date précise est à réécrire en base (décision de Bertrand, 30/09/2026,
+    /// ticket 201 : 20 284 fichiers sur 20 348 relus au premier démarrage).
+    DateAPreciser {
+        /// Clé NFC, telle que la base la range.
+        chemin: String,
+        mtime: f64,
+        taille: u64,
+    },
+}
+
+/// Le verdict du préfiltre, partagé par les scans manuel et de démarrage.
+/// Voir [`file_needs_scan`] pour la clé NFC et la mesure des chemins virtuels.
+pub fn etat_du_fichier(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> EtatDuFichier {
     let path_str: String = path.to_string_lossy().nfc().collect();
     // #5299 — même mesure que le parcours (`ScannedFile`), chemins virtuels
     // `image.iso!/…` compris : sans elle, chaque piste d'une image serait
     // relue à chaque scan.
-    if let Some(info) = existing_tracks.get(path_str.as_str())
-        && let Some((taille, mtime)) = tune_core::audio::iso9660::taille_et_mtime(path)
-    {
-        let unchanged =
-            info.mtime == Some(mtime) && info.taille.is_some_and(|s| s == taille as i64);
-        return !unchanged;
+    let (Some(info), Some((taille, mtime))) = (
+        existing_tracks.get(path_str.as_str()),
+        tune_core::audio::iso9660::taille_et_mtime(path),
+    ) else {
+        return EtatDuFichier::ARelire;
+    };
+    if !info.taille.is_some_and(|s| s == taille as i64) {
+        return EtatDuFichier::ARelire;
     }
-    true
+    match info.mtime {
+        Some(m) if m == mtime => EtatDuFichier::Inchange,
+        Some(m) if m.fract() == 0.0 && mtime.fract() != 0.0 && m == mtime.trunc() => {
+            EtatDuFichier::DateAPreciser {
+                chemin: path_str,
+                mtime,
+                taille,
+            }
+        }
+        _ => EtatDuFichier::ARelire,
+    }
+}
+
+/// Réécrit en base la date précise des fichiers que le préfiltre a tenus pour
+/// inchangés sur une date tronquée ([`EtatDuFichier::DateAPreciser`]). Sans
+/// relire le fichier. Rend le nombre de dates réécrites.
+pub(crate) fn preciser_les_dates(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    dates: Vec<(String, f64, u64)>,
+) -> usize {
+    if dates.is_empty() {
+        return 0;
+    }
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
+    let mut faites = 0usize;
+    for (chemin, mtime, taille) in &dates {
+        match repo.update_mtime_and_size(chemin, *mtime, *taille as i64) {
+            Ok(()) => faites += 1,
+            Err(e) => tracing::warn!(error = %e, "scan_date_precise_non_ecrite"),
+        }
+    }
+    tracing::info!(
+        dates = faites,
+        "scan_dates_precisees — dates tronquées (avant #5223) remplacées sans relecture"
+    );
+    faites
 }
 
 /// `file_path` → la ligne de `tracks` qui le possède, toutes sources.
@@ -1594,7 +1714,12 @@ async fn spawn_library_scan_avec_lecteur(
         // fichiers il y a qu'une fois qu'on les a tous vus. Le client rend
         // alors « n fichiers » et une barre indéterminée, ce qu'il sait déjà
         // faire (SettingsView.svelte) : aucun changement web n'est requis.
-        let list_result = tune_core::scanner::walker::list_audio_files_avec_progression(
+        //
+        // #5552 — « Arrêter » est lu pendant ce parcours aussi : c'est lui qui
+        // tenait le bouton en échec sur un partage lent (#1129). Interrompu, il
+        // ne rend AUCUNE liste — une liste partielle ferait croire à des
+        // fichiers disparus — et le scan s'arrête sans rien écrire.
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
             &scan_dirs,
             &exclude_patterns,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
@@ -1610,7 +1735,15 @@ async fn spawn_library_scan_avec_lecteur(
                     }),
                 );
             },
-        );
+            &scan_cancel_requested,
+        ) else {
+            tracing::info!("scan_arrete_pendant_le_parcours — rien n'a été écrit");
+            if let Err(e) = SettingsRepo::with_backend(db.clone()).set("scan_status", "idle") {
+                tracing::warn!(error = %e, "scan_status_reset_failed");
+            }
+            event_bus.emit("library.scan.completed", json!({ "cancelled": true }));
+            return;
+        };
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -1822,6 +1955,7 @@ async fn spawn_library_scan_avec_lecteur(
         // qu'ils PÈSENT. Le verdict « compilation » porte sur le dossier
         // entier, et la base est le seul témoin de ceux que ce scan ne relira
         // pas (#3528, `TrackImporter::amorcer_depuis_la_base`).
+        let dates_a_preciser = std::sync::Mutex::new(Vec::new());
         let (files_to_scan, files_ecartes): (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) =
             files.into_par_iter().partition(|path| {
                 if scan_cancel_requested() {
@@ -1834,8 +1968,24 @@ async fn spawn_library_scan_avec_lecteur(
                 // Shared with auto_scan so the manual and watcher scans can't
                 // diverge on the NFC key handling (the "scan interminable" bug).
                 // Un exemplaire inchangé se saute comme une piste (#4907).
-                file_needs_scan(path, &existing_tracks) && file_needs_scan(path, &existing_copies)
+                match etat_du_fichier(path, &existing_tracks) {
+                    EtatDuFichier::Inchange => false,
+                    EtatDuFichier::DateAPreciser { chemin, mtime, taille } => {
+                        dates_a_preciser
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((chemin, mtime, taille));
+                        false
+                    }
+                    EtatDuFichier::ARelire => file_needs_scan(path, &existing_copies),
+                }
             });
+        if !scan_cancel_requested() {
+            preciser_les_dates(
+                &db,
+                dates_a_preciser.into_inner().unwrap_or_else(|e| e.into_inner()),
+            );
+        }
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
         tracing::info!(
@@ -2270,12 +2420,12 @@ async fn spawn_library_scan_avec_lecteur(
                             "UPDATE albums SET track_count = {compte_visible} \
                              WHERE id IN ({ids_csv});\
                              UPDATE albums SET \
-                             format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
-                             sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
-                             bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                             {qualite}, \
                              genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                              disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)) \
-                             WHERE id IN ({ids_csv})"
+                             WHERE id IN ({ids_csv})",
+                            // #5413 : qualité RECALCULÉE depuis les pistes.
+                            qualite = tune_core::db::album_repo::sql_qualite_reprise_des_pistes()
                         )).ok();
                     }
                 }
@@ -2609,13 +2759,14 @@ async fn spawn_library_scan_avec_lecteur(
             db.ceder_aux_ecrivains();
             if let Err(e) = db.execute(
                 &format!("UPDATE albums SET \
-                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
-                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
-                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                 {}, \
                  genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                  genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)), \
                  disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)), \
                  {}",
+                    // #5413 : qualité RECALCULÉE depuis les pistes, plus en
+                    // comblement seul — même fragment que la remontée par album.
+                    tune_core::db::album_repo::sql_qualite_reprise_des_pistes(),
                     // #4836 : le label des pistes remonte sur l'album, que lit
                     // l'onglet Labels — même fragment que la remontée par album.
                     tune_core::db::album_repo::sql_label_repris_des_pistes()
@@ -2691,6 +2842,12 @@ async fn spawn_library_scan_avec_lecteur(
             }
         }
         drop(sqlite_write_guard);
+
+        // #5528 — APRÈS la purge et son COMMIT : les albums vidés ont disparu,
+        // les dossiers « Collections » suivent ceux dont les pistes sont
+        // passées dans un autre album. Hors de la transaction, qui ne doit pas
+        // porter une écriture de réglage.
+        tune_core::db::dossiers_des_collections::suivre_sans_echouer(&db);
 
         // #4896 — APRÈS la purge et son COMMIT : la ligne album d'un dossier
         // retouché suit ses balises, par la même règle que le surveillant.
@@ -3026,9 +3183,7 @@ async fn spawn_library_scan_avec_lecteur(
         if scan_cancel_requested() {
             report["cancelled"] = json!(true);
         }
-        let report_path = std::env::var("TUNE_DB_PATH")
-            .unwrap_or_else(|_| "tune.db".into())
-            .replace(".db", "-scan-report.json");
+        let report_path = chemin_du_rapport_de_scan();
         if let Ok(json) = serde_json::to_string_pretty(&report) {
             std::fs::write(&report_path, json).ok();
         }
@@ -3152,31 +3307,38 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
-    // Signal the running batch loop to stop processing further batches. The scan
-    // task then drains its remaining (no-op) batches and runs its normal
-    // completion path, which resets scan_status to "idle" and emits
+pub(crate) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
+    // Signal the running scan to stop. The scan task then stops reading (the
+    // walk, the pre-filter and the batch reads all poll this flag, #5552) and
+    // runs its completion path, which resets scan_status to "idle" and emits
     // library.scan.completed. Without this flag the endpoint only flipped the
     // status string while the scan kept inserting for minutes (bug #1129).
+    //
+    // « Arrêter » est un geste de l'utilisateur : un scan qu'il arrête n'est
+    // pas un scan à reprendre au démarrage suivant (#5531). Le repère n'est
+    // posé que par la mise à jour forcée, qui ne passe pas par cette route.
+    effacer_reprise_du_scan(&state.backend);
     if SCAN_GATE.request_cancel() {
+        // #5552 — NI `scan_status = idle`, NI `library.scan.completed` ici :
+        // le scan tourne encore. Les écrire maintenant levait la garde de mise
+        // à jour et faisait tomber le bandeau pendant que le parcours relisait
+        // encore toute la bibliothèque (LANDES Philippe, fil 2063 : cinq clics
+        // sur « Arrêter » en douze minutes). C'est le scan qui les écrit, une
+        // fois RÉELLEMENT arrêté.
         tracing::info!("scan_cancel_requested");
     } else {
         tracing::info!("scan_cancel_ignored_no_active_scan");
+        // Aucun scan ne tient le droit : un `scanning` persistant est un
+        // reste (processus tué en plein scan). Le remettre à `idle`, et faire
+        // tomber le bandeau d'un client qui l'affiche encore (#1129).
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        if let Err(e) = settings.set("scan_status", "idle") {
+            tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
+        }
+        state
+            .event_bus
+            .emit("library.scan.completed", json!({ "cancelled": true }));
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(e) = settings.set("scan_status", "idle") {
-        tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
-    }
-    // Clear the client's "scanning" banner immediately. The batch loop's own
-    // completion event only fires if the scan is *in* that loop — but if it is
-    // stuck earlier (walker enumerating a slow/inaccessible NAS path, macOS
-    // folder-permission stall) or has already ended, SCAN_CANCEL is a no-op and
-    // no completion event is ever emitted, so "Stop scan" does nothing visible
-    // (#1129). Emitting here guarantees the banner drops on Stop. A duplicate
-    // event from the draining loop is harmless (the UI just clears twice).
-    state
-        .event_bus
-        .emit("library.scan.completed", json!({ "cancelled": true }));
     StatusCode::NO_CONTENT
 }
 
@@ -3500,15 +3662,34 @@ fn chrono_now() -> String {
     format!("{now}")
 }
 
+/// Le fichier du rapport de scan : écrit par le scan manuel et par le scan
+/// automatique (`auto_scan.rs`), relu par `GET /scan/report`.
+///
+/// #5512 — la même formule était recopiée à ces trois endroits. Elle vit ici,
+/// une seule fois, et le build de test la détourne vers un dossier temporaire :
+/// sinon `tune-scan-report.json` s'écrivait dans le répertoire courant des
+/// tests, c'est-à-dire la caisse. Le chemin de production est inchangé.
+#[doc(hidden)] // `pub` pour le témoin d'intégration de #5512 seulement.
+pub fn chemin_du_rapport_de_scan() -> String {
+    if let Some(chemin) = crate::isolement_disque_tests_5467::chemin_du_rapport_de_scan() {
+        return chemin.to_string_lossy().into_owned();
+    }
+    // #5513 — à côté de la base retenue au démarrage (`config.db_path`), et
+    // non plus du seul `TUNE_DB_PATH` : sous le LaunchAgent macOS, le littéral
+    // `tune.db` visait `/`.
+    crate::chemins_de_donnees::rapport_de_scan(
+        crate::chemins_de_donnees::base_retenue(),
+        std::env::var("TUNE_DB_PATH").ok().as_deref(),
+    )
+}
+
 /// Build a JSON array string for the `genres` column from parsed metadata.
 ///
 /// If the structured `genres` vec is non-empty, serialize it as JSON.
 /// Otherwise, fall back to the primary `genre` string and wrap it as a
 /// single-element array so the column is never NULL when genre data exists.
 pub(super) async fn scan_report() -> impl IntoResponse {
-    let report_path = std::env::var("TUNE_DB_PATH")
-        .unwrap_or_else(|_| "tune.db".into())
-        .replace(".db", "-scan-report.json");
+    let report_path = chemin_du_rapport_de_scan();
     match std::fs::read_to_string(&report_path) {
         Ok(json) => match serde_json::from_str::<Value>(&json) {
             Ok(v) => Json(v).into_response(),

@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "b6ef6c8c8a7e83c78369a84b2a111027f52720b1",
+    "web_sha": "f838cde2d4f65ce47d69519b49739b622d4fb636",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -532,6 +532,7 @@
       ],
       "champs_optionnels": [
         "located",
+        "ambiguous",
         "postal_code",
         "code"
       ]
@@ -549,6 +550,7 @@
       ],
       "champs_optionnels": [
         "located",
+        "ambiguous",
         "postal_code",
         "code"
       ]
@@ -563,6 +565,12 @@
       ],
       "champs_optionnels": [
         "scope",
+        "applied_scope",
+        "located",
+        "total",
+        "limit",
+        "offset",
+        "has_more",
         "radius_km",
         "city",
         "country",
@@ -900,7 +908,9 @@
         "tracks"
       ],
       "champs_optionnels": [
-        "ecriture_balises"
+        "ecriture_balises",
+        "defaire_coffret_manuel",
+        "retablir_champ"
       ]
     },
     {
@@ -914,7 +924,25 @@
         "tracks"
       ],
       "champs_optionnels": [
-        "ecriture_balises"
+        "ecriture_balises",
+        "defaire_coffret_manuel",
+        "retablir_champ"
+      ]
+    },
+    {
+      "route": "/library/albums/{}/edition/retablir",
+      "methode": "POST",
+      "type": "EditionReponse",
+      "liste": false,
+      "champs_obligatoires": [
+        "album",
+        "discs",
+        "tracks"
+      ],
+      "champs_optionnels": [
+        "ecriture_balises",
+        "defaire_coffret_manuel",
+        "retablir_champ"
       ]
     },
     {
@@ -1419,6 +1447,31 @@
       "champs_obligatoires": [
         "cible",
         "albums_recrees"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/coffrets/{}/defaire-manuel",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "cible",
+        "albums_recrees"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/collections/{}/missing",
+      "methode": "GET",
+      "type": "AlbumManquantCollection",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title",
+        "artist",
+        "merged_into",
+        "candidates"
       ],
       "champs_optionnels": []
     },
@@ -3001,6 +3054,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -4129,6 +4184,21 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/dynamic-range/progress",
+      "methode": "GET",
+      "type": "AvancementPlageDynamique",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "active",
+        "processed",
+        "total",
+        "remaining",
+        "candidates",
+        "enabled"
+      ]
+    },
+    {
       "route": "/system/enrich",
       "methode": "POST",
       "type": "(en ligne)",
@@ -4350,7 +4420,8 @@
         "reported",
         "enabled",
         "deferred",
-        "waiting_reason"
+        "waiting_reason",
+        "working"
       ]
     },
     {
@@ -4685,6 +4756,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -4755,6 +4828,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -4891,6 +4966,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -4961,6 +5038,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5152,6 +5231,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5234,6 +5315,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5340,6 +5423,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5452,6 +5537,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5569,6 +5656,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5639,6 +5728,8 @@
         "error",
         "stream_url",
         "online",
+        "backend_sortie",
+        "hors_backend_choisi",
         "presence",
         "jours_absente",
         "output_reach",
@@ -5780,6 +5871,11 @@
     },
     {
       "route": "/zone-manager/groups/{}/gapless",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/zones/{}/radio/artist",
       "type": "any",
       "raison": "type non structurel"
     },
@@ -6465,7 +6561,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 320,
-    "appels_non_resolus": 157
+    "routes_cartographiees": 324,
+    "appels_non_resolus": 158
   }
 }

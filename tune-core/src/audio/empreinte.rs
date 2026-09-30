@@ -122,13 +122,30 @@ impl Empreinte {
 /// `Err` si le fichier ne se décode pas ; `Ok(None)` s'il ne contient que du
 /// silence.
 pub fn empreinte_du_fichier(chemin: &str) -> Result<Option<Empreinte>, String> {
-    let decode = decode_to_pcm(
-        chemin,
-        Some(TAUX),
-        Some(1),
-        0.0,
-        FENETRE_S + MARGE_SILENCE_S,
-    )?;
+    let decode = decode_to_pcm(chemin, Some(TAUX), Some(1), 0.0, FENETRE_DECODEE_S)?;
+    empreinte_d_un_decodage_adapte(decode)
+}
+
+/// La fenêtre de tête que décode l'empreinte, marge de silence comprise.
+pub(crate) const FENETRE_DECODEE_S: f64 = FENETRE_S + MARGE_SILENCE_S;
+
+/// L'empreinte tirée d'un décodage NATIF de la fenêtre de tête
+/// (`decode::decode_natif(chemin, Some(TAUX), Some(1), 0.0, FENETRE_DECODEE_S)`).
+///
+/// #5519 — [`empreinte_du_fichier`] vaut exactement ceci appliqué à ce
+/// décodage-là : `decode_to_pcm` n'est que `adapter_pcm ∘ decode_natif`. La
+/// passe ReplayGain l'appelle sur le décodage qu'elle fait déjà, au lieu de
+/// relire le fichier.
+pub(crate) fn empreinte_d_un_decodage_natif(
+    natif: crate::audio::decode::DecodedAudio,
+) -> Result<Option<Empreinte>, String> {
+    let decode = crate::audio::decode::adapter_pcm(natif, Some(TAUX), Some(1))?;
+    empreinte_d_un_decodage_adapte(decode)
+}
+
+fn empreinte_d_un_decodage_adapte(
+    decode: crate::audio::decode::DecodedAudio,
+) -> Result<Option<Empreinte>, String> {
     if decode.channels != 1 || decode.sample_rate != TAUX {
         return Err(format!(
             "decodeur hors contrat : {} canaux a {} Hz",
