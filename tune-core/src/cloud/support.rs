@@ -53,7 +53,7 @@ pub enum SupportAuth {
 
 impl SupportAuth {
     /// Applique l'auth à une requête sortante vers mozaiklabs.
-    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             SupportAuth::Bearer(token) => req.bearer_auth(token),
             SupportAuth::License { key, fingerprint } => req

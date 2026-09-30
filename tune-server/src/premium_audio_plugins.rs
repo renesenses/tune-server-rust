@@ -263,7 +263,7 @@ pub async fn dismiss_reinstall_suggestion(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -303,7 +303,9 @@ mod tests {
     // Le dossier doit survivre à tous les tests du binaire, donc à toute portée.
     // tmp-autorise: repris par `menage_a_la_sortie_du_processus`, pas abandonné.
     static DOSSIER_DE_DONNEES: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    fn dossier_de_donnees_jetable() {
+    /// Partagé avec `catalogue_greffons_audio` : UN seul dossier par processus,
+    /// sinon deux modules se disputeraient `TUNE_AUDIO_PLUGINS_DIR`.
+    pub(crate) fn dossier_de_donnees_jetable() {
         DOSSIER_DE_DONNEES.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
             menage_a_la_sortie_du_processus(dir.path().to_path_buf());
