@@ -453,6 +453,60 @@ pub struct TrackImporter {
     /// chaque ligne AVANT qu'elle soit écrite — les balises relues ne
     /// l'écrasent plus. Voir [`tune_core::db::edition_album::Tenues`].
     tenues: tune_core::db::edition_album::Tenues,
+    /// `Some` dans un lot de scan : le travail de pochette mis de côté par
+    /// `import`, fait après le `COMMIT` (#5202). `None` : fait sur-le-champ.
+    pochettes_differees: Option<Vec<PochetteAFaire>>,
+}
+
+/// Ce que la pochette d'une piste importée doit savoir d'elle (#5202).
+pub(crate) struct PochetteAFaire {
+    chemin: String,
+    /// L'album AVANT les éditions tenues à la main : celui que la pochette a
+    /// toujours suivi.
+    album_id: Option<i64>,
+    use_folder_title: bool,
+    cover_art: Option<(Vec<u8>, String)>,
+    track_artist: Option<Arc<tune_core::db::models::Artist>>,
+}
+
+/// Une [`tune_core::library::pochette_disque::Jaquette`] qui POSSÈDE ses
+/// octets, pour passer sur le fil d'une lecture bornée.
+enum JaquetteConnue {
+    Inconnue,
+    Absente,
+    Lue((Vec<u8>, String)),
+}
+
+impl JaquetteConnue {
+    fn de(j: tune_core::library::pochette_disque::Jaquette<'_>) -> Self {
+        use tune_core::library::pochette_disque::Jaquette;
+        match j {
+            Jaquette::Inconnue => Self::Inconnue,
+            Jaquette::Absente => Self::Absente,
+            Jaquette::Lue(c) => Self::Lue(c.clone()),
+        }
+    }
+    fn vue(&self) -> tune_core::library::pochette_disque::Jaquette<'_> {
+        use tune_core::library::pochette_disque::Jaquette;
+        match self {
+            Self::Inconnue => Jaquette::Inconnue,
+            Self::Absente => Jaquette::Absente,
+            Self::Lue(c) => Jaquette::Lue(c),
+        }
+    }
+}
+
+/// Une lecture du disque, bornée dans un lot, directe sinon.
+fn lire_disque<T: Send + 'static>(
+    lectures: &mut Option<&mut crate::lecture_bornee::LecturesBornees<'_>>,
+    quoi: &'static str,
+    chemin: &str,
+    lire: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match lectures {
+        Some(l) => l.lire(quoi, chemin, lire),
+        None => Some(lire()),
+    }
 }
 
 impl TrackImporter {
@@ -496,6 +550,7 @@ impl TrackImporter {
             artwork_extracted: 0,
             force_artwork: false,
             tenues,
+            pochettes_differees: None,
         }
     }
 
@@ -777,6 +832,323 @@ impl TrackImporter {
     /// Resolve artist + album, extract album cover / artist image as a side
     /// effect, and build the `Track` row. Returns `None` when the file has no
     /// metadata. `id` is left `None`; the caller sets it for the update path.
+    /// La pochette d'UNE piste importée : pochette de son album, image
+    /// d'artiste du dossier, pochette propre de la piste (#5034, #4650).
+    ///
+    /// Rend la `cover_path` PROPRE de la piste, ou `None` si une lecture du
+    /// disque n'a pas rendu la main dans son délai : la piste est alors sautée
+    /// pour la pochette — jamais déclarée sans image (#5202).
+    fn pochettes_de_la_piste(
+        &mut self,
+        t: &PochetteAFaire,
+        mut lectures: Option<&mut crate::lecture_bornee::LecturesBornees<'_>>,
+    ) -> Option<Option<String>> {
+        let chemin_s = t.chemin.as_str();
+        let album_id = t.album_id;
+        let use_folder_title = t.use_folder_title;
+        let mut cover_path: Option<String> = None;
+        // La jaquette intégrée de CETTE piste. `read_metadata` ne la garde pas
+        // (`.read_cover_art(false)`, `metadata/mod.rs`) : la lecture des
+        // balises est PARALLÈLE, jusqu'à 32 fichiers à la fois, et des images
+        // énormes multipliées d'autant avaient envoyé le scanner à l'OOM
+        // (JeromeQ : 261 fichiers → 6,1 Go). `meta.cover_art` était donc
+        // TOUJOURS vide en production, et la pochette propre d'une piste
+        // (#4650, #1284, plus bas) ne se déclenchait jamais : seuls les tests,
+        // qui l'injectaient à la main, la voyaient.
+        //
+        // Elle est relue ICI : l'import est SÉQUENTIEL — une image à la fois
+        // en mémoire, jamais trente-deux.
+        //
+        // Mais pas à chaque piste : relire 250 Kio par piste coûtait +50 % sur
+        // un scan de 3 000 FLAC (mesuré sur Shrek, voir la PR ; décision 3 de
+        // Bertrand du 25/09/2026, « compare par empreinte sans décoder
+        // l'image »). Une EMPREINTE du bloc PICTURE — sa longueur et trois
+        // échantillons, lus sans charger l'image — reconnaît la jaquette de
+        // l'album ; seule une piste dont l'empreinte s'en écarte (le single,
+        // le dossier fourre-tout) est relue en entier.
+        let chemin = std::path::Path::new(chemin_s);
+        let p = chemin.to_path_buf();
+        let empreinte = lire_disque(&mut lectures, "empreinte_jaquette", chemin_s, move || {
+            tune_core::library::artwork::empreinte_jaquette_flac(&p)
+        })?;
+        let comme_l_album = match (&empreinte, album_id) {
+            (Some(e), Some(aid)) => self.album_ref_empreinte.get(&aid) == Some(e),
+            _ => false,
+        };
+        let relue;
+        let (jaquette, connue): (Option<&(Vec<u8>, String)>, _) = match t.cover_art.as_ref() {
+            Some(c) => (
+                Some(c),
+                tune_core::library::pochette_disque::Jaquette::Lue(c),
+            ),
+            // La jaquette de l'album : rien de propre à cette piste, et la
+            // règle de la pochette d'album relira si elle en a besoin.
+            None if comme_l_album => (
+                None,
+                tune_core::library::pochette_disque::Jaquette::Inconnue,
+            ),
+            None => {
+                // Un délai dépassé ne vaut pas « sans jaquette » : la piste
+                // est sautée, jamais déclarée nue (ce qui retirerait la
+                // pochette de son album).
+                let p = chemin.to_path_buf();
+                relue = lire_disque(&mut lectures, "jaquette", chemin_s, move || {
+                    tune_core::library::artwork::extract_cover_art(&p)
+                })?;
+                (
+                    relue.as_ref(),
+                    tune_core::library::pochette_disque::Jaquette::relue(relue.as_ref()),
+                )
+            }
+        };
+
+        if let Some(aid) = album_id
+            && !self.albums_with_cover.contains(&aid)
+        {
+            // La pochette d'album face au DISQUE (#5034) : une règle, portée
+            // par `pochette_disque`, partagée avec le surveillant et le
+            // rattrapage de fin de scan. Elle pose la pochette d'un album qui
+            // n'en a pas (jaquette intégrée d'abord, puis image du dossier),
+            // suit celle dont le fichier source a changé ou disparu, et ne
+            // touche jamais une pochette téléversée.
+            //
+            // Sur un « Scan complet », seule la PREMIÈRE piste de l'album
+            // relue par ce scan reconstruit sa pochette depuis le disque
+            // (#3028) ; les suivantes suivent la règle des passes
+            // automatiques — sans quoi un album illustré par son `cover.jpg`
+            // relirait l'image à chacune de ses pistes.
+            let premiere = self.albums_vus.insert(aid);
+            // #5202 — la règle relit le disque (jaquette, image du dossier,
+            // pistes de l'album) : bornée comme le reste. Ses écritures se
+            // font en base hors de toute transaction de lot.
+            let suivi = {
+                let db = self.db.clone();
+                let piste = chemin.to_path_buf();
+                let cache = self.cache_dir.clone();
+                let complet = self.force_artwork && premiere;
+                let jaquette_connue = JaquetteConnue::de(connue);
+                lire_disque(&mut lectures, "pochette_album", chemin_s, move || {
+                    tune_core::library::pochette_disque::suivre_la_piste(
+                        &db,
+                        aid,
+                        &piste,
+                        jaquette_connue.vue(),
+                        &cache,
+                        complet,
+                    )
+                })
+            };
+            let Some(suivi) = suivi else {
+                // La reconstruction « Scan complet » revient à la piste
+                // suivante de l'album.
+                if premiere {
+                    self.albums_vus.remove(&aid);
+                }
+                return None;
+            };
+            // #4650 — la pochette d'album RÉELLEMENT retenue fait référence :
+            // toute piste dont la jaquette s'en écarte portera la sienne.
+            // Depuis la migration 111, une pochette tirée du disque est
+            // adressée par le condensat de son CONTENU (jamais par l'adresse
+            // héritée dérivée d'un chemin) : elle se compare aux octets.
+            if let Ok(Some(etat)) = self.album_repo.etat_pochette(aid)
+                && etat.source.is_some_and(|s| s.vient_du_disque())
+                && let Some(pochette) = etat.cover_path
+            {
+                self.album_ref_cover.insert(aid, pochette);
+            } else if let Some(cover) = jaquette {
+                self.album_ref_cover
+                    .entry(aid)
+                    .or_insert_with(|| tune_core::library::artwork::content_hash(&cover.0));
+            }
+            if suivi.tranche {
+                self.albums_with_cover.insert(aid);
+            }
+            if suivi.posee {
+                self.artwork_extracted += 1;
+            }
+        }
+        // L'empreinte de la jaquette qui fait référence : celle de la piste dont
+        // les octets SONT la pochette de l'album.
+        if let (Some(aid), Some(e), Some(c)) = (album_id, &empreinte, jaquette)
+            && self.album_ref_cover.get(&aid)
+                == Some(&tune_core::library::artwork::content_hash(&c.0))
+        {
+            self.album_ref_empreinte.insert(aid, e.clone());
+        }
+
+        // Check for a local artist image (artist.jpg/png next to the tracks).
+        //
+        // La mise en cache est passée dans `tune_core::library::artwork` pour
+        // être adressée par le CONTENU (#1444) et testable : la même
+        // `artist.jpg` recopiée dans les N dossiers d'album d'un artiste
+        // n'écrit plus qu'UNE entrée de cache. L'entrée héritée, adressée par
+        // le chemin, reste sondée d'abord — aucune URL déjà distribuée ne
+        // bouge. Rien n'est enregistré si l'écriture du cache échoue, sinon la
+        // base annonce « a une image » sans rien sur le disque (carré gris +
+        // saut définitif).
+        if let Some(ref art) = t.track_artist
+            && art.image_path.is_none()
+        {
+            let p = chemin.to_path_buf();
+            let cache = self.cache_dir.clone();
+            match lire_disque(&mut lectures, "image_artiste", chemin_s, move || {
+                tune_core::library::artwork::folder_artist_image_hash(&p, &cache)
+            }) {
+                // Délai dépassé : journalisé par `LecturesBornees`, l'image
+                // d'artiste attendra un prochain scan.
+                None => {}
+                Some(Some(hash)) => {
+                    let mut updated_artist = tune_core::db::models::Artist::clone(art);
+                    updated_artist.image_path = Some(hash);
+                    updated_artist.image_source = Some("local".to_string());
+                    if let Err(e) = self.artist_repo.update(&updated_artist) {
+                        tracing::warn!(error = %e, "artist_image_update_failed");
+                    }
+                }
+                Some(None) => {
+                    tracing::trace!(
+                        artist = %art.name,
+                        "artist_image_absente_ou_non_mise_en_cache"
+                    );
+                }
+            }
+        }
+
+        // Per-track cover, ONLY for a folder the scanner had to name itself.
+        //
+        // `use_folder_title` means this folder holds several artists AND several
+        // unrelated album tags, so every file in it was filed under one album
+        // named after the folder. That is right for a hand-made compilation, but
+        // a folder of unrelated files gets the same treatment — and the album
+        // cover above is whichever artwork the FIRST such file happened to carry
+        // (`albums_with_cover` never lets a later track override it). Bebelalu55
+        // played a WAV and saw another artist's sleeve (forum #1312).
+        //
+        // Giving the track its own artwork fixes the display without touching
+        // how the folder is grouped: reads do COALESCE(t.cover_path,
+        // al.cover_path), so a track with no embedded art still falls back to
+        // its album's, exactly as before.
+        //
+        // `jaquette` : la jaquette de la piste, relue plus haut une seule fois
+        // par l'import séquentiel (#5034, décision 3). `meta.cover_art`, que ce
+        // bloc lisait seul, était toujours vide en production : la lecture
+        // parallèle des balises ne garde pas les images.
+        //
+        // Même règle que la pochette d'album au-dessus : un « Scan complet »
+        // saute la sonde héritée, sans quoi la pochette de PISTE resterait
+        // périmée pendant que celle de l'album se rafraîchit (#3028).
+        if use_folder_title && let Some(cover) = jaquette {
+            cover_path = if self.force_artwork {
+                tune_core::library::artwork::cache_embedded_cover(chemin, &self.cache_dir, cover)
+            } else {
+                tune_core::library::artwork::save_embedded_cover(chemin, &self.cache_dir, cover)
+            };
+        } else if let Some(cover) = jaquette
+            && let Some(aid) = album_id
+        {
+            // #4650 — UN ALBUM ORDINAIRE, une piste qui porte sa propre image.
+            //
+            // Les quatre singles de *Hackney Diamonds* (dont « Angry ») sont
+            // rangés dans le dossier de l'album et portent chacun une jaquette
+            // différente de la sienne. Jusqu'ici Tune les jetait : la pochette
+            // par piste n'était retenue que dans le cas `use_folder_title`
+            // ci-dessus, c'est-à-dire un dossier fourre-tout (#1284). Décision
+            // de Bertrand du 22/09/2026 : le scan GARDE l'image intégrée à la
+            // piste quand elle diffère de celle de l'album.
+            //
+            // Le coût, lu sur le code plutôt que supposé :
+            // - **aucune lecture de fichier** — `cover.0` est en mémoire, lu
+            //   avec les balises ;
+            // - **aucune écriture de cache** quand l'image est la même : la
+            //   comparaison échoue avant d'y toucher, et le cache est de
+            //   toute façon adressé par le CONTENU ;
+            // - **aucune écriture de base supplémentaire** : `cover_path` est
+            //   une colonne de la ligne piste, que le scan écrit de toute
+            //   façon (et `appliquer_pochettes_de_piste` ne touche que les
+            //   pistes qui en portent une). Un album de 30 pistes à jaquette
+            //   unique ne produit donc que 30 condensats SHA-256 sur des
+            //   octets déjà en RAM, et rien d'autre.
+            //
+            // La comparaison porte sur le condensat de CONTENU et jamais sur
+            // ce que rend `save_embedded_cover` : celui-ci sonde d'abord une
+            // entrée HÉRITÉE adressée par le CHEMIN de la piste, qui ne peut
+            // par construction jamais égaler la référence — toutes les pistes
+            // auraient alors été déclarées « différentes ».
+            let condensat = tune_core::library::artwork::content_hash(&cover.0);
+            match self.album_ref_cover.get(&aid) {
+                // La référence existe et cette piste s'en écarte : elle garde
+                // son image. `cache_embedded_cover` saute la sonde héritée,
+                // donc il rend exactement le condensat comparé — sans quoi la
+                // ligne piste annoncerait une image et la comparaison une
+                // autre. Il n'écrit rien si ces octets sont déjà en cache.
+                Some(reference) if *reference != condensat => {
+                    cover_path = tune_core::library::artwork::cache_embedded_cover(
+                        chemin,
+                        &self.cache_dir,
+                        cover,
+                    );
+                }
+                // Même image que l'album : rien à faire, la lecture retombe
+                // sur la pochette d'album par `COALESCE`.
+                Some(_) => {}
+                // Album sans référence connue (sa pochette vient du dossier) :
+                // la première image rencontrée devient la référence. Sans
+                // cela, un album illustré par un `cover.jpg` verrait TOUTES
+                // ses pistes déclarées « différentes ».
+                None => {
+                    self.album_ref_cover.insert(aid, condensat);
+                }
+            }
+        }
+
+        Some(cover_path)
+    }
+
+    /// Mode des LOTS de scan (#5202) : `import` ne touche plus au disque pour
+    /// les pochettes. Il met le travail de côté, et
+    /// [`TrackImporter::traiter_les_pochettes_differees`] le fait APRÈS le
+    /// `COMMIT` du lot, lecture par lecture et sous délai. Une lecture de
+    /// pochette bloquée sur un partage réseau ne tient donc plus la
+    /// transaction d'écriture, et ne fige plus le lot.
+    pub fn avec_pochettes_differees(mut self) -> Self {
+        self.pochettes_differees = Some(Vec::new());
+        self
+    }
+
+    /// Fait le travail de pochette mis de côté par le lot, dans l'ordre des
+    /// pistes, et rend les pochettes PROPRES à poser, par chemin.
+    pub(crate) fn traiter_les_pochettes_differees(
+        &mut self,
+        lectures: &mut crate::lecture_bornee::LecturesBornees<'_>,
+        lot: usize,
+    ) -> Vec<(String, String)> {
+        let travail = match self.pochettes_differees.as_mut() {
+            Some(file) => std::mem::take(file),
+            None => return Vec::new(),
+        };
+        let total = travail.len();
+        let mut a_poser = Vec::new();
+        for (i, t) in travail.iter().enumerate() {
+            if lectures.arret_demande() || lectures.epuise() {
+                tracing::warn!(
+                    lot,
+                    traitees = i,
+                    total,
+                    non_traitees = total - i,
+                    arret = lectures.annule,
+                    "scan_pochettes_du_lot_interrompues — le reste du lot garde ses pistes, \
+                     sans relire leurs pochettes (#5202)"
+                );
+                break;
+            }
+            if let Some(Some(pochette)) = self.pochettes_de_la_piste(t, Some(&mut *lectures)) {
+                a_poser.push((t.chemin.clone(), pochette));
+            }
+        }
+        a_poser
+    }
+
     pub fn import(&mut self, sf: &ScannedFile) -> Option<(Track, Option<i64>)> {
         let meta = sf.metadata.as_ref()?;
 
@@ -1200,236 +1572,22 @@ impl TrackImporter {
                 .ok();
         }
 
-        // La jaquette intégrée de CETTE piste. `read_metadata` ne la garde pas
-        // (`.read_cover_art(false)`, `metadata/mod.rs`) : la lecture des
-        // balises est PARALLÈLE, jusqu'à 32 fichiers à la fois, et des images
-        // énormes multipliées d'autant avaient envoyé le scanner à l'OOM
-        // (JeromeQ : 261 fichiers → 6,1 Go). `meta.cover_art` était donc
-        // TOUJOURS vide en production, et la pochette propre d'une piste
-        // (#4650, #1284, plus bas) ne se déclenchait jamais : seuls les tests,
-        // qui l'injectaient à la main, la voyaient.
-        //
-        // Elle est relue ICI : l'import est SÉQUENTIEL — une image à la fois
-        // en mémoire, jamais trente-deux.
-        //
-        // Mais pas à chaque piste : relire 250 Kio par piste coûtait +50 % sur
-        // un scan de 3 000 FLAC (mesuré sur Shrek, voir la PR ; décision 3 de
-        // Bertrand du 25/09/2026, « compare par empreinte sans décoder
-        // l'image »). Une EMPREINTE du bloc PICTURE — sa longueur et trois
-        // échantillons, lus sans charger l'image — reconnaît la jaquette de
-        // l'album ; seule une piste dont l'empreinte s'en écarte (le single,
-        // le dossier fourre-tout) est relue en entier.
-        let chemin = std::path::Path::new(&sf.path);
-        let empreinte = tune_core::library::artwork::empreinte_jaquette_flac(chemin);
-        let comme_l_album = match (&empreinte, album_id) {
-            (Some(e), Some(aid)) => self.album_ref_empreinte.get(&aid) == Some(e),
-            _ => false,
+        // #5202 — la pochette (jaquette, image du dossier, image d'artiste)
+        // relit le DISQUE. Dans un lot de scan, ce travail est DIFFÉRÉ après
+        // le `COMMIT` et chaque lecture y est bornée : voir
+        // [`TrackImporter::avec_pochettes_differees`].
+        let travail = PochetteAFaire {
+            chemin: sf.path.clone(),
+            album_id,
+            use_folder_title,
+            cover_art: meta.cover_art.clone(),
+            track_artist: track_artist.clone(),
         };
-        let relue;
-        let (jaquette, connue): (Option<&(Vec<u8>, String)>, _) = match meta.cover_art.as_ref() {
-            Some(c) => (
-                Some(c),
-                tune_core::library::pochette_disque::Jaquette::Lue(c),
-            ),
-            // La jaquette de l'album : rien de propre à cette piste, et la
-            // règle de la pochette d'album relira si elle en a besoin.
-            None if comme_l_album => (
-                None,
-                tune_core::library::pochette_disque::Jaquette::Inconnue,
-            ),
-            None => {
-                relue = tune_core::library::artwork::extract_cover_art(chemin);
-                (
-                    relue.as_ref(),
-                    tune_core::library::pochette_disque::Jaquette::relue(relue.as_ref()),
-                )
-            }
-        };
-
-        if let Some(aid) = album_id
-            && !self.albums_with_cover.contains(&aid)
-        {
-            // La pochette d'album face au DISQUE (#5034) : une règle, portée
-            // par `pochette_disque`, partagée avec le surveillant et le
-            // rattrapage de fin de scan. Elle pose la pochette d'un album qui
-            // n'en a pas (jaquette intégrée d'abord, puis image du dossier),
-            // suit celle dont le fichier source a changé ou disparu, et ne
-            // touche jamais une pochette téléversée.
-            //
-            // Sur un « Scan complet », seule la PREMIÈRE piste de l'album
-            // relue par ce scan reconstruit sa pochette depuis le disque
-            // (#3028) ; les suivantes suivent la règle des passes
-            // automatiques — sans quoi un album illustré par son `cover.jpg`
-            // relirait l'image à chacune de ses pistes.
-            let premiere = self.albums_vus.insert(aid);
-            let suivi = tune_core::library::pochette_disque::suivre_la_piste(
-                &self.db,
-                aid,
-                std::path::Path::new(&sf.path),
-                connue,
-                &self.cache_dir,
-                self.force_artwork && premiere,
-            );
-            // #4650 — la pochette d'album RÉELLEMENT retenue fait référence :
-            // toute piste dont la jaquette s'en écarte portera la sienne.
-            // Depuis la migration 111, une pochette tirée du disque est
-            // adressée par le condensat de son CONTENU (jamais par l'adresse
-            // héritée dérivée d'un chemin) : elle se compare aux octets.
-            if let Ok(Some(etat)) = self.album_repo.etat_pochette(aid)
-                && etat.source.is_some_and(|s| s.vient_du_disque())
-                && let Some(pochette) = etat.cover_path
-            {
-                self.album_ref_cover.insert(aid, pochette);
-            } else if let Some(cover) = jaquette {
-                self.album_ref_cover
-                    .entry(aid)
-                    .or_insert_with(|| tune_core::library::artwork::content_hash(&cover.0));
-            }
-            if suivi.tranche {
-                self.albums_with_cover.insert(aid);
-            }
-            if suivi.posee {
-                self.artwork_extracted += 1;
-            }
-        }
-        // L'empreinte de la jaquette qui fait référence : celle de la piste dont
-        // les octets SONT la pochette de l'album.
-        if let (Some(aid), Some(e), Some(c)) = (album_id, &empreinte, jaquette)
-            && self.album_ref_cover.get(&aid)
-                == Some(&tune_core::library::artwork::content_hash(&c.0))
-        {
-            self.album_ref_empreinte.insert(aid, e.clone());
-        }
-
-        // Check for a local artist image (artist.jpg/png next to the tracks).
-        //
-        // La mise en cache est passée dans `tune_core::library::artwork` pour
-        // être adressée par le CONTENU (#1444) et testable : la même
-        // `artist.jpg` recopiée dans les N dossiers d'album d'un artiste
-        // n'écrit plus qu'UNE entrée de cache. L'entrée héritée, adressée par
-        // le chemin, reste sondée d'abord — aucune URL déjà distribuée ne
-        // bouge. Rien n'est enregistré si l'écriture du cache échoue, sinon la
-        // base annonce « a une image » sans rien sur le disque (carré gris +
-        // saut définitif).
-        if let Some(ref art) = track_artist
-            && art.image_path.is_none()
-        {
-            match tune_core::library::artwork::folder_artist_image_hash(
-                std::path::Path::new(&sf.path),
-                &self.cache_dir,
-            ) {
-                Some(hash) => {
-                    let mut updated_artist = tune_core::db::models::Artist::clone(art);
-                    updated_artist.image_path = Some(hash);
-                    updated_artist.image_source = Some("local".to_string());
-                    if let Err(e) = self.artist_repo.update(&updated_artist) {
-                        tracing::warn!(error = %e, "artist_image_update_failed");
-                    }
-                }
-                None => {
-                    tracing::trace!(
-                        artist = %art.name,
-                        "artist_image_absente_ou_non_mise_en_cache"
-                    );
-                }
-            }
-        }
-
         let mut track = build_track_row(meta, sf, album_id, artist_id, &track_artist_name);
-
-        // Per-track cover, ONLY for a folder the scanner had to name itself.
-        //
-        // `use_folder_title` means this folder holds several artists AND several
-        // unrelated album tags, so every file in it was filed under one album
-        // named after the folder. That is right for a hand-made compilation, but
-        // a folder of unrelated files gets the same treatment — and the album
-        // cover above is whichever artwork the FIRST such file happened to carry
-        // (`albums_with_cover` never lets a later track override it). Bebelalu55
-        // played a WAV and saw another artist's sleeve (forum #1312).
-        //
-        // Giving the track its own artwork fixes the display without touching
-        // how the folder is grouped: reads do COALESCE(t.cover_path,
-        // al.cover_path), so a track with no embedded art still falls back to
-        // its album's, exactly as before.
-        //
-        // `jaquette` : la jaquette de la piste, relue plus haut une seule fois
-        // par l'import séquentiel (#5034, décision 3). `meta.cover_art`, que ce
-        // bloc lisait seul, était toujours vide en production : la lecture
-        // parallèle des balises ne garde pas les images.
-        //
-        // Même règle que la pochette d'album au-dessus : un « Scan complet »
-        // saute la sonde héritée, sans quoi la pochette de PISTE resterait
-        // périmée pendant que celle de l'album se rafraîchit (#3028).
-        if use_folder_title && let Some(cover) = jaquette {
-            track.cover_path = if self.force_artwork {
-                tune_core::library::artwork::cache_embedded_cover(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                    cover,
-                )
-            } else {
-                tune_core::library::artwork::save_embedded_cover(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                    cover,
-                )
-            };
-        } else if let Some(cover) = jaquette
-            && let Some(aid) = album_id
-        {
-            // #4650 — UN ALBUM ORDINAIRE, une piste qui porte sa propre image.
-            //
-            // Les quatre singles de *Hackney Diamonds* (dont « Angry ») sont
-            // rangés dans le dossier de l'album et portent chacun une jaquette
-            // différente de la sienne. Jusqu'ici Tune les jetait : la pochette
-            // par piste n'était retenue que dans le cas `use_folder_title`
-            // ci-dessus, c'est-à-dire un dossier fourre-tout (#1284). Décision
-            // de Bertrand du 22/09/2026 : le scan GARDE l'image intégrée à la
-            // piste quand elle diffère de celle de l'album.
-            //
-            // Le coût, lu sur le code plutôt que supposé :
-            // - **aucune lecture de fichier** — `cover.0` est en mémoire, lu
-            //   avec les balises ;
-            // - **aucune écriture de cache** quand l'image est la même : la
-            //   comparaison échoue avant d'y toucher, et le cache est de
-            //   toute façon adressé par le CONTENU ;
-            // - **aucune écriture de base supplémentaire** : `cover_path` est
-            //   une colonne de la ligne piste, que le scan écrit de toute
-            //   façon (et `appliquer_pochettes_de_piste` ne touche que les
-            //   pistes qui en portent une). Un album de 30 pistes à jaquette
-            //   unique ne produit donc que 30 condensats SHA-256 sur des
-            //   octets déjà en RAM, et rien d'autre.
-            //
-            // La comparaison porte sur le condensat de CONTENU et jamais sur
-            // ce que rend `save_embedded_cover` : celui-ci sonde d'abord une
-            // entrée HÉRITÉE adressée par le CHEMIN de la piste, qui ne peut
-            // par construction jamais égaler la référence — toutes les pistes
-            // auraient alors été déclarées « différentes ».
-            let condensat = tune_core::library::artwork::content_hash(&cover.0);
-            match self.album_ref_cover.get(&aid) {
-                // La référence existe et cette piste s'en écarte : elle garde
-                // son image. `cache_embedded_cover` saute la sonde héritée,
-                // donc il rend exactement le condensat comparé — sans quoi la
-                // ligne piste annoncerait une image et la comparaison une
-                // autre. Il n'écrit rien si ces octets sont déjà en cache.
-                Some(reference) if *reference != condensat => {
-                    track.cover_path = tune_core::library::artwork::cache_embedded_cover(
-                        std::path::Path::new(&sf.path),
-                        &self.cache_dir,
-                        cover,
-                    );
-                }
-                // Même image que l'album : rien à faire, la lecture retombe
-                // sur la pochette d'album par `COALESCE`.
-                Some(_) => {}
-                // Album sans référence connue (sa pochette vient du dossier) :
-                // la première image rencontrée devient la référence. Sans
-                // cela, un album illustré par un `cover.jpg` verrait TOUTES
-                // ses pistes déclarées « différentes ».
-                None => {
-                    self.album_ref_cover.insert(aid, condensat);
-                }
-            }
+        if let Some(file) = self.pochettes_differees.as_mut() {
+            file.push(travail);
+        } else if let Some(cover_path) = self.pochettes_de_la_piste(&travail, None) {
+            track.cover_path = cover_path;
         }
 
         // L'édition manuelle prime sur les balises (écran « Modifier », GO du
@@ -1440,6 +1598,38 @@ impl TrackImporter {
             return Some((track, tenu));
         }
         Some((track, album_id))
+    }
+}
+
+/// Pose les pochettes PROPRES rendues par
+/// [`TrackImporter::traiter_les_pochettes_differees`], hors de toute
+/// transaction de lot (#5202). Une piste que le lot n'a pas écrite (exemplaire,
+/// insertion refusée) n'a pas d'identifiant : elle est ignorée.
+pub(crate) fn poser_les_pochettes_de_piste(db: &Arc<dyn DbBackend>, a_poser: &[(String, String)]) {
+    if a_poser.is_empty() {
+        return;
+    }
+    let chemins: Vec<String> = a_poser.iter().map(|(c, _)| c.clone()).collect();
+    let ids = match tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(db, &chemins) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "scan_pochettes_de_piste_ids_echec");
+            return;
+        }
+    };
+    let pistes: Vec<Track> = a_poser
+        .iter()
+        .filter_map(|(chemin, pochette)| {
+            let mut t = Track::new(String::new());
+            t.id = Some(*ids.get(chemin)?);
+            t.cover_path = Some(pochette.clone());
+            Some(t)
+        })
+        .collect();
+    if let Err(e) = tune_core::db::track_repo::TrackRepo::with_backend(db.clone())
+        .appliquer_pochettes_de_piste(&pistes)
+    {
+        tracing::warn!(error = %e, "scan_pochettes_de_piste_echec");
     }
 }
 
@@ -3099,3 +3289,7 @@ mod tests_edition_manuelle {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "scan_import_pochettes_bornees_tests_5202.rs"]
+mod pochettes_bornees_tests_5202;
