@@ -36,7 +36,7 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           V="$RELEASE_VERSION"
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
             echo "::error::version invalide: $V"
             exit 1
           }

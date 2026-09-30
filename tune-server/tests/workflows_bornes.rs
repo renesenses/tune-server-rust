@@ -2149,7 +2149,7 @@ fn le_drapeau_prerelease_vient_du_manifeste_et_regit_la_promotion() {
         "trigger-os-images.yml",
     ] {
         assert!(
-            workflow(fichier).contains(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$"),
+            workflow(fichier).contains(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$"),
             "{fichier} refuse de nouveau une version suffixée"
         );
     }

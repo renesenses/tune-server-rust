@@ -322,7 +322,7 @@ if plancher is not None and plancher > reference - fenetre:
 # qu'un nouveau venu se remarque au lieu de disparaitre.
 # Une pre-version publiee en « Latest » (la 1.0.0-rc1, 29/09/2026) est une
 # version de Tune comme une autre : elle doit avoir son fil.
-TAG_DE_TUNE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$")
+TAG_DE_TUNE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
 
 
 def annoncee(tag):
@@ -403,7 +403,7 @@ FORME_KO=""
 CANDIDATES=$(jq -r --arg depuis "$FORME_DEPUIS" '
   .[]
   | select((.isDraft | not) and (.isPrerelease | not))
-  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$"))
+  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"))
   | select((.publishedAt // "") >= $depuis)
   | .tagName
 ' "$RELEASES" 2>/dev/null | head -n "${FORME_COMBIEN:-5}")

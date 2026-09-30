@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::lancer depuis main"; exit 1; }
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::version invalide"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::version invalide"; exit 1; }
           [ -f "$PLAN" ] || { echo "::error::manifeste absent"; exit 1; }
           jq -e --arg version "$VERSION" '.version == $version and .ready == true' "$PLAN" >/dev/null \
             || { echo "::error::manifeste non pret"; exit 1; }
@@ -192,7 +192,7 @@ jobs:
           # `gsub(/v[0-9]+\.[0-9]+\.[0-9]+/, ...)` laissait le suffixe :
           # de v1.0.0-rc1 a 1.0.0, il aurait ecrit `v1.0.0-rc1` dans l'URL
           # avec les sommes de la 1.0.0. Et un motif qui accepte un
-          # suffixe `-[0-9A-Za-z.]+` avalerait `-macos` dans
+          # suffixe `-[0-9A-Za-z.-]+` avalerait `-macos` dans
           # `v1.0.0-macos-aarch64` : on ne cherche donc pas, on ecrit.
           awk -v version="$VERSION" -v mac_arm="$MAC_ARM" -v mac_x86="$MAC_X86" \
               -v lin_arm="$LIN_ARM" -v lin_x86="$LIN_X86" '
@@ -206,7 +206,7 @@ jobs:
               if (plat != "") sub(/url "[^"]+"/, "url \"https://github.com/renesenses/tune-server-rust/releases/download/v" version "/tune-server-v" version "-" plat ".tar.gz\"")
             }
             /sha256 "/ && pending != "" { sub(/sha256 "[^"]+"/, "sha256 \"" pending "\""); pending="" }
-            { gsub(/Tune Server v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?/, "Tune Server v" version); print }
+            { gsub(/Tune Server v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?/, "Tune Server v" version); print }
           ' "$F" > "$F.new"
           mv "$F.new" "$F"
           grep -q "version \"$VERSION\"" "$F"
