@@ -360,8 +360,9 @@ pub async fn run_with(opts: RunOptions) {
         settings.set("server_last_alive_at", &now.to_string()).ok();
     }
 
-    // Auto-scan music directories at startup
-    let scan_done = if config.auto_scan {
+    // Auto-scan music directories at startup — et, même sans `auto_scan`,
+    // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
+    let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
         Some(crate::auto_scan::spawn_auto_scan(
             state.backend.clone(),
             state.event_bus.clone(),

@@ -238,6 +238,57 @@ pub(crate) fn scan_cancel_requested() -> bool {
     SCAN_GATE.cancel_requested()
 }
 
+/// Un scan tient-il le droit de scanner en ce moment ? C'est la seule preuve
+/// qu'un scan TOURNE : `scan_status` est un réglage, et un réglage peut dire
+/// « idle » pendant que le parcours lit encore (#5552).
+pub(crate) fn droit_de_scanner_tenu() -> bool {
+    SCAN_GATE.is_active()
+}
+
+/// Demande l'arrêt du scan en cours, s'il y en a un. Même geste que
+/// « Arrêter » (`POST /system/scan/cancel`), sans toucher à `scan_status` :
+/// c'est le scan qui l'écrit en s'arrêtant. `false` : aucun scan ne tournait.
+pub(crate) fn demander_l_arret_du_scan() -> bool {
+    SCAN_GATE.request_cancel()
+}
+
+/// #5531 — repère persistant « un scan a été arrêté pour installer une mise
+/// à jour ; le reprendre au démarrage suivant ». Un réglage, parce qu'il doit
+/// survivre au redémarrage que la mise à jour provoque.
+pub(crate) const CLE_SCAN_A_REPRENDRE: &str = "scan_a_reprendre";
+
+pub(crate) fn poser_reprise_du_scan(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    if let Err(e) =
+        SettingsRepo::with_backend(backend.clone()).set(CLE_SCAN_A_REPRENDRE, &chrono_now())
+    {
+        tracing::warn!(error = %e, "scan_reprise_pose_echouee");
+    }
+}
+
+pub(crate) fn reprise_du_scan_demandee(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get(CLE_SCAN_A_REPRENDRE)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+pub(crate) fn effacer_reprise_du_scan(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    if !reprise_du_scan_demandee(backend) {
+        return;
+    }
+    match SettingsRepo::with_backend(backend.clone()).delete(CLE_SCAN_A_REPRENDRE) {
+        Ok(()) => tracing::info!("scan_reprise_effacee"),
+        Err(e) => tracing::warn!(error = %e, "scan_reprise_effacement_echoue"),
+    }
+}
+
 #[cfg(test)]
 mod scan_gate_tests {
     use super::ScanGate;
@@ -1594,7 +1645,12 @@ async fn spawn_library_scan_avec_lecteur(
         // fichiers il y a qu'une fois qu'on les a tous vus. Le client rend
         // alors « n fichiers » et une barre indéterminée, ce qu'il sait déjà
         // faire (SettingsView.svelte) : aucun changement web n'est requis.
-        let list_result = tune_core::scanner::walker::list_audio_files_avec_progression(
+        //
+        // #5552 — « Arrêter » est lu pendant ce parcours aussi : c'est lui qui
+        // tenait le bouton en échec sur un partage lent (#1129). Interrompu, il
+        // ne rend AUCUNE liste — une liste partielle ferait croire à des
+        // fichiers disparus — et le scan s'arrête sans rien écrire.
+        let Some(list_result) = tune_core::scanner::walker::list_audio_files_avec_arret(
             &scan_dirs,
             &exclude_patterns,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
@@ -1610,7 +1666,15 @@ async fn spawn_library_scan_avec_lecteur(
                     }),
                 );
             },
-        );
+            &scan_cancel_requested,
+        ) else {
+            tracing::info!("scan_arrete_pendant_le_parcours — rien n'a été écrit");
+            if let Err(e) = SettingsRepo::with_backend(db.clone()).set("scan_status", "idle") {
+                tracing::warn!(error = %e, "scan_status_reset_failed");
+            }
+            event_bus.emit("library.scan.completed", json!({ "cancelled": true }));
+            return;
+        };
         let missing_dirs = list_result.missing_dirs;
         let missing_dir_reasons = list_result.missing_dir_reasons;
         let error_dirs = list_result.error_dirs;
@@ -3157,31 +3221,38 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
-    // Signal the running batch loop to stop processing further batches. The scan
-    // task then drains its remaining (no-op) batches and runs its normal
-    // completion path, which resets scan_status to "idle" and emits
+pub(crate) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
+    // Signal the running scan to stop. The scan task then stops reading (the
+    // walk, the pre-filter and the batch reads all poll this flag, #5552) and
+    // runs its completion path, which resets scan_status to "idle" and emits
     // library.scan.completed. Without this flag the endpoint only flipped the
     // status string while the scan kept inserting for minutes (bug #1129).
+    //
+    // « Arrêter » est un geste de l'utilisateur : un scan qu'il arrête n'est
+    // pas un scan à reprendre au démarrage suivant (#5531). Le repère n'est
+    // posé que par la mise à jour forcée, qui ne passe pas par cette route.
+    effacer_reprise_du_scan(&state.backend);
     if SCAN_GATE.request_cancel() {
+        // #5552 — NI `scan_status = idle`, NI `library.scan.completed` ici :
+        // le scan tourne encore. Les écrire maintenant levait la garde de mise
+        // à jour et faisait tomber le bandeau pendant que le parcours relisait
+        // encore toute la bibliothèque (LANDES Philippe, fil 2063 : cinq clics
+        // sur « Arrêter » en douze minutes). C'est le scan qui les écrit, une
+        // fois RÉELLEMENT arrêté.
         tracing::info!("scan_cancel_requested");
     } else {
         tracing::info!("scan_cancel_ignored_no_active_scan");
+        // Aucun scan ne tient le droit : un `scanning` persistant est un
+        // reste (processus tué en plein scan). Le remettre à `idle`, et faire
+        // tomber le bandeau d'un client qui l'affiche encore (#1129).
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        if let Err(e) = settings.set("scan_status", "idle") {
+            tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
+        }
+        state
+            .event_bus
+            .emit("library.scan.completed", json!({ "cancelled": true }));
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(e) = settings.set("scan_status", "idle") {
-        tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
-    }
-    // Clear the client's "scanning" banner immediately. The batch loop's own
-    // completion event only fires if the scan is *in* that loop — but if it is
-    // stuck earlier (walker enumerating a slow/inaccessible NAS path, macOS
-    // folder-permission stall) or has already ended, SCAN_CANCEL is a no-op and
-    // no completion event is ever emitted, so "Stop scan" does nothing visible
-    // (#1129). Emitting here guarantees the banner drops on Stop. A duplicate
-    // event from the draining loop is harmless (the UI just clears twice).
-    state
-        .event_bus
-        .emit("library.scan.completed", json!({ "cancelled": true }));
     StatusCode::NO_CONTENT
 }
 
