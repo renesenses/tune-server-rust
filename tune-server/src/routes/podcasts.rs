@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
 use tune_core::streaming::podcasts::PodcastService;
 use tune_core::streaming::radiofrance::{RadioFranceApi, RfStation};
+use tune_core::streaming::vignette_podcast;
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
@@ -107,7 +108,30 @@ async fn search_podcasts(
 }
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(AppError::internal)?;
-    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.first().and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string()), "source_id": r.get(6).and_then(|v| v.as_string())})).collect();
+    let cache = crate::routes::library::artwork_cache_dir();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let image_url = r.get(4).and_then(|v| v.as_string());
+            // #5214 — la vignette mise en cache, servie par la route des
+            // pochettes locales. Le client lit `cover_url` AVANT `image_url` :
+            // absente (pas encore en cache, téléchargement échoué), il retombe
+            // sur l'URL distante, comme avant.
+            let cover_url = image_url
+                .as_deref()
+                .and_then(|u| vignette_podcast::en_cache(&cache, u));
+            json!({
+                "id": r.first().and_then(|v| v.as_i64()),
+                "feed_url": r.get(1).and_then(|v| v.as_string()),
+                "title": r.get(2).and_then(|v| v.as_string()),
+                "author": r.get(3).and_then(|v| v.as_string()),
+                "image_url": image_url,
+                "cover_url": cover_url,
+                "description": r.get(5).and_then(|v| v.as_string()),
+                "source_id": r.get(6).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
     Ok(Json(json!(items)))
 }
 async fn subscribe(
@@ -190,6 +214,20 @@ async fn subscribe(
                 id,
                 "podcast_subscribed"
             );
+            // #5214 — la vignette est mise en cache MAINTENANT, bornée dans le
+            // temps : un hébergeur lent ne retient pas l'abonnement. Un échec
+            // ne fait pas échouer l'abonnement ; le rattrapage du démarrage et
+            // le prochain rafraîchissement du flux réessaient.
+            let cover_url = match body.image_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                Some(image) => tokio::time::timeout(
+                    DELAI_VIGNETTE_ABONNEMENT,
+                    mettre_vignette_en_cache(&state, image),
+                )
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            };
             // 201 pour une création, 200 pour un abonnement déjà présent : un
             // client qui reçoit 201 sait qu'il vient d'ajouter quelque chose et
             // peut le dire, là où le 201 systématique d'avant lui faisait
@@ -206,6 +244,7 @@ async fn subscribe(
                     "created": creation,
                     "title": body.title,
                     "feed_url": feed_url,
+                    "cover_url": cover_url,
                 })),
             )
                 .into_response()
@@ -321,10 +360,14 @@ async fn episodes_by_feed_url(
             }
         }
     };
-    match svc.get_episodes(&feed_url, q.limit).await {
-        Ok(episodes) => Ok(Json(
-            json!({"feed_url": feed_url, "count": episodes.len(), "episodes": episodes}),
-        )),
+    match svc.get_feed(&feed_url, q.limit).await {
+        Ok(flux) => {
+            suivre_image_du_flux(&state, &feed_url, &flux.image_url);
+            let episodes = flux.episodes;
+            Ok(Json(
+                json!({"feed_url": feed_url, "count": episodes.len(), "episodes": episodes}),
+            ))
+        }
         Err(e) => {
             warn!(feed_url = %feed_url, error = %e, "podcast_episodes_fetch_failed");
             Err(AppError::internal(e))
@@ -338,8 +381,12 @@ async fn podcast_episodes(
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(ref feed_url) = q.feed_url {
         let svc = PodcastService::with_client(state.http_client.clone());
-        return match svc.get_episodes(feed_url, q.limit).await {
-            Ok(episodes) => Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": episodes.len(), "episodes": episodes})).into_response()),
+        return match svc.get_feed(feed_url, q.limit).await {
+            Ok(flux) => {
+                suivre_image_du_flux(&state, feed_url, &flux.image_url);
+                let episodes = flux.episodes;
+                Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": episodes.len(), "episodes": episodes})).into_response())
+            }
             Err(e) => Ok(Json(json!({"podcast_id": podcast_id, "error": e})).into_response()),
         };
     }
@@ -372,8 +419,10 @@ async fn podcast_episodes(
         return Ok(Json(json!({"podcast_id": podcast_id, "episodes": [], "error": "podcast not found in subscriptions"})).into_response());
     };
     let svc = PodcastService::with_client(state.http_client.clone());
-    match svc.get_episodes(&feed_url, q.limit).await {
-        Ok(episodes) => {
+    match svc.get_feed(&feed_url, q.limit).await {
+        Ok(flux) => {
+            suivre_image_du_flux(&state, &feed_url, &flux.image_url);
+            let episodes = flux.episodes;
             let count = episodes.len();
             Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": count, "episodes": episodes})).into_response())
         }
@@ -396,12 +445,21 @@ async fn play_episode(
         .flatten()
         .and_then(|z| z.output_device_id);
     let mime_type = guess_audio_mime(&body.audio_url);
+    // #5214 — la pochette « en cours », que Lecture en cours et l'Historique
+    // du client reprennent : la vignette en cache quand elle existe. La sortie
+    // (`PlayMedia` plus bas) garde l'URL distante, qu'un appareil de rendu va
+    // chercher lui-même.
+    let pochette = pochette_de_lecture(
+        &state,
+        body.cover_url.as_deref(),
+        body.podcast_name.as_deref(),
+    );
     let np = NowPlaying {
         track_id: None,
         title: title.to_string(),
         artist_name: Some(podcast_name.to_string()),
         album_title: Some(podcast_name.to_string()),
-        cover_path: body.cover_url.clone(),
+        cover_path: pochette,
         duration_ms: body.duration_ms.unwrap_or(0) as i64,
         source: "podcast".into(),
         source_id: Some(body.audio_url.clone()),
@@ -449,6 +507,156 @@ async fn play_episode(
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "state": zone_state})).into_response()
 }
+// ─── Vignette mise en cache (#5214) ─────────────────────────────────
+
+/// Délai accordé à la mise en cache de la vignette pendant l'abonnement.
+const DELAI_VIGNETTE_ABONNEMENT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Met en cache la vignette `url` (voir `tune_core::streaming::vignette_podcast`)
+/// et rend son adresse locale, ou `None` en le journalisant.
+pub(crate) async fn mettre_vignette_en_cache(state: &AppState, url: &str) -> Option<String> {
+    let cache = crate::routes::library::artwork_cache_dir();
+    match vignette_podcast::mettre_en_cache(
+        &state.relais_pochettes,
+        &cache,
+        url,
+        vignette_podcast::TAILLE_MAX,
+    )
+    .await
+    {
+        Ok(adresse) => {
+            info!(url, adresse = %adresse, "podcast_vignette_en_cache");
+            Some(adresse)
+        }
+        Err(e) => {
+            warn!(url, erreur = %e, "podcast_vignette_non_mise_en_cache");
+            None
+        }
+    }
+}
+
+/// La pochette à poser sur l'épisode en lecture.
+///
+/// 1. l'image envoyée par le client a sa copie en cache → la copie ;
+/// 2. elle est déjà locale (condensat, chemin `/api/…`) → telle quelle ;
+/// 3. elle est distante sur un hôte que le relais admet → telle quelle : elle
+///    s'affiche déjà, et c'est peut-être l'image propre de l'épisode ;
+/// 4. sinon, la vignette en cache de l'abonnement de ce podcast (même titre) ;
+/// 5. sinon, l'image envoyée, comme avant.
+fn pochette_de_lecture(
+    state: &AppState,
+    cover_url: Option<&str>,
+    podcast_name: Option<&str>,
+) -> Option<String> {
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::library::artwork_proxy::{hote_autorise, hotes_supplementaires};
+    let cache = crate::routes::library::artwork_cache_dir();
+    let envoyee = cover_url.map(str::trim).filter(|c| !c.is_empty());
+    if let Some(c) = envoyee {
+        if let Some(adresse) = vignette_podcast::en_cache(&cache, c) {
+            return Some(adresse);
+        }
+        if !(c.starts_with("http://") || c.starts_with("https://")) {
+            return Some(c.to_string());
+        }
+        let admise = reqwest::Url::parse(c)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .is_some_and(|h| hote_autorise(&h, &hotes_supplementaires(&state.backend)));
+        if admise {
+            return Some(c.to_string());
+        }
+    }
+    let de_l_abonnement = podcast_name.and_then(|nom| {
+        let nom = nom.to_string();
+        state
+            .backend
+            .query_many(
+                "SELECT image_url FROM podcast_subscriptions WHERE title = ?",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .ok()?
+            .into_iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_string()))
+            .find_map(|image| vignette_podcast::en_cache(&cache, &image))
+    });
+    de_l_abonnement.or_else(|| envoyee.map(str::to_string))
+}
+
+/// Après lecture d'un flux : si c'est celui d'un abonnement, retient l'image
+/// que le flux déclare maintenant et la met en cache si elle n'y est pas —
+/// c'est le rattrapage « au prochain rafraîchissement » des abonnements
+/// antérieurs à #5214, et le suivi d'un flux qui change d'image. Le
+/// téléchargement part en tâche de fond : la liste des épisodes n'attend pas.
+fn suivre_image_du_flux(state: &AppState, feed_url: &str, image: &str) {
+    use tune_core::db::backend::ToSqlValue;
+    let image = image.trim();
+    if image.is_empty() {
+        return;
+    }
+    let feed = feed_url.to_string();
+    let Some(ligne) = state
+        .backend
+        .query_one(
+            "SELECT image_url FROM podcast_subscriptions WHERE feed_url = ?",
+            &[&feed as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let stockee = ligne.first().and_then(|v| v.as_string());
+    if stockee.as_deref() != Some(image) {
+        let neuve = image.to_string();
+        match state.backend.execute(
+            "UPDATE podcast_subscriptions SET image_url = ? WHERE feed_url = ?",
+            &[&neuve as &dyn ToSqlValue, &feed as &dyn ToSqlValue],
+        ) {
+            Ok(_) => info!(feed_url, ancienne = ?stockee, image, "podcast_image_du_flux_changee"),
+            Err(e) => warn!(feed_url, erreur = %e, "podcast_image_du_flux_non_enregistree"),
+        }
+    }
+    let cache = crate::routes::library::artwork_cache_dir();
+    if vignette_podcast::en_cache(&cache, image).is_none() {
+        let state = state.clone();
+        let image = image.to_string();
+        tokio::spawn(async move {
+            mettre_vignette_en_cache(&state, &image).await;
+        });
+    }
+}
+
+/// Le rattrapage du démarrage : met en cache la vignette de chaque abonnement
+/// qui n'en a pas encore. Rend (mises en cache, échecs).
+pub async fn rattraper_vignettes(state: &AppState) -> (usize, usize) {
+    let lignes = state
+        .backend
+        .query_many(
+            "SELECT image_url FROM podcast_subscriptions WHERE image_url IS NOT NULL",
+            &[],
+        )
+        .unwrap_or_default();
+    let cache = crate::routes::library::artwork_cache_dir();
+    let (mut faites, mut echecs) = (0, 0);
+    for image in lignes
+        .into_iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+    {
+        let image = image.trim().to_string();
+        if !(image.starts_with("http://") || image.starts_with("https://"))
+            || vignette_podcast::en_cache(&cache, &image).is_some()
+        {
+            continue;
+        }
+        match mettre_vignette_en_cache(state, &image).await {
+            Some(_) => faites += 1,
+            None => echecs += 1,
+        }
+    }
+    (faites, echecs)
+}
+
 // ─── Radio France GraphQL API ───────────────────────────────────────
 
 #[derive(Deserialize)]

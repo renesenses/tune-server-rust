@@ -132,6 +132,14 @@ pub struct PodcastEpisode {
     pub cover_url: String,
 }
 
+/// Un flux lu : l'image de la chaîne (vide si le flux n'en déclare pas) et
+/// ses épisodes.
+#[derive(Debug, Clone)]
+pub struct FluxPodcast {
+    pub image_url: String,
+    pub episodes: Vec<PodcastEpisode>,
+}
+
 pub struct PodcastService {
     client: Client,
 }
@@ -259,6 +267,12 @@ impl PodcastService {
         feed_url: &str,
         limit: usize,
     ) -> Result<Vec<PodcastEpisode>, String> {
+        self.get_feed(feed_url, limit).await.map(|f| f.episodes)
+    }
+
+    /// Les épisodes ET l'image de la chaîne d'un flux — celle que l'abonnement
+    /// met en cache (#5214) : un flux qui la change se reconnaît ici.
+    pub async fn get_feed(&self, feed_url: &str, limit: usize) -> Result<FluxPodcast, String> {
         debug!(feed_url, "podcast_feed_fetching");
         let resp = self
             .client
@@ -278,7 +292,10 @@ impl PodcastService {
             .await
             .map_err(|e| format!("podcast feed read: {e}"))?;
         debug!(feed_url, bytes = xml_text.len(), "podcast_feed_fetched");
-        parse_rss(&xml_text, limit)
+        Ok(FluxPodcast {
+            image_url: extract_channel_image(&xml_text),
+            episodes: parse_rss(&xml_text, limit)?,
+        })
     }
 
     /// Le pays — et le SEUL — que couvre [`Self::curated_french_podcasts`]

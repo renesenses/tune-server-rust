@@ -55,6 +55,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
     spawn_radio_logo_refresh(state);
+    spawn_rattrapage_vignettes_podcasts(state);
     spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
@@ -2451,6 +2452,26 @@ fn spawn_bio_sync(state: &AppState) {
 /// stations : une station absente de l'annuaire ne s'y trouvera pas davantage
 /// au dixieme essai.
 const RATTRAPAGE_LOGOS_DELAIS_SECS: [u64; 3] = [30, 120, 600];
+
+/// Délai avant le rattrapage des vignettes de podcasts : le réseau d'une
+/// appliance n'est pas toujours là au démarrage (même raison que les logos de
+/// radios, #2421).
+const RATTRAPAGE_VIGNETTES_PODCASTS_DELAI_SECS: u64 = 45;
+
+/// #5214 — au démarrage, met en cache la vignette des abonnements qui n'en ont
+/// pas encore (ceux d'avant le correctif, ou dont le téléchargement a échoué).
+/// Aucun abonnement : aucune requête.
+fn spawn_rattrapage_vignettes_podcasts(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            RATTRAPAGE_VIGNETTES_PODCASTS_DELAI_SECS,
+        ))
+        .await;
+        let (faites, echecs) = crate::routes::podcasts::rattraper_vignettes(&state).await;
+        tracing::info!(faites, echecs, "podcast_vignettes_rattrapees_au_demarrage");
+    });
+}
 
 /// Best-effort, at boot: fill in missing station logos from the mozaiklabs.fr
 /// radio directory so the seeded default stations show a vignette instead of
