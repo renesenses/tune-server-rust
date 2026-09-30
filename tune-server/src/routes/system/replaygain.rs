@@ -77,5 +77,12 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         "updated_at": avancement.maj_epoch,
         "reported": avancement.a_parle(),
         "enabled": enabled,
+        // #5519 / tune-web-client#1828 — la passe DÉCODE-t-elle en ce moment ?
+        // `active` dit seulement qu'une campagne est ouverte : elle le reste
+        // quand la plage dynamique « En premier » passe devant, et la carte
+        // affichait « en cours » sur une jauge figée.
+        "working": avancement.actif
+            && tune_core::taches_de_fond::ordre::rang_au_travail()
+                == Some(tune_core::taches_de_fond::ordre::Rang::ReplayGain),
     }))
 }
