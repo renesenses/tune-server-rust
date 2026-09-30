@@ -2020,6 +2020,32 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
     )
 }
 
+/// #5439 — le décodeur progressif des fichiers locaux, sur une source quelconque
+/// (le corps HTTP d'un serveur multimédia lu par la sortie locale). Même
+/// boucle symphonia, même en-tête WAV en tête de flux, à la cadence et aux
+/// canaux de la source : la conversion éventuelle reste à la sortie.
+pub fn decode_source_to_pcm_streaming(
+    source: Box<dyn MediaSource>,
+    codec_hint: &str,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+) -> Result<(u16, u32), String> {
+    let source_name = format!("flux-distant.{codec_hint}");
+    decode_to_pcm_streaming_inner(
+        &source_name,
+        None,
+        None,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        None,
+        None,
+        0.0,
+        Some(source),
+    )
+}
+
 fn decode_to_pcm_streaming_inner(
     file_path: &str,
     target_sample_rate: Option<u32>,
