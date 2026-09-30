@@ -450,10 +450,32 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // interminable" bug: NFD-named files missing the map and re-read over SMB).
         // #5552 — après « Arrêter », plus aucun `stat` : le reste de la liste
         // passe pour inchangé, et le scan s'arrête juste après la partition.
+        //
+        // Une date tronquée d'avant #5223, à taille égale, est tenue pour
+        // inchangée et réécrite précise après la partition, sans relecture.
+        let dates_a_preciser = std::sync::Mutex::new(Vec::new());
         let is_changed = |path: &std::path::Path| {
-            !crate::routes::system::scan::scan_cancel_requested()
-                && crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
-                && crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+            use crate::routes::system::scan::EtatDuFichier;
+            if crate::routes::system::scan::scan_cancel_requested() {
+                return false;
+            }
+            match crate::routes::system::scan::etat_du_fichier(path, &existing_tracks) {
+                EtatDuFichier::Inchange => false,
+                EtatDuFichier::DateAPreciser {
+                    chemin,
+                    mtime,
+                    taille,
+                } => {
+                    dates_a_preciser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((chemin, mtime, taille));
+                    false
+                }
+                EtatDuFichier::ARelire => {
+                    crate::routes::system::scan::file_needs_scan(path, &existing_copies)
+                }
+            }
         };
         // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
         // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
@@ -476,6 +498,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             scan_done_clone.store(true, Ordering::Release);
             return;
         }
+        crate::routes::system::scan::preciser_les_dates(
+            &db,
+            dates_a_preciser
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         let pre_skipped = total_discovered - files_to_scan.len();
 
         info!(
@@ -3359,3 +3387,7 @@ mod arret_du_scan_de_demarrage_tests_5552;
 #[cfg(test)]
 #[path = "mise_a_jour_pendant_un_scan_tests_5531.rs"]
 mod mise_a_jour_pendant_un_scan_tests_5531;
+
+#[cfg(test)]
+#[path = "date_arrondie_tests_5552.rs"]
+mod date_arrondie_tests_5552;

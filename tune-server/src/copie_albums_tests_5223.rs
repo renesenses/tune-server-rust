@@ -25,7 +25,6 @@ fn dater(path: &Path, nanos: u64) {
 #[derive(Clone, Copy, Debug)]
 enum Passe {
     Rapide,
-    AncienneBase,
     Demarrage,
     Surveillant,
     NomDuDossier,
@@ -115,15 +114,6 @@ async fn copie(passe: Passe) {
         provisoire.id,
         "un fichier incomplet inchangé ne doit pas boucler"
     );
-    if matches!(passe, Passe::AncienneBase) {
-        // Valeur réellement écrite par les versions qui tronquaient à la seconde.
-        repo.update_mtime_and_size(
-            &partielle.to_string_lossy(),
-            1_750_000_000.0,
-            taille.unwrap(),
-        )
-        .unwrap();
-    }
     std::fs::write(&partielle, finie).unwrap();
     dater(&partielle, 250_000_000);
     let apres = std::fs::metadata(&partielle).unwrap().modified().unwrap();
@@ -146,7 +136,7 @@ async fn copie(passe: Passe) {
         Some(std::fs::metadata(&partielle).unwrap().len() as i64)
     );
     match passe {
-        Passe::Rapide | Passe::AncienneBase => scan_manuel(&etat, false, None).await,
+        Passe::Rapide => scan_manuel(&etat, false, None).await,
         Passe::Complet => scan_manuel(&etat, true, None).await,
         Passe::Demarrage => scan_de_demarrage(&etat.backend).await,
         Passe::Surveillant | Passe::NomDuDossier => lot_du_surveillant(
@@ -213,10 +203,13 @@ async fn copie_complet_temoin_5223() {
     copie(Passe::Complet).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn copie_ancienne_base_5223() {
-    copie(Passe::AncienneBase).await;
-}
+// `copie_ancienne_base_5223` (ligne datée à la seconde par une version
+// antérieure, fichier réécrit à taille égale dans la même seconde) est RETIRÉE
+// le 30/09/2026, par décision de Bertrand : une date enregistrée sans fraction,
+// égale à la partie entière de celle du disque, à taille égale, est désormais
+// tenue pour inchangée (`EtatDuFichier::DateAPreciser`, ticket 201). Ce cas
+// précis n'est donc plus relu — c'est le prix accepté pour ne pas relire toute
+// une bibliothèque au premier démarrage. Voir `date_arrondie_tests_5552.rs`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copie_nom_du_dossier_5223() {
