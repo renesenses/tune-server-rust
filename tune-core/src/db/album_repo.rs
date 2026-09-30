@@ -1197,50 +1197,11 @@ impl AlbumRepo {
     }
 
     /// Les dossiers de l'utilisateur (`settings['collections']`, liste JSON de
-    /// `{…, "album_ids": […]}`) : le doublon y cède sa place à la cible.
+    /// `{…, "album_ids": […], "album_labels": {…}}`) : le doublon y cède sa
+    /// place à la cible, identifiant ET étiquette (#5528) — voir
+    /// [`super::dossiers_des_collections::remplacer_dans_les_dossiers`].
     fn reecrire_les_collections(&self, cible: i64, doublon: i64) -> Result<usize, TuneError> {
-        let settings = super::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        let Some(brut) = settings.get("collections").ok().flatten() else {
-            return Ok(0);
-        };
-        let Ok(mut collections) = serde_json::from_str::<Vec<serde_json::Value>>(&brut) else {
-            return Ok(0);
-        };
-        let mut reecrites = 0usize;
-        for collection in collections.iter_mut() {
-            let Some(ids) = collection
-                .get("album_ids")
-                .and_then(|v| v.as_array())
-                .cloned()
-            else {
-                continue;
-            };
-            let mut sortie: Vec<i64> = Vec::with_capacity(ids.len());
-            let mut change = false;
-            for id in ids.iter().filter_map(|v| v.as_i64()) {
-                let id = if id == doublon {
-                    change = true;
-                    cible
-                } else {
-                    id
-                };
-                if !sortie.contains(&id) {
-                    sortie.push(id);
-                }
-            }
-            if change {
-                collection["album_ids"] = serde_json::json!(sortie);
-                reecrites += 1;
-            }
-        }
-        if reecrites > 0 {
-            let texte =
-                serde_json::to_string(&collections).map_err(|e| TuneError::from(e.to_string()))?;
-            settings
-                .set("collections", &texte)
-                .map_err(TuneError::from)?;
-        }
-        Ok(reecrites)
+        super::dossiers_des_collections::remplacer_dans_les_dossiers(&self.db, doublon, cible)
     }
 
     /// Les arbitrages « distincts » qui nommaient le doublon n'ont plus d'objet.
@@ -1366,6 +1327,26 @@ impl AlbumRepo {
             }
         }
         Ok(trouves)
+    }
+
+    /// `(id, titre, artiste)` de TOUS les albums — de quoi proposer un
+    /// remplaçant à un album disparu d'un dossier (#5528). Lu à la demande,
+    /// jamais sur la liste des dossiers.
+    pub fn identites(&self) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
+        let rows = self.db.query_many(
+            "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                Some((
+                    cols.first().and_then(|v| v.as_i64())?,
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                ))
+            })
+            .collect())
     }
 
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, TuneError> {
@@ -2676,6 +2657,11 @@ impl AlbumRepo {
             }
             Ok(())
         })?;
+        // #5528 — les albums vidés viennent de disparaître : les dossiers
+        // « Collections » suivent ceux dont les pistes sont passées ailleurs.
+        if count > 0 {
+            super::dossiers_des_collections::suivre_sans_echouer(&self.db);
+        }
         Ok(count)
     }
 

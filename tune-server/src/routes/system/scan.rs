@@ -2692,6 +2692,12 @@ async fn spawn_library_scan_avec_lecteur(
         }
         drop(sqlite_write_guard);
 
+        // #5528 — APRÈS la purge et son COMMIT : les albums vidés ont disparu,
+        // les dossiers « Collections » suivent ceux dont les pistes sont
+        // passées dans un autre album. Hors de la transaction, qui ne doit pas
+        // porter une écriture de réglage.
+        tune_core::db::dossiers_des_collections::suivre_sans_echouer(&db);
+
         // #4896 — APRÈS la purge et son COMMIT : la ligne album d'un dossier
         // retouché suit ses balises, par la même règle que le surveillant.
         balises_vues.realigner(&db);
