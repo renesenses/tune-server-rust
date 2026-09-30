@@ -359,3 +359,153 @@ fn une_pochette_televersee_reste_prioritaire_5454() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #5454, suite — décision de Bertrand du 30/09/2026 : la règle de la majorité
+// vaut aussi pour un album regroupé par NOM DE DOSSIER (`use_folder_title`,
+// dossier fourre-tout : plusieurs artistes ET plusieurs étiquettes d'album).
+// Sa pochette était celle du premier fichier lu (Bebelalu55, forum 1312).
+// ---------------------------------------------------------------------------
+
+const DISQUE_X: &[u8] = b"\xFF\xD8\xFF\xE0POCHETTE-DU-DISQUE-X-5454";
+const DISQUE_Y: &[u8] = b"\xFF\xD8\xFF\xE0POCHETTE-DU-DISQUE-Y-5454";
+const DISQUE_Z: &[u8] = b"\xFF\xD8\xFF\xE0POCHETTE-DU-DISQUE-Z-5454";
+
+fn nom_du_disque(h: Option<&str>) -> &'static str {
+    match h {
+        None => "aucune",
+        Some(h) if h == content_hash(DISQUE_X) => "X",
+        Some(h) if h == content_hash(DISQUE_Y) => "Y",
+        Some(h) if h == content_hash(DISQUE_Z) => "Z",
+        Some(_) => "autre",
+    }
+}
+
+/// Une piste d'un dossier fourre-tout : son propre artiste, son propre album.
+fn piste_de_divers(
+    dossier: &Path,
+    numero: u32,
+    artiste: &str,
+    album: &str,
+    jaquette: &[u8],
+) -> ScannedFile {
+    let mut f = piste(dossier, numero, artiste, jaquette);
+    if let Some(m) = f.metadata.as_mut() {
+        m.artist = Some(artiste.to_string());
+        m.album = Some(album.to_string());
+        m.album_artist = None;
+    }
+    f
+}
+
+/// Joue `ordre` et rend (titre de l'album, sa pochette, pochette affichée par
+/// chaque piste de `fichiers`), en vérifiant que c'est bien UN album nommé
+/// d'après le dossier.
+fn jouer_le_fourre_tout(
+    tmp: &Path,
+    nom: &str,
+    fichiers: &[ScannedFile],
+    ordre: &[ScannedFile],
+) -> (String, &'static str, Vec<&'static str>) {
+    let db = base();
+    scanner(&db, &tmp.join(format!("cache-{nom}")), ordre, 100, false);
+    let pistes = TrackRepo::with_backend(db.clone());
+    let albums: std::collections::BTreeSet<i64> = fichiers
+        .iter()
+        .map(|f| {
+            pistes
+                .get_by_path(&f.path)
+                .unwrap()
+                .unwrap()
+                .album_id
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(albums.len(), 1, "montage : un seul album pour le dossier");
+    let aid = *albums.iter().next().unwrap();
+    let titre = AlbumRepo::with_backend(db.clone())
+        .get(aid)
+        .unwrap()
+        .unwrap()
+        .title;
+    let affichees = fichiers
+        .iter()
+        .map(|f| nom_du_disque(pochette_affichee(&db, f).as_deref()))
+        .collect();
+    (
+        titre,
+        nom_du_disque(pochette_album(&db, fichiers).as_deref()),
+        affichees,
+    )
+}
+
+/// Un dossier fourre-tout de trois disques différents : la piste 1 (disque Y)
+/// est lue la première, les pistes 2 et 3 portent la pochette du disque X.
+/// Deux contre un : l'album prend X, quel que soit l'ordre de lecture, et
+/// chaque piste garde SON image (#1284).
+///
+/// Rouge contre #5487 seule : le premier fichier lu donnait sa pochette au
+/// dossier.
+#[test]
+fn un_dossier_fourre_tout_prend_la_pochette_majoritaire_5454() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dossier = tmp.path().join("Divers");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let fichiers = vec![
+        piste_de_divers(&dossier, 1, "Brel", "Ces gens-là", DISQUE_Y),
+        piste_de_divers(&dossier, 2, "Ferré", "Avec le temps", DISQUE_X),
+        piste_de_divers(&dossier, 3, "Barbara", "L'Aigle noir", DISQUE_X),
+    ];
+    let mut ecarts = Vec::new();
+    for (nom, ordre) in ordres_de_lecture(&fichiers) {
+        let (titre, album, affichees) = jouer_le_fourre_tout(tmp.path(), &nom, &fichiers, &ordre);
+        assert_eq!(
+            titre, "Divers",
+            "montage : l'album est nommé d'après son dossier"
+        );
+        if album != "X" || affichees != ["Y", "X", "X"] {
+            ecarts.push(format!(
+                "ordre « {nom} » : album = {album}, affichage = {affichees:?}"
+            ));
+        }
+    }
+    assert!(
+        ecarts.is_empty(),
+        "#5454 : le dossier fourre-tout doit prendre la pochette de la MAJORITÉ de ses pistes \
+         (X, 2 contre 1), chaque piste gardant la sienne :\n{}",
+        ecarts.join("\n")
+    );
+}
+
+/// Trois disques, trois images : ÉGALITÉ, la première piste dans l'ordre du
+/// disque (numéro 1, disque Z) l'emporte, même lue en dernier.
+#[test]
+fn un_dossier_fourre_tout_a_egalite_prend_la_premiere_piste_du_disque_5454() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dossier = tmp.path().join("Divers");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let fichiers = vec![
+        piste_de_divers(&dossier, 1, "Brel", "Ces gens-là", DISQUE_Z),
+        piste_de_divers(&dossier, 2, "Ferré", "Avec le temps", DISQUE_X),
+        piste_de_divers(&dossier, 3, "Barbara", "L'Aigle noir", DISQUE_Y),
+    ];
+    let mut ecarts = Vec::new();
+    for (nom, ordre) in ordres_de_lecture(&fichiers) {
+        let (titre, album, affichees) = jouer_le_fourre_tout(tmp.path(), &nom, &fichiers, &ordre);
+        assert_eq!(
+            titre, "Divers",
+            "montage : l'album est nommé d'après son dossier"
+        );
+        if album != "Z" || affichees != ["Z", "X", "Y"] {
+            ecarts.push(format!(
+                "ordre « {nom} » : album = {album}, affichage = {affichees:?}"
+            ));
+        }
+    }
+    assert!(
+        ecarts.is_empty(),
+        "#5454 : à égalité, le dossier fourre-tout prend la pochette de la PREMIÈRE piste du \
+         disque (Z) :\n{}",
+        ecarts.join("\n")
+    );
+}
