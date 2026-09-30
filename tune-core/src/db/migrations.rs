@@ -2995,6 +2995,31 @@ fn combler_les_labels_d_album_sqlite(db: &SqliteDb) {
         Err(e) => warn!(error = %e, "albums_labels_repris_des_pistes_failed"),
     }
 }
+/// #5413 (régression v0.9.169) — la qualité des albums (format, fréquence,
+/// profondeur) recalée sur leurs pistes à CHAQUE démarrage, hors migration
+/// numérotée.
+///
+/// Ces colonnes étaient en comblement seul, figées au premier passage ; depuis
+/// que le filtre `?quality=` les lit (#5430), une bibliothèque ancienne ne
+/// rendait plus qu'un album sous « Hi-Res » (Rhorn, fil 2032). Même forme que
+/// [`combler_les_labels_d_album_sqlite`] : bornée aux albums qui changent, un
+/// second passage ne touche aucune ligne. Un échec est journalisé, jamais
+/// bloquant.
+fn recaler_la_qualite_des_albums_sqlite(db: &SqliteDb) {
+    let debut = std::time::Instant::now();
+    match db.execute(
+        &crate::db::album_repo::sql_recaler_la_qualite_des_albums(),
+        &[],
+    ) {
+        Ok(albums) => info!(
+            albums,
+            ms = debut.elapsed().as_millis() as u64,
+            "albums_qualite_recalee_sur_les_pistes"
+        ),
+        Err(e) => warn!(error = %e, "albums_qualite_recalee_sur_les_pistes_failed"),
+    }
+}
+
 /// Index de la CLÉ DE COPIE (#5138) : album, disque, numéro et titre replié,
 /// écrits EXACTEMENT comme le côté `mieux` de
 /// [`super::facet_filter::copie_de_moindre_qualite_exclue`].
@@ -3749,6 +3774,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     migrate_to_unified_queue(db);
 
     combler_les_labels_d_album_sqlite(db);
+    recaler_la_qualite_des_albums_sqlite(db);
 
     // #5192 — les termes de chemin dans `tracks_fts`. Passe rejouée à chaque
     // démarrage, sans numéro : elle lit `sqlite_master` et ne recrée l'index
@@ -4634,6 +4660,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             "pg_albums_labels_repris_des_pistes"
         ),
         Err(e) => warn!(error = %e, "pg_albums_labels_repris_des_pistes_failed"),
+    }
+
+    // #5413 — même passe que `recaler_la_qualite_des_albums_sqlite`, rejouée
+    // à chaque démarrage, sans numéro de migration.
+    let debut_qualite = std::time::Instant::now();
+    match sqlx::query(sqlx::AssertSqlSafe(
+        // Fragments constants seulement : aucune donnée n'entre dans ce texte.
+        crate::db::album_repo::sql_recaler_la_qualite_des_albums(),
+    ))
+    .execute(pool)
+    .await
+    {
+        Ok(r) => info!(
+            albums = r.rows_affected(),
+            ms = debut_qualite.elapsed().as_millis() as u64,
+            "pg_albums_qualite_recalee_sur_les_pistes"
+        ),
+        Err(e) => warn!(error = %e, "pg_albums_qualite_recalee_sur_les_pistes_failed"),
     }
 
     // #5192 — les termes de chemin dans `search_tsv`, même passe que SQLite :

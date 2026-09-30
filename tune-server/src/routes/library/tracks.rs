@@ -1482,16 +1482,18 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                     ecrire_lot_etendu(&meta_repo, &mut etendues);
             }
 
-            // Refresh album genre/quality from their tracks
-            backend_inner.execute_batch(
+            // Refresh album genre/quality from their tracks. La qualité passe
+            // par le fragment commun du scan et du démarrage (#5413) : format
+            // majoritaire, `MAX` sans les 0, valeur d'album gardée si aucune
+            // piste n'en porte.
+            backend_inner.execute_batch(&format!(
                 "UPDATE albums SET \
                  genre = (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1), \
                  genres = (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1), \
-                 format = (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1), \
-                 sample_rate = (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id), \
-                 bit_depth = (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id) \
+                 {} \
                  WHERE source = 'local' OR source IS NULL",
-            )
+                tune_core::db::album_repo::sql_qualite_reprise_des_pistes()
+            ))
             .ok();
             // #4836 : cette passe relit les étiquettes de toute la bibliothèque,
             // TPUB compris ; le label relu remonte sur l'album, en comblement
