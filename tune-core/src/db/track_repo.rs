@@ -2777,12 +2777,13 @@ impl TrackRepo {
                 extra.push_str(&format!(" AND t.format = '{f}'"));
             }
         }
-        match quality {
-            Some("dsd") => extra.push_str(" AND t.format IN ('dsd','dsf','dff')"),
-            Some("hires") => extra.push_str(" AND (t.sample_rate > 44100 OR t.bit_depth > 16)"),
-            Some("cd") => extra.push_str(" AND t.sample_rate = 44100 AND t.bit_depth = 16"),
-            Some("lossy") => extra.push_str(" AND t.format IN ('mp3','aac','ogg','opus','wma')"),
-            _ => {}
+        // #5413 : la MÊME règle que le badge d'album et que le filtre de la
+        // grille (`Album::quality_sql`), appliquée aux champs de la piste.
+        // Sans elle, un album que la grille rend sous « CD » (FLAC 48 kHz /
+        // 16 bits, badge `cd`) s'ouvrirait VIDE sous ce même filtre, l'ancien
+        // prédicat exigeant 44,1 kHz pile.
+        if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
+            extra.push_str(&format!(" AND {pred}"));
         }
         if extra.is_empty() {
             return self.list_by_album(album_id);
