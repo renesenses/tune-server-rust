@@ -562,7 +562,10 @@ mod presence;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
-pub(crate) use backend_de_la_sortie_5353::backend_affiche_de_la_zone;
+pub(crate) use backend_de_la_sortie_5353::{
+    backend_affiche_de_la_zone, backend_affiche_pour_la_sortie, backend_de_la_sortie_de_la_zone,
+    injecter_backend_de_sortie,
+};
 
 #[cfg(test)]
 mod debit_de_zone_tests;
