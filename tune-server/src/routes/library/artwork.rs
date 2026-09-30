@@ -530,6 +530,16 @@ pub(super) async fn enrich_album_artwork(
 }
 
 pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl IntoResponse {
+    demarrer_pochettes_albums(&state, crate::reprise_des_passes::Declencheur::Geste).await
+}
+
+/// Ouvrir la passe des pochettes d'albums manquantes. Le bouton y passe, et la
+/// reprise d'une passe coupée par un arrêt aussi (#5469). Une reprise ne passe
+/// pas par la garde du quota (voir `crate::reprise_des_passes`).
+pub(crate) async fn demarrer_pochettes_albums(
+    state: &AppState,
+    declencheur: crate::reprise_des_passes::Declencheur,
+) -> axum::response::Response {
     let cache_dir = artwork_cache_dir();
     let db = state.backend.clone();
 
@@ -548,8 +558,10 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
 
     // #2507 — jumelle « pochettes » de `enrich-artists` : c'est la moitié
     // pochettes de `POST /system/enrich`, qui est gardé. Même garde, après le
-    // raccourci « rien à faire ».
-    if let Err(refus) = crate::routes::system::gate_enrichment(&state).await {
+    // raccourci « rien à faire ». #5469 : une reprise n'est pas un geste.
+    if declencheur.garde_le_quota()
+        && let Err(refus) = crate::routes::system::gate_enrichment(state).await
+    {
         return refus.into_response();
     }
 
@@ -568,9 +580,21 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
         "Récupération des pochettes d'albums…",
         "enrichment",
     );
+    // #5469 — repère de reprise : effacé à la fin normale, et seulement là.
+    let jeton_de_reprise = crate::reprise_des_passes::noter_ouverture(
+        &state.backend,
+        crate::reprise_des_passes::Passe::PochettesAlbums,
+        None,
+        declencheur,
+    );
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
-        tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
+        tune_core::library::artwork::batch_enrich_artwork(db.clone(), cache_dir).await;
+        crate::reprise_des_passes::noter_fin(
+            &db,
+            crate::reprise_des_passes::Passe::PochettesAlbums,
+            &jeton_de_reprise,
+        );
     });
 
     (
@@ -986,6 +1010,16 @@ fn rendre_la_main_si_la_passe_n_a_pas_annonce_sa_fin(
 pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    demarrer_images_artistes(&state, crate::reprise_des_passes::Declencheur::Geste).await
+}
+
+/// Ouvrir la passe des images d'artistes manquantes. Le bouton y passe, et la
+/// reprise d'une passe coupée par un arrêt aussi (#5469). Une reprise ne passe
+/// pas par la garde du quota (voir `crate::reprise_des_passes`).
+pub(crate) async fn demarrer_images_artistes(
+    state: &AppState,
+    declencheur: crate::reprise_des_passes::Declencheur,
+) -> axum::response::Response {
     let cache_dir = artwork_cache_dir();
     let db = state.backend.clone();
 
@@ -1018,7 +1052,10 @@ pub(super) async fn batch_enrich_artist_artwork(
     // Posée APRÈS le raccourci « rien à faire » ci-dessus : un geste qui n'a
     // rien à enrichir ne consomme pas un des dix gestes du jour — même
     // principe que la portée invalide de `enrich_all_library`.
-    if let Err(refus) = crate::routes::system::gate_enrichment(&state).await {
+    // #5469 : une reprise n'est pas un geste, elle ne passe pas par le quota.
+    if declencheur.garde_le_quota()
+        && let Err(refus) = crate::routes::system::gate_enrichment(state).await
+    {
         return refus.into_response();
     }
 
@@ -1041,6 +1078,15 @@ pub(super) async fn batch_enrich_artist_artwork(
     );
     let bg_tasks = state.background_tasks.clone();
     let poll_db = state.backend.clone();
+    // #5469 — repère de reprise : effacé à la fin normale, et seulement là.
+    // Pas dans `FinDePasseArtistes` : ce `Drop` s'exécute aussi quand l'arrêt
+    // du serveur détruit la tâche, c'est-à-dire quand le repère doit rester.
+    let jeton_de_reprise = crate::reprise_des_passes::noter_ouverture(
+        &state.backend,
+        crate::reprise_des_passes::Passe::ImagesArtistes,
+        None,
+        declencheur,
+    );
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
 
@@ -1048,6 +1094,7 @@ pub(super) async fn batch_enrich_artist_artwork(
         // `tune-core` est posé APRÈS la boucle et deux sorties le sautent.
         let _fin = FinDePasseArtistes::nouvelle(poll_db.clone());
 
+        let db_fin = poll_db.clone();
         sous_suivi_davancement(bg_tasks, poll_db, async move {
             // Phase 1: Match artists without MBID by searching MusicBrainz
             let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
@@ -1057,6 +1104,11 @@ pub(super) async fn batch_enrich_artist_artwork(
             tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
         })
         .await;
+        crate::reprise_des_passes::noter_fin(
+            &db_fin,
+            crate::reprise_des_passes::Passe::ImagesArtistes,
+            &jeton_de_reprise,
+        );
     });
 
     (
@@ -1584,7 +1636,10 @@ mod garde_cablage_des_routes_images_artistes {
     /// complet rendrait vrai quoi qu'il arrive (#2082).
     fn corps_de(nom: &str) -> &'static str {
         const TOUT: &str = include_str!("artwork.rs");
-        let entete = format!("pub(super) async fn {nom}(");
+        // `pub(super)` pour les routes, `pub(crate)` pour le corps partagé avec
+        // la reprise des passes (#5469) : on cherche l'en-tête sans sa
+        // visibilité.
+        let entete = format!("async fn {nom}(");
         let debut = TOUT
             .find(&entete)
             .unwrap_or_else(|| panic!("route `{nom}` introuvable : ce garde ne protège plus rien"));
@@ -1606,8 +1661,14 @@ mod garde_cablage_des_routes_images_artistes {
             "la tranche ne contient pas la réponse de la reprise forcée"
         );
         assert!(
-            corps_de("batch_enrich_artist_artwork").contains("batch artist enrichment started"),
+            corps_de("demarrer_images_artistes").contains("batch artist enrichment started"),
             "la tranche ne contient pas la réponse de la passe des manquantes"
+        );
+        // #5469 — la route ne fait plus que déléguer au corps partagé avec la
+        // reprise des passes : c'est ce corps que les contrôles suivants lisent.
+        assert!(
+            corps_de("batch_enrich_artist_artwork").contains("demarrer_images_artistes("),
+            "la route des manquantes ne passe plus par `demarrer_images_artistes`"
         );
         assert!(
             !corps_de("force_refetch_artist_artwork").contains("batch artist enrichment started"),
@@ -1622,10 +1683,7 @@ mod garde_cablage_des_routes_images_artistes {
     /// des deux, puisqu'elle reprend TOUS les artistes.
     #[test]
     fn les_deux_routes_publient_leur_avancement() {
-        for route in [
-            "force_refetch_artist_artwork",
-            "batch_enrich_artist_artwork",
-        ] {
+        for route in ["force_refetch_artist_artwork", "demarrer_images_artistes"] {
             assert!(
                 corps_de(route).contains("sous_suivi_davancement("),
                 "`{route}` ne monte plus le suivi d'avancement : l'indicateur global \
@@ -1639,10 +1697,7 @@ mod garde_cablage_des_routes_images_artistes {
     /// reprise forcée c'est le SEUL signal de fin que le client possède.
     #[test]
     fn les_deux_routes_garantissent_une_fin_annoncee() {
-        for route in [
-            "force_refetch_artist_artwork",
-            "batch_enrich_artist_artwork",
-        ] {
+        for route in ["force_refetch_artist_artwork", "demarrer_images_artistes"] {
             assert!(
                 corps_de(route).contains("FinDePasseArtistes::nouvelle("),
                 "`{route}` n'installe plus le garde de fin : une passe interrompue \

@@ -20,6 +20,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // 120 s avant leur premier lot, mais l'ordre ne doit rien à cette marge :
     // un traitement suspendu ne repart pas de lui-même, point.
     tune_core::taches_de_fond::hydrater(&state.backend);
+    // #5469 — APRÈS `hydrater` : une passe d'enrichissement coupée par
+    // l'arrêt précédent repart, et si elle était en pause elle se gare à sa
+    // première frontière au lieu de travailler. Un test de câblage garde la
+    // ligne (`reprise_des_passes`).
+    crate::reprise_des_passes::spawn(state);
     spawn_squeezebox_poller(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
