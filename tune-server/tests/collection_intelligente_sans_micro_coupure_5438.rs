@@ -89,10 +89,16 @@ fn remplir_au_profil_du_testeur(state: &AppState) -> i64 {
     for al in 1..=albums {
         let genre = GENRES[(al % GENRES.len() as i64) as usize];
         sql.push_str(&format!(
-            "INSERT INTO albums (id, title, artist_id, source, genre, year) \
-             VALUES ({al}, 'Album {al}', {}, 'local', '{genre}', {});\n",
+            "INSERT INTO albums (id, title, artist_id, source, genre, year, cover_path) \
+             VALUES ({al}, 'Album {al}', {}, 'local', '{genre}', {}, {});\n",
             al % ARTISTES + 1,
             1950 + al % 70,
+            // Un album sur cinq sans pochette : la mosaïque doit les sauter.
+            if al % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'/pochettes/{al}.jpg'")
+            },
         ));
     }
     for id in 1..=PISTES {
@@ -225,7 +231,7 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
     let dossier = tempfile::tempdir().unwrap();
     let chemin = dossier.path().join("tune.db");
 
-    let (addr, albums, collections, backend) = rt.block_on(async {
+    let (addr, albums, collections, backend, bus) = rt.block_on(async {
         let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
         let albums = remplir_au_profil_du_testeur(&state);
         let collections: Vec<(i64, String)> = state
@@ -235,13 +241,21 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
             .into_iter()
             .map(|r| (r[0].as_i64().unwrap(), r[1].as_string().unwrap()))
             .collect();
+        // Un dossier manuel, trois de ses albums sans pochette (5, 10, 20).
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "collections",
+                r#"[{"id":1,"name":"Soirée","album_ids":[5,10,3,7,12,20,1,44,61]}]"#,
+            )
+            .unwrap();
         mesurer_la_resolution_seule(&state);
         let backend = state.backend.clone();
+        let bus = state.event_bus.clone();
         let app = tune_server::routes::router(state).route("/banc/flux", get(flux));
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = ecoute.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
-        (addr, albums, collections, backend)
+        (addr, albums, collections, backend, bus)
     });
     assert!(
         collections.len() >= 8,
@@ -398,6 +412,10 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
         "le rail compte les pistes que la liste annonce"
     );
 
+    // Le client d'aujourd'hui : la liste porte ses pochettes (#5438, suite).
+    // L'écran n'a plus à demander `/{id}/albums` pour CHAQUE collection.
+    ouvrir_l_ecran_une_seconde_fois(addr, &collections, liste, &backend, &bus, albums);
+
     // Le flux.
     assert!(
         pire_silence < SEUIL_SILENCE,
@@ -405,5 +423,165 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
          intelligente : une lecture synchrone tient les {FILS_EXECUTEUR} fils de \
          l'exécuteur (#5438)",
         pire_silence.as_millis()
+    );
+}
+
+/// `quatreDistinctes` du client web (`src/lib/mosaique.ts`), réécrite ici À
+/// PART de celle du serveur : sinon le test comparerait une fonction à
+/// elle-même.
+fn quatre_distinctes_du_client(albums: &Value) -> Vec<String> {
+    fn sans_suffixe(t: &str) -> &str {
+        let mut t = t.trim();
+        loop {
+            let ouvrant = match t.chars().last() {
+                Some(')') => '(',
+                Some(']') => '[',
+                _ => return t,
+            };
+            let Some(i) = t.rfind(ouvrant) else { return t };
+            let reste = t[..i].trim_end();
+            if reste.is_empty() {
+                return t;
+            }
+            t = reste;
+        }
+    }
+    let (mut vues, mut cles) = (Vec::<String>::new(), Vec::<String>::new());
+    for a in albums.as_array().unwrap() {
+        let Some(c) = a["cover_path"].as_str().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let base = sans_suffixe(a["title"].as_str().unwrap_or(""));
+        let cle = if base.is_empty() { c } else { base }.to_lowercase();
+        if cles.contains(&cle) || vues.iter().any(|v| v == c) {
+            continue;
+        }
+        cles.push(cle);
+        vues.push(c.to_string());
+        if vues.len() == 4 {
+            break;
+        }
+    }
+    vues
+}
+
+/// Deuxième ouverture de l'écran des collections, par un client qui lit les
+/// `covers` de la liste : DEUX requêtes au lieu de deux plus une par
+/// collection, des comptes servis par le cache, et justes après un scan.
+fn ouvrir_l_ecran_une_seconde_fois(
+    addr: SocketAddr,
+    collections: &[(i64, String)],
+    premiere_liste: &Value,
+    backend: &Arc<dyn tune_core::db::backend::DbBackend>,
+    bus: &tune_core::event_bus::EventBus,
+    albums: i64,
+) {
+    // (a) Les pochettes de la liste sont celles que le client tirait de
+    // `/{id}/albums` : même albums, même ordre, même règle.
+    for (id, nom) in collections {
+        let fiche = premiere_liste
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_i64() == Some(*id))
+            .unwrap();
+        let (statut, grille) = obtenir(
+            addr,
+            &format!("/api/v1/library/smart-collections/{id}/albums"),
+        );
+        assert_eq!(statut, 200);
+        let attendu: Vec<Value> = quatre_distinctes_du_client(&grille)
+            .into_iter()
+            .map(Value::from)
+            .collect();
+        assert_eq!(
+            fiche["covers"],
+            Value::Array(attendu),
+            "« {nom} » : la liste doit porter les pochettes que l'écran composait lui-même"
+        );
+    }
+    let (statut, dossiers) = obtenir(addr, "/api/v1/library/collections");
+    assert_eq!(statut, 200);
+    let dossiers = dossiers.as_array().unwrap();
+    assert_eq!(dossiers.len(), 1, "{dossiers:?}");
+    let (_, grille) = obtenir(addr, "/api/v1/library/collections/1/albums");
+    let attendu: Vec<Value> = quatre_distinctes_du_client(&grille)
+        .into_iter()
+        .map(Value::from)
+        .collect();
+    assert_eq!(attendu.len(), 4, "le banc : quatre pochettes à trouver");
+    assert_eq!(
+        dossiers[0]["covers"],
+        Value::Array(attendu),
+        "le dossier manuel doit porter les pochettes que l'écran composait lui-même"
+    );
+
+    // (b) L'écran rouvert : deux requêtes, et les comptes viennent du cache.
+    let t0 = Instant::now();
+    let (s1, _) = obtenir(addr, "/api/v1/library/collections");
+    let (s2, liste) = obtenir(addr, "/api/v1/library/smart-collections");
+    let reouverture = t0.elapsed();
+    assert_eq!((s1, s2), (200, 200));
+    eprintln!(
+        "#5438 : écran rouvert en 2 requêtes au lieu de {} : {:.0} ms",
+        2 + collections.len() + dossiers.len(),
+        reouverture.as_secs_f64() * 1e3
+    );
+    let jazz = |liste: &Value| -> (i64, i64) {
+        let f = liste
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str().is_some_and(|n| n.contains("Jazz")))
+            .unwrap()
+            .clone();
+        (
+            f["album_count"].as_i64().unwrap(),
+            f["track_count"].as_i64().unwrap(),
+        )
+    };
+    let avant = jazz(&liste);
+    assert_eq!(
+        avant,
+        jazz(premiere_liste),
+        "le cache rend ce qui a été compté"
+    );
+
+    // (c) Un scan ajoute un album de jazz de douze pistes. Tant que rien n'est
+    // annoncé, le cache garde l'ancien compte — c'est lui qu'on lit.
+    let al = albums + 1;
+    let mut sql = format!(
+        "BEGIN; INSERT INTO albums (id, title, artist_id, source, genre, year, cover_path) \
+         VALUES ({al}, 'Album {al}', 1, 'local', 'Jazz', 2026, '/pochettes/{al}.jpg');"
+    );
+    for n in 1..=12 {
+        let id = PISTES + n;
+        sql.push_str(&format!(
+            "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number, \
+             file_path, format, sample_rate, bit_depth, source, genre, duration_ms) \
+             VALUES ({id}, 'Nouvelle {n}', {al}, 1, 1, {n}, '/musique/nouveau/{n}.flac', \
+             'flac', 44100, 24, 'local', 'Jazz', 240000);"
+        ));
+    }
+    sql.push_str("COMMIT;");
+    backend.execute_batch(&sql).unwrap();
+    let (_, liste) = obtenir(addr, "/api/v1/library/smart-collections");
+    assert_eq!(
+        jazz(&liste),
+        avant,
+        "sans annonce, le compte vient du cache"
+    );
+
+    // Le scan l'annonce comme `auto_scan` le fait en fin de lot.
+    bus.emit_typed(
+        tune_core::event_types::EventType::LibraryUpdated,
+        serde_json::json!({ "source": "banc_5438" }),
+    );
+    let (_, liste) = obtenir(addr, "/api/v1/library/smart-collections");
+    assert_eq!(
+        jazz(&liste),
+        (avant.0 + 1, avant.1 + 12),
+        "après `library.updated`, la liste doit compter l'album scanné : un compte \
+         resté en cache après un scan (#5438)"
     );
 }

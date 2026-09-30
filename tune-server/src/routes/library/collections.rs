@@ -156,6 +156,34 @@ fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
         .collect()
 }
 
+/// Les pochettes de la mosaïque d'un dossier — #5438.
+///
+/// Le client les composait en demandant `/collections/{id}/albums` pour CHAQUE
+/// dossier sans `covers`, dans l'ordre par défaut de cette route (artiste
+/// croissant), puis en y prenant quatre pochettes distinctes. Même ordre, même
+/// règle ([`tune_core::library::mosaique::quatre_distinctes`]) : la mosaïque
+/// ne change pas, et l'écran n'a plus à lancer une requête par dossier.
+///
+/// Un album illisible est simplement sauté : une vignette n'a pas à faire
+/// échouer la liste des dossiers.
+fn pochettes_du_dossier(repo: &AlbumRepo, vivants: &[i64]) -> Vec<String> {
+    let mut albums: Vec<tune_core::db::models::Album> = vivants
+        .iter()
+        .filter_map(|&id| repo.get(id).ok().flatten())
+        .collect();
+    sort_albums(
+        &mut albums,
+        CollectionSort::parse(None),
+        CollectionOrder::parse(None),
+    );
+    tune_core::library::mosaique::quatre_distinctes(
+        albums
+            .iter()
+            .map(|a| (Some(a.title.as_str()), a.cover_path.as_deref())),
+        4,
+    )
+}
+
 /// Rend un dossier tel qu'il est SERVI : `album_ids` réduit aux albums encore
 /// présents, et les identifiants morts dits à voix haute.
 ///
@@ -176,6 +204,7 @@ fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
 /// que personne l'ait demandé. On signale, on ne détruit pas.
 fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError> {
     let (vivants, morts) = partager_ids(repo, &ids_stockes(collection))?;
+    let covers = pochettes_du_dossier(repo, &vivants);
     if !morts.is_empty() {
         tracing::warn!(
             "dossier {:?}: {} identifiant(s) d'album sans album en base: {morts:?} (#3285)",
@@ -191,6 +220,7 @@ fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError
         obj.insert("orphan_album_count".into(), json!(morts.len()));
         obj.insert("orphan_albums".into(), json!(manquants));
         obj.insert("album_ids".into(), json!(vivants));
+        obj.insert("covers".into(), json!(covers));
         // Les étiquettes sont une RÉSERVE, pas une donnée d'écran : un
         // dossier de 2 000 albums doublerait la réponse pour rien.
         obj.remove(ETIQUETTES);

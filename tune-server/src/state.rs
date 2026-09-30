@@ -49,6 +49,11 @@ pub struct AppState {
     /// lecteurs pendant chaque balayage réseau (#1432).
     pub scanner: Arc<SsdpScanner>,
     pub event_bus: Arc<EventBus>,
+    /// Les comptes et pochettes de la liste des collections intelligentes, en
+    /// cache jusqu'au prochain événement de bibliothèque (#5438). Tenu ici et
+    /// non en `static` : chaque état a sa base, et un test ne pollue pas le
+    /// suivant.
+    pub comptes_collections: Arc<tune_smart_http::comptes::CacheDesComptes>,
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
@@ -195,9 +200,11 @@ impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
         // #4473 — le module des règles ne connaît aucun service ; c'est ici,
         // où le registre existe, qu'on lui donne de quoi interroger un
         // catalogue. La frontière de crate reste fermée.
-        Self::new(state.backend.clone()).avec_catalogue(std::sync::Arc::new(
-            crate::catalogue_services::CatalogueDuRegistre::new(state.services.clone()),
-        ))
+        Self::new(state.backend.clone())
+            .avec_catalogue(std::sync::Arc::new(
+                crate::catalogue_services::CatalogueDuRegistre::new(state.services.clone()),
+            ))
+            .avec_comptes(state.comptes_collections.clone())
     }
 }
 
@@ -494,6 +501,11 @@ impl AppState {
             license.clone(),
         )));
 
+        // Abonné AVANT que rien ne soit émis : aucune invalidation manquée.
+        let comptes_collections = Arc::new(tune_smart_http::comptes::CacheDesComptes::new(
+            event_bus.subscribe(),
+        ));
+
         Ok(Self {
             db: sqlite_db,
             backend,
@@ -504,6 +516,7 @@ impl AppState {
             orchestrator,
             scanner,
             event_bus,
+            comptes_collections,
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             upnp: Some(upnp),
