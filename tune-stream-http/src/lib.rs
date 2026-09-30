@@ -480,19 +480,100 @@ pub async fn handle_stream(
     // entendue sur tout DSD converti (.42, Locatelli/Abacab, 24/08). Le canal
     // est séquentiel : la reprise à N est exactement la suite du direct, on
     // l'honore donc avec un vrai 206 dont le Content-Range part de N.
-    let finite_range_start = req_headers
+    let wav_header_included = session
+        .wav_header_included
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let long_wav = is_wav
+        && !is_radio
+        && tune_core::audio::wav::wav_stream_needs_indeterminate_length(
+            session.info.channels,
+            session.info.sample_rate,
+            session.info.bit_depth,
+            session.info.duration_ms,
+        );
+    let preparer = corriger_entete_long(long_wav);
+
+    // ── #5426 — une reprise EN DEÇÀ de ce que le tuyau a déjà rendu ──
+    //
+    // Zone navigateur (Firefox 140, Docker Debian, fil 2034) : après une
+    // série de `stream_delivery_stall`, le navigateur revient avec
+    // `bytes=45289018-` alors que 51 904 556 octets étaient déjà partis — et
+    // cinq fois sur cinq dans le journal, APRÈS que le canal s'était vidé.
+    // Le tuyau n'avait plus rien à rendre : un 206 annonçant 6 Mo, sans un
+    // octet. Le lecteur se taisait ; l'horloge de la zone, elle, avançait.
+    //
+    // La retenue (`StreamSession::relire`) garde les derniers octets tirés du
+    // canal : une reprise qui tombe dedans est servie À L'OCTET, puis le
+    // direct reprend. Ne vaut que là où la position du canal EST celle du flux
+    // (le producteur émet son en-tête, ou pas de WAV), hors radio et hors ICY.
+    let retenue_possible = !is_radio
+        && !(wants_icy && (session.track_title.is_some() || session.track_artist.is_some()))
+        && !(is_wav && !wav_header_included);
+    let seuil_de_reprise = if is_wav { 44 } else { 1 };
+    let range_demande = req_headers
         .get("Range")
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_range_start)
-        .filter(|s| wav_length.is_none_or(|len| *s < len));
-    let use_partial = finite_range_start.is_some() && wav_length.is_some();
+        .and_then(parse_range_start);
+    let mut longueur = wav_length;
+    let mut reprise_exacte: Option<u64> = None;
+    if let (Some(n), Some(_), true) = (range_demande, wav_length, retenue_possible)
+        && n >= seuil_de_reprise
+    {
+        let (retenue_debut, retenue_fin) = session.etendue_retenue();
+        if n < retenue_fin && n >= retenue_debut {
+            // Le canal fermé et vidé, la longueur VRAIE est connue : c'est
+            // elle qu'on annonce, pas la déduction par la durée, sans quoi le
+            // corps finirait avant son Content-Length.
+            let fin = session.vider_si_ferme(&preparer);
+            if let Some(fin) = fin {
+                longueur = Some(fin);
+            }
+            reprise_exacte = Some(n);
+            info!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                fin = ?fin,
+                "reprise_rejouee_depuis_la_retenue — le client reprend en deçà de ce que le \
+                 tuyau a déjà rendu ; servi à l'octet depuis la retenue (#5426)"
+            );
+        } else if n < retenue_fin {
+            warn!(
+                stream_id,
+                reprise = n,
+                retenue_debut,
+                retenue_fin,
+                "reprise_hors_retenue — le client reprend avant le début de la retenue : \
+                 la suite du tuyau part sous l'offset demandé, en phase de trame (#5426)"
+            );
+        } else if let Some(fin) = session.fin_du_canal()
+            && n >= fin
+        {
+            info!(
+                stream_id,
+                reprise = n,
+                fin,
+                "reprise_au_dela_de_la_fin — 416 : le canal est fini, il n'y a rien après (#5426)"
+            );
+            let mut h = HeaderMap::new();
+            h.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes */{fin}")).unwrap(),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, h).into_response();
+        }
+    }
+
+    let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
+    let use_partial = finite_range_start.is_some() && longueur.is_some();
 
     // Pas d'`Accept-Ranges` sur une conversion : ce serait inviter le renderer
     // à seeker un tuyau. Le contrat annoncé est celui de la DIDL et du HEAD :
     // DLNA.ORG_OP=00, streaming séquentiel. Les 206 ci-dessous restent pour les
     // renderers qui sondent (`bytes=0-`, Marantz) ou reprennent une tranche
     // exacte malgré tout — mieux qu'un 200 menteur, jamais une invitation.
-    if let Some(len) = wav_length {
+    if let Some(len) = longueur {
         headers.insert(
             "contentFeatures.dlna.org",
             HeaderValue::from_static(
@@ -636,12 +717,6 @@ pub async fn handle_stream(
     let icy_cover = session.cover_url.clone();
     let icy_stream_id = stream_id.to_string();
 
-    let wav_header_included = session
-        .wav_header_included
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let long_wav = is_wav
-        && !is_radio
-        && tune_core::audio::wav::wav_stream_needs_indeterminate_length(ch, sr, bd, dur_ms);
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -949,8 +1024,11 @@ pub async fn handle_stream(
             } else {
                 0
             };
-            let mut a_remettre_en_phase =
-                debut_demande.filter(|_| saute_entete && trame_de_sortie > 1);
+            let mut a_remettre_en_phase = debut_demande
+                .filter(|_| saute_entete && trame_de_sortie > 1 && reprise_exacte.is_none());
+            // #5426 — prochaine position à servir depuis la retenue ; `None`
+            // hors reprise, ou une fois la retenue rattrapée par le direct.
+            let mut reprise = reprise_exacte;
             // Le doublon d'en-tête ne se juge que sur le PREMIER bloc du canal :
             // au-delà, `RIFF` au début d'un bloc est de l'audio.
             let mut doublon_d_entete_juge = false;
@@ -1010,11 +1088,59 @@ pub async fn handle_stream(
                     }
                 }
 
+                // ── #5426 — servir la reprise depuis la retenue ──
+                //
+                // Tant que la position demandée est derrière le bout de la
+                // retenue, les octets sortent de là, à l'octet. Au bout, on
+                // tire le canal : le bloc reçu est retenu AVANT d'être rendu
+                // ici, et le tour suivant le relit — un seul chemin, donc
+                // aucune position servie deux fois ni sautée.
+                if let Some(position) = reprise {
+                    match session.relire(position, MIN_HTTP_CHUNK) {
+                        tune_core::http::streamer::Relecture::Octets(octets) => {
+                            reprise = Some(position + octets.len() as u64);
+                            coalesce_buf.extend_from_slice(&octets);
+                            while coalesce_buf.len() >= MIN_HTTP_CHUNK {
+                                let flushed: Vec<u8> =
+                                    coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                                session.debut_attente_transport();
+                                yield Ok(bytes::Bytes::from(flushed));
+                                attente_transport += session.fin_attente_transport();
+                            }
+                            continue;
+                        }
+                        tune_core::http::streamer::Relecture::AuBout => {}
+                        tune_core::http::streamer::Relecture::Evincee { debut } => {
+                            // Lu trop lentement : la fenêtre a glissé. Retour
+                            // au comportement du tuyau, en phase de trame.
+                            warn!(
+                                stream_id = %session.id,
+                                position,
+                                retenue_debut = debut,
+                                "reprise_hors_retenue — la fenêtre a glissé pendant la reprise (#5426)"
+                            );
+                            reprise = None;
+                            if trame_de_sortie > 1 {
+                                a_remettre_en_phase = Some(position);
+                            }
+                        }
+                    }
+                }
+
                 let avant_recv = tokio::time::Instant::now();
                 tokio::select! {
                     biased;
                     _ = &mut superseded => continue,
-                    maybe_chunk = session.recv_chunk() => {
+                    maybe_chunk = async {
+                        if retenue_possible {
+                            session
+                                .recv_chunk_retenu(&preparer)
+                                .await
+                                .map(|(position, bloc)| (Some(position), bloc))
+                        } else {
+                            session.recv_chunk().await.map(|bloc| (None, bloc))
+                        }
+                    } => {
                         let attente_producteur = avant_recv.elapsed();
                         if session.note_delivery_stall(attente_producteur, attente_transport) {
                             // `channel_max = 0` ne peut pas décrire un canal
@@ -1043,7 +1169,7 @@ pub async fn handle_stream(
                             );
                         }
                         attente_transport = std::time::Duration::ZERO;
-                        let Some(mut chunk) = maybe_chunk else {
+                        let Some((position_du_bloc, mut chunk)) = maybe_chunk else {
                             // Canal fermé : fin de piste. Vider ce qui reste.
                             if !coalesce_buf.is_empty() {
                                 let restant = std::mem::take(&mut coalesce_buf);
@@ -1087,9 +1213,19 @@ pub async fn handle_stream(
                         // Où ce bloc se trouve-t-il DANS LE FLUX ? Le compteur
                         // avance de tout ce qui est tiré du canal, en-tête
                         // compris : c'est la position du tuyau.
-                        let debut_du_bloc = session
-                            .octets_du_canal
-                            .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        let debut_du_bloc = match position_du_bloc {
+                            // Déjà positionné (et retenu) sous le verrou du canal.
+                            Some(position) => position,
+                            None => session.octets_du_canal.fetch_add(
+                                chunk.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ),
+                        };
+                        // En reprise, le bloc vient d'entrer dans la retenue :
+                        // le tour suivant le sert à sa place.
+                        if reprise.is_some() {
+                            continue;
+                        }
                         // Mettre l'en-tête de côté au passage, pour les
                         // connexions suivantes. `set` n'écrit qu'une fois.
                         if is_wav
@@ -1166,6 +1302,27 @@ pub async fn handle_stream(
     };
 
     (status, headers, body).into_response()
+}
+
+/// #4016 — l'en-tête d'un WAV progressif long porte des tailles « inconnues »
+/// (~2 Gio) : on les pose à `u32::MAX` sur le PREMIER bloc du canal, avant
+/// qu'il soit retenu ou mis en réserve, pour que sondes, reprises et
+/// reconnexions reçoivent le même conteneur. Idempotent.
+fn corriger_entete_long(long_wav: bool) -> impl Fn(u64, &mut Vec<u8>) + Send + Sync + 'static {
+    move |debut: u64, bloc: &mut Vec<u8>| {
+        if long_wav
+            && debut == 0
+            && bloc.len() >= 44
+            && bloc.starts_with(b"RIFF")
+            && &bloc[8..12] == b"WAVE"
+            && &bloc[12..16] == b"fmt "
+            && bloc[16..20] == 16u32.to_le_bytes()
+            && &bloc[36..40] == b"data"
+        {
+            bloc[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            bloc[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+    }
 }
 
 // ─── File serving with Range ────────────────────────────────────
@@ -4679,6 +4836,9 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod long_wav_4016;
+
+#[cfg(test)]
+mod reprise_navigateur_5426;
 
 /// #4645 — la mesure du terrain perdu pendant le service d'un fichier.
 ///
