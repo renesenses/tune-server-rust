@@ -3277,3 +3277,7 @@ mod surveillant_metadonnees_tests_5346;
 #[cfg(test)]
 #[path = "compteur_demarrage_tests_5371.rs"]
 mod compteur_demarrage_tests_5371;
+
+#[cfg(test)]
+#[path = "coffret_manuel_scan_tests_5319.rs"]
+mod coffret_manuel_scan_tests_5319;

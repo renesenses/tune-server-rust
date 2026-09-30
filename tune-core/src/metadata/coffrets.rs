@@ -63,6 +63,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::library::local_path::{dossier_comparable, dossier_et_nom};
+
 /// Un album, réduit à ce que le regroupement regarde.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlbumAGrouper {
@@ -381,9 +383,16 @@ fn rogner_separateurs(s: &str) -> String {
 }
 
 /// Le parent d'un dossier, et son nom de feuille.
+///
+/// 🔴 #5318 — la coupe sur `/` seul rendait, sous Windows, un parent VIDE et
+/// le chemin entier pour feuille (`C:\Musique\X\CD1`) : aucun disque n'avait
+/// de frère. La coupe est celle de [`dossier_et_nom`] ; le parent est rendu
+/// sous sa forme [`dossier_comparable`] (lecteur en capitale, `\` unifié),
+/// parce qu'il sert de CLÉ de fraternité et d'identité du coffret. Un chemin
+/// POSIX sort à l'identique.
 fn parent_et_feuille(dossier: &str) -> (String, String) {
-    match dossier.rsplit_once('/') {
-        Some((p, f)) => (p.to_string(), f.to_string()),
+    match dossier_et_nom(dossier) {
+        Some((p, f)) => (dossier_comparable(p).into_owned(), f.to_string()),
         None => (String::new(), dossier.to_string()),
     }
 }
@@ -1088,5 +1097,55 @@ mod tests {
             titre_commun(&t(&["Pulse (disque 1)", "Pulse (disque 2)"])),
             Some("Pulse".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #5318 — serveur Windows : `tracks.file_path` porte des antislashs.
+    // -----------------------------------------------------------------
+
+    /// Le rangement du *Messiah* de Marco Polo (fil 2009), sur son lecteur.
+    #[test]
+    fn deux_dossiers_freres_sous_windows_font_un_coffret() {
+        let m = r"D:\Musique\Handel - Messiah, Gardiner (Philips 2CD)";
+        let c = coffrets(&[
+            alb(1, "Messiah - Gardiner - CD1", &format!(r"{m}\CD1")),
+            alb(2, "Messiah - Gardiner - CD2", &format!(r"{m}\CD2")),
+        ]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].cible(), Some(1));
+        assert_eq!(c[0].absorbes(), vec![2]);
+        assert_eq!(c[0].parent, m, "le parent est le dossier commun");
+    }
+
+    #[test]
+    fn un_partage_reseau_windows_fait_un_coffret() {
+        let m = r"\\NAS\Musique\Bach - Gardiner Vol 21";
+        let c = coffrets(&[
+            alb(1, "Gardiner Vol 21, Disc 1", &format!(r"{m}\Disc 1")),
+            alb(2, "Gardiner Vol 21, Disc 2", &format!(r"{m}\Disc 2")),
+        ]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].parent, m);
+    }
+
+    /// La casse du lecteur et le séparateur ne séparent pas deux frères.
+    #[test]
+    fn la_casse_du_lecteur_ne_separe_pas_deux_freres() {
+        let c = coffrets(&[
+            alb(1, "Pulse CD1", r"c:\Musique\Pink Floyd\Pulse CD1"),
+            alb(2, "Pulse CD2", r"C:/Musique\Pink Floyd\Pulse CD2"),
+        ]);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].parent, r"C:\Musique\Pink Floyd");
+    }
+
+    /// Deux lecteurs différents ne sont pas frères, même au chemin près.
+    #[test]
+    fn deux_lecteurs_ne_sont_pas_freres() {
+        let c = coffrets(&[
+            alb(1, "Pulse CD1", r"C:\Musique\Pulse CD1"),
+            alb(2, "Pulse CD2", r"D:\Musique\Pulse CD2"),
+        ]);
+        assert!(c.is_empty(), "{c:?}");
     }
 }

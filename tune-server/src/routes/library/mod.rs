@@ -356,6 +356,11 @@ pub fn router() -> Router<AppState> {
         // le geste qui défait un coffret automatique (GO du 25/09/2026).
         .route("/coffrets", get(albums::lister_coffrets))
         .route("/coffrets/{id}/defaire", post(albums::defaire_coffret))
+        // Défaire un coffret composé À LA MAIN (#5319, décision du 29/09).
+        .route(
+            "/coffrets/{id}/defaire-manuel",
+            post(edition::defaire_coffret_manuel),
+        )
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
@@ -382,6 +387,7 @@ pub fn router() -> Router<AppState> {
             "/albums/{id}/edition/write-tags",
             post(edition_balises::ecrire_balises),
         )
+        .route("/albums/{id}/edition/retablir", post(edition::retablir))
         .route("/albums/{id}/discs/attach", post(edition::attacher))
         .route(
             "/albums/{id}/discs/{number}/detach",

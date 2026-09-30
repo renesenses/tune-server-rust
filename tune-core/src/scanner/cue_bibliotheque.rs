@@ -43,9 +43,11 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::cue_album::{AlbumCue, InventaireCue, PisteCue, PlanCue, inventorier_avec};
+use crate::db::album_metadata_repo::AlbumMetadataRepo;
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
 use crate::db::backend::DbBackend;
+use crate::db::edition_album::Tenues;
 use crate::db::models::Track;
 use crate::db::track_repo::TrackRepo;
 
@@ -333,6 +335,29 @@ fn annee_en_nombre(brut: &str) -> Option<i32> {
     chiffres.parse::<i32>().ok().filter(|a| *a > 0)
 }
 
+/// Ce dont [`ecrire_album`] a besoin, construit une fois par passe.
+struct Depots {
+    artistes: ArtistRepo,
+    albums: AlbumRepo,
+    pistes: TrackRepo,
+    metadonnees: AlbumMetadataRepo,
+    /// Ce que l'utilisateur a tenu à la main (#5319).
+    tenues: Tenues,
+}
+
+impl Depots {
+    fn pour(db: &Arc<dyn DbBackend>) -> Self {
+        Self {
+            artistes: ArtistRepo::with_backend(db.clone()),
+            albums: AlbumRepo::with_backend(db.clone()),
+            pistes: TrackRepo::with_backend(db.clone()),
+            metadonnees: AlbumMetadataRepo::with_backend(db.clone()),
+            // Une lecture par passe, comme au scan ordinaire (`TrackImporter`).
+            tenues: Tenues::charger(db),
+        }
+    }
+}
+
 /// Ce qu'un album qui ne vient pas d'une feuille CUE impose à ses lignes.
 ///
 /// Une image SACD (#5297) décrit elle-même ses propriétés audio : la sonde
@@ -348,36 +373,29 @@ struct Imposition<'a> {
 fn ecrire_album(
     dossier: &Path,
     album: &AlbumCue,
-    artist_repo: &ArtistRepo,
-    album_repo: &AlbumRepo,
-    track_repo: &TrackRepo,
+    depots: &Depots,
     bilan: &mut BilanCue,
     images_couvertes: &mut HashSet<PathBuf>,
 ) {
-    ecrire_album_avec(
-        dossier,
-        album,
-        artist_repo,
-        album_repo,
-        track_repo,
-        bilan,
-        images_couvertes,
-        None,
-    );
+    ecrire_album_avec(dossier, album, depots, bilan, images_couvertes, None);
 }
 
 /// [`ecrire_album`], avec ce qu'impose une source autre qu'une feuille.
-#[allow(clippy::too_many_arguments)]
 fn ecrire_album_avec(
     dossier: &Path,
     album: &AlbumCue,
-    artist_repo: &ArtistRepo,
-    album_repo: &AlbumRepo,
-    track_repo: &TrackRepo,
+    depots: &Depots,
     bilan: &mut BilanCue,
     images_couvertes: &mut HashSet<PathBuf>,
     imposition: Option<&Imposition<'_>>,
 ) {
+    let Depots {
+        artistes: artist_repo,
+        albums: album_repo,
+        pistes: track_repo,
+        metadonnees: tenues_meta,
+        tenues,
+    } = depots;
     if album.pistes.is_empty() {
         return;
     }
@@ -449,7 +467,23 @@ fn ecrire_album_avec(
     // On n'écrase QUE si la feuille porte un vrai `TITLE` : `titre_album`
     // retombe sinon sur le nom du dossier, et remplacer un titre par un repli
     // serait une régression.
-    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref()) {
+    //
+    // 🔴 #5319 — SAUF sur un album que l'utilisateur a composé ou disposé à la
+    // main (un coffret réunissant plusieurs feuilles : la feuille de CE
+    // dossier ne décrit plus l'album entier), ni sur un titre qu'il a
+    // lui-même tenu (`edition_manuelle`, la règle de
+    // `AlbumRepo::realigner_sur_les_balises`).
+    let titre_tenu = |id: i64| {
+        tenues.albums_disposes().contains(&id)
+            || tenues_meta
+                .champs_edites_a_la_main(id)
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c == "title")
+    };
+    if let (Some(id), Some(titre_feuille)) = (ligne_album, album.titre.as_deref())
+        && !titre_tenu(id)
+    {
         let titre_feuille = titre_feuille.trim();
         if !titre_feuille.is_empty() && ligne.title != titre_feuille {
             match album_repo.force_update_title(id, titre_feuille) {
@@ -472,6 +506,9 @@ fn ecrire_album_avec(
     let mut sondes: std::collections::HashMap<PathBuf, SondeImage> =
         std::collections::HashMap::new();
     let mut ecrites = 0usize;
+    // Les albums que les tenues désignent à la place de celui du dossier : un
+    // disque rattaché à la main à un coffret y reste (#5319).
+    let mut albums_tenus: HashSet<i64> = HashSet::new();
     let tranches = tranches_par_fichier(album);
     // Les fichiers réellement DÉCOUPÉS — eux seuls doivent sortir du scan
     // ordinaire. Un fichier occupé en entier par une seule piste garde son
@@ -516,6 +553,16 @@ fn ecrire_album_avec(
         );
         if let Some(i) = imposition {
             (i.retoucher)(piste, &mut ligne);
+        }
+        // L'édition manuelle prime sur la feuille, comme sur les balises au
+        // scan ordinaire (`TrackImporter::import`) : album, disque, numéro,
+        // titre et artiste que l'utilisateur a tenus, par chemin ou par
+        // identité CUE (#5319).
+        if tenues.appliquer(&mut ligne)
+            && let Some(tenu) = ligne.album_id
+            && Some(tenu) != ligne_album
+        {
+            albums_tenus.insert(tenu);
         }
         let media = ligne.cue_media_path.clone().unwrap_or_default();
         let debut = ligne.cue_start_ms.unwrap_or(0);
@@ -605,6 +652,9 @@ fn ecrire_album_avec(
         images_couvertes.extend(images_decoupees);
         if let Some(id) = ligne_album {
             bilan.albums_ecrits.insert(id);
+            let _ = album_repo.update_track_count(id);
+        }
+        for id in albums_tenus {
             let _ = album_repo.update_track_count(id);
         }
     }
@@ -775,23 +825,13 @@ fn ecrire_les_dossiers(
     dossiers: &[PathBuf],
     mut observer: impl FnMut(&Path, &PlanCue),
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
-    let artist_repo = ArtistRepo::with_backend(db.clone());
-    let album_repo = AlbumRepo::with_backend(db.clone());
-    let track_repo = TrackRepo::with_backend(db.clone());
+    let depots = Depots::pour(db);
     let mut bilan = BilanCue::default();
     let mut images_couvertes: HashSet<PathBuf> = HashSet::new();
 
     let inventaire = inventorier_avec(dossiers, |dossier: &Path, plan: &PlanCue| {
         for album in &plan.albums {
-            ecrire_album(
-                dossier,
-                album,
-                &artist_repo,
-                &album_repo,
-                &track_repo,
-                &mut bilan,
-                &mut images_couvertes,
-            );
+            ecrire_album(dossier, album, &depots, &mut bilan, &mut images_couvertes);
         }
         observer(dossier, plan);
     });
@@ -872,9 +912,9 @@ pub fn ecrire_les_iso_sacd(
     if isos.is_empty() {
         return;
     }
-    let artist_repo = ArtistRepo::with_backend(db.clone());
-    let album_repo = AlbumRepo::with_backend(db.clone());
-    let track_repo = TrackRepo::with_backend(db.clone());
+    // Les tenues aussi : une image SACD est désignée par `(image, début)`
+    // comme une tranche de feuille (#5319).
+    let depots = Depots::pour(db);
     let mut couvertes: HashSet<PathBuf> = HashSet::new();
     let avant = bilan.pistes_creees + bilan.pistes_mises_a_jour;
     for iso in isos {
@@ -909,9 +949,7 @@ pub fn ecrire_les_iso_sacd(
         ecrire_album_avec(
             &identite,
             &album,
-            &artist_repo,
-            &album_repo,
-            &track_repo,
+            &depots,
             bilan,
             &mut couvertes,
             Some(&imposition),
