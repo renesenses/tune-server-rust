@@ -1225,6 +1225,24 @@ pub fn list_audio_files_avec_progression(
     cadence: std::time::Duration,
     on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
 ) -> ListAudioResult {
+    list_audio_files_avec_arret(dirs, exclude_patterns, cadence, on_progress, &|| false)
+        .expect("sans demande d'arrêt, le parcours va toujours au bout")
+}
+
+/// Comme [`list_audio_files_avec_progression`], mais consulte `arret` à
+/// chaque entrée du parcours et rend `None` dès qu'il répond `true` (#5552).
+///
+/// `None`, et non une liste partielle : une liste tronquée ressemble à une
+/// bibliothèque dont des fichiers ont disparu, et tout ce qui suit le parcours
+/// (confrontation des feuilles CUE, purge) la prendrait au mot. L'appelant qui
+/// reçoit `None` n'écrit rien.
+pub fn list_audio_files_avec_arret(
+    dirs: &[String],
+    exclude_patterns: &[String],
+    cadence: std::time::Duration,
+    on_progress: &mut dyn FnMut(ProgressionParcours<'_>),
+    arret: &dyn Fn() -> bool,
+) -> Option<ListAudioResult> {
     let excludes: Vec<String> = exclude_patterns
         .iter()
         .map(|p| p.trim().to_lowercase())
@@ -1333,6 +1351,10 @@ pub fn list_audio_files_avec_progression(
             continue;
         }
 
+        if arret() {
+            info!(racine = %normalized, "scan_listing_interrompu — arrêt demandé");
+            return None;
+        }
         let mut dir_file_count = 0usize;
         let mut dir_error_count = 0usize;
         let mut dir_iso_error_count = 0usize;
@@ -1357,6 +1379,12 @@ pub fn list_audio_files_avec_progression(
             });
 
         for entry in walker {
+            // #5552 — « Arrêter » est lu à chaque entrée : sur un partage
+            // réseau, ce parcours dure à lui seul plusieurs minutes.
+            if arret() {
+                info!(racine = %normalized, "scan_listing_interrompu — arrêt demandé");
+                return None;
+            }
             match entry {
                 Ok(entry) => {
                     // Signe de vie du parcours (#2203).
@@ -1688,7 +1716,7 @@ pub fn list_audio_files_avec_progression(
         );
     }
 
-    ListAudioResult {
+    Some(ListAudioResult {
         files,
         missing_dirs,
         error_dirs,
@@ -1698,7 +1726,7 @@ pub fn list_audio_files_avec_progression(
         skipped_paths,
         dossiers_avec_feuille_cue: dossiers_cue.into_iter().collect(),
         isos_sacd_natifs,
-    }
+    })
 }
 
 pub fn scan_files_parallel(
