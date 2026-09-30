@@ -1105,8 +1105,17 @@ pub(super) async fn create_zone(
     // Duplicate device assignment already handled above (early return)
 
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    match repo.create(&body.name, output_type, output_device_id) {
-        Ok(id) => {
+    // #5464 — la collision avec une zone qui porte déjà la sortie se reconnaît
+    // par relecture (`create_ou_occupante`), plus par le texte SQLite
+    // « UNIQUE constraint failed », que PostgreSQL ne produit pas.
+    let creation = match output_device_id {
+        Some(device_id) => repo.create_ou_occupante(&body.name, output_type, device_id),
+        None => repo
+            .create(&body.name, output_type, None)
+            .map(tune_core::db::zone_repo::InsertionDeZone::Creee),
+    };
+    match creation {
+        Ok(tune_core::db::zone_repo::InsertionDeZone::Creee(id)) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
 
             // #3589 — la zone vient de naître : c'est le SEUL instant où
@@ -1140,41 +1149,32 @@ pub(super) async fn create_zone(
 
             (StatusCode::CREATED, Json(v)).into_response()
         }
-        Err(e) if e.contains("UNIQUE constraint failed") => {
+        Ok(tune_core::db::zone_repo::InsertionDeZone::Occupee(id)) => {
             // Safety net: a hidden zone with this device_id blocked the INSERT.
             // Unhide it and return it instead of erroring.
-            if let Some(device_id) = output_device_id
-                && let Ok(Some(existing)) = repo.get_by_device_id(device_id)
-                && let Some(id) = existing.id
-            {
-                warn!(
-                    zone_id = id,
-                    device_id, "unique_constraint_recovery_unhiding_zone"
-                );
-                // Ce filet ne se déclenche QUE sur une zone masquée —
-                // c'est ce que dit la contrainte UNIQUE qui vient
-                // d'échouer. Honorer le nom est donc la branche déjà
-                // décidée, et un échec d'écriture ne peut pas ressortir
-                // en `200 OK` avec l'ancienne fiche (#1770, annexe 4).
-                if let Err(e) = repo.unhide(id) {
-                    return echec_ecriture(id, "is_hidden", "0", e);
-                }
-                if let Err(e) = repo.update_name(id, &body.name) {
-                    return echec_ecriture(id, "name", &body.name, e);
-                }
-                let _ = repo.update_online(id, true);
-                // Meme contrat, meme raison qu'au-dessus (#2284).
-                let v = crate::routes::playback::build_zone_json(&state, id).await;
-                state
-                    .event_bus
-                    .emit("zone.updated", json!({ "zone_id": id }));
-                return (StatusCode::OK, Json(v)).into_response();
+            let device_id = output_device_id.unwrap_or_default();
+            warn!(
+                zone_id = id,
+                device_id, "unique_constraint_recovery_unhiding_zone"
+            );
+            // Ce filet ne se déclenche QUE sur une zone masquée —
+            // c'est ce que dit la contrainte UNIQUE qui vient
+            // d'échouer. Honorer le nom est donc la branche déjà
+            // décidée, et un échec d'écriture ne peut pas ressortir
+            // en `200 OK` avec l'ancienne fiche (#1770, annexe 4).
+            if let Err(e) = repo.unhide(id) {
+                return echec_ecriture(id, "is_hidden", "0", e);
             }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": e})),
-            )
-                .into_response()
+            if let Err(e) = repo.update_name(id, &body.name) {
+                return echec_ecriture(id, "name", &body.name, e);
+            }
+            let _ = repo.update_online(id, true);
+            // Meme contrat, meme raison qu'au-dessus (#2284).
+            let v = crate::routes::playback::build_zone_json(&state, id).await;
+            state
+                .event_bus
+                .emit("zone.updated", json!({ "zone_id": id }));
+            (StatusCode::OK, Json(v)).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

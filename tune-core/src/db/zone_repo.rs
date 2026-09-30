@@ -747,6 +747,16 @@ pub struct RapportDIdentite {
     pub refus: Vec<(i64, String)>,
 }
 
+/// Issue de [`ZoneRepo::create_ou_occupante`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertionDeZone {
+    /// La zone vient d'être créée : son identifiant.
+    Creee(i64),
+    /// L'`INSERT` a été refusé : une zone (visible ou masquée) porte déjà la
+    /// sortie. Son identifiant.
+    Occupee(i64),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
     pub id: Option<i64>,
@@ -1241,29 +1251,62 @@ impl ZoneRepo {
             }
         }
         // No existing zone — try to create one.
-        match self.create(name, output_type, Some(output_device_id)) {
-            Ok(id) => Ok((id, true)),
-            Err(e) if e.contains("UNIQUE constraint failed") => {
+        match self.create_ou_occupante(name, output_type, output_device_id)? {
+            InsertionDeZone::Creee(id) => Ok((id, true)),
+            InsertionDeZone::Occupee(id) => {
                 // Race or hidden zone: another thread inserted the same
                 // device_id, or a hidden zone exists with this device_id.
                 // Return the existing zone as-is. A soft-deleted (hidden) zone
                 // stays hidden here too — same rule as the fast path above, so
                 // deleted zones don't reappear regardless of which branch runs.
-                if let Some(existing) = self.get_by_device_id(output_device_id)? {
-                    if let Some(id) = existing.id {
-                        if self.is_device_hidden(output_device_id) {
-                            tracing::debug!(
-                                zone_id = id,
-                                device_id = output_device_id,
-                                "zone_hidden_skipping_auto_unhide_after_unique_conflict"
-                            );
-                        }
-                        return Ok((id, false));
-                    }
+                if self.is_device_hidden(output_device_id) {
+                    tracing::debug!(
+                        zone_id = id,
+                        device_id = output_device_id,
+                        "zone_hidden_skipping_auto_unhide_after_unique_conflict"
+                    );
                 }
-                Err(e)
+                Ok((id, false))
             }
-            Err(e) => Err(e),
+        }
+    }
+
+    /// Créer une zone attachée à `output_device_id`, ou rendre celle qui la
+    /// porte déjà si l'`INSERT` a été refusé à cause d'elle.
+    ///
+    /// 🔴 #5464 — la violation de `idx_zones_output_device_id` se reconnaît
+    /// par RELECTURE, jamais par le texte de l'erreur. Les deux filets
+    /// d'avant (`get_or_create`, `POST /zones`) cherchaient
+    /// « UNIQUE constraint failed » : c'est le texte de SQLite. PostgreSQL dit
+    /// « duplicate key value violates unique constraint », et le filet ne
+    /// s'y déclenchait jamais : la course rendait l'erreur brute au lieu de
+    /// la zone existante. Le code SQLSTATE 23505 ne survit pas à la frontière
+    /// `DbBackend`, qui rend des `String`. Une zone qui porte maintenant la
+    /// sortie est, elle, un fait mesurable sous les deux moteurs.
+    ///
+    /// Une autre erreur (base indisponible, verrou) ne laisse aucune zone
+    /// sur la sortie : la relecture ne trouve rien, et l'erreur d'origine est
+    /// rendue telle quelle.
+    pub fn create_ou_occupante(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: &str,
+    ) -> Result<InsertionDeZone, String> {
+        match self.create(name, output_type, Some(output_device_id)) {
+            Ok(id) => Ok(InsertionDeZone::Creee(id)),
+            Err(e) => match self.get_by_device_id(output_device_id) {
+                Ok(Some(Zone { id: Some(id), .. })) => {
+                    tracing::debug!(
+                        zone_id = id,
+                        device_id = output_device_id,
+                        error = %e,
+                        "zone_insert_refused_output_already_held"
+                    );
+                    Ok(InsertionDeZone::Occupee(id))
+                }
+                _ => Err(e),
+            },
         }
     }
 
@@ -5223,5 +5266,93 @@ mod identite_de_sortie_tests {
             Some("local:audio-gd USB audio (44,1 kHz)"),
             "la zone refusée n'a PAS bougé"
         );
+    }
+}
+
+/// #5464 (suite) — la collision d'`output_device_id` reconnue sous les DEUX
+/// moteurs, par relecture et non par le texte de l'erreur.
+///
+/// La même épreuve joue sur SQLite et sur PostgreSQL : une zone SUPPRIMÉE
+/// (masquée, sa ligne garde la sortie) tient `local:DAC 5464` ; créer une
+/// zone sur cette sortie doit rendre l'occupante, pas l'erreur brute. Sous
+/// PostgreSQL, l'ancien filet — `e.contains("UNIQUE constraint failed")` —
+/// ne reconnaissait pas « duplicate key value violates unique constraint ».
+#[cfg(test)]
+mod collision_de_sortie_5464_tests {
+    use super::*;
+
+    const INDEX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id_5464 \
+                         ON zones(output_device_id) WHERE output_device_id IS NOT NULL";
+
+    fn epreuve(repo: &ZoneRepo) {
+        let tenante = repo
+            .create("Ancien DAC", Some("local"), Some("local:DAC 5464"))
+            .unwrap();
+        repo.delete(tenante).unwrap();
+        // Témoin : l'index refuse bien l'INSERT brut, sinon l'épreuve ne
+        // mesurerait rien.
+        let brut = repo
+            .create("Doublon", Some("local"), Some("local:DAC 5464"))
+            .expect_err("l'index unique doit refuser une seconde zone sur la même sortie");
+        let issue = repo
+            .create_ou_occupante("Nouveau DAC", Some("local"), "local:DAC 5464")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "une collision n'est pas une panne : la zone qui tient la sortie \
+                     doit être rendue, pas l'erreur « {e} » (erreur brute : « {brut} »)"
+                )
+            });
+        assert_eq!(issue, InsertionDeZone::Occupee(tenante));
+        let (id, cree) = repo
+            .get_or_create("Nouveau DAC", Some("local"), "local:DAC 5464")
+            .unwrap();
+        assert_eq!((id, cree), (tenante, false));
+
+        match repo
+            .create_ou_occupante("Libre", Some("local"), "local:libre 5464")
+            .unwrap()
+        {
+            InsertionDeZone::Creee(id) => assert_ne!(id, tenante),
+            autre => panic!("sortie libre : création attendue, obtenu {autre:?}"),
+        }
+    }
+
+    #[test]
+    fn sqlite_5464_une_collision_de_sortie_rend_la_zone_occupante() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch(INDEX).unwrap();
+        epreuve(&ZoneRepo::new(db));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_5464_une_collision_de_sortie_rend_la_zone_occupante() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        // Connexion unique : la table TEMPORAIRE masque `public.zones` pour
+        // elle seule, rien n'est écrit dans la base partagée.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let db: Arc<dyn DbBackend> =
+            Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
+        for ddl in [
+            "CREATE TEMP TABLE zones (LIKE public.zones INCLUDING ALL)",
+            // Colonnes que seul `ensure_schema` pose sur une base native
+            // (même liste que `pg_5077`).
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT",
+            INDEX,
+        ] {
+            db.execute(ddl, &[]).unwrap();
+        }
+        epreuve(&ZoneRepo::with_backend(db));
+        pool.close().await;
     }
 }
