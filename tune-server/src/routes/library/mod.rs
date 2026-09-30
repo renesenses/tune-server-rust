@@ -198,27 +198,17 @@ pub fn artwork_cache_dir() -> std::path::PathBuf {
         return dossier;
     }
 
-    // On Windows, resolve relative artwork_cache to %LOCALAPPDATA%\TuneServer\
-    // to avoid writing into read-only Program Files or an unpredictable CWD.
-    #[cfg(target_os = "windows")]
-    {
-        let data_dir = std::env::var("LOCALAPPDATA")
-            .map(|d| format!("{d}\\TuneServer"))
-            .unwrap_or_else(|_| "TuneServer".into());
-        return std::path::PathBuf::from(format!("{data_dir}\\artwork_cache"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let app_support = std::path::PathBuf::from(home)
-                .join("Library/Application Support/Tune/artwork_cache");
-            return app_support;
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    std::path::PathBuf::from("artwork_cache")
+    // #5513 — `TUNE_ARTWORK_DIR`, puis le cache qu'impose la configuration
+    // d'un appareil Tune OS déplacé, sinon le défaut historique de chaque
+    // plateforme (règle et défauts dans `crate::chemins_de_donnees`).
+    use crate::chemins_de_donnees as chemins;
+    chemins::cache_de_pochettes(None, chemins::cache_impose_retenu(), || {
+        chemins::cache_de_pochettes_par_defaut(
+            chemins::Plateforme::courante(),
+            std::env::var_os("HOME").as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+        )
+    })
 }
 
 /// Une réponse de refus uniforme pour les opérations explicites de la
