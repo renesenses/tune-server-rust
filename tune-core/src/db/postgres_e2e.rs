@@ -2941,3 +2941,21 @@ async fn pg_5413_filtres_de_qualite_suivent_le_badge() {
     reset_schema(&db);
     crate::db::album_repo::tests::scenario_filtres_de_qualite_5413(db);
 }
+
+/// #5413, régression v0.9.169 (Rhorn, réponse 7320) — une bibliothèque
+/// scannée avant le correctif, aux colonnes de qualité d'album figées ou
+/// vides, est recalée sur ses pistes par le runner de DÉMARRAGE PostgreSQL.
+/// Scénario partagé avec `i5413_bibliotheque_ancienne_rattrapee_au_demarrage`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::album_repo::tests::scenario_bibliotheque_ancienne_5413_avant(db.clone());
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip l'a lue");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner au redémarrage");
+    pool.close().await;
+    crate::db::album_repo::tests::scenario_bibliotheque_ancienne_5413_apres(db);
+}
