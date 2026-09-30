@@ -1031,8 +1031,13 @@ fn assembler_les_etapes(
             bit_depth
         });
         let out_sample_rate = wire_sample_rate.map(|v| v as i32).unwrap_or_else(|| {
+            // #5524 — la cadence de même famille sous le plafond, celle que
+            // la décision sert (`cadence_sous_plafond`), pas le plafond brut.
             max_sample_rate
-                .map(|m| (sample_rate as u32).min(m) as i32)
+                .map(|m| {
+                    tune_core::audio::formats::cadence_sous_plafond(sample_rate as u32, Some(m))
+                        as i32
+                })
                 .unwrap_or(sample_rate)
         });
         // Garde-fou #1315 : le nom du conteneur est deviné, les chiffres sont
@@ -1104,14 +1109,18 @@ fn assembler_les_etapes(
             "bit_perfect": false,
         }));
     } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
+        // #5524 — la cadence SERVIE (même famille sous le plafond), celle
+        // de la décision : 176,4 sous 96 s'annonce « → 88,2 kHz », pas 96.
+        let cible =
+            tune_core::audio::formats::cadence_sous_plafond(sample_rate as u32, Some(max_sr));
         let src_khz = sample_rate / 1000;
-        let dst_khz = max_sr / 1000;
-        rate_conversion = Some((sample_rate as u32, max_sr));
+        let dst_khz = cible / 1000;
+        rate_conversion = Some((sample_rate as u32, cible));
         steps.push(json!({
             "name": "Resampler",
             "code": "rate_conversion",
             "from_hz": sample_rate as u32,
-            "to_hz": max_sr,
+            "to_hz": cible,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
         }));

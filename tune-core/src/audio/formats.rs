@@ -414,6 +414,50 @@ pub fn needs_downsample_for_cap(
     effective_rate > max
 }
 
+/// #5524 — la cadence à servir quand la zone plafonne la fréquence.
+///
+/// **Rééchantillonner dans la même famille.** Une source de la famille
+/// 44,1 kHz (44,1 · 88,2 · 176,4 · 352,8…) part vers la plus haute cadence de
+/// SA famille qui tient sous le plafond ; même règle pour la famille 48 kHz.
+/// Un rapport entier (÷2, ÷4) coûte moins au rééchantillonneur et au signal
+/// qu'un saut de famille. Quand aucune cadence de la famille ne tient sous le
+/// plafond (48 kHz source, plafond 44,1), on descend AU plafond.
+///
+/// Rend la source telle quelle quand il n'y a pas de plafond (`None`, `0`)
+/// ou qu'elle tient dessous : « Auto » ne change rien.
+///
+/// Avant #5524, tous les sites servaient le plafond lui-même : 176,4 kHz sous
+/// un plafond à 96 kHz partait en 96 kHz au lieu de 88,2.
+///
+/// Les cadences d'une famille sont `base · 2ⁿ` : 132,3 ou 144 kHz ne sont pas
+/// des cadences qu'un renderer annonce. Une source hors des deux familles
+/// (32 kHz, 11,025…) descend au plafond, comme avant.
+pub fn cadence_sous_plafond(source_hz: u32, plafond: Option<u32>) -> u32 {
+    let Some(max) = plafond.filter(|&m| m > 0) else {
+        return source_hz;
+    };
+    if source_hz <= max {
+        return source_hz;
+    }
+    let base = if source_hz.is_multiple_of(44_100) {
+        44_100
+    } else if source_hz.is_multiple_of(48_000) {
+        48_000
+    } else {
+        return max;
+    };
+    let mut meilleure = None;
+    let mut cadence = base;
+    while cadence <= max && cadence < source_hz {
+        meilleure = Some(cadence);
+        cadence = match cadence.checked_mul(2) {
+            Some(c) => c,
+            None => break,
+        };
+    }
+    meilleure.unwrap_or(max)
+}
+
 pub fn best_output_format(
     source_format: AudioFormat,
     source_sample_rate: u32,
@@ -1091,5 +1135,79 @@ mod conteneur_mp4_3605 {
                 Some(44_100)
             ),
         );
+    }
+}
+
+/// #5524 — « Fréquence max par zone » : la cadence servie sous le plafond.
+#[cfg(test)]
+mod frequence_max_5524 {
+    use super::cadence_sous_plafond;
+
+    // ── #5524 — fréquence max par zone : même famille sous le plafond ──
+
+    #[test]
+    fn cadence_sous_plafond_5524_les_cas_de_la_demande() {
+        // 96 kHz limité à 44,1 : la famille 48 n'a rien sous 44,1 → le plafond.
+        assert_eq!(cadence_sous_plafond(96_000, Some(44_100)), 44_100);
+        // 88,2 limité à 44,1 : même famille, ÷2.
+        assert_eq!(cadence_sous_plafond(88_200, Some(44_100)), 44_100);
+        // 192 limité à 96 : même famille, ÷2.
+        assert_eq!(cadence_sous_plafond(192_000, Some(96_000)), 96_000);
+        // 48 limité à 44,1 : rien de la famille 48 sous 44,1 → le plafond.
+        assert_eq!(cadence_sous_plafond(48_000, Some(44_100)), 44_100);
+    }
+
+    #[test]
+    fn cadence_sous_plafond_5524_reste_dans_la_famille_au_lieu_du_plafond() {
+        // Contre-épreuve de l'ancien comportement (`out_sr = max_sr`) :
+        // 176,4 sous 96 donnait 96, 192 sous 88,2 donnait 88,2.
+        assert_eq!(cadence_sous_plafond(176_400, Some(96_000)), 88_200);
+        assert_eq!(cadence_sous_plafond(192_000, Some(88_200)), 48_000);
+        assert_eq!(cadence_sous_plafond(352_800, Some(192_000)), 176_400);
+        assert_eq!(cadence_sous_plafond(384_000, Some(176_400)), 96_000);
+        assert_eq!(cadence_sous_plafond(176_400, Some(48_000)), 44_100);
+        assert_eq!(cadence_sous_plafond(88_200, Some(48_000)), 44_100);
+        assert_eq!(cadence_sous_plafond(96_000, Some(48_000)), 48_000);
+    }
+
+    #[test]
+    fn cadence_sous_plafond_5524_auto_ne_change_rien() {
+        for hz in [44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000] {
+            assert_eq!(cadence_sous_plafond(hz, None), hz, "Auto, {hz}");
+            assert_eq!(
+                cadence_sous_plafond(hz, Some(0)),
+                hz,
+                "0 = pas de plafond, {hz}"
+            );
+        }
+        // Une source qui tient sous le plafond n'est jamais touchée,
+        // même d'une autre famille.
+        assert_eq!(cadence_sous_plafond(44_100, Some(48_000)), 44_100);
+        assert_eq!(cadence_sous_plafond(88_200, Some(96_000)), 88_200);
+        assert_eq!(cadence_sous_plafond(96_000, Some(96_000)), 96_000);
+    }
+
+    #[test]
+    fn cadence_sous_plafond_5524_hors_famille_descend_au_plafond() {
+        assert_eq!(cadence_sous_plafond(64_000, Some(48_000)), 48_000);
+        assert_eq!(cadence_sous_plafond(32_000, Some(22_050)), 22_050);
+    }
+
+    /// #5524 — le plafond passe par le décodeur NATIF (Symphonia + rubato),
+    /// jamais par ffmpeg : un vrai FLAC 96 kHz/24 bits décodé vers la cadence
+    /// de même famille sous 44,1 kHz sort à 44,1 kHz, profondeur conservée.
+    #[test]
+    fn cadence_sous_plafond_5524_reechantillonne_par_le_decodeur_natif() {
+        let chemin = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/flac/ref_24_96000_stereo.flac"
+        );
+        let cible = cadence_sous_plafond(96_000, Some(44_100));
+        assert_eq!(cible, 44_100);
+        let decode = crate::audio::decode::decode_to_pcm(chemin, Some(cible), Some(2), 0.0, 0.0)
+            .expect("décodage natif du FLAC 96/24");
+        assert_eq!(decode.sample_rate, 44_100, "cadence servie");
+        assert_eq!(decode.bit_depth, 24, "profondeur de la source conservée");
+        assert!(!decode.samples_i32.is_empty(), "des échantillons sortent");
     }
 }
