@@ -676,18 +676,9 @@ async fn delete_collection(
     Json(json!({"deleted": true, "id": id}))
 }
 
-fn resolve_timestamp_sql(input: &str) -> String {
-    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
-    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
-    // through to a literal string ('90d') that no date ever compares against.
-    let rest = input.strip_prefix("now-").unwrap_or(input);
-    let digits = rest.strip_suffix('d').unwrap_or(rest);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        let days: i64 = digits.parse().unwrap_or(30);
-        return format!("DATETIME('now', '-{days} days')");
-    }
-    format!("'{}'", input.replace('\'', "''"))
-}
+// #5547 — la lecture d'une date de règle vit dans `regles_sql`, pour que les
+// playlists la lisent comme les collections.
+use crate::regles_sql::horodatage_sql as resolve_timestamp_sql;
 
 /// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).
 ///
@@ -776,46 +767,8 @@ pub fn build_album_query(
             if op == "has"
                 && let Some(obj) = value_raw.and_then(|v| v.as_object())
             {
-                let mut sub_conds = Vec::new();
-                if let Some(role) = obj
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    sub_conds.push(format!(
-                        "LOWER(tc.role) LIKE LOWER('%{}%')",
-                        role.replace('\'', "''")
-                    ));
-                }
-                if let Some(artist) = obj
-                    .get("artist_name")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    sub_conds.push(format!(
-                        "LOWER(tc.artist_name) LIKE LOWER('%{}%')",
-                        artist.replace('\'', "''")
-                    ));
-                }
-                if let Some(instr) = obj
-                    .get("instrument")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    // MÊME canonisation qu'à l'écriture des crédits
-                    // (#2799 §4). L'enrichissement range désormais
-                    // « grand piano » / « electric piano » sous `piano` ;
-                    // si la règle cherchait le libellé brut saisi par
-                    // l'utilisateur, une collection `instrument: Grand
-                    // Piano` ne trouverait plus rien alors que les lignes
-                    // existent. Deux normalisations, deux résultats.
-                    let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
-                    let motif = if canon.is_empty() { instr } else { &canon };
-                    sub_conds.push(format!(
-                        "LOWER(tc.instrument) LIKE LOWER('%{}%')",
-                        motif.replace('\'', "''")
-                    ));
-                }
+                // #5547 — la même lecture que les playlists (`regles_sql`).
+                let sub_conds = crate::regles_sql::conditions_credit(obj);
                 if !sub_conds.is_empty() {
                     conditions.push(format!(
                         "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
@@ -857,6 +810,13 @@ pub fn build_album_query(
                         continue;
                     }
                 }
+                // #5547 — « jamais » : l'éditeur le propose pour toute date,
+                // et la règle disparaissait ici (`_ => continue`), la
+                // collection rendant TOUT. Une date d'ajout absente est un
+                // fichier sans date connue.
+                "is_null" => "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                     WHERE t2.file_mtime IS NULL)"
+                    .to_string(),
                 _ => continue,
             };
             conditions.push(cond);
@@ -905,6 +865,39 @@ pub fn build_album_query(
                         "al.id IN (SELECT t3.album_id FROM tracks t3 \
                          JOIN listen_history lh ON lh.track_id = t3.id \
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
+                    )
+                }
+                // #5547 — « entre » : l'éditeur le propose pour les deux
+                // champs, et le moteur n'avait aucun bras. La règle tombait
+                // dans `_ => continue` et la collection rendait TOUT (#1231).
+                ("play_count", "between") => {
+                    let Some((lo, hi)) = crate::regles_sql::bornes_de_nombres(value_raw) else {
+                        continue;
+                    };
+                    let dans = format!(
+                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         GROUP BY t3.album_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
+                    );
+                    if lo <= 0 {
+                        // Zéro écoute n'a pas de ligne : « entre 0 et N »
+                        // doit garder les albums jamais écoutés.
+                        format!(
+                            "(al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
+                             JOIN listen_history lh ON lh.track_id = t3.id) OR {dans})"
+                        )
+                    } else {
+                        dans
+                    }
+                }
+                ("last_played_at", "between") => {
+                    let Some((lo, hi)) = crate::regles_sql::bornes_de_dates(value_raw) else {
+                        continue;
+                    };
+                    format!(
+                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
                     )
                 }
                 ("last_played_at", "is_null") => {
