@@ -192,11 +192,13 @@ pub async fn run_with(opts: RunOptions) {
         .expect("Failed to install rustls CryptoProvider");
 
     let config = TuneConfig::load();
-    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
-    // pas la configuration sous la main.
-    crate::chemins_de_donnees::retenir(&config);
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
+
+    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
+    // pas la configuration sous la main. #5596 : après le journal, pour que
+    // le choix du cache de pochettes de l'appareil s'y lise.
+    crate::chemins_de_donnees::retenir(&config);
 
     // #5461 — lancé depuis `<exe>.old` par une version affectée ? Le dire, et
     // relancer sur place le binaire installé quand c'est sûr. Avant tout fil,

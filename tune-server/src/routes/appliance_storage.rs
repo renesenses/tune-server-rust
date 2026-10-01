@@ -662,7 +662,9 @@ fn shell_quote(s: &str) -> String {
 async fn data_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     let db_path = PathBuf::from(&state.config.db_path);
-    let artwork_dir = PathBuf::from(&state.config.artwork_dir);
+    // #5596 : le cache réellement servi, pas la valeur brute de `tune.toml`
+    // (sur l'image Tune OS, `/opt/tune/data/artwork_cache` n'est pas lui).
+    let artwork_dir = crate::routes::library::artwork_cache_dir();
     let mount_point = data_mount_point();
     let on_external = state.config.db_path.starts_with(&mount_point);
     let volume_present = !on_external || db_path.exists();
@@ -670,7 +672,7 @@ async fn data_status(State(state): State<AppState>) -> Result<Json<Value>, AppEr
     let j = job().lock().unwrap().clone();
     Ok(Json(json!({
         "db_path": state.config.db_path,
-        "artwork_dir": state.config.artwork_dir,
+        "artwork_dir": artwork_dir.to_string_lossy(),
         "on_external": on_external,
         "volume_present": volume_present,
         "data_size_bytes": data_size,
@@ -718,7 +720,10 @@ async fn relocate(
 
     let uuid = body.uuid.clone();
     let src_db = PathBuf::from(state.config.db_path.clone());
-    let src_art = PathBuf::from(state.config.artwork_dir.clone());
+    // #5596 : copier le cache réellement servi. La valeur brute de
+    // `tune.toml` (`/opt/tune/data/artwork_cache` sur l'image Tune OS) ne
+    // l'était pas : le déplacement copiait un dossier vide ou presque.
+    let src_art = crate::routes::library::artwork_cache_dir();
     let mount_point = data_mount_point();
     let free = vol["free_bytes"].as_u64().unwrap_or(0);
     let total = src_db.metadata().map(|m| m.len()).unwrap_or(0) + dir_size(&src_art);
