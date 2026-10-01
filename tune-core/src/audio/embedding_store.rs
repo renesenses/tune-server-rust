@@ -161,6 +161,60 @@ pub fn failed_count(backend: &Arc<dyn DbBackend>) -> i64 {
     (processed_count(backend) - analysed_count(backend)).max(0)
 }
 
+/// [`processed_count`] RESTREINT au périmètre réglé (#5593) : les pistes
+/// traitées pour le modèle courant ET éligibles aujourd'hui.
+///
+/// C'est le numérateur qui va avec [`eligible_count`] une fois des racines
+/// exclues ou des genres retenus : sans lui, les pistes d'un NAS analysées
+/// AVANT son exclusion resteraient dans les traitées pendant qu'elles sortent
+/// du dénominateur, et la jauge annoncerait moins de travail qu'il n'en reste.
+/// Sans périmètre réglé, c'est exactement [`processed_count`] — pas une requête
+/// de plus, pas un chiffre qui bouge.
+pub fn processed_count_in_scope(backend: &Arc<dyn DbBackend>) -> i64 {
+    let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
+    if perimetre.is_empty() {
+        return processed_count(backend);
+    }
+    backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM track_metadata m \
+                 WHERE m.key = 'audio_embed_analyzed' AND m.value = ? \
+                   AND EXISTS (SELECT 1 FROM tracks t \
+                         WHERE t.id = m.track_id AND {ELIGIBLE_WHERE}{perimetre})"
+            ),
+            &[&MODEL_ID as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// [`analysed_count`] RESTREINT au périmètre réglé (#5593), pour la même
+/// raison que [`processed_count_in_scope`] : la différence des deux est le
+/// nombre d'échecs, et elle ne vaut que sur la même population.
+pub fn analysed_count_in_scope(backend: &Arc<dyn DbBackend>) -> i64 {
+    let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
+    if perimetre.is_empty() {
+        return analysed_count(backend);
+    }
+    backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM track_audio_embedding e \
+                 WHERE e.model = ? \
+                   AND EXISTS (SELECT 1 FROM tracks t \
+                         WHERE t.id = e.track_id AND {ELIGIBLE_WHERE}{perimetre})"
+            ),
+            &[&MODEL_ID as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Fenêtre que le modèle CLAP regarde, en secondes.
 pub const FENETRE_SECONDES: f64 = 10.0;
 
@@ -229,9 +283,13 @@ pub fn candidats_acoustiques(
     limite: i64,
 ) -> Result<Vec<CandidatAcoustique>, String> {
     let chemin = crate::db::track_repo::sql::CHEMIN_OUVRABLE;
+    // #5593 — le périmètre réglé : racines exclues, genres retenus. Le même
+    // texte que dans `eligible_count` et `deferred_count` : une piste hors
+    // périmètre n'est ni sélectionnée, donc jamais décodée, ni comptée.
+    let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
     let sql = format!(
         "SELECT t.id, {chemin}, COALESCE(t.cue_start_ms, 0), t.cue_end_ms FROM tracks t \
-         WHERE {ELIGIBLE_WHERE} \
+         WHERE {ELIGIBLE_WHERE}{perimetre} \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
                    AND m.value = ?) \
@@ -292,9 +350,11 @@ fn ligne_candidate(row: &[crate::db::backend::SqlValue]) -> CandidatAcoustique {
 /// candidats emploie, moins ses `NOT EXISTS` : le miroir ne peut plus se
 /// fêler.
 pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
+    // #5593 — le périmètre réglé, voir `candidats_acoustiques`.
+    let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
     backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE}"),
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE}{perimetre}"),
             &[],
         )
         .ok()
@@ -308,10 +368,12 @@ pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
 /// des candidats : un report périmé redevient du travail à faire, et un ancien
 /// marqueur de report ne masque jamais une piste déjà traitée pour ce modèle.
 pub fn deferred_count(backend: &Arc<dyn DbBackend>, seuil_report: &str) -> i64 {
+    // #5593 — le périmètre réglé, voir `candidats_acoustiques`.
+    let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
     backend
         .query_one(
             &format!(
-                "SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE} \
+                "SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE}{perimetre} \
           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
             WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' AND m.value = ?) \
           AND EXISTS (SELECT 1 FROM track_metadata m \

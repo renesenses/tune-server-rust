@@ -415,6 +415,18 @@ pub(super) async fn get_config(
             tune_core::taches_de_fond::vitesse::CLE_REGLAGE,
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
+        // #5593 — le périmètre des passes de fond qui décodent : les racines
+        // de bibliothèque exclues (ReplayGain, plage dynamique, empreintes,
+        // CLAP) et les genres auxquels le CLAP est réservé. Vides par défaut :
+        // rien d'exclu, tous les genres — le comportement d'avant.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
+        ),
+        (
+            tune_core::taches_de_fond::perimetre::CLE_GENRES_CLAP,
+            json!([]),
+        ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
         // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
         // normalise en plus la valeur persistée (`"false"` → `false`). Une
@@ -1103,6 +1115,30 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// #5593 — le périmètre des analyses de fond : deux tableaux de chaînes
+/// (racines exclues, genres du CLAP), rognés, sans vide ni doublon. `null`
+/// vaut le tableau vide. Toute autre forme est REFUSÉE (400) en nommant la
+/// clé : une chaîne seule ou un nombre, gardés tels quels en base, se reliraient
+/// « rien d'exclu » sans un mot.
+///
+/// Rend `true` quand l'une des deux clés est dans la requête : l'appelant
+/// referme alors la campagne ReplayGain en cours, dont le total a été compté
+/// sur l'ANCIEN périmètre.
+fn normaliser_perimetre_des_analyses(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<bool, AppError> {
+    use tune_core::taches_de_fond::perimetre::{CLE_GENRES_CLAP, CLE_RACINES_EXCLUES, normaliser};
+    let mut touche = false;
+    for cle in [CLE_RACINES_EXCLUES, CLE_GENRES_CLAP] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let liste = normaliser(brut).map_err(|e| AppError::bad_request(format!("{cle} : {e}")))?;
+        values.insert(cle.to_string(), json!(liste));
+        touche = true;
+    }
+    Ok(touche)
+}
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1170,6 +1206,7 @@ pub(super) async fn update_config(
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1305,6 +1342,13 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
         cles_posees.push(key);
+    }
+    // #5593 — le total de la jauge ReplayGain est compté UNE fois, à
+    // l'ouverture de la campagne. Un périmètre changé en cours de route le
+    // laisserait annoncer les pistes d'une racine qu'on vient d'exclure : on
+    // referme la campagne, le lot suivant la rouvre sur le nouveau compte.
+    if perimetre_touche {
+        tune_core::audio::replaygain::progression::au_repos();
     }
     if !cles_posees.is_empty() {
         tracing::info!(
@@ -4966,6 +5010,87 @@ mod vitesse_des_analyses_5519_tests {
         // Absent : rien à dire.
         let mut vide = serde_json::Map::new();
         assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
+        assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod perimetre_des_analyses_5593_tests {
+    use super::{get_config, normaliser_perimetre_des_analyses};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{CLE_GENRES_CLAP, CLE_RACINES_EXCLUES};
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0
+    }
+
+    /// #5593 — les deux réglages sont publiés, vides par défaut (rien d'exclu,
+    /// tous les genres), puis tels qu'écrits : un TABLEAU, pas sa chaîne JSON.
+    #[tokio::test]
+    async fn le_perimetre_est_publie_vide_puis_tel_qu_ecrit() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = config(&state).await;
+        assert_eq!(c[CLE_RACINES_EXCLUES], json!([]), "{c}");
+        assert_eq!(c[CLE_GENRES_CLAP], json!([]), "{c}");
+
+        // Ce que la boucle d'écriture de `PATCH /config` pose pour un tableau.
+        let mut v: serde_json::Map<String, Value> = json!({
+            CLE_RACINES_EXCLUES: [" \\\\192.168.0.126\\musique ", "", "\\\\192.168.0.126\\musique"],
+            CLE_GENRES_CLAP: ["Jazz", "Pop"],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(normaliser_perimetre_des_analyses(&mut v).unwrap());
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        let c = config(&state).await;
+        assert_eq!(
+            c[CLE_RACINES_EXCLUES],
+            json!(["\\\\192.168.0.126\\musique"]),
+            "rognée, sans vide ni doublon : {c}"
+        );
+        assert_eq!(c[CLE_GENRES_CLAP], json!(["Jazz", "Pop"]));
+        // Et le moteur relit la même chose que la route publie.
+        assert_eq!(
+            tune_core::taches_de_fond::perimetre::racines_exclues(&state.backend),
+            vec!["\\\\192.168.0.126\\musique".to_string()]
+        );
+    }
+
+    /// Une forme qui se relirait « rien d'exclu » en silence est REFUSÉE.
+    #[test]
+    fn une_forme_illisible_est_refusee() {
+        for mauvais in [json!("/mnt/nas"), json!(4), json!(true), json!([1, 2]), json!({})] {
+            for cle in [CLE_RACINES_EXCLUES, CLE_GENRES_CLAP] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais.clone() }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_perimetre_des_analyses(&mut v).is_err(),
+                    "{cle} = {mauvais}"
+                );
+            }
+        }
+        // `null` vaut la liste vide ; absent, rien n'est touché.
+        let mut nul: serde_json::Map<String, Value> =
+            json!({ CLE_GENRES_CLAP: null }).as_object().unwrap().clone();
+        assert!(normaliser_perimetre_des_analyses(&mut nul).unwrap());
+        assert_eq!(nul[CLE_GENRES_CLAP], json!([]));
+        let mut vide = serde_json::Map::new();
+        assert!(!normaliser_perimetre_des_analyses(&mut vide).unwrap());
         assert!(vide.is_empty());
     }
 }

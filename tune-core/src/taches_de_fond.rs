@@ -80,6 +80,8 @@ pub mod rapports_dr;
 
 /// La vitesse des passes qui décodent : fichiers à la fois (#5519).
 pub mod vitesse;
+/// Le périmètre des passes qui décodent : racines exclues, genres du CLAP (#5593).
+pub mod perimetre;
 
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
