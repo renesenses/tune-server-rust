@@ -399,7 +399,13 @@ pub(crate) fn build_smart_query_rapport(
         // que quatre formes : une règle écrite `{"op": "="}` tombait donc sur
         // `_ => continue` et la playlist rendait toute la bibliothèque.
         let op = regles_sql::normaliser_op(raw_op);
-        let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        // #5547 — un nombre JSON se lit en chiffres, comme aux collections ;
+        // une chaîne reste elle-même. La valeur BRUTE sert aux règles qui ne
+        // sont pas un texte : bornes d'un « entre », liste d'un « parmi »,
+        // objet d'un « crédit ».
+        let value_raw = rule.get("value");
+        let value_txt = regles_sql::texte_de(value_raw);
+        let value = value_txt.as_str();
 
         // --- règles « référence » (collection / playlist / favori) ---
         if smart_refs::is_ref_field(field) {
@@ -411,9 +417,49 @@ pub(crate) fn build_smart_query_rapport(
         let val_unaccented = strip_accents(&val_clean);
         let _has_accents = val_clean != val_unaccented;
 
-        // Les deux champs qui ne sont pas une colonne : ils se comptent
-        // ailleurs, dans l'historique d'écoute.
-        let cond = if field == "play_count" {
+        // Les champs qui ne sont pas une colonne : ils se comptent ailleurs —
+        // historique d'écoute, date du fichier, crédits. #5547 : les trois
+        // derniers venaient des collections, qui les traduisent à l'album ;
+        // ici, à la PISTE.
+        let cond = if field == "rating" {
+            // #5547 — la note de l'album de la piste, pour le profil actif.
+            match regles_sql::condition_note("t.album_id", op, value_raw, ctx.profile_id) {
+                Some(c) => c,
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if let Some(c) = condition_hors_colonne(field, op, value, value_raw) {
+            if c == regles_sql::FAUX {
+                refusees.push(format!("{field} {op}"));
+            }
+            c
+        } else if field == "play_count" && op == "between" {
+            // `None` : « entre » sans deux bornes — refusé plus bas.
+            match regles_sql::bornes_de_nombres(value_raw) {
+                Some((lo, hi)) => {
+                    let dans = format!(
+                        "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL \
+                         GROUP BY track_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
+                    );
+                    if lo <= 0 {
+                        // Zéro écoute n'a pas de ligne : « entre 0 et N »
+                        // garde les pistes jamais écoutées.
+                        format!(
+                            "(t.id NOT IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+                             OR {dans})"
+                        )
+                    } else {
+                        dans
+                    }
+                }
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if field == "play_count" {
             let n = value.parse::<i64>().unwrap_or(0);
             let comparateur = match op {
                 "=" => "=",
@@ -441,7 +487,7 @@ pub(crate) fn build_smart_query_rapport(
             // propose passaient par là — dont `composer` en entier et `title`
             // avec tout autre opérateur que « contient ».
             match regles_sql::colonne_piste(field)
-                .and_then(|col| regles_sql::condition(col, op, value))
+                .and_then(|col| regles_sql::condition_valeur(col, op, value_raw))
             {
                 Some(c) => c,
                 None => {
@@ -488,6 +534,81 @@ pub(crate) fn build_smart_query_rapport(
     let limit_clause = max_tracks.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
     (where_clause, order, limit_clause, refusees)
+}
+
+/// Les critères des collections qui ne sont pas une colonne, traduits au
+/// niveau de la PISTE — #5547.
+///
+/// Bertrand, 30/09/2026 : « l'éditeur des playlists intelligentes n'offre pas
+/// les mêmes critères que celui des collections — harmonise ». Les
+/// collections les traduisent à l'album (« au moins une piste de l'album… ») ;
+/// une playlist est faite de pistes, la question se pose donc à la piste
+/// elle-même :
+///
+/// | critère | la piste est retenue si… |
+/// |---|---|
+/// | `added_at` | son FICHIER a été modifié après / avant / entre (`t.file_mtime`, la même date que les collections) ; « jamais » : pas de date |
+/// | `last_played_at` | elle a été écoutée après la date ; sa DERNIÈRE écoute est avant / entre ; « jamais » : aucune écoute |
+/// | `credit` | elle porte ce crédit (rôle, artiste, instrument) |
+///
+/// `None` : le champ n'est pas l'un des trois — l'appelant continue. Un
+/// opérateur que le critère ne connaît pas rend `Some(FAUX)`, jamais « pas de
+/// condition » (#1231) : c'est `build_smart_query_rapport` qui le nomme dans
+/// le rapport, parce qu'il voit la condition FAUSSE revenir.
+fn condition_hors_colonne(
+    field: &str,
+    op: &str,
+    value: &str,
+    value_raw: Option<&Value>,
+) -> Option<String> {
+    let date_du_fichier = "DATETIME(t.file_mtime, 'unixepoch')";
+    let ecoutes = "SELECT track_id FROM listen_history WHERE track_id IS NOT NULL";
+    Some(match (field, op) {
+        ("added_at", ">" | ">=" | "<" | "<=") => {
+            format!(
+                "{date_du_fichier} {op} {}",
+                regles_sql::horodatage_sql(value)
+            )
+        }
+        ("added_at", "between") => match regles_sql::bornes_de_dates(value_raw) {
+            Some((lo, hi)) => format!("{date_du_fichier} BETWEEN {lo} AND {hi}"),
+            None => regles_sql::FAUX.to_string(),
+        },
+        // « jamais » : un fichier sans date connue — la même lecture que les
+        // collections.
+        ("added_at", "is_null") => "t.file_mtime IS NULL".to_string(),
+        ("last_played_at", ">" | ">=") => format!(
+            "t.id IN ({ecoutes} AND listened_at {op} {})",
+            regles_sql::horodatage_sql(value)
+        ),
+        ("last_played_at", "<" | "<=") => format!(
+            "t.id IN ({ecoutes} GROUP BY track_id HAVING MAX(listened_at) {op} {})",
+            regles_sql::horodatage_sql(value)
+        ),
+        ("last_played_at", "between") => match regles_sql::bornes_de_dates(value_raw) {
+            Some((lo, hi)) => format!(
+                "t.id IN ({ecoutes} GROUP BY track_id HAVING MAX(listened_at) BETWEEN {lo} AND {hi})"
+            ),
+            None => regles_sql::FAUX.to_string(),
+        },
+        ("last_played_at", "is_null") => format!("t.id NOT IN ({ecoutes})"),
+        ("credit", "has") => {
+            let sous = value_raw
+                .and_then(|v| v.as_object())
+                .map(regles_sql::conditions_credit)
+                .unwrap_or_default();
+            if sous.is_empty() {
+                regles_sql::FAUX.to_string()
+            } else {
+                format!(
+                    "t.id IN (SELECT tc.track_id FROM track_credits tc WHERE {})",
+                    sous.join(" AND ")
+                )
+            }
+        }
+        ("added_at" | "last_played_at" | "credit", _) => regles_sql::FAUX.to_string(),
+        _ => return None,
+    })
 }
 
 /// #4806 — le socle de TOUTE résolution de smart playlist : un titre banni
@@ -1617,5 +1738,52 @@ mod catalogue_de_service {
             panic!("demande valide")
         };
         assert_eq!(titres(&r).len(), 2, "le profil 2 n'a rien banni");
+    }
+}
+
+/// #5547 — l'APERÇU réel de la route, avec une règle « Note » : il rendait une
+/// erreur 500 (`no such column: t.rating`) sur le .18 en 0.9.169.
+#[cfg(test)]
+mod apercu_note_5547 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    async fn apercu(regles: &str, profil: i64) -> serde_json::Value {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let r = super::preview_smart_collection(
+            axum::extract::State(SmartHttpState::new(backend)),
+            tune_http_types::ActiveProfile(profil),
+            axum::Json(super::PreviewRequest {
+                rules: serde_json::from_str(regles).expect("json"),
+                match_mode: None,
+                sort_by: None,
+                sort_order: None,
+                max_tracks: None,
+            }),
+        )
+        .await;
+        match r {
+            Ok(axum::Json(v)) => v,
+            Err(e) => panic!(
+                "l'aperçu échoue au lieu de répondre : statut {}",
+                axum::response::IntoResponse::into_response(e).status()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn l_apercu_d_une_regle_note_repond_sans_erreur() {
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 1).await;
+        assert_eq!(
+            v["tracks"].as_array().map(|a| a.len()),
+            v["total"].as_u64().map(|n| n as usize)
+        );
+        let attendu = if "tracks" == "tracks" { 2 } else { 1 };
+        assert_eq!(v["total"], attendu, "{v}");
+        // Le profil 2 n'a noté que Giant Steps.
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
+        assert_eq!(v["total"], 1, "{v}");
     }
 }
