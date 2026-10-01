@@ -784,7 +784,10 @@ async fn sync_community_covers(
         };
 
     let client = tune_core::http::client::shared();
-    let artwork_dir = &state.config.artwork_dir;
+    // #5596 : le cache réellement servi. Partout sauf sur Tune OS c'est
+    // déjà `config.artwork_dir` ; sur l'image Tune OS, la valeur brute de
+    // `tune.toml` envoyait ces pochettes dans un dossier jamais lu.
+    let artwork_dir = &crate::routes::library::artwork_cache_dir();
     if let Err(e) = std::fs::create_dir_all(artwork_dir) {
         warn!(error = %e, "artwork_cache_dir_create_failed");
     }
