@@ -52,9 +52,21 @@ async fn relocation_full_flow() {
     let tmp = tune_core::test_scratch::scratch_dir("tune-reloc-test");
 
     // Source : une vraie petite base SQLite + un cache pochettes.
+    //
+    // #5596 — comme sur l'image Tune OS, le cache SERVI (`source/artwork_cache`,
+    // l'historique `/opt/tune/artwork_cache`) n'est pas la valeur brute
+    // `artwork_dir` de `tune.toml` (`source/data/artwork_cache`, l'image écrit
+    // `/opt/tune/data/artwork_cache`), restée vide. Le déplacement doit copier
+    // le cache servi : la rc1 copiait la valeur brute, donc un dossier vide.
+    // En production c'est le démarrage (`chemins_de_donnees::retenir`) qui
+    // désigne le cache servi ; un test d'intégration ne peut le faire que par
+    // `TUNE_ARTWORK_DIR`, que `artwork_cache_dir()` consulte en premier.
     let src = tmp.join("source");
     std::fs::create_dir_all(src.join("artwork_cache")).unwrap();
     std::fs::write(src.join("artwork_cache/cover1.jpg"), b"jpegdata").unwrap();
+    let cache_servi = src.join("artwork_cache");
+    let artwork_dir_brut = src.join("data/artwork_cache");
+    std::fs::create_dir_all(&artwork_dir_brut).unwrap();
     let src_db = src.join("tune.db");
     {
         let conn = rusqlite::Connection::open(&src_db).unwrap();
@@ -78,7 +90,7 @@ async fn relocation_full_flow() {
         format!(
             "port = 8888\ndb_path = \"{}\"\nartwork_dir = \"{}\"\n",
             src_db.display(),
-            src.join("artwork_cache").display()
+            artwork_dir_brut.display()
         ),
     )
     .unwrap();
@@ -131,13 +143,14 @@ async fn relocation_full_flow() {
         std::env::set_var("TUNE_LSBLK_BIN", &lsblk);
         std::env::set_var("TUNE_MUSIC_MOUNT_BASE", tmp.join("music-mounts"));
         std::env::set_var("TUNE_DEV_DIR", tmp.join("dev"));
+        std::env::set_var("TUNE_ARTWORK_DIR", &cache_servi);
     }
     std::fs::create_dir_all(tmp.join("dev")).unwrap();
 
     // App dont la config pointe sur la source réelle.
     let config = tune_server::config::TuneConfig {
         db_path: src_db.to_string_lossy().into_owned(),
-        artwork_dir: src.join("artwork_cache").to_string_lossy().into_owned(),
+        artwork_dir: artwork_dir_brut.to_string_lossy().into_owned(),
         ..Default::default()
     };
     let state = tune_server::state::AppState::new(&config.db_path.clone(), 0, config).unwrap();
@@ -151,6 +164,15 @@ async fn relocation_full_flow() {
     assert_eq!(vols[0]["uuid"], "TEST-UUID");
     assert_eq!(vols[0]["fs"], "exfat");
     assert!(vols[0]["free_bytes"].as_u64().unwrap() > 1_000_000_000_000);
+
+    // #5596 : l'état annonce le cache servi, pas la valeur brute.
+    let (status, st) = get(&app, "/api/v1/appliance/data/status").await;
+    assert_eq!(status, StatusCode::OK, "{st}");
+    assert_eq!(
+        st["artwork_dir"].as_str(),
+        Some(cache_servi.to_string_lossy().as_ref()),
+        "{st}"
+    );
 
     // UUID inconnu → 400.
     let (status, _) = post_json(
@@ -332,6 +354,7 @@ async fn relocation_full_flow() {
             "TUNE_DEV_DIR",
             "TUNE_IMAGE_URL",
             "TUNE_INSTALL_PIPELINE",
+            "TUNE_ARTWORK_DIR",
         ] {
             std::env::remove_var(v);
         }

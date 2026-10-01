@@ -3114,9 +3114,18 @@ async fn resume(
 }
 
 async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+    arreter_la_zone(&state, zone_id).await;
     Json(build_zone_json(&state, zone_id).await)
+}
+
+/// L'arrêt du bouton Stop : `get_zone_device_id` puis `orchestrator.stop`,
+/// qui persiste la position, écrit `last_play_state = "stopped"` en base,
+/// envoie `stop()` à la sortie (locale, DLNA…) et ferme la session de flux.
+/// Tout geste qui ARRÊTE une zone passe par ici (#5571) — pas par
+/// `PlaybackManager::stop`, qui ne change que l'état en mémoire.
+async fn arreter_la_zone(state: &AppState, zone_id: i64) {
+    let device_id = get_zone_device_id(state, zone_id);
+    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
 }
 
 /// Reject playback commands on an orphan zone (a DB row with no
@@ -4592,7 +4601,9 @@ async fn set_sleep(
     Json(body): Json<SleepRequest>,
 ) -> Json<Value> {
     if body.minutes == 0 {
-        SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+        if SLEEP_TIMERS.lock().unwrap().remove(&zone_id).is_some() {
+            info!(zone_id, "sleep_timer_cancelled");
+        }
         return Json(json!({ "sleep_timer": null, "zone_id": zone_id }));
     }
 
@@ -4606,37 +4617,54 @@ async fn set_sleep(
         !existed
     };
 
+    info!(zone_id, minutes = body.minutes, "sleep_timer_armed");
     if starting {
-        let playback = state.playback.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let playing = playback.get_state(zone_id).await.state
-                    == tune_core::playback::PlayState::Playing;
-                let left = {
-                    let mut timers = SLEEP_TIMERS.lock().unwrap();
-                    match timers.get_mut(&zone_id) {
-                        None => break, // cancelled
-                        Some(secs) => {
-                            if playing && *secs > 0 {
-                                *secs -= 1;
-                            }
-                            *secs
-                        }
-                    }
-                };
-                if left == 0 {
-                    playback.stop(zone_id).await;
-                    SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
-                    break;
-                }
-            }
+            decompter_le_minuteur(state, zone_id, std::time::Duration::from_secs(1)).await;
         });
     }
 
     Json(json!({
         "sleep_timer": { "minutes": body.minutes, "zone_id": zone_id },
     }))
+}
+
+/// Le décompte d'un minuteur de sommeil : une seconde de `SLEEP_TIMERS` par
+/// `pas`, seulement pendant la lecture. À zéro, la zone est arrêtée par
+/// [`arreter_la_zone`] — le MÊME chemin que le bouton Stop.
+///
+/// 🔴 #5571 (Levente, fil 2068) : l'échéance appelait `PlaybackManager::stop`,
+/// qui écrit `PlayState::Stopped` en mémoire et émet `stopped`, sans jamais
+/// parler à la sortie. Une zone navigateur se taisait (l'onglet obéit à
+/// l'évènement), mais une sortie locale ou un renderer DLNA continuait de
+/// jouer pendant que l'écran affichait « arrêté ».
+///
+/// `pas` n'existe que pour les tests : la route passe une seconde.
+async fn decompter_le_minuteur(state: AppState, zone_id: i64, pas: std::time::Duration) {
+    loop {
+        tokio::time::sleep(pas).await;
+        let playing = state.playback.get_state(zone_id).await.state
+            == tune_core::playback::PlayState::Playing;
+        let left = {
+            let mut timers = SLEEP_TIMERS.lock().unwrap();
+            match timers.get_mut(&zone_id) {
+                None => break, // annulé
+                Some(secs) => {
+                    if playing && *secs > 0 {
+                        *secs -= 1;
+                    }
+                    *secs
+                }
+            }
+        };
+        if left == 0 {
+            info!(zone_id, "sleep_timer_expired");
+            arreter_la_zone(&state, zone_id).await;
+            SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+            break;
+        }
+    }
 }
 
 async fn get_sleep(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
@@ -8281,5 +8309,179 @@ mod tests_depart_jouable {
             "12 entrees entrent, 12 entrees restent : la piste enjambee \
              demeure atteignable a la main"
         );
+    }
+}
+
+/// 🔴 #5571 — à l'échéance, le minuteur de sommeil ARRÊTE LA SORTIE, par le
+/// chemin du bouton Stop.
+///
+/// Chaque test arme un minuteur de deux secondes de lecture, le décompte au
+/// pas de 10 ms jusqu'à zéro, et mesure ce qui sort du serveur : les `Stop`
+/// reçus par la sortie factice et `last_play_state` en base.
+///
+/// Contre-épreuve : remettre `state.playback.stop(zone_id)` à la place de
+/// `arreter_la_zone` dans `decompter_le_minuteur` (l'appel d'avant le
+/// correctif). Ça compile, et les trois premiers tests tombent : zéro `Stop`
+/// reçu, et la base reste à « playing ».
+#[cfg(test)]
+mod minuteur_de_sommeil_arrete_la_sortie_5571 {
+    use super::{SLEEP_TIMERS, decompter_le_minuteur};
+    use crate::state::AppState;
+    use std::time::Duration;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::playback::{NowPlaying, PlayState};
+
+    /// `SLEEP_TIMERS` est global et chaque base `:memory:` numérote ses
+    /// zones à partir de 1 : les tests de ce module passent l'un après l'autre.
+    static UN_A_LA_FOIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const APPAREIL: &str = "sortie-factice-5571";
+    const PAS: Duration = Duration::from_millis(10);
+
+    /// Une zone qui JOUE, sur une sortie factice du type donné (`None` : zone
+    /// navigateur, sans appareil côté serveur).
+    async fn zone_en_lecture(output_type: Option<&str>) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = match output_type {
+            Some(t) => {
+                let id = repo.create("Salon", Some(t), Some(APPAREIL)).expect("zone");
+                state
+                    .outputs
+                    .lock()
+                    .await
+                    .register(Box::new(MockOutput::new(APPAREIL, "Factice").with_type(t)));
+                id
+            }
+            None => repo.create("Mac", Some("browser"), None).expect("zone"),
+        };
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "9 Crimes".into(),
+                    source: "local".into(),
+                    track_id: Some(1),
+                    duration_ms: 600_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état initial");
+        (state, zone_id)
+    }
+
+    async fn arrets_recus(state: &AppState) -> u64 {
+        let registre = state.outputs.lock().await;
+        let arc = registre.get(APPAREIL).expect("sortie enregistrée");
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("MockOutput")
+            .stop_call_count()
+    }
+
+    /// Arme `secondes` et décompte jusqu'à l'échéance (borne : 5 s).
+    async fn aller_jusqu_a_zero(state: &AppState, zone_id: i64, secondes: u64) {
+        SLEEP_TIMERS.lock().unwrap().insert(zone_id, secondes);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            decompter_le_minuteur(state.clone(), zone_id, PAS),
+        )
+        .await
+        .expect("le minuteur doit arriver à zéro");
+    }
+
+    async fn verifier_l_arret_par_la_sortie(output_type: &str) {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(Some(output_type)).await;
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "rien d'arrêté avant l'échéance"
+        );
+
+        aller_jusqu_a_zero(&state, zone_id, 2).await;
+
+        assert_eq!(
+            arrets_recus(&state).await,
+            1,
+            "sortie {output_type} : l'échéance doit envoyer UN Stop à la sortie — \
+             sans lui, l'écran dit « arrêté » et la musique continue (#5571)"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "sortie {output_type} : la base doit dire « stopped », comme après le bouton Stop"
+        );
+        assert_eq!(
+            state.playback.get_state(zone_id).await.state,
+            PlayState::Stopped
+        );
+        assert!(
+            !SLEEP_TIMERS.lock().unwrap().contains_key(&zone_id),
+            "le minuteur échu doit disparaître"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_echeance_la_sortie_locale_recoit_un_stop() {
+        verifier_l_arret_par_la_sortie("local").await;
+    }
+
+    #[tokio::test]
+    async fn a_echeance_le_renderer_dlna_recoit_un_stop() {
+        verifier_l_arret_par_la_sortie("dlna").await;
+    }
+
+    /// Zone navigateur : pas d'appareil côté serveur, c'est l'évènement
+    /// `stopped` qui fait taire l'onglet. Il doit partir, et la base doit
+    /// suivre comme pour le bouton Stop.
+    #[tokio::test]
+    async fn a_echeance_la_zone_navigateur_est_arretee_comme_par_le_bouton_stop() {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(None).await;
+        let mut evenements = state.playback.subscribe();
+
+        aller_jusqu_a_zero(&state, zone_id, 2).await;
+
+        let mut arret_annonce = false;
+        while let Ok(e) = evenements.try_recv() {
+            if e.event == "stopped" && e.zone_id == zone_id {
+                arret_annonce = true;
+            }
+        }
+        assert!(arret_annonce, "l'onglet n'obéit qu'à l'évènement `stopped`");
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into()),
+            "zone navigateur : la base doit dire « stopped », comme après le bouton Stop"
+        );
+    }
+
+    /// Garde du décompte : une zone en PAUSE ne consomme pas son minuteur et
+    /// n'est donc jamais arrêtée par lui. L'arrêt vient de l'échéance, pas du
+    /// simple fait que la tâche tourne.
+    #[tokio::test]
+    async fn une_zone_en_pause_ne_consomme_pas_son_minuteur() {
+        let _tour = UN_A_LA_FOIS.lock().await;
+        let (state, zone_id) = zone_en_lecture(Some("local")).await;
+        state.playback.pause(zone_id).await;
+        SLEEP_TIMERS.lock().unwrap().insert(zone_id, 2);
+
+        let fini = tokio::time::timeout(
+            Duration::from_millis(200),
+            decompter_le_minuteur(state.clone(), zone_id, PAS),
+        )
+        .await;
+
+        let reste = SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+        assert!(fini.is_err(), "en pause, le minuteur ne doit pas échoir");
+        assert_eq!(reste, Some(2), "en pause, pas une seconde décomptée");
+        assert_eq!(arrets_recus(&state).await, 0);
     }
 }

@@ -676,18 +676,9 @@ async fn delete_collection(
     Json(json!({"deleted": true, "id": id}))
 }
 
-fn resolve_timestamp_sql(input: &str) -> String {
-    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
-    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
-    // through to a literal string ('90d') that no date ever compares against.
-    let rest = input.strip_prefix("now-").unwrap_or(input);
-    let digits = rest.strip_suffix('d').unwrap_or(rest);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        let days: i64 = digits.parse().unwrap_or(30);
-        return format!("DATETIME('now', '-{days} days')");
-    }
-    format!("'{}'", input.replace('\'', "''"))
-}
+// #5547 — la lecture d'une date de règle vit dans `regles_sql`, pour que les
+// playlists la lisent comme les collections.
+use crate::regles_sql::horodatage_sql as resolve_timestamp_sql;
 
 /// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).
 ///
@@ -776,46 +767,8 @@ pub fn build_album_query(
             if op == "has"
                 && let Some(obj) = value_raw.and_then(|v| v.as_object())
             {
-                let mut sub_conds = Vec::new();
-                if let Some(role) = obj
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    sub_conds.push(format!(
-                        "LOWER(tc.role) LIKE LOWER('%{}%')",
-                        role.replace('\'', "''")
-                    ));
-                }
-                if let Some(artist) = obj
-                    .get("artist_name")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    sub_conds.push(format!(
-                        "LOWER(tc.artist_name) LIKE LOWER('%{}%')",
-                        artist.replace('\'', "''")
-                    ));
-                }
-                if let Some(instr) = obj
-                    .get("instrument")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    // MÊME canonisation qu'à l'écriture des crédits
-                    // (#2799 §4). L'enrichissement range désormais
-                    // « grand piano » / « electric piano » sous `piano` ;
-                    // si la règle cherchait le libellé brut saisi par
-                    // l'utilisateur, une collection `instrument: Grand
-                    // Piano` ne trouverait plus rien alors que les lignes
-                    // existent. Deux normalisations, deux résultats.
-                    let canon = tune_core::metadata::instruments::canoniser_instrument(instr);
-                    let motif = if canon.is_empty() { instr } else { &canon };
-                    sub_conds.push(format!(
-                        "LOWER(tc.instrument) LIKE LOWER('%{}%')",
-                        motif.replace('\'', "''")
-                    ));
-                }
+                // #5547 — la même lecture que les playlists (`regles_sql`).
+                let sub_conds = crate::regles_sql::conditions_credit(obj);
                 if !sub_conds.is_empty() {
                     conditions.push(format!(
                         "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
@@ -857,6 +810,13 @@ pub fn build_album_query(
                         continue;
                     }
                 }
+                // #5547 — « jamais » : l'éditeur le propose pour toute date,
+                // et la règle disparaissait ici (`_ => continue`), la
+                // collection rendant TOUT. Une date d'ajout absente est un
+                // fichier sans date connue.
+                "is_null" => "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                     WHERE t2.file_mtime IS NULL)"
+                    .to_string(),
                 _ => continue,
             };
             conditions.push(cond);
@@ -907,6 +867,39 @@ pub fn build_album_query(
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) {op} {ts})"
                     )
                 }
+                // #5547 — « entre » : l'éditeur le propose pour les deux
+                // champs, et le moteur n'avait aucun bras. La règle tombait
+                // dans `_ => continue` et la collection rendait TOUT (#1231).
+                ("play_count", "between") => {
+                    let Some((lo, hi)) = crate::regles_sql::bornes_de_nombres(value_raw) else {
+                        continue;
+                    };
+                    let dans = format!(
+                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         GROUP BY t3.album_id HAVING COUNT(*) BETWEEN {lo} AND {hi})"
+                    );
+                    if lo <= 0 {
+                        // Zéro écoute n'a pas de ligne : « entre 0 et N »
+                        // doit garder les albums jamais écoutés.
+                        format!(
+                            "(al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
+                             JOIN listen_history lh ON lh.track_id = t3.id) OR {dans})"
+                        )
+                    } else {
+                        dans
+                    }
+                }
+                ("last_played_at", "between") => {
+                    let Some((lo, hi)) = crate::regles_sql::bornes_de_dates(value_raw) else {
+                        continue;
+                    };
+                    format!(
+                        "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                         JOIN listen_history lh ON lh.track_id = t3.id \
+                         GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
+                    )
+                }
                 ("last_played_at", "is_null") => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id)"
@@ -915,6 +908,16 @@ pub fn build_album_query(
                 _ => continue,
             };
             conditions.push(cond);
+            continue;
+        }
+
+        // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
+        if field == "rating" {
+            if let Some(c) =
+                crate::regles_sql::condition_note("al.id", op, value_raw, ctx.profile_id)
+            {
+                conditions.push(c);
+            }
             continue;
         }
 
@@ -943,7 +946,6 @@ pub fn build_album_query(
             "track_number" => "CAST(t.track_number AS INTEGER)",
             "disc_number" => "CAST(t.disc_number AS INTEGER)",
             "bpm" => "CAST(t.bpm AS INTEGER)",
-            "rating" => "CAST(t.rating AS INTEGER)",
             _ => continue,
         };
 
@@ -2591,5 +2593,52 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+/// #5547 — l'APERÇU réel de la route, avec une règle « Note » : il rendait une
+/// erreur 500 (`no such column: t.rating`) sur le .18 en 0.9.169.
+#[cfg(test)]
+mod apercu_note_5547 {
+    use std::sync::Arc;
+
+    use crate::SmartHttpState;
+
+    async fn apercu(regles: &str, profil: i64) -> serde_json::Value {
+        let db = crate::criteres::tests::bibliotheque();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let r = super::preview_albums(
+            axum::extract::State(SmartHttpState::new(backend)),
+            tune_http_types::ActiveProfile(profil),
+            axum::Json(super::PreviewRequest {
+                rules: serde_json::from_str(regles).expect("json"),
+                match_mode: None,
+                sort_by: None,
+                sort_order: None,
+                max_limit: None,
+            }),
+        )
+        .await;
+        match r {
+            Ok(axum::Json(v)) => v,
+            Err(e) => panic!(
+                "l'aperçu échoue au lieu de répondre : statut {}",
+                axum::response::IntoResponse::into_response(e).status()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn l_apercu_d_une_regle_note_repond_sans_erreur() {
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 1).await;
+        assert_eq!(
+            v["albums"].as_array().map(|a| a.len()),
+            v["total"].as_u64().map(|n| n as usize)
+        );
+        let attendu = if "albums" == "tracks" { 2 } else { 1 };
+        assert_eq!(v["total"], attendu, "{v}");
+        // Le profil 2 n'a noté que Giant Steps.
+        let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
+        assert_eq!(v["total"], 1, "{v}");
     }
 }
