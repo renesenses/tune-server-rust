@@ -1226,6 +1226,26 @@ pub struct PlayResult {
     pub error: Option<String>,
 }
 
+/// `PlayResult.error` d'une lecture ÉVINCÉE par une plus récente : elle n'a
+/// rien envoyé, et ce n'est pas un échec — la lecture gagnante pilote la
+/// sortie. Nommé pour que l'appelant puisse distinguer ce cas d'un vrai refus
+/// de la sortie (#5574, façade MediaRenderer).
+pub const PLAY_SUPERSEDED: &str = "superseded by a newer play";
+
+impl PlayResult {
+    /// La sortie a-t-elle REFUSÉ la lecture ? Vrai quand rien n'est parti et
+    /// qu'une erreur est portée, hors éviction par une lecture plus récente.
+    ///
+    /// `play()` rend `Ok` dans ce cas (la zone est arrêtée, l'erreur est
+    /// diffusée en toast) : un appelant qui ne lirait que le `Result`
+    /// acquitterait une lecture qui n'a pas eu lieu (#5574).
+    pub fn sortie_refusee(&self) -> Option<&str> {
+        self.error
+            .as_deref()
+            .filter(|e| !self.output_sent && *e != PLAY_SUPERSEDED)
+    }
+}
+
 pub struct ResolvedStream {
     pub url: String,
     pub mime_type: String,

@@ -27,6 +27,12 @@ mod dossiers;
 /// ordre sur un lecteur DLNA et dans le client web.
 pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
 
+/// L'ordre des dossiers du serveur média (sans casse ni accents, nombres par
+/// leur valeur), partagé avec l'écran Répertoires de l'API REST (#5582) : un
+/// même dossier se lit dans le même ordre sur un lecteur DLNA et dans le
+/// client web, et « haydn » ne part plus après « Z ».
+pub use dossiers::comparer_naturel;
+
 // ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------

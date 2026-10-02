@@ -514,13 +514,37 @@ pub async fn handle_stream(
         .get("Range")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_range_start);
+    // Une requête DEPUIS LE DÉBUT (`bytes=0-`, ou sans `Range`) alors que le
+    // tuyau a déjà rendu quelque chose. Zone 10 du .18 (Eversolo DMP-A8,
+    // Qobuz FLAC → WAV, 1.0.0-rc1, 02/10) : à chaque piste, deux `bytes=0-`
+    // de `Lavf/58.45.100` à 200 ms d'écart. La première est une sonde : elle
+    // tire le préchargement puis se ferme. La seconde, la vraie lecture,
+    // recevait l'en-tête rejoué PUIS le tuyau à sa position courante : le
+    // début de la piste, parti dans la sonde, était perdu — « les premières
+    // secondes semblent perdues ». Tant que la retenue commence à 0, on la
+    // rejoue à l'octet, en-tête compris.
+    let depuis_le_debut = is_wav && wav_header_included && range_demande.unwrap_or(0) == 0;
+    let reprise_candidate = match range_demande {
+        Some(n) if n >= seuil_de_reprise => Some(n),
+        _ if depuis_le_debut && session.etendue_retenue().1 > 0 => Some(0),
+        _ => None,
+    };
     let mut longueur = wav_length;
     let mut reprise_exacte: Option<u64> = None;
-    if let (Some(n), Some(_), true) = (range_demande, wav_length, retenue_possible)
-        && n >= seuil_de_reprise
-    {
+    if let (Some(n), Some(_), true) = (reprise_candidate, wav_length, retenue_possible) {
         let (retenue_debut, retenue_fin) = session.etendue_retenue();
-        if n < retenue_fin && n >= retenue_debut {
+        if n == 0 && n < retenue_fin && n < retenue_debut {
+            warn!(
+                stream_id,
+                range = range_hdr,
+                retenue_debut,
+                retenue_fin,
+                octets_de_debut_perdus = retenue_debut.saturating_sub(44),
+                "debut_de_piste_perdu — une lecture demande le DÉBUT alors que la retenue a \
+                 déjà glissé : l'en-tête est rejoué, puis le direct ; les octets de début \
+                 tirés par une connexion précédente ne peuvent plus être servis"
+            );
+        } else if n < retenue_fin && n >= retenue_debut {
             // Le canal fermé et vidé, la longueur VRAIE est connue : c'est
             // elle qu'on annonce, pas la déduction par la durée, sans quoi le
             // corps finirait avant son Content-Length.
@@ -717,6 +741,19 @@ pub async fn handle_stream(
     let icy_cover = session.cover_url.clone();
     let icy_stream_id = stream_id.to_string();
 
+    // Une ligne par connexion terminée sur une conversion : combien d'octets
+    // elle a emportés, pour quelle plage. Sans elle, une sonde qui vide le
+    // préchargement puis se ferme ne laissait au journal que son
+    // `stream_request` (zone 10 du .18, 02/10).
+    let mut bilan = (!is_radio).then(|| BilanDeConnexion {
+        stream_id: stream_id.to_string(),
+        range: range_hdr.to_string(),
+        agent: user_agent.clone().unwrap_or_else(|| "-".to_string()),
+        reprise_depuis_la_retenue: reprise_exacte,
+        octets_envoyes: 0,
+        debut: std::time::Instant::now(),
+        session: session.clone(),
+    });
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -997,9 +1034,12 @@ pub async fn handle_stream(
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_range_start);
             let saute_entete = debut_demande.is_some_and(|s| s >= 44);
+            // Rejouée depuis 0, la retenue porte déjà l'en-tête : ne pas
+            // l'émettre deux fois.
             if is_wav
                 && wav_header_included
                 && !saute_entete
+                && reprise_exacte.is_none()
                 && let Some(entete) = session.wav_header_stash.get()
             {
                 yield Ok(bytes::Bytes::from(entete.clone()));
@@ -1292,6 +1332,12 @@ pub async fn handle_stream(
             }
         }
     };
+    let flux = futures_util::StreamExt::map(flux, move |morceau| {
+        if let (Ok(o), Some(b)) = (&morceau, bilan.as_mut()) {
+            b.octets_envoyes += o.len() as u64;
+        }
+        morceau
+    });
     let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
@@ -1308,6 +1354,36 @@ pub async fn handle_stream(
 /// (~2 Gio) : on les pose à `u32::MAX` sur le PREMIER bloc du canal, avant
 /// qu'il soit retenu ou mis en réserve, pour que sondes, reprises et
 /// reconnexions reçoivent le même conteneur. Idempotent.
+/// Bilan d'UNE connexion au flux d'une conversion, écrit quand son corps est
+/// lâché — qu'il soit allé au bout ou que le client ait coupé.
+struct BilanDeConnexion {
+    stream_id: String,
+    range: String,
+    agent: String,
+    reprise_depuis_la_retenue: Option<u64>,
+    octets_envoyes: u64,
+    debut: std::time::Instant,
+    session: std::sync::Arc<StreamSession>,
+}
+
+impl Drop for BilanDeConnexion {
+    fn drop(&mut self) {
+        info!(
+            stream_id = %self.stream_id,
+            range = %self.range,
+            agent = %self.agent,
+            octets_envoyes = self.octets_envoyes,
+            reprise_depuis_la_retenue = ?self.reprise_depuis_la_retenue,
+            tuyau = self
+                .session
+                .octets_du_canal
+                .load(std::sync::atomic::Ordering::Relaxed),
+            duree_ms = self.debut.elapsed().as_millis() as u64,
+            "stream_connexion_terminee"
+        );
+    }
+}
+
 fn corriger_entete_long(long_wav: bool) -> impl Fn(u64, &mut Vec<u8>) + Send + Sync + 'static {
     move |debut: u64, bloc: &mut Vec<u8>| {
         if long_wav
