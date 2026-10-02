@@ -690,8 +690,45 @@ pub(crate) fn ipv4_listen_socket() -> socket2::Socket {
         Some(socket2::Protocol::TCP),
     )
     .expect("failed to create socket");
-    socket.set_reuse_address(true).ok();
+    if reutiliser_l_adresse_d_ecoute(std::env::consts::OS) {
+        socket.set_reuse_address(true).ok();
+    }
     socket
+}
+
+/// #5640 — `SO_REUSEADDR` sur la socket d'écoute HTTP, oui ou non, selon le
+/// système.
+///
+/// Sous Unix, l'option ne fait que lever l'attente des connexions en
+/// `TIME_WAIT` : une seconde socket ne peut toujours pas se lier à un port
+/// déjà en écoute, et la garde « un seul serveur tient le port » de
+/// `bootstrap.rs` tient.
+///
+/// Sous **Windows**, elle fait tout autre chose : elle autorise une seconde
+/// socket du même compte à se lier au port qu'une première écoute déjà
+/// (documentation Microsoft « Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE » :
+/// première socket `SO_REUSEADDR`, seconde `SO_REUSEADDR`, même adresse
+/// joker → succès). Un deuxième `tune-server.exe` lancé pendant que le
+/// premier tourne obtenait donc 8888 sans erreur, écrivait `listening
+/// addr=[::]:8888`, et les deux serveurs restaient vivants côte à côte —
+/// seuls les ports ouverts SANS l'option (3483, 9090-9092, liés par tokio qui
+/// ne la pose jamais sous Windows) échouaient en 10048. C'est le journal de
+/// bluevelvet (fil 2105) : rapport rendu par un processus démarré 46 min
+/// avant le démarrage journalisé.
+///
+/// Windows n'a pas besoin de l'option pour relancer vite : un `TIME_WAIT` n'y
+/// bloque pas la liaison d'une socket d'écoute. C'est pour cela que la
+/// bibliothèque standard et mio/tokio ne la posent pas sous Windows.
+pub(crate) fn reutiliser_l_adresse_d_ecoute(systeme: &str) -> bool {
+    systeme != "windows"
+}
+
+/// #5640 — un échec de liaison de la socket double pile justifie-t-il le repli
+/// en IPv4 seule ? Oui quand la pile IPv6 manque ou refuse l'adresse ; NON
+/// quand le port est pris : la double pile marche, il faut attendre que
+/// l'autre instance le rende, puis écouter dans les deux familles.
+pub(crate) fn repli_ipv4_apres_echec(erreur: &std::io::Error) -> bool {
+    erreur.kind() != std::io::ErrorKind::AddrInUse
 }
 
 /// Socket d'écoute double pile : une socket IPv6 avec `IPV6_V6ONLY` désactivé
@@ -713,7 +750,10 @@ pub(crate) fn dual_stack_listen_socket(
     )
     .ok()?;
     socket.set_only_v6(false).ok()?;
-    socket.set_reuse_address(true).ok();
+    // #5640 — jamais sous Windows : voir `reutiliser_l_adresse_d_ecoute`.
+    if reutiliser_l_adresse_d_ecoute(std::env::consts::OS) {
+        socket.set_reuse_address(true).ok();
+    }
     let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     Some((socket, addr))
 }
@@ -985,6 +1025,68 @@ mod listen_socket_tests {
             "connexion ::1 refusée sur la socket double pile : {v6:?}"
         );
         drop(listener.accept().expect("accept IPv6"));
+    }
+
+    /// #5640 — sous Windows, `SO_REUSEADDR` laisse une seconde instance se
+    /// lier au port HTTP déjà en écoute : deux serveurs vivants. La règle doit
+    /// le refuser à Windows, et le garder ailleurs (relance rapide malgré les
+    /// `TIME_WAIT`).
+    #[test]
+    fn so_reuseaddr_jamais_sous_windows_5640() {
+        assert!(
+            !reutiliser_l_adresse_d_ecoute("windows"),
+            "SO_REUSEADDR sous Windows = une 2e instance obtient le port 8888 (#5640)"
+        );
+        for systeme in ["linux", "macos", "freebsd", "android"] {
+            assert!(reutiliser_l_adresse_d_ecoute(systeme), "{systeme}");
+        }
+    }
+
+    /// #5640 — un port PRIS ne fait pas tomber en IPv4 seule ; une pile IPv6
+    /// absente, si.
+    #[test]
+    fn port_pris_ne_fait_pas_tomber_en_ipv4_seule_5640() {
+        use std::io::{Error, ErrorKind};
+        assert!(!repli_ipv4_apres_echec(&Error::from(ErrorKind::AddrInUse)));
+        assert!(repli_ipv4_apres_echec(&Error::from(
+            ErrorKind::AddrNotAvailable
+        )));
+        assert!(repli_ipv4_apres_echec(&Error::from(ErrorKind::Unsupported)));
+    }
+
+    /// #5640 — les deux fabriques de socket d'écoute appliquent bien la règle
+    /// du système courant (sous Windows : option absente).
+    #[test]
+    fn les_sockets_d_ecoute_suivent_la_regle_du_systeme_5640() {
+        let attendu = reutiliser_l_adresse_d_ecoute(std::env::consts::OS);
+        let v4 = ipv4_listen_socket();
+        assert_eq!(v4.reuse_address().expect("SO_REUSEADDR lisible"), attendu);
+        if let Some((v6, _)) = dual_stack_listen_socket(0) {
+            assert_eq!(v6.reuse_address().expect("SO_REUSEADDR lisible"), attendu);
+        }
+    }
+
+    /// #5640 — la garde « un seul serveur tient le port » : une seconde
+    /// socket d'écoute sur le port d'une première DOIT être refusée. C'est ce
+    /// refus que `bootstrap.rs` attend pour sortir au lieu de servir en double.
+    #[test]
+    fn une_seconde_socket_d_ecoute_sur_le_meme_port_est_refusee_5640() {
+        let premiere = ipv4_listen_socket();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        premiere.bind(&addr.into()).expect("bind");
+        premiere.listen(8).expect("listen");
+        let port = premiere
+            .local_addr()
+            .expect("local_addr")
+            .as_socket()
+            .expect("adresse IP")
+            .port();
+        let seconde = ipv4_listen_socket();
+        let meme = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        assert!(
+            seconde.bind(&meme.into()).is_err(),
+            "une seconde instance a obtenu le port {port} déjà en écoute"
+        );
     }
 
     #[test]

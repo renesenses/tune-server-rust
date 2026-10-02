@@ -2996,10 +2996,13 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
         // never came back and had to be relaunched by hand). The listening socket
         // is created non-inheritable (socket2 sets WSA_FLAG_NO_HANDLE_INHERIT), so
         // the child does NOT inherit it and this process's exit fully releases
-        // port 8888; the child's bind() retries for ~20s (main.rs) to cover the
-        // brief release window. On a supervised install the child simply races the
-        // supervisor's relaunch and whichever loses exits cleanly on the bind
-        // guard — no crash loop.
+        // port 8888; the child's bind() retries for ~20s (bootstrap.rs) to cover
+        // the brief release window. On a supervised install the child simply races
+        // the supervisor's relaunch and whichever loses exits cleanly on the bind
+        // guard — no crash loop. #5640 : cette garde n'existait pas sous Windows
+        // tant que la socket d'écoute posait SO_REUSEADDR — l'enfant obtenait le
+        // port pendant que ce processus l'écoutait encore, et tout second
+        // lancement aussi. Voir `config::reutiliser_l_adresse_d_ecoute`.
         #[cfg(windows)]
         {
             if let Ok(exe) = std::env::current_exe() {

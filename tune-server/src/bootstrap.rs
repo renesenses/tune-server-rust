@@ -253,7 +253,12 @@ pub async fn run_with(opts: RunOptions) {
                 // Premier échec sur la socket IPv6 : la pile est peut-être
                 // désactivée sur la machine. On repasse en IPv4 seule plutôt
                 // que d'épuiser les tentatives puis de sortir en erreur.
-                Err(e) if ipv6_attempted => {
+                // #5640 — sauf si le port est simplement PRIS : la pile IPv6
+                // marche, une autre instance tient le port (sous Windows,
+                // l'ancien processus d'un « Redémarrer » pendant ses derniers
+                // instants). On attend avec la socket double pile, sinon le
+                // serveur relancé n'écoutait plus qu'en IPv4 (#1321).
+                Err(e) if ipv6_attempted && crate::config::repli_ipv4_apres_echec(&e) => {
                     tracing::info!(error = %e, "bind IPv6 impossible, repli sur IPv4 seule");
                     ipv6_attempted = false;
                     socket = crate::config::ipv4_listen_socket();
