@@ -1518,22 +1518,6 @@ async fn resolve_ytdlp(state: &AppState) {
     }
 }
 
-/// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
-/// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
-/// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
-///
-/// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
-/// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
-/// fonctionnalités.
-#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: f64, fixed_volume: bool) -> f64 {
-    if fixed_volume {
-        1.0
-    } else {
-        (zone_volume / 100.0).clamp(0.0, 1.0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalZoneAction {
     Create,
@@ -1791,14 +1775,13 @@ pub async fn register_local_outputs(state: &AppState) {
             // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
             // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
             if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-                let stored = seed_volume_for(zone.volume, zone.fixed_volume);
-                if let Err(e) =
-                    tune_core::outputs::OutputTarget::set_volume(&local_out, stored).await
-                {
-                    warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
-                } else {
-                    info!(device_id = %device_id, volume = stored, "local_output_volume_seeded");
-                }
+                tune_core::orchestrator::ensemencer_le_volume_local(
+                    &state.backend,
+                    &zone,
+                    &device_id,
+                    &local_out,
+                )
+                .await;
             }
             outputs.register(Box::new(local_out));
             info!(
@@ -2460,6 +2443,9 @@ mod zones_reflet_tests {
 mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
+    #[cfg(feature = "local-audio")]
+    use tune_core::orchestrator::ensemencer_le_volume_local;
+    use tune_core::orchestrator::volume_de_graine as seed_volume_for;
 
     fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -2530,25 +2516,90 @@ mod restore_zone_volumes_tests {
     /// le seul endroit où le volume stocké atteint vraiment le son.
     #[test]
     fn local_output_is_seeded_with_the_stored_level() {
-        assert!((seed_volume_for(30.0, false) - 0.30).abs() < 1e-9);
-        assert!((seed_volume_for(0.0, false) - 0.0).abs() < 1e-9);
-        assert!((seed_volume_for(100.0, false) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(30.0, false, 0.0) - 0.30).abs() < 1e-9);
+        assert!((seed_volume_for(0.0, false, 0.0) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, false, 0.0) - 1.0).abs() < 1e-9);
     }
 
     /// Une zone bit-perfect ne s'ensemence jamais autrement qu'à pleine échelle,
     /// quelle que soit la valeur qui traîne en base (forum 1320, Cyrille).
     #[test]
     fn fixed_volume_output_is_seeded_at_full_scale() {
-        assert!((seed_volume_for(20.0, true) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(100.0, true) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(20.0, true, 0.0) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(100.0, true, 0.0) - 1.0).abs() < 1e-9);
     }
 
     /// Une valeur aberrante en base ne doit pas amplifier — le gain est un
     /// multiplicateur appliqué à chaque échantillon.
     #[test]
     fn out_of_range_stored_level_never_amplifies() {
-        assert!((seed_volume_for(150.0, false) - 1.0).abs() < 1e-9);
-        assert!((seed_volume_for(-5.0, false) - 0.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false, 0.0) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(-5.0, false, 0.0) - 0.0).abs() < 1e-9);
+    }
+
+    /// #5561 — la graine compose le trim, et ne franchit jamais les plafonds :
+    /// un trim positif reste borné à l'unité, une zone « Volume fixe » reste
+    /// à 1.0 quel que soit le trim.
+    #[test]
+    fn la_graine_compose_le_trim_sans_franchir_les_plafonds() {
+        let moins_6 = 0.8 * 10f64.powf(-6.0 / 20.0);
+        assert!((seed_volume_for(80.0, false, -6.0) - moins_6).abs() < 1e-9);
+        assert!((seed_volume_for(90.0, false, 6.0) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(150.0, false, 12.0) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(40.0, true, -6.0) - 1.0).abs() < 1e-9);
+        assert!((seed_volume_for(40.0, true, 6.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// #5561 (GgB, fil 1797) — démarrage simulé : une zone locale à 80 % avec
+    /// un trim enregistré de −6 dB. Le gain que le rendu multiplie réellement
+    /// (`gain_de_rendu`) doit inclure le trim dès la graine, avant tout geste
+    /// de volume — et valoir ce que `Orchestrator::set_volume` aurait envoyé.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn le_trim_enregistre_est_actif_des_le_demarrage() {
+        use std::sync::atomic::Ordering;
+        let (state, id) = state_with_zone(80.0, false);
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(&format!("zone_{id}_gain_trim_db"), "-6")
+            .unwrap();
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get_by_device_id("local:Test")
+            .unwrap()
+            .unwrap();
+
+        let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
+        ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
+
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let attendu = tune_core::orchestrator::volume_avec_trim(0.8, -6.0);
+        assert!(
+            (gain - attendu).abs() < 2e-3,
+            "gain de rendu {gain} au démarrage, attendu {attendu} (80 % × −6 dB) : \
+             le trim enregistré n'est pas appliqué à la graine"
+        );
+        assert!(gain < 0.79, "gain {gain} : le trim −6 dB est absent");
+    }
+
+    /// #5561 — même démarrage simulé, trim positif sur une zone déjà haute :
+    /// le gain de rendu reste plafonné à l'unité.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn un_trim_positif_au_demarrage_ne_depasse_pas_l_unite() {
+        use std::sync::atomic::Ordering;
+        let (state, id) = state_with_zone(95.0, false);
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(&format!("zone_{id}_gain_trim_db"), "12")
+            .unwrap();
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get_by_device_id("local:Test")
+            .unwrap()
+            .unwrap();
+
+        let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
+        ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
+
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
+        assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
     }
 
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
@@ -2582,7 +2633,7 @@ mod restore_zone_volumes_tests {
                 "{cible_db} dB : restauré à {vol} au lieu de {lineaire}"
             );
             // Et le chemin qui atteint vraiment le son dit la même chose.
-            assert!((seed_volume_for(lineaire * 100.0, false) - lineaire).abs() < 1e-12);
+            assert!((seed_volume_for(lineaire * 100.0, false, 0.0) - lineaire).abs() < 1e-12);
         }
     }
 

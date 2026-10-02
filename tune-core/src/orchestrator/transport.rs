@@ -1041,7 +1041,7 @@ impl PlaybackOrchestrator {
                         stream_url: None,
                         output_sent: false,
                         source: "local".into(),
-                        error: Some("superseded by a newer play".into()),
+                        error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
                     }));
                 }
                 Err(e) => {
@@ -1073,7 +1073,7 @@ impl PlaybackOrchestrator {
                 stream_url: None,
                 output_sent: false,
                 source: resolved.source,
-                error: Some("superseded by a newer play".into()),
+                error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
             }));
         }
 
@@ -1852,6 +1852,17 @@ impl PlaybackOrchestrator {
             local_out.set_pending_start_position_ms(position_ms);
             // Producer always pre-seeked — see the comment in send_to_output.
             local_out.set_producer_seeked(true);
+        }
+        // La sortie NAÎT ici, à `user_volume = 1000` : sans graine, elle jouait
+        // à pleine échelle quel que soit le volume enregistré de la zone, trim
+        // ignoré — un saut de volume après chaque recréation (appareil perdu
+        // puis retrouvé, sortie absente du registre). Même graine qu'au
+        // démarrage (#1596, #5561) : volume de la zone × trim, « Volume fixe »
+        // à 1.0, jamais au-delà de l'unité.
+        if let Ok(Some(zone)) = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get_by_device_id(device_id)
+        {
+            ensemencer_le_volume_local(&self.db, &zone, device_id, &local_out).await;
         }
         {
             let mut outputs = self.outputs.lock().await;
