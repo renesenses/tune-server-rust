@@ -61,6 +61,11 @@ pub struct AppState {
     /// à la fois, son relevé lisible. Tenu ici et non en `static` : la route
     /// qui le lit a déjà l'état, et un test ne pollue pas le suivant.
     pub passe_dr: Arc<tune_core::audio::replaygain::plage_dynamique::PasseDr>,
+    /// Le dernier comptage « analysées / éligibles » de la bibliothèque pour
+    /// le ReplayGain (#5597), resservi une minute : l'écran État du serveur
+    /// sonde en boucle, et le comptage parcourt toute la table `tracks`.
+    pub bibliotheque_rg:
+        Arc<tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
@@ -529,6 +534,9 @@ impl AppState {
             comptes_collections,
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
+            bibliotheque_rg: Arc::new(
+                tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain::new(),
+            ),
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,
