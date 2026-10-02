@@ -308,11 +308,11 @@ fn analyser_tt_dr(texte: &str) -> RapportDr {
         if propre.is_empty() {
             continue;
         }
-        if let Some(reste) = propre.strip_prefix("Official DR value:") {
-            rapport.dr_album = valeur_dr(reste.trim());
+        if let Some(dr) = total_du_rapport(propre) {
+            rapport.dr_album = Some(dr);
             continue;
         }
-        if propre.starts_with("DR") && propre.contains("Peak") && propre.contains("RMS") {
+        if est_l_entete_de_colonnes(propre) {
             entete_multicanal = propre.contains("(FL)") || propre.contains("(FR)");
             // La marque d'un rapport : c'est cette ligne, ou `Official DR
             // value:`, qui autorise à ouvrir un fichier au nom inconnu.
@@ -325,6 +325,53 @@ fn analyser_tt_dr(texte: &str) -> RapportDr {
     }
     rapport.lignes = assembler(brutes);
     rapport
+}
+
+/// Le total d'un rapport TT DR : `Official DR value: DR9` en anglais,
+/// `Реальные значения DR:	DR13` dans le foobar2000 russe (#5573, pièce
+/// jointe de Tades, fil 2050, réponse 7412).
+///
+/// Lu par sa STRUCTURE, pas par son libellé : un libellé qui contient le mot
+/// `DR`, deux-points, puis une valeur `DR<n>` et rien d'autre. Le libellé
+/// anglais reste reconnu tel quel, avec sa tolérance d'avant (`DR 9`, `9`).
+/// Le libellé russe est le seul autre établi ; le composant n'a pas de
+/// source publique, et aucune autre traduction n'a été relevée. La structure
+/// couvre néanmoins tout libellé traduit qui garde le sigle `DR` — et un
+/// libellé russe en Windows-1251 relu en Windows-1252 (`Ðåàëüíûå çíà÷åíèÿ
+/// DR:`), où seul l'ASCII survit.
+///
+/// Une ligne de mesure (`DR13  -4.93 дБ … : DR5` dans un titre) n'est jamais
+/// un total : son premier jeton est une valeur DR.
+fn total_du_rapport(propre: &str) -> Option<u8> {
+    if let Some(reste) = propre.strip_prefix("Official DR value:") {
+        return valeur_dr(reste.trim());
+    }
+    let (libelle, valeur) = propre.rsplit_once(':')?;
+    let valeur = valeur.trim();
+    if !valeur.starts_with("DR") {
+        return None;
+    }
+    let mut mots = libelle.split_whitespace();
+    if mots.clone().next().is_some_and(|m| valeur_dr(m).is_some()) {
+        return None;
+    }
+    if !mots.any(|m| m == "DR") {
+        return None;
+    }
+    valeur_dr(valeur)
+}
+
+/// L'en-tête de colonnes du TT DR : `DR         Peak         RMS     Duration
+/// Track`, ou `DR         Пики         RMS           Продолжительность трека`
+/// dans le foobar2000 russe (#5573).
+///
+/// Reconnu par sa structure : premier jeton `DR` NU (une mesure commence par
+/// `DR<n>`) et une colonne `RMS`, sigle que la traduction russe garde. Le
+/// nom de la colonne des crêtes n'est plus exigé : c'est lui que la
+/// traduction change (`Peak` → `Пики`).
+fn est_l_entete_de_colonnes(propre: &str) -> bool {
+    let mut mots = propre.split_whitespace();
+    mots.next() == Some("DR") && mots.any(|m| m == "RMS")
 }
 
 /// Découpe la colonne « piste » de chaque ligne brute en numéro de disque,
@@ -572,18 +619,35 @@ fn est_un_nombre(jeton: &str) -> bool {
         && corps.chars().any(|c| c.is_ascii_digit())
 }
 
+/// Les unités connues. `дБ` est celle du foobar2000 russe (#5573, pièce
+/// jointe de Tades, fil 2050) — en cyrillique UTF-8, donc deux caractères
+/// qui ne sont PAS `dB`.
 fn est_une_unite(jeton: &str) -> bool {
-    matches!(jeton, "dB" | "dBFS" | "dBTP" | "db" | "dbfs")
+    matches!(jeton, "dB" | "dBFS" | "dBTP" | "db" | "dbfs" | "дБ")
+}
+
+/// Un jeton qui peut être une unité TRADUITE : court, sans chiffre, sans
+/// ponctuation de durée. Ce n'est qu'un candidat : il n'est retenu comme
+/// unité que si la colonne suivante le répète (voir [`consommer_mesures`]).
+fn peut_etre_une_unite(jeton: &str) -> bool {
+    let n = jeton.chars().count();
+    (1..=6).contains(&n) && jeton.chars().all(char::is_alphabetic)
 }
 
 /// Une mesure : `-6.69 dBFS`, ou `-6.69dBFS` collé, ou un nombre nu.
-fn consommer_mesure(jetons: &mut Jetons<'_>) -> bool {
+///
+/// `unite_apprise` est l'unité, inconnue de [`est_une_unite`], que la colonne
+/// des crêtes a portée : elle est acceptée derrière le RMS (#5573).
+fn consommer_mesure(jetons: &mut Jetons<'_>, unite_apprise: Option<&str>) -> bool {
     let Some(j) = jetons.regarder() else {
         return false;
     };
     if est_un_nombre(j) {
         jetons.suivant();
-        if jetons.regarder().is_some_and(est_une_unite) {
+        if jetons
+            .regarder()
+            .is_some_and(|u| est_une_unite(u) || Some(u) == unite_apprise)
+        {
             jetons.suivant();
         }
         return true;
@@ -592,12 +656,47 @@ fn consommer_mesure(jetons: &mut Jetons<'_>) -> bool {
     let sans_unite = j
         .strip_suffix("dBFS")
         .or_else(|| j.strip_suffix("dB"))
+        .or_else(|| j.strip_suffix("дБ"))
         .unwrap_or("");
     if est_un_nombre(sans_unite) {
         jetons.suivant();
         return true;
     }
     false
+}
+
+/// Les deux colonnes obligatoires, crête puis RMS.
+///
+/// L'unité se lit par la STRUCTURE de la ligne, pas par une liste de mots
+/// (#5573) : derrière le nombre de la crête, un jeton qui n'est pas un nombre
+/// est l'unité de la colonne — à condition que le RMS, derrière, porte la
+/// MÊME. C'est ce qui lit `-4.93 дБ   -24.80 дБ`, et aussi `-4.93 äÁ
+/// -24.80 äÁ` (le même rapport en Windows-1251 relu en Windows-1252), sans
+/// avaler le premier mot d'un titre : dans `DR12 -0.5 -12.4 So What`, la
+/// crête est suivie d'un nombre, il n'y a pas d'unité à apprendre.
+fn consommer_mesures(jetons: &mut Jetons<'_>) -> bool {
+    let Some(j) = jetons.regarder() else {
+        return false;
+    };
+    let mut unite_apprise = None;
+    if est_un_nombre(j) {
+        let mut essai = Jetons {
+            ligne: jetons.ligne,
+            pos: jetons.pos,
+        };
+        essai.suivant();
+        if let Some(u) = essai.suivant()
+            && !est_une_unite(u)
+            && peut_etre_une_unite(u)
+            && essai.regarder().is_some_and(est_un_nombre)
+        {
+            essai.suivant();
+            if essai.regarder() == Some(u) {
+                unite_apprise = Some(u);
+            }
+        }
+    }
+    consommer_mesure(jetons, unite_apprise) && consommer_mesure(jetons, unite_apprise)
 }
 
 fn analyser_ligne(ligne: &str, entete_multicanal: bool) -> Option<LigneBrute> {
@@ -610,7 +709,7 @@ fn analyser_ligne(ligne: &str, entete_multicanal: bool) -> Option<LigneBrute> {
     }
     let dr = valeur_dr(premier)?;
     // Peak puis RMS, obligatoires : sans eux ce n'est pas une ligne de mesure.
-    if !consommer_mesure(&mut jetons) || !consommer_mesure(&mut jetons) {
+    if !consommer_mesures(&mut jetons) {
         return None;
     }
     // Duration, facultative (absente de certains rapports).
@@ -658,6 +757,9 @@ fn detacher_mesure_en_queue(s: &str) -> Option<(String, &'static str)> {
     let t = s.trim_end();
     let (avant_unite, unite) = if let Some(r) = t.strip_suffix("dBFS") {
         (r, "dBFS")
+    } else if let Some(r) = t.strip_suffix("дБ") {
+        // L'unité du foobar2000 russe (#5573) : une colonne DR par canal.
+        (r, "dB")
     } else {
         (t.strip_suffix("dB")?, "dB")
     };
@@ -1565,5 +1667,114 @@ Official EP/Album DR: 8"#;
         let (dossier, audio) = dossier_avec_audio("foo-dr-4352-tableau");
         std::fs::write(dossier.join("liste des pistes.txt"), TABLEAU_SANS_DR).unwrap();
         assert!(rapport_voisin(&audio).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // #5573 — le rapport d'un foobar2000 russe : unité `дБ`, en-tête
+    // `Пики`, total `Реальные значения DR:`.
+    // ------------------------------------------------------------------
+
+    /// La pièce jointe de Tades (fil 2050, réponse 7412), octet pour octet :
+    /// UTF-8 sans BOM, CRLF. Aucun chemin n'y figure.
+    const RUSSE: &[u8] = include_bytes!("../../tests/fixtures/foo_dr_tades_2050_ru.txt");
+    /// Le même rapport réencodé en Windows-1251 (`iconv -t CP1251`) : la
+    /// forme qu'un foobar2000 russe en « ANSI » écrirait. Ce n'est PAS une
+    /// pièce jointe reçue — l'encodage des autres rapports de Tades n'est pas
+    /// connu — mais il n'est pas UTF-8 valide, donc relu en Windows-1252 :
+    /// `дБ` y devient `äÁ`, `Пики` devient `Ïèêè`.
+    const RUSSE_CP1251: &[u8] =
+        include_bytes!("../../tests/fixtures/foo_dr_tades_2050_ru_cp1251.txt");
+
+    fn verifier_le_rapport_russe(r: &RapportDr, forme: &str) {
+        assert_eq!(
+            r.lignes.len(),
+            5,
+            "#5573 ({forme}) — les cinq mesures du rapport russe sont lues : {r:#?}"
+        );
+        assert_eq!(
+            r.dr_album,
+            Some(13),
+            "#5573 ({forme}) — `Реальные значения DR: DR13`"
+        );
+        assert!(
+            r.entete,
+            "#5573 ({forme}) — l'en-tête `DR  Пики  RMS` est reconnu"
+        );
+        assert!(r.est_signe(), "#5573 ({forme}) — le rapport est signé");
+        let numeros: Vec<Option<u32>> = r.lignes.iter().map(|l| l.numero).collect();
+        assert_eq!(numeros, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+        assert!(r.lignes.iter().all(|l| l.dr == 13));
+        assert_eq!(
+            r.lignes[3].titre,
+            "Symphony No. 5 in C sharp minor (2011 - Remaster): IV. Adagietto (Sehr langsam)",
+            "#5573 ({forme}) — l'unité n'a pas mangé le titre, la durée non plus"
+        );
+        assert!(!r.lignes.iter().any(|l| l.multicanal));
+        assert_eq!(r.dr_pour_la_piste(Some(4), None, None, Some(2)), Some(13));
+    }
+
+    #[test]
+    fn le_rapport_d_un_foobar2000_russe_se_lit_5573() {
+        verifier_le_rapport_russe(&analyser_octets(RUSSE), "UTF-8");
+    }
+
+    #[test]
+    fn le_rapport_russe_en_windows_1251_se_lit_par_sa_structure_5573() {
+        assert!(
+            std::str::from_utf8(RUSSE_CP1251).is_err(),
+            "le témoin n'est pas UTF-8"
+        );
+        verifier_le_rapport_russe(&analyser_octets(RUSSE_CP1251), "Windows-1251");
+    }
+
+    #[test]
+    fn le_nom_traduit_suffit_a_signer_un_fichier_au_nom_inconnu_5573() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-5573-russe");
+        std::fs::write(dossier.join("отчёт.txt"), RUSSE).unwrap();
+        let r = rapport_voisin(&audio).expect("#5573 — le rapport russe est retenu");
+        assert_eq!(r.lignes.len(), 5);
+    }
+
+    /// L'unité apprise ne vaut que si les DEUX colonnes la portent : sans
+    /// cela, le premier mot d'un titre passerait pour une unité.
+    #[test]
+    fn une_unite_inconnue_ne_s_apprend_que_repetee_5573() {
+        let r = analyser(
+            "DR         Peak         RMS     Duration Track\n\
+DR12      -0.50   -12.40      3:30 01-So What\n\
+DR11      -0.50 xx  -12.40 yy  3:30 02-Freddie Freeloader\n\
+DR10      -0.50 äÁ  -12.40 äÁ  9:26 03-Blue in Green\n",
+        );
+        let titres: Vec<&str> = r.lignes.iter().map(|l| l.titre.as_str()).collect();
+        assert_eq!(
+            titres,
+            vec!["So What", "Blue in Green"],
+            "nombres nus : rien à apprendre ; `xx`/`yy` : deux unités qui \
+             diffèrent, pas une colonne ; `äÁ` répété : une unité. Relevé : {r:#?}"
+        );
+    }
+
+    /// Le total se lit par sa structure, pas n'importe quelle ligne à
+    /// deux-points ne l'est.
+    #[test]
+    fn le_total_se_lit_par_sa_structure_et_pas_ailleurs_5573() {
+        assert_eq!(total_du_rapport("Official DR value: DR9"), Some(9));
+        assert_eq!(total_du_rapport("Реальные значения DR:\tDR13"), Some(13));
+        assert_eq!(total_du_rapport("Ðåàëüíûå çíà÷åíèÿ DR:\tDR13"), Some(13));
+        assert_eq!(
+            total_du_rapport("Дата отчёта:\t\t2019-01-24 00:51:01"),
+            None
+        );
+        assert_eq!(total_du_rapport("Analyzed: Artist / Album DR"), None);
+        assert_eq!(total_du_rapport("Количество треков:\t5"), None);
+        assert_eq!(
+            total_du_rapport("DR13  -4.93 дБ  -24.80 дБ  3:00 01-Intro DR: DR5"),
+            None,
+            "une ligne de mesure n'est pas un total"
+        );
+        assert_eq!(
+            total_du_rapport("DR analysis (extrait recopie du forum) :"),
+            None
+        );
     }
 }
