@@ -171,8 +171,15 @@ async fn long_wav_4016_reconnect_replays_the_corrected_header() {
     let s = session(true, 2_760_000).await;
     let first = body(response(s.clone(), None).await).await;
     let replay = body(response(s.clone(), Some(0)).await).await;
-    assert_eq!(replay, first[..44], "réserve identique à l'en-tête envoyé");
-    read_beyond_limits(replay);
+    assert_eq!(
+        replay[..44],
+        first[..44],
+        "réserve identique à l'en-tête envoyé"
+    );
+    // Depuis le début, la retenue rejoue la piste à l'octet : l'en-tête
+    // corrigé PUIS le signal que la première connexion a emporté.
+    assert_eq!(replay, first, "rejeu exact depuis la retenue");
+    read_beyond_limits(replay[..44].to_vec());
     assert_eq!(
         s.octets_du_canal.load(SeqCst),
         50,
