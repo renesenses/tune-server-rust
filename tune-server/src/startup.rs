@@ -1518,55 +1518,6 @@ async fn resolve_ytdlp(state: &AppState) {
     }
 }
 
-/// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
-/// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
-/// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
-///
-/// #5561 — le trim de gain enregistré (`zone_{id}_gain_trim_db`) se compose
-/// dès la graine, par la même fonction que `Orchestrator::set_volume`
-/// ([`tune_core::orchestrator::volume_avec_trim`]). Sans lui, la sortie jouait
-/// au volume brut jusqu'au premier geste de volume ou de trim. La zone
-/// « Volume fixe » n'en reçoit pas, comme `set_volume`, qui ne lui envoie
-/// jamais rien : elle reste à 1.0. Le résultat ne dépasse jamais l'unité.
-///
-/// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
-/// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
-/// fonctionnalités.
-#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-fn seed_volume_for(zone_volume: f64, fixed_volume: bool, trim_db: f64) -> f64 {
-    if fixed_volume {
-        1.0
-    } else {
-        tune_core::orchestrator::volume_avec_trim((zone_volume / 100.0).clamp(0.0, 1.0), trim_db)
-    }
-}
-
-/// Pose sur une sortie locale qui vient de naître le niveau que la base dit
-/// de sa zone, trim compris (#1596, #5561).
-#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
-async fn ensemencer_le_volume_local(
-    db: &Arc<dyn tune_core::db::backend::DbBackend>,
-    zone: &tune_core::db::zone_repo::Zone,
-    device_id: &str,
-    sortie: &dyn tune_core::outputs::OutputTarget,
-) {
-    let trim_db = zone.id.map_or(0.0, |id| {
-        tune_core::orchestrator::gain_trim_db_enregistre(db, id)
-    });
-    let stored = seed_volume_for(zone.volume, zone.fixed_volume, trim_db);
-    if let Err(e) = sortie.set_volume(stored).await {
-        warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
-    } else {
-        info!(
-            device_id = %device_id,
-            volume = stored,
-            zone_volume = zone.volume,
-            trim_db,
-            "local_output_volume_seeded"
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalZoneAction {
     Create,
@@ -1824,7 +1775,13 @@ pub async fn register_local_outputs(state: &AppState) {
             // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
             // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
             if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-                ensemencer_le_volume_local(&state.backend, &zone, &device_id, &local_out).await;
+                tune_core::orchestrator::ensemencer_le_volume_local(
+                    &state.backend,
+                    &zone,
+                    &device_id,
+                    &local_out,
+                )
+                .await;
             }
             outputs.register(Box::new(local_out));
             info!(
@@ -2486,6 +2443,9 @@ mod zones_reflet_tests {
 mod restore_zone_volumes_tests {
     use super::*;
     use tune_core::db::zone_repo::ZoneRepo;
+    #[cfg(feature = "local-audio")]
+    use tune_core::orchestrator::ensemencer_le_volume_local;
+    use tune_core::orchestrator::volume_de_graine as seed_volume_for;
 
     fn state_with_zone(volume: f64, fixed: bool) -> (AppState, i64) {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
