@@ -63,6 +63,11 @@ enum Refus {
     NonConnecte,
     /// Le site ne reconnaît pas de licence Premium valide (402).
     PremiumRefuseParLeSite(String),
+    /// Le site refuse l'IDENTITÉ présentée (401 : `invalid_token`, jeton du
+    /// compte inconnu, révoqué ou expiré) : ce n'est pas un défaut de licence,
+    /// le compte est à reconnecter (412, hors du 402 que le client ramène
+    /// toujours à « fait partie de Tune Premium », #5601).
+    CompteRefuseParLeSite(String),
     /// Le catalogue ne connaît pas ce greffon (404).
     AbsentDuCatalogue,
     /// Le greffon existe, mais pas pour cette plateforme (404).
@@ -97,6 +102,13 @@ impl Refus {
             Refus::PremiumRefuseParLeSite(d) => {
                 (StatusCode::PAYMENT_REQUIRED, "premium_required", d.clone())
             }
+            Refus::CompteRefuseParLeSite(d) => (
+                StatusCode::PRECONDITION_FAILED,
+                "account_token_rejected",
+                format!(
+                    "mozaiklabs.fr ne reconnaît plus le compte connecté à ce serveur ({d}) ; reconnecte-le, puis réessaie."
+                ),
+            ),
             Refus::AbsentDuCatalogue => (
                 StatusCode::NOT_FOUND,
                 "plugin_not_in_catalog",
@@ -188,7 +200,16 @@ async fn demander_la_fiche(
                 return serde_json::from_value(corps)
                     .map_err(|e| Refus::FicheIncoherente(format!("fiche illisible : {e}")));
             }
-            401 | 403 => {
+            401 => {
+                dernier_refus = Refus::CompteRefuseParLeSite(
+                    corps["error"]
+                        .as_str()
+                        .unwrap_or("identifiant refusé")
+                        .to_string(),
+                );
+                continue;
+            }
+            403 => {
                 let message = corps["message"]
                     .as_str()
                     .or(corps["error"].as_str())
@@ -854,6 +875,40 @@ mod tests {
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{corps}");
         assert_eq!(corps["error"], "premium_required", "{corps}");
         assert_eq!(corps["detail"], "licence expirée", "{corps}");
+    }
+
+    /// #5601 — le site refuse le JETON du compte (401 `invalid_token`) : ce
+    /// n'est pas un défaut de licence. La réponse ne doit être ni un 402 ni
+    /// `premium_required`, que le client rend « fait partie de Tune Premium »
+    /// à un abonné Premium.
+    #[tokio::test]
+    async fn jeton_refuse_par_le_site_n_est_pas_un_refus_premium() {
+        let id = "catalogue-essai-jeton-refuse";
+        let site = site_factice(
+            Catalogue::Refus(401, json!({"error": "invalid_token"})),
+            false,
+        )
+        .await;
+        let base = site.base.lock().unwrap().clone();
+        let (state, app) = serveur(&base, true, true).await;
+        // Sans clé de licence : seul le jeton du compte est présenté, comme
+        // sur le Tune OS du rapport.
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings.set("license_key", "").unwrap();
+        let (status, corps) = installer_par_la_route(&app, id).await;
+        assert_ne!(status, StatusCode::PAYMENT_REQUIRED, "{corps}");
+        assert_ne!(corps["error"], "premium_required", "{corps}");
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{corps}");
+        assert_eq!(corps["error"], "account_token_rejected", "{corps}");
+        assert!(
+            corps["detail"].as_str().unwrap().contains("invalid_token"),
+            "{corps}"
+        );
+        assert_eq!(site.vus.lock().unwrap().as_slice(), ["Bearer jeton-sso"]);
+        // La lecture du catalogue rend le même refus.
+        let (status, etat) = lire_le_catalogue(&app, id).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{etat}");
+        assert_eq!(etat["error"], "account_token_rejected", "{etat}");
     }
 
     /// Un compte SSO sans Premium ne masque pas une clé de licence Premium.
