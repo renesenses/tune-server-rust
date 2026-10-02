@@ -901,6 +901,14 @@ path = "tests/serveur_media_ordre_alphabetique_4956.rs"
 name = "bibliotheque_rest_ordre_alphabetique_4956"
 path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 
+# #5582 — l'écran Répertoires (`GET /library/browse/dir`) range ses
+# sous-dossiers dans l'ordre naturel des dossiers du serveur média : « haydn »
+# entre « Handel » et « Mozart », plus après « Z ». `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "repertoires_ordre_alphabetique_5582"
+path = "tests/repertoires_ordre_alphabetique_5582.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
