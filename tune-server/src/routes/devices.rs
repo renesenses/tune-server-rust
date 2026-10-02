@@ -1395,10 +1395,14 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         // render stream and stop playback on Windows (DEvir: refresh UI during
         // local playback → audio dies). While a local output is playing, serve the
         // last cached device list instead of re-scanning the hardware.
+        // #5612 — et jamais l'énumération elle-même sur un fil de
+        // l'ordonnanceur : un balayage bloqué dans le greffon ALSA de PipeWire
+        // y garait un fil par chargement de page, jusqu'à ce que le serveur ne
+        // réponde plus du tout.
         let devices = if crate::background::any_local_output_playing(&state).await {
             tune_core::outputs::local::cached_audio_devices()
         } else {
-            tune_core::outputs::local::list_audio_devices_with_backend(backend)
+            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend).await
         };
         // Publier l'identifiant de registre à côté du nom.
         //
