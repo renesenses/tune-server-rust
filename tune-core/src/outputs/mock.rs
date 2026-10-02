@@ -66,6 +66,10 @@ pub struct MockOutput {
     /// Fil 1915 — le constat que la sortie remet au sondeur par
     /// `take_output_failure` (une seule fois, comme les vraies sorties).
     echec: Arc<std::sync::Mutex<Option<String>>>,
+    /// #5574 — armé, `play_media` REFUSE avec ce motif et l'appareil garde
+    /// l'URI qu'il tenait : le renderer DLNA qui acquitte Play mais tient
+    /// encore l'ancien flux, vu depuis l'orchestrateur.
+    refus_de_lecture: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOutput {
@@ -94,7 +98,15 @@ impl MockOutput {
             media_du_transport_calls: Arc::new(AtomicU64::new(0)),
             bascule_honoree: Arc::new(AtomicBool::new(true)),
             echec: Arc::new(std::sync::Mutex::new(None)),
+            refus_de_lecture: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// #5574 — faire refuser (ou de nouveau accepter, `None`) les `play_media`
+    /// suivants. Le refus est compté comme un appel, et l'URI tenue ne change
+    /// pas.
+    pub fn refuser_la_lecture(&self, motif: Option<&str>) {
+        *self.refus_de_lecture.lock().unwrap() = motif.map(str::to_string);
     }
 
     /// Poser (ou retirer) le contrat de signal publié par la sortie (#4559).
@@ -310,6 +322,14 @@ impl OutputTarget for MockOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let refus = self.refus_de_lecture.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            self.play_calls.lock().await.push(PlayCall {
+                url: media.url.to_string(),
+                title: media.title.map(String::from),
+            });
+            return Err(motif);
+        }
         *self.state.lock().await = TransportState::Playing;
         *self.current_uri.lock().await = Some(media.url.to_string());
         self.position_ms.store(0, Ordering::Relaxed);

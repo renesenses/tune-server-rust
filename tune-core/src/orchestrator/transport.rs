@@ -1041,7 +1041,7 @@ impl PlaybackOrchestrator {
                         stream_url: None,
                         output_sent: false,
                         source: "local".into(),
-                        error: Some("superseded by a newer play".into()),
+                        error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
                     }));
                 }
                 Err(e) => {
@@ -1073,7 +1073,7 @@ impl PlaybackOrchestrator {
                 stream_url: None,
                 output_sent: false,
                 source: resolved.source,
-                error: Some("superseded by a newer play".into()),
+                error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
             }));
         }
 
