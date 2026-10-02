@@ -275,6 +275,58 @@ pub fn volume_avec_trim(volume: f64, trim_db: f64) -> f64 {
     (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
 }
 
+/// Niveau à donner à une sortie locale qui vient de naître, d'après ce que la
+/// base dit de sa zone. Une zone « Volume fixe (bit-perfect) » reste à pleine
+/// échelle — c'est son contrat, le DoP ne survit pas à une multiplication.
+///
+/// #5561 — le trim de gain enregistré (`zone_{id}_gain_trim_db`) se compose
+/// dès la graine, par la même fonction que `Orchestrator::set_volume`
+/// ([`volume_avec_trim`]). Sans lui, la sortie jouait au volume brut jusqu'au
+/// premier geste de volume ou de trim. La zone « Volume fixe » n'en reçoit
+/// pas, comme `set_volume`, qui ne lui envoie jamais rien : elle reste à 1.0.
+/// Le résultat ne dépasse jamais l'unité.
+///
+/// Volontairement HORS du gate `local-audio` : c'est de l'arithmétique, sans
+/// dépendance à `outputs::local`, et les tests tournent dans les deux jeux de
+/// fonctionnalités.
+pub fn volume_de_graine(zone_volume: f64, fixed_volume: bool, trim_db: f64) -> f64 {
+    if fixed_volume {
+        1.0
+    } else {
+        volume_avec_trim((zone_volume / 100.0).clamp(0.0, 1.0), trim_db)
+    }
+}
+
+/// Pose sur une sortie locale qui vient de naître le niveau que la base dit
+/// de sa zone, trim compris (#1596, #5561).
+///
+/// Une `LocalOutput` neuve naît à `user_volume = 1000` (pleine échelle) : sans
+/// cette graine, elle joue à 100 % quel que soit le réglage de la zone. Les
+/// DEUX naissances passent par ici — l'énumération du démarrage
+/// (`tune-server::startup::register_local_outputs`) et la recréation à la
+/// volée de `recreate_local_and_play`, quand l'appareil n'était pas dans le
+/// registre au moment de jouer.
+pub async fn ensemencer_le_volume_local(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    zone: &crate::db::zone_repo::Zone,
+    device_id: &str,
+    sortie: &dyn crate::outputs::OutputTarget,
+) {
+    let trim_db = zone.id.map_or(0.0, |id| gain_trim_db_enregistre(db, id));
+    let stored = volume_de_graine(zone.volume, zone.fixed_volume, trim_db);
+    if let Err(e) = crate::outputs::OutputTarget::set_volume(sortie, stored).await {
+        warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
+    } else {
+        info!(
+            device_id = %device_id,
+            volume = stored,
+            zone_volume = zone.volume,
+            trim_db,
+            "local_output_volume_seeded"
+        );
+    }
+}
+
 pub(super) fn dash_warm_cache_enabled() -> bool {
     std::env::var("TUNE_DASH_WARM_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
