@@ -2974,12 +2974,18 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
                 // se reconnecte tout seul (Jean, forum #1236 — deux onglets).
                 unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
                 tracing::info!(exe = %exe.display(), "restart_reexec");
-                let err = std::process::Command::new(&exe).args(&args).exec();
+                // #5640 — l'image relancée attend le port, elle n'ouvre jamais
+                // « l'instance existante » (qui serait nous-mêmes).
+                let err = std::process::Command::new(&exe)
+                    .args(&args)
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
+                    .exec();
                 // exec() only returns on failure → fall back to spawn+exit so a
                 // supervised deployment still recovers.
                 tracing::warn!(error = %err, "restart_reexec_failed — falling back to spawn+exit");
                 let _ = std::process::Command::new(&exe)
                     .args(&args)
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
@@ -3012,6 +3018,9 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
                     .args(&args)
                     // Onglet existant déjà connecté — pas de nouvel onglet (#1236).
                     .env_remove("TUNE_OPEN_BROWSER")
+                    // #5640 — l'enfant ATTEND que ce processus rende le port ;
+                    // il ne doit pas « ouvrir l'instance existante » qui s'éteint.
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())

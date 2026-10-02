@@ -247,6 +247,7 @@ pub async fn run_with(opts: RunOptions) {
         let mut ipv6_attempted = addr.is_ipv6();
         #[cfg(unix)]
         let mut reclaim_tried = false;
+        let mut instance_sondee = false;
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
@@ -266,6 +267,40 @@ pub async fn run_with(opts: RunOptions) {
                     continue;
                 }
                 Err(e) if attempt < 10 => {
+                    // #5640 — « Ouvrir l'instance existante » : lancé par le
+                    // raccourci alors qu'un Tune de la même version tient
+                    // déjà le port ? Ouvrir le navigateur dessus et s'arrêter
+                    // proprement, au lieu d'attendre 20 s puis d'échouer. Une
+                    // relance interne (« Redémarrer », mise à jour) attend,
+                    // elle, que l'ancien rende le port.
+                    if !instance_sondee && e.kind() == std::io::ErrorKind::AddrInUse {
+                        instance_sondee = true;
+                        use crate::instance_existante as ie;
+                        let en_place = ie::sonder_tune_sur_le_port(config.port);
+                        let conduite = ie::conduite_port_pris(
+                            ie::Lancement::depuis_l_environnement(),
+                            en_place.as_deref(),
+                            tune_core::version(),
+                        );
+                        if conduite == ie::ConduitePortPris::OuvrirLExistante {
+                            let url = format!("http://localhost:{}", config.port);
+                            let phrase = format!(
+                                "Tune tourne déjà sur le port {} : ouverture de l'instance existante ({url}), ce lancement s'arrête.",
+                                config.port
+                            );
+                            eprintln!("{phrase}");
+                            info!(%url, port = config.port, "instance_existante_ouverte — {phrase}");
+                            ie::ouvrir_le_navigateur(&url);
+                            std::process::exit(0);
+                        }
+                        if let Some(version) = en_place.as_deref() {
+                            info!(
+                                port = config.port,
+                                version_en_place = %version,
+                                "port_tenu_par_un_tune — relance interne ou autre version : on attend le port"
+                            );
+                        }
+                    }
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     // The port is held by another process. If it is a *stale*
                     // tune-server instance (an old build that wasn't stopped
@@ -548,14 +583,7 @@ pub async fn run_with(opts: RunOptions) {
             }
             let url = format!("http://localhost:{port}");
             info!(url = %url, "opening_browser");
-            #[cfg(target_os = "macos")]
-            let _ = std::process::Command::new("open").arg(&url).spawn();
-            #[cfg(target_os = "windows")]
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .spawn();
-            #[cfg(target_os = "linux")]
-            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            crate::instance_existante::ouvrir_le_navigateur(&url);
         });
     }
 
