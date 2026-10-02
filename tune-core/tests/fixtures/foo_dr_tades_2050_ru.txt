@@ -1,0 +1,26 @@
+foobar2000 1.3.13 / Замер динамического диапазона (DR) 1.1.1
+Дата отчёта:		2019-01-24 00:51:01
+
+--------------------------------------------------------------------------------
+Анализ:   Sir John Barbirolli / MAHLER: SYMPHONY NO.5
+--------------------------------------------------------------------------------
+
+DR         Пики         RMS           Продолжительность трека
+--------------------------------------------------------------------------------
+DR13      -4.93 дБ   -24.80 дБ     13:47 01-Symphony No. 5 in C sharp minor (2011 - Remaster): I. Trauermarsch (In gemessenem Schritt. Streng. Wie ein Kondukt)
+DR13      -5.52 дБ   -22.85 дБ     15:15 02-Symphony No. 5 in C sharp minor (2011 - Remaster): II. Sturmisch bewegt. Mit grosster Vehemenz
+DR13      -5.90 дБ   -25.10 дБ     18:08 03-Symphony No. 5 in C sharp minor (2011 - Remaster): III. Scherzo (Kraftig, nicht zu schnell)
+DR13     -13.46 дБ   -29.99 дБ      9:52 04-Symphony No. 5 in C sharp minor (2011 - Remaster): IV. Adagietto (Sehr langsam)
+DR13      -5.40 дБ   -23.42 дБ     17:28 05-Symphony No. 5 in C sharp minor (2011 - Remaster): V. Rondo-Finale (Allegro)
+--------------------------------------------------------------------------------
+
+Количество треков:	5
+Реальные значения DR:	DR13
+
+Частота:			2822400 Гц / Частота PCM:	176400 Гц
+Каналов:			2
+Разрядность: 		24
+Битрейт:			5645 кбит/с
+Кодек:			DSD64
+================================================================================
+
