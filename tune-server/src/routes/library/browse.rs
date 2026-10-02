@@ -303,11 +303,14 @@ pub(super) async fn browse_directory(
         .as_ref()
         .and_then(|_| crate::chemin_inaccessible::conseil(&lang, &q.path));
 
+    // Ordre alphabétique naturel, celui des dossiers du serveur média (#5582) :
+    // le tri par octets rangeait toutes les majuscules avant les minuscules,
+    // et un dossier « haydn » partait après « Z », hors de la vue (fil 2072).
     subdirs.sort_by(|a, b| {
-        a.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        tune_core::upnp_server::comparer_naturel(
+            a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            b.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        )
     });
 
     // List tracks in this directory (not recursive — only direct children)
