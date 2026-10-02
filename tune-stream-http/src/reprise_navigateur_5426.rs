@@ -484,14 +484,53 @@ async fn une_lecture_depuis_le_debut_apres_glissement_recoit_l_entete_puis_le_di
     assert!(!charge.is_empty(), "le direct doit suivre l'en-tête");
     // Le direct repart d'où le tuyau en est : un morceau CONTIGU de la
     // source, situé après tout ce que la sonde a tiré.
-    let repere = &charge[..charge.len().min(4096)];
-    let k = (44..source.len())
-        .find(|&k| source[k..].starts_with(repere))
-        .expect("le direct doit être un morceau de la source");
+    let k = situer_dans_la_source(&source, charge).unwrap_or_else(|| {
+        panic!(
+            "après l'en-tête, la lecture doit recevoir le direct contigu : ses {} octets ne \
+             sont un morceau contigu de la source nulle part",
+            charge.len()
+        )
+    });
     assert!(k >= 9_000_000, "le direct repart après la sonde (à {k})");
-    assert!(
-        source[k..].starts_with(charge),
-        "après l'en-tête, la lecture reçoit le direct contigu ({} octets depuis {k})",
-        charge.len()
-    );
+}
+
+/// Où `charge` se trouve-t-elle, ENTIÈRE et contiguë, dans `source` ?
+///
+/// Un repère de 4 Kio ne suffit pas à le dire : `octet(i)` se répète tous
+/// les 251 octets à l'intérieur d'un même bloc de 64 Kio. Le premier
+/// emplacement qui porte le repère peut donc précéder le vrai de 251 × m
+/// octets — c'est le cas chaque fois que le direct repart au MILIEU d'un bloc
+/// de 64 Kio (un bloc de canal impair sur deux, selon l'ordonnancement), et
+/// la comparaison de toute la charge échouait alors au premier changement de
+/// bloc (CI de la PR #5655, 02/10 : « 9961472 octets depuis 9175178 », vrai
+/// départ 9207808 = 9175178 + 130 × 251). On garde donc, parmi les
+/// emplacements qui portent le repère, celui où TOUTE la charge coïncide.
+fn situer_dans_la_source(source: &[u8], charge: &[u8]) -> Option<usize> {
+    let repere = &charge[..charge.len().min(4096)];
+    (44..source.len())
+        .filter(|&k| source[k..].starts_with(repere))
+        .find(|&k| source[k..].starts_with(charge))
+}
+
+/// Le témoin de l'instabilité, sans réseau ni ordonnancement : un direct qui
+/// repart au milieu d'un bloc de 64 Kio (bloc de canal 281, celui de la CI)
+/// est situé à son vrai départ ; un direct troué n'est situé nulle part.
+#[test]
+fn le_direct_est_situe_a_son_vrai_depart_meme_au_milieu_d_un_bloc() {
+    let mut source = tune_core::audio::wav::build_wav_header(1, 8_000, 8).to_vec();
+    source.extend((0..19_200_000usize).map(octet));
+    for bloc in [280usize, 281, 282, 283] {
+        let depart = bloc * 32_768;
+        let charge = &source[depart..source.len() - 30_764];
+        assert_eq!(
+            situer_dans_la_source(&source, charge),
+            Some(depart),
+            "direct parti du bloc de canal {bloc}"
+        );
+    }
+    // Un trou d'un bloc de canal au milieu du direct : plus rien de contigu.
+    let depart = 281 * 32_768;
+    let mut trouee = source[depart..depart + 5 * 32_768].to_vec();
+    trouee.extend_from_slice(&source[depart + 6 * 32_768..depart + 12 * 32_768]);
+    assert_eq!(situer_dans_la_source(&source, &trouee), None);
 }
