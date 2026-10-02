@@ -835,11 +835,16 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let (audio_outputs, audio_backend_name, asio_avail, audio_backend_status) = {
         #[cfg(feature = "local-audio")]
         {
+            // #5612 — hors de l'ordonnanceur et borné : un balayage bloqué
+            // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
             let devs: Vec<String> =
-                tune_core::outputs::local::list_audio_devices_with_backend(audio_backend_pref)
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect();
+                tune_core::outputs::local::list_audio_devices_with_backend_bounded(
+                    audio_backend_pref,
+                )
+                .await
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
             let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
             let asio = tune_core::outputs::local::asio_available();
             // #1395 — le rapport de diagnostic est ce que le testeur colle sur
