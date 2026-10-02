@@ -254,6 +254,27 @@ pub(super) fn gain_trim_factor(trim_db: f64) -> f64 {
     10f64.powf(trim_db.clamp(-12.0, 12.0) / 20.0)
 }
 
+/// Trim de gain enregistré pour une zone (`zone_{id}_gain_trim_db`), en dB.
+/// Absent ou illisible : 0 dB, c'est-à-dire aucun effet.
+pub fn gain_trim_db_enregistre(db: &Arc<dyn crate::db::backend::DbBackend>, zone_id: i64) -> f64 {
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(&format!("zone_{zone_id}_gain_trim_db"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// La valeur que reçoit le device : volume utilisateur × trim, bornée à 0..1.
+///
+/// Seul endroit où le trim se compose — `Orchestrator::set_volume` et la
+/// graine de volume d'une sortie locale au démarrage (#5561) passent tous
+/// deux par ici. La borne haute est le plafond de sécurité : un trim positif
+/// ne fait jamais dépasser l'unité, quel que soit le volume.
+pub fn volume_avec_trim(volume: f64, trim_db: f64) -> f64 {
+    (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
+}
+
 pub(super) fn dash_warm_cache_enabled() -> bool {
     std::env::var("TUNE_DASH_WARM_CACHE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
