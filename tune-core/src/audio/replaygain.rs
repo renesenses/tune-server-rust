@@ -31,6 +31,10 @@ pub mod progression;
 /// au seul DR, que l'utilisateur peut lancer et suivre.
 pub mod plage_dynamique;
 
+/// Le couple « analysées / éligibles » de la BIBLIOTHÈQUE (#5597) : ce que la
+/// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
+pub mod bibliotheque;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;

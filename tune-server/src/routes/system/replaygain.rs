@@ -30,7 +30,13 @@ use crate::state::AppState;
 ///   démarrer — les deux valent `0 / 0`, et les confondre afficherait une
 ///   bibliothèque entièrement analysée sur une machine qui n'a encore rien fait ;
 /// - `enabled` : l'analyse est armée. Une passe désarmée n'avancera pas, et la
-///   carte doit le dire plutôt que d'afficher une jauge immobile.
+///   carte doit le dire plutôt que d'afficher une jauge immobile ;
+/// - `library_analyzed` / `library_eligible` (#5597) : l'avancement de la
+///   BIBLIOTHÈQUE — pistes avec un fichier qui portent `rg_analyzed` ou
+///   `rg_track_gain`, sur pistes avec un fichier. Lus en base, ils survivent à
+///   un redémarrage, contrairement à `processed` / `total` qui repartent de
+///   zéro à chaque campagne. Comptés au plus une fois par minute (cache de
+///   l'état), `null` quand l'analyse est coupée ou que la requête échoue.
 pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<Value> {
     let avancement = tune_core::audio::replaygain::progression::releve();
     let enabled = tune_core::audio::replaygain::analysis_enabled(&state.backend);
@@ -66,6 +72,15 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         0
     };
     let remaining = (total - processed).max(0);
+    // #5597 — la jauge de campagne repart de 0 à chaque démarrage et se lisait
+    // comme une perte de travail. Le couple de la bibliothèque, lui, est lu en
+    // base. Mis en cache : l'écran sonde en boucle, le comptage parcourt
+    // toute la table `tracks` (528 000 pistes chez un testeur).
+    let bibliotheque = if enabled {
+        state.bibliotheque_rg.lire(&state.backend)
+    } else {
+        None
+    };
     let waiting_reason = (remaining == 0 && deferred > 0).then_some("unresolved_paths");
     Json(json!({
         "active": avancement.actif,
@@ -77,6 +92,8 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         "updated_at": avancement.maj_epoch,
         "reported": avancement.a_parle(),
         "enabled": enabled,
+        "library_analyzed": bibliotheque.map(|b| b.analysees),
+        "library_eligible": bibliotheque.map(|b| b.eligibles),
         // #5519 / tune-web-client#1828 — la passe DÉCODE-t-elle en ce moment ?
         // `active` dit seulement qu'une campagne est ouverte : elle le reste
         // quand la plage dynamique « En premier » passe devant, et la carte
