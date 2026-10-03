@@ -191,6 +191,20 @@ impl Device {
     }
 }
 
+impl Device {
+    /// Tune (#5643): does the driver accept the DSD I/O format
+    /// (`kAsioCanDoIoFormat`)? `false` on any driver error.
+    ///
+    /// A `true` here does not yet say which DSD rates or which sample type
+    /// the driver will use: `build_output_stream_raw` with
+    /// `SampleFormat::DsdU8` checks both after switching.
+    pub fn supports_dsd_output(&self) -> bool {
+        self.driver
+            .can_io_format(sys::AsioIoFormatType::Dsd)
+            .unwrap_or(false)
+    }
+}
+
 impl Devices {
     pub fn new(asio: Arc<sys::Asio>) -> Result<Self, DevicesError> {
         let drivers = asio.driver_names().into_iter();
@@ -239,6 +253,12 @@ pub(crate) fn convert_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat
         sys::AsioSampleType::ASIOSTFloat32LSB => SampleFormat::F32,
         sys::AsioSampleType::ASIOSTFloat64MSB => SampleFormat::F64,
         sys::AsioSampleType::ASIOSTFloat64LSB => SampleFormat::F64,
+        // Tune (#5643): packed 1-bit DSD, MSB first or LSB first. The bit
+        // order is converted by the DSD output path (`dsd::DsdLayout`).
+        // `ASIOSTDSDInt8NER8` (8-bit DSD words) stays unmapped: it does not
+        // carry `DsdU8`.
+        sys::AsioSampleType::ASIOSTDSDInt8MSB1 => SampleFormat::DsdU8,
+        sys::AsioSampleType::ASIOSTDSDInt8LSB1 => SampleFormat::DsdU8,
         _ => return None,
     };
     Some(fmt)

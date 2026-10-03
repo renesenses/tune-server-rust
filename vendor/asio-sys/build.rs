@@ -225,11 +225,15 @@ fn create_bindings(cpal_asio_dir: &PathBuf) {
         .allowlist_type("ASIOChannelInfo")
         .allowlist_type("AsioTimeInfoFlags")
         .allowlist_type("ASIOTimeCodeFlags")
+        // Tune (#5643): DSD I/O format switching.
+        .allowlist_type("ASIOIoFormat")
         .allowlist_function("ASIOGetChannels")
         .allowlist_function("ASIOGetChannelInfo")
         .allowlist_function("ASIOGetBufferSize")
         .allowlist_function("ASIOGetSamplePosition")
         .allowlist_function("ASIOOutputReady")
+        // Tune (#5643): kAsioSetIoFormat / kAsioGetIoFormat / kAsioCanDoIoFormat.
+        .allowlist_function("ASIOFuture")
         .allowlist_function("get_sample_rate")
         .allowlist_function("set_sample_rate")
         .allowlist_function("can_sample_rate")

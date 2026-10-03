@@ -115,6 +115,16 @@ impl std::ops::BitOr for AsioTimeInfoFlags {
 #[derive(Debug, Copy, Clone)]
 pub struct ASIOTimeCodeFlags(pub u32);
 
+// Tune (#5643): DSD I/O format, see src/bindings/io_format.rs.
+pub type ASIOIoFormatType = i32;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ASIOIoFormat {
+    pub FormatType: ASIOIoFormatType,
+    pub future: [c_char; 508],
+}
+
 // Stub functions (will never be called on docs.rs)
 #[no_mangle]
 pub unsafe extern "C" fn ASIOInit(_info: *mut ASIODriverInfo) -> ASIOError {
@@ -195,4 +205,11 @@ pub unsafe extern "C" fn set_sample_rate(_rate: c_double) -> ASIOError {
 #[no_mangle]
 pub unsafe extern "C" fn can_sample_rate(_rate: c_double) -> ASIOError {
     0
+}
+
+// Tune (#5643). Answers ASE_InvalidParameter: a stub driver knows no
+// ASIOFuture selector, i.e. it is PCM-only.
+#[no_mangle]
+pub unsafe extern "C" fn ASIOFuture(_selector: c_long, _params: *mut c_void) -> ASIOError {
+    -998
 }

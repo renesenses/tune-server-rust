@@ -1,6 +1,10 @@
 pub mod asio_import;
 #[macro_use]
 pub mod errors;
+// Tune (#5643): DSD I/O format switching. See TUNE-PATCH.md.
+pub mod io_format;
+
+pub use self::io_format::{AsioIoFormat, AsioIoFormatType};
 
 use self::errors::{AsioError, AsioErrorWrapper, LoadDriverError};
 use num_traits::FromPrimitive;
@@ -788,6 +792,75 @@ impl Driver {
         let mut mcb = MESSAGE_CALLBACKS.lock().unwrap();
         mcb.retain(|&(id, _)| id != rem_id);
     }
+
+    /// Tune (#5643): number of buffer callbacks currently registered.
+    ///
+    /// A DSD stream needs the driver for itself: a PCM callback still
+    /// registered would write PCM samples into DSD buffers.
+    pub fn callback_count(&self) -> usize {
+        BUFFER_CALLBACK.lock().unwrap().len()
+    }
+
+    /// Tune (#5643): does the driver accept this I/O format
+    /// (`ASIOFuture(kAsioCanDoIoFormat)`)?
+    ///
+    /// `Ok(false)` when the driver refuses the format or does not know the
+    /// selector (ASIO 2.0 drivers, PCM-only drivers).
+    pub fn can_io_format(&self, format_type: AsioIoFormatType) -> Result<bool, AsioError> {
+        let mut format = AsioIoFormat::new(format_type);
+        let code = unsafe {
+            ai::ASIOFuture(
+                io_format::K_ASIO_CAN_DO_IO_FORMAT,
+                &mut format as *mut AsioIoFormat as *mut c_void,
+            )
+        };
+        match io_format::can_do_from_code(code) {
+            Some(can) => Ok(can),
+            None => asio_result!(code).map(|()| true),
+        }
+    }
+
+    /// Tune (#5643): switch the driver to this I/O format
+    /// (`ASIOFuture(kAsioSetIoFormat)`).
+    ///
+    /// Only in the `Initialized` state: buffers created in one format are
+    /// not valid in the other, and this crate does not own the pointers the
+    /// caller may still hold. Returns `AsioError::BadMode` otherwise; the
+    /// caller disposes of its buffers first (`dispose_buffers`).
+    ///
+    /// After a switch, channel types, sample rate and buffer sizes must be
+    /// queried again.
+    pub fn set_io_format(&self, format_type: AsioIoFormatType) -> Result<(), AsioError> {
+        let state = self.inner.lock_state();
+        if *state != DriverState::Initialized {
+            return Err(AsioError::BadMode);
+        }
+        let mut format = AsioIoFormat::new(format_type);
+        unsafe {
+            asio_result!(ai::ASIOFuture(
+                io_format::K_ASIO_SET_IO_FORMAT,
+                &mut format as *mut AsioIoFormat as *mut c_void,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Tune (#5643): the driver's current I/O format
+    /// (`ASIOFuture(kAsioGetIoFormat)`).
+    ///
+    /// A driver that does not know the selector answers an error
+    /// (`NoDrivers` for `ASE_NotPresent`, `InvalidInput` for
+    /// `ASE_InvalidParameter`): such a driver is PCM-only.
+    pub fn io_format(&self) -> Result<AsioIoFormatType, AsioError> {
+        let mut format = AsioIoFormat::invalid();
+        unsafe {
+            asio_result!(ai::ASIOFuture(
+                io_format::K_ASIO_GET_IO_FORMAT,
+                &mut format as *mut AsioIoFormat as *mut c_void,
+            ))?;
+        }
+        AsioIoFormatType::from_raw(format.format_type).ok_or(AsioError::UnknownError)
+    }
 }
 
 impl DriverState {
@@ -1134,4 +1207,10 @@ fn check_type_sizes() {
         std::mem::size_of::<AsioTime>(),
         std::mem::size_of::<ai::ASIOTime>()
     );
+    // Tune (#5643).
+    assert_eq!(
+        std::mem::size_of::<AsioIoFormat>(),
+        std::mem::size_of::<ai::ASIOIoFormat>()
+    );
+    assert_eq!(std::mem::size_of::<AsioIoFormat>(), 512);
 }
