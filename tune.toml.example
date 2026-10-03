@@ -2,7 +2,7 @@
 # Copy to tune.toml and adjust as needed.
 # Environment variables override these values (TUNE_PORT, TUNE_DB_PATH, etc.)
 
-port = 8085
+port = 8888
 db_path = "tune.db"
 web_dir = "web"
 artwork_dir = "artwork_cache"
