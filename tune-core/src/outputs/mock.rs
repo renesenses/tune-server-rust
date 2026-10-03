@@ -70,6 +70,11 @@ pub struct MockOutput {
     /// l'URI qu'il tenait : le renderer DLNA qui acquitte Play mais tient
     /// encore l'ancien flux, vu depuis l'orchestrateur.
     refus_de_lecture: Arc<std::sync::Mutex<Option<String>>>,
+    /// Fil 2095 — chaque `seek` reçu, dans l'ordre, refusé ou non.
+    seek_calls: Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Fil 2095 — armé, `seek` REFUSE avec ce motif (renderer qui répond
+    /// 701 « Transition not available ») et la position ne bouge pas.
+    refus_de_seek: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOutput {
@@ -99,7 +104,20 @@ impl MockOutput {
             bascule_honoree: Arc::new(AtomicBool::new(true)),
             echec: Arc::new(std::sync::Mutex::new(None)),
             refus_de_lecture: Arc::new(std::sync::Mutex::new(None)),
+            seek_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            refus_de_seek: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Fil 2095 — faire refuser (ou de nouveau accepter, `None`) les `seek`
+    /// suivants. Le refus est compté comme un appel.
+    pub fn refuser_le_seek(&self, motif: Option<&str>) {
+        *self.refus_de_seek.lock().unwrap() = motif.map(str::to_string);
+    }
+
+    /// Fil 2095 — les cibles des `seek` reçus, dans l'ordre.
+    pub fn seek_calls(&self) -> Vec<u64> {
+        self.seek_calls.lock().unwrap().clone()
     }
 
     /// #5574 — faire refuser (ou de nouveau accepter, `None`) les `play_media`
@@ -359,6 +377,11 @@ impl OutputTarget for MockOutput {
     }
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        self.seek_calls.lock().unwrap().push(position_ms);
+        let refus = self.refus_de_seek.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            return Err(motif);
+        }
         self.position_ms.store(position_ms, Ordering::Relaxed);
         if self.seek_laisse_en_pause.load(Ordering::Relaxed) {
             *self.state.lock().await = TransportState::Paused;
