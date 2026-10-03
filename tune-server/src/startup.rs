@@ -2070,6 +2070,7 @@ pub async fn remount_network_shares(state: &AppState) {
         return;
     }
     info!(count = rows.len(), "remounting_network_shares");
+    let mut a_retenter: Vec<PartageEnregistre> = Vec::new();
     for r in rows {
         let host = r.first().and_then(|v| v.as_string()).unwrap_or_default();
         let share = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
@@ -2077,130 +2078,263 @@ pub async fn remount_network_shares(state: &AppState) {
         if host.is_empty() || share.is_empty() || path.is_empty() {
             continue;
         }
-        let id = r.get(5).and_then(|v| v.as_i64());
-        // Deja monte (redemarrage du seul service, systeme reste debout) :
-        // ne pas empiler un second montage sur le meme point.
-        //
-        // Le test etait « le repertoire contient-il quelque chose ? ». Un point
-        // de montage non monte mais portant des residus — un scan a ecrit
-        // dedans pendant que le NAS etait tombe — faisait donc sauter le
-        // remontage SANS UN MOT, et l'utilisateur se retrouvait avec une
-        // bibliotheque a moitie lisible que rien n'expliquait. On demande
-        // desormais s'il s'agit reellement d'un point de montage (#1916).
-        if crate::smb::est_un_point_de_montage(std::path::Path::new(&path)) {
-            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_mounted_skipping");
-            noter_montage(state, id, "mounted", None, None).await;
-            continue;
+        let partage = PartageEnregistre {
+            host,
+            share,
+            path,
+            user: r.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+            pass: r.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+            id: r.get(5).and_then(|v| v.as_i64()),
+            connu: r.get(6).and_then(|v| v.as_string()).unwrap_or_default(),
+        };
+        if monter_un_partage(state, &partage).await == IssueMontage::Echec {
+            a_retenter.push(partage);
         }
-        let user = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
-        let pass = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
-        let connu = r.get(6).and_then(|v| v.as_string()).unwrap_or_default();
+    }
+    // #5682 (fil 2115) — un seul essai, et un NAS pas encore prêt au
+    // démarrage (bail DHCP, disques qui s'éveillent) le restait jusqu'à la
+    // relance du serveur. Les nouveaux essais partent EN FOND : le démarrage,
+    // et le serveur HTTP, n'attendent pas un NAS éteint.
+    for partage in a_retenter {
+        let state = state.clone();
+        tokio::spawn(async move {
+            retenter_en_fond(state, partage).await;
+        });
+    }
+}
 
-        // La RESTITUTION reste propre a chaque appelant — la route rend des
-        // erreurs HTTP a un humain qui attend, celle-ci journalise et passe au
-        // suivant. La STRATEGIE de montage, elle, est commune (`crate::smb`) :
-        // recopiee, elle avait diverge, et ce code imposait encore `vers=3.0`
-        // quand la route avait appris a negocier. Le partage SMB 1.0 de
-        // Philippe Landes montait donc depuis l'assistant, et le premier
-        // redemarrage le lui reprenait (#1834).
-        let (result, dialecte_retenu) = if cfg!(target_os = "macos") {
-            let creds = if user.is_empty() {
-                "guest@".to_string()
-            } else if pass.is_empty() {
-                format!("{user}@")
-            } else {
-                format!("{user}:{pass}@")
-            };
-            let unc = format!("//{creds}{host}/{share}");
+/// Un partage SMB enregistré (`network_mounts`), tel que le remontage le lit.
+struct PartageEnregistre {
+    host: String,
+    share: String,
+    path: String,
+    user: String,
+    pass: String,
+    id: Option<i64>,
+    /// Le dialecte déjà retenu, vide s'il est inconnu.
+    connu: String,
+}
+
+/// L'issue d'un essai de montage, pour décider d'un nouvel essai (#5682).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueMontage {
+    /// Monté — ou déjà monté par quelqu'un d'autre.
+    Monte,
+    /// Un nouvel essai n'y changera rien : identifiants refusés, ou
+    /// `mount.cifs` absent.
+    Definitif,
+    /// Réseau pas prêt, NAS muet, délai dépassé : un nouvel essai peut réussir.
+    Echec,
+}
+
+/// Un essai de montage d'UN partage, son issue écrite sur sa ligne.
+async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMontage {
+    let (host, share, path, id) = (p.host.clone(), p.share.clone(), p.path.clone(), p.id);
+    // Deja monte (redemarrage du seul service, systeme reste debout) :
+    // ne pas empiler un second montage sur le meme point.
+    //
+    // Le test etait « le repertoire contient-il quelque chose ? ». Un point
+    // de montage non monte mais portant des residus — un scan a ecrit
+    // dedans pendant que le NAS etait tombe — faisait donc sauter le
+    // remontage SANS UN MOT, et l'utilisateur se retrouvait avec une
+    // bibliotheque a moitie lisible que rien n'expliquait. On demande
+    // desormais s'il s'agit reellement d'un point de montage (#1916).
+    if crate::smb::est_un_point_de_montage(std::path::Path::new(&path)) {
+        tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_mounted_skipping");
+        noter_montage(state, id, "mounted", None, None).await;
+        return IssueMontage::Monte;
+    }
+    let (user, pass, connu) = (p.user.clone(), p.pass.clone(), p.connu.clone());
+
+    // La RESTITUTION reste propre a chaque appelant — la route rend des
+    // erreurs HTTP a un humain qui attend, celle-ci journalise et passe au
+    // suivant. La STRATEGIE de montage, elle, est commune (`crate::smb`) :
+    // recopiee, elle avait diverge, et ce code imposait encore `vers=3.0`
+    // quand la route avait appris a negocier. Le partage SMB 1.0 de
+    // Philippe Landes montait donc depuis l'assistant, et le premier
+    // redemarrage le lui reprenait (#1834).
+    let (result, dialecte_retenu) = if cfg!(target_os = "macos") {
+        let creds = if user.is_empty() {
+            "guest@".to_string()
+        } else if pass.is_empty() {
+            format!("{user}@")
+        } else {
+            format!("{user}:{pass}@")
+        };
+        let unc = format!("//{creds}{host}/{share}");
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new("mount_smbfs")
+                .args([&unc, &path])
+                .output(),
+        )
+        .await;
+        (res, None)
+    } else {
+        let u = if user.is_empty() { "guest" } else { &user };
+        let unc = format!("//{host}/{share}");
+        // Le dialecte deja retenu passe en premier : sans cela, un partage
+        // SMB 1.0 rejouerait deux essais voues a l'echec a CHAQUE
+        // demarrage, soit vingt secondes avant que sa musique ne soit
+        // lisible. Le reste de l'echelle suit quand meme — un NAS mis a
+        // jour ne doit pas rester prisonnier de ce qu'il repondait avant.
+        let echelle = crate::smb::echelle(if connu.is_empty() {
+            None
+        } else {
+            Some(connu.as_str())
+        });
+        let mut dernier = None;
+        let mut gagnant = None;
+        for dialecte in echelle {
+            let mut opts = format!("username={u},password={pass}");
+            if let Some(v) = dialecte {
+                opts.push_str(&format!(",vers={v}"));
+            }
+            // JAMAIS `opts` dans une trace : il porte le mot de passe.
             let res = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                tokio::process::Command::new("mount_smbfs")
-                    .args([&unc, &path])
+                crate::smb::ESSAI_TIMEOUT,
+                tokio::process::Command::new("mount.cifs")
+                    .args([&unc, &path, "-o", &opts])
                     .output(),
             )
             .await;
-            (res, None)
-        } else {
-            let u = if user.is_empty() { "guest" } else { &user };
-            let unc = format!("//{host}/{share}");
-            // Le dialecte deja retenu passe en premier : sans cela, un partage
-            // SMB 1.0 rejouerait deux essais voues a l'echec a CHAQUE
-            // demarrage, soit vingt secondes avant que sa musique ne soit
-            // lisible. Le reste de l'echelle suit quand meme — un NAS mis a
-            // jour ne doit pas rester prisonnier de ce qu'il repondait avant.
-            let echelle = crate::smb::echelle(if connu.is_empty() {
-                None
-            } else {
-                Some(connu.as_str())
-            });
-            let mut dernier = None;
-            let mut gagnant = None;
-            for dialecte in echelle {
-                let mut opts = format!("username={u},password={pass}");
-                if let Some(v) = dialecte {
-                    opts.push_str(&format!(",vers={v}"));
+            let arreter = match &res {
+                Ok(Ok(out)) if out.status.success() => {
+                    gagnant = Some(crate::smb::etiquette(dialecte).to_string());
+                    true
                 }
-                // JAMAIS `opts` dans une trace : il porte le mot de passe.
-                let res = tokio::time::timeout(
-                    crate::smb::ESSAI_TIMEOUT,
-                    tokio::process::Command::new("mount.cifs")
-                        .args([&unc, &path, "-o", &opts])
-                        .output(),
-                )
-                .await;
-                let arreter = match &res {
-                    Ok(Ok(out)) if out.status.success() => {
-                        gagnant = Some(crate::smb::etiquette(dialecte).to_string());
-                        true
-                    }
-                    Ok(Ok(out)) => crate::smb::est_refus_d_authentification(
-                        &String::from_utf8_lossy(&out.stderr),
-                    ),
-                    // mount.cifs absent ou non executable : changer de dialecte
-                    // n'y fera rien.
-                    Ok(Err(_)) => true,
-                    Err(_) => false,
-                };
-                dernier = Some(res);
-                if arreter {
-                    break;
+                Ok(Ok(out)) => {
+                    crate::smb::est_refus_d_authentification(&String::from_utf8_lossy(&out.stderr))
                 }
-            }
-            (dernier.expect("l'echelle n'est jamais vide"), gagnant)
-        };
-
-        // Chaque issue est desormais ECRITE, pas seulement journalisee. C'est
-        // tout l'objet de #1916 : le remontage echouait, seul le journal le
-        // savait, l'interface continuait d'afficher le partage comme monte, et
-        // la lecture rendait une erreur reseau qui ne nommait jamais la cause.
-        // Eric (`ricouxxx`) a du trouver le contournement seul, sur un forum.
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
-                info!(
-                    host = %host, share = %share, path = %path,
-                    dialect = dialecte_retenu.as_deref().unwrap_or("negocie"),
-                    "network_share_remounted"
-                );
-                noter_montage(state, id, "mounted", None, dialecte_retenu.as_deref()).await;
-            }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                warn!(
-                    host = %host, share = %share, error = %stderr,
-                    "network_share_remount_failed"
-                );
-                noter_montage(state, id, "failed", Some(&stderr), None).await;
-            }
-            Ok(Err(e)) => {
-                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed");
-                noter_montage(state, id, "failed", Some(&e.to_string()), None).await;
-            }
-            Err(_) => {
-                warn!(host = %host, share = %share, "network_share_remount_timeout");
-                noter_montage(state, id, "failed", Some("délai dépassé au montage"), None).await;
+                // mount.cifs absent ou non executable : changer de dialecte
+                // n'y fera rien.
+                Ok(Err(_)) => true,
+                Err(_) => false,
+            };
+            dernier = Some(res);
+            if arreter {
+                break;
             }
         }
+        (dernier.expect("l'echelle n'est jamais vide"), gagnant)
+    };
+
+    // Chaque issue est desormais ECRITE, pas seulement journalisee. C'est
+    // tout l'objet de #1916 : le remontage echouait, seul le journal le
+    // savait, l'interface continuait d'afficher le partage comme monte, et
+    // la lecture rendait une erreur reseau qui ne nommait jamais la cause.
+    // Eric (`ricouxxx`) a du trouver le contournement seul, sur un forum.
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            info!(
+                host = %host, share = %share, path = %path,
+                dialect = dialecte_retenu.as_deref().unwrap_or("negocie"),
+                "network_share_remounted"
+            );
+            noter_montage(state, id, "mounted", None, dialecte_retenu.as_deref()).await;
+            IssueMontage::Monte
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            warn!(
+                host = %host, share = %share, error = %stderr,
+                "network_share_remount_failed"
+            );
+            noter_montage(state, id, "failed", Some(&stderr), None).await;
+            issue_d_un_refus(&stderr)
+        }
+        Ok(Err(e)) => {
+            warn!(host = %host, share = %share, error = %e, "network_share_remount_failed");
+            noter_montage(state, id, "failed", Some(&e.to_string()), None).await;
+            // `mount.cifs` absent ou non exécutable : rien ne changera.
+            IssueMontage::Definitif
+        }
+        Err(_) => {
+            warn!(host = %host, share = %share, "network_share_remount_timeout");
+            noter_montage(state, id, "failed", Some("délai dépassé au montage"), None).await;
+            IssueMontage::Echec
+        }
     }
+}
+
+/// Un refus de `mount.cifs`/`mount_smbfs` : définitif s'il porte sur les
+/// identifiants (réessayer ne ferait que resservir la même réponse), sinon
+/// un nouvel essai peut réussir (#5682).
+pub(crate) fn issue_d_un_refus(stderr: &str) -> IssueMontage {
+    if crate::smb::est_refus_d_authentification(stderr) {
+        IssueMontage::Definitif
+    } else {
+        IssueMontage::Echec
+    }
+}
+
+/// #5682 — les délais avant chaque nouvel essai de montage : croissants, et
+/// bornés (un peu plus de 5 minutes en tout), le temps qu'un NAS allumé avec
+/// l'appareil finisse de s'éveiller. Au-delà, le partage reste en échec sur
+/// sa ligne, comme avant, et l'écran des partages permet de le remonter.
+pub(crate) const DELAIS_DE_REESSAI_SECS: [u64; 8] = [5, 10, 20, 40, 60, 60, 60, 60];
+
+/// Le délai avant le nouvel essai n° `n + 1` (le premier vaut `n = 0`) ;
+/// `None` : on n'essaie plus.
+pub(crate) fn delai_avant_l_essai(n: usize) -> Option<std::time::Duration> {
+    DELAIS_DE_REESSAI_SECS
+        .get(n)
+        .map(|s| std::time::Duration::from_secs(*s))
+}
+
+/// Les nouveaux essais d'un montage, l'horloge INJECTÉE (`dormir`) pour
+/// l'épreuve. Rend le numéro du nouvel essai qui a monté le partage, `None`
+/// s'il a fallu renoncer (refus définitif, ou délais épuisés).
+pub(crate) async fn reessayer_le_montage<E, F, D, G>(mut essai: E, mut dormir: D) -> Option<usize>
+where
+    E: FnMut(usize) -> F,
+    F: std::future::Future<Output = IssueMontage>,
+    D: FnMut(std::time::Duration) -> G,
+    G: std::future::Future<Output = ()>,
+{
+    let mut n = 0;
+    while let Some(delai) = delai_avant_l_essai(n) {
+        dormir(delai).await;
+        n += 1;
+        match essai(n).await {
+            IssueMontage::Monte => return Some(n),
+            IssueMontage::Definitif => return None,
+            IssueMontage::Echec => {}
+        }
+    }
+    None
+}
+
+/// En fond : les nouveaux essais d'un partage resté démonté au démarrage,
+/// puis, s'il finit par monter, un scan de la bibliothèque — celui du
+/// démarrage a trouvé sa racine absente et n'a rien pu en lire.
+async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
+    let monte =
+        reessayer_le_montage(|_| monter_un_partage(&state, &partage), tokio::time::sleep).await;
+    let Some(essai) = monte else {
+        warn!(
+            host = %partage.host, share = %partage.share,
+            "network_share_remount_abandoned — le partage reste démonté (#5682)"
+        );
+        return;
+    };
+    info!(
+        host = %partage.host, share = %partage.share, path = %partage.path, essai,
+        "network_share_mounted_late (#5682)"
+    );
+    if !state.config.auto_scan {
+        return;
+    }
+    // Le scan de démarrage peut encore tenir le droit de scanner : on attend
+    // qu'il le rende, sans fin de délai déraisonnable.
+    for _ in 0..40 {
+        if crate::routes::system::scan::spawn_library_scan(state.clone(), false, None).await {
+            info!(path = %partage.path, "scan_after_late_mount_started (#5682)");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+    warn!(path = %partage.path, "scan_after_late_mount_skipped — un scan tenait le droit (#5682)");
 }
 
 /// Ecrit le constat du dernier montage sur la ligne du partage.
@@ -3393,5 +3527,92 @@ mod prechauffage_asio_5353_tests {
              de démarrage peut passer avant (#5353)"
         );
         assert!(lancement.contains("let _fin = FinDuPrechauffageAsio;"));
+    }
+}
+
+/// #5682 (fil 2115) — les nouveaux essais de montage d'un partage resté
+/// démonté au démarrage, l'horloge injectée.
+#[cfg(test)]
+mod nouveaux_essais_de_montage_tests_5682 {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    /// Rejoue `reessayer_le_montage` avec des issues écrites d'avance ; rend
+    /// le résultat, le nombre d'essais faits et les délais attendus.
+    fn rejouer(issues: &[IssueMontage]) -> (Option<usize>, usize, Vec<Duration>) {
+        let essais = RefCell::new(0usize);
+        let delais = RefCell::new(Vec::new());
+        let horloge = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = horloge.block_on(reessayer_le_montage(
+            |n| {
+                *essais.borrow_mut() += 1;
+                assert_eq!(n, *essais.borrow(), "essais numérotés à partir de 1");
+                let issue = issues.get(n - 1).copied().unwrap_or(IssueMontage::Echec);
+                async move { issue }
+            },
+            |d| {
+                delais.borrow_mut().push(d);
+                async {}
+            },
+        ));
+        (r, essais.into_inner(), delais.into_inner())
+    }
+
+    #[test]
+    fn deux_echecs_puis_le_nas_repond_5682() {
+        use IssueMontage::*;
+        let (r, essais, delais) = rejouer(&[Echec, Echec, Monte]);
+        assert_eq!(r, Some(3), "monté au troisième nouvel essai");
+        assert_eq!(essais, 3, "on s'arrête dès que le partage est monté");
+        assert_eq!(
+            delais,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20)
+            ],
+            "un délai CROISSANT avant chaque essai"
+        );
+    }
+
+    #[test]
+    fn un_refus_d_identifiants_n_est_pas_retente_5682() {
+        let (r, essais, _) = rejouer(&[IssueMontage::Definitif]);
+        assert_eq!(r, None);
+        assert_eq!(
+            essais, 1,
+            "un mot de passe refusé ne se répare pas en réessayant"
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(13): Permission denied"),
+            IssueMontage::Definitif
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(112): Host is down"),
+            IssueMontage::Echec
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(101): Network is unreachable"),
+            IssueMontage::Echec
+        );
+    }
+
+    #[test]
+    fn un_nas_eteint_n_est_pas_retente_sans_fin_5682() {
+        let (r, essais, delais) = rejouer(&[]);
+        assert_eq!(r, None);
+        assert_eq!(essais, DELAIS_DE_REESSAI_SECS.len());
+        let total: Duration = delais.iter().sum();
+        assert!(
+            total <= Duration::from_secs(6 * 60),
+            "les nouveaux essais sont BORNÉS ({total:?})"
+        );
+        assert!(
+            delais.windows(2).all(|w| w[0] <= w[1]),
+            "délais croissants : {delais:?}"
+        );
     }
 }

@@ -2859,12 +2859,27 @@ async fn spawn_library_scan_avec_lecteur(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
-        if !scan_cancel_requested() {
+        // #5682 (fil 2115) — pas quand une racine manquait ou s'est vidée : un
+        // partage pas encore monté faisait voir chaque fichier source
+        // « disparu », et retirait les pochettes de pistes pourtant conservées.
+        if tune_core::library::pochette_disque::le_suivi_peut_conclure(
+            scan_cancel_requested(),
+            &missing_dirs,
+            &racines_videes,
+        ) {
             tune_core::library::pochette_disque::suivre_les_fichiers_sources(
                 &db,
                 &cache_dir,
                 &portee_pochettes,
+                &error_dirs,
                 force,
+            );
+        } else if !scan_cancel_requested() {
+            tracing::warn!(
+                missing = ?missing_dirs,
+                emptied = ?racines_videes,
+                "post_scan_pochettes_non_suivies — racine absente ou vidée : les pochettes \
+                 tirées du disque sont CONSERVÉES (#5682)"
             );
         }
 

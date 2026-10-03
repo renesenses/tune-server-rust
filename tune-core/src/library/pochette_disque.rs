@@ -513,6 +513,17 @@ fn reevaluer_avec(
     {
         pistes.push(p.to_path_buf());
     }
+    // #5682 (fil 2115) — AUCUNE piste de l'album n'est joignable : c'est le
+    // SUPPORT qui manque (partage du NAS pas encore monté, disque débranché),
+    // pas la pochette qui a été ôtée. Conclure « rien sur le disque » retirait
+    // la pochette de chaque album à chaque démarrage où le NAS arrivait en
+    // retard, alors que les pistes, elles, étaient conservées. Une piste
+    // vraiment supprimée quitte la base par la purge d'un scan sain, et
+    // l'album vidé avec elle : la règle de #5034 ne perd rien.
+    if !pistes.is_empty() && !pistes.iter().any(|p| existe(p)) {
+        debug!(album_id, "pochette_gardee — aucune piste joignable (#5682)");
+        return Geste::Garder;
+    }
     let lue = lire_depuis_l_album(&pistes, cache_dir);
     let du_disque = vient_du_disque(etat, lue.as_ref(), &pistes);
     let geste = arbitrer(etat, lue.as_ref(), complet, du_disque);
@@ -857,10 +868,16 @@ fn suivre(
 /// pistes modifiées.
 ///
 /// `portee` : les dossiers scannés (« Répertoires ») ; vide = tous.
+/// `exclus` : les dossiers dont le parcours a échoué (#5682) — ce qu'ils
+/// contiennent n'a pas été vu, rien n'y est conclu.
+///
+/// À n'appeler qu'après un scan dont les racines ont répondu : voir
+/// [`le_suivi_peut_conclure`].
 pub fn suivre_les_fichiers_sources(
     db: &std::sync::Arc<dyn DbBackend>,
     cache_dir: &Path,
     portee: &[String],
+    exclus: &[String],
     complet: bool,
 ) -> usize {
     let repo = AlbumRepo::with_backend(db.clone());
@@ -876,6 +893,9 @@ pub fn suivre_les_fichiers_sources(
         if !portee.is_empty() && !portee.iter().any(|d| sous_le_dossier(&fichier, d)) {
             continue;
         }
+        if exclus.iter().any(|d| sous_le_dossier(&fichier, d)) {
+            continue;
+        }
         let actuelle = empreinte_du_fichier(Path::new(&fichier));
         if actuelle.is_some() && actuelle == empreinte {
             continue;
@@ -888,6 +908,23 @@ pub fn suivre_les_fichiers_sources(
         info!(reprises, "pochettes_suivies_sur_le_disque");
     }
     reprises
+}
+
+/// #5682 (fil 2115) — la passe [`suivre_les_fichiers_sources`] a-t-elle le
+/// droit de conclure « fichier source disparu » au sortir d'un scan ?
+///
+/// Non quand le scan a été annulé, qu'une racine manquait (partage pas
+/// encore monté) ou qu'une racine s'est vidée (montage absent, point de
+/// montage vide) : la même garde que celle qui CONSERVE les pistes
+/// (`auto_scan_root_went_empty`). Les sous-dossiers en erreur de parcours ne
+/// bloquent pas toute la passe — un dossier durablement illisible
+/// l'éteindrait pour toujours — ils sont exclus de sa portée (`exclus`).
+pub fn le_suivi_peut_conclure(
+    annule: bool,
+    racines_absentes: &[String],
+    racines_videes: &[String],
+) -> bool {
+    !annule && racines_absentes.is_empty() && racines_videes.is_empty()
 }
 
 /// `chemin` est-il sous `dossier` ? Comparaison par composants, séparateurs
@@ -912,3 +949,7 @@ pub fn est_une_image_de_pochette(chemin: &Path) -> bool {
 #[cfg(test)]
 #[path = "pochette_disque_tests_5034.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pochette_disque_tests_5682.rs"]
+mod tests_5682;
