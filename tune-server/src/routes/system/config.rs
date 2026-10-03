@@ -1706,12 +1706,18 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
     // l'utilisateur la recopier dans son tableau de bord.
     let spotify_redirect_uri_refus =
         tune_core::streaming::spotify::refus_redirection(&spotify_redirect_uri).map(|r| r.code());
+    // Fil 221 — sans Client ID (`"placeholder"`), Spotify refuse tout : l'écran
+    // offre alors le champ « Client ID » au lieu d'un « Se connecter » voué à
+    // l'échec. Lu sur le service LUI-MÊME, qui reçoit la saisie à chaud.
+    let spotify_client_id_configure =
+        crate::routes::service_tokens::spotify_client_id_configure(&state).await;
     Json(json!({
         "TUNE_PORT": state.port.to_string(),
         "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
         "engine": engine,
         "spotify_redirect_uri": spotify_redirect_uri,
         "spotify_redirect_uri_refus": spotify_redirect_uri_refus,
+        "spotify_client_id_configure": spotify_client_id_configure,
     }))
 }
 
