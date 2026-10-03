@@ -747,12 +747,14 @@ pub async fn handle_stream(
     // `stream_request` (zone 10 du .18, 02/10).
     let mut bilan = (!is_radio).then(|| BilanDeConnexion {
         stream_id: stream_id.to_string(),
+        voie: "conversion",
         range: range_hdr.to_string(),
         agent: user_agent.clone().unwrap_or_else(|| "-".to_string()),
         reprise_depuis_la_retenue: reprise_exacte,
         octets_envoyes: 0,
         debut: std::time::Instant::now(),
-        session: session.clone(),
+        session: Some(session.clone()),
+        fin: "non_suivie",
     });
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
@@ -1354,31 +1356,76 @@ pub async fn handle_stream(
 /// (~2 Gio) : on les pose à `u32::MAX` sur le PREMIER bloc du canal, avant
 /// qu'il soit retenu ou mis en réserve, pour que sondes, reprises et
 /// reconnexions reçoivent le même conteneur. Idempotent.
-/// Bilan d'UNE connexion au flux d'une conversion, écrit quand son corps est
-/// lâché — qu'il soit allé au bout ou que le client ait coupé.
+/// Bilan d'UNE connexion au flux, écrit quand son corps est lâché — qu'il
+/// soit allé au bout ou que le client ait coupé.
+///
+/// Deux voies l'écrivent : la conversion (`voie="conversion"`, #5649) et le
+/// mandataire (`voie="mandataire"`, fil 2095). Sur le mandataire il n'y a pas
+/// de tuyau (`tuyau=-`), et `fin` dit pourquoi le corps s'est arrêté : sans
+/// lui, un journal ne distinguait pas un renderer qui a cessé de lire après
+/// un Seek d'un amont qui a cessé d'envoyer (FabienM, Devialet, 02/10).
 struct BilanDeConnexion {
     stream_id: String,
+    voie: &'static str,
     range: String,
     agent: String,
     reprise_depuis_la_retenue: Option<u64>,
     octets_envoyes: u64,
     debut: std::time::Instant,
-    session: std::sync::Arc<StreamSession>,
+    /// La session dont le tuyau se mesure ; `None` sur le mandataire.
+    session: Option<std::sync::Arc<StreamSession>>,
+    /// Cause de fin. Reste [`FIN_CLIENT_PARTI`] si le corps est lâché avant
+    /// sa fin : c'est le client qui a fermé. `non_suivie` sur la conversion.
+    fin: &'static str,
+}
+
+/// Le corps a été lâché avant la fin : le client a fermé la connexion.
+const FIN_CLIENT_PARTI: &str = "client_parti";
+
+impl BilanDeConnexion {
+    /// Le bilan d'une connexion MANDATAIRE (fil 2095).
+    fn mandataire(stream_id: &str, req_headers: &HeaderMap) -> Self {
+        let entete = |nom: &str| {
+            req_headers
+                .get(nom)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Self {
+            stream_id: stream_id.to_string(),
+            voie: "mandataire",
+            range: entete("Range"),
+            agent: entete("User-Agent"),
+            reprise_depuis_la_retenue: None,
+            octets_envoyes: 0,
+            debut: std::time::Instant::now(),
+            session: None,
+            fin: FIN_CLIENT_PARTI,
+        }
+    }
 }
 
 impl Drop for BilanDeConnexion {
     fn drop(&mut self) {
+        let tuyau = self.session.as_ref().map_or_else(
+            || "-".to_string(),
+            |s| {
+                s.octets_du_canal
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string()
+            },
+        );
         info!(
             stream_id = %self.stream_id,
+            voie = self.voie,
             range = %self.range,
             agent = %self.agent,
             octets_envoyes = self.octets_envoyes,
             reprise_depuis_la_retenue = ?self.reprise_depuis_la_retenue,
-            tuyau = self
-                .session
-                .octets_du_canal
-                .load(std::sync::atomic::Ordering::Relaxed),
+            tuyau = %tuyau,
             duree_ms = self.debut.elapsed().as_millis() as u64,
+            fin = self.fin,
             "stream_connexion_terminee"
         );
     }
@@ -2313,9 +2360,14 @@ fn resumable_proxy_body(
     sauter: u64,
     reresolve: Option<ReresolveFn>,
     compteur: std::sync::Arc<StreamSession>,
+    bilan: BilanDeConnexion,
 ) -> Body {
     let flux = async_stream::stream! {
         use futures_util::StreamExt;
+        // Le bilan ENTIER entre dans le flux : capturer seulement ses champs
+        // `Copy` (capture disjointe) compterait sur une copie, et le bilan
+        // serait écrit, vide, dès la réponse rendue.
+        let mut bilan = bilan;
         let mut resp = initial;
         // Current (possibly re-resolved) CDN URL we reconnect against.
         let mut url = upstream_url;
@@ -2338,9 +2390,11 @@ fn resumable_proxy_body(
                             }
                             let garde = chunk.slice(a_sauter as usize..);
                             a_sauter = 0;
+                            bilan.octets_envoyes += garde.len() as u64;
                             yield Ok::<_, std::io::Error>(garde);
                             continue;
                         }
+                        bilan.octets_envoyes += chunk.len() as u64;
                         yield Ok::<_, std::io::Error>(chunk);
                     }
                     Some(Err(e)) => {
@@ -2352,10 +2406,12 @@ fn resumable_proxy_body(
                 }
             }
             if clean_eof {
+                bilan.fin = "corps_complet";
                 break;
             }
             if resumes >= PROXY_MAX_RESUMES {
                 warn!(pos, "proxy_resume_giveup");
+                bilan.fin = "amont_abandonne";
                 break;
             }
             resumes += 1;
@@ -2378,10 +2434,12 @@ fn resumable_proxy_body(
                 }
                 Ok((r, _)) => {
                     warn!(status = %r.status(), pos, "proxy_resume_bad_status");
+                    bilan.fin = "amont_mauvais_statut";
                     break;
                 }
                 Err(()) => {
                     warn!(pos, "proxy_resume_upstream_failed");
+                    bilan.fin = "amont_injoignable";
                     break;
                 }
             }
@@ -2652,6 +2710,7 @@ async fn proxy_stream(
             0,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2695,6 +2754,7 @@ async fn proxy_stream(
             n,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2746,6 +2806,7 @@ async fn proxy_stream(
             0,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2763,6 +2824,7 @@ async fn proxy_stream(
         0,
         reresolve.clone(),
         session.clone(),
+        BilanDeConnexion::mandataire(&session.id, req_headers),
     );
     diag.journaliser(&session, StatusCode::OK, &headers);
     (StatusCode::OK, headers, body).into_response()
