@@ -12,6 +12,9 @@ pub mod bluos;
 pub mod bridge;
 #[cfg(test)]
 mod capabilities_test;
+/// #5643 — les cadences DSD natives déclarées par chaque pilote ASIO, sondées
+/// une fois. Hors `cfg` : l'API les lit partout, la règle se teste sous Linux.
+pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;

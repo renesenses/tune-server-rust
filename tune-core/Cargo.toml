@@ -621,6 +621,14 @@ name = "alsa_poll_recovery_4295"
 path = "tests/alsa_poll_recovery_4295.rs"
 required-features = ["local-audio"]
 
+# #5643 — DSD natif par ASIO (lots A et B) : les fonctions pures du chemin DSD,
+# compilées sous Linux depuis leurs fichiers de vendor/cpal et vendor/asio-sys
+# par `#[path]`. Ne tire ni cpal ni l'ASIO SDK, d'où aucune feature requise.
+# `autotests = false` en tête de ce manifeste : sans cette cible, jamais compilé.
+[[test]]
+name = "asio_dsd_5643"
+path = "tests/asio_dsd_5643.rs"
+
 # #4378 — la garde qui tient la fonctionnalité `dst` DÉSARMÉE : hors de tout
 # `default`, tirée par aucune autre fonctionnalité, et absente des lignes
 # `--features` de toutes les recettes qui PUBLIENT un artefact (release.yml,

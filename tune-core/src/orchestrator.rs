@@ -1835,6 +1835,10 @@ mod bit_depth_cap_tests;
 #[cfg(test)]
 mod dop_routing_tests;
 
+/// #5643 — la règle du DSD natif local (ASIO) et la valeur publiée par l'API.
+#[cfg(test)]
+mod dsd_natif_5643_tests;
+
 /// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
 ///
 /// Chez Bilou, quatre échecs de sortie BluOS d'affilée ont produit quatre
@@ -1865,6 +1869,10 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// Fil 2095 — le rétablissement d'une session morte ramène le renderer
+/// réseau à la position de la pause.
+#[cfg(test)]
+mod reprise_dlna_position_2095;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
