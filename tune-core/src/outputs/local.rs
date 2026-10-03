@@ -1383,6 +1383,21 @@ impl LocalOutput {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
     }
 
+    /// #5643 — cette sortie prend-elle le bras ASIO exclusif de `play_url` ?
+    /// La MÊME règle que le fil de lecture (`bras_de_cette_plateforme`) :
+    /// l'orchestrateur ne peut pas promettre du DSD natif à une sortie qui
+    /// ouvrirait WASAPI ou le chemin partagé. Toujours faux hors Windows.
+    pub fn sort_par_asio_exclusif(&self) -> bool {
+        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::AsioExclusif
+    }
+
+    /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
+    /// la capacité DSD sondée, `outputs::capacite_dsd_natif`).
+    pub fn nom_du_peripherique(&self) -> &str {
+        &self.device_name
+    }
+
     #[cfg(test)]
     pub(crate) fn strict_bitperfect_for_test(&self) -> bool {
         self.strict_bitperfect.load(Ordering::Relaxed)
@@ -4862,6 +4877,63 @@ impl OutputTarget for LocalOutput {
             // the feed and drain loops below so the thread tears down cleanly
             // instead of waiting forever on a ring buffer nobody drains.
             let device_gone = Arc::new(AtomicBool::new(false));
+
+            // #5643 — un flux DSD brut : l'orchestrateur ne le sert qu'à une
+            // sortie ASIO exclusive dont le pilote déclare le DSD natif à la
+            // cadence du fichier. Reconnu AVANT le WAV, dont il n'a pas
+            // l'en-tête ; rien du chemin PCM ne le voit.
+            if let Some(entete) = crate::audio::dsd_brut::lire_entete(&header_buf) {
+                if !ouverture_encore_voulue(
+                    force_silent.load(Ordering::SeqCst),
+                    stop_rx.try_recv().is_ok(),
+                ) {
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
+                #[cfg(all(target_os = "windows", feature = "asio"))]
+                if enchainement_exclusif::bras_de_cette_plateforme(exclusive_mode, &audio_backend)
+                    == enchainement_exclusif::BrasDeLecture::AsioExclusif
+                {
+                    bras_asio::jouer_dsd_natif_via_asio(bras_asio::EntreesDsdNatif {
+                        device_name,
+                        url,
+                        entete,
+                        header_buf,
+                        reader,
+                        seek_offset,
+                        my_generation,
+                        paused,
+                        playing,
+                        force_silent,
+                        stop_rx,
+                        open_failure,
+                        position_ms,
+                        play_generation,
+                        track_ended_naturally,
+                        track_ended_generation,
+                        dop_active,
+                        chain_exhausted: chain_exhausted_ref,
+                    });
+                    return;
+                }
+                warn!(
+                    device = %device_name,
+                    cadence = entete.cadence,
+                    canaux = entete.canaux,
+                    "local_audio_dsd_natif_recu_sans_bras_asio"
+                );
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(format!(
+                        "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
+                         un pilote ASIO exclusif."
+                    ));
+                }
+                force_silent.store(true, Ordering::SeqCst);
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
 
             // #5439 — un flux décodé en continu repart du début de la piste :
             // son seek passe par le saut d'octets du chemin PCM.

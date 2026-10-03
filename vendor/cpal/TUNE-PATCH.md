@@ -90,3 +90,18 @@ Not proven, needs a Windows host with a DSD-capable ASIO driver:
 - the return to PCM on drop, then a PCM stream on the same device;
 - timestamps (`frames_to_duration` with the DSD rate and the sample count).
 
+
+# Tune: native DSD capability probe (#5643, lots C to E)
+
+- src/host/asio/device.rs: new `Device::dsd_output_rates()`. With no
+  stream alive on the driver (`callback_count() == 0`) and
+  `kAsioCanDoIoFormat` DSD, it releases leftover buffers, switches to DSD,
+  asks `ASIOCanSampleRate` for each rate of `dsd::DSD_RATES`, then switches
+  back to PCM. Empty on any refusal or error. Tune calls it once per device,
+  under its process-wide ASIO device lock, and caches the answer
+  (`tune-core/src/outputs/capacite_dsd_natif.rs`).
+- src/host/asio/stream.rs: `forget_asio_buffers` becomes `pub(super)` so the
+  probe can use it. No behaviour change.
+
+Not proven: what real drivers answer to `ASIOCanSampleRate` in DSD mode, and
+whether the switch there and back sends `kAsioResetRequest`.
