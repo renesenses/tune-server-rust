@@ -23,8 +23,12 @@
 //!   gardée — la valeur par défaut prudente voulue par la décision du
 //!   25/09/2026.
 //!
-//! L'ordre de lecture est celui de `refresh_cover_hash` : la jaquette
-//! intégrée d'abord, puis l'image du dossier.
+//! L'ordre de lecture est celui de `refresh_cover_hash` : l'image du
+//! DOSSIER d'abord, puis la jaquette intégrée. Décision de Bertrand du
+//! 03/10/2026 (#5685, Marco Polo, fil 2118), qui renverse celle du 25/09
+//! (#5035) : une image posée par l'utilisateur à côté de ses fichiers — dans
+//! le dossier du disque, ou dans le dossier qui réunit les disques d'un
+//! coffret ([`dossier_commun`]) — passe avant la jaquette intégrée.
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +36,8 @@ use tracing::{debug, info, warn};
 
 use super::artwork::{
     EmpreinteJaquette, FOLDER_COVER_NAMES, artwork_hash, content_hash, empreinte_jaquette_flac,
-    extended_path, extract_cover_art, find_cached, find_folder_cover, save_to_cache,
+    extended_path, extract_cover_art, find_cached, find_folder_cover, image_de_pochette_dans,
+    save_to_cache,
 };
 use crate::db::album_repo::{AlbumRepo, EtatPochette};
 use crate::db::backend::DbBackend;
@@ -129,8 +134,12 @@ pub fn lire_la_jaquette(
 
 /// L'image du DOSSIER d'une piste (`cover.jpg`, `folder.jpg`…).
 pub fn lire_l_image_du_dossier(piste: &Path, cache_dir: &Path) -> Option<PochetteLue> {
-    let image = find_folder_cover(piste)?;
-    let data = match crate::library::artwork::lire_l_image(&image) {
+    lire_l_image_de_pochette(&find_folder_cover(piste)?, cache_dir)
+}
+
+/// Une image de pochette de dossier déjà trouvée, mise en cache.
+fn lire_l_image_de_pochette(image: &Path, cache_dir: &Path) -> Option<PochetteLue> {
+    let data = match crate::library::artwork::lire_l_image(image) {
         Ok(d) => d,
         Err(e) => {
             debug!(path = %image.display(), error = %e, "pochette_dossier_illisible");
@@ -143,7 +152,99 @@ pub fn lire_l_image_du_dossier(piste: &Path, cache_dir: &Path) -> Option<Pochett
         condensat,
         source: SourcePochette::Dossier,
         fichier: image.to_string_lossy().into_owned(),
-        empreinte: empreinte_du_fichier(&image),
+        empreinte: empreinte_du_fichier(image),
+    })
+}
+
+/// #5685 — de combien de niveaux, au plus, on remonte au-dessus du dossier
+/// d'une piste pour trouver le dossier qui réunit les disques d'un album :
+/// `Coffret/CD1/` (un niveau) ou `Coffret/CD1/FLAC/` (deux).
+pub const REMONTEE_MAX: usize = 2;
+
+/// #5685 — le dossier qui RÉUNIT les dossiers de disques d'un album rangé un
+/// dossier par disque (`Coffret/CD1`, `Coffret/CD2`… → `Coffret`).
+///
+/// `None` quand l'album tient dans un seul dossier (l'image de ce dossier est
+/// celle de [`find_folder_cover`]), quand un dossier de disque est à plus de
+/// [`REMONTEE_MAX`] niveaux du dossier commun, quand ce dossier serait la
+/// racine du système de fichiers, ou pour une piste rangée dans une image ISO
+/// (#5299, qui a sa propre règle).
+pub fn dossier_commun(pistes: &[PathBuf]) -> Option<PathBuf> {
+    let mut dossiers: Vec<&Path> = Vec::new();
+    for p in pistes {
+        if crate::audio::iso9660::est_chemin_virtuel(&p.to_string_lossy()) {
+            return None;
+        }
+        let d = p.parent()?;
+        if !dossiers.contains(&d) {
+            dossiers.push(d);
+        }
+    }
+    let (premier, autres) = dossiers.split_first()?;
+    if autres.is_empty() {
+        return None;
+    }
+    let mut commun = premier.to_path_buf();
+    for d in autres {
+        // `starts_with` compare par COMPOSANTS : `Coffret` n'est pas un
+        // préfixe de `Coffret 2`.
+        while !d.starts_with(&commun) {
+            if !commun.pop() {
+                return None;
+            }
+        }
+    }
+    let niveaux = commun.components().count();
+    if commun.parent().is_none()
+        || dossiers
+            .iter()
+            .any(|d| d.components().count().saturating_sub(niveaux) > REMONTEE_MAX)
+    {
+        return None;
+    }
+    Some(commun)
+}
+
+/// #5685 — l'image de pochette du dossier qui réunit les disques de l'album
+/// ([`dossier_commun`]), si ce dossier n'abrite QUE cet album.
+///
+/// La garde est lue en base : une seule piste d'un autre album sous ce
+/// dossier, et l'image n'est pas la sienne — c'est le dossier d'un artiste
+/// (son `folder.jpg` est sa photo), ou la racine de la bibliothèque. C'est
+/// aussi ce qui borne la remontée à la racine de la bibliothèque : aucune
+/// piste n'est indexée au-dessus d'elle, mais d'autres albums vivent à côté.
+fn image_commune(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    pistes: &[PathBuf],
+) -> Option<PathBuf> {
+    let commun = dossier_commun(pistes)?;
+    let image = image_de_pochette_dans(&commun)?;
+    let sous = crate::db::track_repo::TrackRepo::with_backend(db.clone())
+        .albums_sous_dossier(&commun.to_string_lossy())
+        .ok()?;
+    (!sous.is_empty() && sous.iter().all(|(_, a)| *a == album_id)).then_some(image)
+}
+
+/// #5685 — l'image de DOSSIER d'un album entier : celle du dossier qui réunit
+/// ses disques (`commune`), sinon la première image d'un dossier de piste
+/// dans l'ordre du disque. Chaque dossier n'est regardé qu'une fois.
+fn lire_l_image_de_l_album(
+    commune: Option<&Path>,
+    pistes: &[PathBuf],
+    cache_dir: &Path,
+) -> Option<PochetteLue> {
+    if let Some(lue) = commune.and_then(|i| lire_l_image_de_pochette(i, cache_dir)) {
+        return Some(lue);
+    }
+    let mut vus: Vec<&Path> = Vec::new();
+    pistes.iter().find_map(|p| {
+        let d = p.parent()?;
+        if vus.contains(&d) {
+            return None;
+        }
+        vus.push(d);
+        lire_l_image_du_dossier(p, cache_dir)
     })
 }
 
@@ -175,19 +276,10 @@ impl<'a> Jaquette<'a> {
             _ => None,
         }
     }
-
-    /// La piste porte-t-elle une jaquette ? Ne relit la piste que si l'on
-    /// n'en sait rien.
-    fn presente(self, piste: &Path) -> bool {
-        match self {
-            Self::Lue(_) => true,
-            Self::Absente => false,
-            Self::Inconnue => extract_cover_art(piste).is_some(),
-        }
-    }
 }
 
-/// UNE piste : sa jaquette intégrée d'abord, puis l'image de son dossier.
+/// UNE piste : l'image de son dossier d'abord, puis sa jaquette intégrée
+/// (#5685).
 pub fn lire_depuis_la_piste(
     piste: &Path,
     cache_dir: &Path,
@@ -197,16 +289,32 @@ pub fn lire_depuis_la_piste(
 }
 
 fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<PochetteLue> {
-    let integree = match jaquette {
+    lire_l_image_du_dossier(piste, cache_dir).or_else(|| match jaquette {
         Jaquette::Absente => None,
         j => lire_la_jaquette(piste, cache_dir, j.octets()),
-    };
-    integree.or_else(|| lire_l_image_du_dossier(piste, cache_dir))
+    })
 }
 
-/// L'album ENTIER, relu sur le disque : la jaquette intégrée que porte la
-/// MAJORITÉ de ses pistes (à égalité, la première dans l'ordre du disque),
-/// sinon la première image de dossier.
+/// UNE piste face à son ALBUM : l'image du dossier qui réunit ses disques
+/// (#5685), puis [`lire_selon`].
+fn lire_pour_l_album(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    piste: &Path,
+    cache_dir: &Path,
+    jaquette: Jaquette<'_>,
+) -> Option<PochetteLue> {
+    let pistes = pistes_de_l_album(db, album_id);
+    image_commune(db, album_id, &pistes)
+        .and_then(|i| lire_l_image_de_pochette(&i, cache_dir))
+        .or_else(|| lire_selon(piste, cache_dir, jaquette))
+}
+
+/// L'album ENTIER, relu sur le disque : la première image de dossier dans
+/// l'ordre du disque (#5685), sinon la jaquette intégrée que porte la
+/// MAJORITÉ de ses pistes (à égalité, la première dans l'ordre du disque).
+/// L'image du dossier qui réunit les disques d'un coffret passe avant tout :
+/// voir [`reevaluer_l_album`], qui seul peut la vérifier en base.
 ///
 /// #5454 (Fuccaro, fil 1317) — c'était « la première jaquette intégrée dans
 /// l'ordre du disque » : le single éponyme en piste 1 (*À partir de
@@ -217,22 +325,22 @@ fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<
 /// jaquette en désaccord — jamais à chaque piste du scan : c'est la seule
 /// lecture qui ouvre toutes les pistes.
 pub fn lire_depuis_l_album(pistes: &[PathBuf], cache_dir: &Path) -> Option<PochetteLue> {
-    lire_selon_le_decompte(&compter_les_jaquettes(pistes), pistes, cache_dir)
+    lire_l_album(None, pistes, cache_dir)
 }
 
-fn lire_selon_le_decompte(
-    decompte: &Decompte,
+/// [`lire_depuis_l_album`], l'image du dossier commun (`commune`) en tête.
+/// Les jaquettes ne sont comptées — toutes les pistes ouvertes — que si
+/// aucune image de dossier n'existe.
+fn lire_l_album(
+    commune: Option<&Path>,
     pistes: &[PathBuf],
     cache_dir: &Path,
 ) -> Option<PochetteLue> {
-    decompte
-        .gagnante()
-        .and_then(|g| lire_la_jaquette(&g.fichier, cache_dir, None))
-        .or_else(|| {
-            pistes
-                .iter()
-                .find_map(|p| lire_l_image_du_dossier(p, cache_dir))
-        })
+    lire_l_image_de_l_album(commune, pistes, cache_dir).or_else(|| {
+        compter_les_jaquettes(pistes)
+            .gagnante()
+            .and_then(|g| lire_la_jaquette(&g.fichier, cache_dir, None))
+    })
 }
 
 /// Une image distincte parmi les jaquettes d'un album (#5454).
@@ -524,7 +632,8 @@ fn reevaluer_avec(
         debug!(album_id, "pochette_gardee — aucune piste joignable (#5682)");
         return Geste::Garder;
     }
-    let lue = lire_depuis_l_album(&pistes, cache_dir);
+    let commune = image_commune(db, album_id, &pistes);
+    let lue = lire_l_album(commune.as_deref(), &pistes, cache_dir);
     let du_disque = vient_du_disque(etat, lue.as_ref(), &pistes);
     let geste = arbitrer(etat, lue.as_ref(), complet, du_disque);
     appliquer(repo, album_id, &geste);
@@ -600,7 +709,12 @@ pub fn trancher_par_la_majorite(
     let geste = if televersee {
         Geste::Garder
     } else {
-        match lire_la_jaquette(&gagnante.fichier, cache_dir, None) {
+        // #5685 — une image de dossier passe avant la jaquette majoritaire :
+        // la majorité ne tranche alors que les pochettes PROPRES des pistes.
+        let commune = image_commune(db, album_id, &pistes);
+        match lire_l_image_de_l_album(commune.as_deref(), &pistes, cache_dir)
+            .or_else(|| lire_la_jaquette(&gagnante.fichier, cache_dir, None))
+        {
             Some(lue) => {
                 let du_disque = vient_du_disque(&etat, Some(&lue), &pistes);
                 let g = arbitrer(&etat, Some(&lue), complet, du_disque);
@@ -612,13 +726,18 @@ pub fn trancher_par_la_majorite(
         }
     };
 
+    // La référence des pistes est la pochette de l'album quand elle EST une
+    // jaquette intégrée ; sinon (image de dossier — #5685 —, téléversée,
+    // fournisseur) la jaquette majoritaire : seules les pistes qui s'en
+    // écartent gardent une pochette propre, les autres retombent sur celle
+    // de l'album.
     let apres = repo.etat_pochette(album_id).ok().flatten();
     let reference = match apres {
         Some(EtatPochette {
             cover_path: Some(c),
-            source: Some(s),
+            source: Some(SourcePochette::Integree),
             ..
-        }) if s.vient_du_disque() => c,
+        }) => c,
         _ => gagnante.condensat.clone(),
     };
     let empreinte = (reference == gagnante.condensat)
@@ -683,9 +802,7 @@ pub fn trancher_par_la_majorite(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Suivi {
     /// L'album est tranché pour ce scan : les pistes suivantes n'y reviennent
-    /// pas. Faux pour un album SANS pochette dont cette piste n'a rien donné,
-    /// et pour un album illustré par son IMAGE DE DOSSIER : une piste suivante
-    /// peut porter une jaquette intégrée, qui passe avant (#5035).
+    /// pas. Faux pour un album SANS pochette dont cette piste n'a rien donné.
     pub tranche: bool,
     /// Une pochette a été posée (compteur du rapport de scan).
     pub posee: bool,
@@ -710,25 +827,12 @@ pub fn suivre_la_piste(
     cache_dir: &Path,
     complet: bool,
 ) -> Suivi {
-    let suivi = suivre(db, album_id, piste, jaquette, cache_dir, complet);
-    // #5035 — un album illustré par son image de DOSSIER reste ouvert : la
-    // piste suivante peut porter une jaquette intégrée, qui passe avant.
-    if suivi.tranche
-        && matches!(
-            AlbumRepo::with_backend(db.clone())
-                .etat_pochette(album_id)
-                .ok()
-                .flatten()
-                .and_then(|e| e.source),
-            Some(SourcePochette::Dossier)
-        )
-    {
-        return Suivi {
-            tranche: false,
-            ..suivi
-        };
-    }
-    suivi
+    // #5685 — l'image du dossier passe avant la jaquette intégrée : un album
+    // illustré par son image de DOSSIER ne reste plus ouvert (#5035 le
+    // gardait ouvert pour une jaquette). Une image d'un AUTRE dossier de
+    // disque, ou du dossier qui réunit les disques d'un coffret, est vue en
+    // fin de scan (`suivre_les_fichiers_sources`), album par album.
+    suivre(db, album_id, piste, jaquette, cache_dir, complet)
 }
 
 fn suivre(
@@ -759,7 +863,7 @@ fn suivre(
 
     // Album sans pochette : cette piste la donne, ou la suivante.
     if etat.cover_path.is_none() {
-        let Some(lue) = lire_selon(piste, cache_dir, jaquette) else {
+        let Some(lue) = lire_pour_l_album(db, album_id, piste, cache_dir, jaquette) else {
             return Suivi {
                 tranche: false,
                 posee: false,
@@ -798,19 +902,6 @@ fn suivre(
                 posee: false,
             };
         }
-        // #5035 — l'album est illustré par son IMAGE DE DOSSIER et cette
-        // piste porte une jaquette intégrée : la jaquette passe avant. C'est
-        // le cas où la PREMIÈRE piste lue n'en portait pas — son `cover.jpg`
-        // gagnait, et `albums_with_cover` le figeait pour tout le scan, même
-        // quand toutes les autres pistes portaient la leur. L'album entier
-        // tranche (première jaquette dans l'ordre du disque).
-        Some(SourcePochette::Dossier) if !complet && jaquette.presente(piste) => {
-            let geste = reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste));
-            return Suivi {
-                tranche: true,
-                posee: matches!(geste, Geste::Poser(_)),
-            };
-        }
         // Pochette du disque tirée d'un autre fichier, toujours présent : la
         // relecture de cette piste ne la concerne pas (un single à la jaquette
         // propre, rangé dans l'album, ne la remplace pas — #4650).
@@ -834,7 +925,7 @@ fn suivre(
         _ => {}
     }
 
-    let lue = lire_selon(piste, cache_dir, jaquette);
+    let lue = lire_pour_l_album(db, album_id, piste, cache_dir, jaquette);
     let pistes = [piste.to_path_buf()];
     let du_disque = vient_du_disque(&etat, lue.as_ref(), &pistes);
     // La piste ne porte plus d'image — ou plus la sienne : l'album entier
@@ -897,10 +988,10 @@ pub fn suivre_les_fichiers_sources(
             continue;
         }
         let actuelle = empreinte_du_fichier(Path::new(&fichier));
-        if actuelle.is_some() && actuelle == empreinte {
-            continue;
-        }
-        if reevaluer_l_album(db, album_id, cache_dir, complet, None) != Geste::Garder {
+        let a_relire = actuelle.is_none()
+            || actuelle != empreinte
+            || une_image_de_dossier_l_emporte(db, album_id, &fichier);
+        if a_relire && reevaluer_l_album(db, album_id, cache_dir, complet, None) != Geste::Garder {
             reprises += 1;
         }
     }
@@ -925,6 +1016,74 @@ pub fn le_suivi_peut_conclure(
     racines_videes: &[String],
 ) -> bool {
     !annule && racines_absentes.is_empty() && racines_videes.is_empty()
+}
+
+/// #5685 — une image de DOSSIER que la règle préfère à la pochette en place
+/// (tirée de `fichier`) existe-t-elle ? C'est ce qui fait prendre, au scan
+/// suivant, la bonne image à un album déjà en base dont aucun fichier n'a
+/// bougé :
+///
+/// - un album illustré par une jaquette intégrée, à côté de laquelle une
+///   image de dossier attend (l'ordre d'avant #5685 la laissait passer
+///   après) ;
+/// - un coffret rangé un dossier par disque, illustré par l'image d'UN disque
+///   alors que le dossier qui les réunit porte la sienne — y compris un
+///   coffret réuni après le scan (`coffrets_auto`), dont les disques
+///   absorbés n'ont rien relu.
+///
+/// Ne lit rien pour un album d'un seul dossier déjà illustré par l'image de
+/// ce dossier. Ailleurs, un `read_dir` par dossier écarte d'emblée ceux qui
+/// n'ont aucune image : on ne sonde pas trente noms dans chacun.
+fn une_image_de_dossier_l_emporte(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    fichier: &str,
+) -> bool {
+    let pistes = pistes_de_l_album(db, album_id);
+    let source = Path::new(fichier);
+    let mut dossiers: Vec<&Path> = Vec::new();
+    for d in pistes.iter().filter_map(|p| p.parent()) {
+        if !dossiers.contains(&d) {
+            dossiers.push(d);
+        }
+    }
+    let integree = pistes.iter().any(|p| p == source);
+    if !integree && dossiers.len() == 1 && source.parent() == dossiers.first().copied() {
+        return false;
+    }
+    let preferee = image_commune(db, album_id, &pistes).or_else(|| {
+        let mut vus: Vec<&Path> = Vec::new();
+        pistes.iter().find_map(|p| {
+            let d = p.parent()?;
+            if vus.contains(&d) {
+                return None;
+            }
+            vus.push(d);
+            if !peut_porter_une_image(p) {
+                return None;
+            }
+            find_folder_cover(p)
+        })
+    });
+    preferee.is_some_and(|i| i != source)
+}
+
+/// Le dossier de cette piste peut-il porter une image de pochette ? Un seul
+/// `read_dir`, noms comparés sans casse ; vrai quand on ne peut pas le lister
+/// (image ISO, dossier illisible) : [`find_folder_cover`] tranchera.
+fn peut_porter_une_image(piste: &Path) -> bool {
+    if crate::audio::iso9660::est_chemin_virtuel(&piste.to_string_lossy()) {
+        return true;
+    }
+    let Some(dossier) = piste.parent() else {
+        return false;
+    };
+    match std::fs::read_dir(&*extended_path(dossier)) {
+        Ok(entrees) => entrees
+            .flatten()
+            .any(|e| est_une_image_de_pochette(&e.path())),
+        Err(_) => true,
+    }
 }
 
 /// `chemin` est-il sous `dossier` ? Comparaison par composants, séparateurs
@@ -953,3 +1112,7 @@ mod tests;
 #[cfg(test)]
 #[path = "pochette_disque_tests_5682.rs"]
 mod tests_5682;
+
+#[cfg(test)]
+#[path = "pochette_disque_tests_5685.rs"]
+mod tests_5685;

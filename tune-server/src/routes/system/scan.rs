@@ -3017,7 +3017,25 @@ async fn spawn_library_scan_avec_lecteur(
         // rangé un dossier par disque (« Titre, Disc 2 ») sont réunis. APRÈS
         // la réconciliation des paires distinctes, qu'elle consulte, et hors de
         // la garde `full_scan_ok` : elle ne supprime rien qui ne soit absorbé.
-        tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan");
+        // #5685 — un coffret qui vient d'être réuni prend tout de suite
+        // l'image du dossier qui réunit ses disques.
+        // #5682 — même garde que la passe de fin de scan : rien n'est conclu
+        // d'une racine absente ou vidée.
+        if tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan").reunis > 0
+            && tune_core::library::pochette_disque::le_suivi_peut_conclure(
+                scan_cancel_requested(),
+                &missing_dirs,
+                &racines_videes,
+            )
+        {
+            tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                &db,
+                &cache_dir,
+                &[],
+                &error_dirs,
+                force,
+            );
+        }
 
         // Merge duplicate local albums (same title, case-insensitive, same
         // artist). After a rescan, tag changes can create a second album entry

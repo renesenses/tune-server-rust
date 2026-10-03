@@ -1254,7 +1254,26 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             }
             // Coffrets automatiques (GO du 25/09/2026) — même passe qu'après
             // `POST /system/scan`.
-            tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto");
+            // #5685 — un coffret qui vient d'être réuni prend tout de suite
+            // l'image du dossier qui réunit ses disques, sans attendre le scan
+            // suivant.
+            // #5682 — même garde que la passe de fin de scan : rien n'est
+            // conclu d'une racine absente ou vidée.
+            if tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto").reunis > 0
+                && tune_core::library::pochette_disque::le_suivi_peut_conclure(
+                    crate::routes::system::scan::scan_cancel_requested(),
+                    &missing_dirs,
+                    &racines_videes,
+                )
+            {
+                tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                    &db,
+                    &cache_dir,
+                    &[],
+                    &error_dirs,
+                    false,
+                );
+            }
         }
 
         info!(
@@ -2839,9 +2858,15 @@ fn suivre_les_images_de_pochette(
             .albums_sous_dossier(&dossier.to_string_lossy())
             .unwrap_or_default()
         {
-            // Les seuls fichiers DU dossier : une image ne décrit pas les
-            // sous-dossiers (`find_folder_cover` ne regarde que le parent).
-            if std::path::Path::new(&piste).parent() == Some(dossier) {
+            // Les fichiers DU dossier, et ceux des dossiers de disques qu'il
+            // réunit (#5685, `Coffret/CD1/…`, au plus `REMONTEE_MAX` niveaux) :
+            // la règle ne retient l'image commune que si le dossier n'abrite
+            // que cet album (`pochette_disque::dossier_commun`).
+            if std::path::Path::new(&piste).parent().is_some_and(|p| {
+                p.ancestors()
+                    .take(tune_core::library::pochette_disque::REMONTEE_MAX + 1)
+                    .any(|a| a == dossier)
+            }) {
                 albums.insert(album);
             }
         }
