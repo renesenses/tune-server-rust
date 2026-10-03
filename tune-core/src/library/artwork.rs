@@ -248,14 +248,20 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
         return crate::audio::iso9660::chemin_de_pochette(audio_path)
             .or_else(|| find_folder_cover(&image));
     }
-    let dir = audio_path.parent()?;
-    for name in FOLDER_COVER_NAMES {
-        let candidate = dir.join(name);
-        if extended_path(&candidate).exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    image_de_pochette_dans(audio_path.parent()?)
+}
+
+/// L'image de pochette posée dans `dossier` (`cover.jpg`, `Folder.png`…),
+/// cherchée sous les noms de [`FOLDER_COVER_NAMES`], dans leur ordre.
+///
+/// [`find_folder_cover`] la cherche dans le dossier de la piste ; la pochette
+/// d'un coffret rangé un dossier par disque la cherche aussi dans le dossier
+/// qui les réunit (#5685, `library::pochette_disque`).
+pub fn image_de_pochette_dans(dossier: &Path) -> Option<PathBuf> {
+    FOLDER_COVER_NAMES
+        .iter()
+        .map(|name| dossier.join(name))
+        .find(|candidate| extended_path(candidate).exists())
 }
 
 /// Extensions sous lesquelles une entrée de cache de pochette peut exister,
@@ -2271,12 +2277,12 @@ pub fn cache_embedded_cover(
 /// Pochette du DOSSIER d'un fichier, mise en cache — sans jamais regarder les
 /// tags du fichier lui-même.
 ///
-/// ⚠️ Ne décide PAS de l'ordre de priorité d'un album : la règle, confirmée
-/// par Bertrand le 25/09/2026 (#5035), est « la jaquette intégrée d'abord,
-/// puis l'image du dossier », partout — `refresh_cover_hash`, le scan, le
-/// rattrapage de fin de scan (`library::pochette_disque`). Cette fonction ne
-/// lit que la seconde ; le rattrapage, qui l'appelait EN PREMIER sur la foi
-/// d'une règle inverse, ne l'appelle plus.
+/// ⚠️ Ne décide PAS de l'ordre de priorité d'un album : la règle, décidée
+/// par Bertrand le 03/10/2026 (#5685, qui renverse celle du 25/09 de #5035),
+/// est « l'image du dossier d'abord, puis la jaquette intégrée », partout —
+/// `refresh_cover_hash`, le scan, le rattrapage de fin de scan
+/// (`library::pochette_disque`). Cette fonction ne lit que l'image du dossier
+/// de la piste.
 pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let folder_cover = find_folder_cover(audio_path)?;
     // Entrée héritée, adressée par le CHEMIN de la pochette : la sonder
@@ -2365,7 +2371,7 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
 }
 
 /// [`get_or_extract`] **sans la sonde héritée** : relit toujours la source
-/// (jaquette intégrée, puis pochette du dossier) et rend le condensat de son
+/// (pochette du dossier, puis jaquette intégrée — #5685) et rend le condensat de son
 /// CONTENU.
 ///
 /// C'est le seul chemin capable de rafraîchir la pochette d'un album qui en a
@@ -2385,26 +2391,9 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
 /// automatiques gardent [`get_or_extract`], dont la sonde héritée épargne la
 /// relecture du fichier et fige les URL (#1444).
 pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
-    // Try embedded cover art from the audio file tags.
-    // Nouvelle écriture : adressée par le CONTENU (#1444) — la même jaquette
-    // intégrée à N pistes ne peuple le cache que d'UNE entrée.
-    if let Some((data, mime)) = extract_cover_art(audio_path) {
-        let hash = content_hash(&data);
-        if find_cached(cache_dir, &hash).is_some() {
-            return Some(hash);
-        }
-        let ext = if mime.contains("png") { "png" } else { "jpg" };
-        if save_to_cache(&data, cache_dir, &hash, ext).is_some() {
-            return Some(hash);
-        }
-        warn!(
-            path = %audio_path.display(),
-            cache_dir = %cache_dir.display(),
-            "artwork_extracted_but_save_failed_trying_folder"
-        );
-    }
-
-    // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.).
+    // L'image du DOSSIER d'abord (cover.jpg, folder.jpg, front.jpg…) —
+    // décision de Bertrand du 03/10/2026 (#5685) : une image posée par
+    // l'utilisateur passe avant la jaquette intégrée.
     // Ici l'ancien schéma hachait le chemin de la PISTE : chaque piste du
     // dossier dupliquait la même pochette dans le cache. Le condensat de
     // contenu les fait toutes converger vers une seule entrée.
@@ -2442,6 +2431,25 @@ pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String>
         }
     }
 
+    // Puis la jaquette intégrée aux balises.
+    // Nouvelle écriture : adressée par le CONTENU (#1444) — la même jaquette
+    // intégrée à N pistes ne peuple le cache que d'UNE entrée.
+    if let Some((data, mime)) = extract_cover_art(audio_path) {
+        let hash = content_hash(&data);
+        if find_cached(cache_dir, &hash).is_some() {
+            return Some(hash);
+        }
+        let ext = if mime.contains("png") { "png" } else { "jpg" };
+        if save_to_cache(&data, cache_dir, &hash, ext).is_some() {
+            return Some(hash);
+        }
+        warn!(
+            path = %audio_path.display(),
+            cache_dir = %cache_dir.display(),
+            "artwork_extracted_but_save_failed"
+        );
+    }
+
     None
 }
 
@@ -2466,11 +2474,11 @@ pub fn backfill_embedded_covers(
 
     let mut filled = 0usize;
     for (album_id, _title, _artist, _mbid) in &coverless {
-        // La jaquette INTÉGRÉE d'abord, puis l'image du dossier — la règle
-        // de toute la lecture des pochettes (`refresh_cover_hash`, le scan),
-        // confirmée par Bertrand le 25/09/2026 (#5035). Ce rattrapage prenait
-        // l'ordre inverse, et donnait donc à un même album une autre pochette
-        // selon qu'il passait par le scan ou par ici. La source et le fichier
+        // L'image du DOSSIER d'abord (celui des pistes, ou celui qui réunit
+        // les disques d'un coffret), puis la jaquette intégrée — la règle de
+        // toute la lecture des pochettes, décidée par Bertrand le 03/10/2026
+        // (#5685). Le scan et ce rattrapage passent par la même règle
+        // (`pochette_disque::reevaluer_l_album`). La source et le fichier
         // sont écrits avec elle (#5034) : c'est ce qui permet de la retirer
         // quand ce fichier disparaît.
         if matches!(
