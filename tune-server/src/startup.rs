@@ -181,6 +181,110 @@ fn asio_warm_disabled_by_env() -> bool {
         .unwrap_or(false)
 }
 
+/// #5353 — où en est le préchauffage ASIO de CE processus.
+///
+/// Le préchauffage tient `ASIO_DEVICE_LOCK` du début à la fin de son balayage
+/// (`list_asio_devices` passe par `try_with_asio_device_lock`). Pendant ce
+/// temps, l'énumération de démarrage (`list_audio_devices_with_backend("asio")`)
+/// voit le pilote « occupé » et sert le dernier parc connu (#1267) : vide, sur
+/// un processus neuf. C'est cette liste vide qui faisait conclure « ASIO n'a
+/// rien » et figer les zones locales sur WASAPI, alors que le préchauffage
+/// trouvait les pilotes une à trois secondes plus tard (Jean-François, fil
+/// 2018, 1.0.0-rc1 ; Didier, fil 2107).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) enum EtatPrechauffageAsio {
+    /// Pas lancé : hors Windows, sans hôte ASIO, ou coupé (environnement,
+    /// témoin de plantage). Rien à attendre.
+    Absent,
+    /// Le balayage tourne et tient le pilote.
+    EnCours,
+    /// Le balayage est revenu (ou son fil s'est arrêté) : le pilote est libre.
+    Termine,
+}
+
+/// Ce que le démarrage fait d'une énumération ASIO de démarrage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuiteEnumerationDeDemarrage {
+    /// Le parc énuméré est gardé tel quel (non vide, backend non ASIO, ou
+    /// énumération en échec — pas de repli dans ce dernier cas, voir
+    /// `register_local_outputs`).
+    Garder,
+    /// La liste vide vient du préchauffage qui tient le pilote : attendre sa
+    /// fin (bornée), puis énumérer ASIO de nouveau.
+    AttendreLePrechauffage,
+    /// ASIO a vraiment répondu « aucun appareil » : repli WASAPI.
+    RepliWasapi,
+}
+
+/// #5353 — la décision, sans effet de bord, testable hors Windows.
+///
+/// `appareils` vaut `None` quand l'énumération a expiré ou paniqué : on ne
+/// replie pas (inchangé), puisqu'une sonde ASIO bloquée bloquerait la suivante.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn suite_de_l_enumeration_de_demarrage(
+    backend: &str,
+    appareils: Option<usize>,
+    prechauffage: EtatPrechauffageAsio,
+) -> SuiteEnumerationDeDemarrage {
+    match appareils {
+        Some(0) if backend.eq_ignore_ascii_case("asio") => {
+            if prechauffage == EtatPrechauffageAsio::EnCours {
+                SuiteEnumerationDeDemarrage::AttendreLePrechauffage
+            } else {
+                SuiteEnumerationDeDemarrage::RepliWasapi
+            }
+        }
+        _ => SuiteEnumerationDeDemarrage::Garder,
+    }
+}
+
+/// Borne de l'attente du préchauffage par l'énumération de démarrage. La même
+/// que l'énumération elle-même (`scan_devices`) : au-delà, on se replie comme
+/// avant. Le serveur HTTP n'est pas muet pendant ce temps : le répondeur de
+/// démarrage (`boot_status`) sert la page d'attente, phase « sorties audio ».
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+const ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO: std::time::Duration = std::time::Duration::from_secs(8);
+
+static PRECHAUFFAGE_ASIO: std::sync::LazyLock<tokio::sync::watch::Sender<EtatPrechauffageAsio>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(EtatPrechauffageAsio::Absent).0);
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn noter_le_prechauffage_asio(etat: EtatPrechauffageAsio) {
+    PRECHAUFFAGE_ASIO.send_replace(etat);
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn etat_du_prechauffage_asio() -> EtatPrechauffageAsio {
+    *PRECHAUFFAGE_ASIO.borrow()
+}
+
+/// Attend que le préchauffage ne soit plus `EnCours`, au plus `delai`.
+/// Rend `true` s'il a rendu la main dans le délai.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+async fn attendre_la_fin_du_prechauffage_asio(delai: std::time::Duration) -> bool {
+    let mut rx = PRECHAUFFAGE_ASIO.subscribe();
+    matches!(
+        tokio::time::timeout(
+            delai,
+            rx.wait_for(|etat| *etat != EtatPrechauffageAsio::EnCours)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Passe le préchauffage à `Termine` quand son fil s'arrête, panique comprise :
+/// une attente ne doit jamais dépendre d'un balayage qui n'écrira plus rien.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+struct FinDuPrechauffageAsio;
+
+impl Drop for FinDuPrechauffageAsio {
+    fn drop(&mut self) {
+        noter_le_prechauffage_asio(EtatPrechauffageAsio::Termine);
+    }
+}
+
 /// Lance le préchauffage du cache ASIO, protégé par le témoin de plantage.
 #[cfg(feature = "local-audio")]
 fn spawn_asio_warm_scan() {
@@ -202,7 +306,10 @@ fn spawn_asio_warm_scan() {
     // ni nommer la cause ni indiquer le geste, et l'utilisateur lit « vérifiez
     // qu'elle est branchée et allumée » pour un DAC parfaitement branché.
     match decision {
-        AsioWarmDecision::Run => {}
+        // #5353 — EnCours AVANT de lancer le fil, pour la même raison que la
+        // porte ci-dessous : l'énumération de démarrage ne doit pas profiter
+        // du délai de démarrage du fil pour conclure « rien à attendre ».
+        AsioWarmDecision::Run => noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours),
         AsioWarmDecision::SkippedByEnv => {
             tune_core::outputs::local::block_asio_device_enumeration(
                 tune_core::outputs::asio_blocage_4556::MotifDeBlocage::ParEnvironnement,
@@ -233,6 +340,8 @@ fn spawn_asio_warm_scan() {
             );
         }
         AsioWarmDecision::Run => {
+            // #5353 — `Termine` à la sortie de ce bras, panique comprise.
+            let _fin = FinDuPrechauffageAsio;
             if let Some(dir) = sentinel.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -1627,11 +1736,49 @@ pub async fn register_local_outputs(state: &AppState) {
     // lock, so a second enumeration would only block (and time out) again — better
     // to bring the UI up now and let the next relaunch (with the driver free) pick
     // the device up.
-    let scan = scan_devices(audio_backend_owned.clone()).await;
+    let mut scan = scan_devices(audio_backend_owned.clone()).await;
+    // #5353 — une liste ASIO vide pendant le préchauffage ne dit rien des
+    // pilotes : elle vient du cache servi parce que le préchauffage tient le
+    // pilote (#1267), et ce cache est vide sur un processus neuf. On attend
+    // donc la fin du préchauffage — bornée, et le répondeur de démarrage
+    // continue de servir la page d'attente — puis on énumère ASIO de nouveau,
+    // pilote libre. Jamais deux sondes ASIO en même temps : c'est ce que la
+    // garde #1267 protège, et l'attente la respecte.
+    if suite_de_l_enumeration_de_demarrage(
+        audio_backend,
+        scan.as_ref().map(Vec::len),
+        etat_du_prechauffage_asio(),
+    ) == SuiteEnumerationDeDemarrage::AttendreLePrechauffage
+    {
+        info!("asio_enumeration_waiting_for_warm_scan");
+        crate::boot_status::set_current(Some("préchauffage ASIO"));
+        let termine = attendre_la_fin_du_prechauffage_asio(ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO).await;
+        crate::boot_status::set_current(None);
+        if termine {
+            scan = scan_devices(audio_backend_owned.clone()).await;
+            info!(
+                devices = scan.as_ref().map(Vec::len),
+                "asio_enumeration_after_warm_scan"
+            );
+        } else {
+            warn!(
+                attente_max_secs = ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO.as_secs(),
+                "asio_warm_scan_wait_timeout — le préchauffage ASIO n'a pas rendu la main à \
+                 temps : repli WASAPI pour ce démarrage"
+            );
+        }
+    }
     let mut devices = scan.clone().unwrap_or_default();
     // When ASIO is selected AND the host actually responded but exposed no devices,
     // also enumerate WASAPI so the user still has fallback outputs available.
-    if devices.is_empty() && scan.is_some() && audio_backend.eq_ignore_ascii_case("asio") {
+    // (#5353 : après l'attente ci-dessus ; un préchauffage encore en cours à ce
+    // stade, c'est l'attente expirée, et l'on se replie comme avant.)
+    if suite_de_l_enumeration_de_demarrage(
+        audio_backend,
+        scan.as_ref().map(Vec::len),
+        etat_du_prechauffage_asio(),
+    ) != SuiteEnumerationDeDemarrage::Garder
+    {
         // #4556 — dire POURQUOI l'hôte ASIO n'a rien rendu.
         //
         // Deux causes très différentes tombaient sur la même ligne : l'hôte a
@@ -3129,5 +3276,122 @@ mod asio_blocage_4556_guard {
             "la note doit être GARDÉE par l'état du coupe-circuit, sinon un parc \
              WASAPI légitime ferait accuser ASIO"
         );
+    }
+}
+
+/// #5353 — la course entre le préchauffage ASIO et l'énumération de démarrage.
+///
+/// HORS de `feature = "local-audio"`, comme `asio_blocage_4556_guard` : la
+/// décision est pure et doit s'exécuter dans le job `test` de la CI.
+#[cfg(test)]
+mod prechauffage_asio_5353_tests {
+    use super::{
+        EtatPrechauffageAsio as Etat, SuiteEnumerationDeDemarrage as Suite,
+        suite_de_l_enumeration_de_demarrage as suite,
+    };
+
+    /// Le cas des deux journaux (Jean-François, Didier) : ASIO choisi, liste
+    /// vide, préchauffage en cours. Figer sur WASAPI ici, c'est le défaut.
+    #[test]
+    fn asio_vide_pendant_le_prechauffage_attend_au_lieu_de_replier() {
+        for backend in ["asio", "ASIO", "Asio"] {
+            assert_eq!(
+                suite(backend, Some(0), Etat::EnCours),
+                Suite::AttendreLePrechauffage,
+                "backend {backend} : une liste vide servie pendant le préchauffage ne prouve \
+                 pas qu'ASIO n'a rien — les zones partiraient sur WASAPI (#5353)"
+            );
+        }
+    }
+
+    /// Le repli d'avant reste entier là où ASIO a vraiment répondu « rien ».
+    #[test]
+    fn asio_vide_sans_prechauffage_en_cours_se_replie_sur_wasapi() {
+        for etat in [Etat::Absent, Etat::Termine] {
+            assert_eq!(suite("asio", Some(0), etat), Suite::RepliWasapi, "{etat:?}");
+        }
+    }
+
+    #[test]
+    fn un_parc_non_vide_ou_une_enumeration_en_echec_est_garde() {
+        for etat in [Etat::Absent, Etat::EnCours, Etat::Termine] {
+            assert_eq!(suite("asio", Some(4), etat), Suite::Garder, "{etat:?}");
+            // Expiration ou panique : pas de repli, inchangé (sonde bloquée).
+            assert_eq!(suite("asio", None, etat), Suite::Garder, "{etat:?}");
+            // Hors ASIO, le préchauffage ne concerne pas la liste.
+            for backend in ["wasapi", "auto", ""] {
+                assert_eq!(
+                    suite(backend, Some(0), etat),
+                    Suite::Garder,
+                    "{backend} {etat:?}"
+                );
+            }
+        }
+    }
+
+    /// L'attente rend la main dès la fin du préchauffage, et ne dépasse pas sa
+    /// borne s'il ne revient jamais. Un seul test : l'état est global.
+    #[tokio::test]
+    async fn l_attente_suit_le_prechauffage_et_reste_bornee() {
+        use std::time::Duration;
+        super::noter_le_prechauffage_asio(Etat::EnCours);
+        let debut = std::time::Instant::now();
+        assert!(
+            !super::attendre_la_fin_du_prechauffage_asio(Duration::from_millis(80)).await,
+            "un préchauffage qui ne revient pas doit faire expirer l'attente"
+        );
+        assert!(debut.elapsed() < Duration::from_secs(2));
+
+        let fin = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Comme le fil du préchauffage : la garde passe à `Termine` en tombant.
+            drop(super::FinDuPrechauffageAsio);
+        });
+        assert!(
+            super::attendre_la_fin_du_prechauffage_asio(Duration::from_secs(5)).await,
+            "la fin du préchauffage doit libérer l'attente"
+        );
+        fin.await.unwrap();
+        assert_eq!(super::etat_du_prechauffage_asio(), Etat::Termine);
+        super::noter_le_prechauffage_asio(Etat::Absent);
+    }
+
+    /// Les deux branchements que la décision suppose, sous `cfg(windows)` en
+    /// pratique et donc invisibles d'une porte Linux.
+    #[test]
+    fn le_demarrage_attend_le_prechauffage_avant_de_replier() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split_once("pub async fn register_local_outputs(")
+            .expect("register_local_outputs introuvable")
+            .1;
+        let attente = corps
+            .find("attendre_la_fin_du_prechauffage_asio(ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO)")
+            .expect("register_local_outputs n'attend plus le préchauffage ASIO (#5353)");
+        let repli = corps
+            .find("asio_returned_no_devices")
+            .expect("le repli WASAPI a disparu");
+        assert!(
+            attente < repli,
+            "l'attente doit précéder le repli WASAPI (#5353)"
+        );
+
+        let lancement = source
+            .split_once("fn spawn_asio_warm_scan()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let en_cours = lancement
+            .find("noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours)")
+            .expect("le préchauffage n'est plus noté EnCours (#5353)");
+        let fil = lancement.find("spawn_blocking").expect("spawn_blocking");
+        assert!(
+            en_cours < fil,
+            "EnCours doit être posé AVANT le lancement du fil, sinon l'énumération \
+             de démarrage peut passer avant (#5353)"
+        );
+        assert!(lancement.contains("let _fin = FinDuPrechauffageAsio;"));
     }
 }
