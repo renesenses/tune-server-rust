@@ -4,6 +4,7 @@ extern crate num_traits;
 use crate::I24;
 
 use self::num_traits::PrimInt;
+use super::dsd;
 use super::Device;
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, Data, InputCallbackInfo,
@@ -21,6 +22,9 @@ pub struct Stream {
     asio_streams: Arc<Mutex<sys::AsioStreams>>,
     callback_id: sys::CallbackId,
     message_callback_id: sys::MessageCallbackId,
+    // Tune (#5643): this stream switched the driver to DSD; dropping it
+    // releases the DSD buffers and switches the driver back to PCM.
+    dsd: bool,
 }
 
 // Compile-time assertion that Stream is Send and Sync
@@ -265,6 +269,7 @@ impl Device {
             asio_streams,
             callback_id,
             message_callback_id,
+            dsd: false,
         })
     }
 
@@ -280,6 +285,16 @@ impl Device {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
+        // Tune (#5643): native DSD has its own path. The PCM path below
+        // would have refused these formats anyway: in PCM mode no ASIO type
+        // maps to a DSD `SampleFormat`.
+        if sample_format.is_dsd() {
+            if sample_format != SampleFormat::DsdU8 {
+                return Err(BuildStreamError::StreamConfigNotSupported);
+            }
+            return self.build_output_stream_dsd(config, data_callback, error_callback);
+        }
+
         let stream_type = self.driver.output_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
@@ -544,6 +559,7 @@ impl Device {
             asio_streams,
             callback_id,
             message_callback_id,
+            dsd: false,
         })
     }
 
@@ -643,6 +659,193 @@ impl Device {
         }
     }
 
+    /// Tune (#5643): open an output stream in native DSD.
+    ///
+    /// `config.sample_rate` is a DSD rate (`dsd::DSD_RATES`),
+    /// `config.buffer_size` is `Fixed(bytes per channel)` or `Default` (the
+    /// driver's preferred size). The callback receives `SampleFormat::DsdU8`
+    /// data, interleaved one byte per channel, first bit in the MSB.
+    ///
+    /// The driver must have no other stream: switching to DSD releases its
+    /// buffers. Any failure after the switch puts the driver back in PCM.
+    fn build_output_stream_dsd<D, E>(
+        &self,
+        config: &StreamConfig,
+        data_callback: D,
+        error_callback: E,
+    ) -> Result<Stream, BuildStreamError>
+    where
+        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
+        E: FnMut(StreamError) + Send + 'static,
+    {
+        if !dsd::is_dsd_rate(config.sample_rate) {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+        if self.driver.callback_count() > 0 {
+            return Err(BackendSpecificError {
+                description: "ASIO native DSD needs the driver for itself: \
+                              another stream of this device is still alive"
+                    .to_string(),
+            }
+            .into());
+        }
+        if !self
+            .driver
+            .can_io_format(sys::AsioIoFormatType::Dsd)
+            .map_err(build_stream_err)?
+        {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+
+        // Buffers left by an earlier (dropped) stream belong to the PCM
+        // format: forget them, then release them.
+        forget_asio_buffers(&self.asio_streams);
+        self.driver.dispose_buffers().map_err(build_stream_err)?;
+        self.driver
+            .set_io_format(sys::AsioIoFormatType::Dsd)
+            .map_err(build_stream_err)?;
+
+        self.open_dsd_output(config, data_callback, error_callback)
+            .inspect_err(|_| self.leave_dsd())
+    }
+
+    /// Tune (#5643): the part of `build_output_stream_dsd` that runs with
+    /// the driver in DSD mode.
+    fn open_dsd_output<D, E>(
+        &self,
+        config: &StreamConfig,
+        mut data_callback: D,
+        error_callback: E,
+    ) -> Result<Stream, BuildStreamError>
+    where
+        D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
+        E: FnMut(StreamError) + Send + 'static,
+    {
+        let sample_rate = config.sample_rate;
+        let rate = f64::from(sample_rate);
+        if rate != self.driver.sample_rate().map_err(build_stream_err)? {
+            if !self
+                .driver
+                .can_sample_rate(rate)
+                .map_err(build_stream_err)?
+            {
+                return Err(BuildStreamError::StreamConfigNotSupported);
+            }
+            self.driver
+                .set_sample_rate(rate)
+                .map_err(build_stream_err)?;
+        }
+
+        // The sample type is only meaningful after the switch.
+        let stream_type = self.driver.output_data_type().map_err(build_stream_err)?;
+        let layout = dsd::DsdLayout::from_asio_type(stream_type as i32)
+            .filter(|layout| layout.carries_dsd_u8())
+            .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+
+        let n_channels = config.channels as usize;
+        let outs = self.driver.channels().map_err(build_stream_err)?.outs;
+        if n_channels == 0 || n_channels > outs.max(0) as usize {
+            return Err(BuildStreamError::StreamConfigNotSupported);
+        }
+
+        let requested = match config.buffer_size {
+            BufferSize::Fixed(bytes) => {
+                let samples = dsd::asio_samples_for_bytes(bytes)
+                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+                let (min, max) = self.driver.buffersize_range().map_err(build_stream_err)?;
+                if !(min..=max).contains(&samples) {
+                    return Err(BuildStreamError::StreamConfigNotSupported);
+                }
+                Some(samples)
+            }
+            BufferSize::Default => None,
+        };
+
+        let new_streams = self
+            .driver
+            .prepare_output_stream(None, n_channels, requested)
+            .map_err(build_stream_err)?;
+        let asio_samples = new_streams
+            .output
+            .as_ref()
+            .map(|output| output.buffer_size)
+            .unwrap_or(0);
+        let bytes_per_channel = dsd::bytes_for_asio_samples(asio_samples)
+            .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+        *self.asio_streams.lock().unwrap() = new_streams;
+
+        let silence = layout.silence();
+        let mut interleaved = vec![dsd::DSD_SILENCE_MSB_FIRST; bytes_per_channel * n_channels];
+        let stream_playing = Arc::new(AtomicBool::new(false));
+        let playing = Arc::clone(&stream_playing);
+        let asio_streams = self.asio_streams.clone();
+
+        let callback_id = self.driver.add_callback(move |callback_info| unsafe {
+            let mut stream_lock = asio_streams.lock().unwrap();
+            let asio_stream = match stream_lock.output {
+                Some(ref mut asio_stream) => asio_stream,
+                None => return,
+            };
+            let buffer_index = callback_info.buffer_index as usize;
+
+            // Paused: DSD idle pattern, never the previous buffer again.
+            if !playing.load(Ordering::SeqCst) {
+                for ch_ix in 0..n_channels {
+                    asio_channel_slice_mut::<u8>(
+                        asio_stream,
+                        buffer_index,
+                        ch_ix,
+                        Some(bytes_per_channel),
+                    )
+                    .fill(silence);
+                }
+                return;
+            }
+
+            apply_output_callback_to_data::<u8, _>(
+                &mut data_callback,
+                &mut interleaved,
+                asio_stream,
+                callback_info,
+                sample_rate,
+                SampleFormat::DsdU8,
+            );
+
+            // DSD is not mixed: each channel buffer is overwritten.
+            for ch_ix in 0..n_channels {
+                let asio_channel = asio_channel_slice_mut::<u8>(
+                    asio_stream,
+                    buffer_index,
+                    ch_ix,
+                    Some(bytes_per_channel),
+                );
+                dsd::write_channel(&interleaved, n_channels, ch_ix, layout, asio_channel);
+            }
+        });
+        let message_callback_id = self.add_message_callback(error_callback);
+
+        if let Err(err) = self.driver.start() {
+            self.driver.remove_callback(callback_id);
+            self.driver.remove_message_callback(message_callback_id);
+            return Err(build_stream_err(err));
+        }
+
+        Ok(Stream {
+            playing: stream_playing,
+            driver: self.driver.clone(),
+            asio_streams: self.asio_streams.clone(),
+            callback_id,
+            message_callback_id,
+            dsd: true,
+        })
+    }
+
+    /// Tune (#5643): release the DSD buffers and switch the driver back to
+    /// PCM. Errors are ignored: this runs on failure paths and in `Drop`.
+    fn leave_dsd(&self) {
+        leave_dsd(&self.driver, &self.asio_streams);
+    }
+
     fn add_message_callback<E>(&self, error_callback: E) -> sys::MessageCallbackId
     where
         E: FnMut(StreamError) + Send + 'static,
@@ -665,7 +868,27 @@ impl Drop for Stream {
         self.driver.remove_callback(self.callback_id);
         self.driver
             .remove_message_callback(self.message_callback_id);
+        // Tune (#5643): leave the driver in PCM for the next stream.
+        if self.dsd {
+            leave_dsd(&self.driver, &self.asio_streams);
+        }
     }
+}
+
+/// Tune (#5643): drop the device's ASIO buffer handles. Callbacks see
+/// `None` and return before the buffers are released. The lock is not held
+/// across `ASIODisposeBuffers`: the driver's callback thread may wait on it.
+fn forget_asio_buffers(asio_streams: &Mutex<sys::AsioStreams>) {
+    let mut streams = asio_streams.lock().unwrap();
+    streams.input = None;
+    streams.output = None;
+}
+
+/// Tune (#5643): see `Device::leave_dsd`.
+fn leave_dsd(driver: &sys::Driver, asio_streams: &Mutex<sys::AsioStreams>) {
+    forget_asio_buffers(asio_streams);
+    let _ = driver.dispose_buffers();
+    let _ = driver.set_io_format(sys::AsioIoFormatType::Pcm);
 }
 
 fn asio_ns_to_double(val: sys::bindings::asio_import::ASIOTimeStamp) -> f64 {

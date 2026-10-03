@@ -192,8 +192,6 @@ dependencies = [
 [[package]]
 name = "asio-sys"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "826194e1612938c9be09b78b58323fbb2e326de3d491b4230186cf6e832d8ded"
 dependencies = [
  "bindgen",
  "cc",
