@@ -1869,6 +1869,10 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// Fil 2095 — le rétablissement d'une session morte ramène le renderer
+/// réseau à la position de la pause.
+#[cfg(test)]
+mod reprise_dlna_position_2095;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
