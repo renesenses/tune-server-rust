@@ -2807,6 +2807,47 @@ struct CreateAlarmGlobal {
     multi_zone_ids: Option<String>,
 }
 
+/// Le masque `days_of_week` effectif d'une écriture de réveil (#5669).
+///
+/// Le planificateur lit `days_of_week` AVANT `days`. Un client qui n'envoie
+/// que `days` recevait le masque par défaut `1111111` : son réveil « en
+/// semaine » sonnait tous les jours. Désormais :
+/// - `days_of_week` envoyé → il doit être un masque valide, il prime ;
+/// - sinon `days` envoyé → converti en masque (0 = lundi … 6 = dimanche) ;
+/// - sinon `None` (création : `1111111` comme avant ; mise à jour : inchangé).
+///
+/// Un jour invalide → `Err` (422), plutôt qu'un masque qui perd ou ajoute
+/// un jour en silence.
+fn alarm_days_mask(
+    days: Option<&str>,
+    days_of_week: Option<&str>,
+) -> Result<Option<String>, axum::response::Response> {
+    let invalid = |msg: String| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "invalid_days", "message": msg })),
+        )
+            .into_response()
+    };
+    // An empty `days` is tolerated only next to an explicit mask (no day
+    // ticked: the client sends `days_of_week = "0000000"`).
+    let from_days = match days {
+        Some(d) if days_of_week.is_none() || !d.trim().is_empty() => {
+            Some(tune_core::alarms::days_to_mask(d).map_err(|e| invalid(format!("days: {e}")))?)
+        }
+        _ => None,
+    };
+    if let Some(m) = days_of_week {
+        if !tune_core::alarms::is_days_mask(m) {
+            return Err(invalid(format!(
+                "days_of_week: expected 7 chars of 0/1 (Mon..Sun), got {m:?}"
+            )));
+        }
+        return Ok(Some(m.to_string()));
+    }
+    Ok(from_days)
+}
+
 async fn create_alarm_global(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
@@ -2839,10 +2880,10 @@ async fn create_alarm_global(
 
     // Free tier: no advanced fields
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(0);
-    let days_of_week = body
-        .days_of_week
-        .clone()
-        .unwrap_or_else(|| "1111111".into());
+    let days_of_week = match alarm_days_mask(body.days.as_deref(), body.days_of_week.as_deref()) {
+        Ok(m) => m.unwrap_or_else(|| "1111111".into()),
+        Err(resp) => return resp,
+    };
     let multi_zone_ids = body.multi_zone_ids.clone().unwrap_or_default();
 
     if !is_premium {
@@ -2920,6 +2961,12 @@ async fn update_alarm(
 ) -> Result<impl IntoResponse, AppError> {
     use tune_core::db::backend::{SqlValue, ToSqlValue};
 
+    // Days: `days` alone now also updates the mask the scheduler reads (#5669).
+    let days_of_week = match alarm_days_mask(body.days.as_deref(), body.days_of_week.as_deref()) {
+        Ok(m) => m,
+        Err(resp) => return Ok(resp),
+    };
+
     // Gate advanced fields for Free tier
     let is_premium = state.license.is_premium().await;
     if !is_premium {
@@ -2929,8 +2976,7 @@ async fn update_alarm(
             .as_ref()
             .map(|s| !s.is_empty() && s != "[]")
             .unwrap_or(false);
-        let has_day_selection = body
-            .days_of_week
+        let has_day_selection = days_of_week
             .as_ref()
             .map(|s| s != "1111111")
             .unwrap_or(false);
@@ -3005,7 +3051,7 @@ async fn update_alarm(
         sets.push("enabled = ?".into());
         values.push((enabled as i32).to_sql_value());
     }
-    if let Some(ref days_of_week) = body.days_of_week {
+    if let Some(ref days_of_week) = days_of_week {
         sets.push("days_of_week = ?".into());
         values.push(days_of_week.to_sql_value());
     }
