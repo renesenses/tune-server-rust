@@ -4703,50 +4703,74 @@ mod tests {
 
     /// Même coupure à la vitesse par défaut (deux fichiers à la fois) : ce qui
     /// est déjà en vol finit, mais RIEN de neuf ne part après la coupure.
+    ///
+    /// La coupure tombe au PREMIER témoin posé, quelle que soit la piste : à
+    /// deux fichiers à la fois, l'ordre d'arrivée n'est pas celui du lot (la
+    /// piste 2 peut finir avant la piste 1). Couper sur « la piste 1 » laissait
+    /// partir les pistes 3, 4, 5 tant que la 1 traînait sur le pool bloquant —
+    /// des lancements légitimes, réglage encore armé, que le test prenait pour
+    /// un défaut (done=5 en CI, 02/10). Au premier témoin, aucun fichier n'est
+    /// encore rendu : seuls les `largeur` déjà en vol peuvent finir.
     #[tokio::test]
     async fn switching_off_mid_batch_stops_launching_at_normal_speed() {
         let (_tmp, _db, interne) = sweep_db_fichiers_presents(6);
         SettingsRepo::with_backend(interne.clone())
             .set(MODE_KEY, "track")
             .unwrap();
-        let backend = CoupeAuPremierTemoin::poser(interne.clone());
-        let done = analyze_track_batch(&backend).await;
         let largeur = crate::taches_de_fond::vitesse::largeur_courante(&interne);
         assert!(
-            done >= 1 && done <= largeur + 1,
-            "au plus les fichiers déjà en vol, plus celui qui a coupé : done={done}, largeur={largeur}"
+            largeur >= 2 && largeur < 6,
+            "le test parle de plusieurs fichiers en vol sur un lot plus large : largeur={largeur}"
+        );
+        let backend = CoupeAuPremierTemoin::poser(interne.clone());
+        let done = analyze_track_batch(&backend).await;
+        assert!(
+            done >= 1 && done <= largeur,
+            "au plus les fichiers déjà en vol à la coupure : done={done}, largeur={largeur}"
         );
         let meta = TrackMetadataRepo::with_backend(interne.clone());
         assert!(!meta.get_all(6).unwrap().contains_key("rg_analyzed"));
     }
 
     /// Une base qui passe le mode ReplayGain à « off » dans l'écriture même du
-    /// témoin `rg_analyzed` de la piste 1.
+    /// PREMIER témoin `rg_analyzed` posé, quelle que soit la piste.
+    ///
+    /// La coupure est ATOMIQUE pour les autres écrivains : le verrou est tenu
+    /// du constat jusqu'à l'écriture de « off ». Avec un simple drapeau levé
+    /// avant l'écriture, une autre piste pouvait poser son témoin, voir le
+    /// drapeau, rendre la main et libérer une place pendant que le fil qui
+    /// coupait n'avait pas encore écrit « off » : la garde lisait alors un
+    /// réglage encore armé et lançait — légitimement — un fichier de plus.
+    /// Ici, aucun fichier ne peut rendre la main avant que « off » soit lisible.
     struct CoupeAuPremierTemoin {
         interne: Arc<dyn DbBackend>,
-        coupe: std::sync::atomic::AtomicBool,
+        coupe: std::sync::Mutex<bool>,
     }
 
     impl CoupeAuPremierTemoin {
         fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
             Arc::new(Self {
                 interne,
-                coupe: std::sync::atomic::AtomicBool::new(false),
+                coupe: std::sync::Mutex::new(false),
             })
         }
         fn apres_ecriture(&self) {
-            if self.coupe.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut coupe = self.coupe.lock().unwrap();
+            if *coupe {
                 return;
             }
-            let estampillee = TrackMetadataRepo::with_backend(self.interne.clone())
-                .get_all(1)
-                .map(|m| m.contains_key("rg_analyzed"))
-                .unwrap_or(false);
+            let estampillee = matches!(
+                self.interne.query_one(
+                    "SELECT 1 FROM track_metadata WHERE key = 'rg_analyzed' LIMIT 1",
+                    &[],
+                ),
+                Ok(Some(_))
+            );
             if estampillee {
-                self.coupe.store(true, std::sync::atomic::Ordering::SeqCst);
                 SettingsRepo::with_backend(self.interne.clone())
                     .set(MODE_KEY, "off")
                     .unwrap();
+                *coupe = true;
             }
         }
     }
