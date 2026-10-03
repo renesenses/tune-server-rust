@@ -2318,6 +2318,23 @@ async fn send_with_reresolve(
 
         let Some(reresolve) = reresolve else {
             // No re-resolver (local/non-expiring source) — nothing more to do.
+            //
+            // Fil 2121 (FabienM, Bandcamp → Chromecast) : une URL bcbits signée
+            // 2,7 jours plus tôt répond 410, la session n'a pas de mécanisme de
+            // nouvelle résolution, et l'appelant rend 502 au renderer. Ce
+            // chemin sortait SANS RIEN écrire : le journal montrait le 410,
+            // puis plus rien, et l'on ne pouvait pas dire que l'appareil avait
+            // reçu un 502. Une adresse expirée qu'on ne sait pas renouveler se
+            // dit, avec son statut et l'hôte amont (le service).
+            if let Ok(r) = &outcome {
+                warn!(
+                    status = %r.status(),
+                    amont = %r.url().host_str().unwrap_or("?"),
+                    url = %url,
+                    start = ?start,
+                    "proxy_upstream_expired_no_reresolver"
+                );
+            }
             return Err(());
         };
         if attempts >= PROXY_MAX_RERESOLVES {
