@@ -2741,22 +2741,29 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     }
 
     let backend_clone = scan_backend.clone();
-    let devices = match tokio::task::spawn_blocking(move || {
-        // #4667 — un rescan FORCÉ en WASAPI sur une configuration ASIO est un
-        // sondage, pas une lecture : il ne doit pas réécrire le backend
-        // « actif » que publient la fiche système et le rapport de bogue.
-        if is_asio_configured {
-            tune_core::outputs::local::sans_noter_le_backend_observe(|| {
+    // #5612 — borné : un balayage bloqué dans le greffon ALSA de PipeWire ne
+    // fige plus ce cycle (ni `POST /devices/rescan`, qui l'attend). Le cycle
+    // suivant n'attendra le balayage resté bloqué que
+    // `ATTENTE_MAX_DU_BALAYAGE_EN_COURS`.
+    let devices = match tune_core::outputs::local::enumeration_bornee(
+        tune_core::outputs::local::DELAI_ENUMERATION_ASYNC,
+        move || {
+            // #4667 — un rescan FORCÉ en WASAPI sur une configuration ASIO est un
+            // sondage, pas une lecture : il ne doit pas réécrire le backend
+            // « actif » que publient la fiche système et le rapport de bogue.
+            if is_asio_configured {
+                tune_core::outputs::local::sans_noter_le_backend_observe(|| {
+                    tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
+                })
+            } else {
                 tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
-            })
-        } else {
-            tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
-        }
-    })
+            }
+        },
+    )
     .await
     {
-        Ok(d) => d,
-        Err(_) => return,
+        Some(d) => d,
+        None => return,
     };
 
     {

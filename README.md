@@ -192,4 +192,4 @@ the same one through `spotify_redirect_uri` in `tune.toml` or
 
 ## License
 
-MIT
+Business Source License 1.1 — see [LICENSE](LICENSE).
