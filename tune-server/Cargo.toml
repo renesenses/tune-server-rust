@@ -1018,6 +1018,10 @@ name = "alarm_source_3715"
 path = "tests/alarm_source_3715.rs"
 
 [[test]]
+name = "alarm_days_5669"
+path = "tests/alarm_days_5669.rs"
+
+[[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
 
