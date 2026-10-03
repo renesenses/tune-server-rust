@@ -353,6 +353,7 @@ fn spawn_asio_warm_scan() {
             let devices = tune_core::outputs::local::list_asio_devices();
 
             let _ = std::fs::remove_file(&sentinel);
+            APPAREILS_DU_PRECHAUFFAGE.store(devices.len(), std::sync::atomic::Ordering::Release);
             info!(count = devices.len(), "asio_warm_scan_complete");
         }
     });
@@ -1664,6 +1665,46 @@ pub(crate) fn local_zone_action(
     }
 }
 
+// Enumerate output devices OFF the async runtime and under a hard timeout.
+//
+// Enumerating ASIO opens each driver to read its formats, and an ASIO driver
+// can only be opened by ONE process at a time: if another app (JRiver, foobar,
+// a DSD ASIO proxy…) already holds it, the open BLOCKS — potentially forever.
+// This call sits on the critical boot path *before* the HTTP listener starts
+// serving, so a blocked ASIO probe used to wedge the whole server: the port was
+// bound but nothing accepted connections → completely blank web UI (JP
+// Borderies, Denafrips USB DAC in ASIO with JRiver open). Running it in
+// `spawn_blocking` under a timeout guarantees the web UI always comes up; if the
+// scan does not respond we start WITHOUT local zones for this boot rather than
+// hang. The device becomes usable again once its driver is free (close the other
+// app) and Tune is relaunched.
+#[cfg(feature = "local-audio")]
+async fn scan_devices(backend: String) -> Option<Vec<tune_core::outputs::local::AudioDevice>> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::task::spawn_blocking(move || {
+            tune_core::outputs::local::list_audio_devices_with_backend(&backend)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(devices)) => Some(devices),
+        Ok(Err(_)) => {
+            warn!("local_audio_enumeration_panicked — starting without local zones this boot");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "local_audio_enumeration_timeout — an audio driver (most likely an ASIO device \
+                 held by another application such as JRiver) did not respond within 8s. Starting \
+                 the server WITHOUT local zones so the web UI stays available; close the other app \
+                 and relaunch Tune to use the device."
+            );
+            None
+        }
+    }
+}
+
 /// Register local audio output devices (USB DAC, headphones, speakers).
 ///
 /// Sur une base neuve, seule la sortie système reçoit automatiquement une
@@ -1674,61 +1715,10 @@ pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
     let audio_backend = &audio_backend_owned;
-    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
-    //
-    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
-    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
-    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
-    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
-    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
-    // sorties qui ne sont pas ASIO.
-    let exclusive_demande = state.requested_exclusive_mode();
-    // #5353 — l'écho du forçage ASIO n'est pas une demande pour une sortie
-    // qui ne s'ouvrira pas en ASIO.
-    let exclusif_arme_par_asio = state.exclusif_arme_par_asio();
     // Publish it: this is the value the outputs below are built with, and the
     // only honest answer for the signal path until the next restart.
     if let Ok(mut slot) = state.active_audio_backend.write() {
         *slot = Some(audio_backend_owned.clone());
-    }
-
-    // Enumerate output devices OFF the async runtime and under a hard timeout.
-    //
-    // Enumerating ASIO opens each driver to read its formats, and an ASIO driver
-    // can only be opened by ONE process at a time: if another app (JRiver, foobar,
-    // a DSD ASIO proxy…) already holds it, the open BLOCKS — potentially forever.
-    // This call sits on the critical boot path *before* the HTTP listener starts
-    // serving, so a blocked ASIO probe used to wedge the whole server: the port was
-    // bound but nothing accepted connections → completely blank web UI (JP
-    // Borderies, Denafrips USB DAC in ASIO with JRiver open). Running it in
-    // `spawn_blocking` under a timeout guarantees the web UI always comes up; if the
-    // scan does not respond we start WITHOUT local zones for this boot rather than
-    // hang. The device becomes usable again once its driver is free (close the other
-    // app) and Tune is relaunched.
-    async fn scan_devices(backend: String) -> Option<Vec<tune_core::outputs::local::AudioDevice>> {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            tokio::task::spawn_blocking(move || {
-                tune_core::outputs::local::list_audio_devices_with_backend(&backend)
-            }),
-        )
-        .await
-        {
-            Ok(Ok(devices)) => Some(devices),
-            Ok(Err(_)) => {
-                warn!("local_audio_enumeration_panicked — starting without local zones this boot");
-                None
-            }
-            Err(_) => {
-                warn!(
-                    "local_audio_enumeration_timeout — an audio driver (most likely an ASIO device \
-                     held by another application such as JRiver) did not respond within 8s. Starting \
-                     the server WITHOUT local zones so the web UI stays available; close the other app \
-                     and relaunch Tune to use the device."
-                );
-                None
-            }
-        }
     }
 
     // `None` means the scan timed out or panicked. When that happens we do NOT
@@ -1769,6 +1759,7 @@ pub async fn register_local_outputs(state: &AppState) {
         }
     }
     let mut devices = scan.clone().unwrap_or_default();
+    let mut repli_wasapi = false;
     // When ASIO is selected AND the host actually responded but exposed no devices,
     // also enumerate WASAPI so the user still has fallback outputs available.
     // (#5353 : après l'attente ci-dessus ; un préchauffage encore en cours à ce
@@ -1796,241 +1787,532 @@ pub async fn register_local_outputs(state: &AppState) {
             tune_core::outputs::asio_blocage_4556::noter_repli_wasapi_apres_blocage();
         }
         devices = scan_devices("wasapi".to_string()).await.unwrap_or_default();
+        repli_wasapi = true;
     }
     if !devices.is_empty() {
-        let mut outputs = state.outputs.lock().await;
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
-        // créer quoi que ce soit.
-        //
-        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
-        // renomme l'endpoint — Windows le fait au changement de taux
-        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
-        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
-        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
-        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
-        // stable qu'elle a enregistré.
-        //
-        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
-        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
-        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
-        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
-        //
-        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
-        // absent de `devices` reste introuvable, identifiant ou pas.
-        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
-            devices
-                .iter()
-                .map(
-                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
-                        nom: dev.name.clone(),
-                        endpoint_id: dev.endpoint_id.clone(),
-                    },
-                )
-                .collect();
-        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
-            Ok(rapport) => {
-                for r in &rapport.reassociees {
-                    info!(
-                        zone_id = r.zone_id,
-                        ancien = %r.ancien_device_id,
-                        nouveau = %r.nouveau_device_id,
-                        endpoint_id = %r.endpoint_id,
-                        "zone_locale_reassociee_par_identifiant_stable"
-                    );
-                }
-                // Les refus sont DITS. Une zone qui ne retrouve pas son
-                // appareil alors qu'elle en connaît l'identifiant est
-                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
-                for (zone_id, motif) in &rapport.refus {
-                    warn!(
-                        zone_id,
-                        motif = %motif,
-                        "reassociation_de_zone_locale_refusee"
-                    );
-                }
-                if !rapport.apprises.is_empty() {
-                    info!(
-                        zones = rapport.apprises.len(),
-                        "identifiant_de_sortie_locale_appris"
-                    );
-                }
-            }
-            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        enregistrer_les_sorties_locales(state, &devices).await;
+        // #5353 — retenir les sorties de repli : si ASIO se révèle plus tard
+        // (rescan à chaud), ce sont elles que la bascule remplace.
+        if repli_wasapi {
+            noter_le_repli_wasapi_de_demarrage(
+                devices
+                    .iter()
+                    .map(|dev| format!("local:{}", dev.name))
+                    .collect(),
+            );
         }
-        // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
-        // règle propre — `local_zone_action` autorise la sortie système par
-        // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
-        // lui-même.
-        let auto_create = zone_repo.zone_auto_create_autorise();
-        // Un backend est censé marquer une seule sortie par défaut. `find`
-        // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
-        let system_default_device_id = first_system_default_name(
-            devices
-                .iter()
-                .map(|dev| (dev.name.as_str(), dev.is_default)),
-        )
-        .map(|name| format!("local:{name}"));
-
-        for dev in &devices {
-            let device_id = format!("local:{}", dev.name);
-            // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
-            // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
-            // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
-            // WASAPI alors que la lecture demandera toujours l'hôte « asio »
-            // (#3230).
-            // #3245 — la contrainte de plateforme se pose sur le backend
-            // OUVRABLE de CE périphérique, pas sur le réglage global. Même
-            // rectification que `with_origin_host` juste en dessous, et pour
-            // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
-            // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
-            // le son de toutes les autres applications de la machine.
-            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
-                audio_backend,
-                Some(dev.backend.as_str()),
-                exclusive_demande,
-                exclusif_arme_par_asio,
-            );
-            let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
-                dev.name.clone(),
-                (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                statut_exclusif.effective,
-                audio_backend,
-            )
-            .with_origin_host(&dev.backend);
-            info!(
-                device_id = %device_id,
-                hote_origine = %dev.backend,
-                demande = exclusive_demande,
-                effectif = statut_exclusif.effective,
-                impose = statut_exclusif.forced,
-                "local_output_exclusive_mode_par_peripherique"
-            );
-            // Ensemencer la sortie avec le volume stocké.
-            //
-            // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
-            // `restore_zone_volumes` ne touche que la copie mémoire du
-            // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
-            // ne réimpose plus le volume enregistré à la lecture. Une zone locale
-            // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
-            // après un redémarrage — c'est précisément le réveil brutal que
-            // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
-            //
-            // Ce compromis-là ne s'applique pas ici : il protège le niveau
-            // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
-            // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
-            // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
-            // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
-            if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-                tune_core::orchestrator::ensemencer_le_volume_local(
-                    &state.backend,
-                    &zone,
-                    &device_id,
-                    &local_out,
-                )
-                .await;
-            }
-            outputs.register(Box::new(local_out));
-            info!(
-                name = %dev.name,
-                device_id = %device_id,
-                default = dev.is_default,
-                channels = dev.max_channels,
-                rates = ?dev.sample_rates,
-                "local_audio_output_registered"
-            );
-
-            // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
-            // de moteur audio change le NOM du périphérique système, donc son
-            // `device_id`, donc la ligne en base — et la sortie système WASAPI
-            // se voyait offrir un second « This Computer » à côté de celui
-            // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
-            // sa propre zone ne doit pas compter contre lui.
-            let generique_deja_pris = zone_repo
-                .etiquette_generique_locale_prise(&device_id)
-                .unwrap_or(false);
-            let zone_name = tune_core::config::nom_de_zone_locale(
-                &dev.name,
-                dev.is_default,
-                generique_deja_pris,
-            );
-
-            let zone_exists = zone_repo
-                .get_by_device_id(&device_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
-            let action = local_zone_action(zone_exists, auto_create, is_system_default);
-            if action == LocalZoneAction::Skip {
-                info!(
-                    name = %zone_name,
-                    device_id = %device_id,
-                    default = is_system_default,
-                    auto_create,
-                    "local_audio_zone_manual_creation_required"
-                );
-                continue;
-            }
-
-            match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
-                Ok((zid, true)) => {
-                    info!(
-                        name = %zone_name,
-                        zone_id = zid,
-                        device_id = %device_id,
-                        "local_audio_zone_auto_created"
-                    );
-                }
-                Ok((zid, false)) => {
-                    let _ = zone_repo.set_online_by_device(&device_id, true);
-                    // Zones héritées : les anciennes versions nommaient TOUTES
-                    // les zones locales « This Computer » — deux DAC devenaient
-                    // des jumelles indiscernables (forum #1233, Alain). Un DAC
-                    // non-défaut coincé sur l'étiquette générique prend le nom
-                    // du périphérique ; un nom personnalisé n'est jamais touché.
-                    if !dev.is_default
-                        && let Ok(n) = zone_repo.rename_generic_local_label(zid, &dev.name)
-                        && n > 0
-                    {
-                        info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
-                    }
-                    // Device par défaut : le device_id étant dérivé du NOM du
-                    // périphérique (`local:<name>`), un renommage du Mac ou un
-                    // changement de locale macOS crée une SECONDE zone par
-                    // défaut portant l'étiquette générique de l'autre langue
-                    // (« This Computer » ⇄ « Cet ordinateur »). get_or_create /
-                    // deduplicate matchent sur device_id et ne fusionnent jamais
-                    // ces jumelles → les deux restent dans le sélecteur (Philippe
-                    // Vella). On masque les jumelles génériques, en gardant celle
-                    // liée au device vivant. Étiquettes génériques uniquement —
-                    // une zone renommée par l'utilisateur n'est jamais touchée.
-                    if dev.is_default
-                        && let Ok(n) = zone_repo.hide_duplicate_generic_local(zid)
-                        && n > 0
-                    {
-                        info!(
-                            zone_id = zid,
-                            hidden = n,
-                            "local_default_zone_duplicates_hidden"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        name = %zone_name,
-                        device_id = %device_id,
-                        error = %e,
-                        "local_audio_zone_create_failed"
-                    );
-                }
-            }
-        }
-
-        info!(count = devices.len(), "local_audio_devices_registered");
     } else {
         info!("no_local_audio_devices_found");
     }
+}
+
+/// Enregistre `devices` comme sorties locales et leur donne une zone selon la
+/// règle du démarrage (#1770) : c'est LE chemin d'enregistrement du démarrage,
+/// partagé avec la bascule à chaud d'un repli WASAPI vers ASIO (#5353).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn enregistrer_les_sorties_locales(
+    state: &AppState,
+    devices: &[tune_core::outputs::local::AudioDevice],
+) {
+    let audio_backend_owned = state.effective_audio_backend();
+    let audio_backend = &audio_backend_owned;
+    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
+    //
+    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
+    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
+    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
+    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
+    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
+    // sorties qui ne sont pas ASIO.
+    let exclusive_demande = state.requested_exclusive_mode();
+    // #5353 — l'écho du forçage ASIO n'est pas une demande pour une sortie
+    // qui ne s'ouvrira pas en ASIO.
+    let exclusif_arme_par_asio = state.exclusif_arme_par_asio();
+    let mut outputs = state.outputs.lock().await;
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+    // créer quoi que ce soit.
+    //
+    // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+    // renomme l'endpoint — Windows le fait au changement de taux
+    // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+    // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+    // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+    // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+    // stable qu'elle a enregistré.
+    //
+    // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+    // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+    // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+    // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+    //
+    // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+    // absent de `devices` reste introuvable, identifiant ou pas.
+    let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> = devices
+        .iter()
+        .map(
+            |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                nom: dev.name.clone(),
+                endpoint_id: dev.endpoint_id.clone(),
+            },
+        )
+        .collect();
+    match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+        Ok(rapport) => {
+            for r in &rapport.reassociees {
+                info!(
+                    zone_id = r.zone_id,
+                    ancien = %r.ancien_device_id,
+                    nouveau = %r.nouveau_device_id,
+                    endpoint_id = %r.endpoint_id,
+                    "zone_locale_reassociee_par_identifiant_stable"
+                );
+            }
+            // Les refus sont DITS. Une zone qui ne retrouve pas son
+            // appareil alors qu'elle en connaît l'identifiant est
+            // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+            for (zone_id, motif) in &rapport.refus {
+                warn!(
+                    zone_id,
+                    motif = %motif,
+                    "reassociation_de_zone_locale_refusee"
+                );
+            }
+            if !rapport.apprises.is_empty() {
+                info!(
+                    zones = rapport.apprises.len(),
+                    "identifiant_de_sortie_locale_appris"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+    }
+    // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
+    // règle propre — `local_zone_action` autorise la sortie système par
+    // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
+    // lui-même.
+    let auto_create = zone_repo.zone_auto_create_autorise();
+    // Un backend est censé marquer une seule sortie par défaut. `find`
+    // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
+    let system_default_device_id = first_system_default_name(
+        devices
+            .iter()
+            .map(|dev| (dev.name.as_str(), dev.is_default)),
+    )
+    .map(|name| format!("local:{name}"));
+
+    for dev in devices {
+        let device_id = format!("local:{}", dev.name);
+        // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
+        // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
+        // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
+        // WASAPI alors que la lecture demandera toujours l'hôte « asio »
+        // (#3230).
+        // #3245 — la contrainte de plateforme se pose sur le backend
+        // OUVRABLE de CE périphérique, pas sur le réglage global. Même
+        // rectification que `with_origin_host` juste en dessous, et pour
+        // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
+        // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
+        // le son de toutes les autres applications de la machine.
+        let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+            audio_backend,
+            Some(dev.backend.as_str()),
+            exclusive_demande,
+            exclusif_arme_par_asio,
+        );
+        let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
+            dev.name.clone(),
+            (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
+            statut_exclusif.effective,
+            audio_backend,
+        )
+        .with_origin_host(&dev.backend);
+        info!(
+            device_id = %device_id,
+            hote_origine = %dev.backend,
+            demande = exclusive_demande,
+            effectif = statut_exclusif.effective,
+            impose = statut_exclusif.forced,
+            "local_output_exclusive_mode_par_peripherique"
+        );
+        // Ensemencer la sortie avec le volume stocké.
+        //
+        // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
+        // `restore_zone_volumes` ne touche que la copie mémoire du
+        // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
+        // ne réimpose plus le volume enregistré à la lecture. Une zone locale
+        // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
+        // après un redémarrage — c'est précisément le réveil brutal que
+        // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
+        //
+        // Ce compromis-là ne s'applique pas ici : il protège le niveau
+        // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
+        // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
+        // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
+        // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
+        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
+            tune_core::orchestrator::ensemencer_le_volume_local(
+                &state.backend,
+                &zone,
+                &device_id,
+                &local_out,
+            )
+            .await;
+        }
+        outputs.register(Box::new(local_out));
+        info!(
+            name = %dev.name,
+            device_id = %device_id,
+            default = dev.is_default,
+            channels = dev.max_channels,
+            rates = ?dev.sample_rates,
+            "local_audio_output_registered"
+        );
+
+        // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
+        // de moteur audio change le NOM du périphérique système, donc son
+        // `device_id`, donc la ligne en base — et la sortie système WASAPI
+        // se voyait offrir un second « This Computer » à côté de celui
+        // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
+        // sa propre zone ne doit pas compter contre lui.
+        let generique_deja_pris = zone_repo
+            .etiquette_generique_locale_prise(&device_id)
+            .unwrap_or(false);
+        let zone_name =
+            tune_core::config::nom_de_zone_locale(&dev.name, dev.is_default, generique_deja_pris);
+
+        let zone_exists = zone_repo
+            .get_by_device_id(&device_id)
+            .ok()
+            .flatten()
+            .is_some();
+        let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+        let action = local_zone_action(zone_exists, auto_create, is_system_default);
+        if action == LocalZoneAction::Skip {
+            info!(
+                name = %zone_name,
+                device_id = %device_id,
+                default = is_system_default,
+                auto_create,
+                "local_audio_zone_manual_creation_required"
+            );
+            continue;
+        }
+
+        match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
+            Ok((zid, true)) => {
+                info!(
+                    name = %zone_name,
+                    zone_id = zid,
+                    device_id = %device_id,
+                    "local_audio_zone_auto_created"
+                );
+            }
+            Ok((zid, false)) => {
+                let _ = zone_repo.set_online_by_device(&device_id, true);
+                // Zones héritées : les anciennes versions nommaient TOUTES
+                // les zones locales « This Computer » — deux DAC devenaient
+                // des jumelles indiscernables (forum #1233, Alain). Un DAC
+                // non-défaut coincé sur l'étiquette générique prend le nom
+                // du périphérique ; un nom personnalisé n'est jamais touché.
+                if !dev.is_default
+                    && let Ok(n) = zone_repo.rename_generic_local_label(zid, &dev.name)
+                    && n > 0
+                {
+                    info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
+                }
+                // Device par défaut : le device_id étant dérivé du NOM du
+                // périphérique (`local:<name>`), un renommage du Mac ou un
+                // changement de locale macOS crée une SECONDE zone par
+                // défaut portant l'étiquette générique de l'autre langue
+                // (« This Computer » ⇄ « Cet ordinateur »). get_or_create /
+                // deduplicate matchent sur device_id et ne fusionnent jamais
+                // ces jumelles → les deux restent dans le sélecteur (Philippe
+                // Vella). On masque les jumelles génériques, en gardant celle
+                // liée au device vivant. Étiquettes génériques uniquement —
+                // une zone renommée par l'utilisateur n'est jamais touchée.
+                if dev.is_default
+                    && let Ok(n) = zone_repo.hide_duplicate_generic_local(zid)
+                    && n > 0
+                {
+                    info!(
+                        zone_id = zid,
+                        hidden = n,
+                        "local_default_zone_duplicates_hidden"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    name = %zone_name,
+                    device_id = %device_id,
+                    error = %e,
+                    "local_audio_zone_create_failed"
+                );
+            }
+        }
+    }
+
+    info!(count = devices.len(), "local_audio_devices_registered");
+}
+
+// ---------------------------------------------------------------------------
+// #5353 — bascule à chaud d'un repli WASAPI de démarrage vers ASIO
+// ---------------------------------------------------------------------------
+//
+// Ce qui manquait (journal RC1 de Jean-François, 01/10, 12:58:42 et 12:59:51) :
+// après le démarrage, AUCUN chemin n'énumère ASIO ET n'enregistre ce qu'il
+// trouve. `GET /devices/audio` (l'écran des réglages) énumère bien l'hôte ASIO
+// — `local_audio_host_selected backend="asio" devices=4` — mais ne fait que
+// lister. Le rescan (`POST /devices/rescan` et la tâche périodique), lui,
+// enregistre, mais FORCE WASAPI dès qu'ASIO est choisi (re-sonder ASIO peut
+// emporter le processus) et ne crée aucune zone. Un démarrage qui s'était replié
+// sur WASAPI y restait donc jusqu'au redémarrage suivant, quoi que l'écran
+// affiche.
+//
+// La bascule ne re-sonde ASIO qu'une seule fois par processus, et seulement si
+// le préchauffage du démarrage a déjà ouvert ces pilotes sans dommage et en a
+// trouvé au moins un.
+
+/// Sorties enregistrées par le repli WASAPI du démarrage, tant qu'ASIO ne les a
+/// pas remplacées. `None` : pas de repli (ou bascule faite).
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static REPLI_WASAPI_DE_DEMARRAGE: std::sync::Mutex<Option<Vec<String>>> =
+    std::sync::Mutex::new(None);
+
+/// La seule sonde ASIO à chaud de ce processus a-t-elle été consommée ?
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static BASCULE_ASIO_TENTEE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Combien de pilotes le préchauffage de ce processus a trouvés.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static APPAREILS_DU_PRECHAUFFAGE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// La première bascule différée se dit à l'INFO, les suivantes au DEBUG (le
+/// rescan repasse toutes les deux minutes pendant toute l'écoute).
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static BASCULE_DIFFEREE_DITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn noter_le_repli_wasapi_de_demarrage(sorties: Vec<String>) {
+    *REPLI_WASAPI_DE_DEMARRAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(sorties);
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn repli_wasapi_de_demarrage() -> Option<Vec<String>> {
+    REPLI_WASAPI_DE_DEMARRAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Ce que le rescan à chaud fait d'un repli WASAPI de démarrage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) enum SuiteDuRescanAsio {
+    /// Rien à basculer : le rescan WASAPI habituel suit.
+    RienABasculer,
+    /// La bascule est due mais pas maintenant ; le rescan suivant la retente.
+    Differer(&'static str),
+    /// Sonder ASIO (une fois) et remplacer les sorties de repli.
+    Basculer,
+}
+
+/// #5353 — la décision, sans effet de bord, testable hors Windows.
+///
+/// Une lecture locale en cours DIFFÈRE la bascule au lieu de l'annuler : la
+/// sonde ASIO et le retrait d'une sortie sont exactement ce qui coupe un flux
+/// (DEvir, #1267). Le rescan, qui repasse toutes les deux minutes sous Windows,
+/// la fera au premier passage où rien ne joue — c'est le plus sûr : rien ne
+/// touche au flux en cours, et l'utilisateur n'a pas à redémarrer.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn suite_du_rescan_asio(
+    backend: &str,
+    repli_de_demarrage: bool,
+    sonde_deja_consommee: bool,
+    coupe_circuit: bool,
+    prechauffage: EtatPrechauffageAsio,
+    appareils_du_prechauffage: usize,
+    lecture_locale_en_cours: bool,
+) -> SuiteDuRescanAsio {
+    if !backend.eq_ignore_ascii_case("asio") || !repli_de_demarrage || sonde_deja_consommee {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    // Coupe-circuit (environnement, témoin de plantage) : l'énumération ASIO
+    // servirait le cache sans rien ouvrir, et ce processus ne doit pas rouvrir
+    // un pilote soupçonné de l'avoir déjà tué (#4168, #4556).
+    if coupe_circuit {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    match prechauffage {
+        // Pas de préchauffage : ASIO absent de ce binaire, ou coupé.
+        EtatPrechauffageAsio::Absent => return SuiteDuRescanAsio::RienABasculer,
+        // Il tient le pilote : jamais deux sondes ASIO à la fois (#1267).
+        EtatPrechauffageAsio::EnCours => {
+            return SuiteDuRescanAsio::Differer("prechauffage_asio_en_cours");
+        }
+        EtatPrechauffageAsio::Termine => {}
+    }
+    // Le préchauffage n'a rien trouvé : le repli du démarrage était juste.
+    if appareils_du_prechauffage == 0 {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    if lecture_locale_en_cours {
+        return SuiteDuRescanAsio::Differer("lecture_locale_en_cours");
+    }
+    SuiteDuRescanAsio::Basculer
+}
+
+/// Ce que la bascule a fait, pour le journal et les témoins.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) struct RapportDeBascule {
+    pub(crate) enregistrees: Vec<String>,
+    pub(crate) retirees: Vec<String>,
+    /// Sorties de repli gardées parce qu'elles jouaient au moment du retrait.
+    pub(crate) gardees_en_lecture: Vec<String>,
+}
+
+/// Enregistre `asio` par le chemin du démarrage, puis retire les sorties du
+/// repli WASAPI qu'elles remplacent (zone hors ligne, comme après un
+/// débranchement — #1626). Une sortie de repli qui joue n'est jamais retirée.
+#[cfg(feature = "local-audio")]
+pub(crate) async fn remplacer_le_repli_wasapi(
+    state: &AppState,
+    asio: &[tune_core::outputs::local::AudioDevice],
+    repli: &[String],
+) -> RapportDeBascule {
+    enregistrer_les_sorties_locales(state, asio).await;
+    let enregistrees: Vec<String> = asio.iter().map(|d| format!("local:{}", d.name)).collect();
+
+    let mut rapport = RapportDeBascule {
+        enregistrees: enregistrees.clone(),
+        ..Default::default()
+    };
+    {
+        let mut outputs = state.outputs.lock().await;
+        for id in repli {
+            // Même nom des deux côtés : la sortie ASIO vient de prendre sa
+            // place dans le registre, sous le même identifiant.
+            if enregistrees.contains(id) || !outputs.contains(id) {
+                continue;
+            }
+            let en_lecture = match outputs.get(id) {
+                Some(sortie) => matches!(
+                    sortie.lock().await.get_status().await,
+                    Ok(status) if status.state == tune_core::outputs::traits::TransportState::Playing
+                ),
+                None => false,
+            };
+            if en_lecture {
+                rapport.gardees_en_lecture.push(id.clone());
+                continue;
+            }
+            outputs.remove(id);
+            rapport.retirees.push(id.clone());
+        }
+    }
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    for id in &rapport.retirees {
+        let _ = zone_repo.set_online_by_device(id, false);
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::ZoneUpdated,
+            serde_json::json!({ "device_id": id, "online": false }),
+        );
+    }
+    for (id, dev) in enregistrees.iter().zip(asio) {
+        state.event_bus.emit(
+            "device.discovered",
+            serde_json::json!({ "id": id, "name": dev.name, "type": "local", "hotplug": true }),
+        );
+    }
+    rapport
+}
+
+/// #5353 — à appeler par le rescan à chaud, AVANT son énumération WASAPI.
+/// Rend `true` quand la bascule a eu lieu (le rescan WASAPI de ce passage est
+/// alors inutile : l'énumération vient d'avoir lieu).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn basculer_le_repli_wasapi_sur_asio(
+    state: &AppState,
+    lecture_locale_en_cours: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let backend = state.effective_audio_backend();
+    let repli = repli_wasapi_de_demarrage();
+    let suite = suite_du_rescan_asio(
+        &backend,
+        repli.is_some(),
+        BASCULE_ASIO_TENTEE.load(Ordering::Acquire),
+        tune_core::outputs::asio_blocage_4556::enumeration_bloquee(),
+        etat_du_prechauffage_asio(),
+        APPAREILS_DU_PRECHAUFFAGE.load(Ordering::Acquire),
+        lecture_locale_en_cours,
+    );
+    match suite {
+        SuiteDuRescanAsio::RienABasculer => return false,
+        SuiteDuRescanAsio::Differer(motif) => {
+            if !BASCULE_DIFFEREE_DITE.swap(true, Ordering::AcqRel) {
+                info!(
+                    motif,
+                    "asio_bascule_a_chaud_differee — sorties ASIO trouvées par le \
+                     préchauffage, zones encore sur le repli WASAPI : bascule au \
+                     prochain rescan où rien ne joue"
+                );
+            } else {
+                tracing::debug!(motif, "asio_bascule_a_chaud_differee");
+            }
+            return false;
+        }
+        SuiteDuRescanAsio::Basculer => {}
+    }
+
+    let scan = scan_devices("asio".to_string()).await;
+    let asio: Vec<_> = scan
+        .iter()
+        .flatten()
+        .filter(|d| d.backend.eq_ignore_ascii_case("asio"))
+        .cloned()
+        .collect();
+    if asio.is_empty() {
+        // Une liste non vide SANS appareil ASIO, c'est le parc WASAPI des 5 s
+        // de `SCAN_GUARD`, servi sans rien sonder : on retentera. Une liste
+        // vide ou une sonde expirée, elle, consomme l'unique tentative — on ne
+        // rouvre pas en boucle un pilote qui ne répond pas.
+        let parc_d_un_autre_hote = scan.as_ref().is_some_and(|l| !l.is_empty());
+        if !parc_d_un_autre_hote {
+            BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
+        }
+        warn!(
+            sonde_expiree = scan.is_none(),
+            parc_d_un_autre_hote,
+            "asio_bascule_a_chaud_sans_appareil — le repli WASAPI est conservé"
+        );
+        return false;
+    }
+    BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
+    let repli = repli.unwrap_or_default();
+    let rapport = remplacer_le_repli_wasapi(state, &asio, &repli).await;
+    if rapport.gardees_en_lecture.is_empty() {
+        *REPLI_WASAPI_DE_DEMARRAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    } else {
+        noter_le_repli_wasapi_de_demarrage(rapport.gardees_en_lecture.clone());
+    }
+    info!(
+        enregistrees = ?rapport.enregistrees,
+        retirees = ?rapport.retirees,
+        gardees_en_lecture = ?rapport.gardees_en_lecture,
+        "asio_bascule_a_chaud_faite — sorties ASIO enregistrées à la place du repli WASAPI \
+         du démarrage"
+    );
+    true
 }
 
 /// Remonte les partages reseau enregistres, avant que quoi que ce soit ne lise
@@ -3393,5 +3675,189 @@ mod prechauffage_asio_5353_tests {
              de démarrage peut passer avant (#5353)"
         );
         assert!(lancement.contains("let _fin = FinDuPrechauffageAsio;"));
+    }
+}
+
+/// #5353 — rescan à chaud : un repli WASAPI de démarrage doit céder la place
+/// aux sorties ASIO que le préchauffage a trouvées.
+#[cfg(test)]
+mod bascule_asio_a_chaud_5353_tests {
+    use super::{
+        EtatPrechauffageAsio as Etat, SuiteDuRescanAsio as Suite, suite_du_rescan_asio as suite,
+    };
+
+    /// Le journal de Jean-François après le démarrage : ASIO choisi, repli
+    /// WASAPI, préchauffage terminé avec 4 pilotes, rien ne joue. Avant le
+    /// correctif, le rescan enumérait WASAPI et s'arrêtait là.
+    #[test]
+    fn repli_wasapi_et_pilotes_asio_connus_basculent() {
+        for backend in ["asio", "ASIO"] {
+            assert_eq!(
+                suite(backend, true, false, false, Etat::Termine, 4, false),
+                Suite::Basculer,
+                "{backend} : les zones resteraient sur le repli WASAPI (#5353)"
+            );
+        }
+    }
+
+    /// Une lecture locale en cours, ou le préchauffage qui tient le pilote,
+    /// diffèrent — jamais d'annulation, jamais de sonde pendant un flux.
+    #[test]
+    fn la_lecture_ou_le_prechauffage_differe_la_bascule() {
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Termine, 4, true),
+            Suite::Differer("lecture_locale_en_cours")
+        );
+        assert_eq!(
+            suite("asio", true, false, false, Etat::EnCours, 0, false),
+            Suite::Differer("prechauffage_asio_en_cours")
+        );
+    }
+
+    #[test]
+    fn rien_a_basculer_hors_du_cas_vise() {
+        // Backend non ASIO, ou démarrage sans repli.
+        for backend in ["wasapi", "auto", ""] {
+            assert_eq!(
+                suite(backend, true, false, false, Etat::Termine, 4, false),
+                Suite::RienABasculer
+            );
+        }
+        assert_eq!(
+            suite("asio", false, false, false, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Une seule sonde ASIO à chaud par processus.
+        assert_eq!(
+            suite("asio", true, true, false, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Coupe-circuit : ne pas rouvrir un pilote soupçonné (#4168, #4556).
+        assert_eq!(
+            suite("asio", true, false, true, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Pas de préchauffage, ou préchauffage sans pilote : le repli était juste.
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Absent, 4, false),
+            Suite::RienABasculer
+        );
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Termine, 0, false),
+            Suite::RienABasculer
+        );
+    }
+
+    #[cfg(feature = "local-audio")]
+    fn appareil_asio(nom: &str, defaut: bool) -> tune_core::outputs::local::AudioDevice {
+        tune_core::outputs::local::AudioDevice {
+            name: nom.into(),
+            endpoint_id: format!("asio:{nom}"),
+            is_default: defaut,
+            max_channels: 2,
+            sample_rates: vec![44100, 96000],
+            sample_rates_measured: true,
+            backend: "ASIO".into(),
+            hardware_detail: None,
+        }
+    }
+
+    /// Le geste lui-même, sur le registre et la base : les sorties ASIO sont
+    /// enregistrées par le chemin du démarrage (zone de la sortie système
+    /// comprise), les sorties du repli disparaissent et leurs zones passent
+    /// hors ligne.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn la_bascule_remplace_les_sorties_de_repli_par_les_sorties_asio() {
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::outputs::local::LocalOutput;
+
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_speakers = repo
+            .create("Speakers", Some("local"), Some("local:Speakers"))
+            .unwrap();
+        repo.set_online_by_device("local:Speakers", true).unwrap();
+        {
+            let mut outputs = state.outputs.lock().await;
+            outputs.register(Box::new(LocalOutput::new("Speakers".into())));
+            outputs.register(Box::new(LocalOutput::new("G247HYU".into())));
+        }
+        let repli = vec!["local:Speakers".to_string(), "local:G247HYU".to_string()];
+        let asio = vec![
+            appareil_asio("ASIO4ALL v2", true),
+            appareil_asio("NU Audio", false),
+        ];
+
+        let rapport = super::remplacer_le_repli_wasapi(&state, &asio, &repli).await;
+
+        let outputs = state.outputs.lock().await;
+        for id in ["local:ASIO4ALL v2", "local:NU Audio"] {
+            assert!(
+                outputs.contains(id),
+                "{id} absente du registre après la bascule"
+            );
+        }
+        for id in &repli {
+            assert!(
+                !outputs.contains(id),
+                "{id} : la sortie de repli est restée"
+            );
+        }
+        drop(outputs);
+        assert_eq!(rapport.retirees, repli);
+        assert!(rapport.gardees_en_lecture.is_empty());
+
+        let speakers = repo.get(zone_speakers).unwrap().unwrap();
+        assert!(!speakers.online, "la zone de repli doit passer hors ligne");
+        // Règle du démarrage (#1770) : la sortie système ASIO reçoit sa zone,
+        // les autres restent offertes à la création manuelle.
+        assert!(
+            repo.get_by_device_id("local:ASIO4ALL v2")
+                .unwrap()
+                .is_some()
+        );
+        assert!(repo.get_by_device_id("local:NU Audio").unwrap().is_none());
+    }
+
+    /// Les branchements, invisibles d'une porte Linux (pas d'hôte ASIO).
+    #[test]
+    fn le_rescan_et_le_demarrage_sont_branches_sur_la_bascule() {
+        let fond = include_str!("background.rs");
+        let rescan = fond
+            .split_once("pub async fn rescan_local_audio_devices(")
+            .expect("rescan_local_audio_devices introuvable")
+            .1;
+        let bascule = rescan
+            .find(
+                "crate::startup::basculer_le_repli_wasapi_sur_asio(state, lecture_locale_en_cours)",
+            )
+            .expect("le rescan à chaud n'appelle plus la bascule ASIO (#5353)");
+        let garde = rescan
+            .find("local_audio_rescan_skipped_active_playback")
+            .expect("garde de lecture");
+        let wasapi = rescan
+            .find("list_audio_devices_with_backend(")
+            .expect("énumération du rescan");
+        assert!(bascule < garde && bascule < wasapi);
+
+        let source = include_str!("startup.rs");
+        let demarrage = source
+            .split_once("pub async fn register_local_outputs(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(demarrage.contains("enregistrer_les_sorties_locales(state, &devices).await"));
+        assert!(demarrage.contains("noter_le_repli_wasapi_de_demarrage("));
+        let bascule = source
+            .split_once("pub(crate) async fn remplacer_le_repli_wasapi(")
+            .unwrap()
+            .1;
+        assert!(
+            bascule.contains("enregistrer_les_sorties_locales(state, asio).await"),
+            "la bascule doit réutiliser le chemin d'enregistrement du démarrage"
+        );
     }
 }
