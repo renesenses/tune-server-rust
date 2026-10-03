@@ -921,7 +921,8 @@ impl TrackImporter {
             // La pochette d'album face au DISQUE (#5034) : une règle, portée
             // par `pochette_disque`, partagée avec le surveillant et le
             // rattrapage de fin de scan. Elle pose la pochette d'un album qui
-            // n'en a pas (jaquette intégrée d'abord, puis image du dossier),
+            // n'en a pas (image du dossier d'abord, puis jaquette intégrée —
+            // #5685),
             // suit celle dont le fichier source a changé ou disparu, et ne
             // touche jamais une pochette téléversée.
             //
@@ -980,8 +981,13 @@ impl TrackImporter {
             {
                 self.albums_en_desaccord.insert(aid);
             }
+            // #5685 — une pochette tirée d'une IMAGE DE DOSSIER ne fait pas
+            // référence pour les pistes : elle passe avant leurs jaquettes, et
+            // seules celles qui s'écartent de la jaquette des autres pistes
+            // gardent une pochette propre (la première jaquette lue sert de
+            // référence, plus bas).
             if let Some(etat) = etat_apres
-                && etat.source.is_some_and(|s| s.vient_du_disque())
+                && etat.source == Some(tune_core::db::models::SourcePochette::Integree)
                 && let Some(pochette) = etat.cover_path
             {
                 self.album_ref_cover.insert(aid, pochette);
