@@ -552,10 +552,21 @@ fn export_alarms(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
         "volume",
         "fade_in_seconds",
         "name",
+        "days_of_week",
+        "skip_holidays",
+        "multi_zone_ids",
+        "one_shot",
+        "source_name",
+        "fade_duration_s",
     ];
+    // `days_of_week` (the mask the scheduler reads first), `skip_holidays`
+    // and `multi_zone_ids` were missing: every restored alarm rang daily, on
+    // one zone, holidays included (#5669).
     let rows = backend.query_many(
         "SELECT id, zone_id, time, enabled, days, source_type, \
-         source_id, volume, fade_in_seconds, name \
+         source_id, volume, fade_in_seconds, name, days_of_week, \
+         skip_holidays, multi_zone_ids, one_shot, source_name, \
+         fade_duration_s \
          FROM alarms ORDER BY id",
         &[],
     )?;
@@ -1114,10 +1125,18 @@ fn import_radios(
     Ok(count)
 }
 
+/// Optional text field of a backed-up alarm (absent / null / empty → `None`).
+fn alarm_text(a: &Value, key: &str) -> Option<String> {
+    a[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn import_alarms(
     backend: &Arc<dyn DbBackend>,
     alarms: &[Value],
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let mut count = 0;
     for a in alarms {
@@ -1142,20 +1161,50 @@ fn import_alarms(
             continue;
         }
 
+        // Days: the backed-up mask as is. A backup made before #5669 has no
+        // `days_of_week`: the column default ("1111111", what such a restore
+        // has always produced) applies — the legacy `days` text is not
+        // trusted, the scheduler never read it next to a mask.
+        let days_of_week = match a["days_of_week"].as_str() {
+            Some(m) if crate::alarms::is_days_mask(m) => m.to_string(),
+            other => {
+                if let Some(m) = other {
+                    warnings.push(format!(
+                        "alarm {name:?}: invalid days_of_week {m:?}, restored as every day"
+                    ));
+                }
+                "1111111".to_string()
+            }
+        };
+        // Same binding as the alarm API: an opaque text id (radio uuid,
+        // service id), a numeric one from SQLite is turned into its text.
+        let source_id: Option<String> = a["source_id"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| a["source_id"].as_i64().map(|n| n.to_string()));
+
         backend.execute(
             "INSERT INTO alarms (zone_id, time, enabled, days, source_type, \
-             source_id, volume, fade_in_seconds, name) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             source_id, volume, fade_in_seconds, name, days_of_week, \
+             skip_holidays, multi_zone_ids, one_shot, source_name, \
+             fade_duration_s) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &zone_id as &dyn ToSqlValue,
                 &time.to_string() as &dyn ToSqlValue,
                 &a["enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                 &a["days"].as_str().unwrap_or("1,2,3,4,5,6,7").to_string() as &dyn ToSqlValue,
                 &a["source_type"].as_str().unwrap_or("playlist").to_string() as &dyn ToSqlValue,
-                &a["source_id"].as_i64() as &dyn ToSqlValue,
+                &source_id as &dyn ToSqlValue,
                 &a["volume"].as_f64().unwrap_or(0.3) as &dyn ToSqlValue,
                 &a["fade_in_seconds"].as_i64().unwrap_or(30) as &dyn ToSqlValue,
                 &name.to_string() as &dyn ToSqlValue,
+                &days_of_week as &dyn ToSqlValue,
+                &a["skip_holidays"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
+                &alarm_text(a, "multi_zone_ids") as &dyn ToSqlValue,
+                &a["one_shot"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
+                &alarm_text(a, "source_name") as &dyn ToSqlValue,
+                &a["fade_duration_s"].as_i64().unwrap_or(60) as &dyn ToSqlValue,
             ],
         )?;
         count += 1;
@@ -1369,6 +1418,111 @@ mod tests {
             )
             .unwrap();
         assert!(row.is_some());
+    }
+
+    // ── Alarms round trip (#5669) ───────────────────────────────────
+
+    fn fresh_backend() -> Arc<dyn DbBackend> {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn alarm_row(backend: &Arc<dyn DbBackend>, name: &str) -> Vec<crate::db::backend::SqlValue> {
+        backend
+            .query_one(
+                "SELECT days_of_week, skip_holidays, multi_zone_ids, zone_id, one_shot, \
+                 CAST(source_id AS TEXT), source_name, fade_duration_s \
+                 FROM alarms WHERE name = ?",
+                &[&name.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .expect("alarm restored")
+    }
+
+    /// A weekday alarm that skips holidays and rings two zones comes back
+    /// identical — it used to come back daily, single-zone, holidays included.
+    #[test]
+    fn alarm_days_holidays_and_zones_survive_export_import_5669() {
+        let src = fresh_backend();
+        for z in ["Salon", "Chambre"] {
+            src.execute(
+                "INSERT INTO zones (name, volume) VALUES (?, ?)",
+                &[&z.to_string() as &dyn ToSqlValue, &50i64 as &dyn ToSqlValue],
+            )
+            .unwrap();
+        }
+        src.execute(
+            "INSERT INTO alarms (name, time, days, zone_id, source_type, source_id, \
+             source_name, days_of_week, skip_holidays, multi_zone_ids, one_shot, \
+             fade_duration_s) \
+             VALUES ('Semaine', '06:45', '0,1,2,3,4', 1, 'radio', 'fip-uuid', 'FIP', \
+             '1111100', 1, '[1,2]', 0, 120)",
+            &[],
+        )
+        .unwrap();
+
+        // Through JSON, like a real backup file.
+        let snapshot = export_config(&src).unwrap();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let snapshot: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+
+        let dst = fresh_backend();
+        let report = import_config(&dst, snapshot).unwrap();
+        assert_eq!(report.alarms_restored, 1);
+
+        let r = alarm_row(&dst, "Semaine");
+        assert_eq!(r[0].as_str(), Some("1111100"), "days_of_week");
+        assert_eq!(r[1].as_i64(), Some(1), "skip_holidays");
+        assert_eq!(r[2].as_str(), Some("[1,2]"), "multi_zone_ids");
+        assert_eq!(r[3].as_i64(), Some(1), "zone_id");
+        assert_eq!(r[4].as_i64(), Some(0), "one_shot");
+        assert_eq!(r[5].as_str(), Some("fip-uuid"), "source_id");
+        assert_eq!(r[6].as_str(), Some("FIP"), "source_name");
+        assert_eq!(r[7].as_i64(), Some(120), "fade_duration_s");
+
+        // And the scheduler reads it as Mon..Fri.
+        let alarm = serde_json::json!({ "days_of_week": r[0].as_str() });
+        assert_eq!(
+            crate::alarms::resolve_alarm_days(&alarm),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    /// A backup written before #5669 carries none of these fields: it is
+    /// still accepted, with today's defaults (every day, no holiday skip,
+    /// single zone).
+    #[test]
+    fn alarm_from_backup_without_new_fields_gets_defaults_5669() {
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "0.9.150",
+            "created_at": "2026-08-01T00:00:00Z",
+            "zones": [], "settings": [], "playlists": [], "favorites": [],
+            "radio_stations": [],
+            "alarms": [{
+                "id": 7, "zone_id": null, "time": "07:30", "enabled": 1,
+                "days": "0,1,2,3,4", "source_type": "radio", "source_id": 42,
+                "volume": 0.4, "fade_in_seconds": 30, "name": "Ancien"
+            }],
+            "eq_presets": [], "room_profiles": [], "streaming_tokens": []
+        }))
+        .unwrap();
+
+        let dst = fresh_backend();
+        let report = import_config(&dst, snapshot).unwrap();
+        assert_eq!(report.alarms_restored, 1);
+
+        let r = alarm_row(&dst, "Ancien");
+        assert_eq!(r[0].as_str(), Some("1111111"), "days_of_week default");
+        assert_eq!(r[1].as_i64(), Some(0), "skip_holidays default");
+        assert_eq!(r[2].as_str(), None, "multi_zone_ids default");
+        assert_eq!(r[4].as_i64(), Some(0), "one_shot default");
+        assert_eq!(r[5].as_str(), Some("42"), "numeric source_id kept");
+        assert_eq!(r[7].as_i64(), Some(60), "fade_duration_s default");
     }
 
     // ── Sealed streaming tokens ─────────────────────────────────────
