@@ -1745,7 +1745,9 @@ pub(super) struct ExportConfigQuery {
     include_secrets: bool,
 }
 
-/// `GET /system/config/export` — sauvegarde de la table `settings`.
+/// `GET /system/config/export` — sauvegarde de la table `settings` ET des
+/// zones (fil forum 2110), au format versionné de
+/// [`tune_core::config_export`].
 ///
 /// **Réservée à l'administrateur** (#2793). Sans `RequireAdmin`, le
 /// middleware d'authentification se contentait de vérifier qu'un jeton était
@@ -1754,85 +1756,102 @@ pub(super) struct ExportConfigQuery {
 /// compris. `RequireAdmin` laisse passer sans condition quand l'authentification
 /// est désactivée (`auth.rs:502`), donc l'installation mono-utilisateur, qui est
 /// le cas courant, ne voit aucun changement.
+///
+/// Par défaut, les secrets sont RETIRÉS (pas masqués) par
+/// `tune_core::secrets::retirer_les_secrets` : une sauvegarde se ré-importe,
+/// et poser `********` à la place de `jwt_secret` écraserait le vrai secret à
+/// la restauration ; l'absence de la clé, elle, laisse la valeur en place.
+/// `?include_secrets=true` reste le mode « migration vers un serveur neuf »
+/// pour les seuls réglages ; les réglages de zone n'en portent jamais.
 pub(super) async fn export_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
-) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let all = settings.all().unwrap_or_default();
-    let mut config = serde_json::Map::new();
-    for (k, v) in all {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
-            config.insert(k, parsed);
-        } else {
-            config.insert(k, Value::String(v));
-        }
-    }
-    // By default, omit secrets so a shared or leaked backup file carries no
-    // credentials. import_config merges (it only sets keys present in the
-    // payload), so restoring a redacted backup to the SAME server leaves the
-    // existing secrets untouched. Pass ?include_secrets=true for a full backup
-    // when migrating to a fresh server.
-    //
-    // La liste de trois retraits nommés à la main a été remplacée par la même
-    // règle que `get_config` : c'était la seconde des « listes partielles » de
-    // #2793, et elle ne connaissait ni la graine AirPlay ni les clés
-    // développeur.
-    //
-    // On RETIRE, on ne masque pas — c'est la différence avec `get_config`, et
-    // elle est délibérée : une sauvegarde se ré-importe. Poser `********` à la
-    // place de `jwt_secret` écraserait le vrai secret de signature à la
-    // restauration ; l'absence de la clé, elle, est ce que `import_config` sait
-    // déjà ignorer.
-    if !q.include_secrets {
-        tune_core::secrets::retirer_les_secrets(&mut config);
-    }
-    Json(Value::Object(config))
+) -> Result<Json<Value>, AppError> {
+    tune_core::config_export::exporter(&state.backend, q.include_secrets)
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("configuration export failed: {e}")))
 }
 
-/// `POST /system/config/import` — restauration de réglages.
+#[derive(Deserialize)]
+pub(super) struct ImportConfigQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /system/config/import` — restauration de réglages et de zones.
 ///
 /// **Réservée à l'administrateur** (#2793) : la route appelait `settings.set`
 /// sur chaque clé reçue, donc un utilisateur standard pouvait poster
 /// `{"auth_enabled": "false"}` et éteindre l'authentification du serveur.
 ///
-/// L'application est en DEUX TEMPS : tout le corps est validé et converti
-/// d'abord, et rien n'est écrit tant qu'une entrée est refusée. Avant, la
-/// validation vivait dans la boucle d'écriture, donc un corps dont la dixième
-/// entrée était invalide laissait les neuf premières appliquées.
+/// Lit les deux formats : l'ancien export à plat (sans zones) et le format
+/// versionné. Les zones sont rapprochées par identifiant d'appareil ; une zone
+/// dont l'appareil n'a pas de zone ici est créée hors ligne ; aucune zone n'est
+/// supprimée. Voir [`tune_core::config_export`].
 ///
-/// Une écriture qui échoue en cours de route est désormais DITE (`500`) avec
-/// le nombre de clés déjà appliquées, au lieu d'être avalée par un
-/// `if ….is_ok()` qui rendait `200` et un compte silencieusement trop bas :
-/// l'appelant croyait sa restauration complète.
+/// `?dry_run=true` rend l'aperçu — réglages et zones ajoutés, modifiés,
+/// inchangés — sans RIEN écrire. L'aperçu et l'import sont le même plan
+/// (`planifier`), l'import l'exécute (`appliquer`).
+///
+/// L'application est en DEUX TEMPS : tout le corps est validé et le plan
+/// calculé d'abord, et rien n'est écrit tant qu'une entrée est refusée. Une
+/// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
+/// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut a_ecrire: Vec<(String, String)> = Vec::with_capacity(body.len());
-    for (key, value) in body {
-        if key.trim().is_empty() {
-            return Err(AppError::bad_request("empty setting key"));
-        }
-        let str_val = match value {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        a_ecrire.push((key, str_val));
+    use tune_core::config_export as ce;
+    let fichier = ce::lire(body).map_err(AppError::bad_request)?;
+    let plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    let mut reponse = ce::rapport(&plan);
+    if q.dry_run {
+        reponse["dry_run"] = json!(true);
+        return Ok(Json(reponse));
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut imported = 0;
-    for (key, str_val) in a_ecrire {
-        settings.set(&key, &str_val).map_err(|e| {
-            AppError::internal(format!(
-                "import stopped after {imported} settings: writing '{key}' failed: {e}"
-            ))
-        })?;
-        imported += 1;
+    let bilan = ce::appliquer(&state.backend, &plan).map_err(AppError::internal)?;
+    for id in &bilan.zones_creees {
+        let v = crate::routes::playback::build_zone_json(&state, *id).await;
+        state
+            .event_bus
+            .emit_typed(tune_core::event_types::EventType::ZoneCreated, v);
     }
-    Ok(Json(json!({ "imported": imported })))
+    for id in &bilan.zones_modifiees {
+        let v = crate::routes::playback::build_zone_json(&state, *id).await;
+        state
+            .event_bus
+            .emit_typed(tune_core::event_types::EventType::ZoneUpdated, v);
+    }
+    reponse["dry_run"] = json!(false);
+    reponse["imported"] = json!(bilan.reglages_ecrits);
+    reponse["zones_added"] = json!(bilan.zones_creees.len());
+    reponse["zones_modified"] = json!(bilan.zones_modifiees.len());
+    reponse["warnings"] = json!(bilan.avertissements);
+    Ok(Json(reponse))
+}
+
+/// `POST /system/config/import/preview` — l'aperçu seul, sous un chemin à lui.
+///
+/// Même chose que `POST /system/config/import?dry_run=true`, mais un serveur
+/// ANTÉRIEUR à l'aperçu ne connaît pas ce chemin et répond 404 / 405 : le
+/// client sait alors qu'il n'y a pas d'aperçu. Le même serveur, appelé avec
+/// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
+/// pourquoi l'écran passe par ici.
+pub(super) async fn preview_import_config(
+    admin: crate::auth::RequireAdmin,
+    state: State<AppState>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    import_config(
+        admin,
+        state,
+        Query(ImportConfigQuery { dry_run: true }),
+        Json(body),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

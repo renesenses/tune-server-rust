@@ -16,6 +16,7 @@ pub mod collaborative;
 pub mod confidentialite;
 pub mod config;
 pub mod config_backup;
+pub mod config_export;
 pub mod credentials_vault;
 pub mod dac_calibration;
 pub mod dashboard;
