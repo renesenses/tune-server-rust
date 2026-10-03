@@ -2801,7 +2801,7 @@ struct CreateAlarmGlobal {
     fade_duration_s: Option<i32>,
     fade_in_seconds: Option<i32>,
     enabled: Option<bool>,
-    /// 7-char bitmask "1010100" (Mon..Sun). Premium only for non-"1111111".
+    /// 7-char bitmask "1010100" (Mon..Sun). Free (Bertrand, 03/10/2026).
     days_of_week: Option<String>,
     /// JSON array of zone IDs, e.g. "[1,3,5]". Premium only.
     multi_zone_ids: Option<String>,
@@ -2878,7 +2878,8 @@ async fn create_alarm_global(
         }
     }
 
-    // Free tier: no advanced fields
+    // Free tier: days and fade-in are free (Bertrand, 03/10/2026, #5669) —
+    // only multi-zone stays Premium here.
     let fade_in_seconds = body.fade_in_seconds.unwrap_or(0);
     let days_of_week = match alarm_days_mask(body.days.as_deref(), body.days_of_week.as_deref()) {
         Ok(m) => m.unwrap_or_else(|| "1111111".into()),
@@ -2887,17 +2888,15 @@ async fn create_alarm_global(
     let multi_zone_ids = body.multi_zone_ids.clone().unwrap_or_default();
 
     if !is_premium {
-        let has_fade = fade_in_seconds > 0;
         let has_multi_zone = !multi_zone_ids.is_empty() && multi_zone_ids != "[]";
-        let has_day_selection = days_of_week != "1111111";
 
-        if has_fade || has_multi_zone || has_day_selection {
+        if has_multi_zone {
             return (
                 StatusCode::PAYMENT_REQUIRED,
                 Json(json!({
                     "error": "premium_required",
                     "feature": "Advanced Alarms",
-                    "message": "Fade-in, multi-zone, and day scheduling require Tune Premium.",
+                    "message": "Multi-zone alarms require Tune Premium.",
                     "upgrade_url": "https://mozaiklabs.fr/pricing"
                 })),
             )
@@ -2967,27 +2966,23 @@ async fn update_alarm(
         Err(resp) => return Ok(resp),
     };
 
-    // Gate advanced fields for Free tier
+    // Free tier: days and fade-in are free (Bertrand, 03/10/2026, #5669) —
+    // only multi-zone stays Premium here.
     let is_premium = state.license.is_premium().await;
     if !is_premium {
-        let has_fade = body.fade_in_seconds.map(|v| v > 0).unwrap_or(false);
         let has_multi_zone = body
             .multi_zone_ids
             .as_ref()
             .map(|s| !s.is_empty() && s != "[]")
             .unwrap_or(false);
-        let has_day_selection = days_of_week
-            .as_ref()
-            .map(|s| s != "1111111")
-            .unwrap_or(false);
 
-        if has_fade || has_multi_zone || has_day_selection {
+        if has_multi_zone {
             return Ok((
                 StatusCode::PAYMENT_REQUIRED,
                 Json(json!({
                     "error": "premium_required",
                     "feature": "Advanced Alarms",
-                    "message": "Fade-in, multi-zone, and day scheduling require Tune Premium.",
+                    "message": "Multi-zone alarms require Tune Premium.",
                     "upgrade_url": "https://mozaiklabs.fr/pricing"
                 })),
             )

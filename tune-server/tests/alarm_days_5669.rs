@@ -155,25 +155,45 @@ async fn i5669_jour_invalide_refuse_en_422() {
 }
 
 #[tokio::test]
-async fn i5669_gratuit_le_choix_des_jours_passe_par_la_meme_porte() {
-    // Le palier gratuit refusait déjà `days_of_week != 1111111` (402). Passer
-    // par `days` contournait la porte… et le réveil sonnait tous les jours.
+async fn i5669_gratuit_jours_et_montee_sans_licence() {
+    // Bertrand, 03/10/2026 : « Jours et montée gratuits ».
     let s = etat(false).await;
-    let (st, v) = request(
-        &s,
-        Method::POST,
-        "/api/v1/alarms",
-        reveil(json!("0,1,2,3,4"), None),
-    )
-    .await;
-    assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{v}");
-    let id = creer(&s, reveil(json!("daily"), None)).await;
-    assert_eq!(jours_du_planificateur(&s, id), (0..7).collect::<Vec<_>>());
+    let mut b = reveil(json!("0,1,2,3,4"), Some("1111100"));
+    b["fade_in_seconds"] = json!(30);
+    let (st, v) = request(&s, Method::POST, "/api/v1/alarms", b).await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    assert_eq!(jours_du_planificateur(&s, id), vec![0, 1, 2, 3, 4]);
     let (st, v) = request(
         &s,
         Method::PUT,
         &format!("/api/v1/alarms/{id}"),
-        json!({"days": "0,1,2,3,4"}),
+        json!({"days": "5,6", "fade_in_seconds": 45}),
+    )
+    .await;
+    assert!(st.is_success(), "{st}: {v}");
+    assert_eq!(jours_du_planificateur(&s, id), vec![SAMEDI, DIMANCHE]);
+}
+
+#[tokio::test]
+async fn i5669_gratuit_les_autres_verrous_restent() {
+    let s = etat(false).await;
+    let id = creer(&s, reveil(json!("weekdays"), None)).await;
+    // Multi-zone : toujours Premium, en mise à jour comme en création.
+    let (st, v) = request(
+        &s,
+        Method::PUT,
+        &format!("/api/v1/alarms/{id}"),
+        json!({"multi_zone_ids": "[1,2]"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{v}");
+    // Un seul réveil au palier gratuit.
+    let (st, v) = request(
+        &s,
+        Method::POST,
+        "/api/v1/alarms",
+        reveil(json!("daily"), None),
     )
     .await;
     assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{v}");
