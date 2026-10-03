@@ -272,6 +272,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // 077, alors que `tag_item` nomme la colonne. TEXT comme côté SQLite, NULL
     // pour l'existant.
     "ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT",
+    // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
+    // même raison : une base de bascule ne rejouera jamais la 078, alors que
+    // l'écriture de la file, des favoris et de l'historique nomme la colonne.
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT",
 ];
 
 #[derive(Clone)]

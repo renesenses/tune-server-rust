@@ -24,6 +24,7 @@ async fn paused_browser() -> (AppState, i64, String) {
             duration_ms: 300_000,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         })
         .collect();
     queue.append(zid, &items).unwrap();

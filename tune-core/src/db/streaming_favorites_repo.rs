@@ -142,6 +142,33 @@ pub mod sql {
         )
     }
 
+    /// Pose la référence d'album sur un favori qui n'en a pas — et SEULEMENT
+    /// là (fil 2121, migration 114). Même garde que
+    /// [`premiere_vue_si_absente`] : sans effet sur une ligne déjà renseignée.
+    pub fn completer_album_ref<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET album_ref = {} \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+               AND album_ref IS NULL",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+        )
+    }
+
+    pub fn album_ref<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT album_ref FROM streaming_favorites \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+        )
+    }
+
     pub fn remove<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM streaming_favorites \
@@ -296,7 +323,58 @@ impl StreamingFavoritesRepo {
             &cover_url,
         ];
         self.db.execute(&sql, &params)?;
+        self.completer_reference_d_album(pid, item_type, service, service_id);
         Ok(())
+    }
+
+    /// Fil 2121 — un favori Bandcamp reçoit la référence d'album (l'adresse de
+    /// la page) que la file ou l'historique connaissent déjà pour cette piste.
+    ///
+    /// Le client n'envoie que `service_id`, et pour Bandcamp c'est une URL de
+    /// flux qui expirera : sans la page, le favori ne pourrait plus jamais être
+    /// resigné. Ne fait rien pour les autres services, ni quand la page n'est connue nulle
+    /// part : le favori reste alors comme avant la migration 114. Une erreur
+    /// de base ici n'annule pas l'ajout — le favori est écrit, seule la
+    /// référence manque.
+    fn completer_reference_d_album(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+    ) {
+        // `bandcamp`, ou la clé locale `__bandcamp__` que le client web pose
+        // sur les vignettes de l'onglet Bandcamp (voir `favorites_identity`).
+        if !service.contains("bandcamp") {
+            return;
+        }
+        let Some(page) = super::reference_d_album::reference_d_album_bandcamp(&self.db, service_id)
+        else {
+            return;
+        };
+        let sql = self.dialect_sql(sql::completer_album_ref, sql::completer_album_ref);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 5] = [&page, &profile_id, &item_type, &service, &service_id];
+        let _ = self.db.execute(&sql, &params);
+    }
+
+    /// La référence d'album rangée avec ce favori (fil 2121), ou `None`.
+    pub fn reference_d_album(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+    ) -> Result<Option<String>, String> {
+        let sql = self.dialect_sql(sql::album_ref, sql::album_ref);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 4] = [&profile_id, &item_type, &service, &service_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
     /// Ajoute un favori avec la date que le SERVICE lui donne (`created_at`,
@@ -335,6 +413,7 @@ impl StreamingFavoritesRepo {
             &date,
         ];
         self.db.execute(&sql, &params)?;
+        self.completer_reference_d_album(pid, item_type, service, service_id);
         Ok(())
     }
 

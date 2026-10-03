@@ -1177,6 +1177,7 @@ impl PositionPoller {
                                             media_format: None,
                                             track_number: None,
                                             disc_number: None,
+                                            album_ref: None,
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
