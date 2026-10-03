@@ -54,7 +54,7 @@ pub mod sql {
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position, context_source, context_title, context_cover) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position, context_source, context_title, context_cover, album_ref) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -71,7 +71,8 @@ pub mod sql {
             d.placeholder(14),
             d.placeholder(15),
             d.placeholder(16),
-            d.placeholder(17)
+            d.placeholder(17),
+            d.placeholder(18)
         )
     }
 
@@ -242,7 +243,7 @@ pub mod sql {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListenRecord {
     pub id: Option<i64>,
     pub track_id: Option<i64>,
@@ -299,6 +300,14 @@ pub struct ListenRecord {
     pub context_title: Option<String>,
     /// La POCHETTE de l'objet demande, meme regle que `context_title`.
     pub context_cover: Option<String>,
+    /// La référence d'album du service de la piste jouée
+    /// (`StreamTrack.album_id`, migration 114 / PG 078) — pour Bandcamp,
+    /// l'adresse de la page qui permet de resigner une URL de flux expirée
+    /// (fil 2121). ÉCRITE seulement : la liste de l'historique ne la relit pas
+    /// (elle n'a rien à en faire), et la clé n'apparaît pas dans son JSON.
+    /// C'est `db::reference_d_album` qui la retrouve au besoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_ref: Option<String>,
 }
 
 pub struct HistoryRepo {
@@ -327,7 +336,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 17] = [
+        let params: [&dyn ToSqlValue; 18] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -345,6 +354,7 @@ impl HistoryRepo {
             &rec.context_source,
             &rec.context_title,
             &rec.context_cover,
+            &rec.album_ref,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -1620,6 +1630,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         context_source: None,
         context_title: None,
         context_cover: None,
+        album_ref: None,
     }
 }
 
@@ -1711,6 +1722,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         }
     }
 
@@ -1831,6 +1843,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         };
         repo.record(&depuis_une_playlist).unwrap();
 
@@ -1916,6 +1929,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         };
 
         repo.record(&rec).unwrap();
@@ -1957,6 +1971,7 @@ mod tests {
                 context_source: None,
                 context_title: None,
                 context_cover: None,
+                album_ref: None,
             })
             .unwrap();
         }
@@ -1981,6 +1996,7 @@ mod tests {
                 context_source: None,
                 context_title: None,
                 context_cover: None,
+                album_ref: None,
             })
             .unwrap();
         }
@@ -2017,6 +2033,7 @@ mod tests {
                 context_source: None,
                 context_title: None,
                 context_cover: None,
+                album_ref: None,
             })
             .unwrap();
         }
@@ -2052,6 +2069,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -2080,6 +2098,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -2102,6 +2121,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         })
         .unwrap();
 
@@ -2135,6 +2155,7 @@ mod tests {
                 context_source: None,
                 context_title: None,
                 context_cover: None,
+                album_ref: None,
             })
             .unwrap();
         }
@@ -2151,12 +2172,14 @@ mod tests {
         // 17 colonnes : aux onze d'origine se sont ajoutees `context_type` et
         // `context_id` (migration 84, #2441), `context_position`
         // (migration 94), puis `context_source`, `context_title` et
-        // `context_cover` (migration 105).
+        // `context_cover` (migration 105) ; 18 avec `album_ref` (migration
+        // 114, fil 2121).
         assert!(
-            sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            sql::record(&s)
+                .contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         );
         assert!(sql::record(&p).contains(
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)"
         ));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
@@ -2192,6 +2215,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         })
         .unwrap();
 
@@ -2229,6 +2253,7 @@ mod tests {
             context_source: None,
             context_title: None,
             context_cover: None,
+            album_ref: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -2290,6 +2315,7 @@ mod tests {
                 context_source: None,
                 context_title: None,
                 context_cover: None,
+                album_ref: None,
             })
             .expect("ecoute enregistree");
         // `record` laisse la base dater la ligne ; on la repositionne pour que

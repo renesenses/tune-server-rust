@@ -141,7 +141,7 @@ pub mod sql {
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -152,13 +152,14 @@ pub mod sql {
             d.placeholder(8),
             d.placeholder(9),
             d.placeholder(10),
-            d.placeholder(11)
+            d.placeholder(11),
+            d.placeholder(12)
         )
     }
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number, album_ref FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
             d.placeholder(1)
         )
     }
@@ -208,7 +209,7 @@ pub mod sql {
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
                 COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
-                q.track_number, q.disc_number \
+                q.track_number, q.disc_number, q.album_ref \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
          LEFT JOIN albums al ON t.album_id = al.id \
@@ -400,6 +401,13 @@ pub struct QueueEntry {
     /// Album disc number (streaming items only). NULL for pre-existing rows and
     /// local items. Lets multi-disc streaming albums keep per-disc numbering.
     pub disc_number: Option<i64>,
+    /// La référence d'album du service (`StreamTrack.album_id`), pistes de
+    /// service seulement — migration 114. Pour Bandcamp, l'adresse de la page
+    /// qui permet de resigner une URL de flux expirée (fil 2121). NULL pour
+    /// les lignes antérieures, les pistes locales, et toute entrée dont la
+    /// source ne l'a pas donnée.
+    #[serde(default)]
+    pub album_ref: Option<String>,
 }
 
 impl QueueEntry {
@@ -424,6 +432,9 @@ pub enum QueueInput {
         duration_ms: i64,
         track_number: Option<i64>,
         disc_number: Option<i64>,
+        /// Référence d'album du service (`StreamTrack.album_id`), quand la
+        /// source l'a donnée — voir [`QueueEntry::album_ref`].
+        album_ref: Option<String>,
     },
 }
 
@@ -1070,8 +1081,9 @@ impl PlayQueueRepo {
                         duration_ms,
                         track_number,
                         disc_number,
+                        album_ref,
                     } => {
-                        let p: [&dyn ToSqlValue; 11] = [
+                        let p: [&dyn ToSqlValue; 12] = [
                             &zone_id,
                             &pos,
                             source_id,
@@ -1083,6 +1095,7 @@ impl PlayQueueRepo {
                             source,
                             track_number,
                             disc_number,
+                            album_ref,
                         ];
                         tx.execute(&insert_streaming_sql, &p)?;
                         retenus.push(i);
@@ -1250,6 +1263,22 @@ impl PlayQueueRepo {
         zone_id: i64,
         tracks: &[StreamingQueueItem],
     ) -> Result<(), String> {
+        self.set_streaming_queue_avec_albums(zone_id, tracks, &[])
+    }
+
+    /// Comme [`Self::set_streaming_queue`], avec la référence d'album du
+    /// service de chaque piste (`StreamTrack.album_id`, migration 114).
+    ///
+    /// `album_refs[i]` va à `tracks[i]` ; une liste plus courte (ou vide) laisse
+    /// NULL aux pistes restantes. C'est ce qui permet au relais Bandcamp de
+    /// resigner une URL de flux expirée (fil 2121) : la page album est la
+    /// seule source d'une signature fraîche.
+    pub fn set_streaming_queue_avec_albums(
+        &self,
+        zone_id: i64,
+        tracks: &[StreamingQueueItem],
+        album_refs: &[Option<String>],
+    ) -> Result<(), String> {
         let delete_local_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
@@ -1273,7 +1302,8 @@ impl PlayQueueRepo {
             ) in tracks.iter().enumerate()
             {
                 let pos = i as i64;
-                let p: [&dyn ToSqlValue; 11] = [
+                let album_ref: Option<&str> = album_refs.get(i).and_then(|r| r.as_deref());
+                let p: [&dyn ToSqlValue; 12] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1285,6 +1315,7 @@ impl PlayQueueRepo {
                     source,
                     track_no,
                     disc_no,
+                    &album_ref,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1350,7 +1381,9 @@ impl PlayQueueRepo {
             ) in tracks.iter().enumerate()
             {
                 let pos = current_count + i as i64;
-                let p: [&dyn ToSqlValue; 11] = [
+                // La forme en n-uplet ne porte pas de référence d'album.
+                let album_ref: Option<&str> = None;
+                let p: [&dyn ToSqlValue; 12] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1362,6 +1395,7 @@ impl PlayQueueRepo {
                     source,
                     track_no,
                     disc_no,
+                    &album_ref,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1387,6 +1421,7 @@ impl PlayQueueRepo {
                     "source": cols.get(7).and_then(|v| v.as_string()),
                     "track_number": cols.get(8).and_then(|v| v.as_i64()),
                     "disc_number": cols.get(9).and_then(|v| v.as_i64()),
+                    "album_ref": cols.get(10).and_then(|v| v.as_string()),
                 })
             })
             .collect();
@@ -1433,7 +1468,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     }
 }
 
-/// Maps a row from `sql::unified_select_base()` (18 columns) to a QueueEntry.
+/// Maps a row from `sql::unified_select_base()` (19 columns) to a QueueEntry.
 fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1454,6 +1489,7 @@ fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
         bit_depth: cols.get(15).and_then(|v| v.as_i64()),
         track_number: cols.get(16).and_then(|v| v.as_i64()),
         disc_number: cols.get(17).and_then(|v| v.as_i64()),
+        album_ref: cols.get(18).and_then(|v| v.as_string()),
     }
 }
 
@@ -1880,7 +1916,7 @@ mod tests {
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
         assert!(
             sql::insert_streaming(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)")
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)")
         );
         // The new per-album numbering columns must ride along the streaming insert.
         assert!(sql::insert_streaming(&s).contains("track_number"));
@@ -1950,7 +1986,65 @@ mod tests {
             duration_ms: 200_000,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         }
+    }
+
+    /// Fil 2121 — la référence d'album d'une piste de service entre en file
+    /// et en ressort, par les deux écritures (entrées unifiées et liste de
+    /// pistes d'un album) et par les deux lectures (`get_ordered`/`get_at` et
+    /// la vue streaming qui sert au transfert de zone).
+    #[test]
+    fn la_reference_d_album_entre_en_file_et_en_ressort_2121() {
+        const PAGE: &str = "https://artiste.bandcamp.com/album/disque";
+        let repo = PlayQueueRepo::new(test_db());
+        let mut avec = streaming("https://t4.bcbits.com/stream/e4/mp3-128/1?ts=1", "Avec");
+        if let QueueInput::Streaming { album_ref, .. } = &mut avec {
+            *album_ref = Some(PAGE.into());
+        }
+        repo.append(1, &[avec, streaming("q2", "Sans")]).unwrap();
+        let file = repo.get_ordered(1).unwrap();
+        assert_eq!(file[0].album_ref.as_deref(), Some(PAGE));
+        assert_eq!(file[1].album_ref, None, "sans référence donnée, NULL");
+        assert_eq!(
+            repo.get_at(1, 0).unwrap().unwrap().album_ref.as_deref(),
+            Some(PAGE)
+        );
+
+        // La liste de pistes d'un album (route `streaming_album_id`).
+        let piste = |id: &str| {
+            (
+                id.to_string(),
+                format!("Titre {id}"),
+                "Artiste".to_string(),
+                None,
+                None,
+                1_000i64,
+                Some("bandcamp".to_string()),
+                None,
+                None,
+            )
+        };
+        repo.set_streaming_queue_avec_albums(
+            1,
+            &[piste("a"), piste("b"), piste("c")],
+            &[Some(PAGE.into()), None],
+        )
+        .unwrap();
+        let refs: Vec<Option<String>> = repo
+            .get_ordered(1)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.album_ref)
+            .collect();
+        assert_eq!(
+            refs,
+            vec![Some(PAGE.to_string()), None, None],
+            "chaque piste reçoit SA référence ; une liste courte laisse NULL"
+        );
+        let vue = repo.get_streaming_queue(1).unwrap();
+        assert_eq!(vue[0]["album_ref"].as_str(), Some(PAGE));
+        assert!(vue[1]["album_ref"].is_null());
     }
 
     #[test]

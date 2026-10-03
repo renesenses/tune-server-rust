@@ -725,6 +725,11 @@ CREATE TABLE IF NOT EXISTS zones (
 -- local tracks (track_id set, source='local') and streaming tracks (source_id
 -- + inline metadata). Replaces the play_queue / streaming_queue split. Local
 -- display fields (title/artist/...) stay NULL and are joined from tracks.
+-- `album_ref` : référence d'album du service (`StreamTrack.album_id`) — pour
+-- Bandcamp, la page qui permet de resigner une URL de flux expirée (fil 2121).
+-- Jumelle de la migration SQLite 114 et de la PG 078. Commentaire HORS du
+-- CREATE : un commentaire entre deux colonnes casse `ALTER TABLE … DROP
+-- COLUMN` de SQLite (« incomplete input »).
 CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
@@ -739,7 +744,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     cover_url TEXT,
     duration_ms INTEGER DEFAULT 0,
     track_number INTEGER,
-    disc_number INTEGER
+    disc_number INTEGER,
+    album_ref TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
