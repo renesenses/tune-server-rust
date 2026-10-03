@@ -2859,12 +2859,27 @@ async fn spawn_library_scan_avec_lecteur(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
-        if !scan_cancel_requested() {
+        // #5682 (fil 2115) — pas quand une racine manquait ou s'est vidée : un
+        // partage pas encore monté faisait voir chaque fichier source
+        // « disparu », et retirait les pochettes de pistes pourtant conservées.
+        if tune_core::library::pochette_disque::le_suivi_peut_conclure(
+            scan_cancel_requested(),
+            &missing_dirs,
+            &racines_videes,
+        ) {
             tune_core::library::pochette_disque::suivre_les_fichiers_sources(
                 &db,
                 &cache_dir,
                 &portee_pochettes,
+                &error_dirs,
                 force,
+            );
+        } else if !scan_cancel_requested() {
+            tracing::warn!(
+                missing = ?missing_dirs,
+                emptied = ?racines_videes,
+                "post_scan_pochettes_non_suivies — racine absente ou vidée : les pochettes \
+                 tirées du disque sont CONSERVÉES (#5682)"
             );
         }
 
@@ -3004,11 +3019,21 @@ async fn spawn_library_scan_avec_lecteur(
         // la garde `full_scan_ok` : elle ne supprime rien qui ne soit absorbé.
         // #5685 — un coffret qui vient d'être réuni prend tout de suite
         // l'image du dossier qui réunit ses disques.
+        // #5682 — même garde que la passe de fin de scan : rien n'est conclu
+        // d'une racine absente ou vidée.
         if tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan").reunis > 0
-            && !scan_cancel_requested()
+            && tune_core::library::pochette_disque::le_suivi_peut_conclure(
+                scan_cancel_requested(),
+                &missing_dirs,
+                &racines_videes,
+            )
         {
             tune_core::library::pochette_disque::suivre_les_fichiers_sources(
-                &db, &cache_dir, &[], force,
+                &db,
+                &cache_dir,
+                &[],
+                &error_dirs,
+                force,
             );
         }
 

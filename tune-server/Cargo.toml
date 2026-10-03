@@ -1388,3 +1388,10 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 [[test]]
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
+
+# #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
+# partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
+# `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
+[[test]]
+name = "smb_dialect_seam"
+path = "tests/smb_dialect_seam.rs"

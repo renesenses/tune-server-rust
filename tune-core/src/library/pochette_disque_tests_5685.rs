@@ -117,7 +117,7 @@ fn le_cover_jpg_a_la_racine_du_coffret_gagne_5685() {
     let aid = album(&db, "Elgar", &[(&cd1, 1), (&cd2, 2)]);
     illustre_par_la_jaquette(&db, aid, &cd1);
 
-    let reprises = suivre_les_fichiers_sources(&db, &cache, &[], false);
+    let reprises = suivre_les_fichiers_sources(&db, &cache, &[], &[], false);
 
     assert_eq!(
         pochette(&db, aid),
@@ -126,7 +126,7 @@ fn le_cover_jpg_a_la_racine_du_coffret_gagne_5685() {
     );
     assert_eq!(reprises, 1);
     // Et la passe suivante n'y revient pas : l'image en place est la bonne.
-    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], false), 0);
+    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], &[], false), 0);
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn l_image_du_dossier_du_disque_passe_avant_la_jaquette_5685() {
     // scan lui fait prendre l'image du dossier.
     let aid = album(&db, "Album", &[(&p1, 1), (&p2, 1)]);
     illustre_par_la_jaquette(&db, aid, &p1);
-    suivre_les_fichiers_sources(&db, &cache, &[], false);
+    suivre_les_fichiers_sources(&db, &cache, &[], &[], false);
     assert_eq!(
         pochette(&db, aid),
         (Some(content_hash(DISQUE)), Some(SourcePochette::Dossier))
@@ -189,7 +189,7 @@ fn la_jaquette_seule_ne_change_pas_5685() {
     let aid = album(&db, "Elgar", &[(&cd1, 1), (&cd2, 2)]);
     illustre_par_la_jaquette(&db, aid, &cd1);
 
-    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], false), 0);
+    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], &[], false), 0);
     assert_eq!(
         pochette(&db, aid),
         (Some(content_hash(JAQUETTE)), Some(SourcePochette::Integree))
@@ -216,7 +216,7 @@ fn une_pochette_televersee_n_est_jamais_ecrasee_5685() {
         Some(SourcePochette::Televersee),
     );
 
-    suivre_les_fichiers_sources(&db, &cache, &[], true);
+    suivre_les_fichiers_sources(&db, &cache, &[], &[], true);
     assert_eq!(pochette(&db, aid), attendu, "fin de scan");
     reevaluer_l_album(&db, aid, &cache, true, None);
     assert_eq!(pochette(&db, aid), attendu, "reprise par album");
@@ -247,7 +247,7 @@ fn le_dossier_commun_n_est_retenu_que_s_il_n_abrite_que_l_album_5685() {
     album(&db, "Enigma", &[(&autre, 1)]);
     illustre_par_la_jaquette(&db, aid, &a);
 
-    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], false), 0);
+    assert_eq!(suivre_les_fichiers_sources(&db, &cache, &[], &[], false), 0);
     assert_eq!(pochette(&db, aid).0, Some(content_hash(JAQUETTE)));
 }
 
