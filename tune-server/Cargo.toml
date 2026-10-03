@@ -1384,3 +1384,11 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 [[test]]
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
+
+# Fil forum 2110 (ticket 221) — l'export gratuit de configuration porte les
+# zones ; import rapproché par appareil, zone sans appareil hors ligne, aperçu
+# (`?dry_run=true`) sans écriture. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "config_export_zones"
+path = "tests/config_export_zones.rs"
