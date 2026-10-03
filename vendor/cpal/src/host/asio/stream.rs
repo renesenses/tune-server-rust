@@ -878,7 +878,7 @@ impl Drop for Stream {
 /// Tune (#5643): drop the device's ASIO buffer handles. Callbacks see
 /// `None` and return before the buffers are released. The lock is not held
 /// across `ASIODisposeBuffers`: the driver's callback thread may wait on it.
-fn forget_asio_buffers(asio_streams: &Mutex<sys::AsioStreams>) {
+pub(super) fn forget_asio_buffers(asio_streams: &Mutex<sys::AsioStreams>) {
     let mut streams = asio_streams.lock().unwrap();
     streams.input = None;
     streams.output = None;
