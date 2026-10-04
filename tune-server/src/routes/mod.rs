@@ -292,7 +292,7 @@ async fn api_fallback(
 
 /// Minimal HTML-entity escaping for untrusted text reflected into a page on the
 /// server's own origin. Order matters: `&` first so we don't double-escape.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
