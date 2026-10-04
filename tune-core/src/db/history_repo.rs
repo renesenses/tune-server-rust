@@ -304,9 +304,10 @@ pub struct ListenRecord {
     /// (`StreamTrack.album_id`, migration 114 / PG 078) — pour Bandcamp,
     /// l'adresse de la page qui permet de resigner une URL de flux expirée
     /// (fil 2121). ÉCRITE seulement : la liste de l'historique ne la relit pas
-    /// (elle n'a rien à en faire), et la clé n'apparaît pas dans son JSON.
+    /// (elle n'a rien à en faire), et la clé n'apparaît JAMAIS dans son JSON :
+    /// référence interne de resignature, pas un changement de contrat.
     /// C'est `db::reference_d_album` qui la retrouve au besoin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub album_ref: Option<String>,
 }
 

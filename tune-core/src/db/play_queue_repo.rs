@@ -406,7 +406,11 @@ pub struct QueueEntry {
     /// qui permet de resigner une URL de flux expirée (fil 2121). NULL pour
     /// les lignes antérieures, les pistes locales, et toute entrée dont la
     /// source ne l'a pas donnée.
-    #[serde(default)]
+    ///
+    /// Référence INTERNE de resignature : jamais sérialisée, donc absente de
+    /// `GET /zones/{id}/queue` et de tout JSON bâti sur cette structure — le
+    /// contrat de la file ne change pas (`file_promet_l_enchainement.rs`).
+    #[serde(default, skip_serializing)]
     pub album_ref: Option<String>,
 }
 
