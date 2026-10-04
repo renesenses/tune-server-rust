@@ -538,7 +538,7 @@ fn double_par_un_local(engine: Engine, alias: &str) -> String {
 /// aucun index ne sert une expression, et SQLite parcourait `albums` en
 /// entier pour CHAQUE ligne de la requête englobante — 9 427 × 9 427 sur la
 /// base du .18, 28 s par `COUNT`, exécuté deux fois par page de la grille.
-/// C'est le piège déjà mesuré par [`super::home_queries::HISTORIQUE_VERS_ALBUM`]
+/// C'est le piège déjà mesuré par [`super::home_queries::repli_par_artiste_ou_titre_seul`]
 /// (19 ms contre 83 s), retombé ici une seconde fois.
 ///
 /// * SQLite : `idx_albums_title ON albums(title COLLATE NOCASE)` existe
