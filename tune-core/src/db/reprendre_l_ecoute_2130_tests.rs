@@ -18,13 +18,22 @@
 //! * sur PostgreSQL (`TUNE_TEST_PG_URL`) : mêmes lignes, la 079 pose l'index
 //!   et se saute sans erreur quand la colonne n'existe pas encore, et le plan
 //!   et la durée avant / après sont imprimés.
+//!
+//! Les deux AUTRES appelants de l'ancienne jointure (« genres les plus
+//! écoutés », « albums non écoutés d'un genre ») gardaient le `OR`. Ils sont
+//! réécrits de la même façon (`top_genres_ecoutes`,
+//! `albums_du_genre_non_ecoutes`) et passent les mêmes preuves : mêmes
+//! lignes que l'ancienne écriture sur les deux moteurs, mesure avant / après
+//! sur PostgreSQL. La constante `HISTORIQUE_VERS_ALBUM` a disparu avec eux :
+//! plus aucune requête ne joint par un `OR`.
 
 use std::sync::Arc;
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::Engine;
 use super::home_queries::{
-    continue_listening_albums_deduits, continue_listening_albums_du_contexte,
+    albums_du_genre_non_ecoutes, continue_listening_albums_deduits,
+    continue_listening_albums_du_contexte, top_genres_ecoutes,
 };
 use super::sqlite::SqliteDb;
 
@@ -81,6 +90,41 @@ fn ancienne_du_contexte(ids: &[i64]) -> String {
          LEFT JOIN listen_history lh ON {ANCIENNE_JOINTURE} \
          WHERE a.id IN ({liste}) \
          GROUP BY {COLONNES_ALBUM}, a.track_count"
+    )
+}
+
+/// L'ancien `sql_top_genres` (`tune-server/src/routes/home.rs`), au
+/// caractère près.
+fn ancienne_top_genres() -> String {
+    format!(
+        "SELECT g.genre, COUNT(*) AS cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) AS genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN albums a ON {ANCIENNE_JOINTURE}) g \
+         WHERE g.genre IS NOT NULL AND g.genre <> '' \
+         GROUP BY g.genre ORDER BY cnt DESC, g.genre LIMIT 5"
+    )
+}
+
+/// L'ancienne requête de `albums_du_genre_non_ecoutes`
+/// (`tune-server/src/routes/home.rs`), au caractère près.
+fn ancienne_non_ecoutes(engine: Engine, nb_genres: usize) -> String {
+    let ph = |i: usize| match engine {
+        Engine::Sqlite => "?".to_string(),
+        Engine::Postgres => format!("${i}"),
+    };
+    let genre_placeholders = (1..=nb_genres).map(ph).collect::<Vec<_>>().join(",");
+    let limit_ph = ph(nb_genres + 1);
+    format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+         FROM albums a \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         WHERE a.genre IN ({genre_placeholders}) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE {ANCIENNE_JOINTURE}) \
+         ORDER BY RANDOM() \
+         LIMIT {limit_ph}"
     )
 }
 
@@ -197,6 +241,111 @@ fn banc(uniques: i64, ecoutes: i64) -> Vec<String> {
     sql
 }
 
+/// Les genres du banc, pour les deux autres appelants : sept genres sur les
+/// albums (dont NULL et vide), répartis par identifiant — les deux disques
+/// d'une paire d'homonymes n'ont donc pas le même ; et trois pistes, dont le
+/// genre prime sur celui de l'album (un genre que nul album ne porte, NULL,
+/// vide).
+fn genres_du_banc() -> Vec<String> {
+    vec![
+        "UPDATE albums SET genre = CASE id % 9 \
+           WHEN 0 THEN NULL WHEN 1 THEN '' WHEN 2 THEN 'Rock' WHEN 3 THEN 'Rock' \
+           WHEN 4 THEN 'Jazz' WHEN 5 THEN 'Pop' WHEN 6 THEN 'Folk' \
+           WHEN 7 THEN 'Soul' ELSE 'Blues' END"
+            .to_string(),
+        "INSERT INTO tracks (id, title, file_path, genre) VALUES \
+         (1, 'T1', '/banc/1.flac', 'Baroque'), (2, 'T2', '/banc/2.flac', NULL), \
+         (3, 'T3', '/banc/3.flac', '')"
+            .to_string(),
+        "UPDATE listen_history SET track_id = 1 WHERE title = 'Piste 0'".to_string(),
+        "UPDATE listen_history SET track_id = 2 WHERE title = 'Piste 1'".to_string(),
+        "UPDATE listen_history SET track_id = 3 WHERE title = 'Piste 2'".to_string(),
+    ]
+}
+
+/// Les genres que « albums non écoutés » reçoit.
+const GENRES_DEMANDES: [&str; 5] = ["Rock", "Jazz", "Pop", "Folk", "Blues"];
+
+/// « Albums non écoutés » sans hasard : l'ensemble entier, comparable d'une
+/// écriture à l'autre.
+fn sans_hasard(sql: &str) -> String {
+    assert!(sql.contains("ORDER BY RANDOM()"), "SQL :\n{sql}");
+    sql.replace("ORDER BY RANDOM()", "ORDER BY a.id")
+}
+
+/// Les genres demandés, puis la limite : les places tenues de « albums non
+/// écoutés ».
+fn params_non_ecoutes(tout: &i64) -> Vec<&dyn ToSqlValue> {
+    let mut params: Vec<&dyn ToSqlValue> = GENRES_DEMANDES
+        .iter()
+        .map(|g| g as &dyn ToSqlValue)
+        .collect();
+    params.push(tout);
+    params
+}
+
+/// Les deux autres appelants : ancienne et nouvelle écritures rendent les
+/// mêmes lignes, sur les deux moteurs.
+fn autres_appelants_memes_lignes(db: &dyn DbBackend, engine: Engine) {
+    // Genres les plus écoutés : l'ordre compte (c'est un classement), et le
+    // classement ENTIER, sans la limite, doit coïncider aussi.
+    let rangs = |sql: &str| -> Vec<String> {
+        db.query_many(sql, &[])
+            .unwrap_or_else(|e| panic!("requête en échec : {e}\n{sql}"))
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect()
+    };
+    let (avant, apres) = (ancienne_top_genres(), top_genres_ecoutes());
+    assert_eq!(
+        rangs(&apres),
+        rangs(&avant),
+        "genres les plus écoutés : la réécriture ne rend pas le classement d'avant"
+    );
+    let entier = |sql: &str| sql.replace(" LIMIT 5", "");
+    let classement = rangs(&entier(&avant));
+    assert!(
+        classement.len() >= 7,
+        "le banc doit classer au moins sept genres : {classement:?}"
+    );
+    assert_eq!(
+        rangs(&entier(&apres)),
+        classement,
+        "genres les plus écoutés, classement entier : la réécriture diverge"
+    );
+
+    // Albums non écoutés d'un genre.
+    let tout: i64 = 1_000_000;
+    let params = params_non_ecoutes(&tout);
+    let n = GENRES_DEMANDES.len();
+    let nouvelle = sans_hasard(&albums_du_genre_non_ecoutes(engine, n));
+    let avant = lignes_triees(db, &sans_hasard(&ancienne_non_ecoutes(engine, n)), &params);
+    let apres = lignes_triees(db, &nouvelle, &params);
+    assert!(avant.len() > 20, "non écoutés : {} lignes", avant.len());
+    assert_eq!(
+        apres, avant,
+        "albums non écoutés : la réécriture ne rend pas les lignes d'avant"
+    );
+
+    // Le banc exerce le repli : « Live 12 » d'Homonyme A (50 024, Rock) n'est
+    // écouté que par titre et artiste, son jumeau d'Homonyme B (50 025, Rock)
+    // jamais.
+    let ids: Vec<i64> = db
+        .query_many(&nouvelle, &params)
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.first().and_then(SqlValue::as_i64))
+        .collect();
+    assert!(
+        !ids.contains(&(PREMIER_HOMONYME + 24)),
+        "« Live 12 » d'Homonyme A est écouté par le repli : il ne doit pas remonter"
+    );
+    assert!(
+        ids.contains(&(PREMIER_HOMONYME + 25)),
+        "« Live 12 » d'Homonyme B n'a jamais été écouté : il doit remonter"
+    );
+}
+
 /// Les lignes rendues, en texte et triées : l'ordre de deux albums écoutés à
 /// la même seconde n'est pas fixé par la requête, seul l'ensemble compte.
 fn lignes_triees(db: &dyn DbBackend, sql: &str, params: &[&dyn ToSqlValue]) -> Vec<String> {
@@ -291,7 +440,7 @@ fn banc_sqlite(uniques: i64, ecoutes: i64) -> SqliteDb {
     db.init_schema().unwrap();
     super::migrations::run_migrations(&db).unwrap();
     let mut sql = String::from("BEGIN;\n");
-    for instruction in banc(uniques, ecoutes) {
+    for instruction in banc(uniques, ecoutes).into_iter().chain(genres_du_banc()) {
         sql.push_str(&instruction);
         sql.push_str(";\n");
     }
@@ -309,17 +458,35 @@ fn le_union_all_rend_les_lignes_de_l_ancienne_jointure_sqlite() {
     memes_lignes_qu_avant(backend.as_ref(), Engine::Sqlite);
 }
 
-/// `HISTORIQUE_VERS_ALBUM` n'a pas bougé : les appelants qui la gardent
-/// (genres les plus écoutés, albums non écoutés) suivent la même règle
-/// qu'avant, et c'est elle que la nouvelle écriture doit reproduire.
+/// Les deux autres appelants, SQLite : mêmes lignes qu'avec l'ancienne
+/// jointure.
 #[test]
-fn l_ancienne_jointure_reste_la_reference() {
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(
-        norm(super::home_queries::HISTORIQUE_VERS_ALBUM),
-        norm(ANCIENNE_JOINTURE),
-        "HISTORIQUE_VERS_ALBUM a changé de sens"
-    );
+fn les_autres_appelants_rendent_les_lignes_de_l_ancienne_jointure_sqlite() {
+    let db = banc_sqlite(600, 4_000);
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+    autres_appelants_memes_lignes(backend.as_ref(), Engine::Sqlite);
+}
+
+/// Aucune des quatre requêtes ne joint plus par un `OR` ni ne rejoue l'une
+/// des sous-requêtes corrélées de l'ancienne règle.
+#[test]
+fn aucune_requete_ne_joint_plus_par_un_or() {
+    for engine in [Engine::Sqlite, Engine::Postgres] {
+        for sql in [
+            continue_listening_albums_deduits(engine, ""),
+            continue_listening_albums_du_contexte(&[1, 2]),
+            top_genres_ecoutes(),
+            albums_du_genre_non_ecoutes(engine, 3),
+        ] {
+            assert!(
+                !sql.contains("lh.album_id = a.id OR")
+                    && !sql.contains("= (SELECT")
+                    && !sql.contains("a_hom.id <> a.id"),
+                "la jointure en OR ou une sous-requête corrélée de la règle est \
+                 revenue — 25,7 s sur PostgreSQL (fil 2130). SQL :\n{sql}"
+            );
+        }
+    }
 }
 
 /// La seconde branche ne rejoue plus de sous-requête corrélée par ligne :
@@ -344,8 +511,7 @@ fn le_second_rang_ne_joint_plus_par_un_or() {
             continue_listening_albums_du_contexte(&[1, 2]),
         ] {
             assert!(
-                !sql.contains("lh.album_id = a.id OR")
-                    && !sql.contains(super::home_queries::HISTORIQUE_VERS_ALBUM),
+                !sql.contains("lh.album_id = a.id OR") && !sql.contains(ANCIENNE_JOINTURE),
                 "la jointure en OR est revenue — 25,7 s sur PostgreSQL (fil 2130). \
                  SQL :\n{sql}"
             );
@@ -440,7 +606,7 @@ mod pg {
     }
 
     fn vider(db: &Arc<dyn DbBackend>) {
-        for table in ["listen_history", "albums", "artists", "zones"] {
+        for table in ["listen_history", "tracks", "albums", "artists", "zones"] {
             db.execute(
                 &format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"),
                 &[],
@@ -464,25 +630,27 @@ mod pg {
     fn charger(db: &Arc<dyn DbBackend>, uniques: i64, ecoutes: i64) {
         assurer_le_schema(db);
         vider(db);
-        for instruction in banc(uniques, ecoutes) {
+        for instruction in banc(uniques, ecoutes).into_iter().chain(genres_du_banc()) {
             db.execute(&instruction, &[])
                 .unwrap_or_else(|e| panic!("banc : {e}\n{instruction}"));
         }
         db.execute("ANALYZE listen_history", &[]).unwrap();
         db.execute("ANALYZE albums", &[]).unwrap();
+        db.execute("ANALYZE tracks", &[]).unwrap();
     }
 
     fn plan(db: &Arc<dyn DbBackend>, sql: &str) -> String {
         let tout: i64 = 1_000_000;
-        db.query_many(
-            &format!("EXPLAIN (ANALYZE, COSTS OFF) {sql}"),
-            &[&tout as &dyn ToSqlValue],
-        )
-        .unwrap()
-        .iter()
-        .filter_map(|r| r.first().and_then(SqlValue::as_string))
-        .collect::<Vec<_>>()
-        .join("\n")
+        plan_lie(db, sql, &[&tout as &dyn ToSqlValue])
+    }
+
+    fn plan_lie(db: &Arc<dyn DbBackend>, sql: &str, params: &[&dyn ToSqlValue]) -> String {
+        db.query_many(&format!("EXPLAIN (ANALYZE, COSTS OFF) {sql}"), params)
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.first().and_then(SqlValue::as_string))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Preuve (a), PostgreSQL : mêmes lignes qu'avec l'ancienne jointure, sur
@@ -534,6 +702,74 @@ mod pg {
             duree_apres < std::time::Duration::from_secs(3),
             "la nouvelle écriture dépasse la borne du widget : {duree_apres:?}"
         );
+        vider(&db);
+    }
+
+    /// Les deux autres appelants, PostgreSQL : mêmes lignes qu'avec l'ancienne
+    /// jointure, sur le même banc que SQLite.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_2130_les_autres_appelants_rendent_les_lignes_de_l_ancienne_jointure() {
+        let Some(pool) = pool().await else {
+            eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+            return;
+        };
+        let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
+        charger(&db, 600, 4_000);
+        autres_appelants_memes_lignes(db.as_ref(), Engine::Postgres);
+        vider(&db);
+    }
+
+    /// La mesure des deux autres appelants, sur le banc de
+    /// `pg_2130_mesure_avant_apres` : plans et durées avant / après, mêmes
+    /// lignes, et chaque nouvelle écriture sous la seconde.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_2130_autres_appelants_mesure_avant_apres() {
+        let Some(pool) = pool().await else {
+            eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+            return;
+        };
+        let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
+        charger(&db, 6_000, 30_000);
+        let tout: i64 = 1_000_000;
+        let params = params_non_ecoutes(&tout);
+        let n = GENRES_DEMANDES.len();
+
+        let cas: [(&str, String, String, &[&dyn ToSqlValue]); 2] = [
+            (
+                "genres les plus écoutés",
+                ancienne_top_genres(),
+                top_genres_ecoutes(),
+                &[],
+            ),
+            (
+                "albums non écoutés d'un genre",
+                sans_hasard(&ancienne_non_ecoutes(Engine::Postgres, n)),
+                sans_hasard(&albums_du_genre_non_ecoutes(Engine::Postgres, n)),
+                &params,
+            ),
+        ];
+        for (nom, avant_sql, apres_sql, liees) in cas {
+            let debut = Instant::now();
+            let avant = lignes_triees(db.as_ref(), &avant_sql, liees);
+            let duree_avant = debut.elapsed();
+            let debut = Instant::now();
+            let apres = lignes_triees(db.as_ref(), &apres_sql, liees);
+            let duree_apres = debut.elapsed();
+            eprintln!(
+                "MESURE {nom} — {} albums, 30 000 écoutes, {} lignes rendues : \
+                 avant (OR) {duree_avant:?}, après {duree_apres:?}",
+                6_000 + 2 * 1_200,
+                apres.len()
+            );
+            eprintln!("PLAN AVANT ({nom}) :\n{}", plan_lie(&db, &avant_sql, liees));
+            eprintln!("PLAN APRÈS ({nom}) :\n{}", plan_lie(&db, &apres_sql, liees));
+            assert!(!avant.is_empty(), "{nom} : le banc doit rendre des lignes");
+            assert_eq!(apres, avant, "{nom} : mêmes lignes sur le grand banc");
+            assert!(
+                duree_apres < std::time::Duration::from_secs(1),
+                "{nom} : la nouvelle écriture dépasse la seconde : {duree_apres:?}"
+            );
+        }
         vider(&db);
     }
 
