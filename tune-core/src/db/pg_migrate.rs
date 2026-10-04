@@ -1118,6 +1118,10 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_source TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_title TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_cover TEXT;
+-- listen_history: index de album_id (SQLite migration v115 / PG 079, fil
+-- 2130). APRÈS l'ALTER d'album_id ci-dessus : une base de bascule antérieure
+-- peut ne l'avoir reçue que là.
+CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id);
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';

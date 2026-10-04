@@ -106,7 +106,25 @@ fn ph(engine: Engine, idx: usize) -> String {
 ///
 /// Cout : les deux sous-selects ne sont atteints QUE par les lignes a
 /// `album_id` NULL dont le titre d'album tombe deja juste ; le chemin
-/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus.
+/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus — sur SQLite.
+///
+/// # Le `OR` de cette condition coute 25 s sur PostgreSQL (fil 2130)
+///
+/// Sur PostgreSQL, 113 842 pistes et 8 571 albums, le second rang de
+/// « Continuer l'ecoute » joint par cette condition a pris 25,7 s (deux fois,
+/// `sqlx::query: slow statement`) quand le widget abandonne a 8 s. Un `OR`
+/// entre une egalite de cles et un repli corrélé interdit toute jointure par
+/// hachage ou par index : le planificateur se rabat sur une boucle imbriquee
+/// `listen_history × albums`.
+///
+/// Les deux requetes du widget ne joignent donc plus par cette condition mais
+/// par [`historique_rattache_a_son_album`], la MEME regle ecrite en deux
+/// branches `UNION ALL` (le modele de la PR #4815 pour la grille). Cette
+/// constante reste, inchangee, pour les appelants qui joignent DEPUIS
+/// l'historique en `LEFT JOIN` ou en `NOT EXISTS` (genres les plus ecoutes,
+/// albums non ecoutes) : la regle y est la meme, et le test
+/// `le_union_all_rend_les_lignes_de_l_ancienne_jointure_*` le prouve sur les
+/// deux moteurs.
 pub const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
      OR (lh.album_id IS NULL AND lh.album_title = a.title \
          AND ((COALESCE(lh.artist_name, '') <> '' \
@@ -117,6 +135,78 @@ pub const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
                   AND NOT EXISTS (SELECT 1 FROM albums a_hom \
                                   WHERE a_hom.title = a.title \
                                     AND a_hom.id <> a.id)))))";
+
+/// Les lignes d'historique RATTACHEES a leur album, en table derivee : une
+/// ligne par couple (ecoute, album) que [`HISTORIQUE_VERS_ALBUM`] aurait
+/// joint, ni plus ni moins (fil 2130).
+///
+/// Deux branches `UNION ALL`, disjointes par construction :
+///
+/// 1. `lh.album_id IS NOT NULL` — jointure par cle, `a.id = lh.album_id`.
+///    Hachage ou index, au choix du planificateur ;
+/// 2. `lh.album_id IS NULL` — le repli par titre et artiste, sur les seules
+///    lignes sans identifiant (servies par `idx_listen_history_album_id`,
+///    migration 115 / PG 079).
+///
+/// Le repli y est la regle de [`HISTORIQUE_VERS_ALBUM`], ecrite en
+/// JOINTURES et non en sous-requetes correlees — c'est la seconde moitie du
+/// gain, mesuree sur PostgreSQL 16 (8 400 albums, 30 000 ecoutes, test
+/// `pg_2130_mesure_avant_apres`) : en `OR` 33 a 37 s ; en `UNION ALL` mais
+/// sous-requetes gardees 5,0 s, dont 4 s pour le `NOT EXISTS` des homonymes
+/// rejoue par ligne sur `albums` entier (pas d'index de titre sous
+/// PostgreSQL) ; en jointures 0,13 s.
+///
+/// * « l'artiste de l'album » : `LEFT JOIN artists ar_hist` sur la cle
+///   primaire, au lieu du sous-select scalaire. Meme valeur, NULL compris
+///   (album sans artiste : la comparaison est fausse dans les deux cas) ;
+/// * « aucun homonyme » : `LEFT JOIN` sur les titres portes par PLUS d'un
+///   album (`GROUP BY title HAVING COUNT(*) > 1`, calcule une fois) et
+///   `amb.title IS NULL`, au lieu de `NOT EXISTS (… a_hom.id <> a.id)`. Un
+///   album a un homonyme si et seulement si son titre compte au moins deux
+///   albums ; la comparaison et le regroupement suivent la meme collation de
+///   colonne sur les deux moteurs.
+///
+/// Une ligne a `album_id` non NULL ne passe jamais par le repli : c'etait
+/// deja le cas du `OR`, ou `album_id IS NULL` gardait la seconde moitie. Le
+/// `UNION ALL` (et non `UNION`) garde la multiplicite : deux albums du meme
+/// artiste au meme titre rattachent une ecoute aux deux, comme avant.
+///
+/// La premiere branche joint `albums` elle aussi, au lieu de rendre
+/// `lh.album_id` tel quel : une ligne qui designe un album disparu ne doit
+/// rien rattacher, et un `album_id` reste TEXT sur PostgreSQL (migration 047
+/// sautee) doit continuer d'echouer en `text = bigint` — c'est ce que
+/// `pg_2860_*` exige.
+///
+/// Colonnes rendues : `title, listened_at, context_type, album_rattache`.
+/// `zone_filter` (`AND lh.zone_id = N `, ou vide) et `albums` (identifiants
+/// deja reformates en `i64`, ou `None`) sont poses DANS chaque branche, pour
+/// que le filtrage precede la jointure sur les deux moteurs.
+pub fn historique_rattache_a_son_album(zone_filter: &str, albums: Option<&str>) -> String {
+    let filtre_album = albums
+        .map(|liste| format!("AND a.id IN ({liste}) "))
+        .unwrap_or_default();
+    format!(
+        "(SELECT lh.title, lh.listened_at, lh.context_type, a.id AS album_rattache \
+          FROM listen_history lh \
+          JOIN albums a ON a.id = lh.album_id \
+          WHERE lh.album_id IS NOT NULL \
+          {zone_filter}{filtre_album}\
+          UNION ALL \
+          SELECT lh.title, lh.listened_at, lh.context_type, a.id AS album_rattache \
+          FROM listen_history lh \
+          JOIN albums a ON a.title = lh.album_title \
+          LEFT JOIN artists ar_hist ON ar_hist.id = a.artist_id \
+          LEFT JOIN (SELECT a_hom.title FROM albums a_hom \
+                     GROUP BY a_hom.title HAVING COUNT(*) > 1) amb \
+                 ON amb.title = a.title \
+          WHERE lh.album_id IS NULL \
+            AND ((COALESCE(lh.artist_name, '') <> '' \
+                  AND lh.artist_name = ar_hist.name) \
+                 OR (COALESCE(lh.artist_name, '') = '' \
+                     AND amb.title IS NULL)) \
+          {zone_filter}{filtre_album})"
+    )
+}
 
 /// Les colonnes d'album de « Continuer l'ecoute » et d'« Ajoutes recemment ».
 ///
@@ -172,15 +262,15 @@ pub const DATE_D_AJOUT: &str = "COALESCE(ffs.first_seen_at, \
 /// genre, listened_tracks, track_count, dernier`.
 pub fn continue_listening_albums_deduits(engine: Engine, zone_filter: &str) -> String {
     let p1 = ph(engine, 1);
+    let historique = historique_rattache_a_son_album(zone_filter, None);
     format!(
         "SELECT {COLONNES_ALBUM}, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count, \
                MAX(lh.listened_at) as dernier \
-        FROM listen_history lh \
-        JOIN albums a ON {HISTORIQUE_VERS_ALBUM} \
+        FROM {historique} lh \
+        JOIN albums a ON a.id = lh.album_rattache \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
         WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
-        {zone_filter}\
         GROUP BY {COLONNES_ALBUM}, a.track_count \
         HAVING COUNT(DISTINCT lh.title) < a.track_count \
            AND SUM(CASE WHEN lh.context_type IS NULL THEN 1 ELSE 0 END) > 0 \
@@ -309,12 +399,13 @@ pub fn continue_listening_albums_du_contexte(ids: &[i64]) -> String {
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let historique = historique_rattache_a_son_album("", Some(&liste));
     format!(
         "SELECT {COLONNES_ALBUM}, \
                 COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
-         LEFT JOIN listen_history lh ON {HISTORIQUE_VERS_ALBUM} \
+         LEFT JOIN {historique} lh ON lh.album_rattache = a.id \
          WHERE a.id IN ({liste}) \
          GROUP BY {COLONNES_ALBUM}, a.track_count"
     )
@@ -515,9 +606,14 @@ mod tests {
                 recently_added(engine),
                 continue_listening_albums_du_contexte(&[1, 2]),
             ] {
+                // Le DERNIER `GROUP BY` : celui de la requete englobante. La
+                // table derivee de l'historique (fil 2130) en porte un a elle,
+                // sur les titres d'albums homonymes, qui ne selectionne pas
+                // `ar.name`.
                 let group_by = sql
-                    .split("GROUP BY ")
-                    .nth(1)
+                    .rsplit("GROUP BY ")
+                    .next()
+                    .filter(|_| sql.contains("GROUP BY "))
                     .expect("la requete porte un GROUP BY");
                 assert!(
                     group_by.contains("ar.name"),
