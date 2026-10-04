@@ -97,7 +97,9 @@ use super::{
     GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
     MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
     POSITION_PAST_END_TICKS, RENDERER_CALE_REPRISE_COOLDOWN_SECS, RENDERER_CALE_RESTE_MIN_MS,
-    STOPPED_TICKS_THRESHOLD, SuivantePreparee, TICKS_GELE_DLNA_AVEC_SETNEXT,
+    REPRISE_CALE_DELAI_DE_CONSTAT_MS, REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS,
+    REPRISE_CALE_ECART_TOLERE_MS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
+    TICKS_GELE_DLNA_AVEC_SETNEXT,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -398,6 +400,27 @@ pub fn tampon_du_renderer_peut_encore_jouer(
         && wall_elapsed_secs.saturating_mul(1000) < track_duration_ms.saturating_add(END_MARGIN_MS)
 }
 
+/// Fil 2125 (#5711) — l'horloge de piste est-elle CONNUE ?
+///
+/// `track_started_at` est remis à `None` par les bras gapless (arrêt dans la
+/// garde, fin naturelle en attente d'enchaînement). Le sondeur lit alors
+/// `wall_elapsed = 0` (`unwrap_or(0)`), et
+/// [`tampon_du_renderer_peut_encore_jouer`] en concluait que la piste
+/// ENTIÈRE restait à jouer : une zone dont le renderer s'était tu restait
+/// « en lecture » jusqu'au plafond `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`.
+///
+/// Mesure qui motive la règle (fil 2125, 1.0.0-rc1, renderer Rygel) : six
+/// `flux_servi_en_entier_zone_non_coupee` neuf minutes après le départ, tous
+/// à `wall_secs=0` et `reste_ms=303573` — la piste entière —, puis
+/// `zone_figee_rattrapee immobile_secs=604`.
+///
+/// Horloge inconnue ⇒ `false` : la patience de #4661 ne s'accorde que sur
+/// une horloge mesurée, exactement comme elle se refuse sur une durée
+/// inconnue. Les autres filets (#4480, borne des 120 s) restent en place.
+pub fn horloge_de_piste_connue(track_started_at: Option<std::time::Instant>) -> bool {
+    track_started_at.is_some()
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must
@@ -488,6 +511,74 @@ pub fn reprise_apres_renderer_cale_autorisee(
     let reste_assez = track_duration_ms.saturating_sub(position_ms) >= RENDERER_CALE_RESTE_MIN_MS;
     let hors_fenetre = derniere_il_y_a_secs.is_none_or(|s| s > RENDERER_CALE_REPRISE_COOLDOWN_SECS);
     a_joue && flux_incomplet && reste_assez && hors_fenetre
+}
+
+/// Fil 2125 (#5711) — une reprise après décrochage a-t-elle DÉJÀ été tentée
+/// sur cette lecture de piste ?
+///
+/// `generation_de_la_reprise` est la génération de piste relue juste après le
+/// `play_from_queue` de la reprise. Si le décrochage qu'on examine porte la
+/// même génération, c'est la reprise elle-même qui a décroché : en reprendre
+/// une seconde ferait boucler la zone (fil 2125 : reprise, silence, coupure
+/// 38 s plus tard, reprise…). Une relance par l'utilisateur, une piste
+/// suivante, ont une génération neuve : elles gardent leur droit à une reprise.
+pub fn reprise_cale_deja_tentee_sur_cette_piste(
+    generation_de_la_reprise: Option<u64>,
+    generation_courante: u64,
+) -> bool {
+    generation_de_la_reprise == Some(generation_courante)
+}
+
+/// Ce que dit la position MESURÉE du saut d'une reprise après décrochage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstatDeRepriseCale {
+    /// Trop tôt, ou aucun échantillon probant : on attend le tour suivant.
+    Attendre,
+    /// Le renderer joue à la position visée (à l'écart toléré près).
+    Reussie,
+    /// Le renderer joue, mais loin SOUS la position visée : il a acquitté le
+    /// `Seek` puis relu depuis le début (fil 2125).
+    SautIgnore,
+    /// Aucun échantillon probant dans le délai maximal.
+    NonConstatee,
+    /// La lecture a changé (piste suivante, relance) : plus rien à constater.
+    Abandonnee,
+}
+
+/// Fil 2125 (#5711) — juger le saut d'une reprise après décrochage sur la
+/// position MESURÉE, et non sur l'acquittement SOAP.
+///
+/// Le journal du fil 2125 écrivait `renderer_cale_reprise_automatique` dès que
+/// le `Seek` était acquitté — et le renderer relisait depuis l'octet 0. Une
+/// reprise n'est « réussie » qu'au vu d'un échantillon `Playing`, pris au
+/// moins `REPRISE_CALE_DELAI_DE_CONSTAT_MS` après la demande, à une position
+/// non nulle et au plus `REPRISE_CALE_ECART_TOLERE_MS` sous la cible.
+pub fn constat_de_reprise_cale(
+    generation_de_la_reprise: u64,
+    generation_courante: u64,
+    depuis_la_demande_ms: u64,
+    renderer_joue: bool,
+    position_mesuree_ms: u64,
+    cible_ms: u64,
+) -> ConstatDeRepriseCale {
+    if generation_de_la_reprise != generation_courante {
+        return ConstatDeRepriseCale::Abandonnee;
+    }
+    if depuis_la_demande_ms < REPRISE_CALE_DELAI_DE_CONSTAT_MS {
+        return ConstatDeRepriseCale::Attendre;
+    }
+    if renderer_joue && position_mesuree_ms > 0 {
+        return if position_mesuree_ms.saturating_add(REPRISE_CALE_ECART_TOLERE_MS) >= cible_ms {
+            ConstatDeRepriseCale::Reussie
+        } else {
+            ConstatDeRepriseCale::SautIgnore
+        };
+    }
+    if depuis_la_demande_ms >= REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS {
+        ConstatDeRepriseCale::NonConstatee
+    } else {
+        ConstatDeRepriseCale::Attendre
+    }
 }
 
 /// #4645 — la coupure `playback_failure_stopping_zone` (flux à sec) ouvre-t-elle
