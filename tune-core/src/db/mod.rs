@@ -83,4 +83,8 @@ mod lenteur_albums_4800_tests;
 mod lenteur_pistes_5138_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+/// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de
+/// `listen_history.album_id`, preuves d'équivalence et de migration.
+#[cfg(test)]
+mod reprendre_l_ecoute_2130_tests;
 pub mod upnp_revision;

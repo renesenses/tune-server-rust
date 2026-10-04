@@ -210,6 +210,17 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
 
+      # Fil 2130 — « Reprendre l'écoute » tombait en « (delai) » : la jointure
+      # en OR du second rang prenait 25,7 s sur PostgreSQL. Réécrite en deux
+      # branches UNION ALL : mêmes lignes que l'ancienne écriture (recopiée
+      # dans le test), mesure avant / après, et la migration 079 (index de
+      # listen_history.album_id). En série : les épreuves vident les tables
+      # qu'elles peuplent.
+      - name: « Reprendre l'écoute » en UNION ALL sur PostgreSQL (fil 2130)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2130 -- --nocapture --test-threads=1
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
