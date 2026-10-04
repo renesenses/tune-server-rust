@@ -924,6 +924,67 @@ impl PositionPoller {
                 }
             };
 
+            // ── Fil 2125 (#5711) — le saut de la reprise a-t-il pris ? ──
+            //
+            // Jugé sur la position MESURÉE par la sortie, avant toute garde
+            // qui pourrait sauter le tour : la grâce de déplacement couvre
+            // justement les secondes où ce constat se fait.
+            {
+                let mut reprises = self.reprises_renderer_cale.lock().await;
+                if let Some(r) = reprises.get_mut(&zone_id)
+                    && let Some(demande_a) = r.saut_demande_a
+                {
+                    let constat = decisions::constat_de_reprise_cale(
+                        r.generation,
+                        zone_state.track_generation,
+                        demande_a.elapsed().as_millis() as u64,
+                        status.state == TransportState::Playing,
+                        status.position_ms,
+                        r.cible_ms,
+                    );
+                    let cible_ms = r.cible_ms;
+                    match constat {
+                        decisions::ConstatDeRepriseCale::Attendre => {}
+                        decisions::ConstatDeRepriseCale::Reussie => {
+                            r.saut_demande_a = None;
+                            warn!(
+                                zone_id,
+                                position_ms = cible_ms,
+                                mesuree_ms = status.position_ms,
+                                "renderer_cale_reprise_automatique"
+                            );
+                        }
+                        decisions::ConstatDeRepriseCale::SautIgnore => {
+                            r.saut_demande_a = None;
+                            warn!(
+                                zone_id,
+                                position_ms = cible_ms,
+                                mesuree_ms = status.position_ms,
+                                "renderer_cale_reprise_saut_ignore"
+                            );
+                        }
+                        decisions::ConstatDeRepriseCale::NonConstatee => {
+                            r.saut_demande_a = None;
+                            warn!(
+                                zone_id,
+                                position_ms = cible_ms,
+                                etat = ?status.state,
+                                mesuree_ms = status.position_ms,
+                                "renderer_cale_reprise_saut_non_constate"
+                            );
+                        }
+                        decisions::ConstatDeRepriseCale::Abandonnee => {
+                            r.saut_demande_a = None;
+                            info!(
+                                zone_id,
+                                position_ms = cible_ms,
+                                "renderer_cale_reprise_constat_abandonne_lecture_changee"
+                            );
+                        }
+                    }
+                }
+            }
+
             // ── L'anneau de la sortie s'est-il vidé ? (#3318) ──
             //
             // Le seul instant que l'auditeur ENTEND, et le seul qui n'était
@@ -2335,12 +2396,25 @@ impl PositionPoller {
                                     };
                                 let flux_servi_en_entier =
                                     fsm::flux_servi_en_entier(octets_servis, octets_total);
+                                // Fil 2125 (#5711) — une horloge de piste
+                                // EFFACÉE (`track_started_at` à `None`, posé
+                                // par les bras gapless) n'est pas une horloge
+                                // à zéro : `wall_elapsed` y vaut 0 par défaut,
+                                // et « 0 s écoulée » se lisait « toute la
+                                // piste reste à jouer ». La zone morte restait
+                                // alors « en lecture » jusqu'au plafond de
+                                // 600 s (`wall_secs=0`, `reste_ms` = la piste
+                                // entière). Horloge inconnue ⇒ l'horloge ne
+                                // tranche rien, comme une durée inconnue.
+                                let horloge_de_piste_connue =
+                                    decisions::horloge_de_piste_connue(ps.track_started_at);
                                 let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
                                     flux_servi_en_entier,
-                                    decisions::tampon_du_renderer_peut_encore_jouer(
-                                        wall_elapsed,
-                                        track_duration_ms,
-                                    ),
+                                    horloge_de_piste_connue
+                                        && decisions::tampon_du_renderer_peut_encore_jouer(
+                                            wall_elapsed,
+                                            track_duration_ms,
+                                        ),
                                     ps.premier_arret_a.map(|t| t.elapsed()),
                                     HORLOGE_DE_PISTE_BORNE_HAUTE_SECS,
                                 );
@@ -3405,15 +3479,39 @@ impl PositionPoller {
                 let reprise_cale = match mesure_renderer_cale {
                     Some((position_ms, duree_ms, servis, total)) if !relance => {
                         let mut reprises = self.reprises_renderer_cale.lock().await;
-                        let autorisee = decisions::reprise_apres_renderer_cale_autorisee(
-                            reprises.get(&zone_id).map(|t| t.elapsed().as_secs()),
-                            position_ms,
-                            duree_ms,
-                            servis,
-                            total,
+                        let precedente = reprises.get(&zone_id).copied();
+                        // Fil 2125 (#5711) — une seule reprise par piste : le
+                        // décrochage de la reprise elle-même coupe la zone.
+                        let deja_tentee = decisions::reprise_cale_deja_tentee_sur_cette_piste(
+                            precedente.map(|r| r.generation),
+                            zone_state.track_generation,
                         );
+                        if deja_tentee {
+                            warn!(
+                                zone_id,
+                                position_ms,
+                                generation = zone_state.track_generation,
+                                "renderer_cale_reprise_refusee_deja_tentee_sur_cette_piste"
+                            );
+                        }
+                        let autorisee = !deja_tentee
+                            && decisions::reprise_apres_renderer_cale_autorisee(
+                                precedente.map(|r| r.decidee_a.elapsed().as_secs()),
+                                position_ms,
+                                duree_ms,
+                                servis,
+                                total,
+                            );
                         if autorisee {
-                            reprises.insert(zone_id, Instant::now());
+                            reprises.insert(
+                                zone_id,
+                                RepriseRendererCale {
+                                    decidee_a: Instant::now(),
+                                    generation: zone_state.track_generation,
+                                    cible_ms: position_ms,
+                                    saut_demande_a: None,
+                                },
+                            );
                         }
                         autorisee.then_some(position_ms)
                     }
@@ -3452,6 +3550,12 @@ impl PositionPoller {
                     // sans capacité Seek, renderer qui refuse — la piste
                     // rejouerait depuis le début après un quart d'heure de
                     // musique : inacceptable, on coupe comme avant.
+                    //
+                    // Fil 2125 (#5711) — le saut ne part plus dans la foulée
+                    // du `Play` : sur une sortie réseau, il attend que le
+                    // renderer ait pu ouvrir le flux
+                    // (`seek_output_after_replay`). Son succès se constate
+                    // ensuite sur la position MESURÉE, pas sur l'acquittement.
                     self.orchestrator
                         .stop(zone_id, device_id_ref.as_deref())
                         .await;
@@ -3459,13 +3563,29 @@ impl PositionPoller {
                     match self.orchestrator.play_from_queue(zone_id, position).await {
                         Ok(_) => match self
                             .orchestrator
-                            .seek(zone_id, position_ms, device_id_ref.as_deref())
+                            .sauter_apres_reprise_de_renderer_cale(
+                                zone_id,
+                                device_id_ref.as_deref(),
+                                position_ms,
+                            )
                             .await
                         {
                             Ok(()) => {
-                                warn!(
+                                let generation =
+                                    self.playback.get_state(zone_id).await.track_generation;
+                                if let Some(r) =
+                                    self.reprises_renderer_cale.lock().await.get_mut(&zone_id)
+                                {
+                                    r.generation = generation;
+                                    r.cible_ms = position_ms;
+                                    r.saut_demande_a = Some(Instant::now());
+                                }
+                                info!(
                                     zone_id,
-                                    position, position_ms, "renderer_cale_reprise_automatique"
+                                    position,
+                                    position_ms,
+                                    generation,
+                                    "renderer_cale_reprise_saut_demande"
                                 );
                             }
                             Err(e) => {
