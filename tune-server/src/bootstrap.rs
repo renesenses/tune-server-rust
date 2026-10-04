@@ -507,6 +507,7 @@ pub async fn run_with(opts: RunOptions) {
         port = config.port,
         db = %config.db_path,
         web = %crate::config::resolve_web_dir().display(),
+        fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
 
