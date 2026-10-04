@@ -233,6 +233,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
     // la migration 047 qui la convertit.
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
+    // Fil 2130 — l'index de `album_id` (PG 079), JUSTE APRÈS la colonne : la
+    // 079 le saute quand la colonne n'existe pas encore (base neuve, où seul
+    // ce tableau la pose), et une base de bascule (`schema_version = 99`) ne
+    // rejoue jamais la 079. Sans lui, « Reprendre l'écoute » reste juste mais
+    // lent.
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)",
     // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
     // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
     // exist: text = bigint` et l'historique du profil rend une liste vide.

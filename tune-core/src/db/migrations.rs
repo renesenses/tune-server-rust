@@ -2231,7 +2231,46 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "references_d_album_de_service",
         up: "",
     },
+    // Fil 2130 (04/10) — « Reprendre l'écoute » tombait en « (delai) » sur
+    // PostgreSQL : la jointure de l'historique vers l'album prenait 25,7 s
+    // pour 8 571 albums. La requête est réécrite en deux branches `UNION ALL`
+    // (`home_queries::historique_rattache_a_son_album`) ; cet index sert la
+    // première (`a.id = lh.album_id`, `album_id IN (…)`) et isole la seconde
+    // (`album_id IS NULL`). Aucun index ne portait `listen_history.album_id`.
+    //
+    // Numérotée 115 / PG 079, PAS 114 : la 114 (PG 078) est prise par #5706
+    // (Bandcamp, fil 2121), en PR en même temps que celle-ci. Vérifié le 04/10
+    // sur `origin/rc/v1.0.0`, `origin/batch/bugs-rc3-20261002` et
+    // `origin/batch/feat-rc3-20261002` (dernière : 113 / PG 077) et sur
+    // `fix/bandcamp-resignature-adresse` (114 / PG 078). Le lanceur ne joue
+    // que `version > MAX` : une 115 appliquée AVANT la 114 la ferait sauter en
+    // silence sur toute base déjà montée. Cette migration EXIGE donc la 114
+    // avant elle — sinon, elle se renumérote à la promotion.
+    //
+    // Index posé dans le bloc de version, PAS dans `up` : même règle qu'à la
+    // 113, la colonne est d'abord garantie. Rejoué aussi dans la passe finale
+    // (`IF NOT EXISTS`). Jumelle PG : 079.
+    Migration {
+        version: 115,
+        name: "listen_history_album_id_index",
+        up: "",
+    },
 ];
+
+/// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
+/// posé par la migration ET par la passe finale de `run_migrations`.
+const SQL_INDEX_HISTORIQUE_ALBUM_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)";
+
+/// Garantit la colonne puis pose l'index de la 115. Un échec est JOURNALISÉ,
+/// jamais rendu : sans l'index, « Reprendre l'écoute » est lent, pas faux, et
+/// cela ne vaut pas un démarrage refusé.
+fn index_historique_album_id(db: &SqliteDb) {
+    add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
+    if let Err(e) = db.execute_batch(SQL_INDEX_HISTORIQUE_ALBUM_ID) {
+        warn!(erreur = %e, "migration_115_index_listen_history_album_id");
+    }
+}
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
 ///
@@ -3249,6 +3288,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "streaming_favorites", "album_ref", "TEXT");
             add_column_if_missing(db, "listen_history", "album_ref", "TEXT");
         }
+        if migration.version == 115 {
+            // Index de `listen_history.album_id` (fil 2130).
+            index_historique_album_id(db);
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3763,6 +3806,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "queue_items", "album_ref", "TEXT");
     add_column_if_missing(db, "streaming_favorites", "album_ref", "TEXT");
     add_column_if_missing(db, "listen_history", "album_ref", "TEXT");
+    // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
+    // aussi : une base arrivée sans lui reste juste, mais « Reprendre
+    // l'écoute » y redevient lent. PG : migration 079.
+    index_historique_album_id(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4490,6 +4537,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         78,
         "references_d_album_de_service",
         include_str!("../../migrations/postgres/078_references_d_album_de_service.sql"),
+    ),
+    // Jumelle de la SQLite 115 (fil 2130) : l'index de
+    // `listen_history.album_id`. EXIGE la 78 (#5706) avant elle.
+    (
+        79,
+        "listen_history_album_id_index",
+        include_str!("../../migrations/postgres/079_listen_history_album_id_index.sql"),
     ),
 ];
 
@@ -7231,7 +7285,11 @@ mod tests {
         // SQLite 114. Pose `album_ref` sur `queue_items`,
         // `streaming_favorites` et `listen_history`, que leurs écritures
         // NOMMENT.
-        assert_eq!(pg_latest_version(), 78, "latest PG migration must be 78");
+        // 79 : `listen_history_album_id_index` (fil 2130), jumelle de la
+        // SQLite 115. L'index de `listen_history.album_id` que la jointure de
+        // « Reprendre l'écoute » réécrite en `UNION ALL` emprunte. La 78 est
+        // celle de #5706.
+        assert_eq!(pg_latest_version(), 79, "latest PG migration must be 79");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
