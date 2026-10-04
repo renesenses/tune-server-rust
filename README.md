@@ -1,6 +1,6 @@
 # Tune Server (Rust)
 
-Multi-room music server written in Rust. Manages a local audio library with full-text search, streams from Tidal/Qobuz/Deezer/Spotify, outputs to DLNA renderers and Chromecast devices, and serves a web client for control.
+Multi-room music server written in Rust. Manages a local audio library with full-text search, streams from Tidal/Qobuz/Deezer (Spotify: browsing only), outputs to DLNA renderers and Chromecast devices, and serves a web client for control.
 
 ## Quick Start
 
@@ -83,10 +83,10 @@ tune-server/       Axum HTTP server (385 route handlers, 30 modules)
 - **Library**: Parallel file scanning (rayon), metadata extraction (lofty), FTS5 full-text search
 - **Ingest**: File a new folder into the library — preview the destination paths from a naming
   template, move or copy, then a targeted scan. Every job is undoable
-- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL), Spotify
+- **Streaming**: Tidal (OAuth + HiRes FLAC), Qobuz (signed URLs), Deezer (ARL); Spotify can be browsed and searched, but its tracks do not play
 - **Outputs**: DLNA/UPnP (AVTransport SOAP), Chromecast (rust_cast), local (cpal)
 - **Discovery**: SSDP multicast + mDNS, auto-zone creation
-- **Playback**: Multi-zone, play queue, shuffle, repeat, crossfade, gapless
+- **Playback**: Multi-zone, play queue, shuffle, repeat, gapless
 - **Playlists**: Local + smart playlists (JSON rules engine) + cross-service sync
 - **Scrobbling**: Last.fm session auth + now playing
 - **Real-time**: WebSocket events for all state changes
@@ -192,4 +192,4 @@ the same one through `spotify_redirect_uri` in `tune.toml` or
 
 ## License
 
-MIT
+Business Source License 1.1 — see [LICENSE](LICENSE).

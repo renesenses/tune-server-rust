@@ -514,13 +514,37 @@ pub async fn handle_stream(
         .get("Range")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_range_start);
+    // Une requête DEPUIS LE DÉBUT (`bytes=0-`, ou sans `Range`) alors que le
+    // tuyau a déjà rendu quelque chose. Zone 10 du .18 (Eversolo DMP-A8,
+    // Qobuz FLAC → WAV, 1.0.0-rc1, 02/10) : à chaque piste, deux `bytes=0-`
+    // de `Lavf/58.45.100` à 200 ms d'écart. La première est une sonde : elle
+    // tire le préchargement puis se ferme. La seconde, la vraie lecture,
+    // recevait l'en-tête rejoué PUIS le tuyau à sa position courante : le
+    // début de la piste, parti dans la sonde, était perdu — « les premières
+    // secondes semblent perdues ». Tant que la retenue commence à 0, on la
+    // rejoue à l'octet, en-tête compris.
+    let depuis_le_debut = is_wav && wav_header_included && range_demande.unwrap_or(0) == 0;
+    let reprise_candidate = match range_demande {
+        Some(n) if n >= seuil_de_reprise => Some(n),
+        _ if depuis_le_debut && session.etendue_retenue().1 > 0 => Some(0),
+        _ => None,
+    };
     let mut longueur = wav_length;
     let mut reprise_exacte: Option<u64> = None;
-    if let (Some(n), Some(_), true) = (range_demande, wav_length, retenue_possible)
-        && n >= seuil_de_reprise
-    {
+    if let (Some(n), Some(_), true) = (reprise_candidate, wav_length, retenue_possible) {
         let (retenue_debut, retenue_fin) = session.etendue_retenue();
-        if n < retenue_fin && n >= retenue_debut {
+        if n == 0 && n < retenue_fin && n < retenue_debut {
+            warn!(
+                stream_id,
+                range = range_hdr,
+                retenue_debut,
+                retenue_fin,
+                octets_de_debut_perdus = retenue_debut.saturating_sub(44),
+                "debut_de_piste_perdu — une lecture demande le DÉBUT alors que la retenue a \
+                 déjà glissé : l'en-tête est rejoué, puis le direct ; les octets de début \
+                 tirés par une connexion précédente ne peuvent plus être servis"
+            );
+        } else if n < retenue_fin && n >= retenue_debut {
             // Le canal fermé et vidé, la longueur VRAIE est connue : c'est
             // elle qu'on annonce, pas la déduction par la durée, sans quoi le
             // corps finirait avant son Content-Length.
@@ -717,6 +741,21 @@ pub async fn handle_stream(
     let icy_cover = session.cover_url.clone();
     let icy_stream_id = stream_id.to_string();
 
+    // Une ligne par connexion terminée sur une conversion : combien d'octets
+    // elle a emportés, pour quelle plage. Sans elle, une sonde qui vide le
+    // préchargement puis se ferme ne laissait au journal que son
+    // `stream_request` (zone 10 du .18, 02/10).
+    let mut bilan = (!is_radio).then(|| BilanDeConnexion {
+        stream_id: stream_id.to_string(),
+        voie: "conversion",
+        range: range_hdr.to_string(),
+        agent: user_agent.clone().unwrap_or_else(|| "-".to_string()),
+        reprise_depuis_la_retenue: reprise_exacte,
+        octets_envoyes: 0,
+        debut: std::time::Instant::now(),
+        session: Some(session.clone()),
+        fin: "non_suivie",
+    });
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -997,9 +1036,12 @@ pub async fn handle_stream(
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_range_start);
             let saute_entete = debut_demande.is_some_and(|s| s >= 44);
+            // Rejouée depuis 0, la retenue porte déjà l'en-tête : ne pas
+            // l'émettre deux fois.
             if is_wav
                 && wav_header_included
                 && !saute_entete
+                && reprise_exacte.is_none()
                 && let Some(entete) = session.wav_header_stash.get()
             {
                 yield Ok(bytes::Bytes::from(entete.clone()));
@@ -1292,6 +1334,12 @@ pub async fn handle_stream(
             }
         }
     };
+    let flux = futures_util::StreamExt::map(flux, move |morceau| {
+        if let (Ok(o), Some(b)) = (&morceau, bilan.as_mut()) {
+            b.octets_envoyes += o.len() as u64;
+        }
+        morceau
+    });
     let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
@@ -1308,6 +1356,81 @@ pub async fn handle_stream(
 /// (~2 Gio) : on les pose à `u32::MAX` sur le PREMIER bloc du canal, avant
 /// qu'il soit retenu ou mis en réserve, pour que sondes, reprises et
 /// reconnexions reçoivent le même conteneur. Idempotent.
+/// Bilan d'UNE connexion au flux, écrit quand son corps est lâché — qu'il
+/// soit allé au bout ou que le client ait coupé.
+///
+/// Deux voies l'écrivent : la conversion (`voie="conversion"`, #5649) et le
+/// mandataire (`voie="mandataire"`, fil 2095). Sur le mandataire il n'y a pas
+/// de tuyau (`tuyau=-`), et `fin` dit pourquoi le corps s'est arrêté : sans
+/// lui, un journal ne distinguait pas un renderer qui a cessé de lire après
+/// un Seek d'un amont qui a cessé d'envoyer (FabienM, Devialet, 02/10).
+struct BilanDeConnexion {
+    stream_id: String,
+    voie: &'static str,
+    range: String,
+    agent: String,
+    reprise_depuis_la_retenue: Option<u64>,
+    octets_envoyes: u64,
+    debut: std::time::Instant,
+    /// La session dont le tuyau se mesure ; `None` sur le mandataire.
+    session: Option<std::sync::Arc<StreamSession>>,
+    /// Cause de fin. Reste [`FIN_CLIENT_PARTI`] si le corps est lâché avant
+    /// sa fin : c'est le client qui a fermé. `non_suivie` sur la conversion.
+    fin: &'static str,
+}
+
+/// Le corps a été lâché avant la fin : le client a fermé la connexion.
+const FIN_CLIENT_PARTI: &str = "client_parti";
+
+impl BilanDeConnexion {
+    /// Le bilan d'une connexion MANDATAIRE (fil 2095).
+    fn mandataire(stream_id: &str, req_headers: &HeaderMap) -> Self {
+        let entete = |nom: &str| {
+            req_headers
+                .get(nom)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        Self {
+            stream_id: stream_id.to_string(),
+            voie: "mandataire",
+            range: entete("Range"),
+            agent: entete("User-Agent"),
+            reprise_depuis_la_retenue: None,
+            octets_envoyes: 0,
+            debut: std::time::Instant::now(),
+            session: None,
+            fin: FIN_CLIENT_PARTI,
+        }
+    }
+}
+
+impl Drop for BilanDeConnexion {
+    fn drop(&mut self) {
+        let tuyau = self.session.as_ref().map_or_else(
+            || "-".to_string(),
+            |s| {
+                s.octets_du_canal
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string()
+            },
+        );
+        info!(
+            stream_id = %self.stream_id,
+            voie = self.voie,
+            range = %self.range,
+            agent = %self.agent,
+            octets_envoyes = self.octets_envoyes,
+            reprise_depuis_la_retenue = ?self.reprise_depuis_la_retenue,
+            tuyau = %tuyau,
+            duree_ms = self.debut.elapsed().as_millis() as u64,
+            fin = self.fin,
+            "stream_connexion_terminee"
+        );
+    }
+}
+
 fn corriger_entete_long(long_wav: bool) -> impl Fn(u64, &mut Vec<u8>) + Send + Sync + 'static {
     move |debut: u64, bloc: &mut Vec<u8>| {
         if long_wav
@@ -2195,6 +2318,23 @@ async fn send_with_reresolve(
 
         let Some(reresolve) = reresolve else {
             // No re-resolver (local/non-expiring source) — nothing more to do.
+            //
+            // Fil 2121 (FabienM, Bandcamp → Chromecast) : une URL bcbits signée
+            // 2,7 jours plus tôt répond 410, la session n'a pas de mécanisme de
+            // nouvelle résolution, et l'appelant rend 502 au renderer. Ce
+            // chemin sortait SANS RIEN écrire : le journal montrait le 410,
+            // puis plus rien, et l'on ne pouvait pas dire que l'appareil avait
+            // reçu un 502. Une adresse expirée qu'on ne sait pas renouveler se
+            // dit, avec son statut et l'hôte amont (le service).
+            if let Ok(r) = &outcome {
+                warn!(
+                    status = %r.status(),
+                    amont = %r.url().host_str().unwrap_or("?"),
+                    url = %url,
+                    start = ?start,
+                    "proxy_upstream_expired_no_reresolver"
+                );
+            }
             return Err(());
         };
         if attempts >= PROXY_MAX_RERESOLVES {
@@ -2237,9 +2377,14 @@ fn resumable_proxy_body(
     sauter: u64,
     reresolve: Option<ReresolveFn>,
     compteur: std::sync::Arc<StreamSession>,
+    bilan: BilanDeConnexion,
 ) -> Body {
     let flux = async_stream::stream! {
         use futures_util::StreamExt;
+        // Le bilan ENTIER entre dans le flux : capturer seulement ses champs
+        // `Copy` (capture disjointe) compterait sur une copie, et le bilan
+        // serait écrit, vide, dès la réponse rendue.
+        let mut bilan = bilan;
         let mut resp = initial;
         // Current (possibly re-resolved) CDN URL we reconnect against.
         let mut url = upstream_url;
@@ -2262,9 +2407,11 @@ fn resumable_proxy_body(
                             }
                             let garde = chunk.slice(a_sauter as usize..);
                             a_sauter = 0;
+                            bilan.octets_envoyes += garde.len() as u64;
                             yield Ok::<_, std::io::Error>(garde);
                             continue;
                         }
+                        bilan.octets_envoyes += chunk.len() as u64;
                         yield Ok::<_, std::io::Error>(chunk);
                     }
                     Some(Err(e)) => {
@@ -2276,10 +2423,12 @@ fn resumable_proxy_body(
                 }
             }
             if clean_eof {
+                bilan.fin = "corps_complet";
                 break;
             }
             if resumes >= PROXY_MAX_RESUMES {
                 warn!(pos, "proxy_resume_giveup");
+                bilan.fin = "amont_abandonne";
                 break;
             }
             resumes += 1;
@@ -2302,10 +2451,12 @@ fn resumable_proxy_body(
                 }
                 Ok((r, _)) => {
                     warn!(status = %r.status(), pos, "proxy_resume_bad_status");
+                    bilan.fin = "amont_mauvais_statut";
                     break;
                 }
                 Err(()) => {
                     warn!(pos, "proxy_resume_upstream_failed");
+                    bilan.fin = "amont_injoignable";
                     break;
                 }
             }
@@ -2576,6 +2727,7 @@ async fn proxy_stream(
             0,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2619,6 +2771,7 @@ async fn proxy_stream(
             n,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2670,6 +2823,7 @@ async fn proxy_stream(
             0,
             reresolve.clone(),
             session.clone(),
+            BilanDeConnexion::mandataire(&session.id, req_headers),
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2687,6 +2841,7 @@ async fn proxy_stream(
         0,
         reresolve.clone(),
         session.clone(),
+        BilanDeConnexion::mandataire(&session.id, req_headers),
     );
     diag.journaliser(&session, StatusCode::OK, &headers);
     (StatusCode::OK, headers, body).into_response()

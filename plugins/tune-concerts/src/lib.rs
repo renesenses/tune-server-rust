@@ -136,6 +136,70 @@ pub const LOT: usize = 200;
 /// part » côté utilisateur.
 pub const PLAFOND: usize = 5_000;
 
+/// Le plafond d'écriture du nuage : le limiteur `premium` de site-mozaiklabs
+/// (`AppServiceProvider`, `Limit::perMinute(20)` par `instance_id` sur tout
+/// POST). Chaque lot d'abonnement est UNE écriture (#5591).
+pub const ECRITURES_PAR_MINUTE: u32 = 20;
+
+/// Le rythme de l'envoi des lots, et ce qu'on fait d'un 429 (#5591).
+///
+/// Avant, les 25 lots d'une bibliothèque au plafond partaient d'affilée, en
+/// 31 s, contre 20 écritures par minute côté nuage : les 5 derniers recevaient
+/// un 429, son `Retry-After` était journalisé puis ignoré, et les rangs 4 001 à
+/// 5 000 de l'ordre alphabétique n'étaient jamais abonnés.
+///
+/// Toutes les durées sont exprimées à partir de `seconde` : c'est l'horloge
+/// injectée qui permet aux essais de rejouer une minute de limiteur en
+/// quelques centaines de millisecondes, sans réseau réel ni test lent. En
+/// production, `seconde` vaut une vraie seconde ([`Cadence::production`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cadence {
+    /// La durée d'une seconde : l'unité de `Retry-After` et de tout le reste.
+    pub seconde: std::time::Duration,
+    /// La pause entre deux lots, pour rester sous [`ECRITURES_PAR_MINUTE`].
+    pub pause_entre_lots: std::time::Duration,
+    /// Le nombre d'envois d'un même lot, premier compris, quand le nuage
+    /// répond 429. Borné : un nuage qui refuse toujours ne retient pas la
+    /// tâche indéfiniment.
+    pub essais_par_lot: u32,
+    /// L'attente la plus longue consentie sur un 429, en secondes : un
+    /// `Retry-After` plus grand est ramené à cette borne.
+    pub attente_max_secs: u64,
+    /// L'attente sur un 429 qui ne dit pas combien attendre : la fenêtre
+    /// entière du limiteur. Rien n'est inventé au-delà.
+    pub attente_sans_delai_secs: u64,
+}
+
+impl Cadence {
+    /// La cadence de production, avec une seconde de durée `seconde`.
+    ///
+    /// 3,5 « secondes » entre deux lots : 60 / 20 = 3 s est la limite exacte,
+    /// la demi-seconde de marge absorbe l'écart d'horloge avec la fenêtre du
+    /// nuage. 25 lots partent alors en 84 s au lieu de 31 s.
+    pub fn a_l_echelle(seconde: std::time::Duration) -> Self {
+        Cadence {
+            seconde,
+            pause_entre_lots: seconde * 7 / 2,
+            essais_par_lot: 3,
+            attente_max_secs: 120,
+            attente_sans_delai_secs: 60,
+        }
+    }
+
+    /// La cadence de production : une seconde est une seconde.
+    pub fn production() -> Self {
+        Self::a_l_echelle(std::time::Duration::from_secs(1))
+    }
+
+    /// L'attente avant de renvoyer un lot refusé en 429.
+    fn attente_apres_429(&self, retry_after: Option<u64>) -> std::time::Duration {
+        let secs = retry_after
+            .unwrap_or(self.attente_sans_delai_secs)
+            .min(self.attente_max_secs);
+        self.seconde * u32::try_from(secs).unwrap_or(u32::MAX)
+    }
+}
+
 /// La plus grande page que le nuage accepte pour `/upcoming`
 /// (`PerimetreConcerts::PAGE_MAX`, site-mozaiklabs#242) — et sa page par
 /// défaut. Une valeur au-delà n'est pas refusée ici : elle part telle quelle
@@ -759,7 +823,14 @@ pub async fn synchroniser_abonnements(
     instance_id: &str,
 ) -> Result<usize, String> {
     let artistes = artistes_de_la_bibliotheque(backend)?;
-    envoyer_abonnements(CONCERTS_API, http_client, instance_id, &artistes).await
+    envoyer_abonnements(
+        CONCERTS_API,
+        http_client,
+        instance_id,
+        &artistes,
+        Cadence::production(),
+    )
+    .await
 }
 
 /// L'envoi proprement dit : le découpage en lots, la tolérance au lot perdu et
@@ -777,12 +848,20 @@ pub async fn synchroniser_abonnements(
 /// couper à 200, il resterait vert.
 ///
 /// L'unique appelant en production est [`synchroniser_abonnements`] juste
-/// au-dessus, et il passe [`CONCERTS_API`].
+/// au-dessus, et il passe [`CONCERTS_API`] et [`Cadence::production`].
+///
+/// # Cadence et 429 (#5591)
+///
+/// Les lots sont espacés de `cadence.pause_entre_lots` pour rester sous
+/// [`ECRITURES_PAR_MINUTE`]. Un lot refusé en 429 est renvoyé après le délai
+/// annoncé (`Retry-After`, borné), au plus `cadence.essais_par_lot` fois en
+/// tout ; au-delà, il est compté en échec comme avant.
 pub async fn envoyer_abonnements(
     racine: &str,
     http_client: &reqwest::Client,
     instance_id: &str,
     artistes: &[Value],
+    cadence: Cadence,
 ) -> Result<usize, String> {
     if artistes.is_empty() {
         debug!("concert_alerts_no_artists");
@@ -804,18 +883,56 @@ pub async fn envoyer_abonnements(
     let mut lots_en_echec = 0usize;
     let nombre_de_lots = artistes.len().div_ceil(LOT);
 
-    for lot in artistes.chunks(LOT) {
+    for (rang, lot) in artistes.chunks(LOT).enumerate() {
+        // Rang compté à partir de 1, comme le lirait un humain dans le journal.
+        let rang = rang + 1;
+        if rang > 1 {
+            tokio::time::sleep(cadence.pause_entre_lots).await;
+        }
+
         let body = json!({
             "instance_id": instance_id,
             "artists": lot,
         });
 
-        let resp = http_client
-            .post(format!("{racine}/subscribe"))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await;
+        let mut essai = 1u32;
+        let resp = loop {
+            // `Accept: application/json` (#5591) : sans lui, Laravel répond à un
+            // refus de validation par une redirection 302 vers la racine du
+            // site, que `reqwest` suit jusqu'à une page HTML en 200 — le refus
+            // se lisait alors comme un « lot illisible », sans motif. Même piège
+            // que celui documenté au-dessus de `submit_bug_report`.
+            let resp = http_client
+                .post(format!("{racine}/subscribe"))
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r)
+                    if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        && essai < cadence.essais_par_lot =>
+                {
+                    // Le nuage dit d'attendre : on attend, puis on renvoie le
+                    // MÊME lot. Abandonner ici perdait les derniers lots de
+                    // chaque synchronisation (#5591).
+                    let retry_after = tune_core::cloud::rate_limit::retry_after_secs(r.headers());
+                    let attente = cadence.attente_apres_429(retry_after);
+                    warn!(
+                        rang,
+                        essai,
+                        ?retry_after,
+                        attente_ms = attente.as_millis() as u64,
+                        "concert_subscribe_lot_limite_nouvel_essai"
+                    );
+                    tokio::time::sleep(attente).await;
+                    essai += 1;
+                }
+                autre => break autre,
+            }
+        };
 
         // Un lot en échec ne condamne pas les autres : mieux vaut abonner
         // 1 500 artistes sur 1 747 que zéro parce que le huitième appel a
@@ -829,13 +946,31 @@ pub async fn envoyer_abonnements(
                 // refusé » ne dit pas si le nuage demande d'attendre une minute
                 // ou une heure, et c'est la seule trace qu'on aura. `None` veut
                 // dire « le distant ne l'a pas dit » : jamais fabriqué.
+                let statut = r.status();
                 let retry_after = tune_core::cloud::rate_limit::retry_after_secs(r.headers());
-                warn!(statut = %r.status(), ?retry_after, "concert_subscribe_lot_refuse");
+                // Le motif du nuage (un 422 de validation, désormais lisible
+                // grâce à l'en-tête `Accept`), tronqué : c'est la seule façon
+                // de savoir quel artiste fait refuser tout un lot.
+                let motif: String = r
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(300)
+                    .collect();
+                warn!(
+                    rang,
+                    essais = essai,
+                    statut = %statut,
+                    ?retry_after,
+                    motif = %motif,
+                    "concert_subscribe_lot_refuse"
+                );
                 lots_en_echec += 1;
                 continue;
             }
             Err(e) => {
-                warn!(error = %e, "concert_subscribe_lot_echoue");
+                warn!(rang, error = %e, "concert_subscribe_lot_echoue");
                 lots_en_echec += 1;
                 continue;
             }
@@ -844,7 +979,7 @@ pub async fn envoyer_abonnements(
         let result: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "concert_subscribe_lot_illisible");
+                warn!(rang, error = %e, "concert_subscribe_lot_illisible");
                 lots_en_echec += 1;
                 continue;
             }
@@ -1162,6 +1297,17 @@ mod essais {
     /// Une réponse du banc : statut, corps, et le `Retry-After` à annoncer.
     type Reponse = (u16, &'static str, Option<u64>);
 
+    /// La cadence des essais qui ne jugent pas le rythme : aucune pause entre
+    /// les lots, et une « seconde » d'une milliseconde pour que les attentes
+    /// sur 429 restent courtes.
+    const CADENCE_D_ESSAI: Cadence = Cadence {
+        seconde: std::time::Duration::from_millis(1),
+        pause_entre_lots: std::time::Duration::ZERO,
+        essais_par_lot: 3,
+        attente_max_secs: 120,
+        attente_sans_delai_secs: 60,
+    };
+
     /// Un banc HTTP minimal : il répond dans l'ordre du script et garde ce
     /// qu'il a reçu.
     ///
@@ -1173,6 +1319,8 @@ mod essais {
     struct Banc {
         racine: String,
         recues: Arc<Mutex<Vec<Value>>>,
+        /// L'instant d'arrivée de chaque requête, dans l'ordre de `recues`.
+        arrivees: Arc<Mutex<Vec<std::time::Instant>>>,
         tache: tokio::task::JoinHandle<()>,
     }
 
@@ -1180,6 +1328,10 @@ mod essais {
         /// Ce que le banc a reçu : `{"cible": "…", "corps": …}` par requête.
         fn recues(&self) -> Vec<Value> {
             self.recues.lock().unwrap().clone()
+        }
+
+        fn arrivees(&self) -> Vec<std::time::Instant> {
+            self.arrivees.lock().unwrap().clone()
         }
     }
 
@@ -1200,10 +1352,27 @@ mod essais {
             !script.is_empty(),
             "le script du banc ne peut pas etre vide"
         );
+        banc_avec(move |appel, _| {
+            script
+                .get(appel)
+                .copied()
+                .unwrap_or(script[script.len() - 1])
+        })
+        .await
+    }
+
+    /// Le même banc, mais la réponse est calculée à chaque appel à partir de
+    /// son numéro et de son instant d'arrivée — de quoi jouer un limiteur.
+    async fn banc_avec<F>(mut repondre: F) -> Banc
+    where
+        F: FnMut(usize, std::time::Instant) -> Reponse + Send + 'static,
+    {
         let ecoute = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let racine = format!("http://{}", ecoute.local_addr().unwrap());
         let recues: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let journal = recues.clone();
+        let arrivees: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let journal_des_arrivees = arrivees.clone();
 
         let tache = tokio::spawn(async move {
             let mut appel = 0usize;
@@ -1239,10 +1408,20 @@ mod essais {
                             .to_string();
                         let corps = serde_json::from_slice::<Value>(&brut[fin + 4..])
                             .unwrap_or(Value::Null);
+                        let accept = entetes
+                            .split("\r\naccept:")
+                            .nth(1)
+                            .and_then(|s| s.split("\r\n").next())
+                            .map(|s| s.trim().to_string());
                         journal.lock().unwrap().push(json!({
                             "cible": cible,
+                            "accept": accept,
                             "corps": corps,
                         }));
+                        journal_des_arrivees
+                            .lock()
+                            .unwrap()
+                            .push(std::time::Instant::now());
                         break true;
                     }
                 };
@@ -1251,10 +1430,7 @@ mod essais {
                 }
 
                 // 2. Répondre, puis fermer proprement.
-                let (statut, charge, retry) = script
-                    .get(appel)
-                    .copied()
-                    .unwrap_or(script[script.len() - 1]);
+                let (statut, charge, retry) = repondre(appel, std::time::Instant::now());
                 appel += 1;
                 let mut tete = format!(
                     "HTTP/1.1 {statut} R\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -1274,6 +1450,7 @@ mod essais {
         Banc {
             racine,
             recues,
+            arrivees,
             tache,
         }
     }
@@ -1306,6 +1483,7 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
+            CADENCE_D_ESSAI,
         )
         .await
         .unwrap();
@@ -1349,6 +1527,7 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
+            CADENCE_D_ESSAI,
         )
         .await
         .unwrap();
@@ -1372,6 +1551,7 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
+            CADENCE_D_ESSAI,
         )
         .await;
 
@@ -1384,13 +1564,13 @@ mod essais {
         );
     }
 
-    /// Un 429 est un refus comme un autre pour cette tâche : il est journalisé
-    /// avec son délai, et les lots suivants partent quand même. La tâche est
-    /// périodique, personne ne l'attend — l'arrêter perdrait les 250 autres.
+    /// Un 429 ne fait pas tomber la tâche, et depuis #5591 il ne perd plus le
+    /// lot : le nuage dit d'attendre, on attend, puis on renvoie le MÊME lot.
     #[tokio::test]
-    async fn un_429_sur_un_lot_ne_fait_pas_tomber_la_tache() {
+    async fn un_429_est_renvoye_apres_son_delai_et_le_lot_n_est_pas_perdu() {
         let banc = banc(vec![
             (429, r#"{"message":"Too Many Attempts."}"#, Some(90)),
+            (200, r#"{"subscribed":200}"#, None),
             (200, r#"{"subscribed":200}"#, None),
             (200, r#"{"subscribed":50}"#, None),
         ])
@@ -1401,11 +1581,194 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-1",
             &artistes(450),
+            CADENCE_D_ESSAI,
         )
         .await
         .unwrap();
-        assert_eq!(total, 250);
-        assert_eq!(banc.recues().len(), 3);
+        assert_eq!(
+            total, 450,
+            "le lot refuse en 429 doit etre renvoye, pas perdu"
+        );
+
+        let recues = banc.recues();
+        assert_eq!(recues.len(), 4, "3 lots + 1 nouvel essai");
+        assert_eq!(
+            recues[0]["corps"], recues[1]["corps"],
+            "le nouvel essai doit renvoyer le MEME lot"
+        );
+
+        // Le délai annoncé est honoré : 90 « secondes » de l'horloge d'essai.
+        let arrivees = banc.arrivees();
+        let attendu = CADENCE_D_ESSAI.seconde * 90;
+        assert!(
+            arrivees[1] - arrivees[0] >= attendu,
+            "le nouvel essai est parti {:?} apres le 429, avant le Retry-After ({attendu:?})",
+            arrivees[1] - arrivees[0]
+        );
+    }
+
+    /// Le nouvel essai est BORNÉ : un nuage qui répond toujours 429 ne retient
+    /// pas la tâche indéfiniment. Chaque lot part `essais_par_lot` fois, puis
+    /// il est compté en échec — et un `Retry-After` démesuré est ramené à
+    /// `attente_max_secs` (sinon ce test durerait une heure d'horloge d'essai).
+    #[tokio::test]
+    async fn un_429_permanent_est_borne_en_essais_et_en_attente() {
+        let banc = banc(vec![(
+            429,
+            r#"{"message":"Too Many Attempts."}"#,
+            Some(3_600),
+        )])
+        .await;
+
+        let debut = std::time::Instant::now();
+        let resultat = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(450),
+            CADENCE_D_ESSAI,
+        )
+        .await;
+
+        assert!(
+            resultat.is_err(),
+            "trois lots toujours refuses : une erreur"
+        );
+        assert_eq!(
+            banc.recues().len(),
+            3 * CADENCE_D_ESSAI.essais_par_lot as usize,
+            "chaque lot doit partir exactement essais_par_lot fois"
+        );
+        // 3 lots x 2 attentes bornées à `attente_max_secs`, et non à 3 600.
+        let borne = CADENCE_D_ESSAI.seconde * (6 * CADENCE_D_ESSAI.attente_max_secs as u32 + 1_000);
+        assert!(
+            debut.elapsed() < borne,
+            "l'attente doit etre bornee : {:?}",
+            debut.elapsed()
+        );
+    }
+
+    /// Un faux nuage qui rejoue le limiteur `premium` de site-mozaiklabs : une
+    /// fenêtre fixe de 60 « secondes » ouverte au premier POST, 20 écritures
+    /// dedans, puis 429 avec le `Retry-After` qui reste à courir.
+    fn limiteur(seconde: std::time::Duration) -> impl FnMut(usize, std::time::Instant) -> Reponse {
+        let fenetre = seconde * 60;
+        let mut ouverture: Option<std::time::Instant> = None;
+        let mut ecritures = 0u32;
+        move |_, maintenant| {
+            match ouverture {
+                Some(debut) if maintenant - debut < fenetre => {}
+                _ => {
+                    ouverture = Some(maintenant);
+                    ecritures = 0;
+                }
+            }
+            ecritures += 1;
+            if ecritures <= ECRITURES_PAR_MINUTE {
+                return (200, r#"{"subscribed":200,"ignored":0}"#, None);
+            }
+            let reste = fenetre - (maintenant - ouverture.unwrap());
+            let secondes = reste.as_nanos().div_ceil(seconde.as_nanos()).max(1) as u64;
+            (429, r#"{"message":"Too Many Attempts."}"#, Some(secondes))
+        }
+    }
+
+    /// ⭐ #5591, la cadence : les 25 lots d'une bibliothèque au plafond restent
+    /// sous les 20 écritures par minute du nuage. Les nouveaux essais sont
+    /// coupés (`essais_par_lot = 1`) pour que seule la pause soit jugée :
+    /// avant le correctif, les 25 lots partaient d'affilée et les 5 derniers
+    /// recevaient un 429.
+    #[tokio::test]
+    async fn vingt_cinq_lots_restent_sous_la_limite_d_ecriture_du_nuage() {
+        let seconde = std::time::Duration::from_millis(5);
+        let banc = banc_avec(limiteur(seconde)).await;
+        let cadence = Cadence {
+            essais_par_lot: 1,
+            ..Cadence::a_l_echelle(seconde)
+        };
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(PLAFOND),
+            cadence,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(banc.recues().len(), 25, "5 000 artistes = 25 lots");
+        assert_eq!(
+            total, PLAFOND,
+            "aucun lot ne doit etre refuse par le limiteur du nuage"
+        );
+    }
+
+    /// ⭐ #5591, le `Retry-After` : sans aucune pause entre les lots, le même
+    /// limiteur refuse le 21e envoi — et le lot n'est plus perdu, il repart
+    /// une fois la fenêtre écoulée. Avant le correctif : 5 lots sur 25 perdus.
+    #[tokio::test]
+    async fn sans_pause_le_retry_after_du_limiteur_rattrape_les_cinq_derniers_lots() {
+        let seconde = std::time::Duration::from_millis(5);
+        let banc = banc_avec(limiteur(seconde)).await;
+        let cadence = Cadence {
+            pause_entre_lots: std::time::Duration::ZERO,
+            ..Cadence::a_l_echelle(seconde)
+        };
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(PLAFOND),
+            cadence,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(total, PLAFOND, "les 25 lots doivent finir abonnes");
+        assert!(
+            banc.recues().len() > 25,
+            "le limiteur doit avoir refuse au moins un envoi, sinon ce test ne juge rien"
+        );
+    }
+
+    /// La cadence de PRODUCTION, lue telle quelle : un réglage qui
+    /// repasserait sous 60 s / 20 écritures referait perdre des lots, et les
+    /// essais au-dessus ne le verraient pas (ils construisent leur cadence).
+    #[test]
+    fn la_cadence_de_production_tient_sous_la_limite_du_nuage() {
+        let c = Cadence::production();
+        assert_eq!(c.seconde, std::time::Duration::from_secs(1));
+        assert!(
+            c.pause_entre_lots * ECRITURES_PAR_MINUTE > c.seconde * 60,
+            "{ECRITURES_PAR_MINUTE} lots espaces de {:?} tiennent dans une minute",
+            c.pause_entre_lots
+        );
+        assert!(
+            c.essais_par_lot > 1,
+            "un 429 doit etre renvoye au moins une fois"
+        );
+    }
+
+    /// #5591 : sans `Accept: application/json`, Laravel répond à un refus de
+    /// validation par une redirection 302 vers une page HTML, et le lot se lit
+    /// comme « illisible » au lieu d'un 422 avec son motif.
+    #[tokio::test]
+    async fn l_abonnement_demande_du_json() {
+        let banc = banc(vec![(200, r#"{"subscribed":1}"#, None)]).await;
+
+        envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(1),
+            CADENCE_D_ESSAI,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(banc.recues()[0]["accept"], "application/json");
     }
 
     /// Une bibliothèque vide ne doit produire AUCUN appel : abonner « rien »
@@ -1420,6 +1783,7 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-1",
             &[],
+            CADENCE_D_ESSAI,
         )
         .await
         .unwrap();
@@ -1448,6 +1812,7 @@ mod essais {
             tune_core::http::client::shared(),
             "inst-42",
             &tous,
+            CADENCE_D_ESSAI,
         )
         .await
         .unwrap();

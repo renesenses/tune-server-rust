@@ -2262,15 +2262,7 @@ impl PlaybackOrchestrator {
         // zones fixed_volume ne passent jamais ici (early return ci-dessus).
         // Limite assumée : un trim positif est plafonné quand user_volume est
         // déjà haut (clamp 0..1).
-        let device_volume = {
-            let trim_db = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-                .get(&format!("zone_{zone_id}_gain_trim_db"))
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            (volume * gain_trim_factor(trim_db)).clamp(0.0, 1.0)
-        };
+        let device_volume = volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id));
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(

@@ -6256,6 +6256,82 @@ async fn streaming_seek_on_local_output_is_producer_preseeked_no_consumer_skip()
     );
 }
 
+/// Joue sur `device_id` sans qu'aucune sortie ne soit enregistrée : c'est la
+/// branche `recreate_local_and_play` de `send_to_output`. Rend le gain que le
+/// rendu de la sortie recréée multiplie réellement, en millièmes.
+#[cfg(feature = "local-audio")]
+async fn gain_de_la_sortie_recreee(volume: f64, fixe: bool, trim_db: &str) -> u32 {
+    use std::sync::atomic::Ordering;
+    let orch = test_orchestrator();
+    let device_id = "local:Recreee";
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = repo
+        .create("Recréée", Some("local"), Some(device_id))
+        .unwrap();
+    repo.update_volume(zone_id, volume).unwrap();
+    repo.update_fixed_volume(zone_id, fixe).unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("zone_{zone_id}_gain_trim_db"), trim_db)
+        .unwrap();
+    assert!(orch.outputs.lock().await.get(device_id).is_none());
+
+    // L'URL refuse la connexion : le thread audio s'arrête avant de toucher
+    // un périphérique (comme le témoin #1518 ci-dessus).
+    let media = crate::outputs::traits::PlayMedia {
+        url: "http://127.0.0.1:1/stream",
+        mime_type: "audio/wav",
+        ..Default::default()
+    };
+    let _ = orch
+        .send_to_output(device_id, &media, None, false, zone_id, None)
+        .await;
+
+    let arc = orch
+        .outputs
+        .lock()
+        .await
+        .get(device_id)
+        .expect("la sortie locale doit avoir été recréée et enregistrée");
+    let out = arc.lock().await;
+    let local = out
+        .as_any()
+        .downcast_ref::<crate::outputs::local::LocalOutput>()
+        .unwrap();
+    local.gain_de_rendu().load(Ordering::SeqCst)
+}
+
+/// Une sortie locale RECRÉÉE à la volée (appareil absent du registre au
+/// moment de jouer) doit naître au volume enregistré de sa zone, trim
+/// compris — pas à la pleine échelle d'une `LocalOutput` neuve.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_sortie_locale_recreee_nait_au_volume_de_la_zone_trim_compris() {
+    let gain = gain_de_la_sortie_recreee(30.0, false, "-6").await as f64 / 1000.0;
+    let attendu = super::volume_avec_trim(0.30, -6.0);
+    assert!(
+        (gain - attendu).abs() < 2e-3,
+        "gain de rendu {gain} après recréation, attendu {attendu} (30 % × −6 dB) : \
+         la sortie recréée n'est pas ensemencée avec le volume de la zone"
+    );
+}
+
+/// Les plafonds tiennent aussi à la recréation : une zone « Volume fixe »
+/// reste à pleine échelle quel que soit le trim, et un trim positif sur une
+/// zone haute ne fait jamais dépasser l'unité.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn la_sortie_locale_recreee_respecte_volume_fixe_et_plafond() {
+    assert_eq!(
+        gain_de_la_sortie_recreee(20.0, true, "-6").await,
+        1000,
+        "zone « Volume fixe » recréée hors de la pleine échelle"
+    );
+    assert!(
+        gain_de_la_sortie_recreee(95.0, false, "12").await <= 1000,
+        "trim positif : plafond de l'unité franchi à la recréation"
+    );
+}
+
 #[test]
 fn prefetch_buffer_truncated_cases() {
     // Unknown duration (0) must count as truncated — the DMP-A8 cut.
