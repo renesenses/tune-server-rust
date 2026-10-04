@@ -101,6 +101,31 @@ impl LecteurLinux {
     }
 }
 
+/// Tous les lecteurs optiques de `dossier` (`/dev`) : les `srN`, dans l'ordre
+/// de N (`sr2` avant `sr10`). Fil 2135 : seul `/dev/sr0..3` était regardé,
+/// et seul le premier présent était gardé.
+pub fn peripheriques_optiques(dossier: &std::path::Path) -> Vec<String> {
+    let Ok(entrees) = std::fs::read_dir(dossier) else {
+        return Vec::new();
+    };
+    let mut trouves: Vec<(u32, String)> = entrees
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let nom = e.file_name().into_string().ok()?;
+            let n = nom.strip_prefix("sr")?;
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((
+                n.parse().ok()?,
+                dossier.join(&nom).to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    trouves.sort();
+    trouves.into_iter().map(|(_, c)| c).collect()
+}
+
 fn derniere_erreur() -> String {
     std::io::Error::last_os_error().to_string()
 }
@@ -216,6 +241,25 @@ mod tests {
             assert_eq!(std::mem::offset_of!(CdromReadAudio, buf), 16);
             assert_eq!(std::mem::size_of::<CdromReadAudio>(), 24);
         }
+    }
+
+    /// Fil 2135 : TOUS les `srN`, au-delà de `sr3`, dans l'ordre numérique,
+    /// et rien d'autre (`sg0`, `sda`, `srx`).
+    #[test]
+    fn tous_les_lecteurs_optiques_sont_enumeres() {
+        let dossier = std::env::temp_dir().join(format!("tune-cd-2135-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dossier);
+        std::fs::create_dir_all(&dossier).unwrap();
+        for nom in ["sr1", "sr10", "sda", "sr0", "sg0", "srx", "sr", "sr4"] {
+            std::fs::write(dossier.join(nom), b"").unwrap();
+        }
+        let d = dossier.to_string_lossy().into_owned();
+        assert_eq!(
+            peripheriques_optiques(&dossier),
+            ["sr0", "sr1", "sr4", "sr10"].map(|n| format!("{d}/{n}"))
+        );
+        std::fs::remove_dir_all(&dossier).unwrap();
+        assert!(peripheriques_optiques(&dossier).is_empty());
     }
 
     #[test]

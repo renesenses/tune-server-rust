@@ -70,10 +70,14 @@ pub trait LecteurDisque: Send + Sync {
 /// Le lecteur du système, s'il y en a un que Tune sait lire.
 ///
 /// Linux : `TUNE_CD_DEVICE` impose un périphérique ; sinon un
-/// [`LecteurBranchable`] qui cherche le premier `/dev/sr0..3` présent, comme
-/// la détection de `/cd-rip/drives` — et le cherche ENCORE tant qu'il n'y en
-/// a pas (#5161 : un lecteur USB branché après le démarrage de Tune, ou un
-/// `/dev/sr0` créé par udev après le service, n'était jamais vu).
+/// [`LecteurBranchable`] qui cherche parmi TOUS les `/dev/srN` celui qui
+/// contient un disque, à défaut le premier — et le cherche ENCORE tant qu'il
+/// n'y en a pas (#5161 : un lecteur USB branché après le démarrage de Tune,
+/// ou un `/dev/sr0` créé par udev après le service, n'était jamais vu).
+/// Fil 2135 : avec deux lecteurs branchés, seul le premier `/dev/sr*` était
+/// lu, et un disque mis dans l'autre restait invisible ; un lecteur courant
+/// VIDE cède désormais la place à celui qui a un disque
+/// ([`LecteurBranchable::preferant_le_disque`]).
 ///
 /// macOS : toujours un lecteur, dont la présence dit « aucun lecteur »,
 /// « vide » ou « disque » (un lecteur USB se branche à chaud) ;
@@ -87,16 +91,23 @@ pub fn lecteur_du_systeme() -> Option<Arc<dyn LecteurDisque>> {
         if let Ok(chemin) = std::env::var("TUNE_CD_DEVICE") {
             return Some(Arc::new(crate::linux::LecteurLinux::new(chemin)));
         }
-        Some(Arc::new(LecteurBranchable::new(
-            "/dev/sr*",
-            INTERVALLE_DE_RECHERCHE,
-            Box::new(|| {
-                (0..4)
-                    .map(|i| format!("/dev/sr{i}"))
-                    .find(|c| std::path::Path::new(c).exists())
-                    .map(|c| Arc::new(crate::linux::LecteurLinux::new(c)) as Arc<dyn LecteurDisque>)
-            }),
-        )))
+        Some(Arc::new(
+            LecteurBranchable::new(
+                "/dev/sr*",
+                INTERVALLE_DE_RECHERCHE,
+                Box::new(|| {
+                    preferer_un_disque(
+                        crate::linux::peripheriques_optiques(std::path::Path::new("/dev"))
+                            .into_iter()
+                            .map(|c| {
+                                Arc::new(crate::linux::LecteurLinux::new(c))
+                                    as Arc<dyn LecteurDisque>
+                            }),
+                    )
+                }),
+            )
+            .preferant_le_disque(),
+        ))
     }
     #[cfg(target_os = "macos")]
     {
@@ -130,6 +141,24 @@ pub const INTERVALLE_DE_RECHERCHE: Duration = Duration::from_secs(2);
 /// Ce qui trouve le lecteur branché, s'il y en a un.
 pub type Recherche = Box<dyn Fn() -> Option<Arc<dyn LecteurDisque>> + Send + Sync>;
 
+/// Parmi plusieurs lecteurs, dans l'ordre : le premier qui a un disque, sinon
+/// le premier vide, sinon le premier tout court (fil 2135).
+pub fn preferer_un_disque(
+    candidats: impl IntoIterator<Item = Arc<dyn LecteurDisque>>,
+) -> Option<Arc<dyn LecteurDisque>> {
+    let mut vide = None;
+    let mut premier = None;
+    for l in candidats {
+        match l.presence() {
+            Presence::Disque => return Some(l),
+            Presence::Vide if vide.is_none() => vide = Some(l),
+            _ if premier.is_none() => premier = Some(l),
+            _ => {}
+        }
+    }
+    vide.or(premier)
+}
+
 /// Un lecteur qui peut se brancher APRÈS le démarrage (#5161).
 ///
 /// Tant qu'aucun lecteur n'est trouvé, chaque question (`presence`,
@@ -142,6 +171,9 @@ pub struct LecteurBranchable {
     motif: String,
     intervalle: Duration,
     recherche: Recherche,
+    /// Fil 2135 : un lecteur courant VIDE est-il remplacé par un autre qui a
+    /// un disque ? (Linux, où plusieurs `/dev/srN` coexistent.)
+    preferer_le_disque: bool,
     etat: Mutex<EtatRecherche>,
 }
 
@@ -158,8 +190,19 @@ impl LecteurBranchable {
             motif: motif.into(),
             intervalle,
             recherche,
+            preferer_le_disque: false,
             etat: Mutex::new(EtatRecherche::default()),
         }
+    }
+
+    /// Tant que le lecteur courant est VIDE, la recherche est relancée (au
+    /// plus une fois par intervalle) ; si elle trouve un AUTRE lecteur qui a
+    /// un disque, il devient le lecteur courant (fil 2135). Un lecteur qui a
+    /// un disque n'est jamais quitté : une lecture en cours n'est pas
+    /// interrompue par un disque inséré ailleurs.
+    pub fn preferant_le_disque(mut self) -> Self {
+        self.preferer_le_disque = true;
+        self
     }
 
     /// Le lecteur branché, en le cherchant si l'intervalle est écoulé.
@@ -179,6 +222,37 @@ impl LecteurBranchable {
             }
         }
         e.courant.clone()
+    }
+
+    /// `vide` est le lecteur courant et n'a pas de disque : passe à un autre
+    /// lecteur qui en a un, s'il y en a un (fil 2135). Rend le nouveau.
+    fn basculer_vers_un_disque(
+        &self,
+        vide: &Arc<dyn LecteurDisque>,
+    ) -> Option<Arc<dyn LecteurDisque>> {
+        if !self.preferer_le_disque {
+            return None;
+        }
+        let mut e = self.etat.lock().unwrap_or_else(|p| p.into_inner());
+        if !e.courant.as_ref().is_some_and(|c| Arc::ptr_eq(c, vide))
+            || e.derniere_recherche
+                .is_some_and(|t| t.elapsed() < self.intervalle)
+        {
+            return None;
+        }
+        e.derniere_recherche = Some(Instant::now());
+        let autre = (self.recherche)()?;
+        if autre.chemin() == vide.chemin() || autre.presence() != Presence::Disque {
+            return None;
+        }
+        tracing::info!(
+            precedent = %vide.chemin(),
+            lecteur = %autre.chemin(),
+            "cd_lecteur_avec_disque_choisi"
+        );
+        e.courant = Some(autre.clone());
+        e.generation = e.generation.wrapping_add(1);
+        Some(autre)
     }
 
     /// Oublie `l` s'il est toujours le lecteur courant ; la prochaine
@@ -214,6 +288,9 @@ impl LecteurDisque for LecteurBranchable {
             return Presence::AucunLecteur;
         };
         let p = l.presence();
+        if p == Presence::Vide && self.basculer_vers_un_disque(&l).is_some() {
+            return Presence::Disque;
+        }
         if p != Presence::AucunLecteur {
             return p;
         }
@@ -334,6 +411,182 @@ pub(crate) mod tests {
 
         systeme.branche.store(true, Ordering::SeqCst);
         assert_eq!(l.presence(), Presence::Disque);
+    }
+
+    /// Fil 2135 — un lecteur factice NOMMÉ (`/dev/sr0`, `/dev/sr1`) dont on
+    /// règle la présence : deux lecteurs branchés en même temps.
+    pub(crate) struct LecteurNomme {
+        nom: &'static str,
+        presence: Mutex<Presence>,
+    }
+
+    impl LecteurNomme {
+        fn new(nom: &'static str, presence: Presence) -> Arc<Self> {
+            Arc::new(Self {
+                nom,
+                presence: Mutex::new(presence),
+            })
+        }
+        fn mettre(&self, p: Presence) {
+            *self.presence.lock().unwrap() = p;
+        }
+    }
+
+    impl LecteurDisque for LecteurNomme {
+        fn chemin(&self) -> String {
+            self.nom.into()
+        }
+        fn presence(&self) -> Presence {
+            *self.presence.lock().unwrap()
+        }
+        fn lire_toc(&self) -> Result<Toc, ErreurCd> {
+            match self.presence() {
+                Presence::Disque => Ok(toc_du_vecteur()),
+                _ => Err(ErreurCd::AucunDisque),
+            }
+        }
+        fn lire_secteurs(&self, _: u32, _: u32, _: &mut [u8]) -> Result<(), ErreurCd> {
+            Err(ErreurCd::AucunDisque)
+        }
+    }
+
+    /// Le « système » Linux à deux lecteurs : même recherche et même mode
+    /// que `lecteur_du_systeme`, sur des lecteurs factices.
+    fn deux_lecteurs(
+        sr0: Presence,
+        sr1: Presence,
+    ) -> (
+        Arc<LecteurNomme>,
+        Arc<LecteurNomme>,
+        Arc<AtomicUsize>,
+        LecteurBranchable,
+    ) {
+        let a = LecteurNomme::new("/dev/sr0", sr0);
+        let b = LecteurNomme::new("/dev/sr1", sr1);
+        let recherches = Arc::new(AtomicUsize::new(0));
+        let (ca, cb, n) = (a.clone(), b.clone(), recherches.clone());
+        let l = LecteurBranchable::new(
+            "/dev/sr*",
+            Duration::ZERO,
+            Box::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+                preferer_un_disque([
+                    ca.clone() as Arc<dyn LecteurDisque>,
+                    cb.clone() as Arc<dyn LecteurDisque>,
+                ])
+            }),
+        )
+        .preferant_le_disque();
+        (a, b, recherches, l)
+    }
+
+    /// Fil 2135 : deux lecteurs branchés, le disque dans le SECOND. Avant,
+    /// le premier `/dev/sr*` était pris et le disque restait invisible.
+    #[test]
+    fn le_lecteur_qui_a_un_disque_est_prefere_au_premier() {
+        let (_a, _b, _, l) = deux_lecteurs(Presence::Vide, Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr1");
+        assert!(l.lire_toc().is_ok());
+    }
+
+    /// Fil 2135 : les deux sont vides au démarrage, puis le disque entre
+    /// dans le second. Le lecteur courant (vide) lui cède la place, et la
+    /// génération change pour que la surveillance republie la source.
+    #[test]
+    fn un_disque_insere_dans_l_autre_lecteur_est_suivi() {
+        let (_a, b, _, l) = deux_lecteurs(Presence::Vide, Presence::Vide);
+        assert_eq!(l.presence(), Presence::Vide);
+        assert_eq!(l.chemin(), "/dev/sr0");
+        let g = l.generation_lecteur();
+
+        b.mettre(Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr1");
+        assert_ne!(l.generation_lecteur(), g);
+        assert!(l.lire_toc().is_ok());
+    }
+
+    /// Un lecteur qui a un disque n'est jamais quitté (une lecture en cours
+    /// ne saute pas d'un lecteur à l'autre), et il n'est plus recherché.
+    #[test]
+    fn le_lecteur_qui_a_un_disque_n_est_pas_quitte() {
+        let (_a, _b, recherches, l) = deux_lecteurs(Presence::Disque, Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr0");
+        let (g, n) = (l.generation_lecteur(), recherches.load(Ordering::SeqCst));
+        for _ in 0..5 {
+            assert_eq!(l.presence(), Presence::Disque);
+        }
+        assert_eq!(l.chemin(), "/dev/sr0");
+        assert_eq!(l.generation_lecteur(), g);
+        assert_eq!(recherches.load(Ordering::SeqCst), n);
+    }
+
+    /// Aucun disque nulle part : le lecteur courant est gardé, sans
+    /// changement de génération (pas de republication à chaque tour).
+    #[test]
+    fn sans_disque_nulle_part_le_lecteur_courant_est_garde() {
+        let (_a, _b, _, l) = deux_lecteurs(Presence::Vide, Presence::Vide);
+        assert_eq!(l.presence(), Presence::Vide);
+        let g = l.generation_lecteur();
+        for _ in 0..5 {
+            assert_eq!(l.presence(), Presence::Vide);
+        }
+        assert_eq!(l.chemin(), "/dev/sr0");
+        assert_eq!(l.generation_lecteur(), g);
+    }
+
+    /// Le lecteur courant est débranché : il est oublié, et l'autre, où l'on
+    /// vient de mettre un disque, est retrouvé.
+    #[test]
+    fn le_lecteur_courant_debranche_cede_la_place_a_l_autre() {
+        let (a, b, _, l) = deux_lecteurs(Presence::Vide, Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr1");
+        b.mettre(Presence::AucunLecteur);
+        a.mettre(Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr0");
+    }
+
+    /// Sans `preferant_le_disque` (Windows), rien ne change : le lecteur
+    /// trouvé est gardé tant qu'il est branché.
+    #[test]
+    fn sans_preference_le_premier_lecteur_trouve_est_garde() {
+        let a = LecteurNomme::new("A:", Presence::Vide);
+        let b = LecteurNomme::new("B:", Presence::Disque);
+        let (ca, cb) = (a.clone(), b.clone());
+        let premier = AtomicBool::new(true);
+        let l = LecteurBranchable::new(
+            "*",
+            Duration::ZERO,
+            Box::new(move || {
+                Some(if premier.swap(false, Ordering::SeqCst) {
+                    ca.clone() as Arc<dyn LecteurDisque>
+                } else {
+                    cb.clone() as Arc<dyn LecteurDisque>
+                })
+            }),
+        );
+        assert_eq!(l.presence(), Presence::Vide);
+        assert_eq!(l.presence(), Presence::Vide);
+        assert_eq!(l.chemin(), "A:");
+    }
+
+    #[test]
+    fn preferer_un_disque_suit_l_ordre_disque_vide_absent() {
+        let absent = LecteurNomme::new("absent", Presence::AucunLecteur);
+        let vide = LecteurNomme::new("vide", Presence::Vide);
+        let disque = LecteurNomme::new("disque", Presence::Disque);
+        let choix = |v: &[&Arc<LecteurNomme>]| {
+            preferer_un_disque(v.iter().map(|l| (*l).clone() as Arc<dyn LecteurDisque>))
+                .map(|l| l.chemin())
+        };
+        assert_eq!(choix(&[&absent, &vide, &disque]).as_deref(), Some("disque"));
+        assert_eq!(choix(&[&absent, &vide]).as_deref(), Some("vide"));
+        assert_eq!(choix(&[&absent]).as_deref(), Some("absent"));
+        assert_eq!(choix(&[]), None);
     }
 
     /// Le chemin du SYSTÈME : sans périphérique (Shrek n'a pas de `/dev/sr*`),
