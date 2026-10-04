@@ -680,6 +680,20 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
+        // Fil 2121 (décision de Bertrand, 04/10) — resigner AVANT l'envoi, pour
+        // TOUTES les sorties : la sortie locale et OAAT ouvrent l'URL
+        // elles-mêmes, sans le relais qui sait guérir un 410. Une signature
+        // vieille de 24 h ou plus (ou absente) est remplacée par celle du jour,
+        // lue sur la page. `audio_url` est REDÉFINIE ici : tout ce qui suit —
+        // relais, décodage OAAT, sortie locale, sonde de niveaux — lit l'URL
+        // fraîche.
+        let bc_url_resignee: Option<String> = if is_bandcamp {
+            self.resigner_bandcamp_avant_envoi(req.zone_id, audio_url, bc_album_ref.as_deref())
+                .await
+        } else {
+            None
+        };
+        let audio_url: &str = bc_url_resignee.as_deref().unwrap_or(audio_url);
 
         let is_local_output = req
             .output_device_id
@@ -1551,6 +1565,64 @@ impl PlaybackOrchestrator {
             None,
         )
     }
+    /// Fil 2121 — l'URL du jour d'une piste Bandcamp dont la signature a
+    /// passé le seuil ([`super::bandcamp_resignature::SEUIL_SIGNATURE_BANDCAMP_SECS`]),
+    /// lue sur sa page. `None` quand il n'y a rien à faire ou rien de possible :
+    /// l'appelant garde alors l'URL d'origine.
+    ///
+    /// - signature récente, ou URL qui n'est pas un flux (`/stream/`) : rien ;
+    /// - page inconnue : WARN `bandcamp_signature_perimee_sans_reference`, URL
+    ///   d'origine (le relais, ou B, dira l'échec éventuel) ;
+    /// - relecture en échec : WARN `bandcamp_resignature_avant_envoi_echouee`,
+    ///   URL d'origine.
+    async fn resigner_bandcamp_avant_envoi(
+        &self,
+        zone_id: i64,
+        audio_url: &str,
+        album_ref: Option<&str>,
+    ) -> Option<String> {
+        use super::bandcamp_resignature::{horodatage_de_signature, signature_a_renouveler};
+        crate::db::reference_d_album::identite_de_flux(audio_url)?;
+        let maintenant = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !signature_a_renouveler(audio_url, maintenant) {
+            return None;
+        }
+        let age_secs = horodatage_de_signature(audio_url).map(|ts| maintenant.saturating_sub(ts));
+        let Some(page) = album_ref else {
+            warn!(
+                zone_id,
+                age_secs,
+                url = %audio_url,
+                "bandcamp_signature_perimee_sans_reference"
+            );
+            return None;
+        };
+        let relire = super::bandcamp_resignature::reresolveur_bandcamp(
+            self.services.clone(),
+            page.to_string(),
+            audio_url.to_string(),
+        );
+        match relire().await {
+            Ok(fraiche) => {
+                info!(zone_id, age_secs, page, "bandcamp_resignee_avant_envoi");
+                Some(fraiche)
+            }
+            Err(e) => {
+                warn!(
+                    zone_id,
+                    age_secs,
+                    page,
+                    error = %e,
+                    "bandcamp_resignature_avant_envoi_echouee"
+                );
+                None
+            }
+        }
+    }
+
     async fn relayer_bandcamp_au_reseau(&self, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
