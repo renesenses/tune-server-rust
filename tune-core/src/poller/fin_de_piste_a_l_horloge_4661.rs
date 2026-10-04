@@ -605,3 +605,62 @@ async fn le_plafond_ferme_une_zone_morte_sur_une_piste_tres_longue() {
          devant, la zone ne reste pas ouverte indéfiniment"
     );
 }
+
+// ─────────── 4. fil 2125 (#5711) — l'horloge EFFACÉE ne tranche rien ───────────
+
+/// Durée d'arrêt du fil 2125 au moment des `flux_servi_en_entier_zone_non_coupee`
+/// relevés : bien au-delà de la borne plate de #4480 (120 s), bien en deçà du
+/// plafond de l'horloge (600 s). C'est la fenêtre où la zone morte restait
+/// « en lecture » à tort.
+const ARRET_FIL_2125_S: u64 = 300;
+
+#[test]
+fn une_horloge_de_piste_effacee_n_est_pas_une_horloge_a_zero_2125() {
+    assert!(
+        !decisions::horloge_de_piste_connue(None),
+        "`track_started_at` à `None` : l'horloge est inconnue, pas à zéro"
+    );
+    assert!(decisions::horloge_de_piste_connue(Some(Instant::now())));
+    let branche = branche_du_seuil_d_echec();
+    assert!(
+        branche.contains("decisions::horloge_de_piste_connue(ps.track_started_at)"),
+        "le bras doit vérifier que l'horloge de piste est connue avant de lui \
+         accorder la patience de #4661 (fil 2125)"
+    );
+}
+
+/// Fil 2125 — le fichier est chez le renderer EN ENTIER, le renderer s'est tu,
+/// et un bras gapless a EFFACÉ l'horloge de la piste. Avant le correctif,
+/// `wall_elapsed` valait 0, « toute la piste reste à jouer », et la zone
+/// restait en lecture jusqu'à 600 s d'arrêt. Elle doit être coupée par la
+/// borne ordinaire.
+#[tokio::test]
+async fn une_horloge_effacee_ne_garde_pas_une_zone_morte_2125() {
+    let mut b = Banc::scene(WALL_A_LA_COUPURE_4480_S, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.polls
+        .get_mut(&b.zone)
+        .expect("la zone du banc")
+        .track_started_at = None;
+    b.arret_de(ARRET_FIL_2125_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Stopped,
+        "horloge de piste effacée : rien ne prouve qu'il reste de la musique, \
+         la zone morte doit être coupée au lieu d'attendre le plafond de 600 s"
+    );
+}
+
+/// Témoin du banc précédent : MÊME scène, MÊME arrêt, seule l'horloge est
+/// connue (et loin de la fin). L'épargne de #4661 tient toujours — c'est donc
+/// bien l'horloge effacée, et elle seule, qui fait couper ci-dessus.
+#[tokio::test]
+async fn une_horloge_connue_garde_toujours_la_zone_2125() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.arret_de(ARRET_FIL_2125_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Playing,
+        "horloge connue à 100 s sur une piste de 281 s, fichier servi en \
+         entier : l'épargne de #4661 doit tenir"
+    );
+}

@@ -1873,6 +1873,10 @@ mod pause_rend_le_peripherique_4177;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
+/// ait ouvert le flux.
+#[cfg(test)]
+mod reprise_renderer_cale_2125;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
