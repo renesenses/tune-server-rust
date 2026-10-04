@@ -195,7 +195,22 @@ aussi, mais il n'apporte alors que les crédits, aucune image.
 ## Ce que fait l'import, et ce qu'il ne fait jamais
 
 L'appariement se fait sur **vos artistes, puis leurs albums, puis leurs
-pistes**, par nom et titre.
+pistes**, en deux niveaux.
+
+1. **Égalité stricte** : même nom d'artiste et même titre d'album, une fois
+   repliés (accents, casse, espaces, article « The »). C'est le premier
+   essai, et il garde la priorité.
+2. **Par le contenu**, pour ce que le premier niveau n'a pas trouvé. Les
+   candidats sont les albums de toutes les fiches Tune de ce nom, ceux qui
+   portent une piste de l'artiste (une compilation, par exemple) et, en
+   dernier recours, ceux de toute la bibliothèque. Un candidat doit avoir le
+   même titre que l'album Roon, en ignorant la ponctuation et les suffixes de
+   disque (« (CD 1/2) », « [Disc 2] »…). Ce sont ensuite les **pistes** qui
+   décident : au moins 80 % des pistes doivent se retrouver des deux côtés,
+   avec le même titre et, quand il est connu, le même numéro et le même
+   disque, et au moins deux pistes. Un coffret que Tune range en un album par
+   disque est apparié disque par disque. Si plusieurs candidats conviennent,
+   l'album est classé **ambigu** et rien n'est écrit.
 
 Ce qu'il fait :
 
@@ -212,8 +227,17 @@ Ce qu'il ne fait jamais :
 - il ne **remplace aucun crédit** existant ;
 - il ne crée ni artiste, ni album, ni piste : ce que Tune ne connaît pas est
   listé dans le rapport (`artistes_inconnus`, `albums_inconnus`) et ignoré ;
+- il ne choisit jamais entre deux fiches Tune au hasard de leur ordre : un
+  artiste ou un album en double est listé dans `doublons`, et seul le contenu
+  peut trancher ;
 - ce qui vient de Roon **reste local** : la synchronisation cloud de Tune ne
   l'emporte pas.
+
+Chaque album Roon tombe dans une seule catégorie du rapport : apparié strict
+(`albums_apparies_strict`), apparié par le contenu (`albums_apparies_contenu`,
+détail dans `albums_par_contenu`), ambigu (`albums_ambigus`) ou introuvable
+(`albums_inconnus`, y compris les albums des artistes inconnus). L'aperçu
+établit ce classement sans rien écrire.
 
 Le rapport donne, entre autres : artistes, albums et pistes appariés ;
 crédits à écrire, déjà présents, écrits ; images nommées par l'export et

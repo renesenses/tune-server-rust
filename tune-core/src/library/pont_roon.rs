@@ -26,12 +26,20 @@
 //! (`track_metadata.credits_source = roon`), et rien n'est écrit sur une
 //! piste qui a déjà des crédits — le vide seulement, comme partout.
 //!
+//! ## L'appariement, en deux niveaux (#5749)
+//!
+//! Le niveau 1 est l'égalité stricte du titre replié ([`plier`]), sous les
+//! fiches de l'artiste. Il garde la priorité. Le niveau 2 ne voit que ce qu'il
+//! a laissé : ses candidats partagent la clé de [`cle_d_album`] (ponctuation
+//! et suffixe de disque ignorés), et seules les PISTES décident
+//! ([`decider`]). Le fil 2140 l'a montré : « Dresden (Live-2007) » contre
+//! « … (CD 1/2) », mêmes sept pistes, et deux « FACTORY Communications » de
+//! titres voisins mais de pistes autres.
+//!
 //! ## La garde, inchangée
 //!
 //! Ce qui vient de Roon reste LOCAL. `cloud::library_sync` ne pousse ni les
 //! crédits ni les images — un témoin le tient (voir `routes/system/import.rs`).
-use std::collections::HashMap;
-
 use serde::Deserialize;
 
 /// L'export du moissonneur, tel qu'il l'écrit.
@@ -195,8 +203,24 @@ pub struct Rapport {
     pub artistes_apparies: usize,
     pub artistes_inconnus: Vec<String>,
     pub albums_total: usize,
+    /// Albums Roon appariés, aux deux niveaux : `strict + contenu`.
     pub albums_apparies: usize,
+    /// … par l'égalité stricte du titre replié, sous l'artiste (niveau 1).
+    pub albums_apparies_strict: usize,
+    /// … par leurs pistes (niveau 2, voir [`decider`]).
+    pub albums_apparies_contenu: usize,
+    /// Albums de TUNE enrichis : un coffret Roon en compte un par disque.
+    pub albums_tune_apparies: usize,
+    /// Le détail du niveau 2 : « Artiste — Titre Roon → Titre Tune [+ …] ».
+    pub albums_par_contenu: Vec<String>,
+    /// Plusieurs candidats tiennent : rien n'est écrit.
+    pub albums_ambigus: Vec<String>,
+    /// Introuvables, artistes inconnus compris. Avec les trois autres
+    /// catégories : `albums_total = strict + contenu + ambigus + inconnus`.
     pub albums_inconnus: Vec<String>,
+    /// Deux fiches Tune pour un même nom replié (artiste) ou un même titre
+    /// replié (album) : signalées, jamais tranchées par l'ordre des lignes.
+    pub doublons: Vec<String>,
     pub pistes_total: usize,
     pub pistes_appariees: usize,
     /// Pistes dont la ligne Roon apporte au moins un nom de plus.
@@ -249,13 +273,171 @@ pub fn apparier_piste<'a>(roon: &PisteRoon, locales: &'a [PisteLocale]) -> Optio
     locales.iter().find(|p| plier(&p.titre) == voulu)
 }
 
-/// Index des titres d'album d'un artiste local, repliés.
-pub fn index_par_titre<T>(items: &[T], titre: impl Fn(&T) -> &str) -> HashMap<String, usize> {
-    let mut m = HashMap::new();
-    for (i, it) in items.iter().enumerate() {
-        m.entry(plier(titre(it))).or_insert(i);
+/// Niveau 2 — part MINIMALE des pistes qui doivent se retrouver, en
+/// pourcentage, des deux côtés : celles de l'album Roon ET celles de l'album
+/// Tune (pour un coffret, celles de CHAQUE disque Tune). 80 % tolère une piste
+/// cachée ou un bonus sur dix, pas un autre album : les deux « FACTORY
+/// Communications » du fil 2140 ont des titres voisins et des pistes autres.
+pub const SEUIL_CONTENU_PCT: usize = 80;
+/// Niveau 2 — en dessous de deux pistes retrouvées, le contenu ne prouve rien
+/// (un single, une « Intro ») : l'album reste introuvable.
+pub const PISTES_MIN_CONTENU: usize = 2;
+
+static SUFFIXE_DISQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"[\s\-–:,]*[\(\[\{]?\s*\b(?:cd|disc|disk|disque|disco)\s*\.?\s*(\d{1,2})(?:\s*(?:/|of|sur|de)\s*\d{1,2})?\s*[\)\]\}]?\s*$",
+    )
+    .expect("regex du suffixe de disque")
+});
+
+/// [`plier`], puis toute ponctuation devient espace : « Cristal Automatique
+/// #1 » et « Cristal automatique 1 », « (Live-2007) » et « Live 2007 » se
+/// rejoignent. Sert aux titres de piste du niveau 2 et à la clé de candidat.
+pub fn plier_large(nom: &str) -> String {
+    plier(nom)
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// La clé de CANDIDAT d'un titre d'album, et le disque que son suffixe
+/// annonce : « Dresden (Live-2007) (CD 1/2) » → (`dresden live 2007`, 1).
+///
+/// Elle ne sert qu'à TROUVER des candidats, jamais à décider : deux titres de
+/// même clé restent deux albums tant que leurs pistes ne concordent pas.
+/// Les crochets ne sont pas retirés avec leur contenu : « [2006] » ou
+/// « (Karajan 1977) » distinguent souvent deux éditions.
+pub fn cle_d_album(titre: &str) -> (String, Option<u32>) {
+    let mut t = plier(titre);
+    let mut disque = None;
+    while let Some(c) = SUFFIXE_DISQUE.captures(&t) {
+        let debut = c.get(0).map_or(t.len(), |m| m.start());
+        if debut == 0 {
+            break; // le titre n'est QUE « CD 2 » : on le garde
+        }
+        if disque.is_none() {
+            disque = c.get(1).and_then(|n| n.as_str().parse().ok());
+        }
+        t.truncate(debut);
     }
-    m
+    (plier_large(&t), disque)
+}
+
+/// Un album de Tune candidat au niveau 2, avec ses pistes.
+#[derive(Debug, Clone)]
+pub struct Candidat {
+    pub id: i64,
+    pub titre: String,
+    pub pistes: Vec<PisteLocale>,
+}
+
+/// Les pistes Roon retrouvées dans un album Tune, une à une : (indice Roon,
+/// indice local). Une piste se retrouve par son titre replié large ET, quand
+/// les deux côtés le donnent, par le même numéro et le même disque. Le disque
+/// local est celui du SUFFIXE du titre quand il en porte un : Tune range
+/// souvent « … (CD 2/2) » avec des pistes étiquetées disque 1.
+pub fn pistes_communes(roon: &[PisteRoon], c: &Candidat) -> Vec<(usize, usize)> {
+    let disque_album = cle_d_album(&c.titre).1;
+    let titres: Vec<String> = c.pistes.iter().map(|p| plier_large(&p.titre)).collect();
+    let mut prises = vec![false; c.pistes.len()];
+    let mut out = Vec::new();
+    for (i, p) in roon.iter().enumerate() {
+        let (num, titre) = numero_et_titre(&p.titre);
+        let voulu = plier_large(&titre);
+        if voulu.is_empty() {
+            continue;
+        }
+        let trouve = c.pistes.iter().enumerate().position(|(j, l)| {
+            if prises[j] || titres[j] != voulu {
+                return false;
+            }
+            let Some(n) = num else { return true };
+            let numero_ok = l.numero.is_none_or(|ln| ln == n.piste as i32);
+            let disque_local = disque_album.map(|d| d as i32).or(l.disque);
+            let disque_ok = match (n.disque, disque_local) {
+                (Some(d), Some(ld)) => ld == d as i32,
+                _ => true,
+            };
+            numero_ok && disque_ok
+        });
+        if let Some(j) = trouve {
+            prises[j] = true;
+            out.push((i, j));
+        }
+    }
+    out
+}
+
+/// Ce que le niveau 2 conclut pour un album Roon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Un album Tune (indice de candidat), ou plusieurs pour un coffret rangé
+    /// un album par disque, chacun avec ses paires de pistes.
+    Apparie(Vec<(usize, Vec<(usize, usize)>)>),
+    /// Plusieurs lectures tiennent : les candidats en cause. Rien n'est écrit.
+    Ambigu(Vec<usize>),
+    Introuvable,
+}
+
+fn atteint(trouvees: usize, total: usize) -> bool {
+    total > 0 && trouvees * 100 >= SEUIL_CONTENU_PCT * total
+}
+
+/// Le niveau 2 : quel(s) candidat(s) portent les pistes de l'album Roon ?
+///
+/// 1. **Un seul album** : ≥ [`SEUIL_CONTENU_PCT`] des pistes Roon retrouvées
+///    ET ≥ ce seuil des pistes du candidat, au moins [`PISTES_MIN_CONTENU`].
+///    Deux candidats qui tiennent ainsi → [`Decision::Ambigu`].
+/// 2. **Coffret** (aucun album seul ne tient) : plusieurs candidats dont
+///    chacun est couvert au seuil, sans piste Roon commune entre eux, et qui
+///    réunis couvrent le seuil des pistes Roon. Deux disques qui réclament la
+///    même piste (deux copies du CD 1) → [`Decision::Ambigu`].
+pub fn decider(roon: &[PisteRoon], candidats: &[Candidat]) -> Decision {
+    if roon.is_empty() || candidats.is_empty() {
+        return Decision::Introuvable;
+    }
+    let paires: Vec<Vec<(usize, usize)>> =
+        candidats.iter().map(|c| pistes_communes(roon, c)).collect();
+    let pleins: Vec<usize> = (0..candidats.len())
+        .filter(|&k| {
+            let m = paires[k].len();
+            m >= PISTES_MIN_CONTENU
+                && atteint(m, roon.len())
+                && atteint(m, candidats[k].pistes.len())
+        })
+        .collect();
+    match pleins.as_slice() {
+        [k] => return Decision::Apparie(vec![(*k, paires[*k].clone())]),
+        [_, _, ..] => return Decision::Ambigu(pleins),
+        [] => {}
+    }
+    let parties: Vec<usize> = (0..candidats.len())
+        .filter(|&k| !paires[k].is_empty() && atteint(paires[k].len(), candidats[k].pistes.len()))
+        .collect();
+    if parties.len() < 2 {
+        return Decision::Introuvable;
+    }
+    let mut vues = std::collections::HashSet::new();
+    for &k in &parties {
+        for &(i, _) in &paires[k] {
+            if !vues.insert(i) {
+                return Decision::Ambigu(parties);
+            }
+        }
+    }
+    if vues.len() >= PISTES_MIN_CONTENU && atteint(vues.len(), roon.len()) {
+        Decision::Apparie(
+            parties
+                .into_iter()
+                .map(|k| (k, paires[k].clone()))
+                .collect(),
+        )
+    } else {
+        Decision::Introuvable
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +570,179 @@ mod tests {
         );
         assert_eq!(apparier_piste(&r("9. Inconnue"), &locales), None);
     }
+
+    #[test]
+    fn la_cle_d_album_ignore_le_suffixe_de_disque_et_la_ponctuation() {
+        let k = |t: &str| cle_d_album(t);
+        // Le cas phare du fil 2140.
+        assert_eq!(
+            k("Dresden (Live-2007) (CD 1/2)"),
+            ("dresden live 2007".into(), Some(1))
+        );
+        assert_eq!(k("Dresden (Live-2007)"), ("dresden live 2007".into(), None));
+        assert_eq!(k("Sun Bear [Disc 2]").1, Some(2));
+        assert_eq!(k("Sun Bear - CD2").1, Some(2));
+        assert_eq!(k("Sun Bear (Disque 3 sur 4)"), ("sun bear".into(), Some(3)));
+        assert_eq!(k("Sun Bear, disc 1 of 2"), ("sun bear".into(), Some(1)));
+        assert_eq!(k("Cristal Automatique #1"), k("Cristal automatique 1"));
+        // Ni un mot qui finit par « cd », ni « disco », ni un titre QUI EST
+        // le suffixe ; les crochets restent, contenu compris.
+        assert_eq!(k("Abcd 2"), ("abcd 2".into(), None));
+        assert_eq!(k("Disco 2000").1, None);
+        assert_eq!(k("CD 2"), ("cd 2".into(), None));
+        assert_eq!(
+            k("Les Tortures Volontaires [2006]").0,
+            "les tortures volontaires 2006"
+        );
+        // Deux albums différents restent deux clés.
+        assert_ne!(k("Communications 1978-81").0, k("Communications 1983-87").0);
+    }
+
+    fn roon(titres: &[&str]) -> Vec<PisteRoon> {
+        titres
+            .iter()
+            .map(|t| PisteRoon {
+                titre: (*t).into(),
+                credits: None,
+            })
+            .collect()
+    }
+
+    fn candidat(id: i64, titre: &str, pistes: &[(i32, i32, &str)]) -> Candidat {
+        Candidat {
+            id,
+            titre: titre.into(),
+            pistes: pistes
+                .iter()
+                .enumerate()
+                .map(|(i, (d, n, t))| PisteLocale {
+                    id: id * 100 + i as i64,
+                    titre: (*t).into(),
+                    numero: Some(*n),
+                    disque: (*d > 0).then_some(*d),
+                    artiste: None,
+                    a_des_credits: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn le_contenu_tranche_entre_deux_titres_voisins() {
+        // FACTORY Communications : même artiste, titres proches, pistes
+        // autres. Seul celui qui porte les pistes est retenu.
+        let r = roon(&["1. Atmosphere", "2. Transmission", "3. Shack Up"]);
+        let a = candidat(
+            1,
+            "Communications 1978-81",
+            &[
+                (1, 1, "Atmosphere"),
+                (1, 2, "Transmission"),
+                (1, 3, "Shack Up"),
+            ],
+        );
+        let b = candidat(
+            2,
+            "Communications 1983-87",
+            &[(1, 1, "Blue Monday"), (1, 2, "Fac 51"), (1, 3, "Shack Up")],
+        );
+        assert_eq!(
+            decider(&r, &[b.clone(), a]),
+            Decision::Apparie(vec![(1, vec![(0, 0), (1, 1), (2, 2)])])
+        );
+        // Le même numéro ne suffit pas : le titre doit suivre, et un titre
+        // au mauvais numéro ne compte pas.
+        assert_eq!(decider(&r, &[b]), Decision::Introuvable);
+        let melange = candidat(
+            3,
+            "x",
+            &[
+                (1, 2, "Atmosphere"),
+                (1, 1, "Transmission"),
+                (1, 3, "Shack Up"),
+            ],
+        );
+        assert_eq!(decider(&r, &[melange]), Decision::Introuvable);
+        // Sous le seuil côté Tune : l'album local a deux fois plus de pistes.
+        let gros = candidat(
+            4,
+            "x",
+            &[
+                (1, 1, "Atmosphere"),
+                (1, 2, "Transmission"),
+                (1, 3, "Shack Up"),
+                (1, 4, "A"),
+                (1, 5, "B"),
+                (1, 6, "C"),
+            ],
+        );
+        assert_eq!(decider(&r, &[gros]), Decision::Introuvable);
+        // Une piste ne prouve rien.
+        assert_eq!(
+            decider(
+                &roon(&["1. Intro"]),
+                &[candidat(5, "x", &[(1, 1, "Intro")])]
+            ),
+            Decision::Introuvable
+        );
+    }
+
+    #[test]
+    fn deux_candidats_de_meme_contenu_sont_ambigus() {
+        let r = roon(&["1. Mystic Rumba", "2. Lily Dale"]);
+        let p = [(0, 1, "Mystic Rumba"), (0, 2, "Lily Dale")];
+        assert_eq!(
+            decider(
+                &r,
+                &[
+                    candidat(1, "Mystic Rumba", &p),
+                    candidat(2, "Mystic Rumba!", &p)
+                ]
+            ),
+            Decision::Ambigu(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn un_coffret_s_apparie_disque_par_disque() {
+        let r = roon(&[
+            "1-1 Kyoto Part 1",
+            "1-2 Kyoto Part 2",
+            "2-1 Osaka Part 1",
+            "2-2 Osaka Part 2",
+        ]);
+        // Le CD 2 de Tune étiquette ses pistes disque 1 : le suffixe fait foi.
+        let cd1 = candidat(
+            1,
+            "Sun Bear Concerts (CD 1/2)",
+            &[(1, 1, "Kyoto Part 1"), (1, 2, "Kyoto Part 2")],
+        );
+        let cd2 = candidat(
+            2,
+            "Sun Bear Concerts (CD 2/2)",
+            &[(1, 1, "Osaka Part 1"), (1, 2, "Osaka Part 2")],
+        );
+        assert_eq!(
+            decider(&r, &[cd1.clone(), cd2.clone()]),
+            Decision::Apparie(vec![(0, vec![(0, 0), (1, 1)]), (1, vec![(2, 0), (3, 1)])])
+        );
+        // Un seul disque chez Tune : la moitié des pistes Roon, sous le seuil.
+        assert_eq!(
+            decider(&r, std::slice::from_ref(&cd1)),
+            Decision::Introuvable
+        );
+        // Deux copies du CD 1 réclament les mêmes pistes : ambigu.
+        let copie = candidat(
+            3,
+            "Sun Bear Concerts (CD 1)",
+            &[(1, 1, "Kyoto Part 1"), (1, 2, "Kyoto Part 2")],
+        );
+        assert_eq!(
+            decider(&r, &[cd1, cd2, copie]),
+            Decision::Ambigu(vec![0, 1, 2])
+        );
+    }
+
     /// L'export RÉEL de Fabien (16/09/2026), quand on l'a sous la main :
     /// `TUNE_EXPORT_ROON=/chemin/export.json cargo test … -- --ignored`.
     /// Ce qu'il doit donner : 597 artistes, 1 266 albums, 15 512 pistes.
