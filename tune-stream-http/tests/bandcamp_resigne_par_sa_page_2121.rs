@@ -15,7 +15,7 @@
 //! - un orchestrateur dont le registre porte un faux service « bandcamp » :
 //!   `get_album_tracks(page)` rend les URL du jour, comme une relecture de la
 //!   page ;
-//! - un faux bcbits local : 410 sur la signature du 30/09, 200 `audio/mpeg`
+//! - un faux bcbits local : 410 sur la signature refusée (`_perimee`), 200 `audio/mpeg`
 //!   sur la signature du jour ;
 //! - la résolution de la file (`resolve_queue_item_url`, celle du gapless et
 //!   du pré-chargement), puis le relais de `tune-stream-http`
@@ -51,10 +51,29 @@ use tune_core::streaming::traits::{
 };
 
 const PAGE: &str = "https://framewerk.bandcamp.com/album/love-parade";
-const SIGNATURE_PERIMEE: &str = "p=0&ts=1790782809&t=dcd4&token=1790782809_perimee";
-const SIGNATURE_DU_JOUR: &str = "p=0&ts=1791020000&t=f00d&token=1791020000_du_jour";
+/// Ce banc éprouve le FILET du relais : une signature que Bandcamp refuse
+/// alors qu'elle est plus jeune que le seuil de resignature avant envoi
+/// (24 h) — sinon la piste serait resignée avant même d'atteindre le relais
+/// (voir `bandcamp_resigne_avant_envoi_2121.rs`). Elle est donc datée d'il y a
+/// une heure, et c'est son jeton `_perimee` que le faux bcbits refuse en 410.
+fn signature_perimee() -> String {
+    let ts = maintenant() - 3_600;
+    format!("p=0&ts={ts}&t=dcd4&token={ts}_perimee")
+}
 
-/// Un faux bcbits : 410 sur la signature du 30/09, 403 sans signature (le
+fn signature_du_jour() -> String {
+    let ts = maintenant();
+    format!("p=0&ts={ts}&t=f00d&token={ts}_du_jour")
+}
+
+fn maintenant() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Un faux bcbits : 410 sur la signature refusée (`_perimee`), 403 sans signature (le
 /// chemin nu), 200 `audio/mpeg` sur la signature du jour. Rend la base
 /// `http://hôte:port/stream` et le compteur de requêtes.
 async fn faux_bcbits(corps: Vec<u8>) -> (String, Arc<AtomicUsize>) {
@@ -84,9 +103,9 @@ async fn faux_bcbits(corps: Vec<u8>) -> (String, Arc<AtomicUsize>) {
                     .next()
                     .unwrap_or_default()
                     .to_string();
-                let reponse: &[u8] = if ligne.contains("ts=1790782809") {
+                let reponse: &[u8] = if ligne.contains("_perimee") {
                     b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                } else if !ligne.contains("ts=1791020000") {
+                } else if !ligne.contains("_du_jour") {
                     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 } else {
                     let entete = format!(
@@ -189,12 +208,14 @@ impl StreamingService for FauxBandcamp {
         }
         Ok(vec![
             piste(format!(
-                "{}/aaaa1111/mp3-128/11111111?{SIGNATURE_DU_JOUR}",
-                self.base
+                "{}/aaaa1111/mp3-128/11111111?{}",
+                self.base,
+                signature_du_jour()
             )),
             piste(format!(
-                "{}/e43be2a9/mp3-128/29192493?{SIGNATURE_DU_JOUR}",
-                self.base
+                "{}/e43be2a9/mp3-128/29192493?{}",
+                self.base,
+                signature_du_jour()
             )),
         ])
     }
@@ -252,7 +273,7 @@ async fn banc() -> Banc {
     Banc {
         orch,
         db,
-        perimee: format!("{base}/e43be2a9/mp3-128/29192493?{SIGNATURE_PERIMEE}"),
+        perimee: format!("{base}/e43be2a9/mp3-128/29192493?{}", signature_perimee()),
         corps,
         relectures,
         requetes_amont,
@@ -346,7 +367,7 @@ async fn une_piste_en_file_avec_sa_page_est_resignee_par_le_relais() {
 
     assert!(
         matches!(statut, 200 | 206),
-        "410 sur la signature du 30/09, puis la page relue : la piste est servie (statut {statut})"
+        "410 sur la signature refusée (`_perimee`), puis la page relue : la piste est servie (statut {statut})"
     );
     assert_eq!(
         octets, b.corps,
