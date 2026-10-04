@@ -607,7 +607,8 @@ fn tete_du_decodage(
     natif: &super::decode::DecodedAudio,
     secondes: f64,
 ) -> super::decode::DecodedAudio {
-    let max = (secondes * natif.sample_rate as f64 * natif.channels as f64) as usize;
+    let max =
+        super::decode::echantillons_de_la_fenetre(secondes, natif.sample_rate, natif.channels);
     let samples = natif.samples_i32[..max.min(natif.samples_i32.len())].to_vec();
     let frames = samples.len() as f64 / natif.channels.max(1) as f64;
     super::decode::DecodedAudio {
