@@ -247,9 +247,8 @@ mod tests {
     /// et rien d'autre (`sg0`, `sda`, `srx`).
     #[test]
     fn tous_les_lecteurs_optiques_sont_enumeres() {
-        let dossier = std::env::temp_dir().join(format!("tune-cd-2135-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dossier);
-        std::fs::create_dir_all(&dossier).unwrap();
+        // Effacé à la fin, même sur panique (`test_scratch`, #3030).
+        let dossier = tune_core::test_scratch::scratch_dir("cd-2135-dev");
         for nom in ["sr1", "sr10", "sda", "sr0", "sg0", "srx", "sr", "sr4"] {
             std::fs::write(dossier.join(nom), b"").unwrap();
         }
@@ -258,8 +257,7 @@ mod tests {
             peripheriques_optiques(&dossier),
             ["sr0", "sr1", "sr4", "sr10"].map(|n| format!("{d}/{n}"))
         );
-        std::fs::remove_dir_all(&dossier).unwrap();
-        assert!(peripheriques_optiques(&dossier).is_empty());
+        assert!(peripheriques_optiques(&dossier.join("absent")).is_empty());
     }
 
     #[test]
