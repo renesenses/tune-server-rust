@@ -24,6 +24,10 @@ struct Directe<'a> {
     is_local_output: bool,
     is_browser_output: bool,
     radio_eq_profile: &'a Option<crate::audio::eq::EqProfile>,
+    /// Bandcamp : l'adresse de la page album ou piste, de quoi resigner l'URL
+    /// de flux quand Bandcamp la refuse (fil 2121). `None` hors Bandcamp, et
+    /// pour une piste dont aucune table ne connaît la page.
+    album_ref: Option<&'a str>,
 }
 
 impl PlaybackOrchestrator {
@@ -661,6 +665,21 @@ impl PlaybackOrchestrator {
         };
         let is_radio = source == "radio";
         let is_bandcamp = source == "bandcamp";
+        // Fil 2121 — la page de la piste Bandcamp, pour resigner son URL de
+        // flux. Portée par la demande quand elle vient de la file ou de la
+        // liste de pistes du service ; sinon cherchée là où Tune l'a rangée
+        // (file, favoris, historique) : le client rejoue un favori ou une
+        // ligne d'historique par son seul `source_id`.
+        let bc_album_ref: Option<String> = if is_bandcamp {
+            req.album_ref
+                .clone()
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| {
+                    crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, audio_url)
+                })
+        } else {
+            None
+        };
 
         let is_local_output = req
             .output_device_id
@@ -805,6 +824,7 @@ impl PlaybackOrchestrator {
             is_local_output,
             is_browser_output,
             radio_eq_profile: &radio_eq_profile,
+            album_ref: bc_album_ref.as_deref(),
         };
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) =
             if is_radio && (is_local_output || is_oaat_output) {
@@ -1538,6 +1558,7 @@ impl PlaybackOrchestrator {
             duration_ms,
             bc_quality,
             is_browser_output,
+            album_ref,
             ..
         } = d;
         // Sortie RÉSEAU (DLNA/OpenHome) ou navigateur. Bandcamp ne publie
@@ -1565,9 +1586,25 @@ impl PlaybackOrchestrator {
             duration_ms: duration_ms.map(|d| d as u64),
             ..Default::default()
         };
+        //
+        // 🔴 Fil 2121 — l'URL est SIGNÉE, et Bandcamp la refuse au bout de
+        // quelques jours (410 Gone à 2,7 jours chez FabienM ; 403 pour le
+        // chemin nu d'un favori). Avec l'adresse de la page, le relais reçoit
+        // le même mécanisme de nouvelle résolution que Qobuz et Tidal
+        // (#1136) : sur un statut d'expiration, il relit la page et reprend
+        // sur l'URL du jour. Sans elle (ligne antérieure à la migration 114),
+        // rien ne change : le relais échoue comme avant, et le dit.
+        let reresolve = album_ref.map(|page| {
+            super::bandcamp_resignature::reresolveur_bandcamp(
+                self.services.clone(),
+                page.to_string(),
+                audio_url.to_string(),
+            )
+        });
+        let resignable = reresolve.is_some();
         let session_id = self
             .streamer
-            .create_proxy_session(info, audio_url.to_string(), false)
+            .create_proxy_session_with_reresolve(info, audio_url.to_string(), false, reresolve)
             .await;
         let server_ip = self.server_ip();
         let stream_url = self
@@ -1577,6 +1614,8 @@ impl PlaybackOrchestrator {
             url = %audio_url,
             browser = is_browser_output,
             codec = bc_codec,
+            resignable,
+            page = album_ref.unwrap_or(""),
             "bandcamp_proxy_for_network_or_browser_output"
         );
         (

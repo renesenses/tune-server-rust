@@ -99,6 +99,7 @@ impl HoteLecture for HoteOrchestrateur {
                 media_format: Some("wav".into()),
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             })
             .await?;
         self.playback.update_queue_info(zone_id, 0, 1).await;

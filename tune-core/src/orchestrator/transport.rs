@@ -1656,6 +1656,7 @@ impl PlaybackOrchestrator {
                     titre: context.3.as_deref(),
                     pochette: context.4.as_deref(),
                 },
+                req.album_ref.as_deref(),
             );
         }
     }
@@ -2191,6 +2192,7 @@ impl PlaybackOrchestrator {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         let resultat = self.play_without_history(req).await;
@@ -2811,6 +2813,7 @@ impl PlaybackOrchestrator {
                             media_format: None,
                             track_number: None,
                             disc_number: None,
+                            album_ref: None,
                         };
                         // Même station, même écoute logique : pas de nouvelle
                         // ligne d'historique (même règle que radio_auto_retry).
@@ -3331,6 +3334,7 @@ impl PlaybackOrchestrator {
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
 
                 match self.play_without_history(req).await {
