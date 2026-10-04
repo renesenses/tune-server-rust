@@ -12,7 +12,8 @@
 //!   minuteries qui partent — le battement est frais ;
 //! - une **veille** sur un `std::thread` à elle, qui regarde l'âge du
 //!   battement. Au-delà de [`SEUIL_GEL`], elle écrit un fichier
-//!   `gel-executeur-<horodatage>.txt` à côté du journal, PUIS le dit en WARN
+//!   `gel-executeur-<horodatage>.txt` dans `diagnostics/gels/` du dossier de
+//!   données (voir [`dossier_des_releves`]), PUIS le dit en WARN
 //!   (le fichier d'abord : si c'est le journal qui est pris, le fichier sort
 //!   quand même). Le relevé est repris à 60 s et à 5 min du même gel, pour
 //!   voir s'il change, et la fin du gel est dite avec sa durée.
@@ -24,6 +25,16 @@
 //! avec son état, son `wchan` et son temps processeur — sans `ptrace`, par
 //! `/proc/self/task`. Le `tid` du détenteur se retrouve dans cette liste :
 //! son `wchan` dit ce qu'IL attend.
+//!
+//! **Où vont les relevés (fil 2117/2124, #5677).** Ils allaient à côté du
+//! journal, et sans journal dans `/tmp/tune-gel-executeur-<uid>/`. Sur Tune OS
+//! le service a `PrivateTmp=yes` et `ProtectHome=yes` : pas de journal dans
+//! `$HOME`, donc le `/tmp` privé du service — invisible hors du service et
+//! EFFACÉ à chaque redémarrage. Le testeur a perdu ses relevés. Ils vont
+//! désormais dans `<dossier de données>/diagnostics/gels/` : `TUNE_DATA_DIR`,
+//! sinon le dossier de la base réellement ouverte ; le dossier temporaire
+//! n'est plus qu'un repli quand celui-là n'est pas inscriptible. Sur le disque,
+//! seuls les [`PLAFOND_RELEVES`] plus récents sont gardés.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,9 +56,90 @@ const PALIERS: [Duration; 3] = [
     Duration::from_secs(300),
 ];
 
-/// Plafond de fichiers de relevé par processus : un serveur qui gèlerait en
-/// boucle ne doit pas remplir le disque.
-const PLAFOND_RELEVES: usize = 30;
+/// Plafond de fichiers de relevé, par processus ET sur le disque : un serveur
+/// qui gèlerait en boucle ne doit pas remplir le disque, et le dossier de
+/// données, lui, survit aux redémarrages — seuls les plus récents y restent.
+pub const PLAFOND_RELEVES: usize = 30;
+
+/// Sous-dossier du dossier de données qui reçoit les relevés.
+pub const SOUS_DOSSIER_DES_RELEVES: &str = "diagnostics/gels";
+
+const PREFIXE_RELEVE: &str = "gel-executeur-";
+const SUFFIXE_RELEVE: &str = ".txt";
+
+/// Le dossier de données de Tune, résolu comme celui de la base : la variable
+/// `TUNE_DATA_DIR` quand elle est posée et non vide, sinon le dossier de
+/// `db_path` (la base réellement ouverte, relative au répertoire courant
+/// `cwd` si elle l'est). Fonction pure : l'environnement lui est passé.
+pub fn dossier_de_donnees(tune_data_dir: Option<&str>, db_path: &str, cwd: &Path) -> PathBuf {
+    if let Some(d) = tune_data_dir.filter(|d| !d.trim().is_empty()) {
+        let d = PathBuf::from(d);
+        return if d.is_absolute() { d } else { cwd.join(d) };
+    }
+    let base = Path::new(db_path);
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        cwd.join(base)
+    };
+    match base.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => cwd.to_path_buf(),
+    }
+}
+
+/// Le dossier qui recevra les relevés : `<donnees>/diagnostics/gels` s'il
+/// est inscriptible (créé et sondé par l'écriture d'un fichier), sinon
+/// `repli` — le dossier temporaire par compte.
+pub fn dossier_des_releves(donnees: &Path, repli: PathBuf) -> PathBuf {
+    let voulu = donnees.join(SOUS_DOSSIER_DES_RELEVES);
+    match sonder_l_ecriture(&voulu) {
+        Ok(()) => voulu,
+        Err(e) => {
+            tracing::warn!(
+                voulu = %voulu.display(),
+                repli = %repli.display(),
+                error = %e,
+                "gel_executeur_dossier_de_donnees_non_inscriptible"
+            );
+            repli
+        }
+    }
+}
+
+fn sonder_l_ecriture(dossier: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dossier)?;
+    let sonde = dossier.join(format!(".sonde-{}", std::process::id()));
+    std::fs::write(&sonde, b"")?;
+    let _ = std::fs::remove_file(&sonde);
+    Ok(())
+}
+
+/// Ne garder dans `dossier` que les `garder` relevés les plus récents (le nom
+/// porte l'horodatage UTC, l'ordre des noms est celui du temps). Seuls les
+/// fichiers `gel-executeur-*.txt` sont touchés.
+pub fn elaguer_les_releves(dossier: &Path, garder: usize) {
+    let Ok(entrees) = std::fs::read_dir(dossier) else {
+        return;
+    };
+    let mut releves: Vec<PathBuf> = entrees
+        .flatten()
+        .filter(|e| {
+            let nom = e.file_name();
+            let nom = nom.to_string_lossy();
+            nom.starts_with(PREFIXE_RELEVE) && nom.ends_with(SUFFIXE_RELEVE)
+        })
+        .map(|e| e.path())
+        .collect();
+    if releves.len() <= garder {
+        return;
+    }
+    releves.sort();
+    let trop = releves.len() - garder;
+    for vieux in &releves[..trop] {
+        let _ = std::fs::remove_file(vieux);
+    }
+}
 
 /// La veille : son battement et ses réglages.
 pub struct Veille {
@@ -153,7 +245,7 @@ struct Episode {
     paliers_faits: usize,
 }
 
-/// Démarrer la veille de production, relevés à côté du journal.
+/// Démarrer la veille de production ; `dossier` vient de [`dossier_des_releves`].
 pub fn demarrer_en_production(dossier: PathBuf) -> Arc<Veille> {
     Veille::demarrer(
         &tokio::runtime::Handle::current(),
@@ -165,9 +257,10 @@ pub fn demarrer_en_production(dossier: PathBuf) -> Arc<Veille> {
 
 fn ecrire_le_releve(dossier: &Path, texte: &str) -> Result<PathBuf, String> {
     let horodatage = horodatage().replace([':', '-'], "");
-    let chemin = dossier.join(format!("gel-executeur-{horodatage}.txt"));
+    let chemin = dossier.join(format!("{PREFIXE_RELEVE}{horodatage}{SUFFIXE_RELEVE}"));
     std::fs::create_dir_all(dossier).map_err(|e| e.to_string())?;
     std::fs::write(&chemin, texte).map_err(|e| e.to_string())?;
+    elaguer_les_releves(dossier, PLAFOND_RELEVES);
     Ok(chemin)
 }
 
@@ -303,6 +396,88 @@ mod tests {
         );
         drop(veille);
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Fil 2117/2124 : `TUNE_DATA_DIR` d'abord (Tune OS le pose), une valeur
+    /// vide ne compte pas, puis le dossier de la base réellement ouverte.
+    #[test]
+    fn le_dossier_de_donnees_suit_tune_data_dir_puis_la_base() {
+        let cwd = Path::new("/opt/tune");
+        assert_eq!(
+            dossier_de_donnees(Some("/opt/tune/data"), "/ailleurs/tune.db", cwd),
+            PathBuf::from("/opt/tune/data")
+        );
+        assert_eq!(
+            dossier_de_donnees(Some("  "), "/var/lib/tune/tune.db", cwd),
+            PathBuf::from("/var/lib/tune")
+        );
+        assert_eq!(
+            dossier_de_donnees(None, "/data/tune.db", cwd),
+            PathBuf::from("/data")
+        );
+        assert_eq!(
+            dossier_de_donnees(None, "tune.db", Path::new("/var/lib/tune")),
+            PathBuf::from("/var/lib/tune")
+        );
+        assert_eq!(
+            dossier_de_donnees(Some("donnees"), "tune.db", cwd),
+            PathBuf::from("/opt/tune/donnees")
+        );
+    }
+
+    /// Le cas du testeur : un dossier de données inscriptible reçoit les
+    /// relevés dans `diagnostics/gels/`, et le repli temporaire reste vide.
+    #[test]
+    fn un_dossier_de_donnees_inscriptible_recoit_les_releves() {
+        let donnees = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let repli = tmp.path().join("tune-gel-executeur-0");
+        let choisi = dossier_des_releves(donnees.path(), repli.clone());
+        assert_eq!(choisi, donnees.path().join("diagnostics").join("gels"));
+        assert!(choisi.is_dir());
+        assert!(
+            fichiers(&choisi).is_empty(),
+            "la sonde ne doit rien laisser"
+        );
+        let ecrit = ecrire_le_releve(&choisi, "gel_executeur — témoin").unwrap();
+        assert!(ecrit.starts_with(donnees.path()), "{}", ecrit.display());
+        assert!(!repli.exists(), "le repli temporaire ne sert pas ici");
+    }
+
+    /// Un dossier de données qu'on ne peut pas créer (un FICHIER à sa place :
+    /// le refus tient aussi en root) : repli sur le dossier temporaire.
+    #[test]
+    fn un_dossier_de_donnees_non_inscriptible_replie_sur_le_temporaire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let donnees = tmp.path().join("donnees");
+        std::fs::write(&donnees, b"pas un dossier").unwrap();
+        let repli = tmp.path().join("tune-gel-executeur-0");
+        assert_eq!(dossier_des_releves(&donnees, repli.clone()), repli);
+    }
+
+    /// Le dossier de données survit aux redémarrages : il ne doit garder que
+    /// les PLAFOND_RELEVES relevés les plus récents, et rien d'autre n'y est
+    /// effacé.
+    #[test]
+    fn le_dossier_des_releves_reste_borne_aux_plus_recents() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..PLAFOND_RELEVES + 5 {
+            let nom = format!("gel-executeur-20260101T0000{i:02}.000Z.txt");
+            std::fs::write(dir.path().join(nom), "ancien").unwrap();
+        }
+        std::fs::write(dir.path().join("note.txt"), "à garder").unwrap();
+        let neuf = ecrire_le_releve(dir.path(), "gel_executeur — neuf").unwrap();
+        let mut releves: Vec<String> = fichiers(dir.path())
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter(|n| n.starts_with("gel-executeur-"))
+            .collect();
+        releves.sort();
+        assert_eq!(releves.len(), PLAFOND_RELEVES, "{releves:?}");
+        assert!(neuf.exists(), "le relevé neuf est gardé");
+        // Les six plus anciens (00 à 05) sont partis.
+        assert_eq!(releves[0], "gel-executeur-20260101T000006.000Z.txt");
+        assert!(dir.path().join("note.txt").exists());
     }
 
     /// Un exécuteur qui tourne : aucun relevé.
