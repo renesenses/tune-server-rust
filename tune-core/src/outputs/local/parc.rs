@@ -769,21 +769,142 @@ pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
             );
             return cached_audio_devices();
         }
-        let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((last_scan, ref cached)) = *guard {
-            if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
-                debug!("local_audio_scan_cached");
-                return cached.clone();
+        lister_sous_le_verrou_de_balayage(&SCAN_GUARD, ATTENTE_MAX_DU_BALAYAGE_EN_COURS, || {
+            list_audio_devices_uncached(backend)
+        })
+    })
+}
+
+/// #5612 — combien de temps un appelant attend la fin d'un balayage DÉJÀ en
+/// cours avant de servir le dernier parc publié.
+///
+/// Même ordre de grandeur que la garde du démarrage (`startup.rs`,
+/// `scan_devices`, 8 s) : au-delà, le balayage ne répond plus.
+pub(super) const ATTENTE_MAX_DU_BALAYAGE_EN_COURS: std::time::Duration =
+    std::time::Duration::from_secs(8);
+
+/// #5612 — le cœur de [`list_audio_devices_with_backend`], verrou injecté.
+///
+/// Le verrou d'énumération est tenu pendant TOUT le balayage matériel. Sous
+/// Linux, ce balayage passe par alsa-lib, et le greffon PCM de PipeWire peut
+/// ne jamais rendre la main : le core dump de Belkadi Yacine (fil 2093) montre
+/// `rescan_local_audio_devices` → `list_audio_devices_uncached` →
+/// `cpal … supported_configs` → `snd_pcm_open` → `_snd_pcm_pipewire_open` →
+/// `pw_thread_loop_stop` → `pthread_join`, en attente. Aucun code Rust ne peut
+/// interrompre ce fil.
+///
+/// Ce qu'on peut empêcher, c'est que tous les appelants SUIVANTS l'attendent
+/// avec lui. Ils prenaient le verrou par `lock()`, donc pour toujours : un fil
+/// garé par appel, et `GET /devices/audio` — que le client web interroge à
+/// chaque chargement de page — appelle depuis un gestionnaire `async`. Chaque
+/// chargement de page immobilisait un fil de l'ordonnanceur tokio ; après
+/// autant de chargements que de fils, plus aucune requête n'aboutit, le
+/// processus reste vivant (`Restart=always` ne le relance pas) et seul un
+/// redémarrage à la main le ramène.
+///
+/// Désormais l'attente est bornée : passé `attente`, l'appelant reçoit le
+/// dernier parc publié ([`cached_audio_devices`]) et le balayage bloqué est
+/// nommé au niveau WARN.
+fn lister_sous_le_verrou_de_balayage(
+    verrou: &std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>)>>,
+    attente: std::time::Duration,
+    enumerer: impl FnOnce() -> Vec<AudioDevice>,
+) -> Vec<AudioDevice> {
+    let Some(mut guard) = prendre_avant(verrou, attente) else {
+        let parc = cached_audio_devices();
+        warn!(
+            attente_ms = attente.as_millis() as u64,
+            appareils_servis = parc.len(),
+            "local_audio_scan_in_progress_unresponsive_serving_cache — un balayage des \
+             sorties audio ne rend plus la main (greffon ALSA/PipeWire bloqué ?) : la liste \
+             servie est la dernière connue"
+        );
+        return parc;
+    };
+    if let Some((last_scan, ref cached)) = *guard {
+        if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
+            debug!("local_audio_scan_cached");
+            return cached.clone();
+        }
+    }
+    let result = enumerer();
+    // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
+    // attendre, et les lecteurs n'ont jamais à prendre le verrou d'énumération
+    // (#3730).
+    publier_le_parc(&result);
+    *guard = Some((std::time::Instant::now(), result.clone()));
+    result
+}
+
+/// #5612 — `Mutex::lock` borné dans le temps : `None` si le verrou est encore
+/// tenu après `attente`. Un verrou empoisonné est rendu tel quel, comme le
+/// faisait `lock().unwrap_or_else(|e| e.into_inner())`.
+fn prendre_avant<T>(
+    verrou: &std::sync::Mutex<T>,
+    attente: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let limite = std::time::Instant::now() + attente;
+    loop {
+        match verrou.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= limite {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        let result = list_audio_devices_uncached(backend);
-        // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
-        // attendre, et les lecteurs n'ont jamais à prendre le verrou d'énumération
-        // (#3730).
-        publier_le_parc(&result);
-        *guard = Some((std::time::Instant::now(), result.clone()));
-        result
+    }
+}
+
+/// #5612 — délai au-delà duquel une énumération demandée depuis du code
+/// `async` (route, diagnostic, rescan) cesse d'être attendue. Supérieur à
+/// [`ATTENTE_MAX_DU_BALAYAGE_EN_COURS`] : un appelant qui attend un balayage
+/// voisin rend la main avant ce délai.
+pub const DELAI_ENUMERATION_ASYNC: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #5612 — exécuter une énumération HORS des fils de l'ordonnanceur tokio, et
+/// ne pas l'attendre plus de `delai`.
+///
+/// `None` si l'énumération n'a pas rendu la main à temps, ou si elle a paniqué :
+/// l'appelant décide alors quoi servir (en général [`cached_audio_devices`]).
+/// Un balayage bloqué dans le greffon PipeWire continue sur son fil bloquant —
+/// rien ne peut l'interrompre — mais plus aucune requête ne l'attend.
+pub async fn enumeration_bornee<F>(
+    delai: std::time::Duration,
+    enumerer: F,
+) -> Option<Vec<AudioDevice>>
+where
+    F: FnOnce() -> Vec<AudioDevice> + Send + 'static,
+{
+    match tokio::time::timeout(delai, tokio::task::spawn_blocking(enumerer)).await {
+        Ok(Ok(parc)) => Some(parc),
+        Ok(Err(e)) => {
+            warn!(error = %e, "local_audio_enumeration_failed");
+            None
+        }
+        Err(_) => {
+            warn!(
+                delai_ms = delai.as_millis() as u64,
+                "local_audio_enumeration_timed_out — l'énumération des sorties audio ne rend \
+                 pas la main (greffon ALSA/PipeWire bloqué ?)"
+            );
+            None
+        }
+    }
+}
+
+/// #5612 — [`list_audio_devices_with_backend`] pour du code `async` : hors de
+/// l'ordonnanceur, borné par [`DELAI_ENUMERATION_ASYNC`], et le dernier parc
+/// publié si le balayage ne répond pas.
+pub async fn list_audio_devices_with_backend_bounded(backend: &str) -> Vec<AudioDevice> {
+    let backend = backend.to_string();
+    enumeration_bornee(DELAI_ENUMERATION_ASYNC, move || {
+        list_audio_devices_with_backend(&backend)
     })
+    .await
+    .unwrap_or_else(cached_audio_devices)
 }
 
 /// Return the last cached device list WITHOUT triggering a fresh enumeration.
@@ -1226,3 +1347,7 @@ mod asio_scan_gate_4168_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "balayage_bloque_5612.rs"]
+mod balayage_bloque_5612;

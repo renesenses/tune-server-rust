@@ -7,6 +7,7 @@ use tracing::warn;
 use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
+use super::facets::hors_executeur;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -25,6 +26,17 @@ pub(super) async fn browse_roots(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
     let lang = crate::i18n::lang_from_header(&headers);
+    // #5677 — un `COUNT(*) … LIKE` par racine (le `LIKE` ne s'appuie sur aucun
+    // index : toute la table à chaque fois) et un `is_dir()` par racine, qui
+    // peut rester suspendu des secondes sur un partage réseau décroché. Hors de
+    // l'exécuteur, comme les routes de #5438.
+    hors_executeur("browse_roots", move || lire_les_racines(&state, &lang))
+        .await
+        .map(Json)
+}
+
+/// Le corps de `GET /library/browse`, exécuté HORS de l'exécuteur (#5677).
+fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
@@ -85,6 +97,8 @@ pub(super) async fn browse_roots(
             // real music sits under a different root). Surfacing this lets the
             // UI flag "introuvable / vérifier le montage" vs a genuinely empty
             // but valid directory.
+            #[cfg(test)]
+            simuler_un_disque_lent(std::path::Path::new(&norm));
             let exists = std::path::Path::new(&norm).is_dir();
             // `exists: false` dit QUE le dossier est introuvable, jamais
             // POURQUOI. Or la cause la plus frequente sous Windows a une
@@ -95,7 +109,7 @@ pub(super) async fn browse_roots(
             // conseil n'est calcule que sur un dossier introuvable : sur une
             // racine saine il n'aurait rien a expliquer (#1190).
             let hint = (!exists)
-                .then(|| crate::chemin_inaccessible::conseil(&lang, &norm))
+                .then(|| crate::chemin_inaccessible::conseil(lang, &norm))
                 .flatten();
             json!({
                 "path": norm, "name": name, "track_count": count,
@@ -150,7 +164,7 @@ pub(super) async fn browse_roots(
         }
     }
 
-    Ok(Json(json!({ "roots": roots })))
+    json!({ "roots": roots })
 }
 
 /// Résout le chemin demandé en tenant compte de la forme de normalisation
@@ -200,6 +214,41 @@ pub(super) async fn browse_directory(
     Query(q): Query<BrowseQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let lang = crate::i18n::lang_from_header(&headers);
+    // #5677 — tout ce qui suit est synchrone : `exists()`/`read_dir`/`is_dir()`
+    // sur le disque (un partage SMB ou NFS lent ou décroché peut y rester
+    // suspendu des secondes), puis deux lectures SQLite à `LIKE` récursif sur
+    // toute la table. Posées sur un fil de l'exécuteur, elles l'immobilisent ;
+    // quand elles les tiennent tous, le flux HTTP vers le renderer ne part
+    // plus. Hors de l'exécuteur, comme les routes de #5438.
+    let corps = hors_executeur("browse_directory", move || {
+        lire_le_repertoire(&state, &lang, q)
+    })
+    .await??;
+    Ok(Json(corps))
+}
+
+/// Retard injecté par les tests avant la lecture d'un dossier donné : il
+/// simule un `read_dir` lent (partage réseau) sans dépendre d'un vrai montage.
+/// N'existe pas hors des tests.
+#[cfg(test)]
+static DOSSIERS_LENTS: std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn simuler_un_disque_lent(dossier: &std::path::Path) {
+    let retard = DOSSIERS_LENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(d, _)| d == dossier)
+        .map(|(_, r)| *r);
+    if let Some(retard) = retard {
+        std::thread::sleep(retard);
+    }
+}
+
+/// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
+fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
     let normalized_query =
         resolve_browse_path(&q.path).ok_or_else(|| AppError::bad_request("invalid path"))?;
     let resolved = std::path::Path::new(&normalized_query);
@@ -247,6 +296,8 @@ pub(super) async fn browse_directory(
     // annoncee pour un partage qui en contient 34 169). On remonte desormais la
     // raison au lieu de mentir (#1190).
     let mut unreadable: Option<String> = None;
+    #[cfg(test)]
+    simuler_un_disque_lent(resolved);
     match std::fs::read_dir(resolved) {
         Err(e) => {
             warn!(path = %resolved.display(), error = %e, "browse_dir_unreadable");
@@ -301,13 +352,16 @@ pub(super) async fn browse_directory(
     // porte encore la lettre de lecteur qu'il faut lui apprendre a remplacer.
     let access_hint = unreadable
         .as_ref()
-        .and_then(|_| crate::chemin_inaccessible::conseil(&lang, &q.path));
+        .and_then(|_| crate::chemin_inaccessible::conseil(lang, &q.path));
 
+    // Ordre alphabétique naturel, celui des dossiers du serveur média (#5582) :
+    // le tri par octets rangeait toutes les majuscules avant les minuscules,
+    // et un dossier « haydn » partait après « Z », hors de la vue (fil 2072).
     subdirs.sort_by(|a, b| {
-        a.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        tune_core::upnp_server::comparer_naturel(
+            a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            b.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        )
     });
 
     // List tracks in this directory (not recursive — only direct children)
@@ -416,7 +470,7 @@ pub(super) async fn browse_directory(
         None
     };
 
-    Ok(Json(json!({
+    Ok(json!({
         "path": q.path,
         "parent": parent,
         "music_root": music_root,
@@ -434,7 +488,7 @@ pub(super) async fn browse_directory(
         "accessible": unreadable.is_none(),
         "access_error": unreadable,
         "access_hint": access_hint,
-    })))
+    }))
 }
 
 pub(super) async fn browse_folders(
@@ -567,5 +621,205 @@ mod browse_path_tests {
     #[test]
     fn a_relative_path_is_refused() {
         assert!(resolve_browse_path("Musique").is_none());
+    }
+}
+
+/// #5677 — l'écran Répertoires ne doit pas immobiliser l'exécuteur, même sur
+/// un disque lent (partage SMB/NFS qui tarde ou décroche).
+///
+/// Le banc, sur le modèle de celui de #5438 : un exécuteur Tokio à
+/// [`FILS_EXECUTEUR`] fils, une base SQLite FICHIER, et deux fois plus de
+/// requêtes simultanées que de fils, chacune sur un dossier dont la lecture
+/// prend [`RETARD_DISQUE`] (retard injecté par [`DOSSIERS_LENTS`] juste avant
+/// l'accès disque). Pendant ce temps, une sonde confie toutes les 5 ms une
+/// tâche vide à l'exécuteur depuis un fil système et mesure combien elle
+/// attend qu'un fil la prenne : tant qu'un fil est libre, elle part aussitôt.
+#[cfg(test)]
+mod hors_executeur_5677 {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const FILS_EXECUTEUR: usize = 2;
+    /// Ce qu'un `read_dir` sur un partage réseau qui se réveille peut coûter.
+    const RETARD_DISQUE: Duration = Duration::from_millis(600);
+    /// Même seuil que la sonde de l'exécuteur de #5438.
+    const SEUIL_EXECUTEUR: Duration = Duration::from_millis(150);
+
+    struct Banc {
+        rt: tokio::runtime::Runtime,
+        state: AppState,
+        racine: std::path::PathBuf,
+        lent: std::path::PathBuf,
+        _dossier: tempfile::TempDir,
+    }
+
+    fn banc() -> Banc {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(FILS_EXECUTEUR)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dossier = tempfile::tempdir().unwrap();
+        let racine = dossier.path().join("musique");
+        let lent = racine.join("Lent");
+        std::fs::create_dir_all(lent.join("CD1")).unwrap();
+        let base = dossier.path().join("tune.db");
+        let state = rt.block_on(async {
+            AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap()
+        });
+        let racine_txt = racine.to_str().unwrap().to_string();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[&racine_txt]).unwrap(),
+            )
+            .unwrap();
+        let piste = |id: i64, chemin: &std::path::Path| {
+            format!(
+                "INSERT INTO tracks (id, title, file_path, format, source, track_number) \
+                 VALUES ({id}, 'Piste {id}', '{}', 'flac', 'local', {id});",
+                chemin.to_str().unwrap()
+            )
+        };
+        state
+            .backend
+            .execute_batch(&format!(
+                "{}{}",
+                piste(1, &lent.join("01.flac")),
+                piste(2, &lent.join("CD1").join("01.flac")),
+            ))
+            .unwrap();
+        Banc {
+            rt,
+            state,
+            racine,
+            lent,
+            _dossier: dossier,
+        }
+    }
+
+    fn ralentir(dossier: &std::path::Path) {
+        let resolu = resolve_browse_path(dossier.to_str().unwrap()).unwrap();
+        DOSSIERS_LENTS
+            .lock()
+            .unwrap()
+            .push((std::path::PathBuf::from(resolu), RETARD_DISQUE));
+    }
+
+    /// Lance `requetes` routes ensemble sur l'exécuteur du banc et rend leurs
+    /// corps, avec la plus longue attente de la sonde pendant qu'elles tournaient.
+    fn sous_la_sonde<F, Fut>(b: &Banc, requetes: usize, route: F) -> (Vec<Value>, Duration)
+    where
+        F: Fn(AppState) -> Fut,
+        Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+    {
+        let arret = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sonde = std::thread::spawn({
+            let (arret, executeur) = (arret.clone(), b.rt.handle().clone());
+            move || {
+                let mut pire = Duration::ZERO;
+                while !arret.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (fait, recu) = std::sync::mpsc::channel();
+                    let t0 = Instant::now();
+                    executeur.spawn(async move {
+                        let _ = fait.send(());
+                    });
+                    recu.recv().unwrap();
+                    pire = pire.max(t0.elapsed());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                pire
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let taches: Vec<_> = (0..requetes)
+            .map(|_| b.rt.spawn(route(b.state.clone())))
+            .collect();
+        let t0 = Instant::now();
+        let corps: Vec<Value> = b.rt.block_on(async {
+            let mut corps = Vec::new();
+            for t in taches {
+                let r = t.await.unwrap();
+                assert_eq!(r.status(), axum::http::StatusCode::OK);
+                let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                corps.push(serde_json::from_slice(&octets).unwrap());
+            }
+            corps
+        });
+        let duree = t0.elapsed();
+        arret.store(true, std::sync::atomic::Ordering::Relaxed);
+        let pire = sonde.join().unwrap();
+        eprintln!(
+            "#5677 : {requetes} requêtes sur disque lent ({} ms chacune) servies en {} ms ; \
+             pire attente d'un fil de l'exécuteur : {} ms ({FILS_EXECUTEUR} fils)",
+            RETARD_DISQUE.as_millis(),
+            duree.as_millis(),
+            pire.as_millis()
+        );
+        assert!(
+            duree >= RETARD_DISQUE,
+            "le retard du disque n'a pas été injecté : {duree:?}"
+        );
+        (corps, pire)
+    }
+
+    #[test]
+    fn un_repertoire_lent_ne_bloque_pas_l_executeur() {
+        let b = banc();
+        ralentir(&b.lent);
+        let chemin = b.lent.to_str().unwrap().to_string();
+        let (corps, pire) = sous_la_sonde(&b, 2 * FILS_EXECUTEUR, |state| {
+            let chemin = chemin.clone();
+            async move {
+                browse_directory(
+                    axum::http::HeaderMap::new(),
+                    State(state),
+                    Query(BrowseQuery { path: chemin }),
+                )
+                .await
+                .into_response()
+            }
+        });
+        // La réponse ne change pas : le sous-dossier et sa piste comptée, la
+        // piste directe, et elle seule.
+        for c in &corps {
+            assert_eq!(c["accessible"], true, "{c}");
+            assert_eq!(c["directories"][0]["name"], "CD1", "{c}");
+            assert_eq!(c["directories"][0]["track_count"], 1, "{c}");
+            let pistes = c["tracks"].as_array().unwrap();
+            assert_eq!(pistes.len(), 1, "{c}");
+            assert_eq!(pistes[0]["id"], 1, "{c}");
+        }
+        assert!(
+            pire < SEUIL_EXECUTEUR,
+            "une tâche a attendu {} ms un fil de l'exécuteur pendant la lecture d'un \
+             répertoire lent : `browse_directory` tient les fils de l'exécuteur (#5677)",
+            pire.as_millis()
+        );
+    }
+
+    #[test]
+    fn une_racine_lente_ne_bloque_pas_l_executeur() {
+        let b = banc();
+        ralentir(&b.racine);
+        let (corps, pire) = sous_la_sonde(&b, 2 * FILS_EXECUTEUR, |state| async move {
+            browse_roots(axum::http::HeaderMap::new(), State(state))
+                .await
+                .into_response()
+        });
+        for c in &corps {
+            let racines = c["roots"].as_array().unwrap();
+            assert_eq!(racines.len(), 1, "{c}");
+            assert_eq!(racines[0]["track_count"], 2, "{c}");
+            assert_eq!(racines[0]["exists"], true, "{c}");
+        }
+        assert!(
+            pire < SEUIL_EXECUTEUR,
+            "une tâche a attendu {} ms un fil de l'exécuteur pendant la lecture des \
+             racines : `browse_roots` tient les fils de l'exécuteur (#5677)",
+            pire.as_millis()
+        );
     }
 }

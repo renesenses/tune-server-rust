@@ -410,6 +410,17 @@ async fn avtransport_control(
                         ..Default::default()
                     };
                     match state.orchestrator.play(req).await {
+                        // #5574 — la sortie a REFUSÉ (renderer qui acquitte
+                        // Play et garde l'ancien flux, URL injoignable…) :
+                        // `play()` rend `Ok` avec l'erreur dans le résultat.
+                        // L'acquitter faisait croire au point de contrôle
+                        // (JPlay) qu'il jouait — « fait semblant de lire,
+                        // aucun son ». Le refus remonte comme un échec.
+                        Ok(result) if result.sortie_refusee().is_some() => {
+                            let motif = result.sortie_refusee().unwrap_or_default();
+                            warn!(zone_id, uri = %session.uri, error = %motif, "upnp_renderer_play_refused_by_output");
+                            tune_core::upnp_server::soap_fault(701, motif)
+                        }
                         Ok(result) => {
                             if result.error.is_none() {
                                 memoriser_lecture_renderer(&state, zone_id, &session).await;
@@ -1427,6 +1438,10 @@ mod session_4324_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_5304.rs"]
 mod controleur_tune_face_au_renderer_tune_5304_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_5574.rs"]
+mod url_distante_de_jplay_5574_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

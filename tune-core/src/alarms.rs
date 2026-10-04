@@ -93,12 +93,55 @@ fn parse_days(days_str: Option<&str>) -> Vec<u32> {
     result
 }
 
-/// Resolve active days for an alarm.  Prefers `days_of_week` (7-char
-/// bitmask) when present; falls back to legacy `days` (CSV/named).
-fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
+/// `true` when `mask` is a valid 7-char `days_of_week` bitmask (Mon..Sun).
+pub fn is_days_mask(mask: &str) -> bool {
+    mask.len() == 7 && mask.chars().all(|c| c == '0' || c == '1')
+}
+
+/// Strict conversion of a `days` value into the 7-char `days_of_week` mask
+/// the scheduler reads first.
+///
+/// **One convention, the server's everywhere: 0 = Monday … 6 = Sunday**
+/// (`num_days_from_monday`, `parse_days`, the bitmask order). Accepted:
+/// `daily`, `weekdays`, `weekends`, or a CSV of `0..=6` / `mon..sun`.
+///
+/// Unlike `parse_days` (lenient, used on stored rows), an unknown token or
+/// an empty value is an ERROR: the route must refuse it (422) rather than
+/// store a mask that silently drops — or adds — a day.
+pub fn days_to_mask(days: &str) -> Result<String, String> {
+    let s = days.trim().to_lowercase();
+    let idx: Vec<u32> = match s.as_str() {
+        "" => return Err("empty days".into()),
+        "daily" => (0..7).collect(),
+        "weekdays" => (0..5).collect(),
+        "weekends" => vec![5, 6],
+        _ => {
+            let names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+            let mut v = Vec::new();
+            for p in s.split(',') {
+                let p = p.trim();
+                let d = names
+                    .iter()
+                    .position(|n| *n == p)
+                    .map(|i| i as u32)
+                    .or_else(|| p.parse::<u32>().ok().filter(|&d| d <= 6))
+                    .ok_or_else(|| format!("invalid day {p:?}"))?;
+                v.push(d);
+            }
+            v
+        }
+    };
+    Ok((0..7)
+        .map(|d| if idx.contains(&d) { '1' } else { '0' })
+        .collect())
+}
+
+/// Resolve active days for an alarm (0 = Mon … 6 = Sun).  Prefers
+/// `days_of_week` (7-char bitmask) when present; falls back to legacy
+/// `days` (CSV/named).
+pub fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
     if let Some(dow) = alarm.get("days_of_week").and_then(|v| v.as_str())
-        && dow.len() == 7
-        && dow.chars().all(|c| c == '0' || c == '1')
+        && is_days_mask(dow)
     {
         return parse_days_of_week(dow);
     }
@@ -542,6 +585,39 @@ mod tests {
             "days": "weekends"
         });
         assert_eq!(resolve_alarm_days(&alarm), vec![5, 6]);
+    }
+
+    #[test]
+    fn days_to_mask_uses_monday_zero() {
+        // 0 = lundi : « en semaine » = lun..ven, jamais samedi.
+        assert_eq!(days_to_mask("0,1,2,3,4").unwrap(), "1111100");
+        assert_eq!(days_to_mask("weekdays").unwrap(), "1111100");
+        assert_eq!(days_to_mask("weekends").unwrap(), "0000011");
+        assert_eq!(days_to_mask("daily").unwrap(), "1111111");
+        assert_eq!(days_to_mask(" mon, FRI ").unwrap(), "1000100");
+        // 6 = dimanche (et non samedi).
+        assert_eq!(days_to_mask("6").unwrap(), "0000001");
+        // Agrees with the scheduler's own reading of the same value.
+        for v in ["0,1,2,3,4", "5,6", "mon,wed,fri", "3"] {
+            let m = days_to_mask(v).unwrap();
+            assert_eq!(parse_days_of_week(&m), parse_days(Some(v)), "{v}");
+        }
+    }
+
+    #[test]
+    fn days_to_mask_refuses_invalid_days() {
+        for v in ["", "  ", "7", "1,2,9", "-1", "lundi", "1,,2", "1;2"] {
+            assert!(days_to_mask(v).is_err(), "{v:?} accepted");
+        }
+    }
+
+    #[test]
+    fn is_days_mask_strict() {
+        assert!(is_days_mask("1111100"));
+        assert!(is_days_mask("0000000"));
+        for v in ["", "111110", "11111000", "11111x0", "1,2,3"] {
+            assert!(!is_days_mask(v), "{v:?}");
+        }
     }
 
     #[test]

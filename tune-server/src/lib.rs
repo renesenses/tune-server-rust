@@ -28,8 +28,11 @@ pub mod chemin_inaccessible;
 pub mod chemins_de_donnees;
 pub mod config;
 pub mod discovery_setup;
+/// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
+pub mod fils_de_travail;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
 pub mod gel_executeur;
+mod instance_existante;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;

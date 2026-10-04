@@ -1226,6 +1226,26 @@ pub struct PlayResult {
     pub error: Option<String>,
 }
 
+/// `PlayResult.error` d'une lecture ÉVINCÉE par une plus récente : elle n'a
+/// rien envoyé, et ce n'est pas un échec — la lecture gagnante pilote la
+/// sortie. Nommé pour que l'appelant puisse distinguer ce cas d'un vrai refus
+/// de la sortie (#5574, façade MediaRenderer).
+pub const PLAY_SUPERSEDED: &str = "superseded by a newer play";
+
+impl PlayResult {
+    /// La sortie a-t-elle REFUSÉ la lecture ? Vrai quand rien n'est parti et
+    /// qu'une erreur est portée, hors éviction par une lecture plus récente.
+    ///
+    /// `play()` rend `Ok` dans ce cas (la zone est arrêtée, l'erreur est
+    /// diffusée en toast) : un appelant qui ne lirait que le `Result`
+    /// acquitterait une lecture qui n'a pas eu lieu (#5574).
+    pub fn sortie_refusee(&self) -> Option<&str> {
+        self.error
+            .as_deref()
+            .filter(|e| !self.output_sent && *e != PLAY_SUPERSEDED)
+    }
+}
+
 pub struct ResolvedStream {
     pub url: String,
     pub mime_type: String,
@@ -1845,6 +1865,10 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// Fil 2095 — le rétablissement d'une session morte ramène le renderer
+/// réseau à la position de la pause.
+#[cfg(test)]
+mod reprise_dlna_position_2095;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
@@ -1896,6 +1920,9 @@ mod adoption_du_flux_pre_arme_3442;
 
 #[cfg(test)]
 mod qualite_piste_de_service_3365;
+
+#[cfg(test)]
+mod format_a_l_enchainement_upnp_2119;
 
 /// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
 ///

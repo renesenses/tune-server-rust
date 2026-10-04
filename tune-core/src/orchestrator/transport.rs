@@ -1041,7 +1041,7 @@ impl PlaybackOrchestrator {
                         stream_url: None,
                         output_sent: false,
                         source: "local".into(),
-                        error: Some("superseded by a newer play".into()),
+                        error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
                     }));
                 }
                 Err(e) => {
@@ -1073,7 +1073,7 @@ impl PlaybackOrchestrator {
                 stream_url: None,
                 output_sent: false,
                 source: resolved.source,
-                error: Some("superseded by a newer play".into()),
+                error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
             }));
         }
 
@@ -1852,6 +1852,17 @@ impl PlaybackOrchestrator {
             local_out.set_pending_start_position_ms(position_ms);
             // Producer always pre-seeked — see the comment in send_to_output.
             local_out.set_producer_seeked(true);
+        }
+        // La sortie NAÎT ici, à `user_volume = 1000` : sans graine, elle jouait
+        // à pleine échelle quel que soit le volume enregistré de la zone, trim
+        // ignoré — un saut de volume après chaque recréation (appareil perdu
+        // puis retrouvé, sortie absente du registre). Même graine qu'au
+        // démarrage (#1596, #5561) : volume de la zone × trim, « Volume fixe »
+        // à 1.0, jamais au-delà de l'unité.
+        if let Ok(Some(zone)) = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .get_by_device_id(device_id)
+        {
+            ensemencer_le_volume_local(&self.db, &zone, device_id, &local_out).await;
         }
         {
             let mut outputs = self.outputs.lock().await;
@@ -2755,7 +2766,7 @@ impl PlaybackOrchestrator {
                     }
                     (RepriseDeSession::RetablirALaPosition, Some(did)) => {
                         info!(zone_id, position_ms, "resume_stream_session_restore");
-                        let req = requete_de_retablissement(zone_id, did, np, position_ms);
+                        let req = requete_de_retablissement(zone_id, did.clone(), np, position_ms);
                         // #4666 — encadrer la relecture par deux `seek`, comme
                         // `replay_zone_at_position` et la recréation de flux du
                         // seek. Sans eux, `play()` remet la position de zone à
@@ -2773,6 +2784,23 @@ impl PlaybackOrchestrator {
                         match self.play_without_history(req).await {
                             Ok(_) => {
                                 self.playback.seek(zone_id, position_ms as i64).await;
+                                // Fil 2095 (FabienM, Devialet en DLNA) : la
+                                // session rétablie est mandataire ou fichier,
+                                // servie depuis l'OCTET 0 — `seek_ms` n'y est
+                                // pas lu. Sans ce Seek, le renderer repartait à
+                                // 0:00 au lieu de 0:35. Même règle et même
+                                // chemin que la relecture (#2893) : seulement
+                                // sur une sortie réseau et une session
+                                // seekable, en tâche détachée, et un refus
+                                // (701) n'est que journalisé.
+                                let output_type = self.output_type_of(&did).await;
+                                self.seek_output_after_replay(
+                                    zone_id,
+                                    Some(&did),
+                                    output_type.as_deref(),
+                                    position_ms,
+                                )
+                                .await;
                                 return Ok(());
                             }
                             // Pas de repli silencieux : la sortie n'a plus rien à

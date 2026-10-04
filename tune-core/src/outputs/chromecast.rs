@@ -523,6 +523,81 @@ pub struct ChromecastOutput {
     /// [`CAST_PLAY_RETRY_TIMEOUT`].
     play_retry_timeout: Duration,
     command_slots: Arc<Semaphore>,
+    /// Fil 2121 — ce que Tune a chargé sur le récepteur, et l'erreur de
+    /// lecture qu'il en a rapportée, en attente du sondeur. Voir
+    /// [`ChargementCast`].
+    chargement: Arc<std::sync::Mutex<ChargementCast>>,
+}
+
+/// Fil 2121 — l'erreur de lecture d'un récepteur Cast remonte à la zone.
+///
+/// FabienM (Beosound Stage en Cast, 03/10) : l'URL Bandcamp relayée avait
+/// expiré, Tune a rendu 502 au récepteur, et le récepteur est passé au repos
+/// avec `idleReason = ERROR`. Le sondage ne lisait que `FINISHED` : tout le
+/// reste devenait un `Stopped` muet, et la zone paraissait jouer (avance
+/// rapide, volume) sans un octet de son.
+///
+/// Une `ERROR` sur NOTRE média devient un constat sur le canal
+/// `take_output_failure()` — le même que les autres sorties en échec : le
+/// sondeur émet `zone.playback_error` (`fatal: true`) et arrête la zone.
+///
+/// `CANCELLED` (un émetteur a envoyé STOP, Tune compris) et `INTERRUPTED`
+/// (un autre LOAD a remplacé le média, la piste suivante comprise) ne sont
+/// PAS des erreurs : ce sont les gestes ordinaires de Tune lui-même.
+#[derive(Debug, Default)]
+struct ChargementCast {
+    /// L'URL (`content_id`) du dernier LOAD envoyé par Tune.
+    url: Option<String>,
+    /// La session média que le récepteur a rendue pour ce LOAD.
+    media_session_id: Option<i32>,
+    /// La session média dont l'erreur a déjà été signalée : un récepteur
+    /// reste au repos sur la même entrée, le constat ne part qu'une fois.
+    session_signalee: Option<i32>,
+    /// Le constat en attente, drainé par `take_output_failure()`.
+    echec: Option<String>,
+}
+
+impl ChargementCast {
+    /// Un nouveau LOAD part : l'ancien média et son constat ne valent plus.
+    fn charger(&mut self, url: &str) {
+        *self = Self {
+            url: Some(url.to_string()),
+            ..Self::default()
+        };
+    }
+
+    /// Lit une entrée du statut média. Rend `true` quand elle porte une
+    /// erreur NOUVELLE sur le média que Tune a chargé, et pose alors le
+    /// constat.
+    ///
+    /// « Notre média » : le `content_id` est l'URL du dernier LOAD, ou — un
+    /// récepteur au repos omet souvent `media` — la session média est celle
+    /// que ce LOAD a rendue. Une erreur restée d'une lecture antérieure (autre
+    /// URL, autre session) n'arrête jamais la piste en cours.
+    fn observer(
+        &mut self,
+        idle_reason: Option<rust_cast::channels::media::IdleReason>,
+        content_id: Option<&str>,
+        media_session_id: i32,
+        appareil: &str,
+    ) -> bool {
+        if idle_reason != Some(rust_cast::channels::media::IdleReason::Error) {
+            return false;
+        }
+        let notre_media = match content_id {
+            Some(id) => self.url.as_deref() == Some(id),
+            None => self.url.is_some() && self.media_session_id == Some(media_session_id),
+        };
+        if !notre_media || self.session_signalee == Some(media_session_id) {
+            return false;
+        }
+        self.session_signalee = Some(media_session_id);
+        self.echec = Some(format!(
+            "Sortie Cast « {appareil} » : le récepteur a abandonné la lecture de ce titre \
+             (erreur signalée par l'appareil, aucun son). Le flux n'a pas pu être lu"
+        ));
+        true
+    }
 }
 
 impl ChromecastOutput {
@@ -535,7 +610,14 @@ impl ChromecastOutput {
             command_timeout: CAST_COMMAND_TIMEOUT,
             play_retry_timeout: CAST_PLAY_RETRY_TIMEOUT,
             command_slots: Arc::clone(&CAST_COMMAND_SLOTS),
+            chargement: Arc::default(),
         }
+    }
+
+    fn chargement(&self) -> std::sync::MutexGuard<'_, ChargementCast> {
+        self.chargement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -606,8 +688,10 @@ impl OutputTarget for ChromecastOutput {
         // premier `Play` : un réessai, borné, voir `CAST_PLAY_RETRY_TIMEOUT`.
         // Chaque tentative rebâtit sa connexion et REDEMANDE le statut : le
         // `LAUNCH` parti la première fois est retrouvé, pas renvoyé.
+        self.chargement().charger(media.url);
         play_with_one_retry(self.command_timeout, self.play_retry_timeout, |timeout| {
             let cast_media = build_cast_media(media);
+            let chargement = Arc::clone(&self.chargement);
             let url = media.url.to_string();
             let host = self.host.clone();
             let port = self.port;
@@ -650,10 +734,20 @@ impl OutputTarget for ChromecastOutput {
                     .connect(&transport_id)
                     .map_err(|e| format!("connect transport: {e}"))?;
 
-                device
+                let statut_load = device
                     .media
                     .load(&transport_id, &session_id, &cast_media)
                     .map_err(|e| format!("load media: {e}"))?;
+                // Fil 2121 — retenir la session média de CE chargement, pour
+                // reconnaître une erreur au repos dont l'entrée omet `media`.
+                if let Some(entree) = statut_load.entries.first() {
+                    let mut ch = chargement
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if ch.url.as_deref() == Some(url.as_str()) {
+                        ch.media_session_id = Some(entree.media_session_id);
+                    }
+                }
 
                 // `session_reused=false` sur une piste qui n'est pas la première
                 // d'une écoute désigne le vrai coupable du carillon : la session
@@ -930,6 +1024,8 @@ impl OutputTarget for ChromecastOutput {
         let port = self.port;
         let timeout = self.command_timeout;
         let slots = Arc::clone(&self.command_slots);
+        let chargement = Arc::clone(&self.chargement);
+        let name = self.name.clone();
         run_cast_command(host, port, timeout, slots, move |device| {
             device
                 .connection
@@ -1012,6 +1108,26 @@ impl OutputTarget for ChromecastOutput {
                 Some(rust_cast::channels::media::IdleReason::Finished)
             );
 
+            // Fil 2121 — une ERROR sur notre média n'est plus un `Stopped`
+            // muet : elle part sur le canal `take_output_failure()`.
+            let erreur_nouvelle = chargement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observer(
+                    entry.idle_reason,
+                    current_uri.as_deref(),
+                    entry.media_session_id,
+                    &name,
+                );
+            if erreur_nouvelle {
+                tracing::warn!(
+                    device = %name,
+                    url = current_uri.as_deref().unwrap_or(""),
+                    media_session_id = entry.media_session_id,
+                    "chromecast_media_error"
+                );
+            }
+
             Ok(OutputStatus {
                 state,
                 position_ms,
@@ -1030,6 +1146,12 @@ impl OutputTarget for ChromecastOutput {
             })
         })
         .await
+    }
+
+    /// Fil 2121 — l'erreur de lecture rapportée par le récepteur (voir
+    /// [`ChargementCast`]), rendue une seule fois.
+    fn take_output_failure(&self) -> Option<String> {
+        self.chargement().echec.take()
     }
 
     async fn is_available(&self) -> bool {
@@ -2491,5 +2613,115 @@ mod load_message_tests {
         assert_eq!(m.album_name, None);
         assert_eq!(m.track_number, None);
         assert!(m.images.is_empty());
+    }
+}
+
+/// Fil 2121 — `idleReason = ERROR` remonte à la zone par
+/// `take_output_failure()` ; `FINISHED`, `CANCELLED` et `INTERRUPTED` non.
+///
+/// Contre-épreuve : un `observer` qui rend toujours `false` (le comportement
+/// d'avant, où seule `FINISHED` était lue) fait tomber
+/// `une_erreur_cast_sur_notre_media_remonte_a_la_zone` et
+/// `une_erreur_au_repos_sans_media_est_reconnue_par_sa_session`.
+#[cfg(test)]
+mod erreur_cast_2121_tests {
+    use super::*;
+    use rust_cast::channels::media::IdleReason;
+
+    const URL: &str = "http://192.168.1.74:8085/stream/29d4eeb2.mp3";
+
+    fn sortie() -> ChromecastOutput {
+        ChromecastOutput::new(
+            "Parents".into(),
+            "cast:parents".into(),
+            "192.168.1.24".into(),
+            8009,
+        )
+    }
+
+    #[test]
+    fn une_erreur_cast_sur_notre_media_remonte_a_la_zone() {
+        let out = sortie();
+        out.chargement().charger(URL);
+        assert!(out.take_output_failure().is_none(), "rien avant l'erreur");
+
+        assert!(
+            out.chargement()
+                .observer(Some(IdleReason::Error), Some(URL), 7, "Parents")
+        );
+        let constat = out.take_output_failure().expect("l'erreur part au sondeur");
+        assert!(constat.contains("Parents"), "{constat}");
+        assert!(
+            out.take_output_failure().is_none(),
+            "le constat est rendu UNE fois"
+        );
+
+        // Le récepteur reste au repos sur la même entrée : pas de second constat.
+        assert!(
+            !out.chargement()
+                .observer(Some(IdleReason::Error), Some(URL), 7, "Parents")
+        );
+        assert!(out.take_output_failure().is_none());
+    }
+
+    #[test]
+    fn une_erreur_au_repos_sans_media_est_reconnue_par_sa_session() {
+        let out = sortie();
+        out.chargement().charger(URL);
+        out.chargement().media_session_id = Some(12);
+        assert!(
+            !out.chargement()
+                .observer(Some(IdleReason::Error), None, 11, "Parents"),
+            "une autre session n'est pas la nôtre"
+        );
+        assert!(
+            out.chargement()
+                .observer(Some(IdleReason::Error), None, 12, "Parents")
+        );
+        assert!(out.take_output_failure().is_some());
+    }
+
+    #[test]
+    fn les_fins_ordinaires_ne_sont_pas_des_erreurs() {
+        let out = sortie();
+        out.chargement().charger(URL);
+        for raison in [
+            None,
+            Some(IdleReason::Finished),
+            Some(IdleReason::Cancelled),
+            Some(IdleReason::Interrupted),
+        ] {
+            assert!(
+                !out.chargement().observer(raison, Some(URL), 7, "Parents"),
+                "{raison:?} n'est pas une erreur"
+            );
+        }
+        assert!(out.take_output_failure().is_none());
+    }
+
+    #[test]
+    fn une_erreur_restee_d_une_lecture_anterieure_n_arrete_pas_la_piste() {
+        let out = sortie();
+        // Erreur sur l'ancien média, non drainée, puis nouveau LOAD.
+        out.chargement().charger("http://h/stream/ancienne.mp3");
+        assert!(out.chargement().observer(
+            Some(IdleReason::Error),
+            Some("http://h/stream/ancienne.mp3"),
+            3,
+            "Parents"
+        ));
+        out.chargement().charger(URL);
+        assert!(
+            out.take_output_failure().is_none(),
+            "un nouveau LOAD efface le constat de l'ancien média"
+        );
+        // Le récepteur rapporte encore l'ancienne entrée en erreur.
+        assert!(!out.chargement().observer(
+            Some(IdleReason::Error),
+            Some("http://h/stream/ancienne.mp3"),
+            3,
+            "Parents"
+        ));
+        assert!(out.take_output_failure().is_none());
     }
 }

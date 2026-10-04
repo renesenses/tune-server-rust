@@ -2078,8 +2078,9 @@ pub(super) async fn rescan_album_artwork(
     }
     let cache_dir = artwork_cache_dir();
     // Relecture du DISQUE, sans sonde héritée : c'est le rattrapage manuel
-    // (#3028). Même règle que le scan complet (#5034) — la jaquette intégrée
-    // d'abord, puis l'image du dossier ; source et fichier écrits avec la
+    // (#3028). Même règle que le scan complet (#5034) — l'image du dossier
+    // d'abord (celui des pistes, ou celui qui réunit les disques d'un coffret,
+    // #5685), puis la jaquette intégrée ; source et fichier écrits avec la
     // pochette ; une pochette TÉLÉVERSÉE n'est jamais écrasée ; une pochette
     // du disque dont le fichier a disparu est retirée.
     let found_hash = match tune_core::library::pochette_disque::reevaluer_l_album(

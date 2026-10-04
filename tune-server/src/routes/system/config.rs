@@ -1706,12 +1706,18 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
     // l'utilisateur la recopier dans son tableau de bord.
     let spotify_redirect_uri_refus =
         tune_core::streaming::spotify::refus_redirection(&spotify_redirect_uri).map(|r| r.code());
+    // Fil 221 — sans Client ID (`"placeholder"`), Spotify refuse tout : l'écran
+    // offre alors le champ « Client ID » au lieu d'un « Se connecter » voué à
+    // l'échec. Lu sur le service LUI-MÊME, qui reçoit la saisie à chaud.
+    let spotify_client_id_configure =
+        crate::routes::service_tokens::spotify_client_id_configure(&state).await;
     Json(json!({
         "TUNE_PORT": state.port.to_string(),
         "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
         "engine": engine,
         "spotify_redirect_uri": spotify_redirect_uri,
         "spotify_redirect_uri_refus": spotify_redirect_uri_refus,
+        "spotify_client_id_configure": spotify_client_id_configure,
     }))
 }
 
@@ -2974,12 +2980,18 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
                 // se reconnecte tout seul (Jean, forum #1236 — deux onglets).
                 unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
                 tracing::info!(exe = %exe.display(), "restart_reexec");
-                let err = std::process::Command::new(&exe).args(&args).exec();
+                // #5640 — l'image relancée attend le port, elle n'ouvre jamais
+                // « l'instance existante » (qui serait nous-mêmes).
+                let err = std::process::Command::new(&exe)
+                    .args(&args)
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
+                    .exec();
                 // exec() only returns on failure → fall back to spawn+exit so a
                 // supervised deployment still recovers.
                 tracing::warn!(error = %err, "restart_reexec_failed — falling back to spawn+exit");
                 let _ = std::process::Command::new(&exe)
                     .args(&args)
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
@@ -2996,10 +3008,13 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
         // never came back and had to be relaunched by hand). The listening socket
         // is created non-inheritable (socket2 sets WSA_FLAG_NO_HANDLE_INHERIT), so
         // the child does NOT inherit it and this process's exit fully releases
-        // port 8888; the child's bind() retries for ~20s (main.rs) to cover the
-        // brief release window. On a supervised install the child simply races the
-        // supervisor's relaunch and whichever loses exits cleanly on the bind
-        // guard — no crash loop.
+        // port 8888; the child's bind() retries for ~20s (bootstrap.rs) to cover
+        // the brief release window. On a supervised install the child simply races
+        // the supervisor's relaunch and whichever loses exits cleanly on the bind
+        // guard — no crash loop. #5640 : cette garde n'existait pas sous Windows
+        // tant que la socket d'écoute posait SO_REUSEADDR — l'enfant obtenait le
+        // port pendant que ce processus l'écoutait encore, et tout second
+        // lancement aussi. Voir `config::reutiliser_l_adresse_d_ecoute`.
         #[cfg(windows)]
         {
             if let Ok(exe) = std::env::current_exe() {
@@ -3009,6 +3024,9 @@ pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoRespo
                     .args(&args)
                     // Onglet existant déjà connecté — pas de nouvel onglet (#1236).
                     .env_remove("TUNE_OPEN_BROWSER")
+                    // #5640 — l'enfant ATTEND que ce processus rende le port ;
+                    // il ne doit pas « ouvrir l'instance existante » qui s'éteint.
+                    .env(crate::instance_existante::MARQUEUR_RELANCE_INTERNE, "1")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
