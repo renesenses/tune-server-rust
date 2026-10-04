@@ -492,11 +492,21 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         // exactement le défaut d'origine sous un autre nom.
         "mp4" | "m4a" => {
             // ALAC (Apple Lossless) files in M4A containers report a bit depth
-            // (typically 16 or 24), while AAC (lossy) does not.
+            // (typically 16 or 24).
+            //
+            // 🔴 Fil 2126 (#5710) — SANS profondeur, rien n'est mesuré : ni
+            // lofty ni cette fonction ne savent si c'est de l'AAC. Ce bras
+            // rendait « aac » par défaut, et un album ALAC que lofty et
+            // symphonia ne savaient pas lire s'affichait « LOSSY AAC », 0
+            // canal. Il rend désormais « m4a » : le CONTENEUR, codec non
+            // déterminé (`AudioFormat::M4a`, #3605), la valeur que
+            // `tagless_fallback_no_props` écrit déjà. Seule la sonde
+            // (`probe_m4a_props`) écrit « aac » ou « alac », quand elle a lu le
+            // codec.
             if bit_depth.is_some() {
                 "alac".to_string()
             } else {
-                "aac".to_string()
+                "m4a".to_string()
             }
         }
         // lofty may report "alac" directly for some M4A files
@@ -542,9 +552,25 @@ pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> 
         })
 }
 
+/// [`probe_m4a_props`] pour le SCANNER : un échec de la sonde est journalisé
+/// (`m4a_sonde_echouee`, avec le chemin), et l'appelant garde le format
+/// « m4a » — conteneur, codec non déterminé — au lieu d'un « aac » inventé
+/// (fil 2126, #5710).
+fn sonder_m4a_pour_le_scan(path: &std::path::Path) -> Option<(String, Option<u16>)> {
+    let sonde = probe_m4a_props(path);
+    if sonde.is_none() {
+        tracing::warn!(
+            path = %path.display(),
+            "m4a_sonde_echouee : codec non lu (ni lofty ni symphonia), format \
+             enregistré « m4a » (conteneur, codec non déterminé), pas « aac »"
+        );
+    }
+    sonde
+}
+
 fn probe_m4a_props_inner(path: &std::path::Path) -> Option<(String, Option<u16>)> {
     use symphonia::core::codecs::CodecParameters;
-    use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+    use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC};
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
@@ -566,12 +592,20 @@ fn probe_m4a_props_inner(path: &std::path::Path) -> Option<(String, Option<u16>)
 
     // Match on the codec id (0x2003 for ALAC) rather than a Debug string — the
     // Debug form of the codec parameters doesn't spell out "Alac".
+    //
+    // 🔴 Fil 2126 — « aac » seulement quand le codec LU est l'AAC. Une piste
+    // sans paramètres audio, ou d'un codec que symphonia n'identifie pas,
+    // n'a PAS été analysée : elle rend « m4a » (conteneur, codec non
+    // déterminé), et non plus « aac » par défaut.
     let params = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p,
-        _ => return Some(("aac".to_string(), None)),
+        _ => return Some(("m4a".to_string(), None)),
     };
-    if params.codec != CODEC_ID_ALAC {
+    if params.codec == CODEC_ID_AAC {
         return Some(("aac".to_string(), None));
+    }
+    if params.codec != CODEC_ID_ALAC {
+        return Some(("m4a".to_string(), None));
     }
 
     let bit_depth = params
@@ -2452,10 +2486,11 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     let mut probed_bit_depth: Option<u16> = None;
     let format = {
         let mut fmt = normalize_format(&ext, props.bit_depth());
-        if fmt == "aac"
+        // « m4a » : conteneur sans profondeur, codec à sonder (fil 2126).
+        if fmt == "m4a"
             && (ext == "m4a" || ext == "mp4")
             && props.bit_depth().is_none()
-            && let Some((probed, bd)) = probe_m4a_props(path)
+            && let Some((probed, bd)) = sonder_m4a_pour_le_scan(path)
         {
             fmt = probed;
             probed_bit_depth = bd;
@@ -3690,7 +3725,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let m4a_probe = if (file_ext == "m4a" || file_ext == "mp4" || file_ext == "m4b")
         && props.bit_depth().is_none()
     {
-        probe_m4a_props(path)
+        // Sonde en échec : `normalize_format` rend alors « m4a », jamais
+        // « aac » (fil 2126).
+        sonder_m4a_pour_le_scan(path)
     } else {
         None
     };
@@ -4724,6 +4761,72 @@ mod tests {
         assert_eq!(corrections.len(), 2);
     }
 
+    /// Fil 2126 (#5710) — un `.m4a` dont le codec ne se lit pas n'est PAS
+    /// enregistré « aac ».
+    ///
+    /// Le fichier : l'ALAC de référence (`tests/fixtures/alac`), balisé, dont
+    /// l'entrée d'échantillon `alac` de la boîte `stsd` est renommée en un
+    /// code que ni lofty ni symphonia ne connaissent — la forme du défaut
+    /// d'Yves : étiquettes lisibles, description audio illisible, 0 canal.
+    /// Avant le correctif, ce fichier sortait « aac » ; il sort « m4a »,
+    /// conteneur, codec non déterminé.
+    #[test]
+    fn un_m4a_dont_la_sonde_echoue_n_est_pas_aac() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/alac/ref_16_44100_stereo.m4a"
+        );
+        let mut octets = std::fs::read(fixture).unwrap();
+        // L'entrée de la `stsd` : taille sur 4 octets puis `alac`, juste après
+        // l'en-tête de la `stsd` (taille, `stsd`, version+drapeaux, compte).
+        let stsd = octets
+            .windows(4)
+            .position(|w| w == b"stsd")
+            .expect("la fixture porte une boîte stsd");
+        let entree = stsd + 4 + 4 + 4 + 4;
+        assert_eq!(
+            &octets[entree..entree + 4],
+            b"alac",
+            "la fixture a changé : l'entrée de la stsd n'est plus `alac`"
+        );
+        octets[entree..entree + 4].copy_from_slice(b"zzzz");
+
+        let dossier = tempfile::TempDir::new().unwrap();
+        let chemin = dossier.path().join("01 - Piste.m4a");
+        std::fs::write(&chemin, &octets).unwrap();
+
+        // Témoin du banc : l'ALAC n'est plus reconnu sur ce fichier.
+        assert!(
+            !matches!(probe_m4a_props(&chemin), Some((ref f, _)) if f == "alac"),
+            "la sonde ne doit plus reconnaître l'ALAC sur ce fichier"
+        );
+        let meta = read_metadata(&chemin).expect("les étiquettes restent lisibles");
+        assert_ne!(
+            meta.format.as_deref(),
+            Some("aac"),
+            "un .m4a dont le codec n'a pas été lu est enregistré « aac » — \
+             c'est le « LOSSY AAC » du fil 2126"
+        );
+        assert_eq!(
+            meta.format.as_deref(),
+            Some("m4a"),
+            "attendu : le conteneur, codec non déterminé"
+        );
+    }
+
+    /// Contre-témoin : l'ALAC de référence intact reste « alac » — le
+    /// correctif ne touche que ce qui n'a pas été lu.
+    #[test]
+    fn un_alac_lisible_reste_alac() {
+        let fixture = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/alac/ref_16_44100_stereo.m4a"
+        ));
+        let meta = read_metadata(fixture).expect("fixture lisible");
+        assert_eq!(meta.format.as_deref(), Some("alac"));
+        assert_eq!(meta.bit_depth, Some(16));
+    }
+
     #[test]
     fn probe_m4a_props_attrape_un_panic_du_decodeur() {
         // symphonia-codec-aac 0.6.0 panique `index out of bounds` (ics/mod.rs:246,
@@ -5639,11 +5742,19 @@ mod tests {
         }
     }
 
+    /// Fil 2126 (#5710) — sans profondeur de bits, le codec d'un MP4 n'est
+    /// PAS connu : c'était « aac » par défaut, d'où un album ALAC illisible
+    /// affiché « LOSSY AAC ». C'est le conteneur, « m4a » : seule la sonde
+    /// (`probe_m4a_props`) dit « aac » ou « alac ».
     #[test]
-    fn normalize_format_mp4_aac_no_bit_depth() {
-        // AAC (lossy) in M4A container: lofty reports no bit depth
-        assert_eq!(normalize_format("mp4", None), "aac");
-        assert_eq!(normalize_format("m4a", None), "aac");
+    fn normalize_format_mp4_sans_profondeur_n_est_pas_aac() {
+        assert_eq!(normalize_format("mp4", None), "m4a");
+        assert_eq!(normalize_format("m4a", None), "m4a");
+        assert_eq!(
+            crate::audio::formats::AudioFormat::from_extension(&normalize_format("mp4", None)),
+            Some(crate::audio::formats::AudioFormat::M4a),
+            "la valeur écrite doit être reconnue : conteneur MP4, codec non déterminé"
+        );
     }
 
     #[test]
