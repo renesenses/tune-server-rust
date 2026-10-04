@@ -183,6 +183,19 @@ const RENDERER_CALE_REPRISE_COOLDOWN_SECS: u64 = 180;
 /// détection : on coupe plutôt que de renvoyer un ordre de lecture pour
 /// quelques secondes.
 const RENDERER_CALE_RESTE_MIN_MS: u64 = 15_000;
+/// Fil 2125 (#5711) — délai avant de juger le saut d'une reprise après
+/// décrochage sur la position MESURÉE. Le `Seek` part après
+/// `REPLAY_OUTPUT_SEEK_SETTLE_MS` (500 ms) de pose, puis le renderer doit
+/// rouvrir le flux à l'octet visé : un échantillon pris avant ne dit rien.
+const REPRISE_CALE_DELAI_DE_CONSTAT_MS: u64 = 3_000;
+/// Au-delà, sans aucun échantillon `Playing` à position non nulle, le saut
+/// n'est pas constaté : on le dit, et on cesse de l'attendre.
+const REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS: u64 = 30_000;
+/// Écart toléré sous la position visée. Un renderer qui a honoré le `Seek`
+/// se trouve à la cible, plus le temps écoulé ; un `Seek` ignoré le laisse
+/// à quelques secondes du DÉBUT. Cinq secondes absorbent un calage sur une
+/// trame sans confondre les deux.
+const REPRISE_CALE_ECART_TOLERE_MS: u64 = 5_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -529,7 +542,10 @@ pub struct PositionPoller {
     /// ZonePollState pour exactement la même raison que
     /// `relances_demarrage_mort` : la reprise recrée l'état de sondage, un
     /// drapeau posé dedans repartirait à zéro et bouclerait.
-    reprises_renderer_cale: Mutex<std::collections::HashMap<i64, Instant>>,
+    ///
+    /// Fil 2125 (#5711) : la note porte aussi la génération de piste de la
+    /// reprise (une seule reprise par piste) et le saut encore à constater.
+    reprises_renderer_cale: Mutex<std::collections::HashMap<i64, RepriseRendererCale>>,
     /// #4970 — zones masquées en lecture déjà signalées au journal
     /// (`zone_masquee_en_lecture`), pour ne le dire qu'une fois par lecture.
     zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
@@ -542,6 +558,24 @@ pub struct PositionPoller {
     /// nulle : seules celles-là peuvent être dites « figées à 0 ». Certains
     /// renderers rendent 0 en permanence tout en jouant.
     zones_a_position_prouvee: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+/// Une reprise automatique après décrochage du renderer (#4645), telle que
+/// le sondeur s'en souvient pour une zone.
+#[derive(Debug, Clone, Copy)]
+struct RepriseRendererCale {
+    /// Quand la reprise a été décidée (fenêtre `RENDERER_CALE_REPRISE_COOLDOWN_SECS`).
+    decidee_a: Instant,
+    /// Génération de piste de la lecture REPRISE (relue après
+    /// `play_from_queue`). Un nouveau décrochage sur cette même génération
+    /// est un décrochage de la reprise elle-même : pas de seconde reprise,
+    /// la zone est coupée (fil 2125 : la reprise rejouait en boucle).
+    generation: u64,
+    /// La position visée par le saut.
+    cible_ms: u64,
+    /// Quand le saut a été confié à l'orchestrateur ; `None` une fois le
+    /// constat posé (ou si aucun saut n'a été demandé).
+    saut_demande_a: Option<Instant>,
 }
 
 impl PositionPoller {
@@ -1321,6 +1355,11 @@ mod fin_hors_temps_reel_tests;
 /// bout d'un forfait de deux minutes.
 #[cfg(test)]
 mod fin_de_piste_a_l_horloge_4661;
+
+/// Fil 2125 (#5711) — la reprise après décrochage : une seule par piste, et
+/// réussie seulement au vu de la position mesurée après le saut.
+#[cfg(test)]
+mod reprise_renderer_cale_2125;
 
 /// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
 /// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position

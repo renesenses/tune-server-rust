@@ -55,6 +55,9 @@ pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
 pub mod rattrapage_metadonnees_5043;
+/// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
+/// favoris ou l'historique pour resigner son URL de flux (fil 2121).
+pub mod reference_d_album;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;

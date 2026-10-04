@@ -5676,10 +5676,12 @@ name = "tune-stream-http"
 version = "1.0.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "bytes",
  "futures-util",
  "reqwest",
+ "serde_json",
  "symphonia",
  "tokio",
  "tracing",
