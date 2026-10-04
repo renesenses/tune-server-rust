@@ -8,7 +8,7 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
-use tune_core::db::home_queries::{self, HISTORIQUE_VERS_ALBUM};
+use tune_core::db::home_queries;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -120,33 +120,6 @@ fn ph(engine: Engine, idx: usize) -> String {
         Engine::Sqlite => SqliteDialect.placeholder(idx),
         Engine::Postgres => PostgresDialect.placeholder(idx),
     }
-}
-
-/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
-/// celui de l'album. Partage entre les recommandations et les « top mixes »,
-/// qui prenaient tous deux le genre d'un album homonyme (#2731).
-///
-/// Le filtre sur le genre se pose sur la sous-requete `g`, ou `genre`
-/// n'existe qu'une fois. Pose DANS la sous-requete, a cote de `t.genre` et
-/// `a.genre`, `WHERE genre IS NOT NULL` etait ambigu pour les deux moteurs —
-/// « column reference "genre" is ambiguous » dans le journal de jfpaquet
-/// (#3181, PostgreSQL), « ambiguous column name: genre » sur SQLite — et
-/// l'echec, avale par `ou_defaut_journalise`, faisait tirer « A decouvrir »
-/// au hasard et laissait les « top mixes » vides, sans rien dire a l'ecran.
-///
-/// L'alias `g` n'est pas decoratif : jusqu'a PostgreSQL 15, une sous-requete
-/// de `FROM` doit en porter un. Le second critere de tri rend l'ordre des
-/// ex aequo defini, donc le meme sur les deux moteurs.
-fn sql_top_genres() -> String {
-    format!(
-        "SELECT g.genre, COUNT(*) AS cnt \
-         FROM (SELECT COALESCE(t.genre, a.genre) AS genre \
-               FROM listen_history lh \
-               LEFT JOIN tracks t ON lh.track_id = t.id \
-               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM}) g \
-         WHERE g.genre IS NOT NULL AND g.genre <> '' \
-         GROUP BY g.genre ORDER BY cnt DESC, g.genre LIMIT 5"
-    )
 }
 
 /// Aggregated home page: returns all sections in a single response.
@@ -363,8 +336,8 @@ fn fetch_continue_listening_borne(
     //   plus son disque : « Tune doit refleter la realite de ce qu'a voulu
     //   faire l'auditeur », pas doubler chaque geste.
     //
-    // Le comptage, lui, reste sur TOUTES les lignes (HISTORIQUE_VERS_ALBUM
-    // inchange depuis #2731) : n'avancer que sur les lignes sans contexte
+    // Le comptage, lui, reste sur TOUTES les lignes (la regle de
+    // rattachement inchangee depuis #2731) : n'avancer que sur les lignes sans contexte
     // sous-estimerait un disque commence avant la mise a jour et poursuivi
     // apres.
     //
@@ -1043,13 +1016,16 @@ mod tests_homonymes {
         assert!(
             items.is_empty(),
             "limite connue : « LIVE » ne rejoint pas « Live » — voir le cout \
-             mesure sur HISTORIQUE_VERS_ALBUM avant de changer ceci : {items:?}"
+             mesure sur home_queries::repli_par_artiste_ou_titre_seul avant de changer ceci : {items:?}"
         );
     }
 
     /// Les genres les plus ecoutes, tels que la requete les rend.
     fn genres_ecoutes(state: &AppState) -> Vec<(String, i64)> {
-        let Ok(lignes) = state.backend.query_many(&sql_top_genres(), &[]) else {
+        let Ok(lignes) = state
+            .backend
+            .query_many(&home_queries::top_genres_ecoutes(), &[])
+        else {
             panic!("la requete des genres doit repondre")
         };
         lignes
@@ -1911,7 +1887,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     // Find top genres from listen history
     let top_genres: Vec<String> = state
         .backend
-        .query_many(&sql_top_genres(), &[])
+        .query_many(&home_queries::top_genres_ecoutes(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
@@ -1952,25 +1928,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
 /// Les albums des `genres` donnes que l'historique ne connait pas, au hasard,
 /// `limit` au plus.
 fn albums_du_genre_non_ecoutes(state: &AppState, genres: &[String], limit: i64) -> Vec<Value> {
-    let engine = state.backend.engine();
-    // Build engine-specific placeholders for the IN clause.
-    let genre_placeholders: String = genres
-        .iter()
-        .enumerate()
-        .map(|(i, _)| ph(engine, i + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let limit_ph = ph(engine, genres.len() + 1);
-    let sql = format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
-         FROM albums a \
-         LEFT JOIN artists ar ON a.artist_id = ar.id \
-         WHERE a.genre IN ({genre_placeholders}) \
-           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
-                           WHERE {HISTORIQUE_VERS_ALBUM}) \
-         ORDER BY RANDOM() \
-         LIMIT {limit_ph}"
-    );
+    let sql = home_queries::albums_du_genre_non_ecoutes(state.backend.engine(), genres.len());
 
     // Build a Vec of owned SqlValue-able params: genres + limit.
     let mut param_vals: Vec<Box<dyn ToSqlValue>> = genres
@@ -2014,7 +1972,7 @@ async fn top_mixes(
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
         .backend
-        .query_many(&sql_top_genres(), &[])
+        .query_many(&home_queries::top_genres_ecoutes(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
