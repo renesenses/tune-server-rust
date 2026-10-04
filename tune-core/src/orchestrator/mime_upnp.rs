@@ -306,6 +306,7 @@ mod temoins_du_chemin {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         }
     }
 

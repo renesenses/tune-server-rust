@@ -115,6 +115,7 @@ impl ToolExecutor {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         // Queue remaining tracks
@@ -170,6 +171,7 @@ impl ToolExecutor {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         match self.orchestrator.play(req).await {

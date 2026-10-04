@@ -1,4 +1,7 @@
 #[cfg(test)]
+#[path = "playback/album_ref_bandcamp_2121_tests.rs"]
+mod album_ref_bandcamp_2121_tests;
+#[cfg(test)]
 #[path = "playback/session_locale_tests.rs"]
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
@@ -374,6 +377,7 @@ pub(crate) fn entrees_de_file(
                 duration_ms: s.duration_ms.unwrap_or(0),
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             },
         })
         .collect()
@@ -1871,6 +1875,7 @@ async fn play(
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
                 ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
                 return match state.orchestrator.play(orch_req).await {
@@ -2014,6 +2019,7 @@ async fn play(
                         media_format: None,
                         track_number: None,
                         disc_number: None,
+                        album_ref: None,
                     };
                     return match state.orchestrator.play(orch_req).await {
                         Ok(result) => {
@@ -2155,7 +2161,13 @@ async fn play(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+        // La référence d'album de chaque piste (migration 114) : pour Bandcamp,
+        // la page qui permettra de resigner l'URL de flux quand elle expirera
+        // (fil 2121).
+        let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
+        {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
         state
@@ -2181,6 +2193,7 @@ async fn play(
             media_format: None,
             track_number: first.track_number,
             disc_number: first.disc_number,
+            album_ref: first.album_id.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2296,7 +2309,13 @@ async fn play(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+        // La référence d'album de chaque piste (migration 114) : pour Bandcamp,
+        // la page qui permettra de resigner l'URL de flux quand elle expirera
+        // (fil 2121).
+        let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
+        {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
         state
@@ -2322,6 +2341,7 @@ async fn play(
             media_format: None,
             track_number: first.track_number,
             disc_number: first.disc_number,
+            album_ref: first.album_id.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2409,6 +2429,7 @@ async fn play(
             media_format: body.media_format,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2455,6 +2476,7 @@ async fn play(
                                 duration_ms: duration_val,
                                 track_number: meta.track_number,
                                 disc_number: meta.disc_number,
+                                album_ref: None,
                             }],
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -2586,6 +2608,7 @@ async fn play(
                 media_format: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             };
             ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
             return match state.orchestrator.play(orch_req).await {
@@ -2796,6 +2819,7 @@ async fn play(
         media_format: body.media_format,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
 
     ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
@@ -2965,6 +2989,7 @@ async fn resume(
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
         ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
         return match state.orchestrator.play(orch_req).await {
@@ -3029,6 +3054,10 @@ async fn resume(
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     duration_ms: first.get("duration_ms").and_then(|v| v.as_i64()),
+                    album_ref: first
+                        .get("album_ref")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     ..Default::default()
                 };
                 return match state.orchestrator.play(orch_req).await {
@@ -3066,6 +3095,7 @@ async fn resume(
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -4019,6 +4049,7 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
+            album_ref: None,
         });
     }
 
@@ -4054,6 +4085,7 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
+            album_ref: None,
         });
     }
 
@@ -5055,7 +5087,16 @@ async fn do_transfer(
                 )
             })
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue(target_zone, &tracks) {
+        // La référence d'album suit la piste d'une zone à l'autre (fil 2121) :
+        // sans elle, une piste Bandcamp transférée ne pourrait plus être
+        // resignée.
+        let album_refs: Vec<Option<String>> = streaming_items
+            .iter()
+            .map(|item| item["album_ref"].as_str().map(String::from))
+            .collect();
+        if let Err(e) =
+            queue_repo.set_streaming_queue_avec_albums(target_zone, &tracks, &album_refs)
+        {
             warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
         }
     }
@@ -5518,6 +5559,7 @@ async fn invoke_zone_pin(
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -6188,6 +6230,7 @@ pub async fn shuffle_all(
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -6399,6 +6442,7 @@ mod contrat_suivant_radio_tests {
                 cover_url: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             })
             .collect();
         PlayQueueRepo::with_backend(state.backend.clone())
@@ -7071,6 +7115,7 @@ mod file_deja_chargee_2569 {
             bit_depth: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         }
     }
 
@@ -7681,6 +7726,7 @@ mod vider_la_file_arrete_le_peripherique_3669 {
                     duration_ms: 200_000,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 }],
             )
             .expect("mise en file");
@@ -7807,6 +7853,7 @@ mod vider_la_suite_4169 {
             duration_ms: 200_000,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         }
     }
 

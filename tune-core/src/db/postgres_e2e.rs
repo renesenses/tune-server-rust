@@ -941,6 +941,7 @@ async fn pg_history_round_trip() {
         context_source: None,
         context_title: None,
         context_cover: None,
+        album_ref: None,
     };
     repo.record(&rec).unwrap();
     repo.record(&rec).unwrap();
