@@ -615,7 +615,35 @@ async fn service_album(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
+    let backend = state.backend.clone();
+    with_svc!(&state, &service, |svc| svc
+        .get_album(&album_id)
+        .await
+        .inspect(|album| ranger_le_marquage_ia(&backend, &service, album)))
+}
+
+/// #5530 — la fiche d'un album de service est le moment où Tune lit son
+/// marquage « généré par IA » de première main (`album/get` chez Qobuz). On le
+/// range sur les favoris qui désignent cet album — l'album lui-même, et les
+/// pistes dont la référence d'album le nomme —, pour qu'une règle de playlist
+/// intelligente puisse l'écarter sans rappeler le service.
+///
+/// Rien n'est écrit quand le service ne dit rien (`None`). Une erreur de base
+/// est journalisée, jamais rendue : la fiche reste servie.
+fn ranger_le_marquage_ia(
+    backend: &Arc<dyn DbBackend>,
+    service: &str,
+    album: &tune_core::streaming::StreamAlbum,
+) {
+    let Some(ia) = album.ai_generated else {
+        return;
+    };
+    let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+        backend.clone(),
+    );
+    if let Err(e) = repo.marquer_album_ia(service, &album.id, ia) {
+        tracing::warn!(service, erreur = %e, "marquage_ia_favoris_impossible");
+    }
 }
 
 async fn service_album_tracks(

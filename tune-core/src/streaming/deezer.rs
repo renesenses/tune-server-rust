@@ -638,6 +638,7 @@ impl DeezerService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),

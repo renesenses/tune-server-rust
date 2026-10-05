@@ -334,6 +334,7 @@ impl SpotifyService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: item["id"].as_str().unwrap_or("").into(),
             title: item["name"].as_str().unwrap_or("").into(),
@@ -791,6 +792,7 @@ impl StreamingService for SpotifyService {
                         && !albums.iter().any(|a: &StreamAlbum| a.id == *album_id)
                     {
                         albums.push(StreamAlbum {
+                            ai_generated: None,
                             release_type: None,
                             id: album_id.clone(),
                             title: album_title.clone(),
