@@ -495,6 +495,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
 
+      # Rc2 -- la regle de pochette d'album du scan par lots tourne dans le fil
+      # de `lecture_bornee`, qui n'avait pas de runtime tokio : sur PostgreSQL
+      # elle paniquait a chaque album (« there is no reactor running ») et la
+      # pochette n'etait ni posee ni suivie. Releve par #5860.
+      - name: Pochette d'album suivie par le scan sur PostgreSQL (lecture bornee)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_pochette_lecture_bornee -- --nocapture --test-threads=1
+
       # #4602 -- le VRAI scan (`POST /system/scan`) d'une bibliotheque de FLAC
       # avec pochettes : toute piste doit avoir un album, et les comptes ne
       # doivent pas bouger d'une passe a l'autre. `GROUP_CONCAT` en dur dans
