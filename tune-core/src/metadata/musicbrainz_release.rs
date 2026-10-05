@@ -1302,6 +1302,11 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
     }
 }
 
+// Banc « une seule requête de release par album » (#4805, idée 3 de MetaRust).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_release_en_base.rs"]
+mod banc_release_en_base;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2226,7 +2231,3 @@ mod tests {
 #[cfg(test)]
 #[path = "musicbrainz_release_banc_4805.rs"]
 mod banc_4805;
-
-#[cfg(test)]
-#[path = "musicbrainz_release_banc_release_en_base.rs"]
-mod banc_release_en_base;
