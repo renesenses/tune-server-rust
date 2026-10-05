@@ -1923,4 +1923,137 @@ mod tests {
         acc1.feed(&mono);
         assert_eq!(Some(deux_canaux), acc1.finish());
     }
+
+    /// Pic de mémoire résidente du processus (`VmHWM`, Linux), en Kio.
+    #[cfg(target_os = "linux")]
+    fn pic_residente_kio() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// WAV 24/192 stéréo, écrit au fil de l'eau : un sinus à 997 Hz.
+    #[cfg(target_os = "linux")]
+    fn ecrire_wav_24_192(chemin: &std::path::Path, secondes: u64) {
+        use std::io::Write;
+        let rate = 192_000u64;
+        let data = secondes * rate * 6;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(chemin).unwrap());
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&((36 + data) as u32).to_le_bytes()).unwrap();
+        f.write_all(b"WAVEfmt ").unwrap();
+        for v in [16u32] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [1u16, 2] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [rate as u32, rate as u32 * 6] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [6u16, 24] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"data").unwrap();
+        f.write_all(&(data as u32).to_le_bytes()).unwrap();
+        for i in 0..secondes * rate {
+            let a = 0.1 + 0.4 * ((i / (rate * 7)) % 2) as f64;
+            let v = (a
+                * (i as f64 * 997.0 * std::f64::consts::TAU / rate as f64).sin()
+                * 8_388_607.0) as i32;
+            let b = v.to_le_bytes();
+            f.write_all(&b[..3]).unwrap();
+            f.write_all(&b[..3]).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    /// DSF DSD64 stéréo, octets pseudo-aléatoires, écrit au fil de l'eau.
+    #[cfg(target_os = "linux")]
+    fn ecrire_dsf_64(chemin: &std::path::Path, secondes: u64) {
+        use std::io::Write;
+        const BLOC: u64 = 4096;
+        let total = secondes * 2_822_400;
+        let blocs = (total / 8).div_ceil(BLOC);
+        let data = blocs * BLOC * 2;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(chemin).unwrap());
+        f.write_all(b"DSD ").unwrap();
+        for v in [28u64, 28 + 52 + 12 + data, 0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&52u64.to_le_bytes()).unwrap();
+        for v in [1u32, 0, 2, 2, 2_822_400, 1] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(&total.to_le_bytes()).unwrap();
+        for v in [BLOC as u32, 0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"data").unwrap();
+        f.write_all(&(12 + data).to_le_bytes()).unwrap();
+        let mut graine = 0xb209u32;
+        let mut bloc = vec![0u8; BLOC as usize];
+        for _ in 0..blocs * 2 {
+            for o in bloc.iter_mut() {
+                graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *o = (graine >> 24) as u8;
+            }
+            f.write_all(&bloc).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    /// plafond-analyse — la mémoire de l'analyse ne dépend PAS de la durée.
+    ///
+    /// Mesuré par le PIC de mémoire résidente du processus : la piste courte
+    /// d'abord, la longue ensuite ; le pic ne doit presque pas bouger entre
+    /// les deux. Avant la reprise au bloc des DSF, chaque segment de 30 s
+    /// re-décodait la piste depuis son début : 10 min de DSD64 montaient le
+    /// pic de plus de 600 Mio au-dessus de 2 min.
+    ///
+    /// Ignoré par défaut : il écrit ~2,3 Go de fichiers temporaires et dure
+    /// plusieurs minutes. À lancer SEUL, pour que le pic soit le sien :
+    /// `cargo test --release -p tune-core --lib -- --ignored --exact
+    /// audio::analyzer::tests::la_memoire_de_l_analyse_ne_depend_pas_de_la_duree`
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn la_memoire_de_l_analyse_ne_depend_pas_de_la_duree() {
+        const MARGE_KIO: u64 = 64 * 1024;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (nom, court, long) in [("dsf", 120u64, 600u64), ("wav", 120, 720)] {
+            let c = dir.path().join(format!("court.{nom}"));
+            let l = dir.path().join(format!("long.{nom}"));
+            if nom == "wav" {
+                ecrire_wav_24_192(&c, court);
+                ecrire_wav_24_192(&l, long);
+            } else {
+                ecrire_dsf_64(&c, court);
+                ecrire_dsf_64(&l, long);
+            }
+            let m = mesurer_intensite_plage_et_empreinte(c.to_str().unwrap()).await;
+            assert!(m.mesure.is_some(), "{nom} court : mesure attendue");
+            let apres_court = pic_residente_kio();
+            let m = mesurer_intensite_plage_et_empreinte(l.to_str().unwrap()).await;
+            assert!(m.mesure.is_some(), "{nom} long : mesure attendue");
+            let apres_long = pic_residente_kio();
+            eprintln!(
+                "{nom} : pic après {court} s = {apres_court} Kio, après {long} s = {apres_long} Kio"
+            );
+            assert!(
+                apres_long <= apres_court + MARGE_KIO,
+                "{nom} : la mémoire de l'analyse croît avec la durée — pic {apres_court} Kio \
+                 pour {court} s, {apres_long} Kio pour {long} s"
+            );
+            let _ = std::fs::remove_file(&c);
+            let _ = std::fs::remove_file(&l);
+        }
+    }
 }

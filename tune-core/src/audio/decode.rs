@@ -4579,6 +4579,56 @@ fn dsd_needed_samples(
         .saturating_mul(channels.max(1))
 }
 
+/// Le convertisseur d'un décodage DSF/DFF borné, repris au plus près AVANT
+/// la fenêtre FIR de la première trame demandée (plafond-analyse).
+///
+/// Jusqu'ici un DSF ou un DFF se décodait TOUJOURS depuis son premier bit,
+/// puis le PCM d'avant `seek_s` était jeté. L'analyse ReplayGain/DR lit la
+/// piste par segments de 30 s : chaque segment re-convertissait donc tout ce
+/// qui le précédait. Le temps était quadratique en durée, et la mémoire
+/// résidente du segment croissait avec sa position — toute la piste en PCM
+/// `i32` au dernier segment. C'est ce que le plafond `MAX_ANALYSIS_EST_BYTES`
+/// masquait en écartant les longues pistes DSD.
+///
+/// `chercher` positionne le lecteur sur un octet par canal (arrondi au bloc
+/// par le lecteur, toujours EN DEÇÀ de la cible) et rend l'octet atteint. Le
+/// convertisseur rendu reprend là, et sa première sortie est rendue avec
+/// lui : le PCM est identique au bit près à celui du décodage depuis le début
+/// (`decode_dsf_repris_identique_au_decodage_depuis_le_debut`).
+fn reprendre_le_flux_dsd(
+    dsd_rate: u32,
+    output_rate: u32,
+    channels: usize,
+    lsb_first: bool,
+    seek_s: f64,
+    chercher: impl FnOnce(usize) -> Result<usize, String>,
+) -> Result<(super::dsd_to_pcm::DsdToPcmStreamer, usize), String> {
+    use super::dsd_to_pcm::DsdToPcmStreamer;
+    let depuis_le_debut = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, lsb_first);
+    let trame = if seek_s > 0.0 {
+        (seek_s * output_rate as f64) as usize
+    } else {
+        0
+    };
+    let premier_bit = depuis_le_debut.premier_bit_de_la_sortie(trame);
+    if premier_bit < 8 {
+        return Ok((depuis_le_debut, 0));
+    }
+    let atteint = chercher(premier_bit as usize / 8)?;
+    let repris =
+        DsdToPcmStreamer::a_partir_de(dsd_rate, output_rate, channels, lsb_first, atteint * 8);
+    let premiere = repris.prochaine_sortie();
+    // Le lecteur n'a pas le droit de dépasser la cible ; s'il l'a fait, la
+    // trame demandée n'est plus calculable : on refuse plutôt que de rendre
+    // un PCM décalé.
+    if premiere > trame {
+        return Err(format!(
+            "dsd: reprise au-delà de la fenêtre demandée (octet {atteint}, trame {premiere} > {trame})"
+        ));
+    }
+    Ok((repris, premiere))
+}
+
 fn decode_dsd_to_pcm(
     file_path: &str,
     ext: &str,
@@ -4611,6 +4661,9 @@ fn decode_dsd_to_pcm(
     // qui contient `seek_s` : il ne reste que l'écart à l'intérieur de cette
     // trame (moins de 1/75 s).
     let mut seek_pcm_s = seek_s;
+    // Les trames PCM que la reprise au bloc a déjà sautées (DSF et DFF bruts) :
+    // `all_samples` commence à cette trame-là, pas à la trame 0.
+    let mut deja_saute: usize = 0;
 
     let (dsd_rate, output_rate, channels) = if ext == "iso" {
         let chemin = Path::new(file_path);
@@ -4643,13 +4696,26 @@ fn decode_dsd_to_pcm(
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
         let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
-        // Pre-reserve the whole output so the Vec doesn't repeatedly reallocate
-        // as it grows: output samples ≈ (dsd_samples / decimation) * channels.
         let decimation = (dsd_rate / output_rate).max(1) as u64;
-        all_samples.reserve((info.total_samples / decimation) as usize * channels);
-        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
+        let total_samples = info.total_samples;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
-        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
+        // plafond-analyse : partir du bloc qui précède la fenêtre, pas du
+        // début du fichier. Voir `reprendre_le_flux_dsd`.
+        let (mut streamer, premiere) =
+            reprendre_le_flux_dsd(dsd_rate, output_rate, channels, true, seek_s, |octets| {
+                reader.seek_to_bytes_per_channel(octets)
+            })?;
+        deja_saute = premiere;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels)
+            .saturating_sub(premiere * channels);
+        // Pre-reserve the output so the Vec doesn't repeatedly reallocate as it
+        // grows — but only what this window needs: reserving the WHOLE file at
+        // every 30 s segment committed gigabytes for a long DSD256 track.
+        all_samples.reserve(
+            ((total_samples / decimation) as usize * channels)
+                .saturating_sub(premiere * channels)
+                .min(needed),
+        );
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
             // Débit de décodage observable sans coût (#3140) : un super-bloc
@@ -4677,11 +4743,31 @@ fn decode_dsd_to_pcm(
         // DFF has no explicit sample count; estimate from the data chunk size
         // (data_size bytes * 8 DSD samples/byte, then decimated).
         let decimation = (dsd_rate / output_rate).max(1) as u64;
-        all_samples.reserve((info.data_size.saturating_mul(8) / decimation) as usize);
-        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
-        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels);
+        // plafond-analyse : même reprise que la branche DSF, pour du DSD BRUT.
+        // Un DST se recherche par trame (`LecteurDst::rechercher`) : il garde
+        // son décodage depuis le début, inchangé.
+        let (mut streamer, premiere) = if info.is_dst() {
+            (
+                DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false),
+                0,
+            )
+        } else {
+            reprendre_le_flux_dsd(dsd_rate, output_rate, channels, false, seek_s, |octets| {
+                reader
+                    .seek_to_interleaved_byte(octets.saturating_mul(channels), channels)
+                    .map(|entrelaces| entrelaces / channels.max(1))
+            })?
+        };
+        deja_saute = premiere;
+        let needed = dsd_needed_samples(seek_s, max_duration_s, output_rate, channels)
+            .saturating_sub(premiere * channels);
+        all_samples.reserve(
+            ((info.data_size.saturating_mul(8) / decimation) as usize)
+                .saturating_sub(premiere * channels)
+                .min(needed),
+        );
         while let Some(dsd_chunk) = reader.next_chunk()? {
             append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
             // Même balise que la branche DSF (#3140).
@@ -4703,7 +4789,8 @@ fn decode_dsd_to_pcm(
         (seek_pcm_s * output_rate as f64) as usize
     } else {
         0
-    };
+    }
+    .saturating_sub(deja_saute);
     let skip_samples = skip_frames * channels;
 
     let max_frames = if max_duration_s > 0.0 {
@@ -5062,6 +5149,142 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
             "bounded window should be ~0.005 s, got {} frames",
             frames,
         );
+    }
+
+    /// Octets DSD pseudo-aléatoires déterministes.
+    fn octets_dsd(n: usize, graine: u32) -> Vec<u8> {
+        let mut s = graine;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// DSF stéréo DSD64 de `octets_par_canal` octets par canal, blocs de 4096
+    /// octets, dernier bloc incomplet (bourré de zéros, comme le format).
+    fn ecrire_dsf_aleatoire(path: &str, octets_par_canal: usize) {
+        let canaux = 2usize;
+        let bloc = 4096usize;
+        let flux: Vec<Vec<u8>> = (0..canaux)
+            .map(|c| octets_dsd(octets_par_canal, 0xb209 + c as u32))
+            .collect();
+        let blocs = octets_par_canal.div_ceil(bloc);
+        let mut data = Vec::new();
+        for b in 0..blocs {
+            for f in &flux {
+                let mut morceau = vec![0u8; bloc];
+                let fin = ((b + 1) * bloc).min(octets_par_canal);
+                morceau[..fin - b * bloc].copy_from_slice(&f[b * bloc..fin]);
+                data.extend_from_slice(&morceau);
+            }
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&(canaux as u32).to_le_bytes());
+        buf.extend_from_slice(&2_822_400u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(octets_par_canal as u64 * 8).to_le_bytes());
+        buf.extend_from_slice(&(bloc as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// DFF (DSDIFF) stéréo DSD64 NON compressé, octets entrelacés par canal.
+    fn ecrire_dff_aleatoire(path: &str, octets_par_canal: usize) {
+        let data = octets_dsd(octets_par_canal * 2, 0x0dff_b209);
+        let mut fver = Vec::new();
+        fver.extend_from_slice(b"FVER");
+        fver.extend_from_slice(&4u64.to_be_bytes());
+        fver.extend_from_slice(&0x0105_0000u32.to_be_bytes());
+        let mut prop = Vec::new();
+        prop.extend_from_slice(b"SND ");
+        prop.extend_from_slice(b"FS  ");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(&2_822_400u32.to_be_bytes());
+        prop.extend_from_slice(b"CHNL");
+        prop.extend_from_slice(&10u64.to_be_bytes());
+        prop.extend_from_slice(&2u16.to_be_bytes());
+        prop.extend_from_slice(b"SLFTSRGT");
+        prop.extend_from_slice(b"CMPR");
+        prop.extend_from_slice(&4u64.to_be_bytes());
+        prop.extend_from_slice(b"DSD ");
+        let frm8 = 4 + fver.len() + 12 + prop.len() + 12 + data.len();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"FRM8");
+        buf.extend_from_slice(&(frm8 as u64).to_be_bytes());
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&fver);
+        buf.extend_from_slice(b"PROP");
+        buf.extend_from_slice(&(prop.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&prop);
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// plafond-analyse — un décodage DSF/DFF borné qui commence loin dans le
+    /// fichier rend, au bit près, la tranche correspondante du décodage
+    /// complet. Il ne part plus du premier bit (voir `reprendre_le_flux_dsd`),
+    /// et ne doit pourtant rien changer au PCM : ni décalage d'une trame, ni
+    /// fenêtre FIR amputée, ni fin de fichier différente.
+    #[test]
+    fn decode_dsf_repris_identique_au_decodage_depuis_le_debut() {
+        // 1,2 s de DSD64 : 103 blocs de 4096 octets, le dernier incomplet.
+        let octets = 423_360usize;
+        for ext in ["dsf", "dff"] {
+            let f = tempfile::Builder::new()
+                .suffix(&format!(".{ext}"))
+                .tempfile()
+                .unwrap();
+            let p = f.path().to_str().unwrap().to_string();
+            if ext == "dsf" {
+                ecrire_dsf_aleatoire(&p, octets);
+            } else {
+                ecrire_dff_aleatoire(&p, octets);
+            }
+            for rate in [176_400u32, 88_200] {
+                let complet = decode_dsd_to_pcm(&p, ext, Some(rate), None, 0.0, 0.0).unwrap();
+                assert!(complet.samples_i32.len() > 2 * rate as usize);
+                for seek in [0.0, 0.000_01, 0.0013, 0.093, 0.5, 0.977_7, 1.19, 1.25] {
+                    for duree in [0.1, 0.0] {
+                        let borne =
+                            decode_dsd_to_pcm(&p, ext, Some(rate), None, seek, duree).unwrap();
+                        let debut =
+                            (((seek * rate as f64) as usize) * 2).min(complet.samples_i32.len());
+                        let fin = if duree > 0.0 {
+                            (debut + ((duree * rate as f64) as usize) * 2)
+                                .min(complet.samples_i32.len())
+                        } else {
+                            complet.samples_i32.len()
+                        };
+                        assert_eq!(
+                            borne.samples_i32.len(),
+                            fin - debut,
+                            "{ext} {rate} Hz, seek {seek} s, durée {duree} s : longueur"
+                        );
+                        assert!(
+                            borne.samples_i32 == complet.samples_i32[debut..fin],
+                            "{ext} {rate} Hz, seek {seek} s, durée {duree} s : le PCM repris \
+                             doit être la tranche exacte du décodage complet"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
