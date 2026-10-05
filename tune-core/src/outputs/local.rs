@@ -1185,16 +1185,58 @@ impl LocalOutput {
     /// interrupteur de compensation basculé ensuite passe par le volume seul
     /// (`recalculer_la_compensation` divise par ce qui est porté), sans rien
     /// changer à ce qui est déjà dans l'anneau.
+    ///
+    /// #5215 (lot eq-niveau) — l'égaliseur ne porte que la part que le
+    /// volume COURANT peut rendre, `min(compensation, 1 / (volume ×
+    /// ReplayGain × compensation du crossfeed))`. Le reste, raboté à l'unité,
+    /// n'est de toute façon pas rendu. Porter TOUT faisait descendre le volume
+    /// de ce qui était porté (`effective_volume_units` divise par la part
+    /// portée) : à 100 %, couper l'égaliseur remontait alors le volume AU
+    /// RAPPEL, d'un coup, pendant que l'anneau jouait encore les échantillons
+    /// de l'égaliseur — une marche de toute la compensation, avant le fondu de
+    /// `prendre_la_releve`, qui lui ne voyait rien bouger. Ainsi borné, le
+    /// volume effectif ne dépend plus de la présence de l'égaliseur au volume
+    /// d'installation : la bascule entière tient dans le fondu.
     fn faire_porter_la_compensation(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
         if let Some(p) = eq.as_mut() {
             let facteur = if self.compensation_de_niveau.load(Ordering::Relaxed)
                 && !self.pure_bypass.load(Ordering::Relaxed)
             {
-                10.0_f64.powf(-p.gain_moyen_db() / 20.0)
+                10.0_f64
+                    .powf(-p.gain_moyen_db() / 20.0)
+                    .min(self.marge_du_volume_hors_egaliseur())
             } else {
                 1.0
             };
             p.porter_la_compensation(facteur);
+        }
+    }
+
+    /// #5215 — ce que le rabot à l'unité laisse encore passer, en linéaire,
+    /// une fois appliqués le volume (celui d'avant la sourdine si elle est
+    /// mise), le ReplayGain et la compensation du crossfeed installé :
+    /// `1 / produit`, infini à volume nul.
+    fn marge_du_volume_hors_egaliseur(&self) -> f64 {
+        let volume = if self.muted.load(Ordering::SeqCst) {
+            self.pre_mute_volume.load(Ordering::SeqCst)
+        } else {
+            self.user_volume.load(Ordering::SeqCst)
+        };
+        let crossfeed_db = self
+            .crossfeed
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
+            .filter(|db| db.is_finite())
+            .unwrap_or(0.0);
+        let produit = f64::from(volume) / 1000.0
+            * f64::from(self.replaygain_seul.load(Ordering::SeqCst))
+            / 1000.0
+            * 10.0_f64.powf(-crossfeed_db / 20.0);
+        if produit > 0.0 {
+            1.0 / produit
+        } else {
+            f64::INFINITY
         }
     }
 
