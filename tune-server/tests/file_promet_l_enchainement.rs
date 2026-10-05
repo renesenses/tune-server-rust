@@ -289,6 +289,11 @@ async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
         // connu ; la référence interne `album_ref` (#5706) reste dehors.
         "album_id",
         "album_id_service",
+        // …et l'artiste de la ligne (fil 2143, #5758), sur le même modèle :
+        // `artist_id` (bibliothèque) et `artist_id_service` (service), deux
+        // clefs ADDITIVES, `null` quand rien n'est connu.
+        "artist_id",
+        "artist_id_service",
     ];
     attendues.sort_unstable();
 

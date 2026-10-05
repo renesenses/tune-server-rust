@@ -3751,6 +3751,18 @@ async fn get_queue(
                 // La référence brute `album_ref` reste, elle, hors du JSON.
                 obj.insert("album_id".into(), json!(e.album_id));
                 obj.insert("album_id_service".into(), json!(e.album_id_service()));
+                // Fil forum 2143 (#5758) — « Aller à l'artiste », sur le même
+                // modèle : `artist_id` (entier de bibliothèque) pour une ligne
+                // locale, `artist_id_service` pour une ligne de service. Deux
+                // clefs ADDITIVES, toujours présentes, `null` quand rien n'est
+                // connu. ⚠️ `queue_items` ne garde pas l'artiste CHEZ LE
+                // SERVICE (seul `album_ref` l'est, migration 114) : la clef de
+                // service vaut donc `null` aujourd'hui, et le client retombe,
+                // pour une ligne de service, sur la recherche par nom
+                // (`destinationArtiste`). La remplir demande une colonne
+                // `artist_ref` et sa migration, hors de ce correctif.
+                obj.insert("artist_id".into(), json!(e.artist_id));
+                obj.insert("artist_id_service".into(), Value::Null);
             }
             let suivant = entries.get(idx + 1);
             let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
@@ -7126,6 +7138,7 @@ mod file_deja_chargee_2569 {
             disc_number: None,
             album_ref: None,
             album_id: None,
+            artist_id: None,
         }
     }
 
