@@ -237,6 +237,11 @@ path = "tests/isolement_disque_integration_5512.rs"
 name = "titres_bannis_4806"
 path = "tests/titres_bannis_4806.rs"
 
+# Ticket 134 — trois « suivant » en rafale visent trois pistes distinctes.
+[[test]]
+name = "suivants_en_rafale_134"
+path = "tests/suivants_en_rafale_134.rs"
+
 # #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
 # réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
 [[test]]

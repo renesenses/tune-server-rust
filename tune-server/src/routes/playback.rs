@@ -3240,11 +3240,38 @@ pub(crate) fn radio_hors_file_interdit_le_suivant(
     source_en_cours == Some("radio") && source_de_la_ligne_courante != Some("radio")
 }
 
+/// Ticket 134 — le verrou de décision de « suivant », par zone.
+///
+/// `next` répond tout de suite et lance `play_from_queue` en tâche de fond.
+/// La position de la zone n'avançait que dans cette tâche, après ses lectures
+/// de base (et une écriture de curseur, qui peut attendre sur un hôte lent).
+/// Un deuxième « suivant » arrivé dans l'intervalle relisait l'ANCIENNE
+/// position et visait la même piste : trois appuis rapprochés avançaient de
+/// trois pistes, ou d'une seule, selon le temps qu'avait pris la base.
+///
+/// Règle (inchangée) : un appui = une piste. Elle tient désormais quelle que
+/// soit la vitesse de la base : sous ce verrou, `next` lit la position, la
+/// décide ET la pose avant de rendre la main. Deux zones ne s'attendent
+/// jamais.
+fn verrou_du_suivant(zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Verrous =
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+    static VERROUS: std::sync::OnceLock<Verrous> = std::sync::OnceLock::new();
+    let table = VERROUS.get_or_init(Default::default);
+    let mut table = match table.lock() {
+        Ok(t) => t,
+        Err(p) => p.into_inner(),
+    };
+    table.entry(zone_id).or_default().clone()
+}
+
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_next_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
+    let verrou = verrou_du_suivant(zone_id);
+    let decision = verrou.lock().await;
     let current = state.playback.get_state(zone_id).await;
 
     // #3342 — une radio ne fait pas avancer une file qui n'est pas la sienne.
@@ -3303,6 +3330,14 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
             return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
         }
     };
+    // Ticket 134 — la position est posée AVANT de rendre le verrou : le
+    // « suivant » d'après part d'ici, pas de la piste que la tâche de lecture
+    // n'a pas encore quittée. `play_from_queue` repose la même valeur.
+    state
+        .playback
+        .update_queue_info(zone_id, next_pos, current.queue_length)
+        .await;
+    drop(decision);
     let s = state.clone();
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
