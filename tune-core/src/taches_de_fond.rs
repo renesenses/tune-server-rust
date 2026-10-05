@@ -78,6 +78,8 @@ pub mod ordre;
 /// Le rattrapage des rapports `foo_dr.txt`, sans décodage (#5168).
 pub mod rapports_dr;
 
+/// Le périmètre des passes qui décodent : racines exclues (#5593).
+pub mod perimetre;
 /// La vitesse des passes qui décodent : fichiers à la fois (#5519).
 pub mod vitesse;
 
