@@ -634,7 +634,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
                 let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
-                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                let mut sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
                 if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
                     // Se nommer : tout `write_tx` concurrent echouera tant
                     // que ce lot tient la connexion, et sans cette
@@ -648,7 +648,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     // Un écrivain (favori, édition, enrichissement…) attend que
                     // ce lot ferme sa transaction : lui céder la place entre deux
                     // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
-                    db.ceder_aux_ecrivains();
+                    // Ticket 190 : une écriture de file en attente de la porte
+                    // passe aussi (`ceder_le_lot`).
+                    crate::sqlite_write_gate::ceder_le_lot(
+                        db.as_ref(),
+                        &mut sqlite_write_guard,
+                        "scan:auto",
+                    );
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
