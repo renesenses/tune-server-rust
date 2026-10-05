@@ -1340,6 +1340,10 @@ mod signal_path_tests;
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
 
+// #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
+#[cfg(test)]
+mod signal_path_pure_replaygain_5633_tests;
+
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
 /// Deux situations produisent le même symptôme (file remplie, position qui
