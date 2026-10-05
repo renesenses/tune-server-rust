@@ -1,3 +1,5 @@
+/// AcoustID « à la Picard » : filtres, marge et vote par album (#4805).
+pub mod acoustid_picard;
 pub mod artist_enrichment;
 pub mod artist_split;
 pub mod auto_fix;

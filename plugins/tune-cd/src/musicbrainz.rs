@@ -169,7 +169,8 @@ impl Consultation for MusicBrainz {
             .header("User-Agent", MB_UA)
             .timeout(Duration::from_secs(10))
             .send()
-            .await;
+            .await
+            .inspect(tune_core::metadata::musicbrainz_release::constater_reponse_musicbrainz);
         let infos = match reponse {
             Ok(r) if r.status().is_success() => r
                 .json::<Value>()

@@ -144,6 +144,14 @@
 //! Un album dont la release n'a pas de label reste dans la sélection ; pour
 //! qu'une reprise ne le repaye pas, l'état garde le dernier album traité
 //! (`dernier_album_id`), et une passe en pause ou arrêtée repart après lui.
+//!
+//! # La passe par empreinte AcoustID (#4805, idée 4)
+//!
+//! `POST /library/identify-all?mode=acoustid`, pour les albums que la
+//! recherche texte n'a pas trouvés (marque de #5763). Empreinte `fpcalc`,
+//! une requête AcoustID par piste, vote d'album « à la Picard » ; sans
+//! majorité, rien n'est écrit. Même droit, même pause, même état que les deux
+//! autres modes. Voir [`acoustid`].
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -161,6 +169,9 @@ use tune_core::taches_de_fond::{Tache, est_en_pause};
 
 use super::reidentify::{EchecIdentification, identifier_album};
 use crate::state::AppState;
+
+/// La passe par empreinte AcoustID (#4805, idée 4) : `?mode=acoustid`.
+pub(crate) mod acoustid;
 
 /// La clé de `settings` qui porte l'avancement, sur le modèle de
 /// `enrich_all_status`. En base et non en mémoire : une passe de 2 h 23
@@ -443,9 +454,14 @@ pub(super) async fn identification_lot_start(
     State(state): State<AppState>,
     Query(parametres): Query<ParametresLot>,
 ) -> impl IntoResponse {
+    let mut par_empreinte = false;
     let labels_seulement = match parametres.mode.as_deref() {
         None | Some("") | Some("identification") => false,
         Some("labels") => true,
+        Some("acoustid") => {
+            par_empreinte = true;
+            false
+        }
         Some(autre) => {
             // Un mode inconnu ne retombe pas sur l'identification : ce serait
             // lancer trois heures de requêtes que personne n'a demandées.
@@ -455,7 +471,7 @@ pub(super) async fn identification_lot_start(
                     "code": "mode_inconnu",
                     "error": "mode_inconnu",
                     "mode": autre,
-                    "modes": ["identification", "labels"],
+                    "modes": ["identification", "labels", "acoustid"],
                 })),
             );
         }
@@ -517,6 +533,9 @@ pub(super) async fn identification_lot_start(
 
     if labels_seulement {
         return lancer_la_passe_labels(state, deja).await;
+    }
+    if par_empreinte {
+        return acoustid::lancer(state, deja).await;
     }
 
     // 4. La sélection réussit AVANT le 202 : une panne SQL n'est pas une
