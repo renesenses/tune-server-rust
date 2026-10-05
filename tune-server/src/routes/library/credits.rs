@@ -1431,4 +1431,78 @@ mod tests_balises_5160 {
         );
         assert!(!album.iter().any(|c| c["artist_name"] == "Ne doit pas fuir"));
     }
+
+    /// #5160 (reste) — de bout en bout : un FLAC à deux trames PERFORMER et
+    /// deux trames PRODUCER, SANS « ; », lu par la fonction du scan
+    /// (`read_extended_metadata`), écrit par l'écrivain du scan
+    /// (`set_batch_multi`), relu par `GET /library/albums/{id}/credits`. Avant
+    /// le correctif, seules les premières trames atteignaient la route.
+    #[tokio::test]
+    async fn des_trames_repetees_sans_point_virgule_sortent_toutes_des_credits() {
+        use lofty::config::{ParseOptions, WriteOptions};
+        use lofty::file::AudioFile;
+        use lofty::flac::FlacFile;
+        use lofty::ogg::VorbisComments;
+
+        let gabarit = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tune-core/tests/fixtures/test.flac");
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("trames-5160.flac");
+        std::fs::copy(&gabarit, &chemin).expect("copie du gabarit");
+        let mut fh = std::fs::File::open(&chemin).unwrap();
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).unwrap();
+        drop(fh);
+        if flac.vorbis_comments().is_none() {
+            flac.set_vorbis_comments(VorbisComments::default());
+        }
+        let vc = flac.vorbis_comments_mut().unwrap();
+        for (cle, valeur) in [
+            ("PERFORMER", "Christian McBride (bass)"),
+            ("PERFORMER", "Nasheet Waits (drums)"),
+            ("PRODUCER", "Christian McBride"),
+            ("PRODUCER", "Todd Whitelock"),
+        ] {
+            vc.push(cle.to_string(), valeur.to_string());
+        }
+        flac.save_to_path(&chemin, WriteOptions::default()).unwrap();
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute_batch(
+                "INSERT INTO albums (id, title) VALUES (82, 'New Jawn');
+                 INSERT INTO tracks (id, title, file_path, album_id, track_number, disc_number)
+                    VALUES (83, 'Walkin Funny', '/musique/83.flac', 82, 1, 1);",
+            )
+            .unwrap();
+        let etendu = tune_core::metadata::read_extended_metadata(&chemin);
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(state.backend.clone())
+            .set_batch_multi(&[(83, etendu)])
+            .unwrap();
+
+        let Json(album) = album_credits(State(state), Path(82))
+            .await
+            .unwrap_or_else(|_| panic!("lecture des crédits d'album"));
+        let album = album.as_array().unwrap();
+        let a = |nom: &str, role: &str| {
+            album
+                .iter()
+                .any(|c| c["artist_name"] == nom && c["role"] == role)
+        };
+        assert!(a("Christian McBride", "performer"), "{album:?}");
+        assert!(
+            a("Nasheet Waits", "performer"),
+            "#5160 — la seconde trame PERFORMER est perdue à l'ingestion : {album:?}"
+        );
+        assert!(a("Christian McBride", "producer"), "{album:?}");
+        assert!(
+            a("Todd Whitelock", "producer"),
+            "#5160 — la seconde trame PRODUCER est perdue à l'ingestion : {album:?}"
+        );
+        assert!(
+            album
+                .iter()
+                .any(|c| { c["artist_name"] == "Nasheet Waits" && c["instrument"] == "drums" })
+        );
+    }
 }
