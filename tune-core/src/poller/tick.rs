@@ -3596,9 +3596,32 @@ impl PositionPoller {
                                     error = %e,
                                     "renderer_cale_reprise_saut_echoue"
                                 );
-                                self.orchestrator
-                                    .stop(zone_id, device_id_ref.as_deref())
-                                    .await;
+                                // Décision du 05/10 : un saut REFUSÉ par
+                                // l'appareil laisse la piste jouer depuis son
+                                // début, avec un message non fatal ; tout
+                                // autre échec coupe la zone, comme avant.
+                                if self
+                                    .orchestrator
+                                    .conclure_saut_de_reprise_echoue(
+                                        zone_id,
+                                        device_id_ref.as_deref(),
+                                        position_ms,
+                                        &e,
+                                    )
+                                    .await
+                                {
+                                    // Une seule tentative : la reprise compte
+                                    // pour la lecture RELANCÉE, un nouveau
+                                    // décrochage coupera la zone.
+                                    let generation =
+                                        self.playback.get_state(zone_id).await.track_generation;
+                                    if let Some(r) =
+                                        self.reprises_renderer_cale.lock().await.get_mut(&zone_id)
+                                    {
+                                        r.generation = generation;
+                                        r.cible_ms = position_ms;
+                                    }
+                                }
                             }
                         },
                         Err(e) => {
