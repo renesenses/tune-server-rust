@@ -283,6 +283,12 @@ async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
         "gapless_next",
         // …et le drapeau « titre banni » (#4806), booléen, jamais absent.
         "banned",
+        // …et l'album de la ligne (fil forum 2143, point 8) : l'entier de
+        // bibliothèque d'une ligne locale, l'identifiant chez le service d'une
+        // ligne de service. Deux clefs ADDITIVES, `null` quand rien n'est
+        // connu ; la référence interne `album_ref` (#5706) reste dehors.
+        "album_id",
+        "album_id_service",
     ];
     attendues.sort_unstable();
 
