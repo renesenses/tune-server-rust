@@ -47,6 +47,14 @@ fn ph(engine: Engine, idx: usize) -> String {
     }
 }
 
+/// Les titres d'album portes par PLUS d'un album, calcules une fois.
+///
+/// A joindre en externe sur le titre de l'album : `amb.title IS NULL` dit
+/// « cet album n'a pas d'homonyme ». C'est la moitie « titre seul » de la
+/// regle, sans sous-requete rejouee par ligne.
+pub const TITRES_AMBIGUS: &str = "(SELECT a_hom.title FROM albums a_hom \
+     GROUP BY a_hom.title HAVING COUNT(*) > 1)";
+
 /// Rapproche une ligne d'historique (`lh`) de son album (`a`).
 ///
 /// Le titre SEUL ne designe pas un album : un « Live » de Police et un
@@ -98,47 +106,73 @@ fn ph(engine: Engine, idx: usize) -> String {
 /// `la_casse_separe_encore_une_ecoute_de_son_album` fige la limite pour
 /// qu'on ne la redecouvre pas une troisieme fois.
 ///
-/// Le sous-select sur `artists` evite de dependre de l'ordre des jointures —
-/// `ar` n'existe pas encore quand cette condition est evaluee, et le
-/// GROUP BY de PostgreSQL n'accepte pas qu'on enveloppe `albums` dans une
-/// table derivee (la dependance fonctionnelle ne vaut que pour la cle
-/// primaire d'une vraie table).
+/// # Une regle, aucune jointure en `OR` (fils 2130 et suivants)
 ///
-/// Cout : les deux sous-selects ne sont atteints QUE par les lignes a
-/// `album_id` NULL dont le titre d'album tombe deja juste ; le chemin
-/// nominal reste `lh.album_id = a.id`. Mesure ci-dessus — sur SQLite.
+/// La regle s'ecrivait autrefois en une seule condition, la constante
+/// `HISTORIQUE_VERS_ALBUM` : un `OR` entre la cle (`lh.album_id = a.id`) et
+/// le repli, fait de deux sous-requetes correlees (l'artiste de l'album, et
+/// `NOT EXISTS` d'un homonyme). Sur PostgreSQL ce `OR` interdit toute jointure
+/// par hachage ou par index : le planificateur se rabat sur une boucle
+/// imbriquee `listen_history × albums`, et rejoue le `NOT EXISTS` par ligne
+/// sur `albums` entier. Le second rang de « Reprendre l'ecoute » y a pris
+/// 25,7 s (fil 2130, 113 842 pistes, 8 571 albums), quand le widget abandonne
+/// a 8 s.
 ///
-/// # Le `OR` de cette condition coute 25 s sur PostgreSQL (fil 2130)
+/// La constante a disparu avec son dernier appelant. Chaque requete ecrit
+/// desormais la regle en deux moities DISJOINTES, `lh.album_id IS NOT NULL`
+/// (jointure par cle) et `lh.album_id IS NULL` (le repli), et le repli en
+/// JOINTURES :
 ///
-/// Sur PostgreSQL, 113 842 pistes et 8 571 albums, le second rang de
-/// « Continuer l'ecoute » joint par cette condition a pris 25,7 s (deux fois,
-/// `sqlx::query: slow statement`) quand le widget abandonne a 8 s. Un `OR`
-/// entre une egalite de cles et un repli corrélé interdit toute jointure par
-/// hachage ou par index : le planificateur se rabat sur une boucle imbriquee
-/// `listen_history × albums`.
+/// * « l'artiste de l'album » : `artists` jointe sur sa cle primaire, au lieu
+///   du sous-select scalaire. Meme valeur, NULL compris (album sans artiste :
+///   la comparaison est fausse dans les deux cas) ;
+/// * « aucun homonyme » : jointure externe sur [`TITRES_AMBIGUS`] et
+///   `… IS NULL`, au lieu de `NOT EXISTS (… a_hom.id <> a.id)`. Un album a un
+///   homonyme si et seulement si son titre compte au moins deux albums ; la
+///   comparaison et le regroupement suivent la meme collation de colonne sur
+///   les deux moteurs.
 ///
-/// Les deux requetes du widget ne joignent donc plus par cette condition mais
-/// par [`historique_rattache_a_son_album`], la MEME regle ecrite en deux
-/// branches `UNION ALL` (le modele de la PR #4815 pour la grille). Cette
-/// constante reste, inchangee, pour les appelants qui joignent DEPUIS
-/// l'historique en `LEFT JOIN` ou en `NOT EXISTS` (genres les plus ecoutes,
-/// albums non ecoutes) : la regle y est la meme, et le test
-/// `le_union_all_rend_les_lignes_de_l_ancienne_jointure_*` le prouve sur les
-/// deux moteurs.
-pub const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
-     OR (lh.album_id IS NULL AND lh.album_title = a.title \
-         AND ((COALESCE(lh.artist_name, '') <> '' \
-               AND lh.artist_name \
-                   = (SELECT ar_hist.name FROM artists ar_hist \
-                      WHERE ar_hist.id = a.artist_id)) \
-              OR (COALESCE(lh.artist_name, '') = '' \
-                  AND NOT EXISTS (SELECT 1 FROM albums a_hom \
-                                  WHERE a_hom.title = a.title \
-                                    AND a_hom.id <> a.id)))))";
+/// Les trois requetes et leur forme :
+///
+/// | requete | forme |
+/// |---|---|
+/// | « Reprendre l'ecoute » (deux rangs) | [`historique_rattache_a_son_album`], table derivee en `UNION ALL` |
+/// | genres les plus ecoutes | [`top_genres_ecoutes`], `UNION ALL` de deux jointures externes |
+/// | albums non ecoutes d'un genre | [`albums_du_genre_non_ecoutes`], deux `NOT EXISTS` |
+///
+/// Chacune rend les lignes de l'ancienne ecriture, recopiee au caractere pres
+/// dans `reprendre_l_ecoute_2130_tests.rs` et confrontee sur les deux moteurs.
+///
+/// Une ligne a `album_id` non NULL ne passe jamais par le repli : c'etait
+/// deja le cas du `OR`, ou `album_id IS NULL` gardait la seconde moitie. La
+/// moitie par cle joint `albums` comme avant, au lieu de rendre
+/// `lh.album_id` tel quel : une ligne qui designe un album disparu ne doit
+/// rien rattacher, et un `album_id` reste TEXT sur PostgreSQL (migration 047
+/// sautee) doit continuer d'echouer en `text = bigint` — c'est ce que
+/// `pg_2860_*` exige.
+///
+///
+/// La condition du repli, une fois le TITRE deja apparie
+/// (`lh.album_title = <titre de l'album>`) et sur les seules lignes a
+/// `album_id` NULL.
+///
+/// * artiste de l'ecoute connu : il doit etre celui de l'album, `artiste`
+///   (une colonne de `artists` jointe sur la cle de l'album) ;
+/// * artiste inconnu (NULL ou vide) : le titre ne doit designer qu'un album,
+///   `titre_ambigu` (la colonne `title` d'une jointure externe sur
+///   [`TITRES_AMBIGUS`]) doit etre NULL.
+pub fn repli_par_artiste_ou_titre_seul(artiste: &str, titre_ambigu: &str) -> String {
+    format!(
+        "((COALESCE(lh.artist_name, '') <> '' \
+           AND lh.artist_name = {artiste}) \
+          OR (COALESCE(lh.artist_name, '') = '' \
+              AND {titre_ambigu} IS NULL))"
+    )
+}
 
 /// Les lignes d'historique RATTACHEES a leur album, en table derivee : une
-/// ligne par couple (ecoute, album) que [`HISTORIQUE_VERS_ALBUM`] aurait
-/// joint, ni plus ni moins (fil 2130).
+/// ligne par couple (ecoute, album) que la regle rattache, ni plus ni moins
+/// (fil 2130).
 ///
 /// Deux branches `UNION ALL`, disjointes par construction :
 ///
@@ -148,34 +182,14 @@ pub const HISTORIQUE_VERS_ALBUM: &str = "(lh.album_id = a.id \
 ///    lignes sans identifiant (servies par `idx_listen_history_album_id`,
 ///    migration 115 / PG 079).
 ///
-/// Le repli y est la regle de [`HISTORIQUE_VERS_ALBUM`], ecrite en
-/// JOINTURES et non en sous-requetes correlees — c'est la seconde moitie du
-/// gain, mesuree sur PostgreSQL 16 (8 400 albums, 30 000 ecoutes, test
+/// Mesure sur PostgreSQL 16 (8 400 albums, 30 000 ecoutes, test
 /// `pg_2130_mesure_avant_apres`) : en `OR` 33 a 37 s ; en `UNION ALL` mais
 /// sous-requetes gardees 5,0 s, dont 4 s pour le `NOT EXISTS` des homonymes
 /// rejoue par ligne sur `albums` entier (pas d'index de titre sous
 /// PostgreSQL) ; en jointures 0,13 s.
 ///
-/// * « l'artiste de l'album » : `LEFT JOIN artists ar_hist` sur la cle
-///   primaire, au lieu du sous-select scalaire. Meme valeur, NULL compris
-///   (album sans artiste : la comparaison est fausse dans les deux cas) ;
-/// * « aucun homonyme » : `LEFT JOIN` sur les titres portes par PLUS d'un
-///   album (`GROUP BY title HAVING COUNT(*) > 1`, calcule une fois) et
-///   `amb.title IS NULL`, au lieu de `NOT EXISTS (… a_hom.id <> a.id)`. Un
-///   album a un homonyme si et seulement si son titre compte au moins deux
-///   albums ; la comparaison et le regroupement suivent la meme collation de
-///   colonne sur les deux moteurs.
-///
-/// Une ligne a `album_id` non NULL ne passe jamais par le repli : c'etait
-/// deja le cas du `OR`, ou `album_id IS NULL` gardait la seconde moitie. Le
-/// `UNION ALL` (et non `UNION`) garde la multiplicite : deux albums du meme
-/// artiste au meme titre rattachent une ecoute aux deux, comme avant.
-///
-/// La premiere branche joint `albums` elle aussi, au lieu de rendre
-/// `lh.album_id` tel quel : une ligne qui designe un album disparu ne doit
-/// rien rattacher, et un `album_id` reste TEXT sur PostgreSQL (migration 047
-/// sautee) doit continuer d'echouer en `text = bigint` — c'est ce que
-/// `pg_2860_*` exige.
+/// Le `UNION ALL` (et non `UNION`) garde la multiplicite : deux albums du
+/// meme artiste au meme titre rattachent une ecoute aux deux, comme avant.
 ///
 /// Colonnes rendues : `title, listened_at, context_type, album_rattache`.
 /// `zone_filter` (`AND lh.zone_id = N `, ou vide) et `albums` (identifiants
@@ -185,6 +199,7 @@ pub fn historique_rattache_a_son_album(zone_filter: &str, albums: Option<&str>) 
     let filtre_album = albums
         .map(|liste| format!("AND a.id IN ({liste}) "))
         .unwrap_or_default();
+    let repli = repli_par_artiste_ou_titre_seul("ar_hist.name", "amb.title");
     format!(
         "(SELECT lh.title, lh.listened_at, lh.context_type, a.id AS album_rattache \
           FROM listen_history lh \
@@ -196,15 +211,99 @@ pub fn historique_rattache_a_son_album(zone_filter: &str, albums: Option<&str>) 
           FROM listen_history lh \
           JOIN albums a ON a.title = lh.album_title \
           LEFT JOIN artists ar_hist ON ar_hist.id = a.artist_id \
-          LEFT JOIN (SELECT a_hom.title FROM albums a_hom \
-                     GROUP BY a_hom.title HAVING COUNT(*) > 1) amb \
+          LEFT JOIN {TITRES_AMBIGUS} amb \
                  ON amb.title = a.title \
           WHERE lh.album_id IS NULL \
-            AND ((COALESCE(lh.artist_name, '') <> '' \
-                  AND lh.artist_name = ar_hist.name) \
-                 OR (COALESCE(lh.artist_name, '') = '' \
-                     AND amb.title IS NULL)) \
+            AND {repli} \
           {zone_filter}{filtre_album})"
+    )
+}
+
+/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
+/// celui de l'album. Partage entre les recommandations et les « top mixes »,
+/// qui prenaient tous deux le genre d'un album homonyme (#2731).
+///
+/// Chaque ecoute compte autant de fois que la regle lui rattache d'albums,
+/// et une fois (genre de la piste, ou rien) quand elle n'en rattache aucun :
+/// c'est la jointure EXTERNE d'avant, ecrite en deux moities `UNION ALL`
+/// disjointes. La moitie du repli joint une table derivee des albums deja
+/// munis de leur artiste et de leur ambiguite (`ac`), pour que la jointure
+/// externe ne porte qu'une table et que l'egalite des titres reste une cle
+/// de hachage.
+///
+/// Le filtre sur le genre se pose sur la sous-requete `g`, ou `genre`
+/// n'existe qu'une fois. Pose DANS la sous-requete, a cote de `t.genre` et
+/// `a.genre`, `WHERE genre IS NOT NULL` etait ambigu pour les deux moteurs —
+/// « column reference "genre" is ambiguous » dans le journal de jfpaquet
+/// (#3181, PostgreSQL), « ambiguous column name: genre » sur SQLite — et
+/// l'echec, avale par `ou_defaut_journalise`, faisait tirer « A decouvrir »
+/// au hasard et laissait les « top mixes » vides, sans rien dire a l'ecran.
+///
+/// L'alias `g` n'est pas decoratif : jusqu'a PostgreSQL 15, une sous-requete
+/// de `FROM` doit en porter un. Le second critere de tri rend l'ordre des
+/// ex aequo defini, donc le meme sur les deux moteurs.
+///
+/// Colonnes rendues : `genre, cnt`.
+pub fn top_genres_ecoutes() -> String {
+    let repli = repli_par_artiste_ou_titre_seul("ac.artiste", "ac.titre_ambigu");
+    format!(
+        "SELECT g.genre, COUNT(*) AS cnt \
+         FROM (SELECT COALESCE(t.genre, a.genre) AS genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN albums a ON a.id = lh.album_id \
+               WHERE lh.album_id IS NOT NULL \
+               UNION ALL \
+               SELECT COALESCE(t.genre, ac.genre) AS genre \
+               FROM listen_history lh \
+               LEFT JOIN tracks t ON lh.track_id = t.id \
+               LEFT JOIN (SELECT a.title, a.genre, ar_hist.name AS artiste, \
+                                 amb.title AS titre_ambigu \
+                          FROM albums a \
+                          LEFT JOIN artists ar_hist ON ar_hist.id = a.artist_id \
+                          LEFT JOIN {TITRES_AMBIGUS} amb ON amb.title = a.title) ac \
+                      ON ac.title = lh.album_title AND {repli} \
+               WHERE lh.album_id IS NULL) g \
+         WHERE g.genre IS NOT NULL AND g.genre <> '' \
+         GROUP BY g.genre ORDER BY cnt DESC, g.genre LIMIT 5"
+    )
+}
+
+/// Les albums des `nb_genres` genres donnes que l'historique ne connait pas,
+/// au hasard.
+///
+/// Places tenues : `1..=nb_genres` pour les genres, `nb_genres + 1` pour la
+/// limite.
+///
+/// « Aucune ecoute ne rattache cet album » s'ecrit en deux `NOT EXISTS`, un
+/// par moitie de la regle : par cle (anti-jointure par hachage ou par
+/// l'index `idx_listen_history_album_id`), puis par le repli, dont le titre
+/// est la cle d'anti-jointure. L'artiste de l'album est `ar`, deja jointe
+/// pour la liste SELECT sur la meme cle primaire ; l'ambiguite vient de
+/// [`TITRES_AMBIGUS`], jointe une fois.
+///
+/// Colonnes rendues : `id, title, artist_name, year, cover_path, genre`.
+pub fn albums_du_genre_non_ecoutes(engine: Engine, nb_genres: usize) -> String {
+    let genres = (1..=nb_genres)
+        .map(|i| ph(engine, i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let limite = ph(engine, nb_genres + 1);
+    let repli = repli_par_artiste_ou_titre_seul("ar.name", "amb.title");
+    format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+         FROM albums a \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         LEFT JOIN {TITRES_AMBIGUS} amb ON amb.title = a.title \
+         WHERE a.genre IN ({genres}) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE lh.album_id = a.id) \
+           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
+                           WHERE lh.album_id IS NULL \
+                             AND lh.album_title = a.title \
+                             AND {repli}) \
+         ORDER BY RANDOM() \
+         LIMIT {limite}"
     )
 }
 

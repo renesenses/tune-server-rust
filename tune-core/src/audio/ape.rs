@@ -655,11 +655,8 @@ pub fn decode_ape_to_pcm(
         0
     };
 
-    let max_interleaved_samples = if max_duration_s > 0.0 {
-        (max_duration_s * source_rate as f64 * source_channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_interleaved_samples =
+        super::decode::echantillons_de_la_fenetre(max_duration_s, source_rate, source_channels);
 
     // Determine which frames to decode
     let start_frame = if skip_blocks > 0 {

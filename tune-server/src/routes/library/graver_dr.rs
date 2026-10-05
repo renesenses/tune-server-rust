@@ -221,6 +221,26 @@ pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
     Json(v)
 }
 
+/// Fil 2134 (Levente Toth) — après la gravure, la ligne de la piste reprend
+/// la taille et la date du fichier réécrit.
+///
+/// Seul le tag `DYNAMIC RANGE` a changé, et la base porte déjà sa valeur.
+/// Sans cela, le surveillant voyait chaque fichier gravé comme modifié : il
+/// le relisait, relisait le dossier entier quand une feuille CUE l'accompagne,
+/// et annonçait « bibliothèque modifiée » à chaque lot (1 121 fichiers gravés,
+/// une annonce toutes les 0,96 s chez le client). Le scan complet, lui, aurait
+/// relu les mêmes fichiers pour rien.
+fn remettre_la_ligne_en_phase(pistes: &tune_core::db::track_repo::TrackRepo, chemin: &str) {
+    let Some((taille, mtime)) =
+        tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(chemin))
+    else {
+        return;
+    };
+    if let Err(e) = pistes.update_mtime_and_size(chemin, mtime, taille as i64) {
+        warn!(chemin = %chemin, error = %e, "dr_ligne_non_remise_en_phase");
+    }
+}
+
 /// POST /library/dr/gravure
 ///
 /// Lance la passe en tâche de fond. 202 avec l'inventaire ; 409 si elle tourne
@@ -252,6 +272,7 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
     tokio::spawn(async move {
         let _garde = garde;
         let repo = TrackMetadataRepo::with_backend(backend.clone());
+        let pistes = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
         let (mut written, mut already, mut skipped, mut errors) = (0i32, 0i32, 0i32, 0i32);
         taches.update_progress(TACHE_GRAVER_DR, 0, total as u64, "Dynamic Range");
 
@@ -270,12 +291,20 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
                             "already": already, "skipped": skipped, "errors": errors}),
                 );
             }
+            // Fil 2134 — la ligne était-elle d'accord avec le disque AVANT
+            // la gravure ? Seulement alors, elle peut être remise d'accord
+            // après : sinon un changement venu d'ailleurs, pas encore relu,
+            // passerait pour l'écriture de Tune.
+            let en_phase = crate::auto_scan::fichier_conforme_a_la_base(&backend, chemin);
             match graver_dr(chemin, dr).await {
                 Ok(GravureDr::Ecrite) => {
                     written += 1;
                     // Le fichier porte la valeur : c'est désormais le tag qui
                     // fait foi, et c'est ce que le prochain scan dira aussi.
                     let _ = repo.set(*track_id, "dr_source", "tag");
+                    if en_phase {
+                        remettre_la_ligne_en_phase(&pistes, chemin);
+                    }
                     debug!(track_id, chemin = %chemin, dr = %dr, "dr_grave");
                 }
                 Ok(GravureDr::DejaPresente(du_fichier)) => {
@@ -508,6 +537,92 @@ mod tests_passe_interrompue_2137 {
         ecrire_statut(&s.backend, &fini);
         marquer_passe_interrompue_au_demarrage(&s.backend);
         assert_eq!(lire_statut(&s), fini);
+    }
+}
+
+/// Fil 2134 (Levente Toth) — la gravure ne doit pas faire réimporter au
+/// surveillant les fichiers qu'elle vient de réécrire.
+#[cfg(test)]
+mod tests_ligne_en_phase_2134 {
+    use super::*;
+    use tune_core::db::backend::ToSqlValue;
+
+    /// Une copie de la fixture FLAC, indexée avec un DR calculé. `en_phase` :
+    /// la ligne porte la taille et la date du disque ; sinon, une date
+    /// d'avant (un changement venu d'ailleurs que le surveillant n'a pas
+    /// encore relu).
+    fn banc(en_phase: bool) -> (tempfile::TempDir, String, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("x.flac");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tune-core/tests/fixtures/test.flac"),
+            &cible,
+        )
+        .unwrap();
+        let chemin = cible.to_string_lossy().into_owned();
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (taille, mtime) = tune_core::audio::iso9660::taille_et_mtime(&cible).unwrap();
+        let mtime = if en_phase { mtime } else { mtime - 3600.0 };
+        let taille = taille as i64;
+        s.backend
+            .execute(
+                "INSERT INTO tracks (id, title, file_path, file_size, file_mtime) \
+                 VALUES (1, 'x', ?1, ?2, ?3)",
+                &[&chemin as &dyn ToSqlValue, &taille, &mtime],
+            )
+            .unwrap();
+        let repo = TrackMetadataRepo::with_backend(s.backend.clone());
+        repo.set(1, "dr_track", "12").unwrap();
+        repo.set(1, "dr_source", "analysis").unwrap();
+        (dir, chemin, s)
+    }
+
+    async fn graver(s: &AppState) {
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        for _ in 0..200 {
+            if !en_cours(s) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!en_cours(s), "la passe n'a pas fini");
+        assert_eq!(lire_statut(s)["written"], 1, "{}", lire_statut(s));
+    }
+
+    /// Le fichier a bien été réécrit (sa date a changé), et pourtant sa
+    /// ligne est d'accord avec le disque : le surveillant l'écartera de son
+    /// lot, sans relecture ni annonce.
+    #[tokio::test]
+    async fn le_fichier_grave_reste_conforme_a_sa_ligne_2134() {
+        let (_dir, chemin, s) = banc(true);
+        let stat = || tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(&chemin));
+        let avant = stat();
+        assert!(crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
+        graver(&s).await;
+        assert_ne!(avant, stat(), "témoin : la gravure a réécrit le fichier");
+        assert!(
+            crate::auto_scan::fichier_conforme_a_la_base(&s.backend, &chemin),
+            "après la gravure, la ligne doit porter la taille et la date du fichier gravé"
+        );
+    }
+
+    /// Une ligne qui n'était PAS d'accord avec le disque avant la gravure le
+    /// reste : le changement venu d'ailleurs sera relu par le surveillant ou
+    /// le prochain scan, au lieu de passer pour l'écriture de Tune.
+    #[tokio::test]
+    async fn une_ligne_deja_en_retard_n_est_pas_remise_en_phase_2134() {
+        let (_dir, chemin, s) = banc(false);
+        assert!(!crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
+        graver(&s).await;
+        assert!(!crate::auto_scan::fichier_conforme_a_la_base(
+            &s.backend, &chemin
+        ));
     }
 }
 
