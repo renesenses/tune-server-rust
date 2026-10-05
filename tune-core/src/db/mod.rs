@@ -56,6 +56,8 @@ mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
+/// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
+pub mod rattrapage_dates_ajout_2138;
 pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).

@@ -282,6 +282,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_rejeu_bascule -- --nocapture
 
+      # Fil 2138 — le rattrapage unique des dates d'ajout figees au premier
+      # scan (avant #5748), joue sur la VRAIE base : une base figee a 90 % est
+      # redatee par les fichiers, une base normale n'est pas touchee, la
+      # seconde passe ne refait rien. Bases jetables creees puis supprimees.
+      - name: Rattrapage des dates d'ajout figees au premier scan (fil 2138)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2138 -- --nocapture --test-threads=1
+
       # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
       # chemin qui masque, le démasquage et la réparation sûre, joués sur la
       # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
