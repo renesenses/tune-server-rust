@@ -11,6 +11,16 @@
 # OS.  That mode rotates the password only when the shadow hash still verifies
 # against the historical public password "tune".  A password already changed
 # by an administrator is never overwritten.
+#
+# --premier-acces (tune-server-rust#5617) is the boot-time entry point of an
+# image that cannot rely on the server for the rotation: tune.service runs
+# under ProtectSystem=strict, where /etc and /run are read-only, so the
+# in-process --migrate-legacy cannot write /etc/shadow there.  Run as root
+# OUTSIDE that sandbox (`tune-server --tune-os-premier-acces`), it migrates,
+# forgets the temporary password once it has been changed, and otherwise
+# republishes it in /run/tune/premier-mot-de-passe (tmpfs, root only) for the
+# image's own screens: console issue and Cockpit login banner.  Nothing here
+# ever writes the password to stdout or stderr, which end up in the journal.
 set -euo pipefail
 
 readonly TUNE_USER="tune"
@@ -18,6 +28,8 @@ readonly STATE_DIR="/var/lib/tune-os"
 readonly MIGRATION_MARKER="${STATE_DIR}/ssh-password-v2"
 readonly INITIAL_SECRET="${STATE_DIR}/initial-ssh-password"
 readonly ISSUE_NOTICE="/etc/issue.d/90-tune-initial-password.issue"
+readonly RUNTIME_DIR="/run/tune"
+readonly RUNTIME_SECRET="${RUNTIME_DIR}/premier-mot-de-passe"
 
 generate_password() {
     # 96 random bits, rendered as 24 shell/keyboard-friendly hexadecimal
@@ -106,7 +118,26 @@ acknowledge_change() {
     local last_change
     last_change="$(getent shadow "$TUNE_USER" | cut -d: -f3)"
     [[ -n "$last_change" && "$last_change" != "0" ]] || return 0
-    rm -f "$INITIAL_SECRET" "$ISSUE_NOTICE"
+    rm -f "$INITIAL_SECRET" "$ISSUE_NOTICE" "$RUNTIME_SECRET"
+}
+
+publish_runtime() {
+    # Only a password that is still due is republished.  acknowledge_change
+    # has already removed the secret once it was changed, so its absence is
+    # the "changed" answer and the runtime copy goes with it.
+    if [[ ! -s "$INITIAL_SECRET" ]]; then
+        rm -f "$RUNTIME_SECRET"
+        return 0
+    fi
+    install -d -m 0755 "$RUNTIME_DIR"
+    install -m 0600 "$INITIAL_SECRET" "${RUNTIME_SECRET}.tmp"
+    mv -f "${RUNTIME_SECRET}.tmp" "$RUNTIME_SECRET"
+}
+
+premier_acces() {
+    migrate_legacy
+    acknowledge_change
+    publish_runtime
 }
 
 main() {
@@ -118,7 +149,8 @@ main() {
         --first-boot) first_boot ;;
         --migrate-legacy) migrate_legacy ;;
         --acknowledge) acknowledge_change ;;
-        *) echo "usage: $0 --first-boot|--migrate-legacy|--acknowledge" >&2; return 2 ;;
+        --premier-acces) premier_acces ;;
+        *) echo "usage: $0 --first-boot|--migrate-legacy|--acknowledge|--premier-acces" >&2; return 2 ;;
     esac
 }
 
