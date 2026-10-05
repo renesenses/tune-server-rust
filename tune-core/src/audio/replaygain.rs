@@ -914,6 +914,16 @@ const CANDIDATS_RG_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
 
+/// Le prédicat de la passe ReplayGain, PÉRIMÈTRE compris (#5593) : les racines
+/// exclues par l'utilisateur sortent de la sélection ET du compteur, par le
+/// même texte. Sans paramètre ajouté : la clause porte des littéraux, les `?`
+/// de [`CANDIDATS_RG_WHERE`] ne bougent pas. Voir
+/// [`crate::taches_de_fond::perimetre`].
+fn candidats_rg_where(backend: &Arc<dyn DbBackend>) -> String {
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_RG_WHERE}{perimetre}")
+}
+
 /// Combien de pistes le balayage ReplayGain a encore devant lui (#4144).
 ///
 /// Le dénominateur de la jauge, et rien d'autre : la MÊME sélection que
@@ -922,9 +932,10 @@ const CANDIDATS_RG_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
 /// se rend comme « total inconnu » plutôt que comme une fausse certitude.
 pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let predicat = candidats_rg_where(backend);
     backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_RG_WHERE}"),
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {predicat}"),
             &[&seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -944,10 +955,22 @@ pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
 /// cartes de la page Santé le montrent à côté de la jauge, avec sa cause.
 pub fn compter_les_reportees_par_chemin(backend: &Arc<dyn DbBackend>) -> i64 {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    // #5593 — une piste d'une racine EXCLUE n'attend plus son disque : elle
+    // n'est plus du travail du tout. La compter ici ferait dire à la carte
+    // « en attente d'un disque » pour un partage que l'utilisateur a retiré
+    // des analyses — précisément le NAS démonté de l'exemple.
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    let dans_le_perimetre = if perimetre.is_empty() {
+        String::new()
+    } else {
+        format!(" AND EXISTS (SELECT 1 FROM tracks t WHERE t.id = m.track_id{perimetre})")
+    };
     backend
         .query_one(
-            "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
-             WHERE m.key = 'rg_path_unresolved' AND m.value > ?",
+            &format!(
+                "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
+                 WHERE m.key = 'rg_path_unresolved' AND m.value > ?{dans_le_perimetre}"
+            ),
             &[&seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -994,10 +1017,11 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // `rg_analyzed`, que seule cette passe pose. Les élargir sans elle ne
     // sélectionnerait rien.
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let predicat = candidats_rg_where(backend);
     let rows = match backend.query_many(
         &format!(
             "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
-             WHERE {CANDIDATS_RG_WHERE} LIMIT ?"
+             WHERE {predicat} LIMIT ?"
         ),
         &[
             &seuil_report as &dyn ToSqlValue,
@@ -1447,13 +1471,18 @@ const TEMOIN_RG_EMPREINTE: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
 /// (#5246). Décision de Bertrand du 27/09/2026 : les empreintes et la plage
 /// dynamique se calculent MÊME ReplayGain coupé ; seuls le calcul et
 /// l'application du gain restent désactivés.
+///
+/// #5593 — et le PÉRIMÈTRE : les racines exclues sortent de la sélection et du
+/// compteur. Indispensable même ReplayGain armé : le témoin seul ne suffit pas,
+/// une piste analysée AVANT l'exclusion porte déjà `rg_analyzed`.
 fn candidats_empreinte_where(backend: &Arc<dyn DbBackend>) -> String {
     let temoin = if analysis_enabled(backend) {
         TEMOIN_RG_EMPREINTE
     } else {
         ""
     };
-    format!("{CANDIDATS_EMPREINTE_WHERE}{temoin}")
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_EMPREINTE_WHERE}{temoin}{perimetre}")
 }
 
 /// Combien de pistes le rattrapage traiterait encore. `None` : base
@@ -1622,13 +1651,17 @@ const TEMOIN_RG_DR: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
 
 /// Le prédicat du rattrapage de la plage dynamique, selon l'état du
 /// ReplayGain (#5246) — même règle que [`candidats_empreinte_where`].
+///
+/// #5593 — et le PÉRIMÈTRE, pour la même raison que
+/// [`candidats_empreinte_where`].
 fn candidats_dr_where(backend: &Arc<dyn DbBackend>) -> String {
     let temoin = if analysis_enabled(backend) {
         TEMOIN_RG_DR
     } else {
         ""
     };
-    format!("{CANDIDATS_DR_WHERE}{temoin}")
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_DR_WHERE}{temoin}{perimetre}")
 }
 
 /// Combien de pistes le rattrapage de la plage dynamique prendrait MAINTENANT.

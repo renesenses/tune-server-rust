@@ -471,8 +471,12 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // #5593 — les trois compteurs de la jauge sont pris DANS LE PÉRIMÈTRE réglé
+    // (racines exclues) : une piste hors périmètre n'est plus
+    // du travail, ni à faire ni fait. Sans périmètre, ce sont les compteurs
+    // d'avant, à l'identique.
     #[cfg(feature = "audio-embedding")]
-    let analysed = tune_core::audio::embedding_store::analysed_count(&state.backend);
+    let analysed = tune_core::audio::embedding_store::analysed_count_in_scope(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let analysed = 0_i64;
 
@@ -491,7 +495,7 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // (#1819). C'est `processed` qui doit piloter la barre : il atteint le
     // dénominateur quand il ne reste plus rien à faire.
     #[cfg(feature = "audio-embedding")]
-    let processed = tune_core::audio::embedding_store::processed_count(&state.backend);
+    let processed = tune_core::audio::embedding_store::processed_count_in_scope(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let processed = 0_i64;
 
