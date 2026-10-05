@@ -28,7 +28,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::lecteur::{ErreurCd, LecteurDisque, Presence};
+use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
 use crate::toc::{OCTETS_PAR_SECTEUR, PREGAP, PisteToc, TRAMES_PAR_SECTEUR, Toc};
 
 /// Le nom du fichier de TOC à la racine du volume.
@@ -721,6 +721,8 @@ impl VolumeCdda {
 
 type Localisateur = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 type Detecteur = Box<dyn Fn() -> bool + Send + Sync>;
+/// Éjecte le disque dont le volume est monté à ce chemin.
+pub type Ejecteur = Box<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 /// Le volume ouvert et ses fichiers, gardés ouverts entre deux lectures.
 struct Ouvert {
@@ -737,6 +739,8 @@ pub struct LecteurVolume {
     nom: String,
     trouver: Localisateur,
     lecteur_present: Detecteur,
+    /// `None` : ce lecteur ne sait pas éjecter (dossier fabriqué, essais).
+    ejecteur: Option<Ejecteur>,
     ouvert: Mutex<Option<Ouvert>>,
 }
 
@@ -750,8 +754,18 @@ impl LecteurVolume {
             nom: nom.into(),
             trouver: Box::new(trouver),
             lecteur_present: Box::new(lecteur_present),
+            ejecteur: None,
             ouvert: Mutex::new(None),
         }
+    }
+
+    /// Le moyen d'éjecter le disque du volume (macOS : `diskutil eject`).
+    pub fn avec_ejecteur(
+        mut self,
+        ejecteur: impl Fn(&Path) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.ejecteur = Some(Box::new(ejecteur));
+        self
     }
 
     /// Un lecteur sur un dossier fixe (tests, `TUNE_CD_DEVICE`).
@@ -868,6 +882,23 @@ impl LecteurDisque for LecteurVolume {
             }
         }
         r
+    }
+
+    /// Les fichiers du volume sont FERMÉS d'abord (un AIFF ouvert ferait
+    /// refuser le démontage), puis l'éjecteur reçoit le point de montage.
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        let Some(racine) = self.volume_present() else {
+            return Err(if (self.lecteur_present)() {
+                ErreurEjection::AucunDisque
+            } else {
+                ErreurEjection::AucunLecteur
+            });
+        };
+        let Some(ejecteur) = &self.ejecteur else {
+            return Err(ErreurEjection::NonPrisEnCharge);
+        };
+        *self.ouvert.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        ejecteur(&racine).map_err(ErreurEjection::Echec)
     }
 }
 
@@ -1290,6 +1321,50 @@ pub(crate) mod tests {
         assert_eq!(l.lire_toc(), Err(ErreurCd::AucunDisque));
         let sans_lecteur = LecteurVolume::new("x", || None, || false);
         assert_eq!(sans_lecteur.presence(), Presence::AucunLecteur);
+    }
+
+    /// Fil 2135 — l'éjection COMMANDÉE : les fichiers du volume sont fermés,
+    /// puis l'éjecteur reçoit le point de montage du disque (macOS :
+    /// `diskutil eject <volume>`). Ici, l'éjecteur factice démonte le faux
+    /// volume, et le lecteur se dit « vide ».
+    #[test]
+    fn l_ejection_commandee_passe_le_volume_a_l_ejecteur() {
+        let toc = petite_toc();
+        let v = faux_volume("ejection-commandee", &toc);
+        let racine = v.to_path_buf();
+        let recu: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let r = recu.clone();
+        let l = LecteurVolume::sur_dossier(racine.clone()).avec_ejecteur(move |chemin| {
+            r.lock().unwrap().push(chemin.to_path_buf());
+            std::fs::remove_file(chemin.join(FICHIER_TOC)).map_err(|e| e.to_string())
+        });
+        let mut s = vec![0; 24 * OCTETS_PAR_SECTEUR];
+        l.lire_secteurs(32, 24, &mut s).unwrap();
+        assert!(l.ouvert.lock().unwrap().is_some(), "fichiers ouverts");
+        assert_eq!(l.ejecter_disque(), Ok(()));
+        assert_eq!(*recu.lock().unwrap(), vec![racine]);
+        assert!(l.ouvert.lock().unwrap().is_none(), "fichiers fermés");
+        assert_eq!(l.presence(), Presence::Vide);
+        assert_eq!(l.ejecter_disque(), Err(ErreurEjection::AucunDisque));
+
+        // Sans éjecteur (volume fabriqué, `TUNE_CD_DEVICE`) : le dire.
+        let v2 = faux_volume("ejection-sans-ejecteur", &toc);
+        let l = LecteurVolume::sur_dossier(v2.to_path_buf());
+        assert_eq!(l.ejecter_disque(), Err(ErreurEjection::NonPrisEnCharge));
+        // Un refus du système remonte tel quel.
+        let l = LecteurVolume::sur_dossier(v2.to_path_buf())
+            .avec_ejecteur(|_| Err("Volume en cours d'utilisation".into()));
+        assert_eq!(
+            l.ejecter_disque(),
+            Err(ErreurEjection::Echec(
+                "Volume en cours d'utilisation".into()
+            ))
+        );
+        let sans_lecteur = LecteurVolume::new("x", || None, || false);
+        assert_eq!(
+            sans_lecteur.ejecter_disque(),
+            Err(ErreurEjection::AucunLecteur)
+        );
     }
 
     /// Un fichier devenu illisible (secteur rayé) est une erreur de LECTURE,

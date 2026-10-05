@@ -38,6 +38,7 @@ pub async fn list(
         .find(|s| s["name"] == "spotify")
         .and_then(|s| s["authenticated"].as_bool())
         .unwrap_or(false);
+    let spotify_client_id_ok = spotify_client_id_configure(&state).await;
     let deezer_auth = streaming_status
         .iter()
         .find(|s| s["name"] == "deezer")
@@ -227,6 +228,9 @@ pub async fn list(
             "fields": [],
             "help_url": "/streaming/spotify",
             "help_steps": [tr("svctok.spotify.step1")],
+            // Fil 221 — `POST /services/tokens/spotify {"client_id"}` pose le
+            // Client ID à chaud ; `GET /system/env` dit s'il l'est.
+            "spotify_client_id_configure": spotify_client_id_ok,
         }),
         json!({
             "id": "deezer", "name": "Deezer", "kind": "arl_token",
@@ -263,6 +267,12 @@ pub async fn save(
     // disponible. » : l'ARL n'atteignait pas Deezer (fil 2035).
     if id == "deezer" {
         return Json(enregistrer_arl_deezer(&state, &lang, &body).await);
+    }
+    // Fil 221 — le Client ID Spotify n'est pas non plus un jeton de
+    // métadonnées : il configure le SERVICE DE STREAMING, à chaud.
+    if id == "spotify" {
+        let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
+        return Json(enregistrer_client_id_spotify(&state, &lang, &body, env.as_deref()).await);
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -392,6 +402,104 @@ async fn enregistrer_arl_deezer(
             })
         }
     }
+}
+
+/// Fil 221 (Yan Tasset) — le Client ID de l'application Spotify de
+/// l'utilisateur. Il ne se lisait qu'au démarrage (`TUNE_SPOTIFY_CLIENT_ID`,
+/// sinon `tune.toml`) et AUCUN écran ne permettait de le poser : le serveur
+/// tournait avec `"placeholder"` et Spotify répondait `invalid_client`.
+///
+/// Il est rangé dans le réglage `spotify_client_id` (relu au démarrage, voir
+/// `resolve_client_id`) et remis tout de suite au service. Quand
+/// `TUNE_SPOTIFY_CLIENT_ID` est posée (`env_impose`), elle l'emporte : on le
+/// dit au lieu d'enregistrer une valeur que le prochain démarrage ignorerait.
+///
+/// Un Client ID n'est pas un secret, mais suit la convention de l'ARL : il
+/// n'est ni journalisé ni renvoyé.
+pub(crate) async fn enregistrer_client_id_spotify(
+    state: &AppState,
+    lang: &str,
+    body: &serde_json::Value,
+    env_impose: Option<&str>,
+) -> serde_json::Value {
+    use tune_core::streaming::spotify::{SpotifyService, client_id_configure};
+    let tr = |k: &str| crate::i18n::t(lang, k);
+    let client_id = body
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if client_id.is_empty() {
+        return json!({"valid": false, "etat": "refuse", "validation_message": "Aucune valeur fournie"});
+    }
+    if env_impose.is_some_and(client_id_configure) {
+        return json!({
+            "valid": false,
+            "etat": "impose",
+            "validation_message": tr("svctok.spotify.clientIdEnv"),
+        });
+    }
+    if !client_id_configure(client_id) || !client_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return json!({
+            "valid": false,
+            "etat": "refuse",
+            "validation_message": tr("svctok.spotify.clientIdInvalid"),
+        });
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.set("spotify_client_id", client_id) {
+        error!(error = %e, "spotify_client_id_save_failed");
+        return json!({
+            "valid": false,
+            "etat": "refuse",
+            "validation_message": tr("svctok.err.generic").replace("{error}", &e.to_string()),
+        });
+    }
+
+    let svc = state.services.lock().await.get("spotify");
+    let applique = match svc {
+        Some(svc) => {
+            let mut garde = svc.write().await;
+            match garde.as_any_mut().downcast_mut::<SpotifyService>() {
+                Some(spotify) => {
+                    spotify.set_client_id(client_id);
+                    true
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
+    if !applique {
+        return json!({
+            "valid": false,
+            "etat": "refuse",
+            "validation_message": tr("svctok.err.generic")
+                .replace("{error}", "service Spotify absent de ce serveur"),
+        });
+    }
+    tracing::info!("spotify_client_id_enregistre");
+    json!({
+        "valid": true,
+        "etat": "enregistre",
+        "spotify_client_id_configure": true,
+        "validation_message": tr("svctok.spotify.clientIdSaved"),
+    })
+}
+
+/// Fil 221 — le service Spotify tourne-t-il avec un vrai Client ID ? C'est
+/// ce que lit l'écran pour offrir, ou non, le champ « Client ID ».
+pub(crate) async fn spotify_client_id_configure(state: &AppState) -> bool {
+    let svc = state.services.lock().await.get("spotify");
+    let Some(svc) = svc else {
+        return false;
+    };
+    let garde = svc.read().await;
+    garde
+        .as_any()
+        .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+        .is_some_and(|s| s.client_id_est_configure())
 }
 
 pub async fn test(
@@ -527,6 +635,30 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> im
             svc.write().await.logout().await.ok();
         }
         state.save_tokens().await;
+    }
+    // Fil 221 — « Supprimer » vient d'effacer `spotify_client_id` : le
+    // service revient, à chaud, à ce que le démarrage aurait résolu sans lui.
+    if id == "spotify" {
+        let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
+        let repli = tune_core::streaming::spotify::resolve_client_id(
+            env.as_deref(),
+            None,
+            state.config.spotify_client_id.as_deref(),
+        );
+        let svc = state.services.lock().await.get("spotify");
+        if let Some(svc) = svc {
+            let mut garde = svc.write().await;
+            if let Some(spotify) = garde
+                .as_any_mut()
+                .downcast_mut::<tune_core::streaming::spotify::SpotifyService>()
+            {
+                // Même repli que `SpotifyService::with_config`.
+                let repli = repli
+                    .or_else(|| std::env::var("SPOTIFY_CLIENT_ID").ok())
+                    .unwrap_or_else(|| "placeholder".to_owned());
+                spotify.set_client_id(&repli);
+            }
+        }
     }
     StatusCode::NO_CONTENT
 }
@@ -746,3 +878,7 @@ pub async fn lastfm_disconnect(State(state): State<AppState>) -> impl IntoRespon
 #[cfg(test)]
 #[path = "service_tokens_arl_deezer_i5427_tests.rs"]
 mod tests_arl_deezer_i5427;
+
+#[cfg(test)]
+#[path = "service_tokens_client_id_spotify_fil221_tests.rs"]
+mod tests_client_id_spotify_fil221;

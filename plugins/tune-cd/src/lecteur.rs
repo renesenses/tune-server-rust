@@ -48,6 +48,33 @@ impl fmt::Display for ErreurCd {
     }
 }
 
+/// Pourquoi un disque n'a pas été éjecté (fil 2135 : un Apple SuperDrive
+/// n'a pas de bouton d'éjection, Tune doit pouvoir le faire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErreurEjection {
+    /// Aucun lecteur branché.
+    AucunLecteur,
+    /// Le lecteur est déjà vide.
+    AucunDisque,
+    /// Ce lecteur (ou cette plateforme) ne sait pas commander l'éjection.
+    NonPrisEnCharge,
+    /// Le système a refusé ou échoué (disque occupé, ioctl refusé…).
+    Echec(String),
+}
+
+impl fmt::Display for ErreurEjection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErreurEjection::AucunLecteur => write!(f, "aucun lecteur de CD branché"),
+            ErreurEjection::AucunDisque => write!(f, "aucun disque dans le lecteur"),
+            ErreurEjection::NonPrisEnCharge => {
+                write!(f, "ce lecteur ne sait pas éjecter le disque")
+            }
+            ErreurEjection::Echec(r) => write!(f, "{r}"),
+        }
+    }
+}
+
 pub trait LecteurDisque: Send + Sync {
     /// Le chemin du périphérique, pour l'affichage (`/dev/sr0`).
     fn chemin(&self) -> String;
@@ -65,6 +92,11 @@ pub trait LecteurDisque: Send + Sync {
     /// Lit `nombre` secteurs audio bruts à partir de `lba` dans `sortie`, qui
     /// mesure exactement `nombre × 2 352` octets.
     fn lire_secteurs(&self, lba: u32, nombre: u32, sortie: &mut [u8]) -> Result<(), ErreurCd>;
+    /// Éjecte le disque de CE lecteur. Bloquant : à appeler hors de la
+    /// boucle asynchrone. Par défaut, non pris en charge.
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        Err(ErreurEjection::NonPrisEnCharge)
+    }
 }
 
 /// Le lecteur du système, s'il y en a un que Tune sait lire.
@@ -309,6 +341,18 @@ impl LecteurDisque for LecteurBranchable {
             .ok_or(ErreurCd::AucunDisque)?
             .lire_secteurs(lba, nombre, sortie)
     }
+
+    /// Éjecte le disque du lecteur COURANT — celui que `presence` et la
+    /// lecture suivent, donc celui qui a un disque s'il y en a un (#5739,
+    /// fil 2135). Jamais un autre lecteur de la machine.
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        if self.presence() == Presence::AucunLecteur {
+            return Err(ErreurEjection::AucunLecteur);
+        }
+        self.courant()
+            .ok_or(ErreurEjection::AucunLecteur)?
+            .ejecter_disque()
+    }
 }
 
 /// La plateforme a-t-elle une implémentation ?
@@ -448,6 +492,17 @@ pub(crate) mod tests {
         fn lire_secteurs(&self, _: u32, _: u32, _: &mut [u8]) -> Result<(), ErreurCd> {
             Err(ErreurCd::AucunDisque)
         }
+        fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+            let mut p = self.presence.lock().unwrap();
+            match *p {
+                Presence::AucunLecteur => Err(ErreurEjection::AucunLecteur),
+                Presence::Vide => Err(ErreurEjection::AucunDisque),
+                Presence::Disque => {
+                    *p = Presence::Vide;
+                    Ok(())
+                }
+            }
+        }
     }
 
     /// Le « système » Linux à deux lecteurs : même recherche et même mode
@@ -572,6 +627,42 @@ pub(crate) mod tests {
         assert_eq!(l.presence(), Presence::Vide);
         assert_eq!(l.presence(), Presence::Vide);
         assert_eq!(l.chemin(), "A:");
+    }
+
+    /// Fil 2135 — deux lecteurs, le disque dans le SECOND : l'éjection vise
+    /// le lecteur qui a le disque (celui que la lecture suit), pas le premier
+    /// `/dev/sr*`, et le premier n'est pas touché.
+    #[test]
+    fn l_ejection_vise_le_lecteur_qui_a_le_disque() {
+        let (a, b, _, l) = deux_lecteurs(Presence::Vide, Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.ejecter_disque(), Ok(()));
+        assert_eq!(b.presence(), Presence::Vide, "/dev/sr1 éjecté");
+        assert_eq!(a.presence(), Presence::Vide, "/dev/sr0 intact");
+        assert_eq!(l.presence(), Presence::Vide);
+        // Plus de disque nulle part : le dire, ne rien tenter.
+        assert_eq!(l.ejecter_disque(), Err(ErreurEjection::AucunDisque));
+    }
+
+    /// Deux disques : le lecteur courant (`/dev/sr0`) est éjecté, l'autre
+    /// reste ; la présence passe alors au disque de `/dev/sr1`.
+    #[test]
+    fn avec_deux_disques_seul_le_lecteur_courant_est_ejecte() {
+        let (a, b, _, l) = deux_lecteurs(Presence::Disque, Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr0");
+        assert_eq!(l.ejecter_disque(), Ok(()));
+        assert_eq!(a.presence(), Presence::Vide);
+        assert_eq!(b.presence(), Presence::Disque);
+        assert_eq!(l.presence(), Presence::Disque);
+        assert_eq!(l.chemin(), "/dev/sr1");
+    }
+
+    #[test]
+    fn sans_lecteur_branche_l_ejection_le_dit() {
+        let systeme = Arc::new(SystemeFactice::default());
+        let l = systeme.lecteur(Duration::ZERO);
+        assert_eq!(l.ejecter_disque(), Err(ErreurEjection::AucunLecteur));
     }
 
     #[test]
