@@ -50,6 +50,56 @@ pub fn depuis_etiquette(etiquette: &str) -> Option<&str> {
     }
 }
 
+/// Options passees a `mount.cifs` pour un essai.
+///
+/// `iocharset=utf8` est impose : sans lui, le noyau convertit les noms de
+/// fichiers avec le jeu de caracteres par defaut du systeme, qui n'est pas
+/// toujours UTF-8. Tout caractere qu'il ne sait pas representer — apostrophe
+/// typographique ’, n tilde ñ, e accent aigu decompose, œ — devient alors un
+/// `?` dans le nom que liste le partage. Le fichier apparait au scan, mais
+/// `?` n'est pas son vrai nom : l'ouvrir echoue par `No such file or
+/// directory`, et la piste est perdue pour la bibliotheque.
+///
+/// Les deux appelants (route interactive et remontage au demarrage) passent
+/// par ici : un partage monte en UTF-8 depuis l'assistant doit le rester au
+/// redemarrage.
+///
+/// La chaine porte le mot de passe : elle ne doit JAMAIS aller dans une trace.
+pub fn options_de_montage(user: &str, pass: &str, dialecte: Option<&str>) -> String {
+    let mut opts = format!("username={user},password={pass},iocharset=utf8");
+    if let Some(v) = dialecte {
+        opts.push_str(&format!(",vers={v}"));
+    }
+    opts
+}
+
+#[cfg(test)]
+mod options_de_montage_tests {
+    use super::options_de_montage;
+
+    /// Retour de terrain : sans `iocharset=utf8`, les noms avec ’, ñ ou é passaient
+    /// en `?` et les fichiers devenaient introuvables.
+    #[test]
+    fn chaque_essai_monte_en_utf8() {
+        for dialecte in super::DIALECTES {
+            let opts = options_de_montage("u", "p", dialecte);
+            assert!(
+                opts.split(',').any(|o| o == "iocharset=utf8"),
+                "essai {dialecte:?} sans iocharset=utf8 : {opts}"
+            );
+        }
+    }
+
+    #[test]
+    fn le_dialecte_reste_une_option_a_part() {
+        assert_eq!(
+            options_de_montage("u", "p", Some("1.0")),
+            "username=u,password=p,iocharset=utf8,vers=1.0"
+        );
+        assert!(!options_de_montage("u", "p", None).contains("vers="));
+    }
+}
+
 /// L'echelle a parcourir, le dialecte connu d'abord.
 ///
 /// Un partage qui a deja monte en SMB 1.0 remonte en SMB 1.0 du premier coup :

@@ -2468,10 +2468,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
         let mut dernier = None;
         let mut gagnant = None;
         for dialecte in echelle {
-            let mut opts = format!("username={u},password={pass}");
-            if let Some(v) = dialecte {
-                opts.push_str(&format!(",vers={v}"));
-            }
+            let opts = crate::smb::options_de_montage(u, &pass, dialecte);
             // JAMAIS `opts` dans une trace : il porte le mot de passe.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
