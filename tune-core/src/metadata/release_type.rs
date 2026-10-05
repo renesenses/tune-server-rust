@@ -60,6 +60,13 @@
 //! album de remixes est un `album`. Pour « compilation », la colonne qui fait
 //! foi reste `albums.is_compilation`, écrite par le scan d'après les tags
 //! (#1957) — ce module ne la touche pas.
+//!
+//! Ils sont STOCKÉS à part, dans `albums.release_secondary_types`
+//! (`live;compilation`, voir [`TYPES_SECONDAIRES`]), posés au scan depuis la
+//! même balise que le primaire et sous la même règle : jamais par-dessus une
+//! valeur déjà connue. Un seul sert à ranger : `live`, qui envoie le disque
+//! dans la section « Live » de la fiche artiste ([`est_live`], décision de
+//! Bertrand du 05/10/2026) — et là, il prime sur le primaire.
 
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -201,6 +208,94 @@ pub fn depuis_valeurs_de_tag<'a>(valeurs: impl IntoIterator<Item = &'a str>) -> 
         live,
         compilation,
     })
+}
+
+/// Les TYPES SECONDAIRES de MusicBrainz, dans le mot stocké par
+/// `albums.release_secondary_types` (section « Live », Bertrand, 05/10/2026).
+///
+/// C'est la liste des `secondary-types` d'un groupe de sortie MusicBrainz, mise
+/// en bas de casse. On n'en invente pas d'autre : un mot hors de cette liste
+/// n'est pas stocké.
+pub const TYPES_SECONDAIRES: [&str; 12] = [
+    "compilation",
+    "soundtrack",
+    "spokenword",
+    "interview",
+    "audiobook",
+    "audio drama",
+    "live",
+    "remix",
+    "dj-mix",
+    "mixtape/street",
+    "demo",
+    "field recording",
+];
+
+/// Le séparateur de `albums.release_secondary_types` : `live;compilation`.
+pub const SEPARATEUR_SECONDAIRES: char = ';';
+
+/// Le type secondaire qui range un disque dans la section « Live ».
+pub const SECONDAIRE_LIVE: &str = "live";
+
+/// Reconnaît un type secondaire, quelle que soit sa casse et son écriture
+/// (`Spoken Word`, `DJ Mix`, `Mixtape` ou `Street` seuls, parce que `/` est
+/// aussi un séparateur de la balise).
+fn secondaire_depuis_mot(mot: &str) -> Option<&'static str> {
+    let mot = mot.trim().to_lowercase();
+    let compact: String = mot.chars().filter(|c| c.is_alphanumeric()).collect();
+    let trouve = match compact.as_str() {
+        "spokenword" => "spokenword",
+        "audiodrama" => "audio drama",
+        "djmix" => "dj-mix",
+        "mixtape" | "street" | "mixtapestreet" => "mixtape/street",
+        "fieldrecording" => "field recording",
+        _ => return TYPES_SECONDAIRES.iter().copied().find(|t| *t == mot),
+    };
+    Some(trouve)
+}
+
+/// Les types SECONDAIRES que porte une balise de type de sortie, sans doublon,
+/// dans l'ordre de lecture. Mêmes valeurs et mêmes séparateurs que
+/// [`depuis_valeurs_de_tag`] : `album; live` donne `["live"]`, `RELEASETYPE`
+/// en deux champs `album` puis `live` aussi. Un primaire (`album`, `ep`…) ou
+/// un mot inconnu n'y entre pas.
+pub fn secondaires_depuis_valeurs_de_tag<'a>(
+    valeurs: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'static str> {
+    let mut vus: Vec<&'static str> = Vec::new();
+    for valeur in valeurs {
+        for mot in valeur.split([';', '/', ',', '\0']) {
+            if let Some(t) = secondaire_depuis_mot(mot)
+                && !vus.contains(&t)
+            {
+                vus.push(t);
+            }
+        }
+    }
+    vus
+}
+
+/// La valeur de colonne de [`secondaires_depuis_valeurs_de_tag`] :
+/// `live;compilation`, ou `None` quand la balise n'en porte aucun.
+pub fn colonne_des_secondaires<'a>(valeurs: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let secondaires = secondaires_depuis_valeurs_de_tag(valeurs);
+    (!secondaires.is_empty()).then(|| secondaires.join(&SEPARATEUR_SECONDAIRES.to_string()))
+}
+
+/// Relit `albums.release_secondary_types` : la liste des types, sans vide.
+pub fn secondaires_de_la_colonne(colonne: &str) -> Vec<String> {
+    colonne
+        .split(SEPARATEUR_SECONDAIRES)
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Le disque va-t-il dans la section « Live » ? Oui dès que ses types
+/// secondaires portent `live`, QUEL QUE SOIT son type primaire : un EP live
+/// est un live, pas un EP (Bertrand, 05/10/2026).
+pub fn est_live(secondaires: &[String]) -> bool {
+    secondaires.iter().any(|t| t == SECONDAIRE_LIVE)
 }
 
 /// Remplit `albums.release_type` depuis MusicBrainz, pour les disques dont le
@@ -688,5 +783,47 @@ mod tests {
         assert_eq!(t(&[]), None);
         // Le premier primaire gagne ; un mot inconnu ne gêne pas.
         assert_eq!(t(&["remix; single"]), simple(TypeDeSortie::Single));
+    }
+    #[test]
+    fn les_types_secondaires_de_la_balise_section_live() {
+        let t = |v: &[&str]| secondaires_depuis_valeurs_de_tag(v.iter().copied());
+        assert_eq!(t(&["album; live"]), vec!["live"]);
+        assert_eq!(t(&["album", "live"]), vec!["live"]);
+        assert_eq!(t(&["album\0live"]), vec!["live"]);
+        assert_eq!(t(&["EP;Live;Remix"]), vec!["live", "remix"]);
+        assert_eq!(t(&["album; soundtrack"]), vec!["soundtrack"]);
+        // `/` est un séparateur : « mixtape/street » arrive en deux mots.
+        assert_eq!(t(&["album; mixtape/street"]), vec!["mixtape/street"]);
+        assert_eq!(t(&["Spoken Word", "DJ Mix"]), vec!["spokenword", "dj-mix"]);
+        assert_eq!(t(&["live", "Live"]), vec!["live"], "sans doublon");
+        assert!(t(&["album"]).is_empty());
+        assert!(t(&["inconnu"]).is_empty());
+        assert!(t(&[]).is_empty());
+
+        assert_eq!(
+            colonne_des_secondaires(["album; live; compilation"]).as_deref(),
+            Some("live;compilation")
+        );
+        assert_eq!(colonne_des_secondaires(["single"]), None);
+    }
+
+    #[test]
+    fn la_colonne_relue_et_la_regle_du_live() {
+        assert_eq!(
+            secondaires_de_la_colonne("live;compilation"),
+            vec!["live".to_string(), "compilation".to_string()]
+        );
+        assert_eq!(
+            secondaires_de_la_colonne(" Live ; ;"),
+            vec!["live".to_string()]
+        );
+        assert!(secondaires_de_la_colonne("").is_empty());
+        assert!(est_live(&secondaires_de_la_colonne("remix;live")));
+        assert!(!est_live(&secondaires_de_la_colonne("compilation")));
+        assert!(!est_live(&[]));
+        // Chaque mot stocké se relit tel quel.
+        for mot in TYPES_SECONDAIRES {
+            assert_eq!(secondaires_depuis_valeurs_de_tag([mot]), vec![mot], "{mot}");
+        }
     }
 }

@@ -1228,6 +1228,11 @@ path = "tests/page_artiste_sections_4767.rs"
 name = "page_artiste_ep_singles_5616"
 path = "tests/page_artiste_ep_singles_5616.rs"
 
+# Section « Live » de la fiche artiste (types secondaires, suite de #5616).
+[[test]]
+name = "page_artiste_section_live"
+path = "tests/page_artiste_section_live.rs"
+
 # #1572 — crédits d’un album (GET /library/albums/{id}/credits), fil 1921.
 [[test]]
 name = "credits_album_1572"

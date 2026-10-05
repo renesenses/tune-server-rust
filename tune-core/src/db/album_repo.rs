@@ -674,6 +674,18 @@ pub mod sql {
         )
     }
 
+    /// Section « Live » — les types SECONDAIRES lus dans la balise, posés
+    /// SEULEMENT si la colonne est vide : même règle que
+    /// [`set_release_type_if_empty`], une valeur connue n'est jamais écrasée.
+    pub fn set_release_secondary_types_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_secondary_types = {} WHERE id = {} \
+             AND (release_secondary_types IS NULL OR release_secondary_types = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Écrit le type de sortie d'un album (#4767).
     ///
     /// Paramètre lié et non littéral, contrairement à [`set_compilation`] : la
@@ -2956,6 +2968,59 @@ impl AlbumRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
         Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Section « Live » — pose les types secondaires lus dans la balise
+    /// (`live;remix`), seulement si l'album n'en a pas encore. Rend `true`
+    /// quand la ligne a changé.
+    pub fn poser_types_secondaires_si_vides(
+        &self,
+        album_id: i64,
+        types_secondaires: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::set_release_secondary_types_if_empty,
+            sql::set_release_secondary_types_if_empty,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&types_secondaires, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
+    /// Section « Live » — les types secondaires de chaque album demandé, en une
+    /// requête. Un album sans type secondaire connu est ABSENT de la table.
+    ///
+    /// Lecture à part, comme [`Self::attacher_added_at`] : `select_album`, le
+    /// SELECT commun de tous les écrans d'albums, ne nomme pas la colonne, et
+    /// seule la fiche artiste s'en sert.
+    pub fn types_secondaires_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>, TuneError> {
+        use crate::metadata::release_type::secondaires_de_la_colonne;
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, release_secondary_types FROM albums \
+                 WHERE id IN ({id_list}) AND release_secondary_types IS NOT NULL \
+                 AND release_secondary_types != ''"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                let id = row.first().and_then(|v| v.as_i64());
+                let brut = row.get(1).and_then(|v| v.as_string());
+                if let (Some(id), Some(brut)) = (id, brut) {
+                    let types = secondaires_de_la_colonne(&brut);
+                    if !types.is_empty() {
+                        par_id.insert(id, types);
+                    }
+                }
+            }
+        }
+        Ok(par_id)
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
