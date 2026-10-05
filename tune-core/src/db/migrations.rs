@@ -2255,6 +2255,23 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "listen_history_album_id_index",
         up: "",
     },
+    // #4991 (b) — la marque « déjà tenté, rien trouvé » de l'identification
+    // en lot. Un album que MusicBrainz n'a pas (verdict `not_found`, service
+    // en bonne santé) ne reçoit pas de `musicbrainz_release_id` : sans marque,
+    // il restait en tête de la sélection `ORDER BY al.id`, et la relance
+    // réattaquait l'amas qui venait d'échouer. La sélection range désormais
+    // les albums jamais tentés en tête, puis les tentés du plus ancien au plus
+    // récent ; aucun album n'est exclu.
+    //
+    // TEXT ISO-8601 UTC, NULL pour l'existant (= jamais tenté), posée par
+    // `add_column_if_missing` dans le bloc de version et dans la passe finale.
+    // Numérotée 116 / PG 080 : dernière sur `batch/feat-rc3-20261002` le
+    // 05/10 = 115 / PG 079 (fil 2130). Jumelle PG : 080.
+    Migration {
+        version: 116,
+        name: "albums_identification_tentee_le",
+        up: "",
+    },
 ];
 
 /// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
@@ -3292,6 +3309,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Index de `listen_history.album_id` (fil 2130).
             index_historique_album_id(db);
         }
+        if migration.version == 116 {
+            // Marque « déjà tenté, rien trouvé » de l'identification en lot
+            // (#4991). Sans défaut : NULL = jamais tenté.
+            add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3810,6 +3832,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
     index_historique_album_id(db);
+    // Marque « déjà tenté, rien trouvé » (migration 116, #4991) — posée ICI
+    // aussi : la sélection de `identify-all` la NOMME, et une base arrivée
+    // sans elle ne pourrait plus lancer la passe. PG : migration 080.
+    add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4544,6 +4570,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         79,
         "listen_history_album_id_index",
         include_str!("../../migrations/postgres/079_listen_history_album_id_index.sql"),
+    ),
+    // Jumelle de la SQLite 116 (#4991 b) : `albums.identification_tentee_le`,
+    // la marque « déjà tenté, rien trouvé » de l'identification en lot.
+    (
+        80,
+        "albums_identification_tentee_le",
+        include_str!("../../migrations/postgres/080_albums_identification_tentee_le.sql"),
     ),
 ];
 
@@ -7289,7 +7322,10 @@ mod tests {
         // SQLite 115. L'index de `listen_history.album_id` que la jointure de
         // « Reprendre l'écoute » réécrite en `UNION ALL` emprunte. La 78 est
         // celle de #5706.
-        assert_eq!(pg_latest_version(), 79, "latest PG migration must be 79");
+        // 80 : `albums_identification_tentee_le` (#4991 b), jumelle de la
+        // SQLite 116. La marque « déjà tenté, rien trouvé » que la sélection
+        // de `identify-all` NOMME.
+        assert_eq!(pg_latest_version(), 80, "latest PG migration must be 80");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
