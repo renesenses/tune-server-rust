@@ -58,6 +58,8 @@ pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).
 pub mod reference_d_album;
+/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
+pub(crate) mod replieur_wal;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
@@ -71,7 +73,6 @@ pub mod track_repo;
 /// attend qu'elle se ferme.
 pub(crate) mod transaction_du_lot;
 pub mod tx_holder;
-/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
 pub mod verrou_ecriture;
 pub mod zone_motif_masquage;
 pub mod zone_repo;
@@ -86,6 +87,8 @@ mod lenteur_albums_4800_tests;
 mod lenteur_pistes_5138_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+#[cfg(test)]
+mod replieur_wal_tests;
 /// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de
 /// `listen_history.album_id`, preuves d'équivalence et de migration.
 #[cfg(test)]

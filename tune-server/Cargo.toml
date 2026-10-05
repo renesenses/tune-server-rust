@@ -72,8 +72,8 @@ cd = ["dep:tune-cd"]
 circle = ["dep:tune-circle"]
 # Entrée audio en direct (#5051) : capter une entrée USB (platine, S/PDIF,
 # optique) et la diffuser vers une zone. Dans `default` comme `cd` : opt-in à
-# l'exécution (`default_enabled = false`), hors catalogue tant qu'aucun écran
-# ne le consomme.
+# l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
+# rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
 
 [dependencies]
@@ -183,6 +183,12 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "isolement-disque-de-test",
 ] }
 
+# Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
+# RSS mesure tout le processus.
+[[test]]
+name = "memoire_a_froid"
+path = "tests/memoire_a_froid.rs"
+
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
 [[test]]
@@ -236,6 +242,11 @@ path = "tests/isolement_disque_integration_5512.rs"
 [[test]]
 name = "titres_bannis_4806"
 path = "tests/titres_bannis_4806.rs"
+
+# Ticket 134 — trois « suivant » en rafale visent trois pistes distinctes.
+[[test]]
+name = "suivants_en_rafale_134"
+path = "tests/suivants_en_rafale_134.rs"
 
 # #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
 # réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
@@ -830,6 +841,21 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
 
+# Fil forum 2143 (FabienM), points 5, 6 et 8 — l'album d'un titre de la file :
+# `album_id` / `album_id_service` sur `GET /zones/{id}/queue`, et l'album en
+# cours d'un titre Bandcamp lancé hors de sa page. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "album_de_la_file_fil2143"
+path = "tests/album_de_la_file_fil2143.rs"
+
+# Fil forum 2143 (#5758) — l'artiste d'un titre de la file : `artist_id` /
+# `artist_id_service` sur `GET /zones/{id}/queue`. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "artiste_de_la_file_fil2143"
+path = "tests/artiste_de_la_file_fil2143.rs"
+
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
 # des services simulés. `autotests = false` plus haut : sans cette cible, le
@@ -1188,6 +1214,11 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
+
+# #5616 — EP et singles déduits (pistes et durée) sur la fiche artiste.
+[[test]]
+name = "page_artiste_ep_singles_5616"
+path = "tests/page_artiste_ep_singles_5616.rs"
 
 # #1572 — crédits d’un album (GET /library/albums/{id}/credits), fil 1921.
 [[test]]

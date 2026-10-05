@@ -7,6 +7,8 @@ mod admin;
 pub use admin::peers_payload;
 mod backup;
 mod config;
+// Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
+pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
 mod config_backup;
 mod convert;
 mod database;

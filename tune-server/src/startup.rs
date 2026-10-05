@@ -420,6 +420,19 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // « distinctes », que la passe consulte. Idempotente : sur une base déjà
     // passée, trois lectures et rien d'écrit.
     tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
+    // Fil 2094 — une seule fois (marqueur dans `settings`) : les coffrets
+    // composés avant que la composition pose les sous-titres de disque les
+    // reçoivent. APRÈS la passe, qui écrit elle aussi le marqueur `coffret`.
+    // Hors du chemin du démarrage : pour les coffrets sans titres retenus, la
+    // passe relit la balise ALBUM d'une piste par disque, et un partage lent
+    // ne doit pas retenir le serveur. Une erreur se journalise, le démarrage
+    // continue.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::coffrets_auto::rattrapage_journalise(&backend);
+        });
+    }
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -2468,10 +2481,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
         let mut dernier = None;
         let mut gagnant = None;
         for dialecte in echelle {
-            let mut opts = format!("username={u},password={pass}");
-            if let Some(v) = dialecte {
-                opts.push_str(&format!(",vers={v}"));
-            }
+            let opts = crate::smb::options_de_montage(u, &pass, dialecte);
             // JAMAIS `opts` dans une trace : il porte le mot de passe.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
@@ -2485,9 +2495,9 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     gagnant = Some(crate::smb::etiquette(dialecte).to_string());
                     true
                 }
-                Ok(Ok(out)) => {
-                    crate::smb::est_refus_d_authentification(&String::from_utf8_lossy(&out.stderr))
-                }
+                // Un refus d'identifiants, ou un point deja occupe (EBUSY,
+                // fil 2145) : changer de dialecte n'y fera rien.
+                Ok(Ok(out)) => crate::smb::arrete_l_echelle(&String::from_utf8_lossy(&out.stderr)),
                 // mount.cifs absent ou non executable : changer de dialecte
                 // n'y fera rien.
                 Ok(Err(_)) => true,
@@ -2591,8 +2601,20 @@ where
 /// puis, s'il finit par monter, un scan de la bibliothèque — celui du
 /// démarrage a trouvé sa racine absente et n'a rien pu en lire.
 async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
-    let monte =
-        reessayer_le_montage(|_| monter_un_partage(&state, &partage), tokio::time::sleep).await;
+    // Fil 2145 : un partage OUBLIE pendant les nouveaux essais (« Oublier ce
+    // partage ») ne doit pas etre remonte dans la minute qui suit. Chaque
+    // essai verifie donc que sa ligne existe encore.
+    let (etat, ce_partage) = (&state, &partage);
+    let monte = reessayer_le_montage(
+        move |_| async move {
+            if !ligne_de_partage_existe(etat, ce_partage.id) {
+                return IssueMontage::Definitif;
+            }
+            monter_un_partage(etat, ce_partage).await
+        },
+        tokio::time::sleep,
+    )
+    .await;
     let Some(essai) = monte else {
         warn!(
             host = %partage.host, share = %partage.share,
@@ -2617,6 +2639,22 @@ async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
     warn!(path = %partage.path, "scan_after_late_mount_skipped — un scan tenait le droit (#5682)");
+}
+
+/// La ligne `network_mounts` de ce partage existe-t-elle encore ? Sans id
+/// (ancienne ligne illisible), on ne sait pas : on continue comme avant.
+fn ligne_de_partage_existe(state: &AppState, id: Option<i64>) -> bool {
+    use tune_core::db::backend::ToSqlValue;
+    let Some(id) = id else { return true };
+    match state.backend.query_one(
+        "SELECT id FROM network_mounts WHERE id = ?",
+        &[&id as &dyn ToSqlValue],
+    ) {
+        Ok(ligne) => ligne.is_some(),
+        // Base momentanement illisible : ne pas abandonner un remontage
+        // pour autant.
+        Err(_) => true,
+    }
 }
 
 /// Ecrit le constat du dernier montage sur la ligne du partage.
@@ -4080,5 +4118,39 @@ mod bascule_asio_a_chaud_5353_tests {
             bascule.contains("enregistrer_les_sorties_locales(state, asio).await"),
             "la bascule doit réutiliser le chemin d'enregistrement du démarrage"
         );
+    }
+}
+
+/// Fil 2145 : un partage oublié pendant ses nouveaux essais de montage ne doit
+/// pas être remonté. Chaque essai demande d'abord si sa ligne existe encore.
+#[cfg(test)]
+mod tests_oubli_2145 {
+    use super::ligne_de_partage_existe;
+    use tune_core::db::backend::ToSqlValue;
+
+    #[test]
+    fn un_partage_oublie_n_est_plus_retente() {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let id = etat
+            .backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) \
+                 VALUES ('smb', '192.168.10.69', 'Music', '/mnt/192.168.10.69_Music')",
+                &[],
+            )
+            .unwrap();
+        assert!(ligne_de_partage_existe(&etat, Some(id)));
+        etat.backend
+            .execute(
+                "DELETE FROM network_mounts WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap();
+        assert!(
+            !ligne_de_partage_existe(&etat, Some(id)),
+            "la ligne oubliée doit arrêter les nouveaux essais"
+        );
+        // Sans identifiant, on ne sait pas : on continue comme avant.
+        assert!(ligne_de_partage_existe(&etat, None));
     }
 }

@@ -59,6 +59,9 @@ const CLES_ALBUMS_DETAILED: &[&str] = &[
     "sample_rate",
     "bit_depth",
     "is_compilation",
+    // Fil 2094 — le dossier et le numéro de disque de chaque carte.
+    "folder",
+    "disc_number",
 ];
 
 /// Idem pour une collection intelligente.

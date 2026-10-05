@@ -278,6 +278,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // 077, alors que `tag_item` nomme la colonne. TEXT comme côté SQLite, NULL
     // pour l'existant.
     "ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT",
+    // #4991 (b) — marque « déjà tenté, rien trouvé » de l'identification en
+    // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
+    // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

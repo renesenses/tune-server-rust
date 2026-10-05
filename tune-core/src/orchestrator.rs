@@ -1584,6 +1584,9 @@ mod repli_de_peripherique;
 mod resolve_stream;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
 mod relance_ytdlp_4366;
+// Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
+#[cfg(test)]
+mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
 
@@ -1599,6 +1602,9 @@ mod service_wav_progressif_5080;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
+#[cfg(test)]
+mod volume_pure_5695_tests;
 // #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
 mod eq_en_vol;
 #[cfg(test)]
@@ -1608,6 +1614,10 @@ mod eq_en_vol_4407_tests;
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
 
+/// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
+mod duree_du_flux_2062;
+#[cfg(test)]
+mod duree_du_flux_2062_tests;
 mod resolve_direct;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;

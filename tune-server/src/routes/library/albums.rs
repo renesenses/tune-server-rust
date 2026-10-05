@@ -66,6 +66,12 @@ pub(super) struct AlbumFilters {
     /// Le « bouton de re-tirage » demande au fil 1635 n'est donc rien d'autre
     /// que « redemander la page 0 sans graine », ou avec une autre.
     seed: Option<i64>,
+    /// Fil 1684 — la recherche de l'écran Bibliothèque, sur TOUTE la base :
+    /// titre de l'album, artiste de l'album, artiste d'une piste, compositeur
+    /// d'une piste (`AlbumRepo::list_filtered_recherche_avec_total`). Elle se
+    /// combine aux facettes, au tri et à la pagination ; `total` est alors le
+    /// nombre de RÉSULTATS. Absente ou vide : la réponse d'avant, à l'octet.
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +139,49 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
     // sera repris (voir plus bas) ; ailleurs le SQL reste celui d'avant.
     let sans_facette = p.format.is_none() && p.quality.is_none() && p.compilation.is_none();
     let veut_le_total = dr.is_none() && !include_hidden && sans_facette;
+    // Fil 1684 — une recherche : le total est celui de l'ensemble FILTRÉ.
+    let recherche =
+        p.q.as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_string);
+    if let Some(q) = recherche {
+        let lire = |limit: i64, offset: i64| {
+            repo.list_filtered_recherche_avec_total(
+                limit,
+                offset,
+                sort,
+                order,
+                p.format.as_deref(),
+                p.quality.as_deref(),
+                p.compilation,
+                include_hidden,
+                dr,
+                seed,
+                &q,
+            )
+        };
+        let (items, total) = match lire(limit, offset) {
+            // Page vide : pas de total porté par la fenêtre. Au début de la
+            // liste, c'est qu'il n'y a aucun résultat ; plus loin, on le relit
+            // sur la première ligne.
+            Ok((items, None)) if offset > 0 => {
+                let total = lire(1, 0).ok().and_then(|(_, t)| t).unwrap_or(0);
+                (items, total)
+            }
+            Ok((items, total)) => (items, total.unwrap_or(0)),
+            Err(e) => {
+                tracing::error!(error = %e, sort, order, limit, offset, "list_albums_recherche_echouee");
+                (Vec::new(), 0)
+            }
+        };
+        let mut corps = corps_de_la_page(&repo, items, total, limit, offset, seed);
+        // La saisie RENVOYÉE : c'est ainsi qu'un client sait que ce serveur
+        // a filtré. Un serveur d'avant ignore `q` et rend toute la
+        // bibliothèque — le client doit alors filtrer lui-même.
+        corps["q"] = json!(q);
+        return corps;
+    }
     let page = if veut_le_total {
         repo.list_filtered_seeded_avec_total(
             limit,
@@ -196,6 +245,19 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
             None => repo.count_visible().unwrap_or(0),
         },
     };
+    corps_de_la_page(&repo, items, total, limit, offset, seed)
+}
+
+/// La réponse de `GET /library/albums` pour une page déjà lue : le DR de
+/// chaque album, sans `bio`, et la graine du tri aléatoire.
+fn corps_de_la_page(
+    repo: &AlbumRepo,
+    items: Vec<Album>,
+    total: i64,
+    limit: i64,
+    offset: i64,
+    seed: Option<i64>,
+) -> Value {
     // #4521 — le DR de chaque album de la page, par la règle de la fiche, en
     // UNE requête groupée sur les identifiants déjà bornés. Même type que la
     // fiche (chaîne) ; `null` sans DR, jamais `0` — DR0 est une vraie mesure.
@@ -3813,6 +3875,20 @@ pub(super) async fn composer_coffret(
             titre_compose = Some(t.to_string());
         }
     }
+    // Fil 2094 — le titre d'origine de chaque disque devient son sous-titre,
+    // sauf s'il est celui du coffret. AVANT la disposition tenue, plus bas :
+    // c'est elle qui fait survivre le nom du disque à une relecture des
+    // fichiers.
+    let titre_du_coffret = titre_compose
+        .clone()
+        .or_else(|| repo.get(cible).ok().flatten().map(|a| a.title))
+        .unwrap_or_else(|| titres[0].clone());
+    let sous_titres =
+        coffrets_auto::poser_les_sous_titres(&state.backend, cible, &disques, &titre_du_coffret)
+            .unwrap_or_else(|e| {
+                tracing::warn!(album = cible, erreur = %e, "coffret_manuel_sous_titres_non_poses");
+                Vec::new()
+            });
     // Le marqueur `manuel` : la passe automatique ne touchera JAMAIS à ce
     // coffret — ni pour y ajouter un disque frère, ni pour l'absorber ailleurs.
     // Sans lui, un coffret manuel ne se distingue d'un coffret réparti sur
@@ -3822,6 +3898,7 @@ pub(super) async fn composer_coffret(
         disques,
         titre_compose,
         titre_tenu_avant,
+        sous_titres,
         ..coffrets_auto::Marqueur::manuel()
     })
     .unwrap_or_default();
@@ -4456,5 +4533,138 @@ mod tests_genre_pistes_5314 {
             ["Jazz"],
             "#5314 : la facette Genre d'Oxygen doit proposer le genre posé sur les albums, et lui seul"
         );
+    }
+}
+
+/// Fil 1684 — `GET /library/albums?q=` cherche dans TOUTE la base (titre,
+/// artiste de l'album, artiste d'une piste, compositeur), se combine aux
+/// facettes et à la pagination, rend le total des RÉSULTATS et renvoie la
+/// saisie. Sans `q`, la réponse d'avant — sans champ `q`.
+#[cfg(test)]
+mod tests_recherche_1684 {
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    type Etat = crate::state::AppState;
+
+    async fn get(app: &axum::Router, uri: &str) -> Value {
+        let reponse = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            reponse.status().is_success(),
+            "{uri} : {}",
+            reponse.status()
+        );
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&corps).unwrap()
+    }
+
+    fn titres(json: &Value) -> Vec<String> {
+        json["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|a| a["title"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn la_recherche_de_la_bibliotheque_porte_sur_toute_la_base_1684() {
+        let state = Etat::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        for (id, nom) in [
+            (1_i64, "Miles Davis"),
+            (2, "John Coltrane"),
+            (3, "Orchestre de Paris"),
+        ] {
+            b.execute(
+                "INSERT INTO artists (id, name) VALUES (?, ?)",
+                &[&id as &dyn ToSqlValue, &nom],
+            )
+            .unwrap();
+        }
+        // (titre, artiste d'album, artiste de piste, compositeur)
+        let albums: [(&str, i64, i64, Option<&str>); 3] = [
+            ("Kind of Blue", 1, 2, None),
+            ("Boléro", 3, 3, Some("Maurice Ravel")),
+            ("Nefertiti", 1, 1, None),
+        ];
+        for (n, (titre, artiste, piste, compositeur)) in albums.iter().enumerate() {
+            b.execute(
+                "INSERT INTO albums (title, artist_id, source, track_count) VALUES (?, ?, 'local', 1)",
+                &[titre as &dyn ToSqlValue, artiste],
+            )
+            .unwrap();
+            let album_id = b.last_insert_rowid();
+            let chemin = format!("/m/{n}.flac");
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, track_number, file_path, duration_ms, composer) \
+                 VALUES ('piste', ?, ?, 1, ?, 30000, ?)",
+                &[&album_id as &dyn ToSqlValue, piste, &chemin, compositeur],
+            )
+            .unwrap();
+        }
+        let app = crate::routes::router(state.clone());
+
+        let j = get(&app, "/api/v1/library/albums?q=coltrane&limit=50").await;
+        assert_eq!(
+            titres(&j),
+            vec!["Kind of Blue"],
+            "l'artiste d'une PISTE : {j}"
+        );
+        assert_eq!(j["total"], 1);
+        assert_eq!(j["q"], "coltrane", "la saisie est renvoyée");
+
+        let j = get(&app, "/api/v1/library/albums?q=ravel&limit=50").await;
+        assert_eq!(titres(&j), vec!["Boléro"], "le COMPOSITEUR : {j}");
+
+        // Paginée : le total est celui des résultats, pas de la bibliothèque.
+        let j = get(
+            &app,
+            "/api/v1/library/albums?q=miles&limit=1&sort=title&order=asc",
+        )
+        .await;
+        assert_eq!(titres(&j), vec!["Kind of Blue"]);
+        assert_eq!(j["total"], 2);
+        let j = get(
+            &app,
+            "/api/v1/library/albums?q=miles&limit=1&offset=1&sort=title&order=asc",
+        )
+        .await;
+        assert_eq!(titres(&j), vec!["Nefertiti"]);
+        assert_eq!(j["total"], 2);
+        let j = get(&app, "/api/v1/library/albums?q=miles&limit=1&offset=5").await;
+        assert!(titres(&j).is_empty());
+        assert_eq!(
+            j["total"], 2,
+            "au-delà de la fin, le total reste celui des résultats"
+        );
+
+        // Combinée à une facette.
+        let j = get(&app, "/api/v1/library/albums?q=miles&compilation=true").await;
+        assert!(titres(&j).is_empty());
+        assert_eq!(j["total"], 0);
+
+        // TÉMOIN — sans `q` (ou `q` vide), la réponse d'avant.
+        for uri in [
+            "/api/v1/library/albums?limit=50",
+            "/api/v1/library/albums?limit=50&q=%20",
+        ] {
+            let j = get(&app, uri).await;
+            assert_eq!(titres(&j).len(), 3, "{uri}");
+            assert_eq!(j["total"], 3, "{uri}");
+            assert!(
+                j.get("q").is_none(),
+                "{uri} : pas de champ `q` sans recherche"
+            );
+        }
     }
 }

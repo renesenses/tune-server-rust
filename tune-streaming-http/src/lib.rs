@@ -62,6 +62,34 @@ async fn get_svc(
     // registry lock drops here
 }
 
+/// Comme [`get_svc`], mais refuse un service DÉSACTIVÉ.
+///
+/// Les routes `/{service}/…` prenaient le service que l'URL nommait sans
+/// regarder la case « Actif » des Réglages. Un Qobuz désactivé, et même jamais
+/// connecté, était donc encore interrogé dès que l'écran le demandait : la page
+/// découverte appelait `featured-playlists/by-tag`, Tune relayait vers
+/// `/playlist/getTags`, Qobuz répondait 500 et Tune rendait 502 — quatre fois
+/// dans un même journal de testeur, pour un service que l'utilisateur avait
+/// éteint.
+///
+/// Les routes qui choisissent elles-mêmes leurs services passent déjà par
+/// `utilisable()` (#5103). Celles-ci, où c'est le CLIENT qui nomme le service,
+/// passent par ici : 409 et un motif (une liste vide pour les favoris, comme
+/// pour une source sans favoris), sans un seul appel au service. Restent
+/// sur [`get_svc`] les routes qui doivent fonctionner service éteint : état,
+/// connexion, déconnexion, activation, rappels OAuth.
+async fn get_svc_actif(
+    state: &StreamingHttpState,
+    name: &str,
+) -> Result<Arc<RwLock<Box<dyn StreamingService>>>, (StatusCode, String)> {
+    let arc = get_svc(state, name).await?;
+    if !arc.read().await.enabled() {
+        tracing::debug!(service = name, "streaming_service_desactive_appel_refuse");
+        return Err((StatusCode::CONFLICT, format!("service désactivé : {name}")));
+    }
+    Ok(arc)
+}
+
 /// Type de favori de streaming demandé sur `/{service}/favorites/{fav_type}`.
 ///
 /// Ce type existe pour une seule raison : `service_favorites` dispatche le
@@ -368,7 +396,7 @@ pub fn purge_contenu_utilisateur(service: &str) {
 /// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
 macro_rules! with_svc {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -388,7 +416,7 @@ macro_rules! with_svc {
 /// sans y penser d'un gestionnaire éditorial vers un gestionnaire de favoris.
 macro_rules! with_svc_editorial {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -398,7 +426,7 @@ macro_rules! with_svc_editorial {
 }
 macro_rules! with_svc_mut {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
-        let arc = match get_svc($state, $service).await {
+        let arc = match get_svc_actif($state, $service).await {
             Ok(s) => s,
             Err(e) => return e.into_response(),
         };
@@ -631,7 +659,7 @@ async fn service_artist(
     State(state): State<StreamingHttpState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -927,7 +955,7 @@ async fn service_playlist_tags(
     headers: axum::http::HeaderMap,
 ) -> Response {
     let langues = etiquettes_langue::langues_demandees(&headers);
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -966,7 +994,7 @@ async fn service_featured_playlists_by_tag(
     headers: axum::http::HeaderMap,
 ) -> Response {
     let langues = etiquettes_langue::langues_demandees(&headers);
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1293,7 +1321,7 @@ async fn service_track_similar(
     Path((service, track_id)): Path<(String, String)>,
     Query(q): Query<SimilairesQuery>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1356,7 +1384,7 @@ async fn service_track_url(
     State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> Response {
-    let svc = match get_svc(&state, &service).await {
+    let svc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -1374,7 +1402,7 @@ async fn service_track_url(
             if svc.refresh_if_needed().await.unwrap_or(false) {
                 drop(svc);
                 state.save_tokens().await;
-                let svc = match get_svc(&state, &service).await {
+                let svc = match get_svc_actif(&state, &service).await {
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
@@ -1467,7 +1495,7 @@ async fn service_favorites(
     Path((service, fav_type)): Path<(String, String)>,
     Query(tri): Query<TriQuery>,
 ) -> Response {
-    let arc = match get_svc(&state, &service).await {
+    let arc = match get_svc_actif(&state, &service).await {
         Ok(s) => s,
         // A non-streaming source (e.g. "upnp"/"radio"/"podcast" media-server
         // items) has no streaming favorites. Return an empty list (200) rather
@@ -1514,7 +1542,7 @@ async fn service_favorites(
             };
             if rafraichi {
                 state.save_tokens().await;
-                let arc = match get_svc(&state, &service).await {
+                let arc = match get_svc_actif(&state, &service).await {
                     Ok(s) => s,
                     Err(e) => return e.into_response(),
                 };
@@ -1774,6 +1802,12 @@ async fn compare_services(
             }
         };
         let svc = svc.read().await;
+        // Même règle que `get_svc_actif` : un service éteint n'est pas
+        // interrogé.
+        if !svc.enabled() {
+            results.insert(name.to_string(), json!({"error": "service désactivé"}));
+            continue;
+        }
         match svc.search(query, 10).await {
             Ok(sr) => {
                 results.insert(
@@ -3355,3 +3389,6 @@ mod temoin_rubriques_dans_la_langue_demandee {
         );
     }
 }
+
+#[cfg(test)]
+mod service_desactive_jamais_appele_tests;

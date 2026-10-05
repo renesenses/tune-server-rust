@@ -247,6 +247,12 @@ fn completer_compatible(mut fiche: Value, compatible: bool) -> Value {
     fiche
 }
 
+/// Le `display_name` d'une fiche SDK : celui que le greffon déclare
+/// ([`tune_core::plugin_sdk::TunePlugin::display_name`]), sinon l'identifiant.
+fn nom_affiche<'a>(declare: &'a str, nom: &'a str) -> &'a str {
+    if declare.is_empty() { nom } else { declare }
+}
+
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = fiches_locales_honorables(&state).await;
@@ -291,7 +297,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     {
         let mut card = serde_json::json!({
             "name": info.name,
-            "display_name": info.name,
+            "display_name": nom_affiche(&info.display_name, &info.name),
             "description": info.description,
             "version": info.version,
             "type": "sdk",
@@ -332,7 +338,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         };
         let mut card = serde_json::json!({
             "name": info.name,
-            "display_name": info.name,
+            "display_name": nom_affiche(&info.display_name, &info.name),
             "description": info.description,
             "version": info.version,
             "type": "sdk",
@@ -453,7 +459,7 @@ fn carte_en_erreur(
 ) -> Value {
     let mut card = json!({
         "name": error.name,
-        "display_name": error.name,
+        "display_name": nom_affiche(&error.display_name, &error.name),
         "description": error.description,
         "version": error.version,
         "type": "sdk",

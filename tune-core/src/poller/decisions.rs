@@ -421,6 +421,31 @@ pub fn horloge_de_piste_connue(track_started_at: Option<std::time::Instant>) -> 
     track_started_at.is_some()
 }
 
+/// Ticket 190 — un renderer qui sait rapporter sa position, à l'arrêt, sans
+/// avoir jamais quitté 0 sur cette piste, n'a rien joué.
+///
+/// Les deux patiences du bras `Stopped` supposent qu'une musique est encore
+/// en train de sortir du tampon du renderer :
+/// - #4661 attend la fin nominale de la piste (au plus
+///   `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`) quand le fichier a été servi en
+///   entier ;
+/// - #4480 attend l'avance de l'audio livrée sur la position annoncée (au
+///   plus `AVANCE_AUDIO_BORNE_HAUTE_SECS`).
+///
+/// Ce qui motive la règle (ticket 190) : fichier servi en entier, horloge de
+/// piste connue, renderer qui avait rapporté ses positions sur les pistes
+/// d'avant. Sur celle-ci, il est resté à 0, puis s'est dit arrêté. La zone
+/// restait « en lecture » sans un son pendant plusieurs minutes, jusqu'à la
+/// fin nominale de la piste.
+///
+/// `position_prouvee` est la preuve de #5522 (`zones_a_position_prouvee`) :
+/// sortie locale, ou renderer qui a déjà rapporté une position non nulle sur
+/// cette zone. Sans elle, `false` : certains renderers rendent 0 en permanence
+/// tout en jouant, et leur `Stopped` ne prouve rien.
+pub fn renderer_a_l_arret_sans_avoir_joue(peak_position_ms: u64, position_prouvee: bool) -> bool {
+    position_prouvee && peak_position_ms == 0
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must
@@ -956,6 +981,23 @@ pub fn position_confirms_transition(
                 && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
 }
 
+/// Fil 2062 / #5550 — la durée que la sortie RAPPORTE doit-elle devenir celle
+/// de la piste en cours ?
+///
+/// Seulement pour une piste de serveur UPnP (`source = "upnp"`) partie SANS
+/// durée (`duree_connue_ms == 0`) : une durée connue n'est jamais contredite,
+/// et une radio n'en a pas. Jamais une fois la suivante armée
+/// (`gapless_sent`) : le renderer peut alors déjà parler de la suivante.
+pub fn duree_rapportee_a_adopter(
+    source: Option<&str>,
+    duree_connue_ms: u64,
+    duree_rapportee_ms: u64,
+    gapless_sent: bool,
+) -> Option<u64> {
+    (source == Some("upnp") && duree_connue_ms == 0 && duree_rapportee_ms > 0 && !gapless_sent)
+        .then_some(duree_rapportee_ms)
+}
+
 /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
 /// the final `GAPLESS_WINDOW_MS` of the track and gapless is not yet armed?
 ///
@@ -1460,6 +1502,82 @@ pub enum EnchainementArme {
     Bascule,
     /// Rien n'atteste l'enchaînement : le repli reste de mise.
     Aucun,
+    /// #5411 — la position est retombée comme à un enchaînement, mais le
+    /// renderer nomme encore le flux de la piste FINIE : l'avance de l'écran
+    /// est provisoire, surveillée comme une bascule (voir
+    /// [`renderer_rejoue_la_piste_finie`]).
+    RejeuDeLaPisteFinie,
+}
+
+/// #5411 (fil 2031) — la retombée de position que le sondeur s'apprête à
+/// prendre pour un enchaînement est-elle en fait un REJEU de la piste finie ?
+///
+/// Vrai seulement si le renderer le DIT : son URI courante nomme le flux de
+/// la piste qui vient de finir, et pas le flux armé. Un renderer muet sur son
+/// URI, ou qui nomme le flux armé, n'est jamais soupçonné : l'avance d'avant
+/// s'applique, au mot près. En répétition d'une piste, rejouer la piste finie
+/// est précisément ce qu'on attend : jamais soupçonné non plus.
+pub fn renderer_rejoue_la_piste_finie(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_arme: Option<&str>,
+    repetition_d_une_piste: bool,
+) -> bool {
+    !repetition_d_une_piste
+        && uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, flux_arme)
+}
+
+/// #5411 — au-delà de cette position, un renderer n'est plus « reparti du
+/// début » : la surveillance dure trois à huit secondes, un rejeu s'y voit
+/// bien en deçà.
+pub const REJEU_DEPUIS_LE_DEBUT_MAX_MS: u64 = 15_000;
+
+/// #5411 — débit minimal (octets par seconde, depuis le début de la
+/// surveillance) sur le flux ADOPTÉ pour dire que le renderer le consomme :
+/// 16 000 o/s, soit 128 kbit/s, le plus bas des débits de lecture servis
+/// (MP3 128 k). Un renderer qui rejoue la piste finie ne tire rien du flux
+/// adopté ; un renderer qui a vraiment enchaîné le tire au moins au débit de
+/// lecture, même quand sa `TrackURI` est en retard. C'est un DÉBIT, pas un
+/// volume : le compteur cumule toutes les connexions, sondages compris.
+pub const DEBIT_SOUTENU_MIN_OCTETS_S: u64 = 16_000;
+
+/// #5411 — le flux adopté est-il tiré à un débit soutenu depuis le début de
+/// la surveillance ? Moins d'une demi-seconde de recul : on ne sait pas, donc
+/// non (la décision attend de toute façon son délai pour infirmer).
+pub fn debit_soutenu(octets_depuis_adoption: Option<u64>, age_ms: u64) -> bool {
+    age_ms >= 500
+        && octets_depuis_adoption
+            .is_some_and(|o| o.saturating_mul(1000) / age_ms >= DEBIT_SOUTENU_MIN_OCTETS_S)
+}
+
+/// #5411 — le rejeu de la piste finie est-il AVÉRÉ ? Les trois signes
+/// ensemble, aucun seul :
+///
+/// 1. l'URI courante nomme le flux de la piste finie, pas le flux adopté ;
+/// 2. la position a RECULÉ : revenue près de zéro
+///    ([`REJEU_DEPUIS_LE_DEBUT_MAX_MS`]), loin de la position de référence
+///    (la fin de la piste finie). Un renderer figé en fin de piste (le
+///    DMP-A6 de #4382 : URI de N, position gelée à la durée) n'en relève
+///    pas ;
+/// 3. aucun débit soutenu sur le flux adopté ([`debit_soutenu`]). Un
+///    renderer qui a vraiment enchaîné mais rapporte sa `TrackURI` en retard
+///    tire le flux adopté : il n'en relève pas.
+///
+/// Faux dans tout autre cas : la règle d'avant s'applique.
+pub fn rejeu_de_la_piste_finie_avere(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_adopte: &str,
+    position_ms: u64,
+    position_de_reference_ms: u64,
+    debit_soutenu_sur_le_flux_adopte: bool,
+) -> bool {
+    uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, Some(flux_adopte))
+        && position_ms <= REJEU_DEPUIS_LE_DEBUT_MAX_MS
+        && position_ms.saturating_add(MOUVEMENT_MINIMAL_MS) <= position_de_reference_ms
+        && !debit_soutenu_sur_le_flux_adopte
 }
 
 /// #3967 — a-t-on le droit de demander au renderer de basculer LUI-MÊME sur
@@ -1568,11 +1686,22 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
 /// surveillance, une position gelée à l'ancienne durée finirait par passer
 /// pour la fin de la piste adoptée et la file sauterait un titre.
+///
+/// 🔴 Fil 2031 (#5411, Sony BD-P2100 en DLNA) : « à la fin du morceau N, le
+/// N+1 est en surbrillance, mais le N est rejoué du début ; à la fin, le N+2
+/// est joué ». Un renderer qui REPART DE ZÉRO SUR LA PISTE FINIE bouge, lui
+/// aussi : sa position quitte la valeur gelée. Quand ce rejeu est AVÉRÉ
+/// (`rejeu_avere`, voir [`rejeu_de_la_piste_finie_avere`] : URI de la piste
+/// finie, position revenue près de zéro, AUCUN débit soutenu sur le flux
+/// adopté), ce mouvement ne vaut pas signe de vie, et le délai écoulé, le
+/// repli joue la piste adoptée. Hors de ce cas, la règle d'avant, au mot près.
+#[allow(clippy::too_many_arguments)]
 pub fn suite_de_l_adoption(
     position_ms: u64,
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
+    rejeu_avere: bool,
     renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
@@ -1581,8 +1710,8 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    let signe_de_vie =
-        uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS;
+    let signe_de_vie = uri_confirme
+        || (!rejeu_avere && position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS);
     if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {

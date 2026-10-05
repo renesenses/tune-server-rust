@@ -97,6 +97,15 @@ pub async fn run_with(opts: RunOptions) {
         std::process::exit(0);
     }
 
+    // #5617 — mode ponctuel « premier accès » de Tune OS : appelé en root par
+    // une unité de l'image, HORS du bac à sable de tune.service, il applique la
+    // politique du mot de passe du compte `tune` puis sort. Même place que
+    // `--version` : avant tout journal, port ou base.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::premier_acces_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_premier_acces());
+    }
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]

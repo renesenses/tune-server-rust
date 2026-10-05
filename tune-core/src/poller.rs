@@ -563,6 +563,9 @@ pub struct PositionPoller {
     /// nulle : seules celles-là peuvent être dites « figées à 0 ». Certains
     /// renderers rendent 0 en permanence tout en jouant.
     zones_a_position_prouvee: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5695 — zones PURE verrouillées dont le volume a déjà été réimposé et
+    /// DIT : l'avertissement part une fois par zone, pas à chaque écart.
+    volumes_pure_reimposes: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 /// Une reprise automatique après décrochage du renderer (#4645), telle que
@@ -604,6 +607,7 @@ impl PositionPoller {
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volumes_pure_reimposes: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1003,6 +1007,12 @@ mod demarrage_fige_5522;
 /// #5522 — le banc : vrai sondeur, sortie factice figée à 0.
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
+
+/// #5695 — sous PURE verrouillé, réimposer 100 % au lieu d'adopter le volume
+/// du renderer.
+mod volume_pure_5695;
+#[cfg(test)]
+mod volume_pure_5695_tests;
 
 #[cfg(test)]
 mod tests;

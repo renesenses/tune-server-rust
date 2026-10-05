@@ -112,6 +112,13 @@ pub struct TrackMetadata {
     pub musicbrainz_artist_id: Option<String>,
     pub musicbrainz_album_artist_id: Option<String>,
     pub musicbrainz_release_group_id: Option<String>,
+    /// #5616 — le type de sortie PRIMAIRE lu dans la balise du fichier
+    /// (`RELEASETYPE`, `TXXX:MusicBrainz Album Type`, `----:com.apple.iTunes:
+    /// MusicBrainz Album Type`, `MUSICBRAINZ_ALBUMTYPE`), dans le vocabulaire
+    /// de `albums.release_type`. Voir
+    /// [`crate::metadata::release_type::depuis_valeurs_de_tag`].
+    #[serde(default)]
+    pub release_type: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
     /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
@@ -2021,6 +2028,12 @@ fn dsf_dff_fallback_complete(
     } else {
         (None, None, None, None, None, None)
     };
+    // #5616 — `TXXX:MusicBrainz Album Type` (Picard), même vocabulaire.
+    let mb_release_type = id3_tags
+        .as_ref()
+        .and_then(|tags| tags.get_txxx("MusicBrainz Album Type"))
+        .and_then(|v| release_type::depuis_valeurs_de_tag([v]))
+        .map(|t| t.primaire.as_str().to_string());
 
     Some(TrackMetadata {
         title,
@@ -2058,6 +2071,7 @@ fn dsf_dff_fallback_complete(
         musicbrainz_artist_id: mb_artist_id,
         musicbrainz_album_artist_id: mb_album_artist_id,
         musicbrainz_release_group_id: mb_release_group_id,
+        release_type: mb_release_type,
         isrc,
         has_cover,
         cover_art: None,
@@ -2133,6 +2147,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2276,6 +2291,15 @@ pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u3
         Some(d) => Some(d),
         None => tag,
     }
+}
+
+/// #5616 — le type de sortie que porte un tag lofty, toutes valeurs lues
+/// (Vorbis en porte une par champ, ID3v2.4 les sépare par un nul).
+fn type_de_sortie_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
+    release_type::depuis_valeurs_de_tag(
+        tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
+    )
+    .map(|t| t.primaire.as_str().to_string())
 }
 
 /// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
@@ -2546,6 +2570,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2652,6 +2677,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2726,6 +2752,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -3524,6 +3551,8 @@ mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
 mod label_tests_4836;
+#[cfg(test)]
+mod type_de_sortie_tests_5616;
 
 /// Les balises d'un fichier, lues par lofty sans charger les images.
 ///
@@ -3870,6 +3899,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: get(ItemKey::MusicBrainzArtistId),
         musicbrainz_album_artist_id: get(ItemKey::MusicBrainzReleaseArtistId),
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
+        release_type: type_de_sortie_de_la_balise(tag),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         // Capture the embedded cover from this same lofty pass so the scanner
@@ -3921,6 +3951,22 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     };
 
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
+    // #5160 — une clé de crédit REPÉTABLE. Vorbis (et APE, MP4) écrivent un
+    // interprète par trame : `PERFORMER=A (bass)`, `PERFORMER=B (drums)`.
+    // `get_string` ne rend que la première, et les suivantes étaient perdues à
+    // l'ingestion. Toutes les trames sont gardées, dans l'ordre du fichier,
+    // jointes par « ; » — le séparateur que la route des crédits découpe déjà
+    // (`routes/library/credits.rs`). Une trame unique est rendue telle quelle,
+    // `;` compris. Les doublons exacts et les trames vides sont écartés.
+    let toutes = |key: ItemKey| -> Option<String> {
+        let mut valeurs: Vec<&str> = Vec::new();
+        for v in tag.get_strings(key).map(str::trim) {
+            if !v.is_empty() && !valeurs.contains(&v) {
+                valeurs.push(v);
+            }
+        }
+        (!valeurs.is_empty()).then(|| valeurs.join("; "))
+    };
 
     // Sort-order fields
     if let Some(v) = get(ItemKey::TrackArtistSortOrder) {
@@ -3943,7 +3989,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Lyricist) {
         meta.insert("lyricist".into(), v);
     }
-    if let Some(v) = get(ItemKey::Performer) {
+    if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
     }
     if let Some(v) = get(ItemKey::Remixer) {
@@ -3952,7 +3998,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
-    if let Some(v) = get(ItemKey::Producer) {
+    if let Some(v) = toutes(ItemKey::Producer) {
         meta.insert("producer".into(), v);
     }
 
@@ -7199,6 +7245,107 @@ mod tests_drapeau_compilation {
             try_read_metadata(&faux).unwrap().compilation,
             Some(false),
             "cpil=0 doit rendre faux"
+        );
+    }
+}
+
+/// #5160 — des trames PERFORMER et PRODUCER RÉPÉTÉES, sans « ; », sur un vrai
+/// FLAC (la fixture du dépôt, retaguée par lofty) relu par la fonction de
+/// production. Avant le correctif, seule la première trame de chaque clé
+/// entrait dans `track_metadata`.
+#[cfg(test)]
+mod credits_repetes_5160 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+
+    /// Une copie de la fixture FLAC portant les trames données, une par
+    /// entrée, dans cet ordre.
+    fn flac_avec_trames(
+        epreuve: &str,
+        trames: &[(&str, &str)],
+    ) -> crate::test_scratch::ScratchFile {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let copie =
+            crate::test_scratch::scratch_file(&format!("credits5160-{epreuve}"), "-test.flac");
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        let chemin: &std::path::Path = &copie;
+        let mut fh = std::fs::File::open(chemin).expect("ouverture du gabarit");
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+        drop(fh);
+        if flac.vorbis_comments().is_none() {
+            flac.set_vorbis_comments(VorbisComments::default());
+        }
+        let vc = flac.vorbis_comments_mut().expect("bloc Vorbis Comment");
+        for (cle, valeur) in trames {
+            // `push` et non `insert` : `insert` REMPLACE la trame existante,
+            // et le témoin n'aurait plus qu'une valeur à relire.
+            vc.push((*cle).to_string(), (*valeur).to_string());
+        }
+        flac.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+        copie
+    }
+
+    #[test]
+    fn les_trames_repetees_sans_point_virgule_sont_toutes_gardees() {
+        let chemin = flac_avec_trames(
+            "repetees",
+            &[
+                ("PERFORMER", "Christian McBride (bass)"),
+                ("PERFORMER", "Nasheet Waits (drums)"),
+                ("PRODUCER", "Christian McBride"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)"),
+            "#5160 — la seconde trame PERFORMER est perdue. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Christian McBride; Todd Whitelock"),
+            "#5160 — la seconde trame PRODUCER est perdue. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN VERT — une trame unique qui porte déjà ses « ; » sort telle
+    /// quelle : le format de Reivax66 (fil 1965) ne bouge pas.
+    #[test]
+    fn une_trame_unique_avec_point_virgule_sort_intacte() {
+        let chemin = flac_avec_trames(
+            "unique",
+            &[(
+                "PERFORMER",
+                "Christian McBride (bass); Nasheet Waits (drums)",
+            )],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)")
+        );
+        assert_eq!(meta.get("producer"), None, "aucun producteur inventé");
+    }
+
+    /// Une trame répétée à l'identique ne fabrique pas un doublon.
+    #[test]
+    fn une_trame_dupliquee_ne_se_compte_qu_une_fois() {
+        let chemin = flac_avec_trames(
+            "doublon",
+            &[
+                ("PRODUCER", "Todd Whitelock"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Todd Whitelock")
         );
     }
 }
