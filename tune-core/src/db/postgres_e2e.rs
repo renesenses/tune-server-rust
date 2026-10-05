@@ -2970,3 +2970,16 @@ async fn pg_2094_sous_titres_des_disques_d_un_coffret() {
     reset_schema(&db);
     crate::db::coffrets_auto::tests::scenario_sous_titres_2094(&db);
 }
+
+/// Fil 2094 — le rattrapage des sous-titres des coffrets composés avant, sur
+/// le VRAI moteur : marqueur de `settings`, `SELECT DISTINCT` sur
+/// `COALESCE(file_path, cue_media_path)`, disposition retenue. Même scénario
+/// que `rattrapage_sous_titres_2094_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2094_rattrapage_des_sous_titres_des_coffrets() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_rattrapage_sous_titres_2094(&db);
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_disque_tardif_2094(&db);
+}

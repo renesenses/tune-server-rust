@@ -377,11 +377,22 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
         .flatten()
         .map(|a| a.title)
         .unwrap_or_else(|| c.titre.clone());
-    let sous_titres =
-        poser_les_sous_titres(db, cible, &disques, &titre_du_coffret).unwrap_or_else(|e| {
+    let mut sous_titres = poser_les_sous_titres(db, cible, &disques, &titre_du_coffret)
+        .unwrap_or_else(|e| {
             tracing::warn!(album = cible, erreur = %e, "coffret_sous_titres_non_poses");
             Vec::new()
         });
+    // Un coffret déjà réuni auquel s'ajoute un disque arrivé plus tard : ses
+    // disques portent DÉJÀ les sous-titres de la première réunion, que
+    // `poser_les_sous_titres` ne repose donc pas. Sans les reprendre de son
+    // marqueur, « Défaire » ne les retirerait plus.
+    for &(_, id) in &c.disques {
+        if let Some(m) = inv.marqueurs.get(&id).filter(|m| m.est_auto()) {
+            sous_titres.extend(m.sous_titres.iter().copied());
+        }
+    }
+    sous_titres.sort_unstable();
+    sous_titres.dedup();
     let marqueur = Marqueur {
         origine: ORIGINE_AUTO.into(),
         cle: c.cle.clone(),
@@ -499,6 +510,181 @@ pub fn retirer_les_sous_titres(
         db.execute(&sql, &[&d.titre.trim().to_string() as &dyn ToSqlValue])?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rattrapage des coffrets composés AVANT le fil 2094
+// ---------------------------------------------------------------------------
+
+/// Clé de `settings` qui marque le rattrapage des sous-titres comme fait : il
+/// ne se rejoue pas à chaque démarrage (même modèle que
+/// `reparation_file_first_seen_5389`).
+pub const CLE_RATTRAPAGE_SOUS_TITRES_2094: &str = "rattrapage_sous_titres_coffrets_2094";
+
+/// Ce que le rattrapage a fait — et ce qu'il a laissé, par raison.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RattrapageSousTitres {
+    /// Le marqueur de `settings` était déjà posé : rien n'a été lu ni écrit.
+    pub deja_fait: bool,
+    /// Coffrets examinés (tout album qui porte un marqueur `coffret`).
+    pub coffrets: usize,
+    /// Coffrets dont au moins un disque a reçu son sous-titre.
+    pub coffrets_rattrapes: usize,
+    /// Disques sous-titrés par ce rattrapage.
+    pub disques_sous_titres: usize,
+    /// Coffrets dont le marqueur ne retient AUCUN titre d'origine : coffret
+    /// manuel composé avant #5319, ou formé par « attacher ». Rien à poser.
+    pub titres_inconnus: usize,
+    /// Disques laissés parce que leurs pistes ne sont plus dans le dossier
+    /// que le marqueur retient : disques renumérotés ou déplacés depuis la
+    /// composition, le titre d'origine ne désigne plus sûrement ce disque.
+    pub disques_deplaces: usize,
+    /// Coffrets sur lesquels une écriture a échoué.
+    pub echecs: usize,
+}
+
+/// Fil 2094 — les coffrets composés AVANT que la composition pose les
+/// sous-titres de disque ([`poser_les_sous_titres`]) n'en ont aucun : une
+/// passe UNIQUE leur applique la même règle.
+///
+/// Pour chaque album marqué `coffret`, automatique ou manuel :
+/// - le titre d'origine de chaque disque, lu dans le marqueur, devient son
+///   sous-titre — pas s'il est identique au titre que porte le coffret, jamais
+///   sur un disque qui porte déjà un nom ;
+/// - les numéros sous-titrés rejoignent `Marqueur::sous_titres`, pour que
+///   « Défaire » retire exactement ceux-là ;
+/// - si la disposition de l'album est TENUE (coffret manuel, ou disposé à la
+///   main), elle est retenue à nouveau, nom de disque compris : sans cela, la
+///   relecture des fichiers rendrait au disque le nom (vide) retenu avant.
+///
+/// Un disque dont les pistes ne vivent plus dans le dossier que le marqueur
+/// retient est laissé : renuméroté depuis, son numéro ne désigne plus le
+/// disque d'origine. Un coffret dont le marqueur ne retient aucun disque est
+/// laissé aussi : son titre d'origine a disparu avec l'album absorbé.
+///
+/// Aucun fichier n'est lu. Le marqueur de `settings` n'est posé que si aucun
+/// coffret n'a échoué : sinon le rattrapage repasse au démarrage suivant, sans
+/// risque, puisqu'un disque déjà nommé n'est jamais renommé.
+pub fn rattraper_les_sous_titres(
+    db: &Arc<dyn DbBackend>,
+) -> Result<RattrapageSousTitres, TuneError> {
+    let reglages = SettingsRepo::with_backend(db.clone());
+    if reglages.get(CLE_RATTRAPAGE_SOUS_TITRES_2094)?.is_some() {
+        return Ok(RattrapageSousTitres {
+            deja_fait: true,
+            ..Default::default()
+        });
+    }
+    let mut tous: Vec<(i64, Marqueur)> = marqueurs(db)?.into_iter().collect();
+    tous.sort_by_key(|(id, _)| *id);
+    let mut r = RattrapageSousTitres::default();
+    for (id, mut m) in tous {
+        r.coffrets += 1;
+        if m.disques.is_empty() {
+            r.titres_inconnus += 1;
+            continue;
+        }
+        match rattraper_un_coffret(db, id, &mut m) {
+            Ok((poses, deplaces)) => {
+                r.disques_deplaces += deplaces;
+                if poses > 0 {
+                    r.coffrets_rattrapes += 1;
+                    r.disques_sous_titres += poses;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(album = id, erreur = %e, "coffret_sous_titres_rattrapage_echoue");
+                r.echecs += 1;
+            }
+        }
+    }
+    if r.echecs == 0 {
+        reglages.set(CLE_RATTRAPAGE_SOUS_TITRES_2094, "1")?;
+    }
+    Ok(r)
+}
+
+/// Un coffret : rend `(disques sous-titrés, disques laissés car déplacés)`.
+fn rattraper_un_coffret(
+    db: &Arc<dyn DbBackend>,
+    id: i64,
+    m: &mut Marqueur,
+) -> Result<(usize, usize), TuneError> {
+    let Some(album) = AlbumRepo::with_backend(db.clone()).get(id)? else {
+        return Ok((0, 0));
+    };
+    let mut retenus = Vec::new();
+    let mut deplaces = 0usize;
+    for d in &m.disques {
+        if m.sous_titres.contains(&d.n) {
+            continue;
+        }
+        if disque_a_sa_place(db, id, d)? {
+            retenus.push(d.clone());
+        } else {
+            deplaces += 1;
+        }
+    }
+    let poses = poser_les_sous_titres(db, id, &retenus, &album.title)?;
+    if poses.is_empty() {
+        return Ok((0, deplaces));
+    }
+    m.sous_titres.extend(poses.iter().copied());
+    m.sous_titres.sort_unstable();
+    m.sous_titres.dedup();
+    let json = serde_json::to_string(m).map_err(|e| TuneError::from(e.to_string()))?;
+    AlbumMetadataRepo::with_backend(db.clone()).set(id, CLE_COFFRET, &json)?;
+    super::edition_album::retenir_les_noms_de_disque(db, id)?;
+    Ok((poses.len(), deplaces))
+}
+
+/// Les pistes du disque `d.n` de l'album vivent-elles toutes dans le dossier
+/// que le marqueur retient pour ce disque ? Vrai sans dossier retenu, ou sans
+/// piste à chemin (rien ne contredit alors le marqueur).
+fn disque_a_sa_place(
+    db: &Arc<dyn DbBackend>,
+    album: i64,
+    d: &DisqueRetenu,
+) -> Result<bool, TuneError> {
+    if d.dossier.trim().is_empty() {
+        return Ok(true);
+    }
+    let (p1, p2) = placeholders(db);
+    let sql = format!(
+        "SELECT DISTINCT {c} FROM tracks t WHERE t.album_id = {p1} \
+         AND COALESCE(t.disc_number, 1) = {p2} AND {c} IS NOT NULL",
+        c = chemin_ouvrable!(),
+    );
+    let rows = db.query_many(&sql, &[&album as &dyn ToSqlValue, &(d.n as i64)])?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .all(|chemin| meme_dossier(dossier_de(&chemin), Some(&d.dossier))))
+}
+
+/// Le rattrapage, journalisé — la forme qu'appelle le démarrage. Une erreur
+/// se journalise et ne remonte pas : elle ne bloque jamais le démarrage.
+pub fn rattrapage_journalise(db: &Arc<dyn DbBackend>) -> RattrapageSousTitres {
+    match rattraper_les_sous_titres(db) {
+        Ok(r) => {
+            if !r.deja_fait {
+                tracing::info!(
+                    coffrets = r.coffrets,
+                    coffrets_rattrapes = r.coffrets_rattrapes,
+                    disques_sous_titres = r.disques_sous_titres,
+                    titres_inconnus = r.titres_inconnus,
+                    disques_deplaces = r.disques_deplaces,
+                    echecs = r.echecs,
+                    "coffrets_sous_titres_rattrapage_2094"
+                );
+            }
+            r
+        }
+        Err(e) => {
+            tracing::warn!(erreur = %e, "coffrets_sous_titres_rattrapage_2094_echec");
+            RattrapageSousTitres::default()
+        }
+    }
 }
 
 /// Ce que la passe a fait — et ce qu'elle a laissé, par raison.

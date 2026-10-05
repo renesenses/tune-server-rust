@@ -420,6 +420,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // « distinctes », que la passe consulte. Idempotente : sur une base déjà
     // passée, trois lectures et rien d'écrit.
     tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
+    // Fil 2094 — une seule fois (marqueur dans `settings`) : les coffrets
+    // composés avant que la composition pose les sous-titres de disque les
+    // reçoivent. APRÈS la passe, dans le même fil : les deux écrivent le
+    // marqueur `coffret`. Une erreur se journalise, le démarrage continue.
+    tune_core::db::coffrets_auto::rattrapage_journalise(&state.backend);
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;

@@ -341,6 +341,20 @@ pub fn tenir_la_disposition(
     figer(db, album_id, &heritage)
 }
 
+/// Fil 2094 — après que des noms de disque ont été posés sur un album DÉJÀ
+/// composé (rattrapage des coffrets) : si sa disposition est tenue, elle est
+/// retenue à nouveau depuis les pistes actuelles, noms de disque compris, et
+/// ses renommages de pistes sont repris. Sinon la relecture des fichiers
+/// rendrait à chaque disque le nom retenu AVANT, c'est-à-dire aucun. Un
+/// album sans disposition tenue n'est pas touché : on n'en crée pas.
+pub fn retenir_les_noms_de_disque(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<(), TuneError> {
+    let tenue = lire_edition(db, album_id)?;
+    if !tenue.disposition {
+        return Ok(());
+    }
+    figer(db, album_id, &[&tenue])
+}
+
 // ---------------------------------------------------------------------------
 // Les TENUES — ce que les analyses n'écrasent plus
 // ---------------------------------------------------------------------------
