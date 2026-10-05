@@ -108,6 +108,11 @@ pub struct AppState {
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub upnp_index_lock: Arc<Mutex<()>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
+    /// Le dernier `Seek` reçu par la route, par zone : sa position et son
+    /// heure d'arrivée. Sert à ne pas envoyer deux fois au renderer le MÊME
+    /// déplacement reçu deux fois coup sur coup (ticket 193, voir
+    /// [`crate::routes::playback::seek_en_double`]).
+    pub derniers_seeks: Arc<std::sync::Mutex<HashMap<i64, (u64, Instant)>>>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -573,6 +578,7 @@ impl AppState {
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
+            derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),

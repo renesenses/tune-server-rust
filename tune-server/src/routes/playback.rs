@@ -2,6 +2,9 @@
 #[path = "playback/album_ref_bandcamp_2121_tests.rs"]
 mod album_ref_bandcamp_2121_tests;
 #[cfg(test)]
+#[path = "playback/seek_en_double_193_tests.rs"]
+mod seek_en_double_193_tests;
+#[cfg(test)]
 #[path = "playback/session_locale_tests.rs"]
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
@@ -3493,6 +3496,39 @@ async fn previous(
     Json(json!({ "status": "playing", "queue_position": prev_pos })).into_response()
 }
 
+/// Fenêtre pendant laquelle un second `Seek` vers la MÊME position, sur la
+/// même zone, est tenu pour un doublon du premier.
+const FENETRE_SEEK_EN_DOUBLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Ticket 193 — le même `Seek` reçu deux fois coup sur coup ne part qu'une
+/// fois vers la sortie.
+///
+/// Un simple clic sur la barre de progression du client web envoie DEUX
+/// `POST /seek` à la même position : `mouseup` (fin d'un glisser de longueur
+/// nulle) puis `click`. Le journal du ticket montre les deux à 149 ms
+/// d'écart, donc deux `Seek` SOAP au renderer, donc deux recherches par le
+/// lecteur du renderer, chacune relayée en requêtes de plage vers le CDN.
+/// Le second n'apporte rien : la position demandée est déjà celle du premier.
+///
+/// Rend `true` pour un doublon (à ne pas transmettre). Sinon note ce `Seek`
+/// comme le dernier de la zone et rend `false`. Une position différente, ou
+/// la même au-delà de la fenêtre, passe toujours.
+pub(crate) fn seek_en_double(
+    registre: &mut std::collections::HashMap<i64, (u64, std::time::Instant)>,
+    zone_id: i64,
+    position_ms: u64,
+    maintenant: std::time::Instant,
+) -> bool {
+    if let Some(&(position, recu)) = registre.get(&zone_id)
+        && position == position_ms
+        && maintenant.saturating_duration_since(recu) < FENETRE_SEEK_EN_DOUBLE
+    {
+        return true;
+    }
+    registre.insert(zone_id, (position_ms, maintenant));
+    false
+}
+
 async fn seek(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -3504,6 +3540,24 @@ async fn seek(
         return refus;
     }
     let position_ms = body.position_ms as u64;
+    // Ticket 193 — relevé à l'ARRIVÉE, avant d'attendre la sortie : le doublon
+    // arrive pendant que le premier `Seek` tient encore le renderer.
+    let en_double = {
+        let mut registre = state
+            .derniers_seeks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seek_en_double(
+            &mut registre,
+            zone_id,
+            position_ms,
+            std::time::Instant::now(),
+        )
+    };
+    if en_double {
+        info!(zone_id, position_ms, "seek_en_double_ignore");
+        return Json(json!({ "position_ms": position_ms })).into_response();
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
