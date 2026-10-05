@@ -367,7 +367,7 @@ impl PlaybackOrchestrator {
         // Playing is never blanked and end detection has a duration.
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
-            if let Some(svc) = registry.get(&prefetched.source) {
+            if let Some(svc) = registry.get_actif(&prefetched.source).await {
                 let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
