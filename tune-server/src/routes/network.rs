@@ -1239,10 +1239,7 @@ async fn mount_smb_share(
 
         let mut dernier = None;
         for dialecte in smb::DIALECTES {
-            let mut opts = format!("username={user},password={pass}");
-            if let Some(v) = dialecte {
-                opts.push_str(&format!(",vers={v}"));
-            }
+            let opts = smb::options_de_montage(user, pass, dialecte);
             // JAMAIS `opts` dans une trace : il porte le mot de passe.
             info!(
                 host = %body.host,
