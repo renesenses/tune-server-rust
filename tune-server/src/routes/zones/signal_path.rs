@@ -692,10 +692,16 @@ pub(super) fn build_signal_path(
     // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
     // se rend en fin de fonction, une fois les étapes décrites.
     let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
+    // Fil 2161 — le PCM ALSA réellement visé : `alsa:default` est un greffon
+    // (dmix, PipeWire) qui convertit à SA cadence, `hw:` est le DAC.
+    let pcm_local = (output_type == "local")
+        .then(|| pcm_de_la_zone_locale(zone.output_device_id.as_deref()))
+        .flatten();
     let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
         output_type,
         audio_backend,
         runtime_signal_path,
+        pcm_local.as_deref(),
         &source,
         &forcages,
     );
@@ -1605,15 +1611,22 @@ fn rendre_les_verdicts(
 /// le mode partagé, et on le NOMME : c'est la seule ligne du panneau qui dise
 /// à l'auditeur que « Mode Audiophile » n'a pas pris le périphérique — le
 /// réglage qui le prend s'appelle « Exclusif (bit-perfect) », ailleurs.
+///
+/// Fil 2161 — `pcm_alsa` : le PCM ALSA que la zone ouvre (`alsa:default`,
+/// `alsa:hw:CARD=0,DEV=0`), tel que le parc l'a retenu. Un PCM qui n'est pas
+/// `hw:` est un greffon logiciel et se nomme comme tel, au même titre que le
+/// mode partagé de WASAPI.
 pub(super) fn etiquette_du_transport_local<'a>(
     audio_backend: &'a str,
     exclusif_observe: bool,
+    pcm_alsa: Option<&str>,
 ) -> &'a str {
     match audio_backend {
         "ASIO" => "ASIO (exclusive)",
         "WASAPI" if exclusif_observe => "WASAPI (exclusive)",
         "WASAPI" => "WASAPI (shared \u{2014} Windows mixer)",
         "CoreAudio" => "CoreAudio",
+        "ALSA" if pcm_alsa_est_un_greffon(pcm_alsa) => "ALSA (shared \u{2014} software mixer)",
         "ALSA" => "ALSA",
         other => other,
     }
@@ -1622,17 +1635,63 @@ pub(super) fn etiquette_du_transport_local<'a>(
 /// #4172 — sans contrat de signal, le transport local est-il intact ?
 ///
 /// WASAPI : non — le mode partagé passe par le mixeur Windows (flottant,
-/// volume de session, mélange, cadence du mixeur). CoreAudio et ALSA sans
-/// contrat : inchangé, `true` — ces chemins n'ont pas de mixeur imposé de la
-/// même façon et rien de mesuré ne dit le contraire.
-pub(super) fn transport_partage_est_intact(audio_backend: &str) -> bool {
-    audio_backend != "WASAPI"
+/// volume de session, mélange, cadence du mixeur). CoreAudio sans contrat :
+/// inchangé, `true` — rien de mesuré ne dit le contraire.
+///
+/// ALSA (fil 2161) : intact seulement si la zone ouvre le PCM MATÉRIEL, ou si
+/// son PCM est inconnu (comportement d'avant). Un greffon (`default`,
+/// `dmix:`, `plughw:`, `pipewire`, `pulse`…) accepte toutes les cadences et
+/// convertit vers la sienne : `dmix` est fixé à 48 kHz
+/// (`defaults.pcm.dmix.rate`). Gérard (Eversolo DAC-Z8, Tune OS, rc2) : zone
+/// sur `alsa:default`, Tune ouvre 44,1 kHz, le DAC affiche 48 kHz, et le
+/// panneau disait « ALSA », bit-perfect, 44,1 kHz.
+pub(super) fn transport_partage_est_intact(audio_backend: &str, pcm_alsa: Option<&str>) -> bool {
+    match audio_backend {
+        "WASAPI" => false,
+        "ALSA" => !pcm_alsa_est_un_greffon(pcm_alsa),
+        _ => true,
+    }
+}
+
+/// Fil 2161 — ce PCM ALSA est-il un greffon logiciel, et non le matériel ?
+///
+/// `None` (PCM inconnu : parc pas encore publié, zone sans périphérique) ne
+/// conclut rien et rend `false`. Même critère que la découverte
+/// (`alsa_pcm_is_direct_hardware`) : seul `hw:` atteint le pilote sans
+/// conversion.
+pub(super) fn pcm_alsa_est_un_greffon(pcm_alsa: Option<&str>) -> bool {
+    use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa as nom_du_pcm};
+    pcm_alsa
+        .map(|endpoint| greffon_alsa(nom_du_pcm(endpoint.trim())))
+        .is_some_and(|greffon| !greffon.is_empty() && !greffon.eq_ignore_ascii_case("hw"))
+}
+
+/// Fil 2161 — le PCM ALSA que la zone locale `output_device_id` ouvre, lu dans
+/// le DERNIER parc publié (aucune énumération : même règle que
+/// `canaux_des_peripheriques_locaux`). `None` hors `local-audio`, pour une
+/// zone non locale, ou quand le parc ne connaît pas l'appareil.
+pub(super) fn pcm_de_la_zone_locale(output_device_id: Option<&str>) -> Option<String> {
+    let nom = output_device_id?.strip_prefix("local:")?;
+    #[cfg(feature = "local-audio")]
+    {
+        tune_core::outputs::local::cached_audio_devices()
+            .into_iter()
+            .find(|appareil| appareil.name == nom)
+            .map(|appareil| appareil.endpoint_id)
+            .filter(|endpoint| !endpoint.is_empty())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = nom;
+        None
+    }
 }
 
 fn decrire_le_transport<'a>(
     output_type: &'a str,
     audio_backend: &'a str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
+    pcm_local: Option<&str>,
     source: &Source,
     forcages: &Forcages,
 ) -> (bool, &'a str, &'static str) {
@@ -1760,10 +1819,11 @@ fn decrire_le_transport<'a>(
             // panneau disait « WASAPI », bit-perfect. Il dit désormais le
             // mode, et le verdict qui va avec.
             let exclusif_observe = runtime_signal_path.is_some();
-            let transport = etiquette_du_transport_local(audio_backend, exclusif_observe);
+            let transport =
+                etiquette_du_transport_local(audio_backend, exclusif_observe, pcm_local);
             let intact = match runtime_signal_path {
                 Some(status) => runtime_transport_is_intact(status),
-                None => transport_partage_est_intact(audio_backend),
+                None => transport_partage_est_intact(audio_backend, pcm_local),
             };
             (intact, transport, format_name)
         }
