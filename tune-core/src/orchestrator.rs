@@ -1584,6 +1584,9 @@ mod repli_de_peripherique;
 mod resolve_stream;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
 mod relance_ytdlp_4366;
+// Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
+#[cfg(test)]
+mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
 
