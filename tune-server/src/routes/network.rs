@@ -59,6 +59,13 @@ pub fn router() -> Router<AppState> {
         .route("/scan-host", get(scan_host))
         .route("/smb/discover", get(list_smb_shares).post(trigger_smb_scan))
         .route("/smb/mounts", get(list_smb_mounts))
+        // Fil 2145 : « Oublier ce partage » DEMONTE puis supprime la ligne.
+        // `DELETE /mounts/{id}` supprime la ligne sans demonter : le partage
+        // restait monte, invisible, jusqu'au prochain redemarrage.
+        .route(
+            "/smb/mounts/{id}",
+            axum::routing::delete(oublier_un_partage),
+        )
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
         // Phase 2 du chantier `unifier-serveurs-upnp-et-bibliotheque` :
@@ -185,6 +192,145 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
         )
         .ok();
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize, Default)]
+struct OublierQuery {
+    /// L'utilisateur a confirme : des racines de la bibliotheque dependent du
+    /// partage.
+    #[serde(default)]
+    confirmer: bool,
+}
+
+/// Les racines de la bibliotheque qui vivent sous `mount_path` (le point
+/// lui-meme, ou un dossier en dessous). Comparaison sur chemins normalises,
+/// au separateur pres : `/mnt/nas_Music2` ne depend pas de `/mnt/nas_Music`.
+pub(crate) fn racines_dependantes(music_dirs: &[String], mount_path: &str) -> Vec<String> {
+    use tune_core::scanner::walker::normalize_path;
+    let point = normalize_path(mount_path);
+    let point = point.trim_end_matches(['/', '\\']);
+    if point.is_empty() {
+        return Vec::new();
+    }
+    music_dirs
+        .iter()
+        .filter(|d| {
+            let d = normalize_path(d);
+            let d = d.trim_end_matches(['/', '\\']);
+            d == point
+                || d.strip_prefix(point)
+                    .is_some_and(|reste| reste.starts_with(['/', '\\']))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `DELETE /network/smb/mounts/{id}` — « Oublier ce partage » (fil 2145).
+///
+/// Dans cet ordre : refuser si une racine de la bibliotheque en depend et que
+/// l'utilisateur n'a pas confirme (409, avec la liste) ; demonter si le point
+/// est monte ; supprimer la ligne ; retirer le point de montage s'il est vide.
+///
+/// Un demontage qui echoue garde la ligne : supprimer d'abord laisserait un
+/// partage monte que plus rien ne nomme, ni l'ecran ni le demarrage.
+///
+/// Les racines dependantes ne sont PAS retirees de la bibliotheque : leur
+/// sort (garder les pistes ou non) est le geste « retirer un dossier », avec
+/// sa propre confirmation de purge. Une racine absente est protegee de la
+/// purge par le scan (`verdict_purge`, #1652).
+async fn oublier_un_partage(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<OublierQuery>,
+) -> axum::response::Response {
+    use tune_core::db::backend::ToSqlValue;
+    let ligne = state
+        .backend
+        .query_one(
+            "SELECT mount_path FROM network_mounts WHERE id = ? AND mount_type = 'smb'",
+            &[&id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten();
+    let Some(mount_path) = ligne.and_then(|r| r.first().and_then(|v| v.as_string())) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "partage_inconnu", "message": "Ce partage n'est plus enregistré." })),
+        )
+            .into_response();
+    };
+
+    let racines = racines_dependantes(
+        &crate::routes::system::get_music_dirs_list(&state.backend),
+        &mount_path,
+    );
+    if !racines.is_empty() && !q.confirmer {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "racines_dependantes",
+                "message": format!(
+                    "{} dossier(s) de la bibliothèque se trouvent sur ce partage.",
+                    racines.len()
+                ),
+                "racines": racines,
+            })),
+        )
+            .into_response();
+    }
+
+    let chemin = std::path::Path::new(&mount_path);
+    let mut demonte = false;
+    if smb::est_un_point_de_montage(chemin) {
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("umount").arg(&mount_path).output(),
+        )
+        .await;
+        let echec = match res {
+            Ok(Ok(out)) if out.status.success() => None,
+            Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("délai dépassé".to_string()),
+        };
+        if let Some(cause) = echec.filter(|_| smb::est_un_point_de_montage(chemin)) {
+            warn!(id, path = %mount_path, error = %cause, "smb_oubli_demontage_echoue");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "demontage_impossible",
+                    "message": format!(
+                        "Impossible de démonter {mount_path} : {cause}. Le partage est conservé."
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        demonte = true;
+    }
+
+    if let Err(e) = state.backend.execute(
+        "DELETE FROM network_mounts WHERE id = ?",
+        &[&id as &dyn ToSqlValue],
+    ) {
+        warn!(id, error = %e, "smb_oubli_suppression_echouee");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "suppression_impossible", "message": e.to_string() })),
+        )
+            .into_response();
+    }
+    // `remove_dir` ne retire qu'un dossier VIDE : jamais de la musique.
+    if !smb::est_un_point_de_montage(chemin) {
+        let _ = std::fs::remove_dir(chemin);
+    }
+    info!(id, path = %mount_path, demonte, racines = racines.len(), "smb_partage_oublie");
+    (
+        StatusCode::OK,
+        Json(json!({ "oublie": true, "demonte": demonte, "racines": racines })),
+    )
+        .into_response()
 }
 
 /// Verser dans le registre DURABLE ce que la découverte tient en mémoire.
@@ -2695,5 +2841,148 @@ mod tests_browse_dit_son_echec_4134 {
         assert!(reponse_porte_un_result(BROWSE_VIDE));
         assert!(!reponse_porte_un_result(SOAP_FAULT));
         assert!(reponse_porte_un_result("<Result xmlns=\"x\"></Result>"));
+    }
+}
+
+/// Fil 2145 : « Oublier ce partage » demonte, puis supprime, et demande
+/// confirmation si la bibliotheque en depend.
+#[cfg(test)]
+mod tests_oubli_2145 {
+    use super::racines_dependantes;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[test]
+    fn une_racine_depend_du_point_ou_d_un_dossier_dessous() {
+        let dirs = vec![
+            "/mnt/nas_Music".to_string(),
+            "/mnt/nas_Music/Jazz/".to_string(),
+            "/mnt/nas_Music2".to_string(),
+            "/home/daniel/Musique".to_string(),
+        ];
+        assert_eq!(
+            racines_dependantes(&dirs, "/mnt/nas_Music/"),
+            vec![
+                "/mnt/nas_Music".to_string(),
+                "/mnt/nas_Music/Jazz/".to_string()
+            ]
+        );
+        assert!(racines_dependantes(&dirs, "/mnt/autre").is_empty());
+        assert!(racines_dependantes(&dirs, "").is_empty());
+    }
+
+    async fn appel(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let rep = app.clone().oneshot(req).await.unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap_or_default())
+    }
+
+    fn lignes(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> usize {
+        backend
+            .query_many("SELECT id FROM network_mounts", &[])
+            .unwrap()
+            .len()
+    }
+
+    /// Un partage non monte, dont une racine de bibliotheque depend : sans
+    /// confirmation, 409 et rien ne bouge ; confirme, la ligne disparait, le
+    /// point vide aussi, et la racine reste declaree.
+    #[tokio::test]
+    async fn oublier_un_partage_demande_confirmation_puis_supprime() {
+        use tune_core::db::backend::ToSqlValue;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let point = tune_core::test_scratch::scratch_dir("tune_oubli_2145").join("nas_Music");
+        std::fs::create_dir_all(&point).unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"192.168.10.69" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![point_s.clone()]).unwrap(),
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "racines_dependantes");
+        assert_eq!(v["racines"][0], point_s.as_str());
+        assert_eq!(lignes(&backend), 1, "rien ne doit bouger sans confirmation");
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}?confirmer=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["oublie"], true);
+        assert_eq!(v["demonte"], false, "le point n'etait pas monte");
+        assert_eq!(lignes(&backend), 0, "la ligne doit etre supprimee");
+        assert!(!point.exists(), "le point de montage vide est retire");
+        assert_eq!(
+            crate::routes::system::get_music_dirs_list(&backend),
+            vec![point_s],
+            "la racine reste declaree : son sort est le geste « retirer un dossier »"
+        );
+
+        let (statut, _) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::NOT_FOUND);
+    }
+
+    /// Sans racine dependante, l'oubli se fait sans confirmation. Un point qui
+    /// porte des fichiers n'est jamais efface.
+    #[tokio::test]
+    async fn sans_racine_l_oubli_est_direct_et_ne_touche_pas_aux_fichiers() {
+        use tune_core::db::backend::ToSqlValue;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let point = tune_core::test_scratch::scratch_dir("tune_oubli_2145_b").join("nas_Music");
+        std::fs::create_dir_all(&point).unwrap();
+        std::fs::write(point.join("residu.flac"), b"x").unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"fd12::58d1" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(lignes(&backend), 0);
+        assert!(
+            point.join("residu.flac").exists(),
+            "aucun fichier ne doit etre efface"
+        );
     }
 }
