@@ -420,6 +420,19 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // « distinctes », que la passe consulte. Idempotente : sur une base déjà
     // passée, trois lectures et rien d'écrit.
     tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
+    // Fil 2094 — une seule fois (marqueur dans `settings`) : les coffrets
+    // composés avant que la composition pose les sous-titres de disque les
+    // reçoivent. APRÈS la passe, qui écrit elle aussi le marqueur `coffret`.
+    // Hors du chemin du démarrage : pour les coffrets sans titres retenus, la
+    // passe relit la balise ALBUM d'une piste par disque, et un partage lent
+    // ne doit pas retenir le serveur. Une erreur se journalise, le démarrage
+    // continue.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::coffrets_auto::rattrapage_journalise(&backend);
+        });
+    }
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
