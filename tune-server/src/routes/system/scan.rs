@@ -2168,7 +2168,7 @@ async fn spawn_library_scan_avec_lecteur(
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
-                let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
+                let mut sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
                 if !is_pg {
                     // Se nommer : tout `write_tx` concurrent echouera tant que ce
                     // lot tient la connexion, et sans cette etiquette son message
@@ -2199,7 +2199,13 @@ async fn spawn_library_scan_avec_lecteur(
                     // Un écrivain (favori, édition, enrichissement…) attend que
                     // ce lot ferme sa transaction : lui céder la place entre deux
                     // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
-                    db.ceder_aux_ecrivains();
+                    // Ticket 190 : une écriture de file en attente de la porte
+                    // passe aussi (`ceder_le_lot`).
+                    crate::sqlite_write_gate::ceder_le_lot(
+                        db.as_ref(),
+                        &mut sqlite_write_guard,
+                        "scan:lot",
+                    );
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -2719,7 +2725,7 @@ async fn spawn_library_scan_avec_lecteur(
 
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
-        let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
+        let mut sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
         if !is_pg {
             tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
@@ -2738,7 +2744,11 @@ async fn spawn_library_scan_avec_lecteur(
             }
             // Entre deux passes, céder la place à un écrivain qui attend la
             // fin de cette transaction (transaction_du_lot.rs).
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
@@ -2746,7 +2756,11 @@ async fn spawn_library_scan_avec_lecteur(
             ) {
                 tracing::warn!(error = %e, "post_scan_album_genres_backfill_failed");
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 &format!(
                     "UPDATE albums SET track_count = {}",
@@ -2756,7 +2770,11 @@ async fn spawn_library_scan_avec_lecteur(
             ) {
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 &format!("UPDATE albums SET \
                  {}, \
@@ -2785,7 +2803,11 @@ async fn spawn_library_scan_avec_lecteur(
             // tracks; incremental scans keep the fill-only behaviour so values
             // persist between full scans. The EXISTS guard avoids nulling an
             // album genre when no track carries one.
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if force {
                 // Pick the album genre by MAJORITY VOTE across its tracks, with a
                 // deterministic tie-break, instead of an arbitrary `LIMIT 1` track.
@@ -2821,7 +2843,11 @@ async fn spawn_library_scan_avec_lecteur(
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
                 }
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
             let orphan_albums = db.execute(
                 "DELETE FROM albums WHERE id IN (\

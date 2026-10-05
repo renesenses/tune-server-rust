@@ -209,7 +209,7 @@ pub mod sql {
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
                 COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
-                q.track_number, q.disc_number, q.album_ref \
+                q.track_number, q.disc_number, q.album_ref, t.album_id, t.artist_id \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
          LEFT JOIN albums al ON t.album_id = al.id \
@@ -412,11 +412,49 @@ pub struct QueueEntry {
     /// contrat de la file ne change pas (`file_promet_l_enchainement.rs`).
     #[serde(default, skip_serializing)]
     pub album_ref: Option<String>,
+    /// L'album de BIBLIOTHÈQUE d'une ligne locale (`tracks.album_id`), lu par
+    /// la jointure de `unified_select_base`. `None` pour une ligne de service.
+    ///
+    /// Fil forum 2143, point 8 (FabienM) : le menu d'un titre de la file
+    /// n'offrait pas « Aller à l'album », faute de cet identifiant. Il n'est
+    /// pas sérialisé avec la structure : `GET /zones/{id}/queue` le pose
+    /// lui-même, avec [`QueueEntry::album_id_service`], pour que la forme des
+    /// autres JSON bâtis sur `QueueEntry` ne bouge pas.
+    #[serde(default, skip_serializing)]
+    pub album_id: Option<i64>,
+    /// L'artiste de BIBLIOTHÈQUE d'une ligne locale (`tracks.artist_id`), lu
+    /// par la jointure de `unified_select_base`. `None` pour une ligne de
+    /// service.
+    ///
+    /// Fil forum 2143 (#5758), le jumeau d'[`QueueEntry::album_id`] : le menu
+    /// d'un titre local de la file n'offrait pas « Aller à l'artiste », faute
+    /// de cet identifiant. Hors de la sérialisation pour la même raison :
+    /// `GET /zones/{id}/queue` le pose lui-même.
+    #[serde(default, skip_serializing)]
+    pub artist_id: Option<i64>,
 }
 
 impl QueueEntry {
     pub fn is_local(&self) -> bool {
         self.track_id.is_some()
+    }
+
+    /// L'identifiant de l'album CHEZ SON SERVICE, pour une ligne de service
+    /// dont la source l'a donné à l'enfilage (`album_ref`, migration 114) ;
+    /// `None` pour une ligne locale, et pour une référence absente ou vide.
+    ///
+    /// C'est le champ `album_id_service` que le client lit déjà sur une piste
+    /// (`routageAlbum.albumDeServiceDe`). Fil 2143, points 5, 6 et 8 : pour
+    /// Bandcamp, qui ne sait pas rendre la fiche d'une piste seule, c'est la
+    /// SEULE façon de retrouver l'album d'un titre lancé hors de sa page.
+    pub fn album_id_service(&self) -> Option<&str> {
+        if self.is_local() {
+            return None;
+        }
+        self.album_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
     }
 }
 
@@ -1472,7 +1510,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     }
 }
 
-/// Maps a row from `sql::unified_select_base()` (19 columns) to a QueueEntry.
+/// Maps a row from `sql::unified_select_base()` (21 columns) to a QueueEntry.
 fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1494,6 +1532,8 @@ fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
         track_number: cols.get(16).and_then(|v| v.as_i64()),
         disc_number: cols.get(17).and_then(|v| v.as_i64()),
         album_ref: cols.get(18).and_then(|v| v.as_string()),
+        album_id: cols.get(19).and_then(|v| v.as_i64()),
+        artist_id: cols.get(20).and_then(|v| v.as_i64()),
     }
 }
 

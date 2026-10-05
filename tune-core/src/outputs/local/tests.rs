@@ -4289,3 +4289,110 @@ async fn l_interrupteur_de_compensation_ne_fait_aucune_bouffee_5227() {
         "bouffée à l'interrupteur : {pire} > {niveau_avant}"
     );
 }
+
+// -----------------------------------------------------------------------
+// #5215 (lot eq-niveau) — compensation active, volume HAUT : la bascule
+// tient dans le fondu
+//
+// À volume plein, le rabot à l'unité mange la compensation : le volume
+// effectif valait `1 / part portée par l'égaliseur`. Couper l'égaliseur le
+// remontait à 1 AU RAPPEL, d'un coup, pendant que l'anneau jouait encore les
+// échantillons de l'égaliseur (qui portaient la compensation) : une marche de
+// toute la compensation (~+12 dB, Levente +10,4 dB), AVANT le fondu de 200 ms
+// — qui, lui, fondait entre deux signaux de même niveau. Les témoins de #5227
+// ne la voyaient pas : ils jouent à −20 dB, où la compensation passe en
+// entier. Ceux-ci rejouent la géométrie anneau + volume à 100 % et à 50 %.
+// -----------------------------------------------------------------------
+
+/// Joue la bascule (coupure ou activation) au volume `volume`, compensation
+/// armée, à travers l'anneau simulé. Rend tout ce que le DAC a reçu, d'un
+/// seul tenant, et les niveaux de régime avant et après.
+async fn bascule_au_volume_5215(volume: f64, activer: bool) -> (Vec<f32>, f32, f32) {
+    use crate::outputs::traits::OutputTarget;
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(true);
+    sortie.set_volume(volume).await.expect("set_volume");
+    if !activer {
+        sortie.set_eq(Some(egaliseur_compensable_5227()));
+    }
+    let mut anneau = std::collections::VecDeque::new();
+    let mut trame = 0;
+    // 131 paquets = 52,4 périodes : la frontière que la bascule du volume
+    // franchit au DAC tombe en pleine alternance. À 130 (52 périodes pile),
+    // elle tombe sur un passage à zéro, où une marche de GAIN est invisible —
+    // le témoin restait vert sans le correctif.
+    let mut dac = jouer_avec_anneau_5227(&sortie, &mut anneau, &mut trame, LATENCE_5227 + 31);
+    let avant = crete_5215(&dac[dac.len() - 1200..]);
+    sortie.replace_eq_live(activer.then(egaliseur_compensable_5227));
+    dac.extend(jouer_avec_anneau_5227(
+        &sortie,
+        &mut anneau,
+        &mut trame,
+        LATENCE_5227 + 60,
+    ));
+    let fin = crete_5215(&dac[dac.len() - 1200..]);
+    (dac, avant, fin)
+}
+
+async fn verifier_la_bascule_sans_marche_5215(volume: f64, activer: bool) {
+    let (dac, avant, fin) = bascule_au_volume_5215(volume, activer).await;
+    let geste = if activer { "activer" } else { "couper" };
+    let marche = plus_grande_marche_5215(&dac);
+    eprintln!("{geste} à {volume} : avant {avant}, final {fin}, plus grande marche {marche}");
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "{geste} l'égaliseur au volume {volume}, compensation armée : marche de {marche} \
+         entre deux échantillons au DAC (seuil {MARCHE_MAX_5215}) — le volume saute au \
+         rappel au lieu de laisser la bascule au fondu (régimes {avant} → {fin})"
+    );
+    // La bascule a bien changé le niveau : le témoin n'est pas un fondu
+    // entre deux régimes égaux.
+    let (bas, haut) = if activer { (fin, avant) } else { (avant, fin) };
+    assert!(
+        haut > 2.0 * bas,
+        "le banc veut une vraie différence de niveau : {avant} → {fin}"
+    );
+}
+
+#[tokio::test]
+async fn couper_l_egaliseur_compense_a_volume_plein_ne_fait_aucune_marche_5215() {
+    verifier_la_bascule_sans_marche_5215(1.0, false).await;
+}
+
+#[tokio::test]
+async fn activer_l_egaliseur_compense_a_volume_plein_ne_fait_aucune_marche_5215() {
+    verifier_la_bascule_sans_marche_5215(1.0, true).await;
+}
+
+#[tokio::test]
+async fn couper_l_egaliseur_compense_a_mi_volume_ne_fait_aucune_marche_5215() {
+    verifier_la_bascule_sans_marche_5215(0.5, false).await;
+}
+
+/// Le niveau de régime, lui, ne change pas : ce que le volume rend avec
+/// l'égaliseur est toujours `min(volume × compensation, 1)`, qu'il passe par
+/// l'égaliseur ou par le volume.
+#[tokio::test]
+async fn porter_moins_ne_change_pas_le_niveau_rendu_5215() {
+    use crate::outputs::traits::OutputTarget;
+    for volume in [1.0_f64, 0.5, 0.1] {
+        let sortie = LocalOutput::new("Casque".to_string());
+        sortie.set_compensation_de_niveau(true);
+        sortie.set_volume(volume).await.expect("set_volume");
+        let eq = egaliseur_compensable_5227();
+        let comp = 10f64.powf(-eq.gain_moyen_db() / 20.0);
+        sortie.set_eq(Some(eq));
+        let porte = sortie.compensation_portee_par_l_eq();
+        let rendu = sortie.gain_de_rendu().load(Ordering::SeqCst) as f64 / 1000.0;
+        let total = porte * rendu;
+        let attendu = (volume * comp).min(1.0);
+        assert!(
+            (total - attendu).abs() < 0.003,
+            "volume {volume} : porté {porte} × volume {rendu} = {total}, attendu {attendu}"
+        );
+        assert!(
+            porte <= comp + 1e-3 && porte >= 1.0,
+            "volume {volume} : part portée {porte} hors de [1, {comp}]"
+        );
+    }
+}

@@ -265,15 +265,24 @@ pub(super) fn zone_replaygain_step(
     zone_id: i64,
     track_id: Option<i64>,
 ) -> Option<ReplayGainStep> {
-    use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
-        stored_gain_source, stored_gain_with_peak,
-    };
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let tid = track_id?;
+    replaygain_step_hors_pure(backend, track_id?)
+}
+
+/// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
+/// [`zone_replaygain_step`], sans la garde PURE. #5633 la relit sous PURE pour
+/// dire ce que PURE laisse de côté.
+fn replaygain_step_hors_pure(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    tid: i64,
+) -> Option<ReplayGainStep> {
+    use tune_core::audio::replaygain::{
+        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
+        stored_gain_source, stored_gain_with_peak,
+    };
     let settings = ReplayGainSettings::load(backend);
     let (gain, source, peak_kind) = stored_gain_with_peak(backend, tid, settings.mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
@@ -331,7 +340,37 @@ pub(super) fn zone_replaygain_step(
         alters_audio,
         peak_kind: peak_kind.as_str(),
         peak_headroom_db,
+        gain_db: applied_db,
     })
+}
+
+/// #5633 — ce que PURE laisse de côté : le ReplayGain que la piste en cours
+/// recevrait hors PURE.
+///
+/// PURE garde le chemin intouché, ReplayGain compris : c'est voulu (le
+/// bit-perfect). Mais rien ne le disait, et basculer PURE sur une piste de
+/// bibliothèque à −8 dB de ReplayGain la faisait monter de 8 dB sans
+/// explication (fil 1797). L'objet dit le gain (dB, pré-ampli et
+/// anti-écrêtage compris, comme l'étape hors PURE) et sa granularité.
+///
+/// `None` hors PURE (l'étape « ReplayGain » le dit déjà), en mode off, sans
+/// gain stocké, ou quand le gain ne changerait aucun échantillon.
+pub(super) fn replaygain_ignore_par_pure(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    track_id: Option<i64>,
+) -> Option<Value> {
+    if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
+        return None;
+    }
+    let rg = replaygain_step_hors_pure(backend, track_id?)?;
+    if !rg.alters_audio {
+        return None;
+    }
+    Some(json!({
+        "gain_db": (rg.gain_db * 100.0).round() / 100.0 + 0.0,
+        "granularity": rg.granularity,
+    }))
 }
 
 /// L'étape ReplayGain du chemin du signal, description ET faits bruts.
@@ -352,6 +391,10 @@ pub(super) struct ReplayGainStep {
     /// Cette étape multiplie-t-elle réellement les échantillons ? Faux pour un
     /// refus, qui laisse le fil intact.
     alters_audio: bool,
+    /// #5633 — le gain qui multiplie les échantillons, en dB (pré-ampli et
+    /// anti-écrêtage compris ; 0 pour un refus). Le même nombre que la
+    /// description, sans analyser une chaîne française.
+    gain_db: f64,
 }
 
 /// Ce que l'étage ReplayGain a écrêté depuis le DÉMARRAGE DU PROCESSUS
@@ -747,6 +790,13 @@ pub(super) fn build_signal_path(
             .and_then(tune_core::library::exemplaires::exemplaire_lu)
         {
             v["exemplaire"] = json!(e);
+        }
+        // #5633 — PURE ignore le ReplayGain, et le dit : le gain que la piste
+        // en cours recevrait hors PURE. Clé ABSENTE hors PURE ou sans gain.
+        if pure
+            && let Some(rg) = replaygain_ignore_par_pure(backend, zone_id_courant, np.track_id)
+        {
+            v["pure_replaygain_ignored"] = rg;
         }
         v
     })
@@ -1170,6 +1220,8 @@ fn assembler_les_etapes(
             "clipping_guard": rg.clipping_guard,
             "peak_kind": rg.peak_kind,
             "peak_headroom_db": rg.peak_headroom_db,
+            // #5633 — additif : le gain en nombre.
+            "gain_db": (rg.gain_db * 100.0).round() / 100.0 + 0.0,
             "metrics": replaygain_ecretage_metrics(),
         }));
     }

@@ -662,6 +662,18 @@ pub mod sql {
         "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.release_type IS NULL OR a.release_type = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
     }
 
+    /// #5616 — le type lu dans la balise du fichier, posé SEULEMENT si la
+    /// colonne est vide : un type déjà connu (MusicBrainz, service, édition
+    /// manuelle, ou une balise lue avant) n'est jamais écrasé par un scan.
+    pub fn set_release_type_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_type = {} WHERE id = {} \
+             AND (release_type IS NULL OR release_type = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Écrit le type de sortie d'un album (#4767).
     ///
     /// Paramètre lié et non littéral, contrairement à [`set_compilation`] : la
@@ -2931,6 +2943,21 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #5616 — pose le type lu dans la balise d'un fichier, seulement si
+    /// l'album n'en a pas encore. Rend `true` quand la ligne a changé.
+    pub fn poser_type_de_sortie_si_vide(
+        &self,
+        album_id: i64,
+        type_de_sortie: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::set_release_type_if_empty,
+            sql::set_release_type_if_empty,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_recent, sql::list_recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -3077,6 +3104,101 @@ impl AlbumRepo {
                 tracing::warn!(error = %e, "added_at_by_ids a échoué — liste sans date d'ajout")
             }
         }
+    }
+
+    /// Nombre de pistes et durée totale de chaque album demandé, en une
+    /// requête groupée (#5616) — l'entrée de la règle de repli
+    /// [`crate::metadata::release_type::type_deduit`].
+    ///
+    /// La durée passe par [`crate::db::home_queries::DUREE_MS`] : la colonne
+    /// est BIGINT en SQLite et peut être TEXT en PostgreSQL (`pg_migrate`),
+    /// où `SUM(text)` n'existe pas. `SUM` rend NUMERIC sur PostgreSQL : d'où
+    /// les `CAST(… AS BIGINT)`.
+    pub fn pistes_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<
+        std::collections::HashMap<i64, crate::metadata::release_type::PistesDuDisque>,
+        TuneError,
+    > {
+        use crate::db::home_queries::DUREE_MS;
+        let mut par_id = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT t.album_id, COUNT(*), \
+                        CAST(COALESCE(SUM(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT), \
+                        CAST(SUM(CASE WHEN COALESCE({DUREE_MS}, 0) > 0 THEN 0 ELSE 1 END) AS BIGINT), \
+                        CAST(COALESCE(MAX(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT) \
+                 FROM tracks t WHERE t.album_id IN ({id_list}) GROUP BY t.album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                let entier = |i: usize| row.get(i).and_then(|v| v.as_i64());
+                if let (Some(id), Some(n), Some(ms), Some(inconnues), Some(max_ms)) =
+                    (entier(0), entier(1), entier(2), entier(3), entier(4))
+                {
+                    par_id.insert(
+                        id,
+                        crate::metadata::release_type::PistesDuDisque {
+                            nombre: u32::try_from(n).unwrap_or(u32::MAX),
+                            duree_totale_ms: u64::try_from(ms).unwrap_or(0),
+                            durees_inconnues: u32::try_from(inconnues).unwrap_or(u32::MAX),
+                            piste_la_plus_longue_ms: u64::try_from(max_ms).unwrap_or(0),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
+    /// Le type DÉDUIT de chaque album qui en reçoit un (#5616), par
+    /// identifiant. Un album au type explicite, une compilation, un album
+    /// sans piste ou à durée inconnue n'y figurent pas. Un échec de lecture
+    /// rend une table vide : la page reste celle d'avant, rien n'est inventé.
+    pub fn types_deduits(
+        &self,
+        albums: &[Album],
+    ) -> std::collections::HashMap<i64, crate::metadata::release_type::TypeDeSortie> {
+        use crate::metadata::release_type::{TypeDeSortie, type_deduit};
+        // Seuls les albums qui POURRAIENT recevoir un type sont mesurés.
+        let candidats: Vec<i64> = albums
+            .iter()
+            .filter(|a| {
+                !a.is_compilation
+                    && a.release_type
+                        .as_deref()
+                        .and_then(TypeDeSortie::depuis_mot)
+                        .is_none()
+            })
+            .filter_map(|a| a.id)
+            .collect();
+        if candidats.is_empty() {
+            return Default::default();
+        }
+        let pistes = match self.pistes_par_album(&candidats) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "pistes_par_album a échoué — aucun type déduit");
+                return Default::default();
+            }
+        };
+        albums
+            .iter()
+            .filter_map(|a| {
+                let id = a.id?;
+                type_deduit(
+                    a.release_type.as_deref(),
+                    a.is_compilation,
+                    pistes.get(&id).copied(),
+                )
+                .map(|t| (id, t))
+            })
+            .collect()
     }
 
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
@@ -3396,6 +3518,7 @@ impl AlbumRepo {
             include_hidden,
             dr,
             seed,
+            None,
             false,
         )
         .map(|(albums, _)| albums)
@@ -3437,8 +3560,87 @@ impl AlbumRepo {
             include_hidden,
             dr,
             seed,
+            None,
             true,
         )
+    }
+
+    /// [`Self::list_filtered_seeded_avec_total`], restreint aux albums qui
+    /// répondent à `recherche` (fil 1684) : titre de l'album, artiste de
+    /// l'album, artiste d'une de ses pistes, compositeur d'une de ses pistes.
+    /// Les facettes, le tri et la pagination s'y appliquent comme sans
+    /// recherche, et le total est celui de l'ensemble FILTRÉ (recherche ET
+    /// facettes) : c'est le nombre de résultats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_filtered_recherche_avec_total(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+        seed: Option<i64>,
+        recherche: &str,
+    ) -> Result<(Vec<Album>, Option<i64>), TuneError> {
+        self.lister_filtre(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            seed,
+            Some(recherche),
+            true,
+        )
+    }
+
+    /// Le prédicat de la recherche de l'écran Bibliothèque (fil 1684).
+    ///
+    /// Un album répond quand la saisie (repliée : casse et accents ignorés,
+    /// comme la recherche globale `search_where`) apparaît dans son titre, le
+    /// nom de son artiste, le nom de l'artiste d'UNE de ses pistes, ou le
+    /// compositeur d'UNE de ses pistes. C'est ce que le champ promet : on y
+    /// tape « Coltrane » et l'on veut aussi les albums d'autres artistes où
+    /// il joue une piste, « Ravel » et l'on veut ses œuvres sous le nom de
+    /// leur chef.
+    ///
+    /// Les marqueurs se prennent dans la séquence commune (`next_ph`), AVANT
+    /// ceux de LIMIT/OFFSET — piège n°2 de `facet_filter` : PostgreSQL
+    /// numérote, SQLite lit par position, il faut une valeur par occurrence.
+    fn recherche_wheres(
+        recherche: &str,
+        make_ph: &dyn Fn(usize) -> String,
+        next_ph: &mut usize,
+        bind_values: &mut Vec<SqlValue>,
+    ) -> Option<String> {
+        let saisie = recherche.replace('"', "");
+        let saisie = saisie.trim();
+        if saisie.is_empty() {
+            return None;
+        }
+        let motif = crate::db::engine::motif_like(saisie);
+        let mut ph = || {
+            let p = make_ph(*next_ph);
+            *next_ph += 1;
+            bind_values.push(SqlValue::Text(motif.clone()));
+            p
+        };
+        let (p1, p2, p3, p4) = (ph(), ph(), ph(), ph());
+        Some(format!(
+            "(LOWER(unaccent(a.title)) LIKE LOWER(unaccent({p1})) \
+             OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p2})) \
+             OR EXISTS (SELECT 1 FROM tracks rt LEFT JOIN artists rar ON rar.id = rt.artist_id \
+             WHERE rt.album_id = a.id AND (LOWER(unaccent(rar.name)) LIKE LOWER(unaccent({p3})) \
+             OR LOWER(unaccent(rt.composer)) LIKE LOWER(unaccent({p4})))))"
+        ))
     }
 
     /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
@@ -3515,6 +3717,10 @@ impl AlbumRepo {
         // doublons en pagination. C'est la route HTTP qui en tire une quand le
         // client n'en donne pas, et qui la lui renvoie.
         seed: Option<i64>,
+        // Fil 1684 — la recherche de l'écran Bibliothèque, sur TOUTE la base
+        // (voir [`Self::recherche_wheres`]). `None` = pas de filtre, et le SQL
+        // est celui d'avant au caractère près.
+        recherche: Option<&str>,
         // `true` = compter l'ensemble filtré dans la même requête (#4800) ;
         // `false` = le SQL d'avant, au caractère près, pour les appelants qui
         // n'ont que faire du total (Browse UPnP, maintenance).
@@ -3648,6 +3854,13 @@ impl AlbumRepo {
                 &mut next_ph,
                 &mut bind_values,
             ));
+        }
+
+        // Fil 1684 — la recherche, après le DR et avant LIMIT/OFFSET.
+        if let Some(pred) = recherche
+            .and_then(|q| Self::recherche_wheres(q, &make_ph, &mut next_ph, &mut bind_values))
+        {
+            wheres.push(pred);
         }
 
         let where_clause = if wheres.is_empty() {
@@ -6810,6 +7023,114 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
+    }
+
+    /// Fil 1684 — la recherche de l'écran Bibliothèque porte sur toute la
+    /// base : titre de l'album, artiste de l'album, artiste d'UNE piste,
+    /// compositeur d'UNE piste — casse et accents ignorés. Elle se combine aux
+    /// facettes, et le total est celui de l'ensemble filtré.
+    ///
+    /// Avant, `GET /library/albums` n'avait pas de recherche : le client
+    /// filtrait ce qu'il tenait, sur le titre et l'artiste de l'album seuls.
+    ///
+    /// Le même scénario tourne sur PostgreSQL
+    /// (`postgres_e2e::pg_1684_recherche_de_la_bibliotheque`).
+    pub(crate) fn scenario_recherche_de_la_bibliotheque_1684(db: Arc<dyn DbBackend>) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let artistes = ArtistRepo::with_backend(db.clone());
+        let repo = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db.clone());
+        let nouvel = |nom: &str| artistes.create(&Artist::new(nom.into())).unwrap();
+        let miles = nouvel("Miles Davis");
+        let coltrane = nouvel("John Coltrane");
+        let orchestre = nouvel("Orchestre de Paris");
+        let album = |titre: &str, artiste: i64| {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(artiste);
+            repo.create(&a).unwrap()
+        };
+        let piste = |album_id: i64, artiste: i64, n: i32, compositeur: Option<&str>| {
+            let mut t = Track::new(format!("piste {n}"));
+            t.album_id = Some(album_id);
+            t.artist_id = Some(artiste);
+            t.track_number = n;
+            t.composer = compositeur.map(str::to_string);
+            t.file_path = Some(format!("/m/{album_id}/{n}.flac"));
+            pistes.create(&t).unwrap();
+        };
+        let kind = album("Kind of Blue", miles);
+        piste(kind, miles, 1, None);
+        piste(kind, coltrane, 2, None);
+        let bolero = album("Boléro", orchestre);
+        piste(bolero, orchestre, 1, Some("Maurice Ravel"));
+        let ete = album("Été indien", orchestre);
+        piste(ete, orchestre, 1, None);
+        let comp = album("Jazz sur Seine", miles);
+        piste(comp, coltrane, 1, None);
+        repo.mark_compilation(comp).unwrap();
+
+        let chercher = |q: &str, compilation: Option<bool>, limit: i64| {
+            let (v, total) = repo
+                .list_filtered_recherche_avec_total(
+                    limit,
+                    0,
+                    "title",
+                    "asc",
+                    None,
+                    None,
+                    compilation,
+                    false,
+                    None,
+                    None,
+                    q,
+                )
+                .unwrap();
+            (v.into_iter().map(|a| a.title).collect::<Vec<_>>(), total)
+        };
+
+        // L'artiste d'une PISTE : Coltrane ne signe aucun de ces albums.
+        assert_eq!(
+            chercher("coltrane", None, 50),
+            (
+                vec!["Jazz sur Seine".into(), "Kind of Blue".into()],
+                Some(2)
+            )
+        );
+        // Le COMPOSITEUR d'une piste.
+        assert_eq!(
+            chercher("ravel", None, 50),
+            (vec!["Boléro".into()], Some(1))
+        );
+        // L'artiste de l'album, et le titre — accents ignorés dans les deux sens.
+        assert_eq!(chercher("ORCHESTRE", None, 50).1, Some(2));
+        assert_eq!(
+            chercher("ete", None, 50),
+            (vec!["Été indien".into()], Some(1))
+        );
+        assert_eq!(chercher("bolero", None, 50).0, vec!["Boléro".to_string()]);
+        // Combinée à une facette, et paginée : le total reste celui de
+        // l'ensemble filtré, pas celui de la page.
+        assert_eq!(
+            chercher("coltrane", Some(false), 50),
+            (vec!["Kind of Blue".into()], Some(1))
+        );
+        assert_eq!(
+            chercher("coltrane", None, 1),
+            (vec!["Jazz sur Seine".into()], Some(2))
+        );
+        // Rien : une page vide.
+        assert_eq!(chercher("zzz", None, 50), (Vec::<String>::new(), None));
+        // TÉMOIN — sans recherche, la liste d'avant.
+        let tout = repo
+            .list_filtered(100, 0, "title", "asc", None, None, None, false, None)
+            .unwrap();
+        assert_eq!(tout.len(), 4);
+    }
+
+    #[test]
+    fn la_recherche_de_la_bibliotheque_couvre_artistes_de_piste_et_compositeurs_1684() {
+        scenario_recherche_de_la_bibliotheque_1684(Arc::new(test_db()));
     }
 
     /// #4767 — le type de sortie s'ECRIT et se RELIT, et un album sans MBID

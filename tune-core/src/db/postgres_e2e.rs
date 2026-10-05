@@ -2960,3 +2960,39 @@ async fn pg_5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
     pool.close().await;
     crate::db::album_repo::tests::scenario_bibliotheque_ancienne_5413_apres(db);
 }
+
+/// Fil 1684 — la recherche de l'écran Bibliothèque (`GET /library/albums?q=`)
+/// sur le VRAI moteur : quatre marqueurs `$n` de plus dans la séquence de
+/// `lister_filtre`, avant LIMIT/OFFSET, `unaccent` et la sous-requête des
+/// pistes. Même scénario que le témoin SQLite.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1684_recherche_de_la_bibliotheque() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::album_repo::tests::scenario_recherche_de_la_bibliotheque_1684(db);
+}
+
+/// Fil 2094 — les sous-titres de disque d'un coffret réuni, sur le VRAI
+/// moteur : `UPDATE … WHERE NOT EXISTS` sur la même table, cinq marqueurs
+/// `$n`. Même scénario que `sous_titres_2094_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2094_sous_titres_des_disques_d_un_coffret() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_sous_titres_2094(&db);
+}
+
+/// Fil 2094 — le rattrapage des sous-titres des coffrets composés avant, sur
+/// le VRAI moteur : marqueur de `settings`, `SELECT DISTINCT` sur
+/// `COALESCE(file_path, cue_media_path)`, disposition retenue. Même scénario
+/// que `rattrapage_sous_titres_2094_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2094_rattrapage_des_sous_titres_des_coffrets() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_rattrapage_sous_titres_2094(&db);
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_disque_tardif_2094(&db);
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_rattrapage_par_les_balises_2094(&db);
+}

@@ -1265,3 +1265,84 @@ async fn reunir_lister_defaire_et_ne_pas_reformer_par_les_routes() {
         3
     );
 }
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — composer un coffret à la
+/// main fait du titre d'ORIGINE de chaque disque son sous-titre de disque :
+/// le 101 montre « 101 - Disc A » / « 101 - Disc B », plus « Disque 1 » /
+/// « Disque 2 ». « Défaire le coffret » les retire. Un disque au titre
+/// IDENTIQUE à celui du coffret n'en reçoit pas.
+#[tokio::test]
+async fn composer_un_coffret_donne_a_chaque_disque_son_titre_d_origine_2094() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+    let sous_titres = |id: i64| -> Vec<(i64, Option<String>)> {
+        let mut v: Vec<(i64, Option<String>)> = state
+            .backend
+            .query_many(
+                "SELECT DISTINCT disc_number, disc_subtitle FROM tracks WHERE album_id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.first().and_then(|v| v.as_i64()).unwrap_or(-1),
+                    r.get(1).and_then(|v| v.as_string()),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, b] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["titre"].as_str(), Some("101"));
+    assert_eq!(
+        sous_titres(a),
+        vec![
+            (1, Some("101 - Disc A".to_string())),
+            (2, Some("101 - Disc B".to_string())),
+        ],
+        "chaque disque porte le titre de l'album qu'il était"
+    );
+
+    // DÉFAIRE : les sous-titres posés par la composition partent.
+    let (statut, corps) = appel(
+        &app,
+        "POST",
+        &format!("/api/v1/library/coffrets/{a}/defaire-manuel"),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    let recrees: Vec<i64> = corps["albums_recrees"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    assert_eq!(recrees.len(), 1, "corps = {corps}");
+    assert_eq!(sous_titres(a), vec![(1, None)]);
+    assert_eq!(sous_titres(recrees[0]), vec![(1, None)]);
+
+    // TÉMOIN — deux disques au titre identique : le coffret en garde le
+    // titre, et aucun disque ne prend de sous-titre.
+    let ark = artiste(&state, "Arkhangelsk");
+    let x = album(&state, "Arkhangelsk", ark);
+    let y = album(&state, "Arkhangelsk", ark);
+    piste(&state, x, ark, 1, "/m/Ark/CD01/01.flac");
+    piste(&state, y, ark, 1, "/m/Ark/CD02/01.flac");
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [x, y] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(sous_titres(x), vec![(1, None), (2, None)]);
+}

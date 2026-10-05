@@ -38,6 +38,8 @@ pub mod i18n;
 pub mod journal;
 mod lecture_bornee;
 pub mod lien_de_partage;
+/// Rendre au système, à froid, la mémoire libre que garde l'allocateur.
+pub mod memoire_a_froid;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
@@ -47,6 +49,8 @@ pub mod plugins;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins_host;
 pub mod premium_guard;
+/// Détail du RSS (`RssAnon`, `RssFile`, `RssShmem`) pour `memory_diagnostics`.
+pub mod releve_memoire;
 pub mod reprise_des_passes;
 pub mod routes;
 pub mod scan_import;
