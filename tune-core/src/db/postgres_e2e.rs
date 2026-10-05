@@ -2982,4 +2982,6 @@ async fn pg_2094_rattrapage_des_sous_titres_des_coffrets() {
     crate::db::coffrets_auto::tests::scenario_rattrapage_sous_titres_2094(&db);
     reset_schema(&db);
     crate::db::coffrets_auto::tests::scenario_disque_tardif_2094(&db);
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_rattrapage_par_les_balises_2094(&db);
 }

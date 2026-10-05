@@ -1189,6 +1189,9 @@ pub(crate) fn scenario_rattrapage_sous_titres_2094(db: &Arc<dyn DbBackend>) {
             coffrets_rattrapes: 2,
             disques_sous_titres: 4,
             titres_inconnus: 1,
+            disques_sous_titres_par_balise: 0,
+            // Le coffret « Yes Box » : ses fichiers n'existent pas.
+            fichiers_illisibles: 2,
             disques_deplaces: 1,
             echecs: 0,
         }
@@ -1357,4 +1360,165 @@ pub(crate) fn scenario_disque_tardif_2094(db: &Arc<dyn DbBackend>) {
 #[test]
 fn disque_tardif_2094_sur_sqlite() {
     scenario_disque_tardif_2094(&sqlite());
+}
+
+/// Une copie d'un vrai fichier du dépôt (`tests/fixtures/<gabarit>`), sa
+/// balise ALBUM posée à `album`.
+fn fichier_tague(dossier: &std::path::Path, nom: &str, gabarit: &str, album: &str) -> String {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::{Accessor, Tag};
+    std::fs::create_dir_all(dossier).unwrap();
+    let chemin = dossier.join(nom);
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(gabarit),
+        &chemin,
+    )
+    .unwrap();
+    let mut f = lofty::read_from_path(&chemin).unwrap();
+    if f.primary_tag().is_none() {
+        let genre = f.primary_tag_type();
+        f.insert_tag(Tag::new(genre));
+    }
+    f.primary_tag_mut().unwrap().set_album(album.to_string());
+    f.save_to_path(&chemin, WriteOptions::default()).unwrap();
+    chemin.to_string_lossy().into_owned()
+}
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — un coffret dont le
+/// marqueur ne retient AUCUN titre d'origine : le rattrapage relit la balise
+/// ALBUM de la PREMIÈRE piste de chaque disque, sur de vrais FLAC et MP3, et
+/// applique la même règle. Le marqueur est complété : « Défaire » retire ce
+/// qui a été posé.
+pub(crate) fn scenario_rattrapage_par_les_balises_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let reglages = SettingsRepo::with_backend(db.clone());
+    let _ = reglages.delete(CLE_REFUS);
+    let _ = reglages.delete(CLE_RATTRAPAGE_SOUS_TITRES_2094);
+    let racine = tempfile::tempdir().unwrap();
+    let r = racine.path();
+    let y = artiste(db, "Yes");
+    let un_disque = |titre: &str, dossier: &std::path::Path, pistes: &[(i32, String)]| {
+        let id = album(db, titre, y, &dossier.to_string_lossy());
+        for (n, chemin) in pistes {
+            piste(db, id, y, *n, 1, chemin);
+        }
+        id
+    };
+    // Disque 1 (FLAC) : la piste 2 est ENREGISTRÉE avant la piste 1, avec
+    // une autre balise — c'est la PREMIÈRE piste qui fait foi.
+    let dossier1 = r.join("Yes Box/CD1");
+    let p2 = fichier_tague(&dossier1, "02.flac", "test.flac", "Relayer (bonus)");
+    let p1 = fichier_tague(&dossier1, "01.flac", "test.flac", "Relayer");
+    let b1 = un_disque("Yes Box", &dossier1, &[(2, p2), (1, p1)]);
+    // Disque 2 (MP3, ID3v2).
+    let dossier2 = r.join("Yes Box/CD2");
+    let b2 = un_disque(
+        "Fragile",
+        &dossier2,
+        &[(1, fichier_tague(&dossier2, "01.mp3", "test.mp3", "Fragile"))],
+    );
+    // Disque 3 : balise identique au titre du coffret — rien.
+    let dossier3 = r.join("Yes Box/CD3");
+    let b3 = un_disque(
+        "Yes Box",
+        &dossier3,
+        &[(
+            1,
+            fichier_tague(&dossier3, "01.flac", "test.flac", "YES box"),
+        )],
+    );
+    // Disque 4 : fichier ABSENT (partage démonté) — laissé, compté.
+    let dossier4 = r.join("Yes Box/CD4");
+    let b4 = un_disque(
+        "Yes Box",
+        &dossier4,
+        &[(1, dossier4.join("01.flac").to_string_lossy().into_owned())],
+    );
+    // Disque 5 : porte DÉJÀ un nom — jamais remplacé.
+    let dossier5 = r.join("Yes Box/CD5");
+    let b5 = un_disque(
+        "Yes Box",
+        &dossier5,
+        &[(1, fichier_tague(&dossier5, "01.flac", "test.flac", "90125"))],
+    );
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2}"),
+        &[&"Bonus" as &dyn ToSqlValue, &b5],
+    )
+    .unwrap();
+    coffret_manuel_d_avant_2094(db, "Yes Box", &[b1, b2, b3, b4, b5], vec![]);
+    // Le marqueur d'un coffret d'avant #5319 : ni disques, ni titre composé.
+    AlbumMetadataRepo::with_backend(db.clone())
+        .set(
+            b1,
+            CLE_COFFRET,
+            &serde_json::to_string(&Marqueur::manuel()).unwrap(),
+        )
+        .unwrap();
+
+    let rapport = rattraper_les_sous_titres(db).unwrap();
+    assert_eq!(
+        rapport,
+        RattrapageSousTitres {
+            deja_fait: false,
+            coffrets: 1,
+            coffrets_rattrapes: 1,
+            disques_sous_titres: 2,
+            titres_inconnus: 0,
+            disques_sous_titres_par_balise: 2,
+            fichiers_illisibles: 1,
+            disques_deplaces: 0,
+            echecs: 0,
+        }
+    );
+    assert_eq!(
+        sous_titres_de(db, b1),
+        vec![
+            (1, Some("Relayer".into())),
+            (2, Some("Fragile".into())),
+            (3, None),
+            (4, None),
+            (5, Some("Bonus".into())),
+        ],
+        "balise de la première piste ; titre du coffret, fichier absent et nom existant laissés"
+    );
+    let m = marqueurs(db).unwrap();
+    assert_eq!(m[&b1].sous_titres, vec![1, 2]);
+    assert_eq!(
+        m[&b1]
+            .disques
+            .iter()
+            .map(|d| (d.n, d.titre.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "Relayer"), (2, "Fragile")],
+        "les titres relus rejoignent le marqueur"
+    );
+    let tenue = &crate::db::edition_album::editions_tenues(db, &[b1]).unwrap()[0];
+    assert!(
+        tenue
+            .pistes
+            .iter()
+            .filter(|p| p.disque == 2)
+            .all(|p| p.nom_disque.as_deref() == Some("Fragile")),
+        "la disposition tenue retient le nom relu"
+    );
+
+    // DÉFAIRE : ce qui a été posé part, « Bonus » reste.
+    let recrees = crate::db::edition_album::defaire_coffret_manuel(db, b1).unwrap();
+    let restes: BTreeSet<Option<String>> = std::iter::once(b1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(restes, BTreeSet::from([None, Some("Bonus".to_string())]));
+}
+
+#[test]
+fn rattrapage_par_les_balises_2094_sur_sqlite() {
+    scenario_rattrapage_par_les_balises_2094(&sqlite());
 }

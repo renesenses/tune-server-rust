@@ -532,9 +532,17 @@ pub struct RattrapageSousTitres {
     pub coffrets_rattrapes: usize,
     /// Disques sous-titrés par ce rattrapage.
     pub disques_sous_titres: usize,
-    /// Coffrets dont le marqueur ne retient AUCUN titre d'origine : coffret
-    /// manuel composé avant #5319, ou formé par « attacher ». Rien à poser.
+    /// Coffrets dont le marqueur ne retient AUCUN titre d'origine (coffret
+    /// manuel composé avant #5319, ou formé par « attacher ») ET dont aucune
+    /// balise ALBUM n'a pu être relue : rien à poser.
     pub titres_inconnus: usize,
+    /// Disques sous-titrés d'après la balise ALBUM de leur première piste
+    /// (coffrets sans titres retenus) — compris dans `disques_sous_titres`.
+    pub disques_sous_titres_par_balise: usize,
+    /// Disques dont la première piste n'a pas pu être relue (fichier absent,
+    /// partage démonté, balises illisibles) ou ne porte pas de balise ALBUM :
+    /// laissés.
+    pub fichiers_illisibles: usize,
     /// Disques laissés parce que leurs pistes ne sont plus dans le dossier
     /// que le marqueur retient : disques renumérotés ou déplacés depuis la
     /// composition, le titre d'origine ne désigne plus sûrement ce disque.
@@ -559,12 +567,20 @@ pub struct RattrapageSousTitres {
 ///
 /// Un disque dont les pistes ne vivent plus dans le dossier que le marqueur
 /// retient est laissé : renuméroté depuis, son numéro ne désigne plus le
-/// disque d'origine. Un coffret dont le marqueur ne retient aucun disque est
-/// laissé aussi : son titre d'origine a disparu avec l'album absorbé.
+/// disque d'origine.
 ///
-/// Aucun fichier n'est lu. Le marqueur de `settings` n'est posé que si aucun
-/// coffret n'a échoué : sinon le rattrapage repasse au démarrage suivant, sans
-/// risque, puisqu'un disque déjà nommé n'est jamais renommé.
+/// Un coffret dont le marqueur ne retient AUCUN disque (manuel d'avant
+/// #5319, ou « attacher ») a perdu ses titres d'origine avec les albums
+/// absorbés. Décision de Bertrand du 05/10/2026 : on relit alors la balise
+/// ALBUM de la PREMIÈRE piste de chaque disque — l'en-tête des balises
+/// seulement, aucun décodage audio — et la même règle s'applique. Les disques
+/// sous-titrés ainsi rejoignent `Marqueur::disques`, pour que « Défaire »
+/// sache quoi retirer. Un fichier absent ou illisible est laissé et compté.
+///
+/// Le marqueur de `settings` n'est posé que si aucun coffret n'a échoué en
+/// ÉCRITURE : sinon le rattrapage repasse au démarrage suivant, sans risque,
+/// puisqu'un disque déjà nommé n'est jamais renommé. Un fichier illisible
+/// n'est pas un échec : il ne fait pas repasser la passe.
 pub fn rattraper_les_sous_titres(
     db: &Arc<dyn DbBackend>,
 ) -> Result<RattrapageSousTitres, TuneError> {
@@ -580,16 +596,24 @@ pub fn rattraper_les_sous_titres(
     let mut r = RattrapageSousTitres::default();
     for (id, mut m) in tous {
         r.coffrets += 1;
-        if m.disques.is_empty() {
-            r.titres_inconnus += 1;
-            continue;
-        }
-        match rattraper_un_coffret(db, id, &mut m) {
-            Ok((poses, deplaces)) => {
-                r.disques_deplaces += deplaces;
-                if poses > 0 {
+        let resultat = if m.disques.is_empty() {
+            rattraper_par_les_balises(db, id, &mut m)
+        } else {
+            rattraper_un_coffret(db, id, &mut m)
+        };
+        match resultat {
+            Ok(b) => {
+                r.disques_deplaces += b.deplaces;
+                r.fichiers_illisibles += b.illisibles;
+                if b.titres_inconnus {
+                    r.titres_inconnus += 1;
+                }
+                if b.poses > 0 {
                     r.coffrets_rattrapes += 1;
-                    r.disques_sous_titres += poses;
+                    r.disques_sous_titres += b.poses;
+                    if b.par_balise {
+                        r.disques_sous_titres_par_balise += b.poses;
+                    }
                 }
             }
             Err(e) => {
@@ -604,14 +628,24 @@ pub fn rattraper_les_sous_titres(
     Ok(r)
 }
 
-/// Un coffret : rend `(disques sous-titrés, disques laissés car déplacés)`.
+/// Ce que le rattrapage a fait d'UN coffret.
+#[derive(Default)]
+struct BilanCoffret {
+    poses: usize,
+    deplaces: usize,
+    illisibles: usize,
+    par_balise: bool,
+    titres_inconnus: bool,
+}
+
+/// Un coffret dont le marqueur retient ses disques d'origine.
 fn rattraper_un_coffret(
     db: &Arc<dyn DbBackend>,
     id: i64,
     m: &mut Marqueur,
-) -> Result<(usize, usize), TuneError> {
+) -> Result<BilanCoffret, TuneError> {
     let Some(album) = AlbumRepo::with_backend(db.clone()).get(id)? else {
-        return Ok((0, 0));
+        return Ok(BilanCoffret::default());
     };
     let mut retenus = Vec::new();
     let mut deplaces = 0usize;
@@ -626,16 +660,149 @@ fn rattraper_un_coffret(
         }
     }
     let poses = poser_les_sous_titres(db, id, &retenus, &album.title)?;
-    if poses.is_empty() {
-        return Ok((0, deplaces));
+    if !poses.is_empty() {
+        retenir_au_marqueur(db, id, m, &poses, &[])?;
     }
+    Ok(BilanCoffret {
+        poses: poses.len(),
+        deplaces,
+        ..Default::default()
+    })
+}
+
+/// Un coffret dont le marqueur ne retient AUCUN disque : le titre d'origine
+/// de chaque disque est relu dans la balise ALBUM de sa première piste.
+fn rattraper_par_les_balises(
+    db: &Arc<dyn DbBackend>,
+    id: i64,
+    m: &mut Marqueur,
+) -> Result<BilanCoffret, TuneError> {
+    let Some(album) = AlbumRepo::with_backend(db.clone()).get(id)? else {
+        return Ok(BilanCoffret::default());
+    };
+    let mut lus = Vec::new();
+    let mut illisibles = 0usize;
+    for (n, chemin) in premieres_pistes(db, id)? {
+        match album_de_la_balise(&chemin) {
+            Some(titre) => lus.push(DisqueRetenu {
+                n,
+                titre,
+                dossier: dossier_de(&chemin).unwrap_or_default().to_string(),
+                artiste_id: None,
+            }),
+            None => {
+                tracing::debug!(album = id, disque = n, chemin = %chemin, "coffret_balise_album_illisible");
+                illisibles += 1;
+            }
+        }
+    }
+    let poses = poser_les_sous_titres(db, id, &lus, &album.title)?;
+    if !poses.is_empty() {
+        let retenus: Vec<DisqueRetenu> = lus.into_iter().filter(|d| poses.contains(&d.n)).collect();
+        retenir_au_marqueur(db, id, m, &poses, &retenus)?;
+    } else if lus.is_empty() {
+        return Ok(BilanCoffret {
+            illisibles,
+            titres_inconnus: true,
+            ..Default::default()
+        });
+    }
+    Ok(BilanCoffret {
+        poses: poses.len(),
+        illisibles,
+        par_balise: true,
+        ..Default::default()
+    })
+}
+
+/// Complète le marqueur (sous-titres posés, disques relus) et retient à
+/// nouveau la disposition tenue, noms de disque compris.
+fn retenir_au_marqueur(
+    db: &Arc<dyn DbBackend>,
+    id: i64,
+    m: &mut Marqueur,
+    poses: &[u32],
+    disques: &[DisqueRetenu],
+) -> Result<(), TuneError> {
     m.sous_titres.extend(poses.iter().copied());
     m.sous_titres.sort_unstable();
     m.sous_titres.dedup();
+    m.disques.extend(disques.iter().cloned());
+    m.disques.sort_by_key(|d| d.n);
     let json = serde_json::to_string(m).map_err(|e| TuneError::from(e.to_string()))?;
     AlbumMetadataRepo::with_backend(db.clone()).set(id, CLE_COFFRET, &json)?;
     super::edition_album::retenir_les_noms_de_disque(db, id)?;
-    Ok((poses.len(), deplaces))
+    Ok(())
+}
+
+/// `(numéro de disque, chemin)` de la PREMIÈRE piste de chaque disque de
+/// l'album : plus petit numéro de piste, puis plus petit identifiant. Le
+/// chemin est celui qu'on peut ouvrir — le fichier, ou l'image d'une piste
+/// CUE. Trié en Rust : les colonnes numériques ne se trient pas pareil sur
+/// les deux moteurs.
+fn premieres_pistes(db: &Arc<dyn DbBackend>, album: i64) -> Result<Vec<(u32, String)>, TuneError> {
+    let (p1, _) = placeholders(db);
+    let sql = format!(
+        "SELECT COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0), t.id, {c}          FROM tracks t WHERE t.album_id = {p1} AND {c} IS NOT NULL",
+        c = chemin_ouvrable!(),
+    );
+    let entier = |v: Option<&super::backend::SqlValue>| {
+        v.and_then(|v| v.as_i64().or_else(|| v.as_string()?.trim().parse().ok()))
+    };
+    let mut pistes: Vec<(i64, i64, i64, String)> = db
+        .query_many(&sql, &[&album as &dyn ToSqlValue])?
+        .into_iter()
+        .filter_map(|r| {
+            Some((
+                entier(r.first())?,
+                entier(r.get(1)).unwrap_or(0),
+                entier(r.get(2))?,
+                r.get(3)?.as_string()?,
+            ))
+        })
+        .collect();
+    pistes.sort();
+    let mut premieres: Vec<(u32, String)> = Vec::new();
+    for (disque, _, _, chemin) in pistes {
+        let Ok(n) = u32::try_from(disque) else {
+            continue;
+        };
+        if premieres.last().map(|(d, _)| *d) != Some(n) {
+            premieres.push((n, chemin));
+        }
+    }
+    Ok(premieres)
+}
+
+/// La balise ALBUM d'un fichier, lue dans l'EN-TÊTE des balises seulement :
+/// ni propriétés audio, ni pochette, aucun décodage. `None` pour un fichier
+/// absent, illisible ou sans balise ALBUM. Le chemin stocké est d'abord
+/// résolu vers sa graphie sur disque (NFC/NFD, #1865).
+fn album_de_la_balise(chemin: &str) -> Option<String> {
+    use lofty::config::{ParseOptions, ParsingMode};
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::ItemKey;
+
+    let reel = crate::library::local_path::resolve_local_path(chemin)
+        .found()
+        .unwrap_or_else(|| chemin.to_string());
+    let tagged = Probe::open(reel)
+        .and_then(|p| {
+            p.options(
+                ParseOptions::new()
+                    .parsing_mode(ParsingMode::Relaxed)
+                    .read_properties(false)
+                    .read_cover_art(false),
+            )
+            .guess_file_type()?
+            .read()
+        })
+        .ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    tag.get_string(ItemKey::AlbumTitle)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Les pistes du disque `d.n` de l'album vivent-elles toutes dans le dossier
@@ -673,6 +840,8 @@ pub fn rattrapage_journalise(db: &Arc<dyn DbBackend>) -> RattrapageSousTitres {
                     coffrets_rattrapes = r.coffrets_rattrapes,
                     disques_sous_titres = r.disques_sous_titres,
                     titres_inconnus = r.titres_inconnus,
+                    disques_sous_titres_par_balise = r.disques_sous_titres_par_balise,
+                    fichiers_illisibles = r.fichiers_illisibles,
                     disques_deplaces = r.disques_deplaces,
                     echecs = r.echecs,
                     "coffrets_sous_titres_rattrapage_2094"
