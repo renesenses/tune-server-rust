@@ -274,6 +274,14 @@ path = "tests/collection_intelligente_sans_micro_coupure_5438.rs"
 name = "lecture_sans_famine_collection_intelligente"
 path = "tests/lecture_sans_famine_collection_intelligente.rs"
 
+# #5677 — banc de mesure des blocages de Tune OS (un processeur, 100 000
+# pistes, lecture + navigation + lots d'écriture + analyse). `#[ignore]` :
+# lancé à la main sous `taskset -c 0`. `autotests = false` : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "blocages_tuneos_5677"
+path = "tests/blocages_tuneos_5677.rs"
+
 # #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
 # sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
 # jamais compilé.
