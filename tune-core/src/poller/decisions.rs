@@ -1460,6 +1460,30 @@ pub enum EnchainementArme {
     Bascule,
     /// Rien n'atteste l'enchaînement : le repli reste de mise.
     Aucun,
+    /// #5411 — la position est retombée comme à un enchaînement, mais le
+    /// renderer nomme encore le flux de la piste FINIE : l'avance de l'écran
+    /// est provisoire, surveillée comme une bascule (voir
+    /// [`renderer_rejoue_la_piste_finie`]).
+    RejeuDeLaPisteFinie,
+}
+
+/// #5411 (fil 2031) — la retombée de position que le sondeur s'apprête à
+/// prendre pour un enchaînement est-elle en fait un REJEU de la piste finie ?
+///
+/// Vrai seulement si le renderer le DIT : son URI courante nomme le flux de
+/// la piste qui vient de finir, et pas le flux armé. Un renderer muet sur son
+/// URI, ou qui nomme le flux armé, n'est jamais soupçonné : l'avance d'avant
+/// s'applique, au mot près. En répétition d'une piste, rejouer la piste finie
+/// est précisément ce qu'on attend : jamais soupçonné non plus.
+pub fn renderer_rejoue_la_piste_finie(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_arme: Option<&str>,
+    repetition_d_une_piste: bool,
+) -> bool {
+    !repetition_d_une_piste
+        && uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, flux_arme)
 }
 
 /// #3967 — a-t-on le droit de demander au renderer de basculer LUI-MÊME sur
@@ -1568,11 +1592,24 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
 /// surveillance, une position gelée à l'ancienne durée finirait par passer
 /// pour la fin de la piste adoptée et la file sauterait un titre.
+///
+/// 🔴 Fil 2031 (#5411, Sony BD-P2100 en DLNA) : « à la fin du morceau N, le
+/// N+1 est en surbrillance, mais le N est rejoué du début ; à la fin, le N+2
+/// est joué ». Un renderer qui REPART DE ZÉRO SUR LA PISTE FINIE bouge, lui
+/// aussi : sa position quitte la valeur gelée. Si l'URI qu'il rapporte nomme
+/// encore le flux de la piste finie (`flux_fini`), ce mouvement est celui
+/// d'un rejeu, pas d'un enchaînement — il ne vaut pas signe de vie, et le
+/// délai écoulé, le repli joue la piste adoptée. C'est la règle que
+/// [`enchainement_sur_le_flux_arme`] applique déjà au moment de la fin : un
+/// renderer qui nomme la piste finie est cru sur parole. Un renderer qui ne
+/// rapporte aucune URI garde la règle d'avant, au mot près.
+#[allow(clippy::too_many_arguments)]
 pub fn suite_de_l_adoption(
     position_ms: u64,
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
+    flux_fini: Option<&str>,
     renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
@@ -1581,8 +1618,10 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    let signe_de_vie =
-        uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS;
+    let rejoue_la_piste_finie = !uri_confirme && uri_nomme_le_flux(current_uri, flux_fini);
+    let signe_de_vie = uri_confirme
+        || (!rejoue_la_piste_finie
+            && position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS);
     if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {
