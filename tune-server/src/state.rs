@@ -688,6 +688,7 @@ impl AppState {
                             // que les scripts ne créent les tables (chasse PG
                             // du 25/09/2026, voir `ensure_schema`).
                             pg.ensure_schema().await;
+                            reparer_premieres_vues_5389(&pg, db_path).await;
                             let backend =
                                 tune_core::db::backend::PostgresBackend::new(pg.pool().clone());
                             Ok::<_, String>(Arc::new(backend) as Arc<dyn DbBackend>)
@@ -717,6 +718,35 @@ impl AppState {
     pub async fn save_tokens(&self) {
         let registry = self.services.lock().await;
         registry.save_all_tokens(&self.backend).await;
+    }
+}
+
+/// Réparation des bases basculées vers PostgreSQL sans `file_first_seen`
+/// (#5389), au démarrage sur PostgreSQL, une seule fois : les dates d'ajout
+/// sont relues dans la base SQLite d'origine (`db_path`) si elle existe encore.
+/// Ne bloque jamais le démarrage : une erreur se journalise et le serveur part.
+#[cfg(feature = "postgres")]
+async fn reparer_premieres_vues_5389(pg: &tune_core::db::postgres::PostgresDb, db_path: &str) {
+    use tune_core::db::pg_migrate::{
+        ReparationPremieresVues, reparer_premieres_vues_depuis_sqlite,
+    };
+    match reparer_premieres_vues_depuis_sqlite(pg.pool(), std::path::Path::new(db_path)).await {
+        Ok(ReparationPremieresVues::DejaFaite) => {}
+        Ok(ReparationPremieresVues::SourceAbsente) => info!(
+            source = %db_path,
+            "file_first_seen_5389_source_sqlite_absente — dates d'ajout d'une bascule \
+             antérieure à v0.9.169 non réparables sans l'ancienne base SQLite"
+        ),
+        Ok(ReparationPremieresVues::Faite { lignes }) => info!(
+            source = %db_path,
+            lignes,
+            "file_first_seen_5389_dates_d_ajout_recopiees_depuis_sqlite"
+        ),
+        Err(e) => tracing::warn!(
+            source = %db_path,
+            error = %e,
+            "file_first_seen_5389_reparation_echouee"
+        ),
     }
 }
 
