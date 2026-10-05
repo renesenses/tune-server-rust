@@ -2485,9 +2485,9 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     gagnant = Some(crate::smb::etiquette(dialecte).to_string());
                     true
                 }
-                Ok(Ok(out)) => {
-                    crate::smb::est_refus_d_authentification(&String::from_utf8_lossy(&out.stderr))
-                }
+                // Un refus d'identifiants, ou un point deja occupe (EBUSY,
+                // fil 2145) : changer de dialecte n'y fera rien.
+                Ok(Ok(out)) => crate::smb::arrete_l_echelle(&String::from_utf8_lossy(&out.stderr)),
                 // mount.cifs absent ou non executable : changer de dialecte
                 // n'y fera rien.
                 Ok(Err(_)) => true,
