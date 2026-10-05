@@ -705,8 +705,15 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                     &desc.event_sub_urls(),
                                 ),
                             )
-                            .with_upnp_silence(
-                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
+                            .with_upnp_silence(crate::config::resolve_upnp_silence(
+                                &state.backend,
+                                &d.id,
+                            ))
+                            // #5793 — plage de volume et canaux lus dans le SCPD.
+                            .with_rendering_control_scpd(
+                                desc.scpd_urls().get("renderingcontrol").map(|p| {
+                                    crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
+                                }),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;
