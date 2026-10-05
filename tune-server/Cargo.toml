@@ -72,8 +72,8 @@ cd = ["dep:tune-cd"]
 circle = ["dep:tune-circle"]
 # Entrée audio en direct (#5051) : capter une entrée USB (platine, S/PDIF,
 # optique) et la diffuser vers une zone. Dans `default` comme `cd` : opt-in à
-# l'exécution (`default_enabled = false`), hors catalogue tant qu'aucun écran
-# ne le consomme.
+# l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
+# rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
 
 [dependencies]
