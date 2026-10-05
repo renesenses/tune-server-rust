@@ -3312,6 +3312,16 @@ pub fn spawn_file_watcher(
     if music_dirs.is_empty() {
         return;
     }
+    // Fil 2148 (#5792) — le délai des sondes de partage réseau, réglable.
+    tune_core::scanner::watcher::regler_intervalle_reseau(
+        tune_core::scanner::watcher::resolve_network_poll_interval(
+            settings
+                .get(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        ),
+    );
 
     // Le surveillant supprime des lignes de `tracks` : il passe par le MÊME
     // arbitrage que la purge de fin de scan (#1943), dans

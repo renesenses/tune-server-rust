@@ -1,22 +1,89 @@
 use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+use std::time::{Instant, SystemTime};
 
 use notify::event::ModifyKind;
-use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
 
-/// Poll interval for directories on network mounts. notify's native backends
-/// (FSEvents/inotify/ReadDirectoryChangesW) receive NOTHING for changes made
-/// by other machines on an SMB/NFS share — the watcher looked alive but was
-/// deaf for the most common NAS setup. Polling stats the WHOLE tree every
-/// interval: on a large SMB library one sweep alone can take minutes
-/// (Pierre M: 6 min 43 for the baseline walk of K:\), so 120 s would have
-/// kept the NAS under permanent scan. 15 min keeps the sweep an occasional
-/// background cost while still surfacing remote changes without a rescan.
-const NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(900);
+/// Fil 2148 (#5792) — le délai entre deux passages de la sonde d'un partage
+/// réseau. Les moteurs natifs (FSEvents/inotify/ReadDirectoryChangesW) ne
+/// reçoivent RIEN des changements faits par une autre machine sur un partage
+/// SMB/NFS : la sonde va voir elle-même.
+///
+/// Il valait 900 s, figés, avec un parcours COMPLET de l'arbre à chaque
+/// passage (Pierre M : 6 min 43 pour `K:\`) : un album copié sur le NAS
+/// attendait jusqu'à un quart d'heure. Le passage ordinaire est désormais
+/// incrémental (voir [`Releve::tour`]), ce qui permet un défaut de 5 min et un
+/// réglage serveur, `network_poll_interval_secs`, borné de 60 s à 1 h.
+pub const NETWORK_POLL_INTERVAL_KEY: &str = "network_poll_interval_secs";
+/// Défaut du délai entre deux passages, en secondes.
+pub const NETWORK_POLL_INTERVAL_DEFAULT: u64 = 300;
+/// Plancher : en dessous d'une minute, même le passage incrémental (un `stat`
+/// par dossier de premier et de second niveau) tiendrait le NAS éveillé.
+pub const NETWORK_POLL_INTERVAL_FLOOR: u64 = 60;
+/// Plafond : au-delà d'une heure, un album ajouté se fait attendre plus
+/// longtemps qu'un rescan manuel.
+pub const NETWORK_POLL_INTERVAL_CEILING: u64 = 3_600;
+
+/// Un passage sur `RELEVE_COMPLET_PERIODE` au plus relit TOUT l'arbre : c'est
+/// le filet de ce que la comparaison des dates de dossiers ne voit pas (un
+/// fichier retouché sur place, un changement à plus de deux niveaux sous la
+/// racine, un serveur qui ne met pas à jour la date de ses dossiers).
+const RELEVE_COMPLET_PERIODE: Duration = Duration::from_secs(3_600);
+
+/// Le délai en vigueur, partagé par toutes les sondes. Réglé au démarrage du
+/// surveillant et à chaque `PATCH /system/config` qui le change : une sonde le
+/// relit pendant son attente, sans redémarrage.
+static INTERVALLE_RESEAU_SECS: AtomicU64 = AtomicU64::new(NETWORK_POLL_INTERVAL_DEFAULT);
+
+/// Résout le délai depuis sa forme PERSISTÉE : illisible ⇒ le défaut, hors
+/// bornes ⇒ ramené dans les bornes. Même discipline que
+/// `resolve_shuffle_max_tracks`.
+pub fn resolve_network_poll_interval(brut: Option<&str>) -> u64 {
+    brut.map(str::trim)
+        .map(|v| v.trim_matches('"').trim())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(NETWORK_POLL_INTERVAL_DEFAULT)
+        .clamp(NETWORK_POLL_INTERVAL_FLOOR, NETWORK_POLL_INTERVAL_CEILING)
+}
+
+/// Valide une valeur ARRIVANTE (`PATCH /system/config`) : hors bornes ou
+/// illisible, elle est refusée en nommant les bornes, jamais devinée.
+pub fn valider_network_poll_interval(brut: &str) -> Result<u64, String> {
+    let nettoye = brut.trim().trim_matches('"').trim();
+    let Ok(n) = nettoye.parse::<u64>() else {
+        return Err(format!(
+            "{NETWORK_POLL_INTERVAL_KEY} : un nombre de secondes entre \
+             {NETWORK_POLL_INTERVAL_FLOOR} et {NETWORK_POLL_INTERVAL_CEILING} — reçu « {brut} »"
+        ));
+    };
+    if !(NETWORK_POLL_INTERVAL_FLOOR..=NETWORK_POLL_INTERVAL_CEILING).contains(&n) {
+        return Err(format!(
+            "{NETWORK_POLL_INTERVAL_KEY} = {n} : hors bornes ({NETWORK_POLL_INTERVAL_FLOOR} à \
+             {NETWORK_POLL_INTERVAL_CEILING} secondes)"
+        ));
+    }
+    Ok(n)
+}
+
+/// Applique le délai à toutes les sondes, en vigueur dès leur attente en
+/// cours. Rend la valeur appliquée, ramenée dans les bornes.
+pub fn regler_intervalle_reseau(secs: u64) -> u64 {
+    let borne = secs.clamp(NETWORK_POLL_INTERVAL_FLOOR, NETWORK_POLL_INTERVAL_CEILING);
+    INTERVALLE_RESEAU_SECS.store(borne, Ordering::Release);
+    borne
+}
+
+/// Le délai en vigueur, en secondes.
+pub fn intervalle_reseau() -> u64 {
+    INTERVALLE_RESEAU_SECS.load(Ordering::Acquire)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeType {
@@ -50,7 +117,7 @@ pub struct FileChange {
 
 pub struct FileWatcher {
     watcher: Option<RecommendedWatcher>,
-    /// Les racines réseau sondées, une sonde (`PollWatcher`) par racine — le
+    /// Les racines réseau sondées, une sonde ([`Releve`]) par racine — le
     /// moteur natif ne reçoit rien des changements faits par une autre machine
     /// sur un partage SMB/NFS. Voir [`Sondage`] : une sonde n'y entre qu'une
     /// fois son relevé initial terminé, en tâche de fond.
@@ -67,14 +134,13 @@ pub struct FileWatcher {
 
 /// Les sondes des racines réseau, partagées avec les fils qui les amorcent.
 ///
-/// `PollWatcher::watch` PARCOURT TOUT L'ARBRE avant de rendre la main : il y
-/// relève la date et la taille de chaque fichier pour comparer les passages
-/// suivants. Sur un grand partage SMB, ce relevé dure des minutes (Pierre M :
-/// 6 min 43 pour `K:\`). Il se faisait dans `FileWatcher::new`, donc AVANT la
-/// boucle du surveillant : tant qu'il durait, aucun changement n'était traité,
-/// même sur les racines locales déjà suivies par le moteur natif, et
-/// `auto_scan` jetait ensuite comme « rejoués » les événements accumulés
-/// entre-temps.
+/// Le relevé initial d'une sonde PARCOURT TOUT L'ARBRE : il relève la date et
+/// la taille de chaque fichier pour comparer les passages suivants. Sur un
+/// grand partage SMB, il dure des minutes (Pierre M : 6 min 43 pour `K:\`). Il
+/// se faisait dans `FileWatcher::new`, donc AVANT la boucle du surveillant :
+/// tant qu'il durait, aucun changement n'était traité, même sur les racines
+/// locales déjà suivies par le moteur natif, et `auto_scan` jetait ensuite
+/// comme « rejoués » les événements accumulés entre-temps.
 ///
 /// Le relevé d'une racine réseau part donc sur son propre fil : la sonde
 /// n'entre ici qu'une fois prête, et les racines locales sont suivies dès la
@@ -83,7 +149,7 @@ pub struct FileWatcher {
 #[derive(Default)]
 struct Sondage {
     /// Sondes prêtes : leur relevé initial est fait, elles comparent.
-    pretes: Mutex<Vec<(PathBuf, PollWatcher)>>,
+    pretes: Mutex<Vec<(PathBuf, SondeReseau)>>,
     /// Racines dont le relevé initial est en cours sur un fil à part.
     en_amorce: Mutex<Vec<PathBuf>>,
     /// Racines dont la sonde n'a pas pu être posée : elles reviennent au
@@ -93,8 +159,415 @@ struct Sondage {
     arrete: AtomicBool,
 }
 
+/// Une sonde de racine réseau en service. Son fil passe toutes les
+/// [`intervalle_reseau`] secondes ; la lâcher arrête ce fil.
+struct SondeReseau {
+    arret: Arc<AtomicBool>,
+}
+
+impl Drop for SondeReseau {
+    fn drop(&mut self) {
+        self.arret.store(true, Ordering::Release);
+    }
+}
+
 fn verrou<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ce qu'une sonde retient d'un chemin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entree {
+    Fichier {
+        mtime: Option<SystemTime>,
+        taille: u64,
+    },
+    Dossier {
+        mtime: Option<SystemTime>,
+    },
+}
+
+impl Entree {
+    fn est_un_dossier(&self) -> bool {
+        matches!(self, Entree::Dossier { .. })
+    }
+}
+
+/// Ce qu'un passage de sonde a coûté et trouvé.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BilanDuTour {
+    /// `read_dir` lancés.
+    pub dossiers_lus: usize,
+    /// `stat` lancés, fichiers et dossiers.
+    pub entrees_examinees: usize,
+    /// Événements émis vers le surveillant.
+    pub evenements: usize,
+    /// Passage complet (tout l'arbre relu) ou incrémental.
+    pub complet: bool,
+}
+
+/// Fil 2148 (#5792) — le relevé d'une racine réseau, et ses passages.
+///
+/// `notify::PollWatcher` relisait TOUT l'arbre à chaque passage : un `stat` par
+/// fichier, des centaines de milliers sur un NAS. Un passage ordinaire ne
+/// relit plus que ce qui a bougé, d'après la date des dossiers : un dossier
+/// change de date quand une entrée y est créée, renommée ou supprimée.
+///
+/// - la racine, puis chaque dossier de PREMIER niveau (l'artiste, d'ordinaire)
+///   qui a changé de date : relecture de ses entrées directes, et de tout le
+///   sous-arbre d'un dossier apparu ;
+/// - chaque dossier de SECOND niveau (l'album) qui a changé de date : son
+///   sous-arbre entier est relu.
+///
+/// Un dossier inchangé coûte un `stat`, et ses fichiers aucun. Ce que les
+/// dates de dossiers ne disent pas — un fichier retouché sur place, un
+/// changement à trois niveaux ou plus sous la racine, un serveur qui ne date
+/// pas ses dossiers — attend le passage complet, une fois par
+/// [`RELEVE_COMPLET_PERIODE`] au plus.
+///
+/// Les événements émis sont ceux du gestionnaire commun
+/// ([`make_event_handler`]) : `Create`/`Remove` de fichier ou de dossier, et
+/// `Modify(Data)` pour un fichier dont la date ou la taille a changé.
+/// (`PollWatcher` émettait `Modify(Metadata(WriteTime))` pour ce dernier cas,
+/// que le gestionnaire écarte : une retouche de balises sur le NAS n'arrivait
+/// jamais.)
+pub(crate) struct Releve {
+    racine: PathBuf,
+    mtime_racine: Option<SystemTime>,
+    /// Tout ce qui est sous la racine, la racine exclue.
+    entrees: BTreeMap<PathBuf, Entree>,
+    /// Dossiers vus changés au passage précédent : relus une fois de plus.
+    /// Certains serveurs datent à la seconde (FAT, à deux secondes) : un
+    /// second changement dans la même seconde que la relecture ne changerait
+    /// pas la date.
+    suspects: HashSet<PathBuf>,
+}
+
+/// Lit `dossier` : ses entrées directes, ou tout son sous-arbre. `None` si un
+/// `read_dir` échoue — rien n'est conclu d'une lecture partielle, qui ferait
+/// passer pour supprimé ce qui n'a pas été lu. Les liens symboliques de
+/// dossier ne sont pas suivis (comme [`fichiers_audio_sous`]).
+fn lister(
+    dossier: &Path,
+    recursif: bool,
+    bilan: &mut BilanDuTour,
+) -> Option<BTreeMap<PathBuf, Entree>> {
+    let mut trouves = BTreeMap::new();
+    let mut a_lire = vec![dossier.to_path_buf()];
+    while let Some(courant) = a_lire.pop() {
+        bilan.dossiers_lus += 1;
+        for entree in std::fs::read_dir(&courant).ok()? {
+            let entree = entree.ok()?;
+            let Ok(genre) = entree.file_type() else {
+                continue;
+            };
+            let chemin = entree.path();
+            bilan.entrees_examinees += 1;
+            // `DirEntry::metadata` ne suit pas les liens ; `fs::metadata` si.
+            let meta = if genre.is_symlink() {
+                std::fs::metadata(&chemin)
+            } else {
+                entree.metadata()
+            };
+            // Disparu entre la liste et le `stat` : le passage suivant le dira.
+            let Ok(meta) = meta else {
+                continue;
+            };
+            if meta.is_dir() {
+                if genre.is_symlink() {
+                    continue;
+                }
+                trouves.insert(
+                    chemin.clone(),
+                    Entree::Dossier {
+                        mtime: meta.modified().ok(),
+                    },
+                );
+                if recursif {
+                    a_lire.push(chemin);
+                }
+            } else {
+                trouves.insert(
+                    chemin,
+                    Entree::Fichier {
+                        mtime: meta.modified().ok(),
+                        taille: meta.len(),
+                    },
+                );
+            }
+        }
+    }
+    Some(trouves)
+}
+
+fn evenement(kind: EventKind, chemin: &Path) -> Event {
+    Event::new(kind).add_path(chemin.to_path_buf())
+}
+
+impl Releve {
+    /// Le relevé initial : tout l'arbre. `None` si la racine ne se lit pas.
+    pub(crate) fn initial(racine: &Path) -> Option<(Self, BilanDuTour)> {
+        let mut bilan = BilanDuTour {
+            complet: true,
+            ..Default::default()
+        };
+        bilan.entrees_examinees += 1;
+        let mtime_racine = std::fs::metadata(racine).ok()?.modified().ok();
+        let entrees = lister(racine, true, &mut bilan)?;
+        Some((
+            Self {
+                racine: racine.to_path_buf(),
+                mtime_racine,
+                entrees,
+                suspects: HashSet::new(),
+            },
+            bilan,
+        ))
+    }
+
+    /// Combien de chemins le relevé connaît sous la racine.
+    pub(crate) fn taille(&self) -> usize {
+        self.entrees.len()
+    }
+
+    /// Ce que le relevé sait sous `dossier`, `dossier` exclu.
+    fn sous(&self, dossier: &Path) -> impl Iterator<Item = (&PathBuf, &Entree)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.entrees
+            .range::<PathBuf, _>((Excluded(dossier.to_path_buf()), Unbounded))
+            .take_while(move |(p, _)| p.starts_with(dossier))
+    }
+
+    fn mtime_connue(&self, dossier: &Path) -> Option<Option<SystemTime>> {
+        if dossier == self.racine {
+            return Some(self.mtime_racine);
+        }
+        match self.entrees.get(dossier) {
+            Some(Entree::Dossier { mtime }) => Some(*mtime),
+            _ => None,
+        }
+    }
+
+    fn poser_mtime(&mut self, dossier: &Path, mtime: Option<SystemTime>) {
+        if dossier == self.racine {
+            self.mtime_racine = mtime;
+        } else if let Some(Entree::Dossier { mtime: m }) = self.entrees.get_mut(dossier) {
+            *m = mtime;
+        }
+    }
+
+    /// Un passage : incrémental, ou complet si `complet`.
+    pub(crate) fn tour(&mut self, complet: bool, emettre: &mut dyn FnMut(Event)) -> BilanDuTour {
+        let mut bilan = BilanDuTour {
+            complet,
+            ..Default::default()
+        };
+        let suspects = std::mem::take(&mut self.suspects);
+        let racine = self.racine.clone();
+        if complet {
+            bilan.entrees_examinees += 1;
+            let Some(mtime) = std::fs::metadata(&racine).ok().map(|m| m.modified().ok()) else {
+                return bilan;
+            };
+            if let Some(neuf) = lister(&racine, true, &mut bilan) {
+                let ancien: BTreeMap<PathBuf, Entree> =
+                    self.sous(&racine).map(|(p, e)| (p.clone(), *e)).collect();
+                self.remplacer(ancien, neuf, emettre, &mut bilan);
+                self.mtime_racine = mtime;
+            } else {
+                self.suspects = suspects;
+            }
+            return bilan;
+        }
+
+        // Niveau 0 puis 1 : relecture des entrées directes.
+        self.verifier(&racine, &suspects, false, emettre, &mut bilan);
+        let niveau = |releve: &Self, n: usize| -> Vec<PathBuf> {
+            releve
+                .entrees
+                .iter()
+                .filter(|(p, e)| {
+                    e.est_un_dossier()
+                        && p.strip_prefix(&releve.racine)
+                            .is_ok_and(|r| r.components().count() == n)
+                })
+                .map(|(p, _)| p.clone())
+                .collect()
+        };
+        for d in niveau(self, 1) {
+            self.verifier(&d, &suspects, false, emettre, &mut bilan);
+        }
+        // Niveau 2 : le sous-arbre entier.
+        for d in niveau(self, 2) {
+            self.verifier(&d, &suspects, true, emettre, &mut bilan);
+        }
+        bilan
+    }
+
+    /// Relit `dossier` si sa date a changé (ou s'il est suspect). Rend vrai
+    /// s'il a été relu.
+    fn verifier(
+        &mut self,
+        dossier: &Path,
+        suspects: &HashSet<PathBuf>,
+        sous_arbre: bool,
+        emettre: &mut dyn FnMut(Event),
+        bilan: &mut BilanDuTour,
+    ) -> bool {
+        let Some(connue) = self.mtime_connue(dossier) else {
+            return false;
+        };
+        bilan.entrees_examinees += 1;
+        // Disparu ou illisible : c'est la relecture de son parent qui le dira.
+        let Ok(meta) = std::fs::metadata(dossier) else {
+            return false;
+        };
+        let mtime = meta.modified().ok();
+        let a_change = mtime != connue;
+        if !a_change && !suspects.contains(dossier) {
+            return false;
+        }
+        let relu = if sous_arbre {
+            self.relire_le_sous_arbre(dossier, emettre, bilan)
+        } else {
+            self.relire_les_entrees(dossier, emettre, bilan)
+        };
+        if relu {
+            // La date lue AVANT la relecture : un changement pendant celle-ci
+            // laisse une date plus récente, vue au passage suivant.
+            self.poser_mtime(dossier, mtime);
+        }
+        if a_change || !relu {
+            self.suspects.insert(dossier.to_path_buf());
+        }
+        relu
+    }
+
+    fn relire_le_sous_arbre(
+        &mut self,
+        dossier: &Path,
+        emettre: &mut dyn FnMut(Event),
+        bilan: &mut BilanDuTour,
+    ) -> bool {
+        let Some(neuf) = lister(dossier, true, bilan) else {
+            return false;
+        };
+        let ancien: BTreeMap<PathBuf, Entree> =
+            self.sous(dossier).map(|(p, e)| (p.clone(), *e)).collect();
+        self.remplacer(ancien, neuf, emettre, bilan);
+        true
+    }
+
+    /// Les entrées directes de `dossier` ; le sous-arbre d'un dossier apparu
+    /// ou disparu en entier ; un dossier resté en place n'est pas relu (sa
+    /// date, à lui, le dira).
+    fn relire_les_entrees(
+        &mut self,
+        dossier: &Path,
+        emettre: &mut dyn FnMut(Event),
+        bilan: &mut BilanDuTour,
+    ) -> bool {
+        let Some(directes) = lister(dossier, false, bilan) else {
+            return false;
+        };
+        let mut ancien: BTreeMap<PathBuf, Entree> = self
+            .sous(dossier)
+            .filter(|(p, _)| p.parent() == Some(dossier))
+            .map(|(p, e)| (p.clone(), *e))
+            .collect();
+        let mut neuf = BTreeMap::new();
+        for (chemin, entree) in directes {
+            match (entree, ancien.get(&chemin)) {
+                // Resté en place : sa date reste la sienne, pas celle que la
+                // liste du parent vient de lire — sinon son propre changement
+                // passerait inaperçu.
+                (Entree::Dossier { .. }, Some(vieux @ Entree::Dossier { .. })) => {
+                    neuf.insert(chemin, *vieux);
+                }
+                (Entree::Dossier { .. }, _) => {
+                    let Some(dessous) = lister(&chemin, true, bilan) else {
+                        return false;
+                    };
+                    neuf.insert(chemin, entree);
+                    neuf.extend(dessous);
+                }
+                (Entree::Fichier { .. }, _) => {
+                    neuf.insert(chemin, entree);
+                }
+            }
+        }
+        let disparus: Vec<PathBuf> = ancien
+            .iter()
+            .filter(|(p, e)| {
+                e.est_un_dossier() && !matches!(neuf.get(*p), Some(Entree::Dossier { .. }))
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for d in disparus {
+            let dessous: Vec<(PathBuf, Entree)> =
+                self.sous(&d).map(|(p, e)| (p.clone(), *e)).collect();
+            ancien.extend(dessous);
+        }
+        self.remplacer(ancien, neuf, emettre, bilan);
+        true
+    }
+
+    /// Remplace `ancien` par `neuf` dans le relevé et émet la différence.
+    fn remplacer(
+        &mut self,
+        ancien: BTreeMap<PathBuf, Entree>,
+        neuf: BTreeMap<PathBuf, Entree>,
+        emettre: &mut dyn FnMut(Event),
+        bilan: &mut BilanDuTour,
+    ) {
+        use notify::event::{CreateKind, DataChange, RemoveKind};
+        let mut emettre = |e: Event| {
+            bilan.evenements += 1;
+            emettre(e);
+        };
+        let retrait = |e: &Entree| {
+            EventKind::Remove(if e.est_un_dossier() {
+                RemoveKind::Folder
+            } else {
+                RemoveKind::File
+            })
+        };
+        let creation = |e: &Entree| {
+            EventKind::Create(if e.est_un_dossier() {
+                CreateKind::Folder
+            } else {
+                CreateKind::File
+            })
+        };
+        for (chemin, vieux) in &ancien {
+            match neuf.get(chemin) {
+                None => emettre(evenement(retrait(vieux), chemin)),
+                Some(e) if e.est_un_dossier() != vieux.est_un_dossier() => {
+                    emettre(evenement(retrait(vieux), chemin));
+                }
+                _ => {}
+            }
+        }
+        for (chemin, entree) in &neuf {
+            match ancien.get(chemin) {
+                None => emettre(evenement(creation(entree), chemin)),
+                Some(vieux) if vieux.est_un_dossier() != entree.est_un_dossier() => {
+                    emettre(evenement(creation(entree), chemin));
+                }
+                Some(vieux @ Entree::Fichier { .. }) if vieux != entree => emettre(evenement(
+                    EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                    chemin,
+                )),
+                _ => {}
+            }
+        }
+        for chemin in ancien.keys() {
+            if !neuf.contains_key(chemin) {
+                self.entrees.remove(chemin);
+            }
+        }
+        self.entrees.extend(neuf);
+    }
 }
 
 /// Épreuves : simuler une racine réseau sur un système de fichiers local, et
@@ -136,7 +609,8 @@ fn est_une_racine_reseau(dir: &Path) -> bool {
 }
 
 /// Le relevé initial d'une racine réseau, sur son propre fil (voir
-/// [`Sondage`]). Il peut durer des heures sur un grand partage SMB.
+/// [`Sondage`]), puis ses passages sur ce même fil. Le relevé peut durer des
+/// heures sur un grand partage SMB.
 fn amorcer_la_sonde(sondage: Arc<Sondage>, event_tx: mpsc::Sender<FileChange>, dir: PathBuf) {
     let fil = std::thread::Builder::new()
         .name("tune-sonde-reseau".into())
@@ -146,28 +620,32 @@ fn amorcer_la_sonde(sondage: Arc<Sondage>, event_tx: mpsc::Sender<FileChange>, d
             move || {
                 #[cfg(test)]
                 simulation_reseau::attendre_la_liberation(&dir);
-                let debut = std::time::Instant::now();
-                let sonde = PollWatcher::new(
-                    make_event_handler(event_tx),
-                    Config::default().with_poll_interval(NETWORK_POLL_INTERVAL),
-                )
-                .and_then(|mut pw| pw.watch(&dir, RecursiveMode::Recursive).map(|()| pw));
+                let debut = Instant::now();
+                let releve = Releve::initial(&dir);
                 verrou(&sondage.en_amorce).retain(|d| d != &dir);
-                match sonde {
-                    Ok(pw) if !sondage.arrete.load(Ordering::Acquire) => {
+                match releve {
+                    Some((releve, bilan)) if !sondage.arrete.load(Ordering::Acquire) => {
                         info!(
                             dir = %dir.display(),
-                            interval_secs = NETWORK_POLL_INTERVAL.as_secs(),
+                            interval_secs = intervalle_reseau(),
                             releve_ms = debut.elapsed().as_millis() as u64,
-                            "watching_directory_poll — network mount, using polling"
+                            entrees = releve.taille(),
+                            dossiers_lus = bilan.dossiers_lus,
+                            "watching_directory_poll — network mount, incremental polling"
                         );
-                        verrou(&sondage.pretes).push((dir, pw));
+                        let arret = Arc::new(AtomicBool::new(false));
+                        verrou(&sondage.pretes).push((
+                            dir.clone(),
+                            SondeReseau {
+                                arret: arret.clone(),
+                            },
+                        ));
+                        sonder(releve, &arret, &sondage, make_event_handler(event_tx));
                     }
-                    // Surveillant arrêté pendant le relevé : la sonde est
-                    // abandonnée (son `Drop` arrête son fil).
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(dir = %dir.display(), error = %e, "poll_watch_failed — falling back to native watch");
+                    // Surveillant arrêté pendant le relevé : rien n'est posé.
+                    Some(_) => {}
+                    None => {
+                        warn!(dir = %dir.display(), "poll_watch_failed — root unreadable, falling back to native watch");
                         verrou(&sondage.repli_natif).push(dir);
                     }
                 }
@@ -177,6 +655,55 @@ fn amorcer_la_sonde(sondage: Arc<Sondage>, event_tx: mpsc::Sender<FileChange>, d
         warn!(dir = %dir.display(), error = %e, "poll_watch_failed — falling back to native watch");
         verrou(&sondage.en_amorce).retain(|d| d != &dir);
         verrou(&sondage.repli_natif).push(dir);
+    }
+}
+
+/// Les passages d'une sonde, jusqu'à ce qu'on la lâche ou que le surveillant
+/// s'arrête. Le délai est relu pendant l'attente : un nouveau réglage vaut
+/// dès l'attente en cours.
+fn sonder(
+    mut releve: Releve,
+    arret: &AtomicBool,
+    sondage: &Sondage,
+    gestionnaire: impl Fn(Result<Event, notify::Error>),
+) {
+    let mut dernier_complet = Instant::now();
+    loop {
+        let attente = Instant::now();
+        loop {
+            if arret.load(Ordering::Acquire) || sondage.arrete.load(Ordering::Acquire) {
+                return;
+            }
+            if attente.elapsed() >= Duration::from_secs(intervalle_reseau()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let complet = dernier_complet.elapsed() >= RELEVE_COMPLET_PERIODE;
+        let debut = Instant::now();
+        let bilan = releve.tour(complet, &mut |e| gestionnaire(Ok(e)));
+        if complet {
+            dernier_complet = Instant::now();
+        }
+        let duree_ms = debut.elapsed().as_millis() as u64;
+        if bilan.complet || bilan.evenements > 0 {
+            info!(
+                dir = %releve.racine.display(),
+                complet = bilan.complet,
+                duree_ms,
+                dossiers_lus = bilan.dossiers_lus,
+                entrees_examinees = bilan.entrees_examinees,
+                evenements = bilan.evenements,
+                "network_poll_pass"
+            );
+        } else {
+            debug!(
+                dir = %releve.racine.display(),
+                duree_ms,
+                entrees_examinees = bilan.entrees_examinees,
+                "network_poll_pass_unchanged"
+            );
+        }
     }
 }
 
@@ -460,12 +987,12 @@ impl FileWatcher {
         {
             let mut pretes = verrou(&self.sondage.pretes);
             let mut still_polled = Vec::new();
-            for (dir, mut pw) in std::mem::take(&mut *pretes) {
+            for (dir, sonde) in std::mem::take(&mut *pretes) {
                 if std::fs::read_dir(&dir).is_ok() {
-                    still_polled.push((dir, pw));
+                    still_polled.push((dir, sonde));
                 } else {
                     warn!(dir = %dir.display(), "watch_dir_lost — unmounted or unreadable, will re-watch when it returns");
-                    let _ = pw.unwatch(&dir);
+                    drop(sonde);
                     self.pending.push(dir);
                 }
             }
@@ -566,9 +1093,8 @@ impl FileWatcher {
             }
         }
         self.sondage.arrete.store(true, Ordering::Release);
-        for (dir, mut pw) in std::mem::take(&mut *verrou(&self.sondage.pretes)) {
-            let _ = pw.unwatch(&dir);
-        }
+        // Lâcher une sonde arrête son fil.
+        verrou(&self.sondage.pretes).clear();
         info!("file_watcher_stopped");
     }
 }
@@ -992,7 +1518,7 @@ mod tests {
     }
 
     /// Fil forum 2148 — le relevé initial d'une racine RÉSEAU ne retient plus
-    /// le surveillant. `PollWatcher::watch` parcourt tout l'arbre avant de
+    /// le surveillant. Le relevé initial parcourt tout l'arbre avant de
     /// rendre la main ; fait dans `FileWatcher::new`, ce parcours retardait
     /// d'autant la boucle du surveillant, dossiers locaux compris. Ici le
     /// relevé est RETENU indéfiniment : la création doit rendre la main quand
@@ -1158,5 +1684,258 @@ mod tests {
             !signales.contains(&supprime),
             "un rapport supprimé ou une pochette ne relancent rien : {signales:?}"
         );
+    }
+
+    /// Une bibliothèque `Artiste/Album/piste.flac` sous `racine`.
+    fn bibliotheque(racine: &Path, artistes: usize, albums: usize, pistes: usize) {
+        for a in 0..artistes {
+            for b in 0..albums {
+                let album = racine
+                    .join(format!("Artiste {a:04}"))
+                    .join(format!("Album {b:02}"));
+                fs::create_dir_all(&album).unwrap();
+                for p in 0..pistes {
+                    fs::write(album.join(format!("{p:02} - Piste.flac")), b"x").unwrap();
+                }
+            }
+        }
+    }
+
+    /// Un passage de sonde, traduit par le gestionnaire de production.
+    fn passage(releve: &mut Releve, complet: bool) -> (BilanDuTour, HashMap<String, ChangeType>) {
+        let mut bruts = Vec::new();
+        let bilan = releve.tour(complet, &mut |e| bruts.push(e));
+        (bilan, genres(&rejouer_evenements_notify(bruts)))
+    }
+
+    /// Certains systèmes de fichiers datent à la seconde : laisser la date
+    /// d'un dossier changer pour de bon.
+    fn laisser_passer_une_seconde() {
+        std::thread::sleep(Duration::from_millis(1_100));
+    }
+
+    /// Fil 2148 (#5792) — un fichier ajouté dans un sous-dossier d'un partage
+    /// réseau est vu au passage suivant SANS relire tout l'arbre : seul le
+    /// dossier dont la date a changé est relu, les autres coûtent un `stat`
+    /// chacun et leurs fichiers aucun.
+    #[test]
+    fn un_fichier_ajoute_dans_un_sous_dossier_est_vu_sans_relire_tout_l_arbre_2148() {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-sonde-incrementale-2148",
+        );
+        bibliotheque(&racine, 20, 5, 3);
+        let (mut releve, initial) = Releve::initial(&racine).expect("relevé initial");
+        // 20 artistes, 100 albums, 300 pistes.
+        assert_eq!(releve.taille(), 420);
+        assert_eq!(initial.dossiers_lus, 121);
+
+        // Rien n'a bougé : aucune liste relue, aucun événement.
+        let (bilan, vus) = passage(&mut releve, false);
+        assert!(vus.is_empty(), "{vus:?}");
+        assert_eq!(
+            bilan.dossiers_lus, 0,
+            "🔴 #5792 — un passage sans changement relit des dossiers (parcours complet ?) : {bilan:?}"
+        );
+
+        laisser_passer_une_seconde();
+        let nouveau = racine
+            .join("Artiste 0007")
+            .join("Album 03")
+            .join("99 - Nouvelle.flac");
+        fs::write(&nouveau, b"x").unwrap();
+        let (bilan, vus) = passage(&mut releve, false);
+        assert_eq!(
+            vus.get(&*nouveau.to_string_lossy()),
+            Some(&ChangeType::Added),
+            "🔴 #5792 — le fichier ajouté n'est pas vu au passage suivant : {vus:?}"
+        );
+        assert_eq!(vus.len(), 1, "{vus:?}");
+        assert_eq!(
+            bilan.dossiers_lus, 1,
+            "🔴 #5792 — seul l'album qui a bougé doit être relu : {bilan:?}"
+        );
+        // Un `stat` pour la racine, les 20 artistes et les 100 albums, plus
+        // les 4 entrées de l'album relu : rien des 296 autres pistes.
+        assert_eq!(bilan.entrees_examinees, 1 + 20 + 100 + 4, "{bilan:?}");
+        assert!(!bilan.complet);
+    }
+
+    /// Fil 2148 — les autres gestes, au premier et au second niveau, dans un
+    /// même passage : un album renommé, un album ajouté chez un artiste dont
+    /// un AUTRE album reçoit un fichier (la date de cet album-là ne doit pas
+    /// être écrasée par la relecture de l'artiste), un artiste supprimé.
+    #[test]
+    fn renommer_ajouter_et_supprimer_sous_les_deux_premiers_niveaux_2148() {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-sonde-gestes-2148",
+        );
+        bibliotheque(&racine, 4, 3, 2);
+        let (mut releve, _) = Releve::initial(&racine).unwrap();
+        laisser_passer_une_seconde();
+
+        let a1 = racine.join("Artiste 0001");
+        fs::rename(a1.join("Album 00"), a1.join("Album renommé")).unwrap();
+        let a2 = racine.join("Artiste 0002");
+        fs::create_dir_all(a2.join("Album neuf")).unwrap();
+        fs::write(a2.join("Album neuf").join("01.flac"), b"x").unwrap();
+        fs::write(a2.join("Album 01").join("99.flac"), b"x").unwrap();
+        let a3 = racine.join("Artiste 0003");
+        fs::remove_dir_all(&a3).unwrap();
+
+        let (_bilan, vus) = passage(&mut releve, false);
+        let vu = |p: PathBuf| vus.get(&*p.to_string_lossy()).cloned();
+        assert_eq!(
+            vu(a1.join("Album 00")),
+            Some(ChangeType::DossierDisparu),
+            "🔴 album renommé non vu : la relecture de la racine a-t-elle écrasé la \
+             date de l'artiste resté en place ?"
+        );
+        assert_eq!(
+            vu(a1.join("Album renommé")),
+            Some(ChangeType::DossierApparu)
+        );
+        assert_eq!(
+            vu(a1.join("Album renommé").join("00 - Piste.flac")),
+            Some(ChangeType::Added)
+        );
+        assert_eq!(vu(a2.join("Album neuf")), Some(ChangeType::DossierApparu));
+        assert_eq!(
+            vu(a2.join("Album neuf").join("01.flac")),
+            Some(ChangeType::Added)
+        );
+        assert_eq!(
+            vu(a2.join("Album 01").join("99.flac")),
+            Some(ChangeType::Added),
+            "la relecture de l'artiste ne doit pas masquer le changement de son album"
+        );
+        assert_eq!(vu(a3.clone()), Some(ChangeType::DossierDisparu));
+        assert_eq!(
+            vu(a3.join("Album 00").join("00 - Piste.flac")),
+            Some(ChangeType::Deleted)
+        );
+
+        // Le passage suivant relit une fois les dossiers suspects, sans rien
+        // inventer.
+        let (_, vus) = passage(&mut releve, false);
+        assert!(vus.is_empty(), "{vus:?}");
+        let (bilan, vus) = passage(&mut releve, false);
+        assert!(vus.is_empty(), "{vus:?}");
+        assert_eq!(bilan.dossiers_lus, 0, "{bilan:?}");
+    }
+
+    /// Fil 2148 — ce que la date des dossiers ne dit pas (une retouche sur
+    /// place, un changement à trois niveaux sous la racine) attend le passage
+    /// complet, qui le voit. La retouche sort en `Modified` : avec
+    /// `PollWatcher`, elle sortait en `Modify(Metadata(WriteTime))`, écarté.
+    #[test]
+    fn le_passage_complet_voit_ce_que_les_dates_de_dossiers_taisent_2148() {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-sonde-complet-2148",
+        );
+        bibliotheque(&racine, 2, 2, 2);
+        let cd2 = racine.join("Artiste 0000").join("Album 00").join("CD2");
+        fs::create_dir_all(&cd2).unwrap();
+        let (mut releve, _) = Releve::initial(&racine).unwrap();
+        laisser_passer_une_seconde();
+        let retouche = racine
+            .join("Artiste 0001")
+            .join("Album 01")
+            .join("00 - Piste.flac");
+        fs::write(&retouche, b"balises reecrites").unwrap();
+        let profond = cd2.join("01.flac");
+        fs::write(&profond, b"x").unwrap();
+
+        let (_, vus) = passage(&mut releve, false);
+        assert!(
+            vus.is_empty(),
+            "le passage incrémental ne les voit pas : {vus:?}"
+        );
+        let (bilan, vus) = passage(&mut releve, true);
+        assert!(bilan.complet);
+        assert_eq!(
+            vus.get(&*retouche.to_string_lossy()),
+            Some(&ChangeType::Modified)
+        );
+        assert_eq!(
+            vus.get(&*profond.to_string_lossy()),
+            Some(&ChangeType::Added)
+        );
+    }
+
+    #[test]
+    fn le_delai_des_partages_reseau_se_resout_dans_ses_bornes_2148() {
+        assert_eq!(resolve_network_poll_interval(None), 300);
+        assert_eq!(resolve_network_poll_interval(Some("beaucoup")), 300);
+        assert_eq!(resolve_network_poll_interval(Some("\"120\"")), 120);
+        assert_eq!(resolve_network_poll_interval(Some("5")), 60);
+        assert_eq!(resolve_network_poll_interval(Some("90000")), 3_600);
+        assert_eq!(valider_network_poll_interval("600"), Ok(600));
+        assert!(valider_network_poll_interval("59").is_err());
+        assert!(valider_network_poll_interval("3601").is_err());
+        assert!(valider_network_poll_interval("-1").is_err());
+    }
+
+    /// Banc du fil 2148 : le coût d'un passage sur un partage simulé.
+    ///
+    /// `TUNE_BANC_SONDE_RACINE=/dev/shm/... cargo test -p tune-core --lib \
+    ///  banc_sonde_reseau -- --ignored --nocapture`
+    /// Sans la variable, l'arbre va dans un dossier jetable du dossier courant.
+    #[test]
+    #[ignore = "banc : 100 000 fichiers, à lancer à la main"]
+    fn banc_sonde_reseau_100000_fichiers_2148() {
+        let garde;
+        let racine = match std::env::var_os("TUNE_BANC_SONDE_RACINE") {
+            Some(r) => {
+                let r = PathBuf::from(r);
+                let _ = fs::remove_dir_all(&r);
+                fs::create_dir_all(&r).unwrap();
+                r
+            }
+            None => {
+                garde = crate::test_scratch::scratch_dir_in(
+                    std::env::current_dir().unwrap(),
+                    "watcher-banc-2148",
+                );
+                garde.to_path_buf()
+            }
+        };
+        let t = Instant::now();
+        bibliotheque(&racine, 1_000, 10, 10);
+        eprintln!("arbre : 100 000 fichiers créés en {:?}", t.elapsed());
+        let t = Instant::now();
+        let (mut releve, initial) = Releve::initial(&racine).unwrap();
+        eprintln!("relevé initial : {:?} {initial:?}", t.elapsed());
+        for complet in [false, true, false] {
+            let t = Instant::now();
+            let (bilan, vus) = passage(&mut releve, complet);
+            eprintln!(
+                "passage sans changement : {:?} {bilan:?} ({} vus)",
+                t.elapsed(),
+                vus.len()
+            );
+        }
+        laisser_passer_une_seconde();
+        fs::write(
+            racine
+                .join("Artiste 0500")
+                .join("Album 05")
+                .join("99 - Nouvelle.flac"),
+            b"x",
+        )
+        .unwrap();
+        let t = Instant::now();
+        let (bilan, vus) = passage(&mut releve, false);
+        eprintln!(
+            "passage avec un ajout : {:?} {bilan:?} ({} vus)",
+            t.elapsed(),
+            vus.len()
+        );
+        assert_eq!(vus.len(), 1);
+        if std::env::var_os("TUNE_BANC_SONDE_RACINE").is_some() {
+            let _ = fs::remove_dir_all(&racine);
+        }
     }
 }
