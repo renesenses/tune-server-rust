@@ -200,6 +200,14 @@ struct OublierQuery {
     /// partage.
     #[serde(default)]
     confirmer: bool,
+    /// Retirer aussi ces racines de la bibliotheque, par le chemin existant
+    /// de retrait de dossier (decision de Bertrand, 05/10).
+    #[serde(default)]
+    retirer_racines: bool,
+    /// Le nombre de pistes montre a l'utilisateur et accepte : meme contrat
+    /// que `confirm_purge` de `POST /system/music-dirs/remove` (#1943).
+    #[serde(default)]
+    confirmer_purge: Option<u64>,
 }
 
 /// Les racines de la bibliotheque qui vivent sous `mount_path` (le point
@@ -234,9 +242,11 @@ pub(crate) fn racines_dependantes(music_dirs: &[String], mount_path: &str) -> Ve
 /// Un demontage qui echoue garde la ligne : supprimer d'abord laisserait un
 /// partage monte que plus rien ne nomme, ni l'ecran ni le demarrage.
 ///
-/// Les racines dependantes ne sont PAS retirees de la bibliotheque : leur
-/// sort (garder les pistes ou non) est le geste « retirer un dossier », avec
-/// sa propre confirmation de purge. Une racine absente est protegee de la
+/// Les racines dependantes : `?retirer_racines=true` les retire de la
+/// bibliotheque par le chemin de `POST /system/music-dirs/remove`
+/// (`retirer_un_dossier`), avec la purge de leurs pistes si
+/// `confirmer_purge` couvre le nombre montre dans le 409 (`pistes`). Sans
+/// l'option, elles restent declarees ; une racine absente est protegee de la
 /// purge par le scan (`verdict_purge`, #1652).
 async fn oublier_un_partage(
     _admin: crate::auth::RequireAdmin,
@@ -275,6 +285,9 @@ async fn oublier_un_partage(
                     racines.len()
                 ),
                 "racines": racines,
+                // Ce que la purge emporterait si l'utilisateur retire aussi
+                // ces dossiers : il doit le voir avant d'accepter.
+                "pistes": crate::routes::system::pistes_qui_partiraient(&state, &racines),
             })),
         )
             .into_response();
@@ -325,10 +338,39 @@ async fn oublier_un_partage(
     if !smb::est_un_point_de_montage(chemin) {
         let _ = std::fs::remove_dir(chemin);
     }
-    info!(id, path = %mount_path, demonte, racines = racines.len(), "smb_partage_oublie");
+    // Les racines ne partent qu'APRES le demontage et la suppression reussis :
+    // un oubli refuse ne doit rien avoir retire de la bibliotheque.
+    let mut racines_retirees = Vec::new();
+    let mut pistes_retirees = 0u64;
+    let mut purge_refusee = false;
+    if q.retirer_racines {
+        for r in &racines {
+            match crate::routes::system::retirer_un_dossier(&state, r, q.confirmer_purge) {
+                Ok(v) => {
+                    pistes_retirees += v["purged"].as_u64().unwrap_or(0);
+                    purge_refusee |= v["purge_refused"].as_bool().unwrap_or(false);
+                    racines_retirees.push(r.clone());
+                }
+                Err(e) => {
+                    warn!(id, racine = %r, error = %e.message, "smb_oubli_retrait_racine_echoue")
+                }
+            }
+        }
+    }
+    info!(
+        id, path = %mount_path, demonte, racines = racines.len(),
+        racines_retirees = racines_retirees.len(), pistes_retirees, "smb_partage_oublie"
+    );
     (
         StatusCode::OK,
-        Json(json!({ "oublie": true, "demonte": demonte, "racines": racines })),
+        Json(json!({
+            "oublie": true,
+            "demonte": demonte,
+            "racines": racines,
+            "racines_retirees": racines_retirees,
+            "pistes_retirees": pistes_retirees,
+            "purge_refusee": purge_refusee,
+        })),
     )
         .into_response()
 }
@@ -2951,6 +2993,84 @@ mod tests_oubli_2145 {
         )
         .await;
         assert_eq!(statut, StatusCode::NOT_FOUND);
+    }
+
+    /// Decision de Bertrand (05/10) : la confirmation propose de retirer aussi
+    /// les dossiers, avec la purge habituelle de leurs pistes. Le 409 dit
+    /// combien de pistes partiraient ; confirme avec ce nombre, les racines
+    /// sont retirees par le chemin de `POST /system/music-dirs/remove` et
+    /// leurs pistes purgees ; une racine qui ne depend pas du partage reste,
+    /// avec ses pistes.
+    #[tokio::test]
+    async fn oublier_en_retirant_les_racines_purge_leurs_pistes() {
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::models::Track;
+        use tune_core::db::track_repo::TrackRepo;
+        let n = tune_core::scanner::walker::normalize_path;
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let base = tune_core::test_scratch::scratch_dir("tune_oubli_2145_c");
+        let point = base.join("nas_Music");
+        let autre = base.join("disque_local");
+        std::fs::create_dir_all(&point).unwrap();
+        let (point_s, autre_s) = (n(&point.to_string_lossy()), n(&autre.to_string_lossy()));
+        let id = backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                &[&"192.168.10.69" as &dyn ToSqlValue, &"Music" as &dyn ToSqlValue, &point_s as &dyn ToSqlValue],
+            )
+            .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![point_s.clone(), autre_s.clone()]).unwrap(),
+            )
+            .unwrap();
+        let repo = TrackRepo::with_backend(backend.clone());
+        for chemin in [
+            format!("{point_s}/a.flac"),
+            format!("{point_s}/Jazz/b.flac"),
+            format!("{autre_s}/c.flac"),
+        ] {
+            let mut t = Track::new(format!("piste {chemin}"));
+            t.file_path = Some(chemin);
+            repo.create(&t).unwrap();
+        }
+        let app = crate::routes::router(etat);
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["pistes"], 2, "deux pistes vivent sur le partage : {v}");
+
+        let (statut, v) = appel(
+            &app,
+            Request::delete(format!(
+                "/api/v1/network/smb/mounts/{id}?confirmer=true&retirer_racines=true&confirmer_purge=2"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["racines_retirees"][0], point_s.as_str(), "{v}");
+        assert_eq!(v["pistes_retirees"], 2, "{v}");
+        assert_eq!(v["purge_refusee"], false, "{v}");
+        assert_eq!(lignes(&backend), 0);
+        assert_eq!(
+            crate::routes::system::get_music_dirs_list(&backend),
+            vec![autre_s.clone()],
+            "seule la racine du partage est retiree"
+        );
+        let restantes = backend
+            .query_many("SELECT file_path FROM tracks", &[])
+            .unwrap();
+        assert_eq!(restantes.len(), 1, "la piste de l'autre racine reste");
     }
 
     /// Sans racine dependante, l'oubli se fait sans confirmation. Un point qui
