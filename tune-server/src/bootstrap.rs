@@ -600,14 +600,13 @@ pub async fn run_with(opts: RunOptions) {
         });
     }
 
-    if let Err(e) = axum::serve(
-        listener,
-        // ConnectInfo<SocketAddr> lets handlers see the client IP (used to
-        // disambiguate browser zones created by different machines — Bertrand).
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown_state))
-    .await
+    // #4645 — le transport HTTP tourne sur son propre moteur, et les flux
+    // audio (`/stream/…`) y sont servis sur place : un gel de l'exécuteur
+    // principal ne tait plus le renderer. Le reste des requêtes est traité ici
+    // comme avant. `ConnectInfo<SocketAddr>` reste posé sur chaque requête
+    // (zones navigateur distinguées par l'adresse du client — Bertrand).
+    if let Err(e) =
+        crate::aiguillage_des_flux::servir(listener, app, shutdown_signal(shutdown_state)).await
     {
         tracing::error!(error = %e, "server_fatal_error");
         #[cfg(windows)]
