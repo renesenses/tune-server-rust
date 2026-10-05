@@ -28,6 +28,8 @@ pub mod chemin_inaccessible;
 pub mod chemins_de_donnees;
 pub mod config;
 pub mod discovery_setup;
+/// Dossiers de données inscriptibles, contrôlés avant la base (`EX_CONFIG`).
+pub mod dossiers_inscriptibles;
 /// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
 pub mod fils_de_travail;
 /// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
