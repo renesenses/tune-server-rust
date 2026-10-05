@@ -30,7 +30,8 @@ use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::db::track_repo::TrackRepo;
 use crate::library::pont_roon::{
     Candidat, Classement, Decision, ExportRoon, PisteLocale, Rapport, apparier_piste,
-    cle_courte_d_album, cle_d_album, credits_a_ecrire, decider, exemplaires_identiques, plier,
+    cle_courte_d_album, cle_d_album, credits_a_ecrire, decider, exemplaires_identiques,
+    nom_generique, plier,
 };
 
 /// Marque d'origine, sur la piste : `track_metadata.credits_source = roon`.
@@ -237,7 +238,11 @@ pub fn appliquer(
             r.images_portees += usize::from(porte(&ar.image));
         }
         let fiches: Vec<usize> = par_nom.get(&plier(&ar.nom)).cloned().unwrap_or_default();
-        if fiches.is_empty() {
+        // « Unknown Artist », « Various Artists » : le nom ne prouve rien. Ses
+        // fiches restent des candidats au niveau 2, rien de plus — ni artiste
+        // apparié, ni image, ni album apparié en strict.
+        let artiste_generique = nom_generique(&ar.nom);
+        if fiches.is_empty() || artiste_generique {
             r.artistes_inconnus.push(ar.nom.clone());
         } else {
             r.artistes_apparies += 1;
@@ -258,6 +263,7 @@ pub fn appliquer(
         // Image d'artiste : seulement s'il n'en a pas, et seulement sur une
         // fiche UNIQUE — entre deux homonymes, on ne choisit pas.
         if let [i] = fiches.as_slice()
+            && !artiste_generique
             && porte(&ar.image)
         {
             let artiste_id = locaux[*i].0;
@@ -295,7 +301,13 @@ pub fn appliquer(
             let nom_roon = format!("{} — {}", ar.nom, al.titre);
 
             let voulu = plier(&al.titre);
-            let stricts: Vec<&Album> = siens.iter().filter(|a| plier(&a.title) == voulu).collect();
+            // Un nom générique d'artiste ou d'album n'est jamais une preuve :
+            // l'album passe directement au niveau 2.
+            let stricts: Vec<&Album> = if artiste_generique || nom_generique(&al.titre) {
+                Vec::new()
+            } else {
+                siens.iter().filter(|a| plier(&a.title) == voulu).collect()
+            };
             // (album Tune, paires (piste Roon, piste locale))
             let trouves: Vec<(Album, Vec<(usize, PisteLocale)>)> = if let [seul] =
                 stricts.as_slice()
@@ -1176,6 +1188,59 @@ mod tests {
         );
         assert_eq!(r.albums_inconnus, vec!["Unknown Artist — Unknown Album"]);
         assert!(credits_de(&b, 100).is_empty());
+    }
+
+    /// « Unknown Artist — Unknown Album » des deux côtés, pistes « Track
+    /// 01… » : avant, le niveau strict l'appariait et les crédits s'écrivaient
+    /// par numéro. Un nom générique ne prouve rien : sans preuve par le
+    /// contenu, rien n'est écrit.
+    #[test]
+    fn un_nom_generique_ne_s_apparie_jamais_en_strict() {
+        let b = base();
+        artiste(&b, 1, "Unknown Artist");
+        album(&b, 1, "Unknown Album", 1, false);
+        pistes_de(
+            &b,
+            1,
+            &[
+                (1, 1, 1, "Track 01"),
+                (1, 1, 2, "Track 02"),
+                (1, 1, 3, "Track 03"),
+            ],
+        );
+        let e = export_un_album(
+            "Unknown Artist",
+            "Unknown Album",
+            &["1. Track 01", "2. Track 02", "3. Track 03"],
+        );
+        let r = appliquer(&b, &e, false, None);
+        assert_eq!(
+            (r.albums_apparies_strict, r.albums_apparies),
+            (0, 0),
+            "{r:?}"
+        );
+        assert_eq!((r.pistes_appariees, r.credits_ecrits), (0, 0));
+        assert_eq!(r.artistes_apparies, 0);
+        assert!(credits_de(&b, 100).is_empty(), "aucun crédit sans preuve");
+        assert_eq!(r.albums_inconnus, vec!["Unknown Artist — Unknown Album"]);
+
+        // Les mêmes noms avec de VRAIES pistes : le contenu apparie.
+        let b = base();
+        artiste(&b, 1, "Unknown Artist");
+        album(&b, 1, "Unknown Album", 1, false);
+        pistes_de(&b, 1, &[(1, 1, 1, "Paper Nut"), (1, 1, 2, "Heitor")]);
+        let e = export_un_album(
+            "Unknown Artist",
+            "Unknown Album",
+            &["1. Paper Nut", "2. Heitor"],
+        );
+        let r = appliquer(&b, &e, false, None);
+        assert_eq!(
+            (r.albums_apparies_strict, r.albums_apparies_contenu),
+            (0, 1),
+            "{r:?}"
+        );
+        assert_eq!(r.credits_ecrits, 2);
     }
 
     /// La seconde clé, sans crochets : « Black Orpheus [Original Soundtrack] »

@@ -199,7 +199,13 @@ pistes**, en deux niveaux.
 
 1. **Égalité stricte** : même nom d'artiste et même titre d'album, une fois
    repliés (accents, casse, espaces, article « The »). C'est le premier
-   essai, et il garde la priorité.
+   essai, et il garde la priorité. Un nom **générique** d'artiste ou d'album
+   (« Unknown », « Unknown Artist », « Unknown Album », « Inconnu »,
+   « Artiste inconnu », « Album inconnu », « Various », « Various Artists »,
+   « VA », « Divers », « Artistes divers », « Compilation », « Untitled »,
+   « Sans titre ») ne s'apparie **jamais** à ce niveau : il ne prouve rien,
+   et seul le niveau 2 peut le relier par ses pistes. Un tel artiste n'est
+   pas compté comme apparié, et son image n'est pas posée.
 2. **Par le contenu**, pour ce que le premier niveau n'a pas trouvé. Les
    candidats sont les albums de toutes les fiches Tune de ce nom, ceux qui
    portent une piste de l'artiste (une compilation, par exemple) et, en
@@ -212,8 +218,10 @@ pistes**, en deux niveaux.
    - au moins 80 % des pistes doivent se retrouver des deux côtés, avec le
      même titre et, quand il est connu, le même numéro et le même disque, et
      au moins deux pistes ;
-   - les titres **génériques** ne comptent jamais : titre vide ou fait de
-     chiffres seuls, « Track 01 », « Track01 », « Piste 1 », « Titre 3 »,
+   - les titres **génériques** ne comptent jamais : titre vide, titre fait
+     de chiffres seuls qui ne fait que répéter le numéro de la piste (« 03 »
+     en piste 3 ; « 1999 » ou « 22 » sur une autre piste restent de vrais
+     titres), « Track 01 », « Track01 », « Piste 1 », « Titre 3 »,
      « Unknown », « Unknown Title », « Untitled », « Sans titre »,
      « No title », « Inconnu ». Un album « Unknown Album » fait de
      « Track 01… » ne s'apparie donc pas par le contenu ;

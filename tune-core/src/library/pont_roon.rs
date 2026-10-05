@@ -292,7 +292,7 @@ pub fn apparier_piste<'a>(roon: &PisteRoon, locales: &'a [PisteLocale]) -> Optio
     }
     // Un titre générique (« Track 01 ») ne désigne rien : sans numéro, il
     // n'apparie pas.
-    if titre_generique(&titre) {
+    if titre_generique_numerote(&titre, num.map(|n| n.piste as i32)) {
         return None;
     }
     let voulu = plier(&titre);
@@ -320,7 +320,10 @@ pub const MARGE_CONTENU_PCT: usize = 10;
 /// Track 12 » se ressembleraient parfaitement. Exclus du compte des pistes
 /// communes, à tous les niveaux, et jamais appariés par leur seul titre.
 ///
-/// - vide, ou chiffres seuls (« 01 », « 1 2 ») ;
+/// - vide ;
+/// - des chiffres seuls ÉGAUX au numéro de la piste (« 01 » ou « 1 » pour la
+///   piste 1) : voir [`titre_generique_numerote`]. « 1999 » ou « 22 » sur une
+///   autre piste sont de vrais titres ;
 /// - un mot de piste suivi ou non d'un numéro : `track`, `piste`, `titre`,
 ///   `pista`, `traccia`, `titel` (« Track 01 »,
 ///   « Track01 », « Piste 1 ») ;
@@ -329,12 +332,59 @@ pub const MARGE_CONTENU_PCT: usize = 10;
 pub fn titre_generique(titre: &str) -> bool {
     static GENERIQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"^(?:[\d ]*|(?:track|piste|titre|pista|traccia|titel) ?\d*|unknown|untitled|sans titre|no title|inconnu|inconnue)$",
+            r"^(?:|(?:track|piste|titre|pista|traccia|titel) ?\d*|unknown|untitled|sans titre|no title|inconnu|inconnue)$",
         )
         .expect("regex des titres génériques")
     });
     let t = plier_large(titre);
     GENERIQUE.is_match(&t) || t.contains("unknown title") || t.contains("unknown track")
+}
+
+/// [`titre_generique`], plus le titre fait de chiffres seuls qui ne fait que
+/// répéter le numéro de la piste (« 03 » en piste 3).
+pub fn titre_generique_numerote(titre: &str, numero: Option<i32>) -> bool {
+    if titre_generique(titre) {
+        return true;
+    }
+    let t = plier_large(titre);
+    numero.is_some_and(|n| {
+        !t.is_empty()
+            && t.chars().all(|c| c.is_ascii_digit())
+            && t.parse::<i64>().ok() == Some(i64::from(n))
+    })
+}
+
+/// Les noms d'artiste ou d'album génériques, une fois repliés par
+/// [`plier_large`] : ils ne désignent personne ni aucun disque, et deux
+/// « Unknown Artist — Unknown Album » ne sont pas le même album. Ils ne
+/// s'apparient JAMAIS au niveau strict : seules les pistes peuvent les relier.
+///
+/// `unknown`, `unknown artist`, `unknown album`, `inconnu`, `inconnue`,
+/// `artiste inconnu`, `album inconnu`, `various`, `various artists`, `va`,
+/// `divers`, `artistes divers`, `artistes varies`, `compilation`, `untitled`,
+/// `sans titre`, `no title`, et le nom vide.
+pub fn nom_generique(nom: &str) -> bool {
+    const NOMS: &[&str] = &[
+        "",
+        "unknown",
+        "unknown artist",
+        "unknown album",
+        "inconnu",
+        "inconnue",
+        "artiste inconnu",
+        "album inconnu",
+        "various",
+        "various artists",
+        "va",
+        "divers",
+        "artistes divers",
+        "artistes varies",
+        "compilation",
+        "untitled",
+        "sans titre",
+        "no title",
+    ];
+    NOMS.contains(&plier_large(nom).as_str())
 }
 
 static SUFFIXE_DISQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -429,12 +479,16 @@ pub struct Candidat {
 pub fn pistes_communes(roon: &[PisteRoon], c: &Candidat) -> Vec<(usize, usize)> {
     let disque_album = cle_d_album(&c.titre).1;
     let titres: Vec<String> = c.pistes.iter().map(|p| plier_large(&p.titre)).collect();
-    let generiques: Vec<bool> = c.pistes.iter().map(|p| titre_generique(&p.titre)).collect();
+    let generiques: Vec<bool> = c
+        .pistes
+        .iter()
+        .map(|p| titre_generique_numerote(&p.titre, p.numero))
+        .collect();
     let mut prises = vec![false; c.pistes.len()];
     let mut out = Vec::new();
     for (i, p) in roon.iter().enumerate() {
         let (num, titre) = numero_et_titre(&p.titre);
-        if titre_generique(&titre) {
+        if titre_generique_numerote(&titre, num.map(|n| n.piste as i32)) {
             continue;
         }
         let voulu = plier_large(&titre);
@@ -888,7 +942,6 @@ mod tests {
             "unknown",
             "Untitled",
             "Sans titre",
-            "01",
             "",
             " - ",
         ] {
@@ -901,6 +954,29 @@ mod tests {
             "Pistes noires",
         ] {
             assert!(!titre_generique(t), "« {t} » n'est pas générique");
+        }
+        // Des chiffres seuls : génériques seulement s'ils répètent le numéro.
+        assert!(titre_generique_numerote("01", Some(1)));
+        assert!(titre_generique_numerote("3", Some(3)));
+        assert!(!titre_generique_numerote("1999", Some(5)));
+        assert!(!titre_generique_numerote("22", Some(3)));
+        assert!(!titre_generique_numerote("01", None));
+        let r = roon(&["1. 01", "5. 1999", "3. 22"]);
+        let c = candidat(1, "x", &[(1, 1, "01"), (1, 5, "1999"), (1, 3, "22")]);
+        assert_eq!(pistes_communes(&r, &c), vec![(1, 1), (2, 2)]);
+        // Les noms génériques d'artiste et d'album.
+        for n in [
+            "Unknown Artist",
+            "unknown album",
+            "<Unknown>",
+            "Various Artists",
+            "Artiste inconnu",
+            "Divers",
+        ] {
+            assert!(nom_generique(n), "« {n} » est générique");
+        }
+        for n in ["Unknown Pleasures", "Divers & Mixtes", "Jan Garbarek Group"] {
+            assert!(!nom_generique(n), "« {n} » n'est pas générique");
         }
         // Jamais apparié par son seul titre, ni compté au niveau 2.
         let r = roon(&["1. Track 01", "2. Track 02", "Track 03"]);
