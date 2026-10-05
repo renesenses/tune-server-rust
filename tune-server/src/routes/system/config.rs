@@ -387,6 +387,11 @@ pub(super) async fn get_config(
             json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT),
         ),
         ("quality_split", json!(true)),
+        // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
+        (
+            tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY,
+            json!(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_DEFAULT),
+        ),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
@@ -506,6 +511,32 @@ pub(super) async fn get_config(
         "shuffle_max_tracks_max".to_string(),
         json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
     );
+    // Fil 2148 (#5792) — le délai des partages réseau tel qu'il s'applique,
+    // et ses bornes, sur le modèle du plafond aléatoire juste au-dessus.
+    {
+        use tune_core::scanner::watcher::{
+            NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_FLOOR, NETWORK_POLL_INTERVAL_KEY,
+            resolve_network_poll_interval,
+        };
+        let effectif = resolve_network_poll_interval(
+            config
+                .get(NETWORK_POLL_INTERVAL_KEY)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(NETWORK_POLL_INTERVAL_KEY.to_string(), json!(effectif));
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_min"),
+            json!(NETWORK_POLL_INTERVAL_FLOOR),
+        );
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_max"),
+            json!(NETWORK_POLL_INTERVAL_CEILING),
+        );
+    }
     // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
     // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
     // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
@@ -1152,6 +1183,27 @@ fn normaliser_plafond_aleatoire(
     Ok(())
 }
 
+/// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
+/// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
+/// après l'écriture.
+fn normaliser_intervalle_reseau(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<u64>, AppError> {
+    let cle = tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY;
+    let Some(brut) = values.get(cle) else {
+        return Ok(None);
+    };
+    let texte = match brut {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    };
+    let secs = tune_core::scanner::watcher::valider_network_poll_interval(&texte)
+        .map_err(AppError::bad_request)?;
+    values.insert(cle.to_string(), Value::String(secs.to_string()));
+    Ok(Some(secs))
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     profile: ActiveProfile,
@@ -1200,6 +1252,7 @@ pub(super) async fn update_config(
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
+    let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1352,6 +1405,12 @@ pub(super) async fn update_config(
     }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+    // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
+    // cours des sondes, sans redémarrage.
+    if let Some(secs) = intervalle_reseau_demande {
+        let applique = tune_core::scanner::watcher::regler_intervalle_reseau(secs);
+        tracing::info!(secs = applique, "network_poll_interval_applied");
+    }
 
     let mut reponse = json!({"ok": true});
     if exclusif_desarme_avec_asio {
@@ -1489,6 +1548,90 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
 }
 
 /// #3809 — l'interrupteur doit agir MAINTENANT.
+#[cfg(test)]
+mod intervalle_reseau_tests_2148 {
+    use crate::state::AppState;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::scanner::watcher::{
+        NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_DEFAULT, NETWORK_POLL_INTERVAL_FLOOR,
+        NETWORK_POLL_INTERVAL_KEY, intervalle_reseau,
+    };
+
+    async fn requete(state: &AppState, methode: &str, corps: Option<Value>) -> (StatusCode, Value) {
+        let corps = corps.map(|c| c.to_string()).unwrap_or_default();
+        let response = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri("/api/v1/system/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// Fil 2148 (#5792) — le délai des partages réseau est un réglage serveur :
+    /// publié avec ses bornes (défaut 300 s), écrit par `PATCH`, appliqué aux
+    /// sondes sans redémarrage, et refusé hors bornes.
+    #[tokio::test]
+    async fn le_delai_des_partages_reseau_se_regle_et_s_applique_a_chaud_2148() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (status, config) = requete(&state, "GET", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            config[NETWORK_POLL_INTERVAL_KEY],
+            json!(NETWORK_POLL_INTERVAL_DEFAULT)
+        );
+        assert_eq!(NETWORK_POLL_INTERVAL_DEFAULT, 300);
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_min")],
+            json!(NETWORK_POLL_INTERVAL_FLOOR)
+        );
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_max")],
+            json!(NETWORK_POLL_INTERVAL_CEILING)
+        );
+
+        let (status, _) = requete(
+            &state,
+            "PATCH",
+            Some(json!({ NETWORK_POLL_INTERVAL_KEY: 120 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            intervalle_reseau(),
+            120,
+            "🔴 #5792 — le délai est écrit mais pas appliqué aux sondes"
+        );
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+
+        for hors_bornes in [json!(59), json!(3601), json!("souvent")] {
+            let (status, _) = requete(
+                &state,
+                "PATCH",
+                Some(json!({ NETWORK_POLL_INTERVAL_KEY: hors_bornes })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{hors_bornes}");
+        }
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+        assert_eq!(intervalle_reseau(), 120);
+    }
+}
+
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
