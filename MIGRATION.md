@@ -264,11 +264,11 @@ WantedBy=multi-user.target
 
 ## Docker
 
-### Image: `renesenses/tune:dev`
+### Image: `renesenses/tune:latest`
 
 ```bash
-# Build
-docker build -t renesenses/tune:dev .
+# Pull the published image (amd64/arm64)
+docker pull renesenses/tune:latest
 
 # Run
 docker run -d \
@@ -277,7 +277,7 @@ docker run -d \
   -v /path/to/music:/music:ro \
   -v tune-data:/data \
   -e TUNE_AUTO_SCAN=true \
-  renesenses/tune:dev
+  renesenses/tune:latest
 ```
 
 ### docker-compose
@@ -285,7 +285,7 @@ docker run -d \
 ```yaml
 services:
   tune:
-    image: renesenses/tune:dev
+    image: renesenses/tune:latest
     container_name: tune-server
     restart: unless-stopped
     network_mode: host
