@@ -2648,6 +2648,47 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Le message de l'interface pour un `Seek` que l'appareil a REFUSÉ
+    /// (tête [`crate::outputs::dlna::SEEK_REFUSE_PREFIX`]), `None` pour tout
+    /// autre échec : ceux-là gardent la seule réponse HTTP, comme avant.
+    pub fn message_deplacement_refuse(error: &OutputCommandError) -> Option<String> {
+        let OutputCommandError::Failed { message, .. } = error else {
+            return None;
+        };
+        let detail = message
+            .strip_prefix(crate::outputs::dlna::SEEK_REFUSE_PREFIX)?
+            .trim();
+        Some(format!(
+            "L'appareil a refusé le déplacement dans la piste ({detail}). \
+             La lecture continue à sa position actuelle."
+        ))
+    }
+
+    /// Dire à TOUTES les télécommandes qu'un déplacement demandé par
+    /// l'utilisateur a été refusé par l'appareil.
+    ///
+    /// Même canal que [`Self::dire_piste_non_demarree`] —
+    /// `zone.playback_error` — mais `fatal: false` : la zone JOUE toujours,
+    /// seule la position demandée n'a pas été prise. Appelé par la route du
+    /// geste utilisateur seulement ; les sauts automatiques (reprise,
+    /// transfert, renderer calé) se contentent du journal.
+    pub fn dire_deplacement_refuse(&self, zone_id: i64, error: &OutputCommandError) {
+        let Some(message) = Self::message_deplacement_refuse(error) else {
+            return;
+        };
+        warn!(zone_id, error = %error, "seek_refuse_par_le_renderer");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": false,
+                }),
+            );
+        }
+    }
+
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         self.resume_with_session_error_message(zone_id, device_id, message_session_perdue)
             .await

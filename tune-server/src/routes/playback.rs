@@ -3431,7 +3431,10 @@ async fn seek(
         .await
     {
         Ok(()) => Json(json!({ "position_ms": position_ms })).into_response(),
-        Err(error) => output_command_error_response(error),
+        Err(error) => {
+            state.orchestrator.dire_deplacement_refuse(zone_id, &error);
+            output_command_error_response(error)
+        }
     }
 }
 
@@ -5167,7 +5170,24 @@ async fn do_transfer(
                         )
                         .await
                 {
-                    return output_command_error_response(error);
+                    // Un `Seek` REFUSÉ par l'appareil (701/710/711) ne doit
+                    // pas couper le transfert en son milieu : la cible joue
+                    // déjà, depuis le début de la piste. Arrêter là laissait
+                    // la source jouer aussi, et la file de la cible non
+                    // enregistrée. Tout autre échec garde l'ancienne conduite.
+                    if tune_core::orchestrator::PlaybackOrchestrator::message_deplacement_refuse(
+                        &error,
+                    )
+                    .is_none()
+                    {
+                        return output_command_error_response(error);
+                    }
+                    tracing::warn!(
+                        target_zone,
+                        position_ms = source_position_ms,
+                        error = %error,
+                        "transfert_seek_refuse_cible_joue_depuis_le_debut"
+                    );
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
