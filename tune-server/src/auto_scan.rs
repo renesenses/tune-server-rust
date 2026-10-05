@@ -1001,8 +1001,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            let sous_arbres =
-                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            let sous_arbres = crate::routes::system::scan::sous_arbres_vides(
+                &music_dirs,
+                &existing_refs,
+                &discovered_paths,
+            );
             if !sous_arbres.is_empty() {
                 tracing::error!(
                     dossiers = ?sous_arbres,
