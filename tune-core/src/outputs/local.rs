@@ -6946,6 +6946,8 @@ impl PromotionDuFilDeRendu {
         let issue = crate::audio::ordonnancement_rt::demander_pour_le_fil_courant();
         journaliser_l_ordonnancement(&issue);
         note_realtime_scheduling(issue);
+        // Une fois par processus, hors du fil de rendu (lot audio-rt).
+        crate::audio::ordonnancement_rt::verrouiller_la_memoire_en_arriere_plan();
     }
 }
 
@@ -6953,6 +6955,12 @@ impl PromotionDuFilDeRendu {
 /// fil de rendu, avant que la porte de préchargement ne laisse passer le son.
 fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::OrdonnancementTempsReel) {
     use crate::audio::ordonnancement_rt::OrdonnancementTempsReel;
+    // Une ligne par verdict et par processus : chaque réouverture du flux crée
+    // un fil de rendu neuf, qui ne doit pas répéter la même ligne.
+    if !crate::audio::ordonnancement_rt::premiere_fois(issue) {
+        debug!(?issue, "local_audio_realtime_scheduling — verdict inchangé");
+        return;
+    }
     match issue {
         OrdonnancementTempsReel::Obtenu {
             policy,
@@ -6973,6 +6981,9 @@ fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::Ordonna
             rlimit_rtprio = ?rlimit_rtprio,
             cause = %cause,
             "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER (#3206)"
+        ),
+        OrdonnancementTempsReel::Desactive => info!(
+            "local_audio_realtime_scheduling — TUNE_AUDIO_RT_PRIORITY=0 : rien demandé, le fil de rendu reste en SCHED_OTHER (#3206)"
         ),
         OrdonnancementTempsReel::SansObjet => {}
     }

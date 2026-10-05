@@ -935,6 +935,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // avait été DEMANDÉ, ni pourquoi les deux diffèrent. `null` sans
         // sortie locale compilée.
         "audio_backend_status": audio_backend_status,
+        // #3206 — politique et priorité OBTENUES par le fil de rendu local
+        // (`render_thread`, `null` avant toute lecture), limites RT et
+        // memlock du processus, verrouillage mémoire. Présent même sans
+        // `local-audio` : c'est ce qui dit si les limites de Tune OS servent.
+        "audio_realtime": tune_core::audio::ordonnancement_rt::fiche(),
         "asio_available": asio_avail,
         // #3205 — famine de l'anneau par sortie : `ring_starvation_events`
         // compte les rappels comblés par des zéros, `..._missing_samples`
