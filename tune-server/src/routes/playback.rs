@@ -3507,6 +3507,10 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     Json(json!({ "status": "playing", "queue_position": next_pos })).into_response()
 }
 
+#[cfg(test)]
+#[path = "playback/precedent_deux_appuis_5770_tests.rs"]
+mod precedent_deux_appuis_5770_tests;
+
 /// Dernier « précédent » ayant relancé la piste au lieu de reculer, par zone.
 ///
 /// Sans cette mémoire, « précédent » n'est qu'une fonction de la position
