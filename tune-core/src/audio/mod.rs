@@ -41,6 +41,8 @@ pub mod dsf;
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
 mod dsf_http_progressif_tests;
+/// Fil 2062 — la durée d'un flux distant lue dans ses en-têtes.
+pub mod duree_des_entetes;
 pub mod ecretage;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;

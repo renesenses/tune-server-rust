@@ -1646,6 +1646,25 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.duration_ms as u64)
                 .unwrap_or(0);
+            // Fil 2062 / #5550 — une piste UPnP partie sans durée (ni DIDL, ni
+            // en-têtes lisibles) prend celle que la sortie rapporte : le
+            // `TrackDuration` du renderer, ou la durée mesurée par le décodeur
+            // de la sortie locale.
+            let track_duration_ms = match decisions::duree_rapportee_a_adopter(
+                zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                track_duration_ms,
+                status.duration_ms,
+                ps.gapless_sent,
+            ) {
+                Some(duree) => {
+                    info!(zone_id, duration_ms = duree, "upnp_duree_rapportee_adoptee");
+                    self.playback
+                        .adopter_la_duree_rapportee(zone_id, duree as i64)
+                        .await;
+                    duree
+                }
+                None => track_duration_ms,
+            };
 
             // Helper: has enough of the track been played?
             // When track_duration is known: peak_position_ms >= 80% of duration.

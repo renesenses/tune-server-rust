@@ -825,6 +825,15 @@ impl PlaybackOrchestrator {
         }
         // ------------------------------------------------------------------
 
+        // Fil 2062 / #5550 — un serveur UPnP qui n'annonce aucune durée (la
+        // Freebox) : on la lit dans les en-têtes du flux, et seulement alors.
+        // Une durée connue passe telle quelle, sans une requête de plus.
+        let duration_ms = if source == "upnp" {
+            self.duree_d_une_piste_upnp(req, audio_url).await
+        } else {
+            duration_ms
+        };
+
         // La sortie locale applique déjà l'EQ dans son callback : le refaire
         // ici colorerait le signal deux fois. OAAT, DLNA et navigateur
         // consomment en revanche le WAV construit par ce décodeur ; le profil

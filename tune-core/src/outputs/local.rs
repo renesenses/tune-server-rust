@@ -5497,6 +5497,11 @@ impl OutputTarget for LocalOutput {
                 let total_output_samples = samples.len() as u64;
                 let output_frames = total_output_samples / output_ch as u64;
                 let output_duration_ms = (output_frames as f64 / output_sr as f64 * 1000.0) as u64;
+                // Fil 2062 / #5550 — une piste arrivée sans durée prend celle que
+                // le décodeur vient de mesurer ; une durée connue reste.
+                if duration_ms_arc.load(Ordering::SeqCst) == 0 {
+                    duration_ms_arc.store(output_duration_ms + seek_offset, Ordering::SeqCst);
+                }
                 let mut fed_samples = initial_written as u64;
 
                 if initial_written < samples.len() {

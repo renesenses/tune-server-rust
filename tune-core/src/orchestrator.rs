@@ -1611,6 +1611,10 @@ mod eq_en_vol_4407_tests;
 #[cfg(test)]
 mod greffon_natif_tiers_tests;
 
+/// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
+mod duree_du_flux_2062;
+#[cfg(test)]
+mod duree_du_flux_2062_tests;
 mod resolve_direct;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;
