@@ -3742,6 +3742,15 @@ async fn get_queue(
                     _ => false,
                 };
                 obj.insert("banned".into(), Value::Bool(bannie));
+                // Fil forum 2143, point 8 — « Aller à l'album » dans le menu
+                // d'un titre de la file. Le client n'offre l'entrée que si la
+                // piste désigne son album : `album_id` (entier de bibliothèque)
+                // pour une ligne locale, `album_id_service` pour une ligne de
+                // service (le champ que lit déjà `routageAlbum`). Deux clefs
+                // ADDITIVES, toujours présentes, `null` quand rien n'est connu.
+                // La référence brute `album_ref` reste, elle, hors du JSON.
+                obj.insert("album_id".into(), json!(e.album_id));
+                obj.insert("album_id_service".into(), json!(e.album_id_service()));
             }
             let suivant = entries.get(idx + 1);
             let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
@@ -7116,6 +7125,7 @@ mod file_deja_chargee_2569 {
             track_number: None,
             disc_number: None,
             album_ref: None,
+            album_id: None,
         }
     }
 

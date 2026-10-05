@@ -830,6 +830,14 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
 
+# Fil forum 2143 (FabienM), points 5, 6 et 8 — l'album d'un titre de la file :
+# `album_id` / `album_id_service` sur `GET /zones/{id}/queue`, et l'album en
+# cours d'un titre Bandcamp lancé hors de sa page. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "album_de_la_file_fil2143"
+path = "tests/album_de_la_file_fil2143.rs"
+
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
 # des services simulés. `autotests = false` plus haut : sans cette cible, le
