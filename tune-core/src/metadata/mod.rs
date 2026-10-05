@@ -1,5 +1,6 @@
 pub mod artist_enrichment;
 pub mod artist_split;
+pub mod artistes_du_pressage;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;

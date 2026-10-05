@@ -593,6 +593,10 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
     let mut identifies = 0usize;
     let mut sans_correspondance = 0usize;
     let mut pistes = 0usize;
+    // #4805, étape B — artistes munis d'un MBID par les crédits du pressage,
+    // et cas ambigus laissés sans écriture. Journal de fin de passe seulement.
+    let mut artistes_mbid_poses = 0usize;
+    let mut artistes_ambigus = 0usize;
     let mut disjoncteur = Disjoncteur::default();
 
     for (rang, album_id) in albums.into_iter().enumerate() {
@@ -637,6 +641,10 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                     "reidentified" | "unchanged" => {
                         identifies += 1;
                         pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
+                        if let Some(b) = issue.artistes.as_ref() {
+                            artistes_mbid_poses += b.ecrits;
+                            artistes_ambigus += b.ambigus;
+                        }
                     }
                     _ => {
                         // `not_found` comme `no_tracks` : rien n'a été posé.
@@ -720,6 +728,8 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
         identifies,
         sans_correspondance,
         pistes_identifiees = pistes,
+        artistes_mbid_poses,
+        artistes_ambigus,
         "identification_lot_termine"
     );
     ecrire_etat(
