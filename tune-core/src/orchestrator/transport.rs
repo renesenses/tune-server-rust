@@ -783,7 +783,18 @@ impl PlaybackOrchestrator {
         };
         let np = self.composer_le_now_playing(&req, &resolved, &habillage);
 
-        self.playback.play(req.zone_id, np).await;
+        // Ticket 134 — la session REMPLACÉE se lit au moment du remplacement,
+        // pas au départ de cette lecture : une autre lecture a pu s'intercaler
+        // entre les deux, et sa session n'aurait alors été fermée par personne
+        // (voir `sessions_a_fermer_apres_remplacement`).
+        let flux_remplace = self
+            .playback
+            .play_en_rendant_le_flux_remplace(req.zone_id, np)
+            .await;
+        let sessions_a_fermer = sessions_a_fermer_apres_remplacement(
+            old_stream_id.as_deref(),
+            flux_remplace.as_deref(),
+        );
 
         // Persist play state for auto-resume after server restart
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
@@ -810,8 +821,10 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
-        if !is_local && let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
+        if !is_local {
+            for sid in &sessions_a_fermer {
+                self.streamer.remove_session(sid).await;
+            }
         }
 
         let (output_sent, output_error) = self
@@ -822,8 +835,10 @@ impl PlaybackOrchestrator {
 
         // For local outputs, clean up the old stream now that play_url() has
         // called stop() and the old audio thread is no longer reading.
-        if is_local && let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
+        if is_local {
+            for sid in &sessions_a_fermer {
+                self.streamer.remove_session(sid).await;
+            }
         }
 
         self.annoncer_apres_la_sortie(
@@ -3444,3 +3459,34 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
+/// sortie basculée sur la sienne.
+///
+/// Deux sources, dans cet ordre :
+///
+/// * `notee_au_depart` : la session en cours quand `play_inner` a commencé,
+///   comme avant ;
+/// * `remplacee` : celle que `now_playing` portait AU MOMENT où cette lecture
+///   l'a remplacé ([`crate::playback::PlaybackManager::play_en_rendant_le_flux_remplace`]).
+///
+/// Elles diffèrent quand une autre lecture s'est intercalée : trois
+/// « suivant » rapprochés, la deuxième lecture remplace la première, la
+/// troisième remplace la deuxième — mais la troisième avait noté la PREMIÈRE
+/// à son départ. Seule, la note du départ laissait la session de la deuxième
+/// ouverte, son décodeur bloqué sur un canal que plus personne ne lit.
+pub(crate) fn sessions_a_fermer_apres_remplacement(
+    notee_au_depart: Option<&str>,
+    remplacee: Option<&str>,
+) -> Vec<String> {
+    let mut sessions: Vec<String> = notee_au_depart.map(str::to_owned).into_iter().collect();
+    if let Some(r) = remplacee
+        && notee_au_depart != Some(r)
+    {
+        sessions.push(r.to_owned());
+    }
+    sessions
+}
+
+#[cfg(test)]
+mod session_remplacee_ticket_134;
