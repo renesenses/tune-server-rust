@@ -273,6 +273,15 @@ async fn fade_in_volume(
 
 // ─── Scheduler ─────────────────────────────────────────────────
 
+/// Ce qu'un déclenchement a fait de chaque zone visée (#5669).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZonesDuReveil {
+    /// Zones où la source du réveil a été lancée.
+    pub sonnees: Vec<i64>,
+    /// Zones laissées à leur musique : elles jouaient déjà.
+    pub sautees: Vec<i64>,
+}
+
 pub struct AlarmScheduler {
     db: Arc<dyn DbBackend>,
     orchestrator: Arc<PlaybackOrchestrator>,
@@ -393,21 +402,21 @@ impl AlarmScheduler {
     /// fade-in.  Public so the test endpoint (`POST /alarms/{id}/test`) can
     /// trigger it directly.
     ///
-    /// Le bouton d'essai est un geste explicite : il sonne même sur une zone
-    /// qui joue. Seul le planificateur respecte une lecture en cours (#5669).
-    pub async fn fire_alarm(&self, alarm: &serde_json::Value) {
-        self.sonner(alarm, true).await;
+    /// Décision de Bertrand du 05/10 (#5669) : le bouton d'essai ne coupe pas
+    /// la musique non plus. Sur une zone qui joue déjà, il ne joue rien ; la
+    /// route répond 409 `zone_en_lecture` quand aucune zone n'a sonné.
+    pub async fn fire_alarm(&self, alarm: &serde_json::Value) -> ZonesDuReveil {
+        self.sonner(alarm, true).await
     }
 
-    /// `interrompre` : `true` pour le bouton d'essai, `false` pour le
-    /// planificateur.
+    /// `essai` : `true` pour le bouton d'essai, `false` pour le planificateur.
     ///
-    /// Décision de Bertrand du 05/10 (#5669) : quand un réveil programmé sonne
-    /// sur une zone qui JOUE déjà, Tune ignore le réveil sur cette zone. La
-    /// musique en cours n'est pas interrompue et le saut est journalisé
+    /// Décision de Bertrand du 05/10 (#5669) : quand un réveil sonne sur une
+    /// zone qui JOUE déjà, Tune ignore le réveil sur cette zone. La musique en
+    /// cours n'est pas interrompue et le saut est journalisé
     /// (`alarm_skipped_zone_playing`). Cyrille Moutia (fil 2111) avait vu son
     /// album Qobuz coupé par France Inter, un réveil d'essai oublié.
-    async fn sonner(&self, alarm: &serde_json::Value, interrompre: bool) {
+    async fn sonner(&self, alarm: &serde_json::Value, essai: bool) -> ZonesDuReveil {
         let alarm_id = alarm["id"].as_i64().unwrap_or(0);
         // Owner of this alarm: its playback is tagged to that profile's history
         // (inherited by any autoplay after). None → NULL, never guessed.
@@ -459,17 +468,16 @@ impl AlarmScheduler {
         );
 
         let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
-        let mut zones_sonnees = 0usize;
+        let mut zones = ZonesDuReveil::default();
 
         for &target_zone in &target_zones {
-            if !interrompre
-                && self
-                    .orchestrator
-                    .playback
-                    .get_state(target_zone)
-                    .await
-                    .state
-                    == crate::playback::PlayState::Playing
+            if self
+                .orchestrator
+                .playback
+                .get_state(target_zone)
+                .await
+                .state
+                == crate::playback::PlayState::Playing
             {
                 info!(
                     alarm_id,
@@ -477,9 +485,10 @@ impl AlarmScheduler {
                     zone_id = target_zone,
                     "alarm_skipped_zone_playing"
                 );
+                zones.sautees.push(target_zone);
                 continue;
             }
-            zones_sonnees += 1;
+            zones.sonnees.push(target_zone);
             let device_id = zone_repo
                 .get(target_zone)
                 .ok()
@@ -536,7 +545,7 @@ impl AlarmScheduler {
 
         // Update last_fired_at — seulement si le réveil a sonné quelque part.
         // Un réveil sauté sur toutes ses zones n'a pas sonné (#5669).
-        if zones_sonnees > 0 {
+        if !zones.sonnees.is_empty() {
             let now_str = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
             self.db
                 .execute(
@@ -553,9 +562,11 @@ impl AlarmScheduler {
             );
         }
 
-        // One-shot: disable after firing. Un réveil unique sauté compte comme
-        // son occurrence : il ne doit pas ressurgir le lendemain.
-        if alarm["one_shot"].as_i64().unwrap_or(0) != 0 {
+        // One-shot: disable after firing. Un réveil unique sauté par le
+        // planificateur compte comme son occurrence : il ne doit pas ressurgir
+        // le lendemain. Un ESSAI qui n'a rien joué ne consomme rien.
+        let essai_sans_effet = essai && zones.sonnees.is_empty();
+        if alarm["one_shot"].as_i64().unwrap_or(0) != 0 && !essai_sans_effet {
             self.db
                 .execute(
                     "UPDATE alarms SET enabled = '0' WHERE id = ?",
@@ -564,6 +575,7 @@ impl AlarmScheduler {
                 .ok();
             info!(alarm_id, "alarm_one_shot_disabled");
         }
+        zones
     }
 
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
