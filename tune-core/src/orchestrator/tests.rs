@@ -9157,6 +9157,81 @@ async fn la_portee_de_la_bascule_pure_distingue_la_relance_de_la_piste_suivante_
     assert_eq!(portee, PorteeDuReglage::RienNeJoue);
     assert_eq!(portee.code(), "not_playing");
 }
+/// #5683 — une bascule PURE est ANNONCÉE au client (`zone.updated`), quelle
+/// que soit sa portée. Seul le bras « flux conservé » l'annonçait ; ailleurs,
+/// le panneau « Chemin du signal » gardait l'étape ReplayGain d'avant la
+/// bascule jusqu'au premier geste de volume, dont l'événement relisait
+/// `/zones` — d'où « l'étape suit le curseur, pas PURE » (GgB, fil 1797).
+#[tokio::test]
+async fn toute_bascule_pure_annonce_la_zone_au_client_5683() {
+    use crate::orchestrator::PorteeDuReglage;
+
+    fn annoncee(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        zone_id: i64,
+    ) -> bool {
+        let mut vue = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event_type == "zone.updated" && ev.data["zone_id"] == zone_id {
+                vue = true;
+            }
+        }
+        vue
+    }
+
+    // Relance : zone réseau dont le flux porte un égaliseur.
+    let (mut orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-relance")).await;
+    let bus = Arc::new(EventBus::new());
+    orch.event_bus = Some(bus.clone());
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let mut rx = bus.subscribe();
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::Relance
+    );
+    assert!(
+        annoncee(&mut rx, zone_id),
+        "bascule PURE avec relance du flux : aucune annonce `zone.updated`, le \
+         panneau garde l'état d'avant la bascule"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    // Piste suivante : zone navigateur, position inconnue.
+    let (mut orch2, zone2, _dir2) = zone_qui_joue_un_flac(Some("browser"), None).await;
+    let bus2 = Arc::new(EventBus::new());
+    orch2.event_bus = Some(bus2.clone());
+    let orch2 = Arc::new(orch2);
+    armer_un_egaliseur_audible(&orch2, zone2);
+    let mut rx2 = bus2.subscribe();
+    regler_pure(&orch2, zone2, true);
+    assert_eq!(
+        orch2.apply_audiophile_change_portee(zone2).await,
+        PorteeDuReglage::PisteSuivante
+    );
+    assert!(
+        annoncee(&mut rx2, zone2),
+        "bascule PURE portée à la piste suivante : aucune annonce `zone.updated`"
+    );
+
+    // Flux conservé : l'annonce d'avant reste là.
+    let (mut orch3, zone3, _dir3) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-nu")).await;
+    let bus3 = Arc::new(EventBus::new());
+    orch3.event_bus = Some(bus3.clone());
+    let orch3 = Arc::new(orch3);
+    let mut rx3 = bus3.subscribe();
+    regler_pure(&orch3, zone3, true);
+    assert_eq!(
+        orch3.apply_audiophile_change_portee(zone3).await,
+        PorteeDuReglage::Immediate
+    );
+    assert!(annoncee(&mut rx3, zone3));
+}
+
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision

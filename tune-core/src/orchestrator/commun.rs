@@ -480,7 +480,28 @@ impl PlaybackOrchestrator {
     /// effet à la piste suivante » — faux dans le premier cas, où la relance
     /// à la position courante s'entend dans l'instant. Même contrat que
     /// [`Self::apply_eq_change_portee`].
+    ///
+    /// 🔴 #5683 — la bascule est ANNONCÉE (`zone.updated`) quelle que soit sa
+    /// portée. Seul le bras « flux conservé » l'annonçait : sur une sortie
+    /// locale qui joue (bras `Immediate` de `refresh_zone_pure_dsp`), sur une
+    /// relance ou à la piste suivante, rien ne disait au client de relire la
+    /// zone. Le panneau « Chemin du signal » gardait alors l'étape ReplayGain
+    /// d'AVANT la bascule, jusqu'au premier geste de volume (dont l'événement
+    /// relisait `/zones`) : l'étape semblait suivre le curseur, pas PURE.
     pub async fn apply_audiophile_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        let portee = self.portee_de_la_bascule_pure(zone_id).await;
+        if let Some(ref bus) = self.event_bus {
+            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        portee
+    }
+
+    /// Le corps de [`Self::apply_audiophile_change_portee`] : applique la
+    /// bascule et dit sa portée, sans l'annoncer.
+    async fn portee_de_la_bascule_pure(
         self: &std::sync::Arc<Self>,
         zone_id: i64,
     ) -> PorteeDuReglage {
@@ -512,9 +533,6 @@ impl PlaybackOrchestrator {
                     zone_id,
                     pure, "pure_bascule_sans_effet_sur_le_signal_flux_conserve"
                 );
-                if let Some(ref bus) = self.event_bus {
-                    bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
-                }
                 PorteeDuReglage::Immediate
             }
         }
