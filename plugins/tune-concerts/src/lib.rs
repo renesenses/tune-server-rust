@@ -773,14 +773,54 @@ fn refus_du_nuage(err: &CloudError, lecture: bool) -> Response {
 /// et le fait de base — « un artiste sans MBID part quand même » — redeviendrait
 /// invérifiable, c'est-à-dire effaçable en silence. C'est exactement ce que
 /// cette PR a failli faire.
+///
+/// # Qui est gardé quand la bibliothèque dépasse le plafond (#5523)
+///
+/// Les artistes étaient pris par `ORDER BY name` : au-delà de [`PLAFOND`], on
+/// gardait les 5 000 premiers noms de l'alphabet. Tades en a 12 443, et sa
+/// liste de concerts « s'arrête au F de Florent Pagny ». Ils sont désormais
+/// classés par **pertinence**, avec ce que la base expose déjà :
+///
+/// 1. les artistes mis en **favori** (`favorites`, `item_type = 'artist'`) ;
+/// 2. le **nombre d'écoutes** (`listen_history`, hors radio, rapproché par
+///    nom comme le fait le palmarès `top_artists`) ;
+/// 3. la **dernière écoute**, à nombre égal ;
+/// 4. le **nombre de pistes** de l'artiste dans la bibliothèque ;
+/// 5. le nom, en dernier recours — d'où l'ordre alphabétique inchangé sur une
+///    bibliothèque sans écoutes ni favoris, et sous le plafond.
+///
+/// Les quatre clés sont rendues non nulles (`COALESCE`) : SQLite classe les
+/// NUL en dernier dans un tri décroissant, PostgreSQL en premier. Sans cela,
+/// sur PostgreSQL, les artistes jamais écoutés passeraient devant les autres.
+/// Le plafond lui-même ne change pas : le relever est une décision à part.
 pub fn artistes_de_la_bibliotheque(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     // `PLAFOND` est injecté plutôt qu'écrit en dur : si le `LIMIT` et le seuil
     // d'alerte divergeaient, la troncature redeviendrait silencieuse — le
     // défaut même que ce code corrige.
+    //
+    // Les écoutes sont jointes par NOM, donc dupliquées sur chaque ligne d'un
+    // même nom : `MAX`, pas `SUM`. Les pistes sont jointes par `artist_id`,
+    // propres à chaque ligne : là, `SUM` additionne les doublons du nom.
     let sql = format!(
-        "SELECT name, MAX(musicbrainz_id) FROM artists \
-         WHERE name IS NOT NULL AND name != '' \
-         GROUP BY name ORDER BY name \
+        "SELECT a.name, MAX(a.musicbrainz_id), \
+                MAX(CASE WHEN f.item_id IS NOT NULL THEN 1 ELSE 0 END) AS favori, \
+                COALESCE(MAX(e.ecoutes), 0) AS ecoutes, \
+                COALESCE(MAX(e.derniere), '') AS derniere, \
+                COALESCE(SUM(p.pistes), 0) AS pistes \
+         FROM artists a \
+         LEFT JOIN (SELECT DISTINCT item_id FROM favorites \
+                    WHERE item_type = 'artist') f ON f.item_id = a.id \
+         LEFT JOIN (SELECT artist_name, COUNT(*) AS ecoutes, \
+                           MAX(listened_at) AS derniere \
+                    FROM listen_history \
+                    WHERE artist_name IS NOT NULL AND source != 'radio' \
+                    GROUP BY artist_name) e ON e.artist_name = a.name \
+         LEFT JOIN (SELECT artist_id, COUNT(*) AS pistes FROM tracks \
+                    WHERE artist_id IS NOT NULL \
+                    GROUP BY artist_id) p ON p.artist_id = a.id \
+         WHERE a.name IS NOT NULL AND a.name != '' \
+         GROUP BY a.name \
+         ORDER BY favori DESC, ecoutes DESC, derniere DESC, pistes DESC, a.name \
          LIMIT {PLAFOND}"
     );
 
@@ -1701,6 +1741,38 @@ mod essais {
         assert_eq!(
             total, PLAFOND,
             "aucun lot ne doit etre refuse par le limiteur du nuage"
+        );
+    }
+
+    /// #5591 et #5523 : la cadence tient quand le nombre d'artistes augmente.
+    /// La pause est posée ENTRE CHAQUE lot, pas calculée sur un total : 60 lots
+    /// (12 000 artistes, la taille de la bibliothèque de Tades) passent le
+    /// même limiteur sans un seul refus. Ce test garde la cadence le jour où
+    /// [`PLAFOND`] serait relevé ; aujourd'hui, l'envoi réel s'arrête à 25 lots.
+    #[tokio::test]
+    async fn soixante_lots_restent_sous_la_limite_d_ecriture_du_nuage() {
+        let seconde = std::time::Duration::from_millis(5);
+        let banc = banc_avec(limiteur(seconde)).await;
+        let cadence = Cadence {
+            essais_par_lot: 1,
+            ..Cadence::a_l_echelle(seconde)
+        };
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(12_000),
+            cadence,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(banc.recues().len(), 60, "12 000 artistes = 60 lots");
+        assert_eq!(
+            total, 12_000,
+            "aucun lot ne doit etre refuse par le limiteur du nuage, \
+             quel que soit le nombre de lots"
         );
     }
 
