@@ -2589,6 +2589,10 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// - `rss_delta_mb` : la croissance depuis le démarrage du serveur. Un seul
 ///   relevé ne dit rien ; c'est l'écart qui parle, et le lire dans la ligne
 ///   évite d'avoir à retrouver la première.
+/// - `rss_anon_mb`, `rss_file_mb`, `rss_shmem_mb` : la ventilation du RSS
+///   lue dans `/proc/self/status` ([`crate::releve_memoire`]). Le tas (anonyme)
+///   et les fichiers projetés (la base) ne se diagnostiquent pas pareil ; un
+///   champ que le noyau ne publie pas est absent de la ligne.
 ///
 /// Ce n'est PAS un correctif. Le ticket demande explicitement trois mesures du
 /// testeur avant de coder, parce qu'une fuite de lecture et une fuite de tâche
@@ -2626,9 +2630,15 @@ fn spawn_memory_diagnostics(
                 // Signé : un relevé sous la valeur de départ est une information
                 // (mémoire rendue), pas un débordement à cacher.
                 let rss_delta_mb = rss_mb as i64 - base as i64;
+                // Ventilation du RSS : un champ indisponible est omis de la
+                // ligne, jamais remplacé par un zéro.
+                let detail = crate::releve_memoire::lire().await;
                 info!(
                     rss_mb,
                     rss_delta_mb,
+                    rss_anon_mb = detail.anon_mb,
+                    rss_file_mb = detail.file_mb,
+                    rss_shmem_mb = detail.shmem_mb,
                     outputs_count = count,
                     stream_sessions,
                     "memory_diagnostics"
