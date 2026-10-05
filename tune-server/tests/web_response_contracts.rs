@@ -1067,5 +1067,82 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
     );
 }
 
+/// 🔴 #5834 (fil 2157, « Analyse plage dynamique reste bloquée à 97 % ») —
+/// les pistes sans DR qu'AUCUNE passe ne mesurera, et qu'aucun compteur ne
+/// nommait.
+///
+/// La passe ReplayGain estampille `rg_analyzed` + `rg_skipped_oversized` une
+/// piste trop longue pour son budget mémoire, sans plage dynamique ; le
+/// rattrapage du DR l'écarte (`CANDIDATS_DR_WHERE`) et ne pose donc jamais
+/// `dr_indisponible`. Une piste CUE (`file_path` vide) n'entre dans aucune
+/// passe. Ni l'une ni l'autre n'était comptée : la carte Santé les rangeait
+/// « en attente », pour toujours, et sa jauge ne finissait pas.
+///
+/// Le témoin vérifie aussi qu'aucune piste n'est comptée deux fois : une
+/// piste trop longue qui a un DR (lu dans ses tags) ou déjà marquée
+/// indisponible ne compte pas parmi les trop longues.
+#[tokio::test]
+async fn la_completude_nomme_les_pistes_que_la_plage_dynamique_ne_mesurera_jamais_5834() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+
+    let poser = |nom: &str, fichier: bool| -> i64 {
+        let mut t = tune_core::db::models::Track::new(nom.into());
+        t.file_path = fichier.then(|| format!("/music/{nom}.flac"));
+        pistes.create(&t).expect("piste temoin")
+    };
+    let trop_longue = |id: i64| {
+        meta.set(id, "rg_analyzed", "1700000000")
+            .expect("temoin rg");
+        meta.set(id, "rg_skipped_oversized", "1")
+            .expect("trop longue");
+    };
+
+    // Trop longue, sans DR : la seule à compter parmi les trop longues.
+    let longue = poser("longue-sans-dr", true);
+    trop_longue(longue);
+    // Trop longue mais DR lu dans les tags : elle a son DR, elle ne manque pas.
+    let longue_taguee = poser("longue-taguee", true);
+    trop_longue(longue_taguee);
+    meta.set(longue_taguee, "dr_track", "9").expect("dr tague");
+    meta.set(longue_taguee, "dr_source", "tag").expect("source");
+    // Trop longue ET indisponible : déjà comptée dans `dynamic_range_unavailable`.
+    let longue_ecartee = poser("longue-ecartee", true);
+    trop_longue(longue_ecartee);
+    meta.set(longue_ecartee, "dr_indisponible", "1")
+        .expect("ecartee");
+    // Une piste CUE sans DR, et une piste CUE dont le DR vient d'ailleurs.
+    let _cue = poser("cue-sans-dr", false);
+    let cue_taguee = poser("cue-taguee", false);
+    meta.set(cue_taguee, "dr_track", "11").expect("dr cue");
+    // Une piste ordinaire en attente : ni l'un ni l'autre.
+    let _vierge = poser("vierge", true);
+
+    let app = tune_server::routes::router(etat);
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+
+    assert_eq!(
+        p["dynamic_range_oversized"], 1,
+        "une seule piste est trop longue pour l'analyse ET sans DR ni marque \
+         « indisponible » — sans ce compteur la carte Santé la croit en \
+         attente pour toujours (fil 2157). payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_without_file"], 1,
+        "une seule piste sans fichier propre (CUE) n'a pas de DR. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_unavailable"], 1,
+        "la piste trop longue déjà écartée reste comptée là, et une seule fois. payload={p}"
+    );
+    assert_eq!(p["with_dynamic_range"], 2, "payload={p}");
+    assert_eq!(p["total_tracks"], 6, "payload={p}");
+}
+
 #[path = "web_contracts/album_tracks_1897.rs"]
 mod album_tracks_1897;
