@@ -3921,6 +3921,22 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     };
 
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
+    // #5160 — une clé de crédit REPÉTABLE. Vorbis (et APE, MP4) écrivent un
+    // interprète par trame : `PERFORMER=A (bass)`, `PERFORMER=B (drums)`.
+    // `get_string` ne rend que la première, et les suivantes étaient perdues à
+    // l'ingestion. Toutes les trames sont gardées, dans l'ordre du fichier,
+    // jointes par « ; » — le séparateur que la route des crédits découpe déjà
+    // (`routes/library/credits.rs`). Une trame unique est rendue telle quelle,
+    // `;` compris. Les doublons exacts et les trames vides sont écartés.
+    let toutes = |key: ItemKey| -> Option<String> {
+        let mut valeurs: Vec<&str> = Vec::new();
+        for v in tag.get_strings(key).map(str::trim) {
+            if !v.is_empty() && !valeurs.contains(&v) {
+                valeurs.push(v);
+            }
+        }
+        (!valeurs.is_empty()).then(|| valeurs.join("; "))
+    };
 
     // Sort-order fields
     if let Some(v) = get(ItemKey::TrackArtistSortOrder) {
@@ -3943,7 +3959,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Lyricist) {
         meta.insert("lyricist".into(), v);
     }
-    if let Some(v) = get(ItemKey::Performer) {
+    if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
     }
     if let Some(v) = get(ItemKey::Remixer) {
@@ -3952,7 +3968,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
-    if let Some(v) = get(ItemKey::Producer) {
+    if let Some(v) = toutes(ItemKey::Producer) {
         meta.insert("producer".into(), v);
     }
 
@@ -7199,6 +7215,107 @@ mod tests_drapeau_compilation {
             try_read_metadata(&faux).unwrap().compilation,
             Some(false),
             "cpil=0 doit rendre faux"
+        );
+    }
+}
+
+/// #5160 — des trames PERFORMER et PRODUCER RÉPÉTÉES, sans « ; », sur un vrai
+/// FLAC (la fixture du dépôt, retaguée par lofty) relu par la fonction de
+/// production. Avant le correctif, seule la première trame de chaque clé
+/// entrait dans `track_metadata`.
+#[cfg(test)]
+mod credits_repetes_5160 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+
+    /// Une copie de la fixture FLAC portant les trames données, une par
+    /// entrée, dans cet ordre.
+    fn flac_avec_trames(
+        epreuve: &str,
+        trames: &[(&str, &str)],
+    ) -> crate::test_scratch::ScratchFile {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let copie =
+            crate::test_scratch::scratch_file(&format!("credits5160-{epreuve}"), "-test.flac");
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        let chemin: &std::path::Path = &copie;
+        let mut fh = std::fs::File::open(chemin).expect("ouverture du gabarit");
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+        drop(fh);
+        if flac.vorbis_comments().is_none() {
+            flac.set_vorbis_comments(VorbisComments::default());
+        }
+        let vc = flac.vorbis_comments_mut().expect("bloc Vorbis Comment");
+        for (cle, valeur) in trames {
+            // `push` et non `insert` : `insert` REMPLACE la trame existante,
+            // et le témoin n'aurait plus qu'une valeur à relire.
+            vc.push((*cle).to_string(), (*valeur).to_string());
+        }
+        flac.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+        copie
+    }
+
+    #[test]
+    fn les_trames_repetees_sans_point_virgule_sont_toutes_gardees() {
+        let chemin = flac_avec_trames(
+            "repetees",
+            &[
+                ("PERFORMER", "Christian McBride (bass)"),
+                ("PERFORMER", "Nasheet Waits (drums)"),
+                ("PRODUCER", "Christian McBride"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)"),
+            "#5160 — la seconde trame PERFORMER est perdue. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Christian McBride; Todd Whitelock"),
+            "#5160 — la seconde trame PRODUCER est perdue. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN VERT — une trame unique qui porte déjà ses « ; » sort telle
+    /// quelle : le format de Reivax66 (fil 1965) ne bouge pas.
+    #[test]
+    fn une_trame_unique_avec_point_virgule_sort_intacte() {
+        let chemin = flac_avec_trames(
+            "unique",
+            &[(
+                "PERFORMER",
+                "Christian McBride (bass); Nasheet Waits (drums)",
+            )],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)")
+        );
+        assert_eq!(meta.get("producer"), None, "aucun producteur inventé");
+    }
+
+    /// Une trame répétée à l'identique ne fabrique pas un doublon.
+    #[test]
+    fn une_trame_dupliquee_ne_se_compte_qu_une_fois() {
+        let chemin = flac_avec_trames(
+            "doublon",
+            &[
+                ("PRODUCER", "Todd Whitelock"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Todd Whitelock")
         );
     }
 }
