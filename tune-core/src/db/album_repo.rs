@@ -5859,6 +5859,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fil 2126 — un album `m4a` (codec non lu) ne sort sous AUCUN filtre de
+    /// qualité, et sa fiche n'y montre aucune piste : le filtre suit le badge,
+    /// et il n'en a pas. Témoin : un FLAC 96/24 sort bien sous « Hi-Res ».
+    #[test]
+    fn i2126_un_album_m4a_ne_sort_sous_aucun_filtre_de_qualite() {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db: Arc<dyn DbBackend> = Arc::new(test_db());
+        let aid = ArtistRepo::with_backend(db.clone())
+            .create(&Artist::new("Artiste 2126".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(db.clone());
+        let pistes = TrackRepo::with_backend(db);
+        let mut ids = Vec::new();
+        for (titre, format, sr, bd) in [
+            ("Album M4A 96", "m4a", Some(96000), None),
+            ("Album M4A 44", "m4a", Some(44100), None),
+            ("Témoin FLAC 96-24", "flac", Some(96000), Some(24)),
+        ] {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(aid);
+            a.format = Some(format.into());
+            a.sample_rate = sr;
+            a.bit_depth = bd;
+            let id = albums.create(&a).unwrap();
+            let mut t = Track::new(format!("{titre} 1"));
+            t.album_id = Some(id);
+            t.artist_id = Some(aid);
+            t.track_number = 1;
+            t.duration_ms = 1000;
+            t.file_path = Some(format!("/music/2126/{titre}/1.{format}"));
+            t.format = Some(format.into());
+            t.sample_rate = sr;
+            t.bit_depth = bd;
+            pistes.create(&t).unwrap();
+            ids.push((titre, format, id));
+        }
+        let lister = |q: &str| -> Vec<i64> {
+            albums
+                .list_filtered(100, 0, "id", "asc", None, Some(q), None, false, None)
+                .unwrap()
+                .into_iter()
+                .filter_map(|a| a.id)
+                .collect()
+        };
+        for q in ["dsd", "hires", "hi-res", "lossy", "cd"] {
+            let rendus = lister(q);
+            for (titre, format, id) in &ids {
+                if *format != "m4a" {
+                    continue;
+                }
+                assert!(
+                    !rendus.contains(id),
+                    "« {titre} » (m4a, codec non lu) est rendu sous ?quality={q} : \
+                     un album sans badge ne doit sortir sous aucun filtre (fil 2126)"
+                );
+                assert!(
+                    pistes
+                        .list_by_album_filtered(*id, None, Some(q))
+                        .unwrap()
+                        .is_empty(),
+                    "la fiche de « {titre} » montre des pistes sous ?quality={q}"
+                );
+            }
+        }
+        let temoin = ids.iter().find(|(_, f, _)| *f == "flac").unwrap().2;
+        assert!(
+            lister("hires").contains(&temoin),
+            "témoin : le FLAC 96/24 sort sous Hi-Res"
+        );
+    }
+
     #[test]
     fn i5413_les_filtres_de_qualite_suivent_le_badge() {
         scenario_filtres_de_qualite_5413(Arc::new(test_db()));

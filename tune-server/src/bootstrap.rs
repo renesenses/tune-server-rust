@@ -193,7 +193,7 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
-    let chemin_du_journal = installer_le_journal(&config.log_level);
+    let _chemin_du_journal = installer_le_journal(&config.log_level);
 
     // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
     // pas la configuration sous la main. #5596 : après le journal, pour que
@@ -207,17 +207,22 @@ pub async fn run_with(opts: RunOptions) {
     crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
-    // ptrace ni sudo. Les relevés vont à côté du journal.
+    // ptrace ni sudo. Fil 2117/2124 (#5677) : les relevés vont dans le dossier
+    // de données (`diagnostics/gels/`), qui survit aux redémarrages ; sur
+    // Tune OS, `/tmp` est PRIVÉ au service et effacé à chaque relance. Le
+    // dossier temporaire par compte (#4770) n'est plus qu'un repli.
     {
-        let dossier = chemin_du_journal
-            .as_deref()
-            .and_then(|c| c.parent())
-            .map(std::path::Path::to_path_buf)
-            // #4770 : sans journal, un dossier par compte plutôt que la
-            // racine temporaire partagée.
-            .unwrap_or_else(|| {
-                tune_core::chemins_de_travail::racine_de_travail("tune-gel-executeur")
-            });
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let donnees = crate::gel_executeur::dossier_de_donnees(
+            std::env::var("TUNE_DATA_DIR").ok().as_deref(),
+            &config.db_path,
+            &cwd,
+        );
+        let dossier = crate::gel_executeur::dossier_des_releves(
+            &donnees,
+            tune_core::chemins_de_travail::racine_de_travail("tune-gel-executeur"),
+        );
+        tracing::info!(dossier = %dossier.display(), "gel_executeur_releves");
         std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
     }
 

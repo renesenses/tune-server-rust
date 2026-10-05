@@ -535,7 +535,17 @@ impl PlaybackOrchestrator {
         cover_url: Option<&str>,
         session_profile_id: Option<i64>,
         contexte: ContexteEcoute<'_>,
+        album_ref: Option<&str>,
     ) {
+        // La référence d'album du service (fil 2121, migration 114). Donnée
+        // par la demande quand elle la porte ; sinon, pour une piste Bandcamp,
+        // celle que la file ou les favoris connaissent déjà — une avance
+        // gapless ou une annonce différée n'ont pas la demande sous la main.
+        let album_ref = album_ref.map(String::from).or_else(|| {
+            source_id.filter(|_| source == "bandcamp").and_then(|sid| {
+                crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, sid)
+            })
+        });
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
         // gapless advances). `None` → tag NULL rather than guess an owner: a
@@ -570,6 +580,7 @@ impl PlaybackOrchestrator {
             context_source: contexte.service.map(Into::into),
             context_title: contexte.titre.map(Into::into),
             context_cover: contexte.pochette.map(Into::into),
+            album_ref,
         })
         .ok();
 
@@ -686,6 +697,7 @@ impl PlaybackOrchestrator {
                     titre: etat.session_context_title.as_deref(),
                     pochette: etat.session_context_cover.as_deref(),
                 },
+                None,
             );
         }
 

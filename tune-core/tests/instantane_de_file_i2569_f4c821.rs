@@ -142,6 +142,7 @@ fn album_de(n: i64) -> Vec<QueueInput> {
             duration_ms: 200_000,
             track_number: Some(i + 1),
             disc_number: Some(1),
+            album_ref: None,
         })
         .collect()
 }

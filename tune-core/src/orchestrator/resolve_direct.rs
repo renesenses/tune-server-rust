@@ -24,6 +24,10 @@ struct Directe<'a> {
     is_local_output: bool,
     is_browser_output: bool,
     radio_eq_profile: &'a Option<crate::audio::eq::EqProfile>,
+    /// Bandcamp : l'adresse de la page album ou piste, de quoi resigner l'URL
+    /// de flux quand Bandcamp la refuse (fil 2121). `None` hors Bandcamp, et
+    /// pour une piste dont aucune table ne connaît la page.
+    album_ref: Option<&'a str>,
 }
 
 impl PlaybackOrchestrator {
@@ -673,6 +677,35 @@ impl PlaybackOrchestrator {
         };
         let is_radio = source == "radio";
         let is_bandcamp = source == "bandcamp";
+        // Fil 2121 — la page de la piste Bandcamp, pour resigner son URL de
+        // flux. Portée par la demande quand elle vient de la file ou de la
+        // liste de pistes du service ; sinon cherchée là où Tune l'a rangée
+        // (file, favoris, historique) : le client rejoue un favori ou une
+        // ligne d'historique par son seul `source_id`.
+        let bc_album_ref: Option<String> = if is_bandcamp {
+            req.album_ref
+                .clone()
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| {
+                    crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, audio_url)
+                })
+        } else {
+            None
+        };
+        // Fil 2121 (décision de Bertrand, 04/10) — resigner AVANT l'envoi, pour
+        // TOUTES les sorties : la sortie locale et OAAT ouvrent l'URL
+        // elles-mêmes, sans le relais qui sait guérir un 410. Une signature
+        // vieille de 24 h ou plus (ou absente) est remplacée par celle du jour,
+        // lue sur la page. `audio_url` est REDÉFINIE ici : tout ce qui suit —
+        // relais, décodage OAAT, sortie locale, sonde de niveaux — lit l'URL
+        // fraîche.
+        let bc_url_resignee: Option<String> = if is_bandcamp {
+            self.resigner_bandcamp_avant_envoi(req.zone_id, audio_url, bc_album_ref.as_deref())
+                .await
+        } else {
+            None
+        };
+        let audio_url: &str = bc_url_resignee.as_deref().unwrap_or(audio_url);
 
         let is_local_output = req
             .output_device_id
@@ -817,6 +850,7 @@ impl PlaybackOrchestrator {
             is_local_output,
             is_browser_output,
             radio_eq_profile: &radio_eq_profile,
+            album_ref: bc_album_ref.as_deref(),
         };
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) =
             if is_radio && (is_local_output || is_oaat_output) {
@@ -1543,6 +1577,64 @@ impl PlaybackOrchestrator {
             None,
         )
     }
+    /// Fil 2121 — l'URL du jour d'une piste Bandcamp dont la signature a
+    /// passé le seuil ([`super::bandcamp_resignature::SEUIL_SIGNATURE_BANDCAMP_SECS`]),
+    /// lue sur sa page. `None` quand il n'y a rien à faire ou rien de possible :
+    /// l'appelant garde alors l'URL d'origine.
+    ///
+    /// - signature récente, ou URL qui n'est pas un flux (`/stream/`) : rien ;
+    /// - page inconnue : WARN `bandcamp_signature_perimee_sans_reference`, URL
+    ///   d'origine (le relais, ou B, dira l'échec éventuel) ;
+    /// - relecture en échec : WARN `bandcamp_resignature_avant_envoi_echouee`,
+    ///   URL d'origine.
+    async fn resigner_bandcamp_avant_envoi(
+        &self,
+        zone_id: i64,
+        audio_url: &str,
+        album_ref: Option<&str>,
+    ) -> Option<String> {
+        use super::bandcamp_resignature::{horodatage_de_signature, signature_a_renouveler};
+        crate::db::reference_d_album::identite_de_flux(audio_url)?;
+        let maintenant = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if !signature_a_renouveler(audio_url, maintenant) {
+            return None;
+        }
+        let age_secs = horodatage_de_signature(audio_url).map(|ts| maintenant.saturating_sub(ts));
+        let Some(page) = album_ref else {
+            warn!(
+                zone_id,
+                age_secs,
+                url = %audio_url,
+                "bandcamp_signature_perimee_sans_reference"
+            );
+            return None;
+        };
+        let relire = super::bandcamp_resignature::reresolveur_bandcamp(
+            self.services.clone(),
+            page.to_string(),
+            audio_url.to_string(),
+        );
+        match relire().await {
+            Ok(fraiche) => {
+                info!(zone_id, age_secs, page, "bandcamp_resignee_avant_envoi");
+                Some(fraiche)
+            }
+            Err(e) => {
+                warn!(
+                    zone_id,
+                    age_secs,
+                    page,
+                    error = %e,
+                    "bandcamp_resignature_avant_envoi_echouee"
+                );
+                None
+            }
+        }
+    }
+
     async fn relayer_bandcamp_au_reseau(&self, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
@@ -1550,6 +1642,7 @@ impl PlaybackOrchestrator {
             duration_ms,
             bc_quality,
             is_browser_output,
+            album_ref,
             ..
         } = d;
         // Sortie RÉSEAU (DLNA/OpenHome) ou navigateur. Bandcamp ne publie
@@ -1577,9 +1670,25 @@ impl PlaybackOrchestrator {
             duration_ms: duration_ms.map(|d| d as u64),
             ..Default::default()
         };
+        //
+        // 🔴 Fil 2121 — l'URL est SIGNÉE, et Bandcamp la refuse au bout de
+        // quelques jours (410 Gone à 2,7 jours chez FabienM ; 403 pour le
+        // chemin nu d'un favori). Avec l'adresse de la page, le relais reçoit
+        // le même mécanisme de nouvelle résolution que Qobuz et Tidal
+        // (#1136) : sur un statut d'expiration, il relit la page et reprend
+        // sur l'URL du jour. Sans elle (ligne antérieure à la migration 114),
+        // rien ne change : le relais échoue comme avant, et le dit.
+        let reresolve = album_ref.map(|page| {
+            super::bandcamp_resignature::reresolveur_bandcamp(
+                self.services.clone(),
+                page.to_string(),
+                audio_url.to_string(),
+            )
+        });
+        let resignable = reresolve.is_some();
         let session_id = self
             .streamer
-            .create_proxy_session(info, audio_url.to_string(), false)
+            .create_proxy_session_with_reresolve(info, audio_url.to_string(), false, reresolve)
             .await;
         let server_ip = self.server_ip();
         let stream_url = self
@@ -1589,6 +1698,8 @@ impl PlaybackOrchestrator {
             url = %audio_url,
             browser = is_browser_output,
             codec = bc_codec,
+            resignable,
+            page = album_ref.unwrap_or(""),
             "bandcamp_proxy_for_network_or_browser_output"
         );
         (

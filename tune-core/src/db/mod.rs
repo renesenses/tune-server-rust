@@ -55,6 +55,9 @@ pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
 pub mod rattrapage_metadonnees_5043;
+/// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
+/// favoris ou l'historique pour resigner son URL de flux (fil 2121).
+pub mod reference_d_album;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
@@ -83,4 +86,8 @@ mod lenteur_albums_4800_tests;
 mod lenteur_pistes_5138_tests;
 #[cfg(test)]
 mod pochette_source_pg_tests_5034;
+/// Fil 2130 — « Reprendre l'écoute » : jointure en UNION ALL et index de
+/// `listen_history.album_id`, preuves d'équivalence et de migration.
+#[cfg(test)]
+mod reprendre_l_ecoute_2130_tests;
 pub mod upnp_revision;

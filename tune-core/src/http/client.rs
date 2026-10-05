@@ -40,6 +40,38 @@ pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder().use_preconfigured_tls(TLS_CONFIG.clone())
 }
 
+/// Décrit une erreur `reqwest` pour un journal, **sans son URL** et avec la
+/// chaîne de ses causes (#5553, #5522).
+///
+/// Une URL de CDN signée porte ses paramètres d'autorisation : elle ne doit
+/// pas finir dans un journal qu'un testeur publie. `reqwest::Error` l'écrit
+/// pourtant dans son `Display` (« error sending request for url (…) »), et
+/// s'arrête là : la cause réelle — connexion fermée avant la réponse, remise
+/// à zéro, TLS — n'apparaît que dans ses `source()`. Ce texte garde la nature
+/// de l'erreur, ajoute chaque cause, et laisse l'URL de côté : l'URL vit à
+/// part dans l'erreur, aucune cause ne la recopie.
+pub fn decrire_erreur_http(error: &reqwest::Error) -> String {
+    let nature = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_body() {
+        "response body failed"
+    } else if error.is_decode() {
+        "response decode failed"
+    } else {
+        "request failed"
+    };
+    let mut texte = nature.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(c) = cause {
+        texte.push_str(": ");
+        texte.push_str(&c.to_string());
+        cause = c.source();
+    }
+    texte
+}
+
 static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     builder()
         .timeout(Duration::from_secs(30))

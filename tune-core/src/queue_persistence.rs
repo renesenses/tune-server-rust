@@ -49,6 +49,11 @@ pub struct QueueSnapshotItem {
     pub cover_url: Option<String>,
     #[serde(default)]
     pub duration_ms: i64,
+    /// Référence d'album du service (fil 2121, migration 114) : sans elle, une
+    /// file restaurée au démarrage perdrait de quoi resigner une piste
+    /// Bandcamp. Absente des instantanés antérieurs, d'où le défaut.
+    #[serde(default)]
+    pub album_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +172,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
             album_title: e.album_title.clone(),
             cover_url: e.cover_path.clone(),
             duration_ms: e.duration_ms.unwrap_or(0),
+            album_ref: e.album_ref.clone(),
         })
         .collect();
     // Current position from the unified list (a streaming item can be current).
@@ -388,6 +394,7 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
                         // Snapshot items don't carry per-album numbering.
                         track_number: None,
                         disc_number: None,
+                        album_ref: it.album_ref.clone(),
                     });
                 }
             }
@@ -409,6 +416,7 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
                     // Legacy streaming snapshot entries carry no track/disc number.
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 });
             }
         }
@@ -688,6 +696,7 @@ mod tests {
                     duration_ms: 100,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 },
             ],
         )

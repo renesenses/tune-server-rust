@@ -3,6 +3,8 @@
 //! La TOC est demandée en LBA (`IOCTL_CDROM_READ_TOC_EX`, `Msf = 0`), puis
 //! les secteurs audio bruts par `IOCTL_CDROM_RAW_READ` en mode CDDA. Le
 //! périphérique est partagé avec les autres lecteurs, sans extraction.
+//! L'éjection (fil 2135) : `IOCTL_STORAGE_MEDIA_REMOVAL` (déverrouiller)
+//! puis `IOCTL_STORAGE_EJECT_MEDIA`.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Mutex;
@@ -18,10 +20,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
-use windows_sys::Win32::System::Ioctl::IOCTL_STORAGE_CHECK_VERIFY;
+use windows_sys::Win32::System::Ioctl::{
+    IOCTL_STORAGE_CHECK_VERIFY, IOCTL_STORAGE_EJECT_MEDIA, IOCTL_STORAGE_MEDIA_REMOVAL,
+    PREVENT_MEDIA_REMOVAL,
+};
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_CDROM;
 
-use crate::lecteur::{ErreurCd, LecteurDisque, Presence};
+use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
 use crate::toc::{OCTETS_PAR_SECTEUR, Toc};
 use crate::windows_toc::decoder_toc;
 
@@ -227,5 +232,40 @@ impl LecteurDisque for LecteurWindows {
             return Err(ErreurCd::AucunDisque);
         }
         resultat
+    }
+
+    /// Sur un handle NEUF, le handle de lecture fermé et le verrou tenu
+    /// (aucune lecture ne le rouvre pendant l'éjection). Le déverrouillage
+    /// est une précaution : sans effet si rien n'a verrouillé le tiroir.
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        match self.presence() {
+            Presence::AucunLecteur => return Err(ErreurEjection::AucunLecteur),
+            Presence::Vide => return Err(ErreurEjection::AucunDisque),
+            Presence::Disque => {}
+        }
+        let mut garde = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        *garde = None;
+        let handle = self
+            .ouvrir()
+            .map_err(|e| ErreurEjection::Echec(format!("{} ne s'ouvre pas : {e}", self.chemin)))?;
+        let liberer = PREVENT_MEDIA_REMOVAL {
+            PreventMediaRemoval: false,
+        };
+        let _ = ioctl(
+            &handle,
+            IOCTL_STORAGE_MEDIA_REMOVAL,
+            (&liberer as *const PREVENT_MEDIA_REMOVAL).cast(),
+            std::mem::size_of::<PREVENT_MEDIA_REMOVAL>() as u32,
+            &mut [],
+        );
+        ioctl(
+            &handle,
+            IOCTL_STORAGE_EJECT_MEDIA,
+            std::ptr::null(),
+            0,
+            &mut [],
+        )
+        .map(|_| tracing::info!(lecteur = %self.chemin, "cd_disque_ejecte"))
+        .map_err(|e| ErreurEjection::Echec(format!("IOCTL_STORAGE_EJECT_MEDIA : {e}")))
     }
 }

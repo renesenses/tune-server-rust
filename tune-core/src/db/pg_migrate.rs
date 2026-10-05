@@ -710,6 +710,13 @@ CREATE TABLE IF NOT EXISTS item_tags (
 -- CREATE IF NOT EXISTS ci-dessus ne la corrige pas. Même raison que
 -- `streaming_favorites.first_seen_at` plus haut.
 ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
+-- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :
+-- l'adresse de la page Bandcamp qui permet de resigner une URL de flux
+-- expirée. En ALTER pour la même raison que juste au-dessus : les trois tables
+-- existent déjà sur une base de bascule antérieure.
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT;
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
@@ -1111,6 +1118,10 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_source TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_title TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_cover TEXT;
+-- listen_history: index de album_id (SQLite migration v115 / PG 079, fil
+-- 2130). APRÈS l'ALTER d'album_id ci-dessus : une base de bascule antérieure
+-- peut ne l'avoir reçue que là.
+CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id);
 
 -- smart_playlists: match_mode (SQLite migration v48)
 ALTER TABLE smart_playlists ADD COLUMN IF NOT EXISTS match_mode TEXT NOT NULL DEFAULT 'all';

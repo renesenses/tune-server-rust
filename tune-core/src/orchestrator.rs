@@ -1216,6 +1216,15 @@ pub struct PlayRequest {
     /// queue row (or the library track) so an output does not have to guess it.
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    /// La référence d'album du service (`StreamTrack.album_id`), portée depuis
+    /// la ligne de file ou la liste de pistes du service (migration 114).
+    ///
+    /// Pour Bandcamp, c'est l'adresse de la page album ou piste : le relais en
+    /// a besoin pour RESIGNER une URL de flux expirée (fil 2121). `None` quand
+    /// l'appelant ne la connaît pas ; la résolution Bandcamp la cherche alors
+    /// dans la file, les favoris de service et l'historique (voir
+    /// `db::reference_d_album`).
+    pub album_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1622,6 +1631,9 @@ mod history;
 mod bandcamp;
 pub use bandcamp::*;
 
+/// Fil 2121 — resigner une URL de flux Bandcamp expirée depuis sa page.
+mod bandcamp_resignature;
+
 mod qualite_pre_armee;
 pub(crate) use qualite_pre_armee::{QualitePreArmee, format_du_mime, format_nomme_par_la_source};
 
@@ -1835,6 +1847,10 @@ mod bit_depth_cap_tests;
 #[cfg(test)]
 mod dop_routing_tests;
 
+/// #5643 — la règle du DSD natif local (ASIO) et la valeur publiée par l'API.
+#[cfg(test)]
+mod dsd_natif_5643_tests;
+
 /// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
 ///
 /// Chez Bilou, quatre échecs de sortie BluOS d'affilée ont produit quatre
@@ -1869,6 +1885,10 @@ mod pause_rend_le_peripherique_4177;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
+/// ait ouvert le flux.
+#[cfg(test)]
+mod reprise_renderer_cale_2125;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]

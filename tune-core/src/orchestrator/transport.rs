@@ -1656,6 +1656,7 @@ impl PlaybackOrchestrator {
                     titre: context.3.as_deref(),
                     pochette: context.4.as_deref(),
                 },
+                req.album_ref.as_deref(),
             );
         }
     }
@@ -2191,6 +2192,7 @@ impl PlaybackOrchestrator {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         let resultat = self.play_without_history(req).await;
@@ -2269,6 +2271,65 @@ impl PlaybackOrchestrator {
             false,
         )
         .await;
+    }
+
+    /// Fil 2125 (#5711) — le saut de la reprise automatique après décrochage
+    /// du renderer (#4645), appelé par le sondeur juste après
+    /// `play_from_queue`.
+    ///
+    /// Le sondeur envoyait un `Seek` NU dans la foulée du `Play` : sur le
+    /// Rygel du fil 2125, `Seek` envoyé et acquitté à 10:42:17.982, puis le
+    /// renderer ouvre le flux à 10:42:18.037 avec `range="-"` — depuis
+    /// l'octet 0. Le `Seek` était parti avant l'ouverture du flux, le
+    /// renderer l'a acquitté puis a relu depuis le début : « la pièce reprend
+    /// du début ».
+    ///
+    /// Sur une sortie réseau dont la session sait chercher, on passe donc par
+    /// [`Self::seek_output_after_replay`] : pose de
+    /// `REPLAY_OUTPUT_SEEK_SETTLE_MS`, relecture de la génération des
+    /// commandes, puis `Seek` — le chemin de la relecture (#2893) et du
+    /// rétablissement (#5666). Ailleurs (sortie locale, session sans `Range`),
+    /// [`Self::seek`] fait déjà ce qu'il faut : recréer le flux à la position.
+    ///
+    /// Le `Ok` ne prouve PAS que le renderer a sauté : la tâche détachée
+    /// n'est pas encore partie. C'est au sondeur de constater le saut sur la
+    /// position MESURÉE ensuite.
+    pub async fn sauter_apres_reprise_de_renderer_cale(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        position_ms: u64,
+    ) -> OutputCommandResult<()> {
+        let output_type = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_type);
+        let stream_id = self
+            .playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id);
+        let session_is_range_seekable = match stream_id {
+            Some(ref sid) => self.streamer.is_seekable_session(sid).await,
+            None => false,
+        };
+        if device_id.is_none()
+            || !replay_needs_output_seek(
+                is_network_output_type(output_type.as_deref()),
+                session_is_range_seekable,
+                position_ms,
+            )
+        {
+            return self.seek(zone_id, position_ms, device_id).await;
+        }
+        // La position publique suit tout de suite : l'interface ne repart pas
+        // de 0:00, et la grâce de déplacement du sondeur part d'ici.
+        self.playback.seek(zone_id, position_ms as i64).await;
+        self.seek_output_after_replay(zone_id, device_id, output_type.as_deref(), position_ms)
+            .await;
+        Ok(())
     }
 
     /// Le seek qui suit une reprise ou une relecture sur un renderer réseau
@@ -2752,6 +2813,7 @@ impl PlaybackOrchestrator {
                             media_format: None,
                             track_number: None,
                             disc_number: None,
+                            album_ref: None,
                         };
                         // Même station, même écoute logique : pas de nouvelle
                         // ligne d'historique (même règle que radio_auto_retry).
@@ -3272,6 +3334,7 @@ impl PlaybackOrchestrator {
                     media_format: None,
                     track_number: None,
                     disc_number: None,
+                    album_ref: None,
                 };
 
                 match self.play_without_history(req).await {

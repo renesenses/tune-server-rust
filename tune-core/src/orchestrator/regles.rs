@@ -1002,7 +1002,14 @@ pub enum TransportDsd {
     /// C'est le mensonge de #2369, nommé plutôt que corrigé — le corriger
     /// suppose d'ouvrir le périphérique dans un format DSD, ce qui n'est pas
     /// une décision d'orchestrateur.
+    ///
+    /// #5643 — reste le transport d'une zone « natif » tant que
+    /// [`decider_dsd_natif_local`] ne l'a pas promue en [`Self::Natif`].
     NatifServiEnDop,
+    /// #5643 — DSD natif : la sortie locale ASIO reçoit les octets DSD
+    /// eux-mêmes (`DsdU8`), sans DoP, sans volume ni DSP. Seule
+    /// [`decider_dsd_natif_local`] y mène, jamais [`transport_dsd`] seul.
+    Natif,
 }
 
 impl TransportDsd {
@@ -1014,6 +1021,7 @@ impl TransportDsd {
             Self::Pcm => "pcm",
             Self::Dop => "dop",
             Self::NatifServiEnDop => "natif_servi_en_dop",
+            Self::Natif => "natif",
         }
     }
 
@@ -1048,6 +1056,118 @@ pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> Transp
         return TransportDsd::Dop;
     }
     TransportDsd::Pcm
+}
+
+/// #5643 — ce que l'orchestrateur sait de la sortie locale d'une zone
+/// « natif », au moment de résoudre une piste DSD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortieDsdLocale {
+    /// La sortie ne passe pas par le bras ASIO exclusif (WASAPI, partagé,
+    /// macOS, Linux/ALSA — ce dernier reste hors périmètre de #5643).
+    NonAsio,
+    /// Bras ASIO, capacité pas encore sondée et impossible à sonder
+    /// maintenant : le verrou de périphérique est tenu par un flux en cours.
+    AsioNonSondee,
+    /// Bras ASIO, pilote sondé : les cadences DSD qu'il a déclarées (vide =
+    /// pilote PCM seulement).
+    Asio { cadences: Vec<u32> },
+}
+
+/// #5643 — pourquoi une zone « natif » part quand même en DoP. Chaque motif
+/// a un libellé stable, écrit dans le journal à côté de
+/// `dsd_local_natif_indisponible_servi_en_dop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifDsdServiEnDop {
+    /// La sortie n'est pas ASIO exclusif.
+    SortieNonAsio,
+    /// Pilote occupé par un autre flux : capacité non sondée, on ne touche
+    /// pas au pilote pendant une lecture.
+    CapaciteNonSondee,
+    /// Le pilote ne déclare aucune cadence DSD.
+    PiloteSansDsd,
+    /// L'en-tête du fichier est illisible : cadence inconnue.
+    CadenceInconnue,
+    /// Le pilote déclare le DSD, mais pas à la cadence du fichier.
+    CadenceNonDeclaree,
+    /// Le plafond de cadence de la zone (`max_sample_rate`, combiné avec le
+    /// catalogue) interdit cette cadence — la même règle que le DoP : le
+    /// débit DoP équivalent (cadence / 16) doit tenir sous le plafond.
+    PlafondDeZone,
+}
+
+impl MotifDsdServiEnDop {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SortieNonAsio => "sortie_non_asio",
+            Self::CapaciteNonSondee => "pilote_occupe_capacite_non_sondee",
+            Self::PiloteSansDsd => "pilote_sans_dsd",
+            Self::CadenceInconnue => "cadence_du_fichier_inconnue",
+            Self::CadenceNonDeclaree => "cadence_non_declaree_par_le_pilote",
+            Self::PlafondDeZone => "plafond_de_cadence_de_la_zone",
+        }
+    }
+}
+
+/// #5643 — la règle du DSD natif local, pure.
+///
+/// Appelée SEULEMENT quand [`transport_dsd`] a rendu
+/// [`TransportDsd::NatifServiEnDop`] (zone « natif », sortie locale, source
+/// DSD). Rend `Ok(())` si la piste peut partir en DSD natif, sinon le motif du
+/// repli en DoP — le comportement d'avant #5643, inchangé.
+///
+/// - `cadence_fichier` : la cadence DSD lue dans l'en-tête du fichier ;
+/// - `plafond_zone` : le plafond de cadence de la zone, déjà combiné avec le
+///   catalogue (`zone_max_sample_rate`). Il s'applique comme au DoP, sur le
+///   débit équivalent `cadence / 16` : une zone que le DoP n'a pas le droit de
+///   servir à cette cadence ne la reçoit pas non plus en natif ;
+/// - `strict` : « bit-perfect strict ». Le DSD natif est bit-perfect par
+///   construction, le mode strict ne l'empêche donc pas ; sur repli, c'est le
+///   chemin DoP qui applique le strict comme avant (refus si le plafond
+///   l'interdit, #3973).
+pub fn decider_dsd_natif_local(
+    sortie: &SortieDsdLocale,
+    cadence_fichier: Option<u32>,
+    plafond_zone: Option<u32>,
+    strict: bool,
+) -> Result<(), MotifDsdServiEnDop> {
+    let _ = strict;
+    let cadences = match sortie {
+        SortieDsdLocale::NonAsio => return Err(MotifDsdServiEnDop::SortieNonAsio),
+        SortieDsdLocale::AsioNonSondee => return Err(MotifDsdServiEnDop::CapaciteNonSondee),
+        SortieDsdLocale::Asio { cadences } => cadences,
+    };
+    if cadences.is_empty() {
+        return Err(MotifDsdServiEnDop::PiloteSansDsd);
+    }
+    let Some(cadence) = cadence_fichier else {
+        return Err(MotifDsdServiEnDop::CadenceInconnue);
+    };
+    if !cadences.contains(&cadence) {
+        return Err(MotifDsdServiEnDop::CadenceNonDeclaree);
+    }
+    if plafond_zone.is_some_and(|max| cadence / 16 > max) {
+        return Err(MotifDsdServiEnDop::PlafondDeZone);
+    }
+    Ok(())
+}
+
+/// #5643 — le `dsd_transport` que l'API publie. Même règle que
+/// [`transport_dsd`], plus la capacité DÉJÀ connue de la sortie : « natif »
+/// quand une zone « natif » sort par un pilote ASIO qui a déclaré le DSD.
+/// L'API ne connaît pas la cadence de la piste à venir : une piste à une
+/// cadence non déclarée partira en DoP, et le journal le dira.
+#[must_use]
+pub fn transport_dsd_publie(
+    is_local: bool,
+    is_network: bool,
+    dsd_mode: &str,
+    natif_annonce: bool,
+) -> TransportDsd {
+    match transport_dsd(is_local, is_network, dsd_mode) {
+        TransportDsd::NatifServiEnDop if natif_annonce => TransportDsd::Natif,
+        autre => autre,
+    }
 }
 
 /// Un emballage DoP part-il ? Déduit de [`transport_dsd`] : c'est la MÊME

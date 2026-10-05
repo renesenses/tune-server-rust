@@ -1395,3 +1395,18 @@ path = "tests/sso_modules_du_compte.rs"
 [[test]]
 name = "smb_dialect_seam"
 path = "tests/smb_dialect_seam.rs"
+
+# Reconnexion au compte après une attente imposée par le cloud : l'attente est
+# dite AVANT de rediriger, le navigateur reçoit une page et non du JSON, et un
+# délai hors de la fenêtre de la route ne bloque pas l'essai suivant.
+[[test]]
+name = "sso_reconnexion_apres_attente"
+path = "tests/sso_reconnexion_apres_attente.rs"
+
+# Fil forum 2110 (ticket 221) — l'export gratuit de configuration porte les
+# zones ; import rapproché par appareil, zone sans appareil hors ligne, aperçu
+# (`?dry_run=true`) sans écriture. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "config_export_zones"
+path = "tests/config_export_zones.rs"

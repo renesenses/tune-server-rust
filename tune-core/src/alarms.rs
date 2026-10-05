@@ -428,6 +428,7 @@ impl AlarmScheduler {
                 media_format: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             };
             // Stamp the alarm owner as the zone's session profile BEFORE the
             // play so record_listen tags the alarm's listen to that person
