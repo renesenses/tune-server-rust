@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "f503b7f1df9e5e6c449c3e480cee877ea262b22d",
+    "web_sha": "b1d83e211405e9de7c9267bd208db9b924e1908f",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -376,6 +376,25 @@
         "expert_bands"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/eq/import/autoeq",
+      "methode": "POST",
+      "type": "EqAutoEqImport",
+      "liste": false,
+      "champs_obligatoires": [
+        "preset",
+        "band_count"
+      ],
+      "champs_optionnels": [
+        "ignored_filter_count",
+        "ignored_filters",
+        "preamp_db",
+        "reserved_headroom_db",
+        "preamp_applied",
+        "preamp_covered_by_headroom",
+        "warning"
+      ]
     },
     {
       "route": "/eq/presets",
@@ -4092,7 +4111,10 @@
       "champs_obligatoires": [
         "imported"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "zones_added",
+        "zones_modified"
+      ]
     },
     {
       "route": "/system/database/migrate",
@@ -6507,6 +6529,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/system/config/import/preview",
+      "type": "unknown",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/import/status/{}",
       "type": "EtatImport",
       "raison": "type introuvable dans les sources"
@@ -6578,7 +6605,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 324,
-    "appels_non_resolus": 158
+    "routes_cartographiees": 325,
+    "appels_non_resolus": 159
   }
 }
