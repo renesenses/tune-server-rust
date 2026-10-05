@@ -1220,11 +1220,12 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
     assert_eq!(step_desc(&sp, "Source").as_deref(), Some("MP3 48kHz"));
 }
 
-// Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
-// celui d'avant. Ce test existe pour que la suppression du repli soit un
-// choix explicite si elle a lieu un jour, pas un effet de bord.
+// Sans session ET sans métadonnées, il n'y a rien à lire. Le repli en dur
+// 44100/16 a été retiré EXPRÈS (fil 2119 : un WAV 24/176,4 annoncé
+// « FLAC 44kHz/16bit ») : le codec connu s'affiche seul, sans chiffres
+// inventés.
 #[test]
-fn no_wire_no_metadata_still_falls_back() {
+fn no_wire_no_metadata_does_not_invent_rate_2119() {
     let (backend, zone) = dlna_zone();
     let np = NowPlaying {
         title: "Track".into(),
@@ -1239,10 +1240,7 @@ fn no_wire_no_metadata_still_falls_back() {
         ..Default::default()
     };
     let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
-    assert_eq!(
-        step_desc(&sp, "Source").as_deref(),
-        Some("FLAC 44kHz/16bit")
-    );
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("FLAC"));
 }
 
 // Le fil prime sur la règle. Ici la zone force le LPCM 16 bits, mais la
@@ -1423,6 +1421,79 @@ fn replaygain_active_shows_step_and_breaks_bit_perfect() {
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
     // Le RG ne rend pas la SOURCE lossy : le badge qualité reste vert.
     assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+}
+
+/// #5683 — l'étape ReplayGain se décide sur PURE, jamais sur le curseur de
+/// volume. Le constructeur du panneau est relu à 100 %, à 35 % puis de
+/// nouveau à 100 % : l'étape est là, identique, les trois fois ; et PURE
+/// l'éteint aux deux volumes. (Le défaut observé venait d'une zone non
+/// relue après la bascule PURE : voir le test d'orchestrateur
+/// `toute_bascule_pure_annonce_la_zone_au_client_5683`.)
+fn chemin_au_volume_5683(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    ps: &ZoneState,
+    pct: f64,
+) -> Value {
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_volume(zone_id, pct).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    build_signal_path(
+        ps,
+        &zone,
+        backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn l_etape_replaygain_suit_pure_et_jamais_le_curseur_de_volume_5683() {
+    let (backend, zone) = dlna_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let attendu = Some("ReplayGain (track, -4.2 dB, tags du fichier)".to_string());
+    // (1) PURE inactif, volume 100 %, tags présents : l'étape est là.
+    let plein = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&plein, "ReplayGain"),
+        attendu,
+        "volume 100 % : {plein}"
+    );
+    assert_eq!(step_desc(&plein, "Volume"), None);
+    // (2) Bouger le curseur ne la fait ni apparaître ni disparaître.
+    let bas = chemin_au_volume_5683(&backend, zone_id, &ps, 35.0);
+    assert_eq!(
+        step_desc(&bas, "ReplayGain"),
+        attendu,
+        "volume 35 % : {bas}"
+    );
+    assert_eq!(step_desc(&bas, "Volume").as_deref(), Some("Volume 35%"));
+    let retour = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&retour, "ReplayGain"),
+        attendu,
+        "retour à 100 % : {retour}"
+    );
+
+    // PURE éteint l'étape, quel que soit le curseur.
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    for pct in [100.0, 35.0] {
+        let pur = chemin_au_volume_5683(&backend, zone_id, &ps, pct);
+        assert_eq!(
+            step_desc(&pur, "ReplayGain"),
+            None,
+            "PURE à {pct} % : {pur}"
+        );
+    }
 }
 
 // RG off (défaut) : la même piste taguée n'affiche rien et reste
@@ -4438,4 +4509,45 @@ async fn frequence_max_5524_auto_ne_change_rien() {
         assert_eq!(r.bit_depth, Some(24));
         assert_eq!(step_desc(&sp, "Resampler"), None, "Auto, {source} : {sp}");
     }
+}
+
+/// Fil 2119 — une source dont ni la lecture en cours, ni la base, ni le fil
+/// ne nomment le format est INCONNUE. Elle était annoncée « FLAC 44kHz/16bit »
+/// et « Sans perte » par un repli en dur, pour un WAV 24/176,4 servi intact.
+#[test]
+fn source_inconnue_n_est_plus_annoncee_flac_16_44_2119() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "03 - Eugen Jochum - 3. Veris leta facies".into(),
+            source: "upnp".into(),
+            source_id: Some("http://203.0.113.9:8888/api/v1/library/tracks/24011/audio".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("My Devialet"), "none", None).unwrap();
+    let source = step_desc(&sp, "Source").unwrap();
+    assert!(
+        !source.contains("FLAC") && !source.contains("44kHz") && !source.contains("16bit"),
+        "aucun format inventé pour une source inconnue, vu : {source}"
+    );
+    assert_eq!(source, CODEC_INCONNU);
+    assert_eq!(
+        step_field(&sp, "Source", "code").and_then(|v| v.as_str()),
+        Some("source_codec_unknown"),
+        "l'étape Source doit DIRE que le codec est inconnu (#4346)"
+    );
+    assert_eq!(
+        sp["lossless"],
+        Value::Null,
+        "inconnu, ni sans perte ni avec"
+    );
+    let tout = sp.to_string();
+    assert!(
+        !tout.contains("0Hz/0bit") && !tout.contains("0kHz/0bit"),
+        "pas de chiffres nuls affichés : {tout}"
+    );
 }

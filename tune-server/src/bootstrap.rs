@@ -97,6 +97,15 @@ pub async fn run_with(opts: RunOptions) {
         std::process::exit(0);
     }
 
+    // #5617 — mode ponctuel « premier accès » de Tune OS : appelé en root par
+    // une unité de l'image, HORS du bac à sable de tune.service, il applique la
+    // politique du mot de passe du compte `tune` puis sort. Même place que
+    // `--version` : avant tout journal, port ou base.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::premier_acces_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_premier_acces());
+    }
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
@@ -407,6 +416,19 @@ pub async fn run_with(opts: RunOptions) {
         settings.set("server_last_alive_at", &now.to_string()).ok();
     }
 
+    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
+    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
+    // « 0 fichier » (#1692).
+    //
+    // #5682 (fil 2115) — le commentaire le disait, le code faisait l'inverse :
+    // le scan de démarrage et le surveillant partaient AVANT ce remontage, et
+    // un NAS monté une seconde trop tard laissait la bibliothèque vide jusqu'à
+    // la relance du serveur. Le PREMIER essai de chaque partage est attendu
+    // ici (borné par `smb::ESSAI_TIMEOUT` par dialecte) ; les nouveaux essais
+    // d'un partage injoignable partent en fond, sans retenir le serveur HTTP.
+    crate::boot_status::set_phase("partages réseau");
+    crate::startup::remount_network_shares(&state).await;
+
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
     let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
@@ -421,12 +443,6 @@ pub async fn run_with(opts: RunOptions) {
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
     crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done, state.event_bus.clone());
-
-    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
-    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
-    // « 0 fichier » (#1692).
-    crate::boot_status::set_phase("partages réseau");
-    crate::startup::remount_network_shares(&state).await;
 
     // Register local audio outputs (USB DAC, headphones, speakers)
     crate::boot_status::set_phase("sorties audio");
@@ -505,6 +521,7 @@ pub async fn run_with(opts: RunOptions) {
         port = config.port,
         db = %config.db_path,
         web = %crate::config::resolve_web_dir().display(),
+        fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
 

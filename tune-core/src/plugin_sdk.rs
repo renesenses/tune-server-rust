@@ -85,6 +85,10 @@ impl PluginRegistrations {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: String,
+    /// Le nom à montrer — voir [`TunePlugin::display_name`]. Vide dans une
+    /// fiche sérialisée avant son ajout : l'hôte retombe alors sur `name`.
+    #[serde(default)]
+    pub display_name: String,
     pub version: String,
     pub description: String,
     pub enabled: bool,
@@ -103,6 +107,9 @@ pub struct PluginInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailablePluginInfo {
     pub name: String,
+    /// Le nom à montrer — voir [`TunePlugin::display_name`].
+    #[serde(default)]
+    pub display_name: String,
     pub version: String,
     pub description: String,
     pub config_schema: serde_json::Value,
@@ -343,6 +350,16 @@ impl PluginContext {
 #[async_trait]
 pub trait TunePlugin: Send + Sync {
     fn name(&self) -> &str;
+    /// Le nom à MONTRER dans le gestionnaire des extensions (`display_name`
+    /// de `GET /api/v1/plugins`), quand l'identifiant technique ne se lit pas
+    /// (« entree-audio » → « Entrée audio », #5296).
+    ///
+    /// Par défaut, l'identifiant lui-même : rien ne change pour un greffon qui
+    /// ne le surcharge pas. Le client web traduit les noms qu'il connaît ;
+    /// celui-ci est le repli des clients qui ne les connaissent pas.
+    fn display_name(&self) -> &str {
+        self.name()
+    }
     fn version(&self) -> &str;
     fn description(&self) -> &str;
     fn config_schema(&self) -> serde_json::Value {
@@ -506,6 +523,9 @@ impl PluginSetupErrorReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginSetupError {
     pub name: String,
+    /// Le nom à montrer — voir [`TunePlugin::display_name`].
+    #[serde(default)]
+    pub display_name: String,
     pub version: String,
     pub description: String,
     pub config_schema: serde_json::Value,
@@ -704,6 +724,7 @@ impl PluginLoader {
                     if plugin.catalogued() {
                         unloaded.push(AvailablePluginInfo {
                             name: name.clone(),
+                            display_name: plugin.display_name().to_string(),
                             version: plugin.version().to_string(),
                             description: plugin.description().to_string(),
                             config_schema: plugin.config_schema(),
@@ -902,6 +923,7 @@ impl PluginLoader {
     ) -> PluginSetupError {
         PluginSetupError {
             name: plugin.name().to_string(),
+            display_name: plugin.display_name().to_string(),
             version: plugin.version().to_string(),
             description: plugin.description().to_string(),
             config_schema: plugin.config_schema(),
@@ -1157,6 +1179,7 @@ pub fn public_setup_message(raw: &str) -> String {
 fn plugin_info_of(p: &dyn TunePlugin) -> PluginInfo {
     PluginInfo {
         name: p.name().to_string(),
+        display_name: p.display_name().to_string(),
         version: p.version().to_string(),
         description: p.description().to_string(),
         enabled: true,

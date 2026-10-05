@@ -205,6 +205,64 @@ const MIGRATION_TABLES: &[&str] = &[
     "sync_links",
     "sync_link_snapshots",
     "track_source_links",
+    // Tables que la bascule laissait VIDES en PostgreSQL, relevees par le test
+    // `pg_bascule_toute_table_du_schema_sqlite_est_classee_5389` (#5389).
+    // Favoris des services de streaming : sans cette ligne, tous les favoris
+    // Qobuz/Tidal/... etaient perdus a la bascule.
+    "streaming_favorites",
+    // Jetons des services de streaming : sans elle, il fallait se reconnecter
+    // a chaque service apres la bascule.
+    "streaming_auth",
+    // Signalements de metadonnees pas encore pousses.
+    "metadata_reports",
+    // Paroles deja trouvees (les identifiants de pistes sont conserves).
+    "lyrics_cache",
+];
+
+/// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
+/// les scripts PostgreSQL numerotes, pas par `PG_FULL_SCHEMA`, et n'existent
+/// donc pas encore au moment de la premiere passe (#5389). Les colonnes sont
+/// alors deja typees (BIGINT, BYTEA…) : `column_casts` lit ces types.
+const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
+    // Exemplaires d'une meme piste et repertoire prefere par album (#5034,
+    // script PG 073) : le choix de l'utilisateur etait perdu a la bascule.
+    "track_copies",
+    "album_preferred_roots",
+    // Empreintes audio CLAP (script 015) : recalculables, mais au prix d'une
+    // nouvelle analyse de toute la bibliotheque.
+    "track_audio_embedding",
+    // Propositions de metadonnees et decisions de l'utilisateur (script 023).
+    "metadata_proposals",
+    // Modifications pas encore synchronisees vers le nuage (script 008).
+    "sync_changelog",
+];
+
+/// Les tables du schema SQLite que la bascule ne copie PAS, deliberement, avec
+/// la raison. Toute table du schema doit figurer soit dans `MIGRATION_TABLES`,
+/// soit ici : le test `toute_table_du_schema_sqlite_est_classee_5389` lit le
+/// schema reel (`init_schema` + `run_migrations`) et refuse une table oubliee
+/// des deux listes — c'est ainsi que `file_first_seen` s'etait perdue (#5389).
+#[cfg_attr(not(test), allow(dead_code))]
+const TABLES_NON_COPIEES: &[(&str, &str)] = &[
+    (
+        "_migrations",
+        "tenue des versions du schema SQLite ; PostgreSQL a sa propre `schema_version`",
+    ),
+    (
+        "albums_fts",
+        "index plein texte FTS5 de SQLite, sans equivalent a copier en PostgreSQL",
+    ),
+    ("artists_fts", "index plein texte FTS5 de SQLite, idem"),
+    ("tracks_fts", "index plein texte FTS5 de SQLite, idem"),
+    (
+        "task_runs",
+        "historique d'observabilite de l'AUTRE moteur, recommence deliberement (voir PG_FULL_SCHEMA)",
+    ),
+    (
+        "upnp_catalog_revision",
+        "compteur de revision du catalogue UPnP, remis a zero par le script PG 066 ; \
+         les clients UPnP relisent le catalogue",
+    ),
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
@@ -1224,38 +1282,10 @@ pub async fn migrate_sqlite_to_pg(
         details: Vec::new(),
     };
 
-    let tables_total = MIGRATION_TABLES.len();
+    let tables_total = MIGRATION_TABLES.len() + MIGRATION_TABLES_APRES_SCRIPTS.len();
 
     for (idx, table_name) in MIGRATION_TABLES.iter().enumerate() {
-        match migrate_table(sqlite_db, &pool, table_name).await {
-            Ok(rows) => {
-                info!(
-                    table = table_name,
-                    rows,
-                    progress = format!("{}/{}", idx + 1, tables_total),
-                    "pg_migrate_table_done"
-                );
-                result.tables_migrated += 1;
-                result.total_rows += rows;
-                result.details.push(TableMigrationDetail {
-                    table: table_name.to_string(),
-                    rows,
-                    skipped: false,
-                });
-            }
-            Err(e) => {
-                // Table might not exist in SQLite (e.g. streaming_queue
-                // is lazily created). Log and continue.
-                let msg = format!("{table_name}: {e}");
-                info!(table = table_name, error = %e, "pg_migrate_table_skipped");
-                result.errors.push(msg);
-                result.details.push(TableMigrationDetail {
-                    table: table_name.to_string(),
-                    rows: 0,
-                    skipped: true,
-                });
-            }
-        }
+        copier_une_table(sqlite_db, &pool, table_name, idx, tables_total, &mut result).await;
     }
 
     // Bring the freshly-migrated database up to the latest schema right now —
@@ -1273,6 +1303,26 @@ pub async fn migrate_sqlite_to_pg(
         result
             .errors
             .push(format!("post-migration schema upgrade failed: {e}"));
+    }
+
+    // Seconde passe (#5389) : les tables que seuls les scripts numerotes
+    // creent existent maintenant.
+    for (idx, table_name) in MIGRATION_TABLES_APRES_SCRIPTS.iter().enumerate() {
+        let idx = MIGRATION_TABLES.len() + idx;
+        copier_une_table(sqlite_db, &pool, table_name, idx, tables_total, &mut result).await;
+    }
+
+    // Les lignes copiees portent leur `id` d'origine : une sequence restee a 1
+    // ferait echouer le prochain INSERT sans `id` (« duplicate key »), par
+    // exemple le premier favori ajoute apres la bascule (#5389).
+    for table in MIGRATION_TABLES
+        .iter()
+        .chain(MIGRATION_TABLES_APRES_SCRIPTS.iter())
+    {
+        if let Err(e) = recaler_sequence_id(&pool, table).await {
+            tracing::warn!(table, error = %e, "pg_migrate_sequence_recalage_echoue");
+            result.errors.push(format!("{table}: sequence : {e}"));
+        }
     }
 
     // Belt and braces: even if the upgrade above failed before migration 013
@@ -1297,6 +1347,226 @@ pub async fn migrate_sqlite_to_pg(
 
     pool.close().await;
     Ok(result)
+}
+
+/// Copie une table et range son issue dans `result` — une table absente ou en
+/// erreur est journalisee et sautee, la bascule continue.
+async fn copier_une_table(
+    sqlite_db: &SqliteDb,
+    pool: &PgPool,
+    table_name: &str,
+    idx: usize,
+    tables_total: usize,
+    result: &mut MigrationResult,
+) {
+    match migrate_table(sqlite_db, pool, table_name).await {
+        Ok(rows) => {
+            info!(
+                table = table_name,
+                rows,
+                progress = format!("{}/{}", idx + 1, tables_total),
+                "pg_migrate_table_done"
+            );
+            result.tables_migrated += 1;
+            result.total_rows += rows;
+            result.details.push(TableMigrationDetail {
+                table: table_name.to_string(),
+                rows,
+                skipped: false,
+            });
+        }
+        Err(e) => {
+            // Table might not exist in SQLite (e.g. streaming_queue
+            // is lazily created). Log and continue.
+            let msg = format!("{table_name}: {e}");
+            info!(table = table_name, error = %e, "pg_migrate_table_skipped");
+            result.errors.push(msg);
+            result.details.push(TableMigrationDetail {
+                table: table_name.to_string(),
+                rows: 0,
+                skipped: true,
+            });
+        }
+    }
+}
+
+/// Recale la sequence de la colonne `id` d'une table sur `MAX(id)`, si cette
+/// colonne est entiere et tire sa valeur d'un `nextval(...)`. Sans effet
+/// sinon (pas de colonne `id`, `id` texte, table vide ou absente). Ne recule
+/// jamais une sequence.
+async fn recaler_sequence_id(pool: &PgPool, table: &str) -> Result<(), String> {
+    let colonne: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT data_type::text, column_default::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 AND column_name = 'id'",
+    )
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("colonne id : {e}"))?;
+    let Some((type_id, Some(defaut))) = colonne else {
+        return Ok(());
+    };
+    if !matches!(type_id.as_str(), "bigint" | "integer" | "smallint") {
+        return Ok(());
+    }
+    let Some(sequence) = defaut
+        .split_once("nextval('")
+        .and_then(|(_, r)| r.split_once('\''))
+        .map(|(s, _)| s.to_string())
+    else {
+        return Ok(());
+    };
+    let nom_sur = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"')
+    };
+    if !nom_sur(&sequence) || !nom_sur(table) {
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT setval('{sequence}', GREATEST(m, (SELECT last_value FROM {sequence}))) \
+         FROM (SELECT MAX(id)::bigint AS m FROM {table}) t WHERE m IS NOT NULL"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("setval {sequence} : {e}"))?;
+    Ok(())
+}
+
+/// Clef de `settings` (cote PostgreSQL) qui marque la reparation #5389 comme
+/// faite : elle ne se rejoue pas a chaque demarrage.
+pub const CLE_REPARATION_PREMIERES_VUES_5389: &str = "reparation_file_first_seen_5389";
+
+/// Issue de [`reparer_premieres_vues_depuis_sqlite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReparationPremieresVues {
+    /// Le marqueur est deja pose : rien n'a ete relu ni ecrit.
+    DejaFaite,
+    /// La base SQLite d'origine n'existe plus a ce chemin : les dates d'ajout
+    /// figees sur le mtime ne peuvent PAS etre retrouvees. Aucun marqueur
+    /// n'est pose : si le fichier revient, la reparation se fera au demarrage
+    /// suivant.
+    SourceAbsente,
+    /// `lignes` dates d'ajout recopiees depuis la base SQLite (0 si sa table
+    /// `file_first_seen` est vide ou absente). Le marqueur est pose.
+    Faite { lignes: usize },
+}
+
+/// Reparation des bases DEJA basculees vers PostgreSQL sans `file_first_seen`
+/// (#5389, bascules faites avant v0.9.169).
+///
+/// Une telle base arrivait avec `file_first_seen` VIDE : chaque piste
+/// retombait sur son `file_mtime`, et le scan suivant (#4546) figeait ce mtime
+/// comme date d'ajout. Ajouter la table a `MIGRATION_TABLES` ne repare que les
+/// bascules futures ; une copie `ON CONFLICT DO NOTHING` ne suffit pas non
+/// plus, les lignes figees existent deja.
+///
+/// Si la base SQLite d'origine existe encore a `sqlite_path`, ses dates
+/// d'ajout sont recopiees EN ECRASANT celles de PostgreSQL pour les memes
+/// chemins : la base SQLite n'est plus ecrite apres la bascule, sa date est
+/// celle d'avant le gel. Les chemins absents de la base SQLite (pistes
+/// ajoutees apres la bascule) ne sont pas touches. Sur une base basculee
+/// correctement, les valeurs sont deja egales : la reparation ne change rien.
+///
+/// La base SQLite est ouverte en LECTURE SEULE. Une seule transaction ; le
+/// marqueur [`CLE_REPARATION_PREMIERES_VUES_5389`] est pose dans la meme.
+pub async fn reparer_premieres_vues_depuis_sqlite(
+    pool: &PgPool,
+    sqlite_path: &std::path::Path,
+) -> Result<ReparationPremieresVues, String> {
+    let marqueur: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+        .bind(CLE_REPARATION_PREMIERES_VUES_5389)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("lecture du marqueur #5389 : {e}"))?;
+    if marqueur.is_some() {
+        return Ok(ReparationPremieresVues::DejaFaite);
+    }
+    if !sqlite_path.is_file() {
+        return Ok(ReparationPremieresVues::SourceAbsente);
+    }
+
+    let lignes = lire_premieres_vues_sqlite(sqlite_path)?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("transaction #5389 : {e}"))?;
+    for lot in lignes.chunks(1000) {
+        let mut sql =
+            String::from("INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ");
+        for i in 0..lot.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("(${}, ${}::float8)", 2 * i + 1, 2 * i + 2));
+        }
+        sql.push_str(
+            " ON CONFLICT (file_path) DO UPDATE SET first_seen_at = EXCLUDED.first_seen_at",
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for (chemin, date) in lot {
+            q = q.bind(chemin.as_str()).bind(*date);
+        }
+        q.execute(&mut *tx)
+            .await
+            .map_err(|e| format!("recopie de file_first_seen : {e}"))?;
+    }
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(CLE_REPARATION_PREMIERES_VUES_5389)
+    .bind(lignes.len().to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("pose du marqueur #5389 : {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("validation #5389 : {e}"))?;
+
+    Ok(ReparationPremieresVues::Faite {
+        lignes: lignes.len(),
+    })
+}
+
+/// Les dates d'ajout d'une base SQLite, ouverte en lecture seule. Une table
+/// absente (base anterieure a #473) donne une liste vide ; une date nulle,
+/// negative ou non finie est ecartee.
+fn lire_premieres_vues_sqlite(chemin: &std::path::Path) -> Result<Vec<(String, f64)>, String> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        chemin,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("ouverture de {} : {e}", chemin.display()))?;
+    let table: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_first_seen'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("schema de {} : {e}", chemin.display()))?;
+    if table == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_path, CAST(first_seen_at AS REAL) FROM file_first_seen \
+             WHERE file_path IS NOT NULL AND first_seen_at IS NOT NULL",
+        )
+        .map_err(|e| format!("lecture de file_first_seen : {e}"))?;
+    let lignes = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+        .map_err(|e| format!("lecture de file_first_seen : {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("lecture de file_first_seen : {e}"))?;
+    Ok(lignes
+        .into_iter()
+        .filter(|(_, d)| d.is_finite() && *d > 0.0)
+        .collect())
 }
 
 /// Migrate a single table from SQLite to PG.
@@ -1416,6 +1686,11 @@ fn conflict_clause(table: &str) -> &'static str {
         // `DO NOTHING` garde une bascule rejouee (#5199) sans doublon, et ne
         // reecrit pas une date deja posee en PostgreSQL.
         "file_first_seen" => "ON CONFLICT (file_path) DO NOTHING",
+        // Pas de colonne `id` (#5389).
+        "streaming_auth" => "ON CONFLICT (service) DO NOTHING",
+        "lyrics_cache" => "ON CONFLICT (track_id) DO NOTHING",
+        "album_preferred_roots" => "ON CONFLICT (album_id) DO NOTHING",
+        "track_audio_embedding" => "ON CONFLICT (track_id) DO NOTHING",
         // For tables with BIGSERIAL PK, conflict on id
         _ => "ON CONFLICT (id) DO NOTHING",
     }
@@ -1886,7 +2161,24 @@ mod tests {
             .expect("PG_FULL_SCHEMA");
 
         let mut ecarts = Vec::new();
-        for table in MIGRATION_TABLES {
+        let premiere_passe = MIGRATION_TABLES.len();
+        for (i, table) in MIGRATION_TABLES
+            .iter()
+            .chain(MIGRATION_TABLES_APRES_SCRIPTS.iter())
+            .enumerate()
+        {
+            if i == premiere_passe {
+                // Comme la bascule : la seconde passe suit les scripts.
+                let pool = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&cible)
+                    .await
+                    .unwrap();
+                crate::db::migrations::run_pg_migrations(&pool)
+                    .await
+                    .expect("run_pg_migrations");
+                pool.close().await;
+            }
             let clause = conflict_clause(table);
             let mut visees: Vec<String> = clause
                 .split_once('(')
@@ -1992,6 +2284,346 @@ mod tests {
         assert_eq!(
             apres_seconde, attendu,
             "la bascule rejouee a double ou change la date d'ajout (#5199, #5389)"
+        );
+    }
+
+    /// #5389 : toute table du schema SQLite REEL (`init_schema` puis
+    /// `run_migrations`, lus dans `sqlite_master`) est soit copiee par la
+    /// bascule (`MIGRATION_TABLES`), soit ecartee avec sa raison
+    /// (`TABLES_NON_COPIEES`). Une table ajoutee au schema sans etre classee
+    /// fait rougir ce test — c'est ainsi que `file_first_seen` s'etait perdue.
+    /// Ne demande pas de PostgreSQL.
+    #[test]
+    fn pg_bascule_toute_table_du_schema_sqlite_est_classee_5389() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let tables: Vec<(String, String)> = {
+            let conn = db.read_connection();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, COALESCE(sql, '') FROM sqlite_master \
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // Les tables d'ombre d'une table virtuelle (FTS5 : `<nom>_data`,
+        // `<nom>_idx`, …) appartiennent a celle-ci : seule la virtuelle se classe.
+        let virtuelles: Vec<&str> = tables
+            .iter()
+            .filter(|(_, sql)| sql.to_uppercase().starts_with("CREATE VIRTUAL TABLE"))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let schema: Vec<&str> = tables
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| {
+                !virtuelles
+                    .iter()
+                    .any(|v| n != v && n.starts_with(&format!("{v}_")))
+            })
+            .collect();
+        assert!(
+            schema.contains(&"tracks") && schema.contains(&"file_first_seen"),
+            "le schema lu doit etre le vrai : {schema:?}"
+        );
+
+        let ecartees: Vec<&str> = TABLES_NON_COPIEES.iter().map(|(t, _)| *t).collect();
+        let copiees: Vec<&str> = MIGRATION_TABLES
+            .iter()
+            .chain(MIGRATION_TABLES_APRES_SCRIPTS.iter())
+            .copied()
+            .collect();
+        let oubliees: Vec<&str> = schema
+            .iter()
+            .copied()
+            .filter(|t| !copiees.contains(t) && !ecartees.contains(t))
+            .collect();
+        let deux_fois: Vec<&str> = ecartees
+            .iter()
+            .copied()
+            .filter(|t| copiees.contains(t))
+            .collect();
+        let perimees: Vec<&str> = ecartees
+            .iter()
+            .copied()
+            .filter(|t| !schema.contains(t))
+            .collect();
+        assert!(
+            oubliees.is_empty(),
+            "tables du schema SQLite que la bascule vers PostgreSQL ne copie pas, \
+             sans raison declaree — leurs donnees seraient perdues (#5389). \
+             A ajouter a MIGRATION_TABLES (ou MIGRATION_TABLES_APRES_SCRIPTS) ou a \
+             TABLES_NON_COPIEES : {oubliees:?}"
+        );
+        assert!(
+            deux_fois.is_empty(),
+            "a la fois copiees et ecartees : {deux_fois:?}"
+        );
+        assert!(
+            perimees.is_empty(),
+            "TABLES_NON_COPIEES nomme des tables absentes du schema : {perimees:?}"
+        );
+    }
+
+    /// #5389, bases DEJA basculees : la reparation recopie les dates d'ajout
+    /// de la base SQLite d'origine en ECRASANT les dates figees sur le mtime,
+    /// ne touche pas aux pistes ajoutees apres la bascule, ne se rejoue pas,
+    /// et dit quand la source a disparu.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_reparation_file_first_seen_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_reparation_5389";
+        const A: &str = "/musique/A/01.flac"; // figee sur son mtime apres la bascule
+        const B: &str = "/musique/B/01.flac"; // jamais arrivee en PostgreSQL
+        const C: &str = "/musique/C/01.flac"; // ajoutee apres la bascule
+        const A_VRAIE: f64 = 1_316_000_000.123_456_7;
+        const A_FIGEE: f64 = 1_600_000_000.0;
+        const B_VRAIE: f64 = 1_200_000_000.5;
+        const C_PG: f64 = 1_700_000_000.0;
+
+        let cible = base_jetable(&url, BASE).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&cible)
+            .await
+            .unwrap();
+        sqlx::raw_sql(PG_FULL_SCHEMA)
+            .execute(&pool)
+            .await
+            .expect("PG_FULL_SCHEMA");
+        sqlx::query(
+            "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2), ($3, $4)",
+        )
+        .bind(A)
+        .bind(A_FIGEE)
+        .bind(C)
+        .bind(C_PG)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let dossier = tempfile::tempdir().unwrap();
+        let source = dossier.path().join("tune.db");
+        {
+            let db = SqliteDb::open(source.to_str().unwrap()).unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            db.connection()
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO file_first_seen (file_path, first_seen_at) \
+                     VALUES (?1, ?2), (?3, ?4)",
+                    rusqlite::params![A, A_VRAIE, B, B_VRAIE],
+                )
+                .unwrap();
+        }
+        let sans_table = dossier.path().join("ancienne.db");
+        rusqlite::Connection::open(&sans_table)
+            .unwrap()
+            .execute_batch("CREATE TABLE tracks (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        async fn lignes(pool: &PgPool) -> Vec<(String, f64)> {
+            sqlx::query("SELECT file_path, first_seen_at::float8 FROM file_first_seen ORDER BY 1")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|l| (l.get::<String, _>(0), l.get::<f64, _>(1)))
+                .collect()
+        }
+        async fn marqueur(pool: &PgPool) -> Option<String> {
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+                .bind(CLE_REPARATION_PREMIERES_VUES_5389)
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+        }
+
+        let absente =
+            reparer_premieres_vues_depuis_sqlite(&pool, &dossier.path().join("disparue.db")).await;
+        let apres_absente = lignes(&pool).await;
+        let marqueur_absente = marqueur(&pool).await;
+
+        let faite = reparer_premieres_vues_depuis_sqlite(&pool, &source).await;
+        let apres_faite = lignes(&pool).await;
+        let marqueur_faite = marqueur(&pool).await;
+
+        // Une date changee en PostgreSQL apres la reparation n'est plus
+        // ecrasee : le marqueur l'empeche.
+        sqlx::query("UPDATE file_first_seen SET first_seen_at = 42 WHERE file_path = $1")
+            .bind(A)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rejouee = reparer_premieres_vues_depuis_sqlite(&pool, &source).await;
+        let a_apres_rejeu = lignes(&pool).await;
+
+        // Base SQLite trop ancienne pour avoir la table : rien a recopier.
+        sqlx::query("DELETE FROM settings WHERE key = $1")
+            .bind(CLE_REPARATION_PREMIERES_VUES_5389)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let vieille = reparer_premieres_vues_depuis_sqlite(&pool, &sans_table).await;
+        let apres_vieille = lignes(&pool).await;
+
+        pool.close().await;
+        supprimer_base(&url, BASE).await;
+
+        let avant = vec![(A.to_string(), A_FIGEE), (C.to_string(), C_PG)];
+        assert_eq!(absente, Ok(ReparationPremieresVues::SourceAbsente));
+        assert_eq!(
+            apres_absente, avant,
+            "source absente : rien ne doit changer"
+        );
+        assert_eq!(marqueur_absente, None, "source absente : aucun marqueur");
+
+        assert_eq!(faite, Ok(ReparationPremieresVues::Faite { lignes: 2 }));
+        assert_eq!(
+            apres_faite,
+            vec![
+                (A.to_string(), A_VRAIE),
+                (B.to_string(), B_VRAIE),
+                (C.to_string(), C_PG),
+            ],
+            "la date d'ajout figee sur le mtime n'a pas ete reparee depuis la base SQLite (#5389)"
+        );
+        assert_eq!(marqueur_faite.as_deref(), Some("2"));
+
+        assert_eq!(rejouee, Ok(ReparationPremieresVues::DejaFaite));
+        assert_eq!(
+            a_apres_rejeu[0],
+            (A.to_string(), 42.0),
+            "la reparation s'est rejouee"
+        );
+
+        assert_eq!(vieille, Ok(ReparationPremieresVues::Faite { lignes: 0 }));
+        assert_eq!(apres_vieille, a_apres_rejeu);
+    }
+
+    /// #5389 : les tables que la bascule laissait vides en PostgreSQL —
+    /// favoris et jetons de streaming, exemplaires, empreintes, etc. —
+    /// passent, et un ajout APRES la bascule (sans `id`) ne heurte pas les
+    /// `id` copies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_bascule_tables_oubliees_5389() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const BASE: &str = "tune_bascule_oubliees_5389";
+        let cible = base_jetable(&url, BASE).await;
+        let sqlite = sqlite_de_depart();
+        sqlite
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO albums (id, title) VALUES (7, 'Kind of Blue');
+                 INSERT INTO tracks (id, title, album_id, file_path, source)
+                     VALUES (70, 'So What', 7, '/m/a/01.flac', 'local');
+                 INSERT INTO streaming_favorites (id, item_type, service, service_id, title)
+                     VALUES (5, 'album', 'qobuz', 'q-1', 'Favori');
+                 INSERT INTO streaming_auth (service, token_data) VALUES ('qobuz', '{}');
+                 INSERT INTO metadata_reports (id, entity, reason, created_at)
+                     VALUES (3, 'album', 'faux', '2026-01-01');
+                 INSERT INTO lyrics_cache (track_id, title, artist) VALUES (70, 'So What', 'Miles');
+                 INSERT INTO track_copies (id, track_id, file_path) VALUES (1, 70, '/m/b/01.flac');
+                 INSERT INTO album_preferred_roots (album_id, root) VALUES (7, '/m/b');
+                 INSERT INTO track_audio_embedding (track_id, model, embedding, analyzed_at)
+                     VALUES (70, 'clap', X'0102', 1);
+                 INSERT INTO metadata_proposals (id, entity, cloud_entity_id, local_id, field, fetched_at)
+                     VALUES (1, 'album', 1, 7, 'year', '2026-01-01');
+                 INSERT INTO sync_changelog (id, entity_type, entity_id, action)
+                     VALUES (1, 'track', 70, 'update');",
+            )
+            .expect("lignes SQLite des tables oubliees");
+
+        let r = migrate_sqlite_to_pg(&sqlite, &cible)
+            .await
+            .unwrap_or_else(|e| panic!("bascule : {e}"));
+        let mut pertes = Vec::new();
+        for table in [
+            "streaming_favorites",
+            "streaming_auth",
+            "metadata_reports",
+            "lyrics_cache",
+            "track_copies",
+            "album_preferred_roots",
+            "track_audio_embedding",
+            "metadata_proposals",
+            "sync_changelog",
+        ] {
+            let erreurs: Vec<&String> = r
+                .errors
+                .iter()
+                .filter(|e| e.starts_with(&format!("{table}:")))
+                .collect();
+            let en_pg = compte(&cible, table).await;
+            if !erreurs.is_empty() || en_pg != 1 {
+                pertes.push(format!(
+                    "{table} : {en_pg} ligne(s) sur 1 en PostgreSQL, erreurs {erreurs:?}"
+                ));
+            }
+        }
+
+        // Un ajout apres la bascule, sans `id` : la sequence doit etre au-dela
+        // des `id` copies. Les tables de la seconde passe portent l'`id` 1,
+        // celui qu'une sequence neuve rendrait : seul `recaler_sequence_id`
+        // les garde (les scripts recalent celles de la premiere passe).
+        let mut c = PgConnection::connect(&cible).await.unwrap();
+        let mut ajouts = Vec::new();
+        for (table, ordre) in [
+            (
+                "streaming_favorites",
+                "INSERT INTO streaming_favorites (item_type, service, service_id) \
+                 VALUES ('album', 'qobuz', 'q-2')",
+            ),
+            (
+                "metadata_reports",
+                "INSERT INTO metadata_reports (entity, reason, created_at) \
+                 VALUES ('album', 'autre', '2026-01-02')",
+            ),
+            (
+                "track_copies",
+                "INSERT INTO track_copies (track_id, file_path) VALUES (70, '/m/c/01.flac')",
+            ),
+            (
+                "metadata_proposals",
+                "INSERT INTO metadata_proposals (entity, cloud_entity_id, local_id, field, fetched_at) \
+                 VALUES ('album', 2, 7, 'genre', '2026-01-02')",
+            ),
+            (
+                "sync_changelog",
+                "INSERT INTO sync_changelog (entity_type, entity_id, action) \
+                 VALUES ('track', 70, 'delete')",
+            ),
+        ] {
+            if let Err(e) = sqlx::query(ordre).execute(&mut c).await {
+                ajouts.push(format!("{table} : {e}"));
+            }
+        }
+        c.close().await.ok();
+        supprimer_base(&url, BASE).await;
+        assert!(
+            pertes.is_empty(),
+            "tables perdues a la bascule SQLite -> PostgreSQL (#5389) :\n{}",
+            pertes.join("\n")
+        );
+        assert!(
+            ajouts.is_empty(),
+            "ajout impossible apres la bascule, sequence non recalee :\n{}",
+            ajouts.join("\n")
         );
     }
 }

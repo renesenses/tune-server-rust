@@ -1,7 +1,10 @@
 //! Le lecteur Linux : ioctl `CDROMREADTOCHDR`, `CDROMREADTOCENTRY`,
-//! `CDROMREADAUDIO` et `CDROM_DRIVE_STATUS` sur `/dev/sr*` (`linux/cdrom.h`).
+//! `CDROMREADAUDIO` et `CDROM_DRIVE_STATUS` sur `/dev/sr*` (`linux/cdrom.h`),
+//! et `CDROMEJECT` pour éjecter (fil 2135).
 //!
-//! Aucun outil externe : ni `cdparanoia`, ni `cdda2wav`, ni ffmpeg. C'est la
+//! Aucun outil externe pour lire : ni `cdparanoia`, ni `cdda2wav`, ni ffmpeg.
+//! L'éjection seule se replie sur la commande `eject` si l'ioctl est refusé
+//! (voir [`LecteurLinux::ejecter_disque`]). C'est la
 //! seule partie du greffon qui parle au noyau ; elle ne se prouve que sur une
 //! machine équipée d'un lecteur (voir la procédure de test manuel de la PR).
 
@@ -10,7 +13,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Mutex;
 
-use crate::lecteur::{ErreurCd, LecteurDisque, Presence};
+use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
 use crate::toc::{OCTETS_PAR_SECTEUR, PisteToc, Toc};
 
 // linux/cdrom.h
@@ -18,6 +21,8 @@ const CDROMREADTOCHDR: u64 = 0x5305;
 const CDROMREADTOCENTRY: u64 = 0x5306;
 const CDROMREADAUDIO: u64 = 0x530e;
 const CDROM_DRIVE_STATUS: u64 = 0x5326;
+const CDROMEJECT: u64 = 0x5309;
+const CDROM_LOCKDOOR: u64 = 0x5329;
 const CDROM_LBA: u8 = 0x01;
 const CDROM_LEADOUT: u8 = 0xAA;
 const CDROM_DATA_TRACK: u8 = 0x04;
@@ -220,6 +225,58 @@ impl LecteurDisque for LecteurLinux {
         }
         r
     }
+
+    /// `CDROMEJECT` sur un descripteur NEUF, le descripteur gardé fermé.
+    ///
+    /// Le pilote `cdrom` refuse l'éjection (`EBUSY`) tant que le
+    /// périphérique est ouvert plus d'une fois (`cdi->use_count != 1`) : le
+    /// descripteur de lecture est donc jeté d'abord, et le verrou pris pour
+    /// qu'aucune lecture ne le rouvre pendant l'ioctl. La porte est
+    /// déverrouillée avant (`CDROM_LOCKDOOR 0`, sans effet si elle ne l'est
+    /// pas). Si un autre programme tient le lecteur ouvert (udisks, un
+    /// lecteur de musique), l'ioctl reste refusé : repli sur `eject`, qui
+    /// passe par une commande SCSI. Sans `eject`, l'erreur du noyau est
+    /// rendue telle quelle.
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        match self.presence() {
+            Presence::AucunLecteur => return Err(ErreurEjection::AucunLecteur),
+            Presence::Vide => return Err(ErreurEjection::AucunDisque),
+            Presence::Disque => {}
+        }
+        let mut garde = self.fichier.lock().unwrap_or_else(|e| e.into_inner());
+        *garde = None;
+        let par_ioctl = (|| {
+            let f = self
+                .ouvrir()
+                .map_err(|e| format!("{} ne s'ouvre pas : {e}", self.chemin))?;
+            // SAFETY: ioctls sans pointeur ; l'argument est un entier.
+            unsafe { libc::ioctl(f.as_raw_fd(), CDROM_LOCKDOOR as _, 0 as libc::c_int) };
+            // SAFETY: idem, `CDROMEJECT` ne prend aucun argument.
+            if unsafe { libc::ioctl(f.as_raw_fd(), CDROMEJECT as _, 0 as libc::c_int) } < 0 {
+                return Err(format!("CDROMEJECT : {}", derniere_erreur()));
+            }
+            Ok(())
+        })();
+        let Err(raison) = par_ioctl else {
+            tracing::info!(lecteur = %self.chemin, "cd_disque_ejecte");
+            return Ok(());
+        };
+        tracing::warn!(lecteur = %self.chemin, %raison, "cd_ejection_ioctl_refusee");
+        match std::process::Command::new("eject")
+            .arg(&self.chemin)
+            .output()
+        {
+            Ok(sortie) if sortie.status.success() => {
+                tracing::info!(lecteur = %self.chemin, "cd_disque_ejecte_par_eject");
+                Ok(())
+            }
+            Ok(sortie) => Err(ErreurEjection::Echec(format!(
+                "{raison} ; eject : {}",
+                String::from_utf8_lossy(&sortie.stderr).trim()
+            ))),
+            Err(_) => Err(ErreurEjection::Echec(raison)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +322,7 @@ mod tests {
         let l = LecteurLinux::new("/dev/n-existe-pas-4863".into());
         assert_eq!(l.presence(), Presence::AucunLecteur);
         assert!(l.lire_toc().is_err());
+        // Rien à éjecter, et surtout aucune commande lancée au hasard.
+        assert_eq!(l.ejecter_disque(), Err(ErreurEjection::AucunLecteur));
     }
 }

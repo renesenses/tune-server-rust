@@ -1706,12 +1706,18 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
     // l'utilisateur la recopier dans son tableau de bord.
     let spotify_redirect_uri_refus =
         tune_core::streaming::spotify::refus_redirection(&spotify_redirect_uri).map(|r| r.code());
+    // Fil 221 — sans Client ID (`"placeholder"`), Spotify refuse tout : l'écran
+    // offre alors le champ « Client ID » au lieu d'un « Se connecter » voué à
+    // l'échec. Lu sur le service LUI-MÊME, qui reçoit la saisie à chaud.
+    let spotify_client_id_configure =
+        crate::routes::service_tokens::spotify_client_id_configure(&state).await;
     Json(json!({
         "TUNE_PORT": state.port.to_string(),
         "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),
         "engine": engine,
         "spotify_redirect_uri": spotify_redirect_uri,
         "spotify_redirect_uri_refus": spotify_redirect_uri_refus,
+        "spotify_client_id_configure": spotify_client_id_configure,
     }))
 }
 
@@ -2174,7 +2180,18 @@ pub(super) async fn remove_music_dir(
     State(state): State<AppState>,
     Json(body): Json<RemoveMusicDir>,
 ) -> Result<Json<Value>, AppError> {
-    let normalized = tune_core::scanner::walker::normalize_path(&body.path);
+    retirer_un_dossier(&state, &body.path, body.confirm_purge).map(Json)
+}
+
+/// Le corps de `POST /system/music-dirs/remove`, réutilisé tel quel par
+/// « Oublier ce partage » (fil 2145) : un seul chemin de retrait de dossier,
+/// donc une seule purge, sous le même plafond (#1943).
+pub(crate) fn retirer_un_dossier(
+    state: &AppState,
+    path: &str,
+    confirm_purge: Option<u64>,
+) -> Result<Value, AppError> {
+    let normalized = tune_core::scanner::walker::normalize_path(path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
@@ -2204,7 +2221,7 @@ pub(super) async fn remove_music_dir(
 
     // Sans confirmation : on DIT, on ne touche à rien. Comportement de tout
     // client existant, inchangé.
-    let Some(confirmee) = body.confirm_purge else {
+    let Some(confirmee) = confirm_purge else {
         if plan.tracks > 0 {
             tracing::info!(
                 dossier = %normalized,
@@ -2215,22 +2232,22 @@ pub(super) async fn remove_music_dir(
                  confirm_purge=N, ou /music-dirs/purge-orphans — peut les retirer."
             );
         }
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "impact": impact_json(&plan),
             "confirm_purge_required": plan.tracks,
-        })));
+        }));
     };
 
     if orphelines.is_empty() {
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": 0,
             "purged": 0,
             "purge_refused": false,
             "impact": impact_json(&plan),
-        })));
+        }));
     }
 
     // Le plafond de #1943 s'applique à ce geste comme aux autres, par la
@@ -2245,7 +2262,7 @@ pub(super) async fn remove_music_dir(
             "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
              constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
         );
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "purged": 0,
@@ -2259,7 +2276,7 @@ pub(super) async fn remove_music_dir(
                  Confirmez ce nombre exact pour les retirer aussi.",
                 plan.tracks
             ),
-        })));
+        }));
     }
 
     let r = executer_purge(&state, &orphelines);
@@ -2278,7 +2295,7 @@ pub(super) async fn remove_music_dir(
          explicitement confirmée par l'utilisateur (#2149)."
     );
 
-    Ok(Json(json!({
+    Ok(json!({
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
@@ -2292,7 +2309,24 @@ pub(super) async fn remove_music_dir(
         "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
         "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
-    })))
+    }))
+}
+
+/// Combien de pistes partiraient avec ces racines : sous l'une d'elles, et
+/// sous aucune des racines qui resteraient. Le compte que « Oublier ce
+/// partage » montre avant de proposer la purge (fil 2145).
+pub(crate) fn pistes_qui_partiraient(state: &AppState, racines: &[String]) -> u64 {
+    use tune_core::scanner::walker::normalize_path;
+    let retirees: Vec<String> = racines.iter().map(|r| normalize_path(r)).collect();
+    let restantes: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .into_iter()
+        .filter(|d| !retirees.contains(&normalize_path(d)))
+        .collect();
+    let mut ids = std::collections::BTreeSet::new();
+    for r in &retirees {
+        ids.extend(pistes_orphelines_sous(state, r, &restantes));
+    }
+    ids.len() as u64
 }
 
 // ───────────────────────────────────────────────────────────────────────────

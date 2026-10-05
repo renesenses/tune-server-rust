@@ -157,7 +157,9 @@ impl PositionPoller {
                 // actually moved since the last poll (see decisions::
                 // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
+                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol)
+                    && !self.volume_pure_reimpose(zone_id, status.volume).await
+                {
                     self.playback.set_volume(zone_id, status.volume).await;
                     // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
                     // tombait a 0 sous 0,01 lineaire (-40 dB).
@@ -1129,6 +1131,7 @@ impl PositionPoller {
                             status.volume,
                             zone_state.volume,
                         )
+                        && !self.volume_pure_reimpose(zone_id, status.volume).await
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
                         // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
@@ -1467,6 +1470,7 @@ impl PositionPoller {
                     status.volume,
                     zone_state.volume,
                 )
+                && !self.volume_pure_reimpose(zone_id, status.volume).await
             {
                 self.playback.set_volume(zone_id, status.volume).await;
                 // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
@@ -1541,11 +1545,31 @@ impl PositionPoller {
                     self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
                         .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
+                    // #5411 — le rejeu de la piste finie, AVÉRÉ seulement :
+                    // URI de la piste finie, position revenue près de zéro,
+                    // et rien de soutenu tiré du flux adopté.
+                    let octets_depuis = decisions::octets_depuis_adoption(
+                        self.orchestrator.streamer_bytes_sent(&adoption.flux).await,
+                        adoption.octets_a_l_adoption,
+                    );
+                    let debit = decisions::debit_soutenu(
+                        octets_depuis,
+                        adoption.depuis.elapsed().as_millis() as u64,
+                    );
+                    let rejeu_avere = decisions::rejeu_de_la_piste_finie_avere(
+                        status.current_uri.as_deref(),
+                        adoption.flux_fini.as_deref(),
+                        &adoption.flux,
+                        status.position_ms,
+                        adoption.position_figee_ms,
+                        debit,
+                    );
                     match decisions::suite_de_l_adoption(
                         status.position_ms,
                         adoption.position_figee_ms,
                         status.current_uri.as_deref(),
                         &adoption.flux,
+                        rejeu_avere,
                         // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
                         status.state == TransportState::Stopped,
                         age_secs,
@@ -1573,6 +1597,10 @@ impl PositionPoller {
                                 uri = ?status.current_uri,
                                 preuve = ?adoption.preuve,
                                 stream_id = %adoption.flux,
+                                flux_fini = ?adoption.flux_fini,
+                                rejeu_avere,
+                                debit_soutenu = debit,
+                                octets_depuis_adoption = ?octets_depuis,
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
@@ -1622,6 +1650,25 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.duration_ms as u64)
                 .unwrap_or(0);
+            // Fil 2062 / #5550 — une piste UPnP partie sans durée (ni DIDL, ni
+            // en-têtes lisibles) prend celle que la sortie rapporte : le
+            // `TrackDuration` du renderer, ou la durée mesurée par le décodeur
+            // de la sortie locale.
+            let track_duration_ms = match decisions::duree_rapportee_a_adopter(
+                zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                track_duration_ms,
+                status.duration_ms,
+                ps.gapless_sent,
+            ) {
+                Some(duree) => {
+                    info!(zone_id, duration_ms = duree, "upnp_duree_rapportee_adoptee");
+                    self.playback
+                        .adopter_la_duree_rapportee(zone_id, duree as i64)
+                        .await;
+                    duree
+                }
+                None => track_duration_ms,
+            };
 
             // Helper: has enough of the track been played?
             // When track_duration is known: peak_position_ms >= 80% of duration.
@@ -1787,15 +1834,30 @@ impl PositionPoller {
                         .position_a_avancer(zone_id, zone_state, arme_avant)
                         .await
                     {
+                        // #5411 — lu AVANT l'avance, qui fait adopter le flux
+                        // armé à la zone.
+                        let rejeu = self
+                            .rejeu_de_la_piste_finie(
+                                zone_id,
+                                zone_state,
+                                &status,
+                                track_duration_ms,
+                            )
+                            .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
-                        if let Err(e) = self
+                        let avance = self
                             .orchestrator
                             .advance_queue_metadata(zone_id, next_pos)
-                            .await
-                        {
+                            .await;
+                        if let Err(e) = &avance {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
+                        // Surveiller une avance qui n'a pas eu lieu relancerait
+                        // la piste finie.
+                        if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                            ps.adoption_horloge = Some(surveillance);
+                        }
                         // The identity-keyed latch re-arms by itself on the new
                         // track; clearing it here additionally covers gapless
                         // repeat-one, where the advanced track has the same
@@ -2357,11 +2419,26 @@ impl PositionPoller {
                                     };
                                 let avance_audio_ms =
                                     fsm::avance_audio_ms(audio_servi_ms, ps.peak_position_ms);
-                                let famine_etablie = fsm::famine_etablie_malgre_l_avance(
-                                    avance_audio_ms,
-                                    ps.premier_arret_a.map(|t| t.elapsed()),
-                                    AVANCE_AUDIO_BORNE_HAUTE_SECS,
-                                );
+                                // Ticket 190 — un renderer qui sait rapporter
+                                // sa position et n'a jamais quitté 0 sur cette
+                                // piste n'a rien en train de jouer : aucune des
+                                // deux patiences ci-dessous ne s'applique.
+                                let a_l_arret_sans_avoir_joue =
+                                    decisions::renderer_a_l_arret_sans_avoir_joue(
+                                        ps.peak_position_ms,
+                                        device_id.starts_with("local:")
+                                            || self
+                                                .zones_a_position_prouvee
+                                                .lock()
+                                                .map(|z| z.contains(&zone_id))
+                                                .unwrap_or(false),
+                                    );
+                                let famine_etablie = a_l_arret_sans_avoir_joue
+                                    || fsm::famine_etablie_malgre_l_avance(
+                                        avance_audio_ms,
+                                        ps.premier_arret_a.map(|t| t.elapsed()),
+                                        AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                    );
                                 fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
                                 // 🔴 #4661 — la borne de #4480 est PLATE :
@@ -2411,6 +2488,7 @@ impl PositionPoller {
                                 let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
                                     flux_servi_en_entier,
                                     horloge_de_piste_connue
+                                        && !a_l_arret_sans_avoir_joue
                                         && decisions::tampon_du_renderer_peut_encore_jouer(
                                             wall_elapsed,
                                             track_duration_ms,
@@ -2673,15 +2751,27 @@ impl PositionPoller {
                         if let Some(next_pos) =
                             Self::prochaine_position_jouable(&self.db, zone_id, zone_state)
                         {
+                            // #5411 — même lecture qu'à la retombée de position.
+                            let rejeu = self
+                                .rejeu_de_la_piste_finie(
+                                    zone_id,
+                                    zone_state,
+                                    &status,
+                                    track_duration_ms,
+                                )
+                                .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            if let Err(e) = self
+                            let avance = self
                                 .orchestrator
                                 .advance_queue_metadata(zone_id, next_pos)
-                                .await
-                            {
+                                .await;
+                            if let Err(e) = &avance {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
+                            if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                                ps.adoption_horloge = Some(surveillance);
+                            }
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;

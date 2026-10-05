@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+
 use super::{CompressedDecodeFailure, decode_compressed_stream, record_compressed_decode_failure};
 
 const TOUS: [CompressedDecodeFailure; 4] = [
@@ -61,7 +63,7 @@ fn l_echec_de_decodage_passe_par_le_canal_que_le_sondeur_draine() {
 fn un_flux_illisible_rend_le_motif_conteneur_non_reconnu() {
     let poubelle = vec![0x42u8; 8192];
     assert_eq!(
-        decode_compressed_stream(&poubelle),
+        decode_compressed_stream(&poubelle, &AtomicBool::new(false)),
         Err(CompressedDecodeFailure::ContainerUnrecognised)
     );
 }
@@ -69,5 +71,5 @@ fn un_flux_illisible_rend_le_motif_conteneur_non_reconnu() {
 /// TÉMOIN VERT : un flux vide ne doit pas, lui non plus, rendre `Ok`.
 #[test]
 fn un_flux_vide_ne_rend_jamais_un_succes() {
-    assert!(decode_compressed_stream(&[]).is_err());
+    assert!(decode_compressed_stream(&[], &AtomicBool::new(false)).is_err());
 }

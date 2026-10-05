@@ -805,12 +805,81 @@ impl PositionPoller {
                         ADOPTION_HORLOGE_DELAI_SECS
                     },
                     octets_a_l_adoption: octets_tires,
+                    // L'instantané du tour est pris AVANT l'avance : il nomme
+                    // encore la piste finie.
+                    flux_fini: zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.clone()),
                 });
             }
             None => {
                 self.handle_track_end(zone_id, zone_state).await;
             }
         }
+    }
+
+    /// #5411 (fil 2031) — l'écran va avancer parce que la position du
+    /// renderer est retombée, ou parce qu'il est reparti après un arrêt dans
+    /// la garde. Si le renderer nomme ENCORE le flux de la piste finie, il ne
+    /// joue pas la suivante : il rejoue la piste finie (Sony BD-P2100 : « le
+    /// N est rejoué du début, le N+1 a été remplacé par le N »). L'avance
+    /// devient alors provisoire : rend la surveillance à poser, celle d'une
+    /// bascule. L'URI qui passe au flux armé la confirme ; sinon, le délai
+    /// écoulé, le repli joue la piste affichée — aucune piste n'est sautée.
+    ///
+    /// À appeler AVANT `advance_queue_metadata`, qui consomme le flux armé.
+    /// `None` — le cas de tout renderer qui ne rapporte pas d'URI, ou qui
+    /// nomme le flux armé — laisse l'avance d'avant intacte.
+    pub(super) async fn rejeu_de_la_piste_finie(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        status: &OutputStatus,
+        duree_de_la_piste_finie_ms: u64,
+    ) -> Option<AdoptionHorloge> {
+        // Sans durée connue, le recul de position ne se juge pas : la règle
+        // d'avant.
+        if duree_de_la_piste_finie_ms == 0 {
+            return None;
+        }
+        let flux_fini = zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.clone());
+        let flux_arme = self.orchestrator.flux_pre_arme(zone_id).await;
+        if !decisions::renderer_rejoue_la_piste_finie(
+            status.current_uri.as_deref(),
+            flux_fini.as_deref(),
+            flux_arme.as_deref(),
+            matches!(zone_state.repeat, RepeatMode::One),
+        ) {
+            return None;
+        }
+        warn!(
+            zone_id,
+            position_ms = status.position_ms,
+            uri = ?status.current_uri,
+            flux_fini = ?flux_fini,
+            flux_arme = ?flux_arme,
+            "gapless_retombee_sur_la_piste_finie_surveillee"
+        );
+        // Le débit tiré du flux armé se mesure à partir d'ici.
+        let octets_a_l_adoption = match flux_arme.as_deref() {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        Some(AdoptionHorloge {
+            depuis: Instant::now(),
+            // La référence du recul : la fin de la piste finie, d'où le
+            // renderer vient de retomber.
+            position_figee_ms: duree_de_la_piste_finie_ms,
+            flux: flux_arme.unwrap_or_default(),
+            preuve: decisions::EnchainementArme::RejeuDeLaPisteFinie,
+            delai_secs: BASCULE_DELAI_SECS,
+            octets_a_l_adoption,
+            flux_fini,
+        })
     }
 
     pub(super) async fn resolve_gapless_next(

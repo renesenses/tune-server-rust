@@ -162,6 +162,17 @@ pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
         if colle.contains("://") || colle.contains('/') {
             return Err("spotify: l'adresse collee ne contient pas de code".into());
         }
+        // Fil 221 — Yan Tasset y a colle son Client ID : il partait vers
+        // `api/token` comme un code, et Spotify repondait `invalid_client`.
+        if ressemble_a_un_client_id(colle) {
+            return Err(
+                "spotify: ceci est un Client ID (32 caracteres hexadecimaux), \
+                        pas l'adresse de retour. Enregistrez-le dans le champ Client ID, \
+                        puis collez ici l'adresse complete de la page 127.0.0.1 \
+                        (elle contient ?code=...)"
+                    .into(),
+            );
+        }
         return Ok(colle.to_owned());
     };
     let requete = requete.split('#').next().unwrap_or(requete);
@@ -181,6 +192,50 @@ pub fn code_depuis_rappel(colle: &str) -> Result<String, String> {
         Some(e) => format!("spotify: {e}"),
         None => "spotify: l'adresse collee ne contient pas de code".into(),
     })
+}
+
+/// Fil 221 (Yan Tasset) — debut du refus d'`authenticate` quand le serveur
+/// n'a aucun Client ID : la route de streaming et l'ecran le reconnaissent.
+pub const CLIENT_ID_ABSENT: &str = "spotify: aucun Client ID configure";
+
+/// Un Client ID est-il REELLEMENT configure ? Vide et `"placeholder"` (le
+/// defaut de la caisse) ne le sont pas : avec eux, Spotify repond
+/// `invalid_client` a tout.
+pub fn client_id_configure(client_id: &str) -> bool {
+    let id = client_id.trim();
+    !id.is_empty() && id != DEFAULT_CLIENT_ID
+}
+
+/// Fil 221 — un Client ID Spotify est une suite de 32 caracteres
+/// hexadecimaux. Un code d'autorisation, lui, en compte bien davantage et
+/// n'est jamais de cette forme : un texte nu de cette forme colle dans le
+/// champ de l'adresse de retour est un Client ID, pas un code.
+pub fn ressemble_a_un_client_id(texte: &str) -> bool {
+    let t = texte.trim();
+    t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Le Client ID que le service doit employer — fil 221.
+///
+/// Ordre de priorite, du plus fort au plus faible :
+/// 1. la variable `TUNE_SPOTIFY_CLIENT_ID` (l'exploitant l'impose) ;
+/// 2. le reglage `spotify_client_id` en base, saisi dans Reglages ;
+/// 3. `spotify_client_id` de `tune.toml`.
+///
+/// `None` : rien de tout cela. `with_config` se rabat alors sur l'ancienne
+/// variable `SPOTIFY_CLIENT_ID`, puis sur `"placeholder"` (non configure).
+/// Une valeur vide ou egale a `"placeholder"` compte comme absente.
+pub fn resolve_client_id(
+    tune_env: Option<&str>,
+    reglage: Option<&str>,
+    toml: Option<&str>,
+) -> Option<String> {
+    [tune_env, reglage, toml]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|id| client_id_configure(id))
+        .map(str::to_owned)
 }
 
 /// L'URI que Tune enverra REELLEMENT a Spotify, lue depuis l'environnement du
@@ -238,6 +293,20 @@ impl SpotifyService {
             enabled_override: None,
             token_rejected: AtomicBool::new(false),
         }
+    }
+
+    /// Fil 221 — le Client ID saisi dans Reglages, applique a chaud. Un
+    /// echange PKCE entame avec l'ancien identifiant ne peut pas aboutir avec
+    /// le nouveau : son verificateur est oublie.
+    pub fn set_client_id(&mut self, client_id: &str) {
+        self.client_id = client_id.trim().to_owned();
+        self.code_verifier = None;
+    }
+
+    /// Fil 221 — ce que `GET /system/env` publie : `false` tant que le
+    /// service tourne avec `"placeholder"`.
+    pub fn client_id_est_configure(&self) -> bool {
+        client_id_configure(&self.client_id)
     }
 
     /// Enregistre un refus de jeton pour que le prochain tick le rafraîchisse.
@@ -501,6 +570,17 @@ impl StreamingService for SpotifyService {
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
+        // Fil 221 — sans Client ID, l'URL d'autorisation portait
+        // `client_id=placeholder` et l'echange d'un code finissait en
+        // `invalid_client` : refuser tout de suite, en disant ou le poser.
+        if !self.client_id_est_configure() {
+            return Err(format!(
+                "{CLIENT_ID_ABSENT} : enregistrez celui de votre application Spotify \
+                 (developer.spotify.com, tableau de bord) dans Reglages > Acces et jetons > \
+                 Services de streaming, ou posez TUNE_SPOTIFY_CLIENT_ID"
+            )
+            .into());
+        }
         // #2680 — `callback_url` : l'adresse de rappel collee depuis un autre
         // poste, ou le rappel `127.0.0.1` ne peut pas aboutir.
         let code = match credentials.get("callback_url").and_then(|v| v.as_str()) {
@@ -1182,6 +1262,97 @@ mod tests {
         );
         assert!(code_depuis_rappel("http://127.0.0.1:8888/cb").is_err());
         assert!(code_depuis_rappel("").is_err());
+    }
+
+    /// Fil 221 (Yan Tasset) — le Client ID colle dans le champ de l'adresse
+    /// de retour partait vers `api/token` comme un code : Spotify repondait
+    /// `invalid_client`, et l'ecran accusait l'URI de redirection.
+    #[test]
+    fn fil_221_un_client_id_colle_n_est_pas_pris_pour_un_code() {
+        let client_id = "0123456789abcdef0123456789ABCDEF";
+        let err = code_depuis_rappel(client_id).expect_err("un Client ID n'est pas un code");
+        assert!(err.contains("Client ID"), "{err}");
+        assert!(err.contains("pas l'adresse de retour"), "{err}");
+        // Entoure d'espaces, c'est toujours lui.
+        assert!(code_depuis_rappel(&format!("  {client_id} ")).is_err());
+        // Un vrai code (long, base64url) reste accepte tel quel.
+        let code = "AQB".to_owned() + &"x_-9".repeat(60);
+        assert_eq!(code_depuis_rappel(&code), Ok(code.clone()));
+        // Le meme Client ID DANS une adresse de rappel n'est pas en cause.
+        assert_eq!(
+            code_depuis_rappel(&format!("http://127.0.0.1:8888/cb?code={client_id}")),
+            Ok(client_id.to_owned())
+        );
+    }
+
+    /// Fil 221 — sans Client ID, `authenticate` rendait une URL
+    /// `client_id=placeholder` (« Ouvrir la page de connexion » menait a une
+    /// erreur Spotify) et echangeait un code voue a `invalid_client`.
+    #[tokio::test]
+    async fn fil_221_sans_client_id_authenticate_refuse_en_le_disant() {
+        for absent in ["placeholder", "", "   "] {
+            let mut svc = SpotifyService::with_config(None, None, 8888);
+            svc.set_client_id(absent);
+            assert!(!svc.client_id_est_configure());
+            let err = svc
+                .authenticate(&json!({}))
+                .await
+                .expect_err("aucune URL d'autorisation sans Client ID");
+            assert!(err.to_string().starts_with(CLIENT_ID_ABSENT), "{err}");
+            assert!(err.to_string().contains("TUNE_SPOTIFY_CLIENT_ID"), "{err}");
+            let err = svc
+                .authenticate(&json!({"callback_url": "http://127.0.0.1:8888/cb?code=abc"}))
+                .await
+                .expect_err("aucun echange de code sans Client ID");
+            assert!(err.to_string().starts_with(CLIENT_ID_ABSENT), "{err}");
+        }
+    }
+
+    /// Fil 221 — le Client ID enregistre s'applique a chaud : l'URL
+    /// d'autorisation suivante le porte, sans redemarrage.
+    #[tokio::test]
+    async fn fil_221_le_client_id_s_applique_a_chaud() {
+        let mut svc = SpotifyService::with_config(None, None, 8888);
+        svc.set_client_id("placeholder");
+        svc.set_client_id(" 0123456789abcdef0123456789abcdef ");
+        assert!(svc.client_id_est_configure());
+        let st = svc
+            .authenticate(&json!({}))
+            .await
+            .expect("URL d'autorisation");
+        let url = st.verification_url.expect("une URL");
+        assert!(
+            url.contains("client_id=0123456789abcdef0123456789abcdef"),
+            "{url}"
+        );
+        assert!(svc.code_verifier.is_some());
+        // Changer d'identifiant oublie l'echange PKCE entame avec l'ancien.
+        svc.set_client_id("fedcba9876543210fedcba9876543210");
+        assert!(svc.code_verifier.is_none());
+    }
+
+    /// Fil 221 — l'ordre : la variable d'environnement, puis le reglage en
+    /// base, puis `tune.toml`. Vide et `placeholder` comptent comme absents.
+    #[test]
+    fn fil_221_ordre_de_resolution_du_client_id() {
+        assert_eq!(
+            resolve_client_id(Some("env"), Some("base"), Some("toml")).as_deref(),
+            Some("env")
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("base"), Some("toml")).as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            resolve_client_id(Some(""), Some(" base "), Some("toml")).as_deref(),
+            Some("base")
+        );
+        assert_eq!(
+            resolve_client_id(None, Some("placeholder"), Some("toml")).as_deref(),
+            Some("toml")
+        );
+        assert_eq!(resolve_client_id(None, None, Some("placeholder")), None);
+        assert_eq!(resolve_client_id(None, None, None), None);
     }
 
     /// Le chemin `callback_url` passe bien par l'echange de code : sans

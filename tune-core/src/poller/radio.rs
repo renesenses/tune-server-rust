@@ -153,7 +153,14 @@ impl PositionPoller {
         source: &str,
         seed_source_id: Option<&str>,
     ) -> usize {
-        let Some(service) = self.orchestrator.services.lock().await.get(source) else {
+        let Some(service) = self
+            .orchestrator
+            .services
+            .lock()
+            .await
+            .get_actif(source)
+            .await
+        else {
             warn!(zone_id, source, "autoplay_streaming_service_absent");
             return 0;
         };

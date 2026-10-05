@@ -122,7 +122,11 @@ fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
                 MAX(t.format), \
                 MAX(t.sample_rate), \
                 MAX(t.bit_depth), \
-                MAX(al.is_compilation) \
+                MAX(al.is_compilation), \
+                MAX(al.folder_path), \
+                MIN(COALESCE(t.file_path, t.cue_media_path)), \
+                MIN(COALESCE(t.disc_number, 1)), \
+                MAX(COALESCE(t.disc_number, 1)) \
          FROM tracks t \
          LEFT JOIN albums al ON al.id = t.album_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
@@ -158,6 +162,16 @@ fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
             // sans album, ou une base migrée qui porte encore NULL, vaut
             // « non », exactement comme dans le modèle `Album`.
             let is_compilation = tune_core::db::album_repo::drapeau_compilation(it.next().as_ref());
+            // Fil 2094 — le DOSSIER et le numéro de disque : ce qui distingue
+            // vingt-sept « Arkhangelsk » dans le sélecteur de coffret.
+            let dossier_d_album = it.next().and_then(|v| v.as_string());
+            let premier_chemin = it.next().and_then(|v| v.as_string());
+            let folder = dossier_de_la_carte(dossier_d_album, premier_chemin.as_deref());
+            let disque_min = it.next().and_then(|v| v.as_i64());
+            let disque_max = it.next().and_then(|v| v.as_i64());
+            // Un seul numéro pour toutes les pistes : c'est LE disque de
+            // l'album. Plusieurs : `disc_count` le dit déjà.
+            let disc_number = disque_min.filter(|_| disque_min == disque_max);
             Some(json!({
                 "album_id": album_id,
                 "title": title,
@@ -172,6 +186,8 @@ fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
                 "is_compilation": is_compilation,
+                "folder": folder,
+                "disc_number": disc_number,
             }))
         })
         .collect();
@@ -181,6 +197,22 @@ fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
         "total": total,
         "limit": limit,
         "offset": offset,
+    })
+}
+
+/// Le dossier d'une carte : celui que la ligne album retient
+/// (`albums.folder_path`), sinon le dossier de la première de ses pistes —
+/// une base d'avant la colonne n'en a pas. Coupé sur `/` comme sur `\` : la
+/// bibliothèque d'un serveur Windows porte des chemins `C:\…`.
+fn dossier_de_la_carte(
+    folder_path: Option<String>,
+    premier_chemin: Option<&str>,
+) -> Option<String> {
+    folder_path.filter(|d| !d.trim().is_empty()).or_else(|| {
+        premier_chemin
+            .and_then(|c| c.rsplit_once(['/', '\\']))
+            .map(|(d, _)| d.to_string())
+            .filter(|d| !d.is_empty())
     })
 }
 
@@ -351,6 +383,98 @@ mod tests {
             .expect("corps");
         let v: Value = serde_json::from_slice(&octets).expect("json");
         assert_eq!(v["items"][0]["album_artist"], "Étiquette Fichier");
+    }
+
+    /// Fil 2094 — le sélecteur Métadonnées › Coffret affichait vingt-sept
+    /// « Arkhangelsk » identiques : la carte ne disait ni le DOSSIER ni le
+    /// numéro de disque. Elle porte désormais `folder` (celui de la ligne
+    /// album, sinon celui de la première piste) et `disc_number` (quand
+    /// toutes les pistes partagent un numéro).
+    #[tokio::test]
+    async fn la_carte_porte_son_dossier_et_son_numero_de_disque_2094() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Arkhangelsk')",
+            &[],
+        )
+        .expect("artiste");
+        // Deux disques au MÊME titre ; le premier a son dossier retenu, le
+        // second non (base d'avant la colonne). Un troisième, double.
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, folder_path) VALUES \
+             (1, 'Arkhangelsk', 1, '/m/Coffret/CD01'), (2, 'Arkhangelsk', 1, NULL), \
+             (3, 'Double', 1, NULL)",
+            &[],
+        )
+        .expect("albums");
+        for (album, disque, chemin) in [
+            (1_i64, 1_i64, "/m/Coffret/CD01/01.flac"),
+            (1, 1, "/m/Coffret/CD01/02.flac"),
+            (2, 2, "/m/Coffret/CD02/01.flac"),
+            (3, 1, "/m/Double/1-01.flac"),
+            (3, 2, "/m/Double/2-01.flac"),
+        ] {
+            b.execute(
+                "INSERT INTO tracks (title, artist_id, album_id, disc_number, source, file_path) \
+                 VALUES ('t', 1, ?1, ?2, 'local', ?3)",
+                &[&album as &dyn ToSqlValue, &disque, &chemin],
+            )
+            .expect("piste");
+        }
+        let reponse = super::super::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/albums-detailed?limit=10")
+                    .body(Body::empty())
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        let v: Value = serde_json::from_slice(&octets).expect("json");
+        let par_id = |id: i64| {
+            v["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|c| c["album_id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("album {id} absent : {v}"))
+        };
+        assert_eq!(par_id(1)["folder"], "/m/Coffret/CD01");
+        assert_eq!(par_id(1)["disc_number"], 1);
+        assert_eq!(par_id(2)["folder"], "/m/Coffret/CD02", "repli sur la piste");
+        assert_eq!(par_id(2)["disc_number"], 2);
+        assert_eq!(
+            par_id(3)["disc_number"],
+            Value::Null,
+            "deux disques : pas UN numéro"
+        );
+        assert_eq!(par_id(3)["disc_count"], 2);
+    }
+
+    #[test]
+    fn le_dossier_d_une_carte_se_coupe_aussi_sous_windows() {
+        use super::dossier_de_la_carte;
+        assert_eq!(
+            dossier_de_la_carte(None, Some(r"C:\Musique\Coffret\CD03\01.flac")).as_deref(),
+            Some(r"C:\Musique\Coffret\CD03")
+        );
+        assert_eq!(
+            dossier_de_la_carte(Some(" ".into()), Some("/m/a/01.flac")).as_deref(),
+            Some("/m/a")
+        );
+        assert_eq!(dossier_de_la_carte(None, None), None);
     }
 
     /// Marqueur de contrat : le total pagine des ALBUMS. Compter des pistes
