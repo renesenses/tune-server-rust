@@ -705,16 +705,27 @@ const MBID_ATTENDUS: &[(&str, &str)] = &[
 /// chaque album identifié, le rattachement tel que l'appelle
 /// `identifier_album`. Mesure : la part des fiches munies d'un MBID, avant et
 /// après.
-#[tokio::test(start_paused = true)]
-async fn banc_artistes_4805_avant_apres() {
+/// La bibliothèque synthétique du banc de l'étape B, AVANT rattachement :
+/// une fiche par artiste distinct (au sens de `cle_artiste`), un album par
+/// ligne de `ALBUMS`, et pour chaque album identifié ses pistes calquées sur
+/// le pressage retenu. Rend la base et, par album identifié, de quoi
+/// rejouer le rattachement : `(album_id, pressage, pistes locales)`.
+/// Partagée avec le banc de l'étape C.
+pub(super) async fn bibliotheque_du_banc_b() -> (
+    std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    Vec<(
+        i64,
+        super::MBReleaseDetail,
+        Vec<crate::metadata::reidentify::LocalTrack>,
+    )>,
+) {
     use std::sync::Arc;
 
     use crate::db::artist_repo::cle_artiste;
     use crate::db::backend::{DbBackend, ToSqlValue};
     use crate::db::migrations;
     use crate::db::sqlite::SqliteDb;
-    use crate::metadata::artistes_du_pressage::rattacher_les_artistes_de_l_album;
-    use crate::metadata::reidentify::{LocalTrack, map_recording_ids};
+    use crate::metadata::reidentify::LocalTrack;
 
     let brut = std::fs::read_to_string(chemin_fixture_pressages()).expect("fixture des pressages");
     let fixture: Value = serde_json::from_str(&brut).expect("fixture JSON");
@@ -793,6 +804,19 @@ async fn banc_artistes_4805_avant_apres() {
         }
         details.push((album_id, detail, locales));
     }
+    (backend, details)
+}
+
+#[tokio::test(start_paused = true)]
+async fn banc_artistes_4805_avant_apres() {
+    use std::sync::Arc;
+
+    use crate::db::artist_repo::cle_artiste;
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::metadata::artistes_du_pressage::rattacher_les_artistes_de_l_album;
+    use crate::metadata::reidentify::map_recording_ids;
+
+    let (backend, details) = bibliotheque_du_banc_b().await;
 
     let compter = |backend: &Arc<dyn DbBackend>| -> (i64, i64) {
         let l = backend
@@ -960,3 +984,7 @@ async fn enregistrer_les_pressages() {
     )
     .expect("écriture de la fixture");
 }
+
+// #4805, étape C : la passe artistes par le réseau, sur cette bibliothèque.
+#[path = "musicbrainz_release_banc_4805_c.rs"]
+mod banc_c;
