@@ -1602,6 +1602,9 @@ mod service_wav_progressif_5080;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
+#[cfg(test)]
+mod volume_pure_5695_tests;
 // #4407 — l'égaliseur remplacé en vol dans un flux réseau fabriqué par Tune.
 mod eq_en_vol;
 #[cfg(test)]
