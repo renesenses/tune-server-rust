@@ -2960,3 +2960,13 @@ async fn pg_5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
     pool.close().await;
     crate::db::album_repo::tests::scenario_bibliotheque_ancienne_5413_apres(db);
 }
+
+/// Fil 2094 — les sous-titres de disque d'un coffret réuni, sur le VRAI
+/// moteur : `UPDATE … WHERE NOT EXISTS` sur la même table, cinq marqueurs
+/// `$n`. Même scénario que `sous_titres_2094_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2094_sous_titres_des_disques_d_un_coffret() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_sous_titres_2094(&db);
+}

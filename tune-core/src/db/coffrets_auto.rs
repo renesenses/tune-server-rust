@@ -100,6 +100,11 @@ pub struct Marqueur {
     /// alors pas ce marquage, qui n'est pas le sien.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub titre_tenu_avant: bool,
+    /// Fil 2094 — les numéros des disques dont la composition a fait du
+    /// titre d'origine le SOUS-TITRE ([`poser_les_sous_titres`]). « Défaire »
+    /// ne retire que ceux-là ([`retirer_les_sous_titres`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sous_titres: Vec<u32>,
 }
 
 impl Marqueur {
@@ -110,6 +115,7 @@ impl Marqueur {
             disques: vec![],
             titre_compose: None,
             titre_tenu_avant: false,
+            sous_titres: vec![],
         }
     }
 
@@ -362,18 +368,137 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
     if !titre_tenu && let Err(e) = repo.force_update_title(cible, &c.titre) {
         tracing::warn!(album = cible, erreur = %e, "coffret_titre_non_renomme");
     }
+    // Fil 2094 — le titre d'origine de chaque disque devient son sous-titre,
+    // comparé au titre que le coffret porte VRAIMENT (celui de l'utilisateur
+    // s'il le tient à la main).
+    let titre_du_coffret = repo
+        .get(cible)
+        .ok()
+        .flatten()
+        .map(|a| a.title)
+        .unwrap_or_else(|| c.titre.clone());
+    let sous_titres =
+        poser_les_sous_titres(db, cible, &disques, &titre_du_coffret).unwrap_or_else(|e| {
+            tracing::warn!(album = cible, erreur = %e, "coffret_sous_titres_non_poses");
+            Vec::new()
+        });
     let marqueur = Marqueur {
         origine: ORIGINE_AUTO.into(),
         cle: c.cle.clone(),
         disques,
         titre_compose: None,
         titre_tenu_avant: false,
+        sous_titres,
     };
     let json = serde_json::to_string(&marqueur).unwrap_or_default();
     if let Err(e) = meta.set(cible, CLE_COFFRET, &json) {
         tracing::warn!(album = cible, erreur = %e, "coffret_non_marque");
     }
     Ok(absorbes)
+}
+
+/// Deux titres qui disent la même chose : casse, accents et espaces ignorés.
+fn meme_titre(a: &str, b: &str) -> bool {
+    let cle = |s: &str| {
+        crate::db::engine::fold_diacritics(s)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    cle(a) == cle(b)
+}
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — le titre d'ORIGINE de
+/// chaque disque devient son sous-titre de disque (`tracks.disc_subtitle`),
+/// sauf s'il est identique au titre du coffret.
+///
+/// La composition, manuelle ou automatique, ne gardait ces titres que dans le
+/// marqueur : la fiche affichait « Disque 1 », « Disque 2 »… là où les albums
+/// réunis s'appelaient « 101 - Disc A », « Bach : Cantates, vol. 3 ».
+///
+/// Appelée APRÈS la réunion : les pistes sont toutes dans `cible`, chaque
+/// disque sous son numéro `n`. Un sous-titre déjà présent (balise
+/// DISCSUBTITLE, nom donné à la main) n'est jamais remplacé, ni complété sur
+/// les autres pistes de son disque. Rend les numéros
+/// des disques effectivement sous-titrés, à retenir dans le marqueur.
+pub fn poser_les_sous_titres(
+    db: &Arc<dyn DbBackend>,
+    cible: i64,
+    disques: &[DisqueRetenu],
+    titre_du_coffret: &str,
+) -> Result<Vec<u32>, TuneError> {
+    let p = |i| match db.engine() {
+        Engine::Postgres => PostgresDialect.placeholder(i),
+        Engine::Sqlite => SqliteDialect.placeholder(i),
+    };
+    // Un disque dont UNE piste porte déjà un nom est laissé entier : un
+    // sous-titre posé sur ses autres pistes le couperait en deux en-têtes.
+    let sql = format!(
+        "UPDATE tracks SET disc_subtitle = {} WHERE album_id = {} \
+         AND COALESCE(disc_number, 1) = {} \
+         AND NOT EXISTS (SELECT 1 FROM tracks n WHERE n.album_id = {} \
+         AND COALESCE(n.disc_number, 1) = {} AND TRIM(COALESCE(n.disc_subtitle, '')) <> '')",
+        p(1),
+        p(2),
+        p(3),
+        p(4),
+        p(5)
+    );
+    let mut poses = Vec::new();
+    for d in disques {
+        let titre = d.titre.trim();
+        if titre.is_empty() || meme_titre(titre, titre_du_coffret) {
+            continue;
+        }
+        let numero = d.n as i64;
+        let n = db.execute(
+            &sql,
+            &[
+                &titre.to_string() as &dyn ToSqlValue,
+                &cible,
+                &numero,
+                &cible,
+                &numero,
+            ],
+        )?;
+        if n > 0 {
+            poses.push(d.n);
+        }
+    }
+    Ok(poses)
+}
+
+/// « Défaire » un coffret : retire les sous-titres que la composition avait
+/// posés ([`poser_les_sous_titres`]), sur les albums rendus. Seulement ceux
+/// que le marqueur retient, et seulement s'ils portent encore le titre
+/// d'origine — un nom changé depuis est celui de l'utilisateur.
+pub fn retirer_les_sous_titres(
+    db: &Arc<dyn DbBackend>,
+    albums: &[i64],
+    marqueur: &Marqueur,
+) -> Result<(), TuneError> {
+    if albums.is_empty() {
+        return Ok(());
+    }
+    let liste = albums
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let (p1, _) = placeholders(db);
+    let sql = format!(
+        "UPDATE tracks SET disc_subtitle = NULL WHERE album_id IN ({liste}) \
+         AND disc_subtitle = {p1}"
+    );
+    for d in marqueur
+        .disques
+        .iter()
+        .filter(|d| marqueur.sous_titres.contains(&d.n))
+    {
+        db.execute(&sql, &[&d.titre.trim().to_string() as &dyn ToSqlValue])?;
+    }
+    Ok(())
 }
 
 /// Ce que la passe a fait — et ce qu'elle a laissé, par raison.
@@ -569,6 +694,10 @@ pub fn defaire(db: &Arc<dyn DbBackend>, cible: i64) -> Result<Vec<i64>, RefusDef
         repo.force_update_title(cible, &premier.titre)?;
     }
     repo.update_track_count(cible)?;
+    let rendus: Vec<i64> = std::iter::once(cible)
+        .chain(recrees.iter().copied())
+        .collect();
+    retirer_les_sous_titres(db, &rendus, &marqueur)?;
     meta.delete(cible, CLE_COFFRET)?;
     let mut r = refus(db);
     r.insert(marqueur.cle.clone());

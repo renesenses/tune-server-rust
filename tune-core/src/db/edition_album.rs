@@ -1499,6 +1499,11 @@ pub fn defaire_coffret_manuel(
             ne_plus_tenir(db, album_id, "title")?;
         }
     }
+    // Fil 2094 — les sous-titres que la composition avait posés.
+    let rendus: Vec<i64> = std::iter::once(album_id)
+        .chain(recrees.iter().copied())
+        .collect();
+    super::coffrets_auto::retirer_les_sous_titres(db, &rendus, &marqueur)?;
     AlbumMetadataRepo::with_backend(db.clone()).delete(album_id, CLE_COFFRET)?;
 
     // Plus de disposition tenue ; les renommages de pistes suivent la piste.

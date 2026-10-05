@@ -3813,6 +3813,20 @@ pub(super) async fn composer_coffret(
             titre_compose = Some(t.to_string());
         }
     }
+    // Fil 2094 — le titre d'origine de chaque disque devient son sous-titre,
+    // sauf s'il est celui du coffret. AVANT la disposition tenue, plus bas :
+    // c'est elle qui fait survivre le nom du disque à une relecture des
+    // fichiers.
+    let titre_du_coffret = titre_compose
+        .clone()
+        .or_else(|| repo.get(cible).ok().flatten().map(|a| a.title))
+        .unwrap_or_else(|| titres[0].clone());
+    let sous_titres =
+        coffrets_auto::poser_les_sous_titres(&state.backend, cible, &disques, &titre_du_coffret)
+            .unwrap_or_else(|e| {
+                tracing::warn!(album = cible, erreur = %e, "coffret_manuel_sous_titres_non_poses");
+                Vec::new()
+            });
     // Le marqueur `manuel` : la passe automatique ne touchera JAMAIS à ce
     // coffret — ni pour y ajouter un disque frère, ni pour l'absorber ailleurs.
     // Sans lui, un coffret manuel ne se distingue d'un coffret réparti sur
@@ -3822,6 +3836,7 @@ pub(super) async fn composer_coffret(
         disques,
         titre_compose,
         titre_tenu_avant,
+        sous_titres,
         ..coffrets_auto::Marqueur::manuel()
     })
     .unwrap_or_default();

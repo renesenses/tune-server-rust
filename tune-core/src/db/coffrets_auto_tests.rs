@@ -886,3 +886,152 @@ pub(crate) fn scenario_windows(db: &Arc<dyn DbBackend>) {
 fn chemins_windows_sur_sqlite() {
     scenario_windows(&sqlite());
 }
+
+/// `(numéro de disque, sous-titre)` des pistes d'un album, distincts, triés.
+fn sous_titres_de(db: &Arc<dyn DbBackend>, album: i64) -> Vec<(i64, Option<String>)> {
+    let (p1, _) = placeholders(db);
+    let mut v: Vec<(i64, Option<String>)> = db
+        .query_many(
+            &format!(
+                "SELECT DISTINCT COALESCE(disc_number, 1), disc_subtitle FROM tracks \
+                 WHERE album_id = {p1}"
+            ),
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r.first().and_then(|v| v.as_i64()).unwrap_or(-1),
+                r.get(1).and_then(|v| v.as_string()),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Fil 2094 (décision de Bertrand du 05/10/2026) — réunir un coffret fait du
+/// titre d'ORIGINE de chaque disque son sous-titre de disque, sauf quand il
+/// est celui du coffret ; un nom déjà porté par un disque reste le sien ;
+/// « Défaire » retire ce que la réunion a posé, et rien d'autre.
+///
+/// Avant : la fiche affichait « Disque 1 », « Disque 2 » — les titres
+/// d'origine ne vivaient que dans le marqueur `coffret`.
+pub(crate) fn scenario_sous_titres_2094(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let bach = artiste(db, "Jean-Sébastien Bach");
+    let r = "/m/CLASSIQUE/Bach";
+    let d1 = disque(
+        db,
+        "Cantates, Disc 1",
+        bach,
+        &format!("{r}/Cantates, Disc 1"),
+        2,
+        1,
+    );
+    let d2 = disque(
+        db,
+        "Cantates, Disc 2",
+        bach,
+        &format!("{r}/Cantates, Disc 2"),
+        2,
+        2,
+    );
+    // Le disque 3 porte DÉJÀ un nom (balise DISCSUBTITLE) sur une piste.
+    let d3 = disque(
+        db,
+        "Cantates, Disc 3",
+        bach,
+        &format!("{r}/Cantates, Disc 3"),
+        2,
+        3,
+    );
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!(
+            "UPDATE tracks SET disc_subtitle = {p1} WHERE id = \
+             (SELECT MIN(id) FROM tracks WHERE album_id = {p2})"
+        ),
+        &[&"BWV 140" as &dyn ToSqlValue, &d3],
+    )
+    .unwrap();
+    assert_eq!(sous_titres_de(db, d1), vec![(1, None)], "avant : aucun nom");
+
+    let rapport = passe(db).unwrap();
+    assert_eq!(rapport.reunis, 1, "{rapport:?}");
+    assert_eq!(titre(db, d1), "Cantates");
+    assert!(!existe(db, d2) && !existe(db, d3));
+    assert_eq!(
+        sous_titres_de(db, d1),
+        vec![
+            (1, Some("Cantates, Disc 1".into())),
+            (2, Some("Cantates, Disc 2".into())),
+            (3, None),
+            (3, Some("BWV 140".into())),
+        ],
+        "chaque disque prend son titre d'origine ; le disque 3 garde le sien, entier"
+    );
+    let m = marqueurs(db).unwrap();
+    assert_eq!(m[&d1].sous_titres, vec![1, 2]);
+
+    // DÉFAIRE : les sous-titres posés partent, le nom du disque 3 reste.
+    let recrees = defaire(db, d1).unwrap();
+    assert_eq!(sous_titres_de(db, d1), vec![(1, None)]);
+    let mut restes: Vec<(i64, Option<String>)> = recrees
+        .iter()
+        .flat_map(|id| sous_titres_de(db, *id))
+        .collect();
+    restes.sort();
+    assert_eq!(
+        restes,
+        vec![(2, None), (3, None), (3, Some("BWV 140".into()))],
+        "rien de ce que la réunion avait posé ne reste"
+    );
+
+    // TÉMOIN — des disques au titre IDENTIQUE à celui du coffret : aucun
+    // sous-titre (27 « Arkhangelsk »). Composés à la main faute de marqueur
+    // chiffré dans le titre : la fonction est appelée comme la route le fait.
+    let ark = artiste(db, "Arkhangelsk");
+    let a1 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD01", 1, 1);
+    let a2 = disque(db, "Arkhangelsk", ark, "/m/Arkhangelsk/CD02", 1, 1);
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_number = 2 WHERE album_id = {p1}"),
+        &[&a2 as &dyn ToSqlValue],
+    )
+    .unwrap();
+    db.execute(
+        &format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}"),
+        &[&a1 as &dyn ToSqlValue, &a2],
+    )
+    .unwrap();
+    let retenus = |n, d: &str| DisqueRetenu {
+        n,
+        titre: "Arkhangelsk".into(),
+        dossier: d.into(),
+        artiste_id: Some(ark),
+    };
+    let poses = poser_les_sous_titres(
+        db,
+        a1,
+        &[
+            retenus(1, "/m/Arkhangelsk/CD01"),
+            retenus(2, "/m/Arkhangelsk/CD02"),
+        ],
+        "ARKHANGELSK ",
+    )
+    .unwrap();
+    assert!(
+        poses.is_empty(),
+        "titre identique (casse, espaces) : {poses:?}"
+    );
+    assert_eq!(sous_titres_de(db, a1), vec![(1, None), (2, None)]);
+}
+
+#[test]
+fn sous_titres_2094_sur_sqlite() {
+    scenario_sous_titres_2094(&sqlite());
+}
