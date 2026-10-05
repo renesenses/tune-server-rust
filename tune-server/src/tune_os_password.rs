@@ -188,6 +188,26 @@ mod tests {
         assert!(PASSWORD_SCRIPT.contains(r#"install -m 0600 "$INITIAL_SECRET""#));
     }
 
+    /// #5617 — the embedded policy, fed on stdin exactly as in production,
+    /// must reach `main`. A probe mode stops at its root check or its usage
+    /// line, without touching any account.
+    #[test]
+    fn embedded_policy_reaches_main_when_fed_on_stdin() {
+        let mut command = Command::new("/bin/bash");
+        command.args(["-s", "--", "--sonde"]);
+        let output = run_policy(command, Stdio::piped()).expect("bash lancé");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unbound variable"),
+            "politique arrêtée avant main : {stderr}"
+        );
+        assert!(
+            stderr.contains("exécutée par root") || stderr.contains("usage:"),
+            "main jamais atteint : {stderr}"
+        );
+        assert!(!output.status.success());
+    }
+
     #[test]
     fn embedded_policy_never_reintroduces_the_public_password() {
         assert!(PASSWORD_SCRIPT.contains("password_matches_legacy"));

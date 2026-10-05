@@ -102,6 +102,8 @@ pub(super) async fn lyrics_status(State(state): State<AppState>) -> Result<Json<
         // dernier bilan. Une interface doit pouvoir dire « désactivé » sans
         // avoir à lancer la passe pour l'apprendre.
         "write_enabled": lyrics_pass::write_consent_given(&state.backend),
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE:
+            crate::routes::ecriture_fichiers::autorisee(&state),
         "write_target": lyrics_pass::WriteTarget::from_settings(&state.backend),
         "write_result": write_result,
     })))
@@ -262,6 +264,23 @@ pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResp
                 "setting": lyrics_pass::SETTING_WRITE_ENABLED,
                 "message": "l'écriture dans les fichiers n'est pas autorisée \
                             (lyrics_write_files_enabled)",
+            })),
+        );
+    }
+    // La cible « étiquette » réécrit le fichier AUDIO : elle exige en plus le
+    // réglage général (désactivé par défaut). Le `.lrc` voisin, non.
+    if target == lyrics_pass::WriteTarget::Tag
+        && !crate::routes::ecriture_fichiers::autorisee(&state)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "refused",
+                "reason": tune_core::metadata::ecriture_fichiers::CODE_REFUS,
+                "error": tune_core::metadata::ecriture_fichiers::CODE_REFUS,
+                "code": tune_core::metadata::ecriture_fichiers::CODE_REFUS,
+                "setting": tune_core::metadata::ecriture_fichiers::CLE,
+                "message": tune_core::metadata::ecriture_fichiers::MOTIF_REFUS,
             })),
         );
     }

@@ -148,10 +148,7 @@ SORTIE = os.path.join(BASE, "etat", "nouveautes.tsv")
 EN_VOL = os.path.join(BASE, "etat", "instantane-forum.encours.json")
 
 API = "https://mozaiklabs.fr/api/v1/forum"
-TOKEN = os.environ.get(
-    "FORUM_API_TOKEN",
-    "5fed36d6029c5c11058925682c77d0a99e49f32c8b0d8d09e96009ba208869cc",
-)
+TOKEN = os.environ.get("FORUM_API_TOKEN")
 
 # Les quatre comptes d'equipe. Sans « Bertrand Clech » (id 5), un balayage
 # declare « jamais repondu » des fils qui l'ont ete — vecu, cf tune-stubs.md.
@@ -166,6 +163,8 @@ EN_TETE = ["type", "id", "fil", "slug", "date", "auteur", "camp", "titre_du_fil"
 # ---------------------------------------------------------------- transport
 
 def http(url):
+    if not TOKEN:
+        raise SystemExit("FORUM_API_TOKEN absent de l'environnement")
     dernier = None
     for essai in range(TENTATIVES):
         try:
