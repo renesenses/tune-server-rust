@@ -3117,8 +3117,28 @@ async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
 
     match scheduler.get_alarm(id) {
         Ok(Some(alarm)) => {
-            scheduler.fire_alarm(&alarm).await;
-            Json(json!({ "id": id, "tested": true })).into_response()
+            let zones = scheduler.fire_alarm(&alarm).await;
+            // #5669 (décision de Bertrand du 05/10) : l'essai ne coupe pas la
+            // musique. Aucune zone n'a sonné parce qu'elles jouaient toutes :
+            // on le dit, au lieu d'un « tested » qui n'a rien testé.
+            if zones.sonnees.is_empty() && !zones.sautees.is_empty() {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "zone_en_lecture",
+                        "message": "La zone joue déjà : le test n'a pas été lancé",
+                        "zones": zones.sautees,
+                    })),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "id": id,
+                "tested": true,
+                "zones": zones.sonnees,
+                "zones_en_lecture": zones.sautees,
+            }))
+            .into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
