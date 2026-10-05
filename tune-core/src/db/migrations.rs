@@ -2255,6 +2255,27 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "listen_history_album_id_index",
         up: "",
     },
+    // Section « Live » de la fiche artiste (Bertrand, 05/10/2026, suite de
+    // #5616) — `albums.release_secondary_types` : les types SECONDAIRES
+    // MusicBrainz (`live`, `compilation`, `soundtrack`, `remix`…) séparés par
+    // `;`. `albums.release_type` ne garde que le primaire : sans cette
+    // colonne, un live restait dans Albums.
+    //
+    // Numérotée 117 / PG 081, PAS 116 / 080 : la 116 et la PG 080 sont prises
+    // par #5763 (`albums_identification_tentee_le`), PR ouverte vers
+    // `batch/feat-rc3-20261002` en même temps que celle-ci. Le lanceur ne joue
+    // que `version > MAX` : une 117 appliquée AVANT la 116 ferait sauter la 116
+    // en silence. Cette migration EXIGE donc #5763 fusionnée avant elle —
+    // sinon, elle se renumérote à la promotion. `migration_count_matches` le
+    // signale tant que la 116 manque.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 081.
+    Migration {
+        version: 117,
+        name: "albums_types_secondaires",
+        up: "",
+    },
 ];
 
 /// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
@@ -3292,6 +3313,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Index de `listen_history.album_id` (fil 2130).
             index_historique_album_id(db);
         }
+        if migration.version == 117 {
+            // Types secondaires MusicBrainz (section « Live »). Sans défaut :
+            // NULL = INCONNU pour tout album existant ; le prochain scan qui
+            // relit ses fichiers les pose depuis la balise.
+            add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3639,6 +3666,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // NOMME desormais `a.release_type`. Une base qui arriverait ici sans la
     // colonne ferait echouer TOUTES les requetes d'albums.
     add_column_if_missing(db, "albums", "release_type", "TEXT");
+
+    // Types secondaires du disque (migration v117, section « Live »). La fiche
+    // artiste NOMME cette colonne : une base qui arriverait ici sans elle
+    // perdrait la section « Live ».
+    add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
 
     // Credits MusicBrainz par disque (migration v107, #4767). La page artiste
     // et la passe des credits NOMMENT ces deux colonnes : une base qui
@@ -4544,6 +4576,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         79,
         "listen_history_album_id_index",
         include_str!("../../migrations/postgres/079_listen_history_album_id_index.sql"),
+    ),
+    // Jumelle de la SQLite 117 (section « Live ») : types secondaires du
+    // disque. Numérotée 81 : la 80 est prise par #5763, PR ouverte en même
+    // temps. Elle EXIGE la 80 avant elle — la garde de contiguïté le signale.
+    (
+        81,
+        "albums_types_secondaires",
+        include_str!("../../migrations/postgres/081_albums_types_secondaires.sql"),
     ),
 ];
 
@@ -6800,6 +6840,75 @@ mod tests {
         }
     }
 
+    /// Section « Live » — la migration 117 pose `albums.release_secondary_types`
+    /// sur une base ANCIENNE (sans toucher aux lignes, qui naissent INCONNUES)
+    /// comme sur une base NEUVE, et sa jumelle PG 081 est enregistrée.
+    #[test]
+    fn migration_117_pose_les_types_secondaires() {
+        let colonnes = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut st = conn.prepare("PRAGMA table_info(albums)").unwrap();
+            st.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert!(
+            colonnes(&neuve)
+                .iter()
+                .any(|c| c == "release_secondary_types")
+        );
+
+        let ancienne = SqliteDb::open_in_memory().unwrap();
+        ancienne
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist_id INTEGER,
+                    year INTEGER,
+                    folder_path TEXT
+                );
+                INSERT INTO albums (title) VALUES ('Live Rust');",
+            )
+            .unwrap();
+        ancienne.init_schema().unwrap();
+        run_migrations(&ancienne).unwrap();
+        assert!(
+            colonnes(&ancienne)
+                .iter()
+                .any(|c| c == "release_secondary_types")
+        );
+        let t: Option<String> = ancienne
+            .connection()
+            .lock()
+            .unwrap()
+            .query_row("SELECT MAX(release_secondary_types) FROM albums", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(t.is_none(), "un album existant reste INCONNU : {t:?}");
+
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 117 && m.name == "albums_types_secondaires")
+        );
+        let sql_pg = include_str!("../../migrations/postgres/081_albums_types_secondaires.sql");
+        assert!(sql_pg.contains("ADD COLUMN IF NOT EXISTS release_secondary_types TEXT"));
+        assert!(sql_pg.contains("VALUES (81, 'albums_types_secondaires')"));
+        assert!(
+            include_str!("migrations.rs")
+                .contains("(\n        81,\n        \"albums_types_secondaires\"")
+        );
+    }
+
     #[test]
     fn migration_count_matches() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -7289,7 +7398,11 @@ mod tests {
         // SQLite 115. L'index de `listen_history.album_id` que la jointure de
         // « Reprendre l'écoute » réécrite en `UNION ALL` emprunte. La 78 est
         // celle de #5706.
-        assert_eq!(pg_latest_version(), 79, "latest PG migration must be 79");
+        // 80 : `albums_identification_tentee_le` (#5763).
+        // 81 : `albums_types_secondaires` (section « Live »), jumelle de la
+        // SQLite 117. Pose `albums.release_secondary_types`, que la fiche
+        // artiste NOMME.
+        assert_eq!(pg_latest_version(), 81, "latest PG migration must be 81");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

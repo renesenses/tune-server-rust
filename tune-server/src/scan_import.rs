@@ -419,6 +419,8 @@ pub struct TrackImporter {
     /// #5616 — albums dont le type de sortie de la balise a déjà été proposé
     /// pendant ce scan : un seul `UPDATE` par album, pas un par piste.
     types_de_sortie_poses: HashSet<i64>,
+    /// Section « Live » — même marque pour les types SECONDAIRES de la balise.
+    types_secondaires_poses: HashSet<i64>,
     /// `(dossier, album)` dont la décision « compilation » a déjà été
     /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
     /// écrirait la même ligne huit cents fois.
@@ -559,6 +561,7 @@ impl TrackImporter {
             preuves,
             albums_reclasses: HashSet::new(),
             types_de_sortie_poses: HashSet::new(),
+            types_secondaires_poses: HashSet::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
@@ -1695,6 +1698,19 @@ impl TrackImporter {
                 tracing::warn!(album_id = aid, error = %e, "type_de_sortie_balise_non_pose");
             }
         }
+        // Section « Live » — les types SECONDAIRES de la même balise (`live`,
+        // `remix`…) remplissent `albums.release_secondary_types` s'il est
+        // VIDE, sous la même règle : une valeur connue n'est jamais écrasée.
+        if let (Some(aid), Some(secondaires)) = (album_id, meta.release_secondary_types.as_deref())
+            && self.types_secondaires_poses.insert(aid)
+        {
+            if let Err(e) = self
+                .album_repo
+                .poser_types_secondaires_si_vides(aid, secondaires)
+            {
+                tracing::warn!(album_id = aid, error = %e, "types_secondaires_balise_non_poses");
+            }
+        }
 
         // #5202 — la pochette (jaquette, image du dossier, image d'artiste)
         // relit le DISQUE. Dans un lot de scan, ce travail est DIFFÉRÉ après
@@ -2082,6 +2098,76 @@ mod tests {
         albums.definir_type_de_sortie(ids[0], "album").unwrap();
         importer(&lot);
         assert_eq!(type_de(ids[0]).as_deref(), Some("album"));
+    }
+
+    /// Section « Live » — les types secondaires de la balise atteignent
+    /// `albums.release_secondary_types` quand la colonne est vide, et
+    /// n'écrasent JAMAIS une valeur déjà connue.
+    #[test]
+    fn les_types_secondaires_de_la_balise_remplissent_la_colonne_vide() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+
+        let fichier = |dossier: &str, n: u32, secondaires: Option<&str>| {
+            let d = tmp.path().join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut f = sf(&d.join(format!("0{n}.flac")).to_string_lossy());
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{dossier} {n}")),
+                artist: Some("Neil Young".into()),
+                album: Some(dossier.to_string()),
+                album_artist: Some("Neil Young".into()),
+                track_number: Some(n),
+                release_type: Some("album".into()),
+                release_secondary_types: secondaires.map(String::from),
+                ..Default::default()
+            });
+            f
+        };
+        let importer = |lot: &[ScannedFile]| {
+            let mut imp = TrackImporter::new(
+                backend.clone(),
+                true,
+                tmp.path().to_path_buf(),
+                PorteeDuScan::TOUT,
+            );
+            imp.begin_batch(lot);
+            lot.iter()
+                .map(|f| imp.import(f).expect("import").1.expect("un album"))
+                .collect::<Vec<i64>>()
+        };
+        let types_de = |id: i64| {
+            albums
+                .types_secondaires_par_album(&[id])
+                .unwrap()
+                .remove(&id)
+        };
+
+        let lot = vec![
+            fichier("Live Rust", 1, None),
+            fichier("Live Rust", 2, Some("live")),
+            fichier("Harvest", 1, None),
+        ];
+        let ids = importer(&lot);
+        assert_eq!(types_de(ids[0]), Some(vec!["live".to_string()]));
+        assert_eq!(types_de(ids[2]), None, "sans balise, rien n'est inventé");
+
+        // Une valeur déjà connue n'est pas écrasée par un scan suivant.
+        assert!(
+            !albums
+                .poser_types_secondaires_si_vides(ids[0], "remix")
+                .unwrap()
+        );
+        let relu = vec![fichier("Live Rust", 1, Some("compilation"))];
+        importer(&relu);
+        assert_eq!(types_de(ids[0]), Some(vec!["live".to_string()]));
     }
 
     #[test]
