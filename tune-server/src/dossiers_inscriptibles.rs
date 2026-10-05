@@ -187,6 +187,13 @@ pub fn rapport(refus: &[Refus], processus: Option<(u32, u32)>, conteneur: bool) 
         }
         if systeme_en_lecture_seule(&r.erreur) {
             t.push_str("    It is mounted READ-ONLY: mount it read-write (drop `:ro`).\n");
+        } else if processus.is_some()
+            && r.proprietaire.map(|(ou, _)| ou) == processus.map(|(u, _)| u)
+        {
+            // Le compte est déjà propriétaire : c'est le mode, pas le chown.
+            t.push_str(&format!(
+                "    It already belongs to this account but is not writable: chmod u+rwx {d}\n"
+            ));
         }
     }
     t.push_str("How to fix:\n");
@@ -357,6 +364,12 @@ mod tests {
         let moi = identite_du_processus().unwrap();
         assert_eq!(refus[0].proprietaire, Some(moi), "propriétaire relevé");
 
+        let texte = rapport(&refus, Some(moi), false);
+        assert!(
+            texte.contains(&format!("chmod u+rwx {}", data.display())),
+            "{texte}"
+        );
+
         let texte = rapport(&refus, Some((1000, 1000)), true);
         assert!(texte.contains("uid=1000 gid=1000"), "{texte}");
         assert!(
@@ -394,6 +407,10 @@ mod tests {
         );
         assert!(texte.contains("owned by uid=0 gid=0"), "{texte}");
         assert!(!texte.contains("<host folder"), "{texte}");
+        assert!(
+            !texte.contains("chmod"),
+            "root propriétaire : chown, pas chmod : {texte}"
+        );
     }
 
     #[cfg(unix)]
