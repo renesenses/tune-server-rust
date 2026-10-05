@@ -261,16 +261,198 @@ fn la_decision_pure() {
 
     use decisions::{SuiteAdoption, suite_de_l_adoption};
     assert_eq!(
-        suite_de_l_adoption(2_000, 237_000, uri_finie, "bbbb-armee", finie, false, 1, 3),
+        suite_de_l_adoption(2_000, 237_000, uri_finie, "bbbb-armee", true, false, 1, 3),
         SuiteAdoption::EnAttente,
-        "le mouvement d'un rejeu ne vaut pas signe de vie"
+        "le mouvement d'un rejeu avéré ne vaut pas signe de vie"
     );
     assert_eq!(
-        suite_de_l_adoption(2_000, 237_000, uri_finie, "bbbb-armee", finie, false, 3, 3),
+        suite_de_l_adoption(2_000, 237_000, uri_finie, "bbbb-armee", true, false, 3, 3),
         SuiteAdoption::Infirmee
     );
     assert_eq!(
-        suite_de_l_adoption(2_000, 237_000, uri_armee, "bbbb-armee", finie, false, 1, 3),
+        suite_de_l_adoption(2_000, 237_000, uri_finie, "bbbb-armee", false, false, 1, 3),
+        SuiteAdoption::Confirmee,
+        "sans rejeu avéré, la règle d'avant : le mouvement confirme"
+    );
+    assert_eq!(
+        suite_de_l_adoption(2_000, 237_000, uri_armee, "bbbb-armee", true, false, 1, 3),
         SuiteAdoption::Confirmee
     );
+
+    // Le rejeu AVÉRÉ : les trois signes ensemble, aucun seul.
+    use decisions::{debit_soutenu, rejeu_de_la_piste_finie_avere as avere};
+    assert!(avere(uri_finie, finie, "bbbb-armee", 2_000, 237_000, false));
+    assert!(
+        !avere(uri_finie, finie, "bbbb-armee", 237_000, 237_000, false),
+        "DMP-A6 (#4382) : URI de N, position figée en fin de piste — pas un rejeu"
+    );
+    assert!(
+        !avere(uri_finie, finie, "bbbb-armee", 60_000, 237_000, false),
+        "une position loin du début n'est pas « reparti de zéro »"
+    );
+    assert!(
+        !avere(uri_finie, finie, "bbbb-armee", 2_000, 237_000, true),
+        "le flux adopté tiré à débit soutenu : vrai enchaînement, URI en retard"
+    );
+    assert!(!avere(
+        uri_armee,
+        finie,
+        "bbbb-armee",
+        2_000,
+        237_000,
+        false
+    ));
+    assert!(!avere(None, finie, "bbbb-armee", 2_000, 237_000, false));
+    assert!(
+        !avere(uri_finie, finie, "bbbb-armee", 2_000, 0, false),
+        "sans position de référence, pas de recul jugé"
+    );
+
+    assert!(!debit_soutenu(Some(1_000_000), 200), "trop tôt pour juger");
+    assert!(!debit_soutenu(None, 2_000));
+    assert!(!debit_soutenu(Some(0), 3_000), "rien tiré");
+    assert!(
+        !debit_soutenu(Some(30_000), 3_000),
+        "10 ko/s : en deçà du MP3 128 k"
+    );
+    assert!(
+        debit_soutenu(Some(3 * 176_400), 3_000),
+        "WAV 44,1/16 au temps réel"
+    );
+    assert!(
+        debit_soutenu(Some(3 * 16_000), 3_000),
+        "MP3 128 k au temps réel"
+    );
+}
+
+/// Les octets tirés du flux adopté DEPUIS le début de la surveillance, au
+/// débit de `octets_par_seconde`, sur `secs` secondes.
+impl Banc {
+    async fn le_flux_adopte_est_tire_depuis(
+        &mut self,
+        flux: &str,
+        octets_par_seconde: u64,
+        secs: u64,
+    ) {
+        let a_l_adoption = self
+            .surveillance()
+            .expect("une surveillance doit être en cours")
+            .octets_a_l_adoption
+            .unwrap_or(0);
+        self.le_renderer_tire(flux, a_l_adoption + octets_par_seconde * secs)
+            .await;
+        self.vieillir_la_surveillance(secs);
+    }
+}
+
+/// **Le cas A6 (#4382), non touché par #5411.** `Next` acquitté, l'appareil
+/// nomme encore N, sa position reste figée à la durée, et il tire le flux
+/// armé (~1,26× le temps réel, relevé de terrain). Le rejeu n'est PAS avéré
+/// (la position n'a pas reculé) : rien d'anticipé dans le délai, et au délai,
+/// exactement le repli d'avant ce correctif — qui reste l'affaire de #4382.
+#[tokio::test]
+async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avant() {
+    let mut banc = Banc::monter().await;
+    banc.la_suivante_est_tenue_et_le_next_ignore().await;
+    let (flux, _) = banc.armer().await;
+    banc.le_renderer_tire(&flux, OCTETS_TIRES).await;
+    let uri_finie = banc.uri_de_la_piste_finie();
+    banc.le_renderer_rapporte(Some(uri_finie.clone())).await;
+    banc.la_fin_a_l_horloge().await;
+    assert_eq!(
+        banc.surveillance().map(|s| s.preuve),
+        Some(decisions::EnchainementArme::Bascule)
+    );
+
+    // Dans le délai : figé, URI de N, flux armé tiré à ~1,26× le WAV.
+    banc.le_flux_adopte_est_tire_depuis(&flux, 222_000, 2).await;
+    banc.renderer_a(POSITION_GELEE_MS, 2).await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_some(),
+        "aucune infirmation anticipée : on attend le délai, comme avant"
+    );
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+    assert!(
+        !decisions::rejeu_de_la_piste_finie_avere(
+            Some(&uri_finie),
+            Some(&banc.flux_finie),
+            &flux,
+            POSITION_GELEE_MS,
+            POSITION_GELEE_MS,
+            true,
+        ),
+        "figé en fin de piste : pas un rejeu au sens de #5411"
+    );
+
+    // Au délai : le repli d'avant ce correctif, mot pour mot (#4382 décidera).
+    banc.le_flux_adopte_est_tire_depuis(&flux, 222_000, BASCULE_DELAI_SECS + 1)
+        .await;
+    banc.renderer_a(POSITION_GELEE_MS, BASCULE_DELAI_SECS + 1)
+        .await;
+    banc.tic().await;
+    assert_eq!(banc.play_complets().await, vec![ARMEE.to_string()]);
+}
+
+/// **Vrai enchaînement, URI en retard (bascule).** L'appareil a bien changé
+/// de piste — sa position repart de zéro et il tire le flux adopté au débit
+/// de lecture — mais sa `TrackURI` nomme encore N. Pas de relance.
+#[tokio::test]
+async fn un_vrai_enchainement_avec_uri_en_retard_n_est_pas_relance() {
+    let mut banc = Banc::monter().await;
+    banc.la_suivante_est_tenue_et_le_next_ignore().await;
+    let (flux, _) = banc.armer().await;
+    banc.le_renderer_tire(&flux, OCTETS_TIRES).await;
+    banc.le_renderer_rapporte(Some(banc.uri_de_la_piste_finie()))
+        .await;
+    banc.la_fin_a_l_horloge().await;
+
+    banc.le_flux_adopte_est_tire_depuis(&flux, 176_400, 2).await;
+    banc.renderer_a(2_000, 2).await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_none(),
+        "le flux adopté tiré au débit de lecture : l'enchaînement est confirmé"
+    );
+    assert_eq!(
+        banc.play_complets().await,
+        Vec::<String>::new(),
+        "aucune relance d'une piste qui joue"
+    );
+    let (position, titre, _) = banc.ecran().await;
+    assert_eq!((position, titre.as_str()), (1, ARMEE));
+}
+
+/// **Vrai enchaînement, URI en retard (retombée de position).** Même chose
+/// sur le chemin de la retombée : la surveillance posée est levée par le
+/// débit tiré du flux armé, sans relance.
+#[tokio::test]
+async fn une_retombee_avec_uri_en_retard_et_flux_arme_tire_n_est_pas_relancee() {
+    let mut banc = Banc::monter().await;
+    banc.fin_de_la_piste_finie().await;
+    let flux = banc
+        .orchestrator
+        .flux_pre_arme(banc.zone_id)
+        .await
+        .expect("flux armé");
+    banc.le_renderer_rapporte(Some(banc.uri_de_la_piste_finie()))
+        .await;
+    banc.le_renderer_signale(crate::outputs::traits::TransportState::Playing, 1_000)
+        .await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_some(),
+        "prémisse : avance surveillée"
+    );
+
+    banc.le_flux_adopte_est_tire_depuis(&flux, 176_400, 2).await;
+    banc.renderer_a(3_000, 2).await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_none(),
+        "le débit sur le flux armé confirme l'enchaînement"
+    );
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+    let (position, titre, _) = banc.ecran().await;
+    assert_eq!((position, titre.as_str()), (1, ARMEE));
 }

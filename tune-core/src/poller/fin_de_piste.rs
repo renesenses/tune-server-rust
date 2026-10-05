@@ -836,7 +836,13 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         status: &OutputStatus,
+        duree_de_la_piste_finie_ms: u64,
     ) -> Option<AdoptionHorloge> {
+        // Sans durée connue, le recul de position ne se juge pas : la règle
+        // d'avant.
+        if duree_de_la_piste_finie_ms == 0 {
+            return None;
+        }
         let flux_fini = zone_state
             .now_playing
             .as_ref()
@@ -858,13 +864,20 @@ impl PositionPoller {
             flux_arme = ?flux_arme,
             "gapless_retombee_sur_la_piste_finie_surveillee"
         );
+        // Le débit tiré du flux armé se mesure à partir d'ici.
+        let octets_a_l_adoption = match flux_arme.as_deref() {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
         Some(AdoptionHorloge {
             depuis: Instant::now(),
-            position_figee_ms: status.position_ms,
+            // La référence du recul : la fin de la piste finie, d'où le
+            // renderer vient de retomber.
+            position_figee_ms: duree_de_la_piste_finie_ms,
             flux: flux_arme.unwrap_or_default(),
             preuve: decisions::EnchainementArme::RejeuDeLaPisteFinie,
             delai_secs: BASCULE_DELAI_SECS,
-            octets_a_l_adoption: None,
+            octets_a_l_adoption,
             flux_fini,
         })
     }

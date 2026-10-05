@@ -1486,6 +1486,58 @@ pub fn renderer_rejoue_la_piste_finie(
         && !uri_nomme_le_flux(current_uri, flux_arme)
 }
 
+/// #5411 — au-delà de cette position, un renderer n'est plus « reparti du
+/// début » : la surveillance dure trois à huit secondes, un rejeu s'y voit
+/// bien en deçà.
+pub const REJEU_DEPUIS_LE_DEBUT_MAX_MS: u64 = 15_000;
+
+/// #5411 — débit minimal (octets par seconde, depuis le début de la
+/// surveillance) sur le flux ADOPTÉ pour dire que le renderer le consomme :
+/// 16 000 o/s, soit 128 kbit/s, le plus bas des débits de lecture servis
+/// (MP3 128 k). Un renderer qui rejoue la piste finie ne tire rien du flux
+/// adopté ; un renderer qui a vraiment enchaîné le tire au moins au débit de
+/// lecture, même quand sa `TrackURI` est en retard. C'est un DÉBIT, pas un
+/// volume : le compteur cumule toutes les connexions, sondages compris.
+pub const DEBIT_SOUTENU_MIN_OCTETS_S: u64 = 16_000;
+
+/// #5411 — le flux adopté est-il tiré à un débit soutenu depuis le début de
+/// la surveillance ? Moins d'une demi-seconde de recul : on ne sait pas, donc
+/// non (la décision attend de toute façon son délai pour infirmer).
+pub fn debit_soutenu(octets_depuis_adoption: Option<u64>, age_ms: u64) -> bool {
+    age_ms >= 500
+        && octets_depuis_adoption
+            .is_some_and(|o| o.saturating_mul(1000) / age_ms >= DEBIT_SOUTENU_MIN_OCTETS_S)
+}
+
+/// #5411 — le rejeu de la piste finie est-il AVÉRÉ ? Les trois signes
+/// ensemble, aucun seul :
+///
+/// 1. l'URI courante nomme le flux de la piste finie, pas le flux adopté ;
+/// 2. la position a RECULÉ : revenue près de zéro
+///    ([`REJEU_DEPUIS_LE_DEBUT_MAX_MS`]), loin de la position de référence
+///    (la fin de la piste finie). Un renderer figé en fin de piste (le
+///    DMP-A6 de #4382 : URI de N, position gelée à la durée) n'en relève
+///    pas ;
+/// 3. aucun débit soutenu sur le flux adopté ([`debit_soutenu`]). Un
+///    renderer qui a vraiment enchaîné mais rapporte sa `TrackURI` en retard
+///    tire le flux adopté : il n'en relève pas.
+///
+/// Faux dans tout autre cas : la règle d'avant s'applique.
+pub fn rejeu_de_la_piste_finie_avere(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_adopte: &str,
+    position_ms: u64,
+    position_de_reference_ms: u64,
+    debit_soutenu_sur_le_flux_adopte: bool,
+) -> bool {
+    uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, Some(flux_adopte))
+        && position_ms <= REJEU_DEPUIS_LE_DEBUT_MAX_MS
+        && position_ms.saturating_add(MOUVEMENT_MINIMAL_MS) <= position_de_reference_ms
+        && !debit_soutenu_sur_le_flux_adopte
+}
+
 /// #3967 — a-t-on le droit de demander au renderer de basculer LUI-MÊME sur
 /// la suivante, plutôt que de tout relancer ?
 ///
@@ -1596,20 +1648,18 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// 🔴 Fil 2031 (#5411, Sony BD-P2100 en DLNA) : « à la fin du morceau N, le
 /// N+1 est en surbrillance, mais le N est rejoué du début ; à la fin, le N+2
 /// est joué ». Un renderer qui REPART DE ZÉRO SUR LA PISTE FINIE bouge, lui
-/// aussi : sa position quitte la valeur gelée. Si l'URI qu'il rapporte nomme
-/// encore le flux de la piste finie (`flux_fini`), ce mouvement est celui
-/// d'un rejeu, pas d'un enchaînement — il ne vaut pas signe de vie, et le
-/// délai écoulé, le repli joue la piste adoptée. C'est la règle que
-/// [`enchainement_sur_le_flux_arme`] applique déjà au moment de la fin : un
-/// renderer qui nomme la piste finie est cru sur parole. Un renderer qui ne
-/// rapporte aucune URI garde la règle d'avant, au mot près.
+/// aussi : sa position quitte la valeur gelée. Quand ce rejeu est AVÉRÉ
+/// (`rejeu_avere`, voir [`rejeu_de_la_piste_finie_avere`] : URI de la piste
+/// finie, position revenue près de zéro, AUCUN débit soutenu sur le flux
+/// adopté), ce mouvement ne vaut pas signe de vie, et le délai écoulé, le
+/// repli joue la piste adoptée. Hors de ce cas, la règle d'avant, au mot près.
 #[allow(clippy::too_many_arguments)]
 pub fn suite_de_l_adoption(
     position_ms: u64,
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
-    flux_fini: Option<&str>,
+    rejeu_avere: bool,
     renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
@@ -1618,10 +1668,8 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    let rejoue_la_piste_finie = !uri_confirme && uri_nomme_le_flux(current_uri, flux_fini);
     let signe_de_vie = uri_confirme
-        || (!rejoue_la_piste_finie
-            && position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS);
+        || (!rejeu_avere && position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS);
     if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {

@@ -633,16 +633,16 @@ fn la_surveillance_pure() {
     use decisions::{SuiteAdoption, suite_de_l_adoption};
     let flux = "3f3eb421";
     assert_eq!(
-        suite_de_l_adoption(237_000, 237_000, None, flux, None, false, 3, 8),
+        suite_de_l_adoption(237_000, 237_000, None, flux, false, false, 3, 8),
         SuiteAdoption::EnAttente
     );
     assert_eq!(
-        suite_de_l_adoption(237_400, 237_000, None, flux, None, false, 3, 8),
+        suite_de_l_adoption(237_400, 237_000, None, flux, false, false, 3, 8),
         SuiteAdoption::EnAttente,
         "un tremblement de quelques centaines de ms n'est pas un signe de vie"
     );
     assert_eq!(
-        suite_de_l_adoption(2_000, 237_000, None, flux, None, false, 1, 8),
+        suite_de_l_adoption(2_000, 237_000, None, flux, false, false, 1, 8),
         SuiteAdoption::Confirmee,
         "la position qui repart confirme"
     );
@@ -652,7 +652,7 @@ fn la_surveillance_pure() {
             237_000,
             Some("http://h/stream/3f3eb421.wav"),
             flux,
-            None,
+            false,
             false,
             1,
             8
@@ -661,18 +661,18 @@ fn la_surveillance_pure() {
         "l'URI qui nomme le flux adopté confirme, position gelée ou pas"
     );
     assert_eq!(
-        suite_de_l_adoption(237_000, 237_000, None, flux, None, false, 8, 8),
+        suite_de_l_adoption(237_000, 237_000, None, flux, false, false, 8, 8),
         SuiteAdoption::Infirmee
     );
     // Fils 1926/1931 — un renderer ARRÊTÉ, position remise à 0 : l'écart
     // avec la position gelée n'est pas un signe de vie.
     assert_eq!(
-        suite_de_l_adoption(0, 237_000, None, flux, None, true, 1, 3),
+        suite_de_l_adoption(0, 237_000, None, flux, false, true, 1, 3),
         SuiteAdoption::EnAttente,
         "arrêté à 0 dans le délai : on attend, on ne confirme pas"
     );
     assert_eq!(
-        suite_de_l_adoption(0, 237_000, None, flux, None, true, 3, 3),
+        suite_de_l_adoption(0, 237_000, None, flux, false, true, 3, 3),
         SuiteAdoption::Infirmee,
         "arrêté à 0, délai écoulé : le repli relance la piste adoptée"
     );
@@ -682,7 +682,7 @@ fn la_surveillance_pure() {
             237_000,
             Some("http://h/stream/3f3eb421.wav"),
             flux,
-            None,
+            false,
             true,
             1,
             3
