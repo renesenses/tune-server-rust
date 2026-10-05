@@ -183,6 +183,12 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "isolement-disque-de-test",
 ] }
 
+# Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
+# RSS mesure tout le processus.
+[[test]]
+name = "memoire_a_froid"
+path = "tests/memoire_a_froid.rs"
+
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
 [[test]]
