@@ -418,6 +418,23 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
 // SMB discovery and mount management
 // ---------------------------------------------------------------------------
 
+/// L'adresse a retenir parmi celles qu'un service mDNS annonce.
+///
+/// `get_addresses()` est un `HashSet` : `first()` y prenait une adresse au
+/// hasard, et un Synology qui publie aussi son IPv6 etait propose tantot sous
+/// l'une, tantot sous l'autre. Daniel Levy (fil 2145) s'est retrouve avec le
+/// meme partage enregistre deux fois. On prefere l'IPv4, puis une IPv6 hors
+/// lien local (une `fe80::` sans zone ne se monte pas), et on trie pour que le
+/// choix soit le meme d'une decouverte a l'autre.
+pub(crate) fn adresse_preferee(addrs: &[std::net::IpAddr]) -> Option<std::net::IpAddr> {
+    let rang = |a: &std::net::IpAddr| match a {
+        std::net::IpAddr::V4(_) => 0,
+        std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) != 0xfe80 => 1,
+        std::net::IpAddr::V6(_) => 2,
+    };
+    addrs.iter().copied().min_by_key(|a| (rang(a), *a))
+}
+
 /// Discover network shares via mDNS service browsing (_smb._tcp).
 async fn list_shares() -> Json<Value> {
     let result = tokio::task::spawn_blocking(|| {
@@ -431,12 +448,14 @@ async fn list_shares() -> Json<Value> {
             match receiver.recv_timeout(Duration::from_millis(500)) {
                 Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
                     let host = info.get_hostname().trim_end_matches('.').to_string();
-                    let addrs: Vec<String> = info
+                    let addrs: Vec<std::net::IpAddr> = info
                         .get_addresses()
                         .iter()
-                        .map(|a| a.to_ip_addr().to_string())
+                        .map(|a| a.to_ip_addr())
                         .collect();
-                    let ip = addrs.first().cloned().unwrap_or_default();
+                    let ip = adresse_preferee(&addrs)
+                        .map(|a| a.to_string())
+                        .unwrap_or_default();
                     let name = info
                         .get_fullname()
                         .split("._smb._tcp")
@@ -855,8 +874,10 @@ async fn mount_smb_share(
     Json(body): Json<MountRequest>,
 ) -> impl IntoResponse {
     let share_safe = body.share_name.replace(['/', '\\', ' '], "_");
-    let mount_path = body
+    let chemin_impose = body.mount_path.is_some();
+    let mut mount_path = body
         .mount_path
+        .clone()
         .unwrap_or_else(|| format!("/mnt/{}_{}", body.host, share_safe));
 
     // Dry run: just test reachability without mounting
@@ -884,6 +905,53 @@ async fn mount_smb_share(
         .into_response();
     }
 
+    // Fil 2145 (Daniel Levy) : le meme NAS, enregistre une fois sous son IPv6
+    // (decouverte) et une fois sous son IPv4 (saisie), donnait deux lignes et
+    // deux montages du meme dossier — `montage_existant` compare des textes.
+    // On demande donc au serveur son identite SMB2 et on la compare a celle des
+    // partages du meme nom deja enregistres sous une AUTRE adresse. Seulement
+    // quand le chemin n'est pas impose : un chemin choisi a la main reste
+    // celui de l'utilisateur.
+    let mut ligne_cible = None;
+    let mut serveur_du_jumeau = None;
+    if !chemin_impose {
+        let lignes = lignes_smb(&state.backend);
+        if let Some(j) = jumeau_parmi(&body.host, &body.share_name, lignes, |h| async move {
+            smb::guid_du_serveur(&h, 445).await
+        })
+        .await
+        {
+            if smb::est_un_point_de_montage(std::path::Path::new(&j.mount_path)) {
+                info!(
+                    id = j.id, host = %body.host, jumeau = %j.server, share = %body.share_name,
+                    "smb_meme_serveur_deja_monte"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": j.id,
+                        "mounted": true,
+                        "mount_path": j.mount_path,
+                        "existant": true,
+                        "deja_monte": true,
+                        "meme_serveur_que": j.server,
+                    })),
+                )
+                    .into_response();
+            }
+            // Le jumeau n'est pas monte : on monte par la nouvelle adresse, au
+            // point du jumeau, et sa ligne passe a cette adresse. Le chemin ne
+            // change pas — une racine de bibliotheque peut en dependre.
+            info!(
+                id = j.id, host = %body.host, jumeau = %j.server, share = %body.share_name,
+                "smb_meme_serveur_ligne_reprise"
+            );
+            mount_path = j.mount_path.clone();
+            ligne_cible = Some(j.id);
+            serveur_du_jumeau = Some(j.server);
+        }
+    }
+
     // Create mount directory
     if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
         // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
@@ -903,6 +971,34 @@ async fn mount_smb_share(
             Json(json!({ "message": message, "error": motif })),
         )
             .into_response();
+    }
+
+    // Fil 2145 : le point est DEJA monte. Lancer `mount.cifs` par-dessus
+    // rendait `mount error(16)` (EBUSY), puis l'echelle descendait jusqu'a
+    // SMB 1.0 et l'utilisateur lisait « Operation not supported ». Le
+    // remontage au demarrage faisait ce test (`startup.rs`,
+    // `monter_un_partage`) ; la route interactive ne l'avait jamais fait.
+    if smb::est_un_point_de_montage(std::path::Path::new(&mount_path)) {
+        let source = smb::source_du_montage(std::path::Path::new(&mount_path));
+        let admis: Vec<&str> = std::iter::once(body.host.as_str())
+            .chain(serveur_du_jumeau.as_deref())
+            .collect();
+        match source.as_deref() {
+            Some(src)
+                if !admis
+                    .iter()
+                    .any(|h| smb::meme_source(src, h, &body.share_name)) =>
+            {
+                warn!(host = %body.host, path = %mount_path, source = %src, "smb_mount_point_occupe");
+                return point_occupe(&mount_path, Some(src));
+            }
+            _ => {
+                // Meme source, ou source illisible (hors Linux) : le partage
+                // est la, on l'enregistre et on rend son chemin.
+                info!(host = %body.host, share = %body.share_name, path = %mount_path, "smb_mount_deja_monte");
+                return persister_le_montage(&state, ligne_cible, &body, &mount_path, None, true);
+            }
+        }
     }
 
     // Dialecte qui a effectivement monte le partage, a persister pour que le
@@ -1002,8 +1098,9 @@ async fn mount_smb_share(
                     );
                     // Un refus d'authentification ne se repare pas en changeant
                     // de dialecte : inutile de faire patienter l'utilisateur
-                    // vingt secondes de plus pour la meme reponse.
-                    smb::est_refus_d_authentification(&stderr)
+                    // vingt secondes de plus pour la meme reponse. Un point
+                    // deja occupe (EBUSY) non plus (fil 2145).
+                    smb::arrete_l_echelle(&stderr)
                 }
                 Ok(Err(e)) => {
                     // mount.cifs absent ou non executable : reessayer avec un
@@ -1028,10 +1125,14 @@ async fn mount_smb_share(
         dernier.expect("DIALECTES n'est jamais vide")
     };
 
-    let mount_ok = match mount_result {
-        Ok(Ok(out)) if out.status.success() => true,
+    match mount_result {
+        Ok(Ok(out)) if out.status.success() => {}
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // La vraie cause, et non l'erreur du dernier dialecte essaye.
+            if smb::est_deja_monte(&stderr) {
+                return point_occupe(&mount_path, None);
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("mount failed: {stderr}") })),
@@ -1054,40 +1155,177 @@ async fn mount_smb_share(
         }
     };
 
-    // Persist to database
+    persister_le_montage(
+        &state,
+        ligne_cible,
+        &body,
+        &mount_path,
+        dialecte_retenu,
+        false,
+    )
+}
+
+/// 409 : le point de montage est occupe par autre chose que ce partage.
+fn point_occupe(mount_path: &str, source: Option<&str>) -> axum::response::Response {
+    let message = match source {
+        Some(src) => format!(
+            "Le point de montage {mount_path} est déjà occupé par un autre montage ({src}). \
+             Démontez-le, ou choisissez un autre point de montage."
+        ),
+        None => format!(
+            "Le point de montage {mount_path} est déjà occupé (le système répond « Device or \
+             resource busy »). Le partage y est peut-être déjà monté."
+        ),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "message": message, "error": "point_de_montage_occupe" })),
+    )
+        .into_response()
+}
+
+/// Une ligne SMB enregistree : `(id, server, share, mount_path)`.
+type LigneSmb = (i64, String, String, String);
+
+fn lignes_smb(backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<LigneSmb> {
+    backend
+        .query_many(
+            "SELECT id, server, share, mount_path FROM network_mounts \
+             WHERE mount_type = 'smb' ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            Some((
+                r.first()?.as_i64()?,
+                r.get(1)?.as_string()?,
+                r.get(2)?.as_string()?,
+                r.get(3)?.as_string()?,
+            ))
+        })
+        .collect()
+}
+
+/// Une ligne qui designe le MEME partage du MEME serveur, sous une autre
+/// adresse.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Jumeau {
+    pub id: i64,
+    pub server: String,
+    pub mount_path: String,
+}
+
+/// Chercher, parmi `lignes`, le meme partage du meme serveur enregistre sous
+/// une autre adresse que `hote` (fil 2145 : IPv6 et IPv4 d'un Synology).
+///
+/// `sonde` rend l'identite SMB2 (`ServerGuid`) d'une adresse ; elle est
+/// injectee pour l'epreuve. Si `hote` ne repond pas ou n'a pas d'identite, on
+/// ne conclut rien : mieux vaut une ligne en trop que deux NAS confondus.
+pub(crate) async fn jumeau_parmi<S, F>(
+    hote: &str,
+    partage: &str,
+    lignes: Vec<LigneSmb>,
+    mut sonde: S,
+) -> Option<Jumeau>
+where
+    S: FnMut(String) -> F,
+    F: std::future::Future<Output = Option<smb::GuidServeur>>,
+{
+    let hote_nu = hote.trim_start_matches('[').trim_end_matches(']');
+    let candidats: Vec<LigneSmb> = lignes
+        .into_iter()
+        .filter(|(_, server, share, _)| {
+            share.eq_ignore_ascii_case(partage)
+                && !server
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .eq_ignore_ascii_case(hote_nu)
+        })
+        .collect();
+    if candidats.is_empty() {
+        return None;
+    }
+    let identite = sonde(hote.to_string()).await?;
+    for (id, server, _, mount_path) in candidats {
+        if sonde(server.clone()).await == Some(identite) {
+            return Some(Jumeau {
+                id,
+                server,
+                mount_path,
+            });
+        }
+    }
+    None
+}
+
+/// Enregistrer le montage qui vient d'etre etabli (ou constate, `deja_monte`).
+///
+/// `ligne_cible` : la ligne d'un jumeau (meme serveur, autre adresse) a
+/// reprendre plutot que d'en ajouter une.
+fn persister_le_montage(
+    state: &AppState,
+    ligne_cible: Option<i64>,
+    body: &MountRequest,
+    mount_path: &str,
+    dialecte_retenu: Option<String>,
+    deja_monte: bool,
+) -> axum::response::Response {
     use tune_core::db::backend::ToSqlValue;
+    let mount_path = mount_path.to_string();
     // Remonter un partage deja enregistre passe souvent par cet ecran plutot
     // que par le bouton de remontage : sans ce controle on ajoutait une ligne
     // jumelle (#2453), et depuis l'index unique on echouerait. On rafraichit
     // la ligne existante — le dialecte retenu et le constat de montage sont
     // justement ce qui vient d'etre etabli.
-    if let Some(id) = montage_existant(
-        &state.backend,
-        "smb",
-        &body.host,
-        &body.share_name,
-        &mount_path,
-    ) {
-        let _ = state.backend.execute(
-            "UPDATE network_mounts SET username = ?, password = ?, smb_version = ?, \
-             mount_state = ?, active = 1 WHERE id = ?",
-            &[
-                &body.username as &dyn ToSqlValue,
-                &body.password as &dyn ToSqlValue,
-                &dialecte_retenu as &dyn ToSqlValue,
-                &"mounted" as &dyn ToSqlValue,
-                &id as &dyn ToSqlValue,
-            ],
-        );
-        tracing::info!(id, host = %body.host, share = %body.share_name, "montage_reseau_rafraichi");
+    let existante = ligne_cible.or_else(|| {
+        montage_existant(
+            &state.backend,
+            "smb",
+            &body.host,
+            &body.share_name,
+            &mount_path,
+        )
+    });
+    if let Some(id) = existante {
+        let res = if deja_monte {
+            // Rien n'a ete monte : ni les identifiants saisis ni un dialecte
+            // n'ont ete eprouves. On ne note que le constat — ecraser les
+            // identifiants qui montent ce partage au demarrage par ceux d'un
+            // formulaire peut-etre vide le perdrait au prochain redemarrage.
+            state.backend.execute(
+                "UPDATE network_mounts SET mount_state = ?, active = 1 WHERE id = ?",
+                &[&"mounted" as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            )
+        } else {
+            state.backend.execute(
+                "UPDATE network_mounts SET server = ?, mount_path = ?, username = ?, \
+                 password = ?, smb_version = COALESCE(?, smb_version), \
+                 mount_state = ?, active = 1 WHERE id = ?",
+                &[
+                    &body.host as &dyn ToSqlValue,
+                    &mount_path as &dyn ToSqlValue,
+                    &body.username as &dyn ToSqlValue,
+                    &body.password as &dyn ToSqlValue,
+                    &dialecte_retenu as &dyn ToSqlValue,
+                    &"mounted" as &dyn ToSqlValue,
+                    &id as &dyn ToSqlValue,
+                ],
+            )
+        };
+        if let Err(e) = res {
+            warn!(id, error = %e, "montage_reseau_rafraichissement_echoue");
+        }
+        tracing::info!(id, host = %body.host, share = %body.share_name, deja_monte, "montage_reseau_rafraichi");
         return (
             StatusCode::OK,
             Json(json!({
                 "id": id,
-                "mounted": mount_ok,
+                "mounted": true,
                 "mount_path": mount_path,
                 "smb_version": dialecte_retenu,
                 "existant": true,
+                "deja_monte": deja_monte,
             })),
         )
             .into_response();
@@ -1122,7 +1360,8 @@ async fn mount_smb_share(
                 StatusCode::CREATED,
                 Json(json!({
                     "id": id,
-                    "mounted": mount_ok,
+                    "mounted": true,
+                    "deja_monte": deja_monte,
                     "mount_path": mount_path,
                     "smb_version": dialecte_retenu,
                 })),
@@ -2695,5 +2934,158 @@ mod tests_browse_dit_son_echec_4134 {
         assert!(reponse_porte_un_result(BROWSE_VIDE));
         assert!(!reponse_porte_un_result(SOAP_FAULT));
         assert!(reponse_porte_un_result("<Result xmlns=\"x\"></Result>"));
+    }
+}
+
+/// Fil 2145 (Daniel Levy, « Disparition bibliothèque sur unité NAS ») : un
+/// partage deja monte faisait echouer l'assistant avec un message faux, et le
+/// meme NAS vu sous deux adresses donnait deux lignes.
+#[cfg(test)]
+mod tests_montage_2145 {
+    use super::{Jumeau, adresse_preferee, jumeau_parmi};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn la_decouverte_prefere_l_ipv4() {
+        let synology = [
+            ip("fd12:3456:789a::58d1"),
+            ip("192.168.10.69"),
+            ip("fe80::1"),
+        ];
+        assert_eq!(adresse_preferee(&synology), Some(ip("192.168.10.69")));
+        // L'ordre de la collection ne change rien.
+        let mut inverse = synology;
+        inverse.reverse();
+        assert_eq!(adresse_preferee(&inverse), Some(ip("192.168.10.69")));
+        // Sans IPv4 : l'IPv6 routable plutot que le lien local.
+        assert_eq!(
+            adresse_preferee(&[ip("fe80::1"), ip("fd12::58d1")]),
+            Some(ip("fd12::58d1"))
+        );
+        assert_eq!(adresse_preferee(&[]), None);
+    }
+
+    fn lignes() -> Vec<(i64, String, String, String)> {
+        vec![
+            (
+                1,
+                "fd12::58d1".into(),
+                "Music".into(),
+                "/mnt/fd12::58d1_Music".into(),
+            ),
+            (
+                2,
+                "192.168.10.80".into(),
+                "Music".into(),
+                "/mnt/192.168.10.80_Music".into(),
+            ),
+            (
+                3,
+                "fd12::58d1".into(),
+                "Video".into(),
+                "/mnt/fd12::58d1_Video".into(),
+            ),
+        ]
+    }
+
+    /// L'identite SMB2 de chaque adresse du banc : le Synology de Daniel a
+    /// deux adresses et un seul GUID ; un autre NAS en a un autre.
+    async fn sonde(h: String) -> Option<crate::smb::GuidServeur> {
+        match h.as_str() {
+            "192.168.10.69" | "fd12::58d1" | "[fd12::58d1]" => Some(*b"daniel-synology!"),
+            "192.168.10.80" => Some(*b"un-autre-serveur"),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn le_meme_nas_sous_son_ipv4_retrouve_sa_ligne_ipv6() {
+        let j = jumeau_parmi("192.168.10.69", "music", lignes(), sonde).await;
+        assert_eq!(
+            j,
+            Some(Jumeau {
+                id: 1,
+                server: "fd12::58d1".into(),
+                mount_path: "/mnt/fd12::58d1_Music".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn un_autre_nas_ou_un_autre_partage_n_est_pas_un_jumeau() {
+        // Autre serveur (GUID different) : aucune fusion.
+        let lignes_autre = vec![lignes()[1].clone()];
+        assert_eq!(
+            jumeau_parmi("192.168.10.69", "Music", lignes_autre, sonde).await,
+            None
+        );
+        // Meme serveur, autre partage.
+        assert_eq!(
+            jumeau_parmi("192.168.10.69", "Photo", lignes(), sonde).await,
+            None
+        );
+        // Serveur sans identite (SMB1, injoignable) : on ne conclut rien.
+        assert_eq!(
+            jumeau_parmi("10.0.0.9", "Music", lignes(), sonde).await,
+            None
+        );
+        // La meme adresse n'est pas un jumeau : `montage_existant` s'en charge.
+        let meme = vec![lignes()[0].clone()];
+        assert_eq!(
+            jumeau_parmi("[fd12::58d1]", "Music", meme, sonde).await,
+            None
+        );
+    }
+
+    /// Un point de montage occupe par AUTRE CHOSE que le partage demande :
+    /// `/proc`, toujours monte sur Linux. Avant le correctif, la route lancait
+    /// `mount.cifs` par-dessus (EBUSY, ou commande absente) et rendait 500 avec
+    /// l'erreur du dernier dialecte ; elle doit rendre 409 et nommer la cause,
+    /// sans lancer de montage ni ecrire de ligne.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn un_point_occupe_par_autre_chose_rend_409_et_sa_cause() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let backend = etat.backend.clone();
+        let app = crate::routes::router(etat);
+        let corps = serde_json::json!({
+            "host": "192.168.10.69",
+            "share_name": "Music",
+            "mount_path": "/proc",
+        });
+        let rep = app
+            .oneshot(
+                Request::post("/api/v1/network/smb/mount")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap_or_default();
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "point_de_montage_occupe", "{v}");
+        let message = v["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/proc") && message.contains("proc"),
+            "{message}"
+        );
+        let n = backend
+            .query_many("SELECT id FROM network_mounts", &[])
+            .unwrap()
+            .len();
+        assert_eq!(n, 0, "aucune ligne ne doit etre ecrite");
     }
 }
