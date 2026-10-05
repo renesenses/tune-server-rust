@@ -855,6 +855,19 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 
+-- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
+-- de MetaRust) : l'identification les demande avec les `inc` des crédits, la
+-- passe des crédits les relit sans requête. `corps` = JSON compressé (zlib),
+-- `inc` triés, `fetched_at` ISO-8601 UTC (validité : 90 jours). Sans
+-- migration numérotée, comme `streaming_hidden_items` : présente AUSSI dans
+-- le rattrapage de `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
+    mbid TEXT PRIMARY KEY,
+    inc TEXT NOT NULL,
+    corps BLOB NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
 -- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums
 -- (grouped / merge-duplicates) tourne sur une base née de `init_schema` seul,

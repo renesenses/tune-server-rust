@@ -263,6 +263,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "compteur de revision du catalogue UPnP, remis a zero par le script PG 066 ; \
          les clients UPnP relisent le catalogue",
     ),
+    (
+        "musicbrainz_release_cache",
+        "reponses MusicBrainz gardees (#4805) : un cache de 90 jours, que la passe \
+         des credits reconstitue",
+    ),
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
@@ -1054,6 +1059,16 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+-- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
+-- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
+-- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
+-- c'est un cache, la passe des crédits le reconstitue.
+CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
+    mbid TEXT PRIMARY KEY,
+    inc TEXT NOT NULL,
+    corps BYTEA NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upnp_library_sources (
     source_key TEXT PRIMARY KEY,
     udn TEXT NOT NULL,

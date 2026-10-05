@@ -17,6 +17,8 @@ pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+// Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
+pub mod musicbrainz_release_cache;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;

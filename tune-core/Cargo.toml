@@ -133,7 +133,9 @@ libloading = { version = "0.9", optional = true }
 # unlike ort's static-link dists) and unpack them — `.tgz` via flate2+tar,
 # Windows `.zip` via the `zip` crate already in deps. Gated behind
 # `audio-embedding`, so the default build pulls none of this.
-flate2 = { version = "1", optional = true }
+# flate2 n'est plus optionnel (#4805) : les réponses MusicBrainz gardées en
+# base (`musicbrainz_release_cache`) sont compressées. Déjà au Cargo.lock.
+flate2 = { version = "1" }
 tar = { version = "0.4", optional = true }
 # CLAP text tower tokenizer (natural-language acoustic search, Phase 3). Loads the
 # published RoBERTa `tokenizer.json`. `default-features = false` drops the CLI-only
@@ -387,7 +389,7 @@ postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
-audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
+audio-embedding = ["dep:ort", "dep:libloading", "dep:tar", "dep:tokenizers"]
 # #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
 # de toute ligne de build publiée : la licence de `dst-decoder` n'est pas
 # tranchée (Apache-2.0 déclarée contre l'en-tête ISO/Philips reproduit dans

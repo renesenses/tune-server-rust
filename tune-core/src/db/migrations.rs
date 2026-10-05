@@ -3804,6 +3804,22 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ON streaming_hidden_items(item_type, source, source_id);",
     )
     .ok();
+    // Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
+    // de MetaRust). SANS migration numérotée, pour la raison écrite juste
+    // au-dessus pour `streaming_hidden_items` : une table neuve n'en a pas
+    // besoin, et réserver un numéro pendant que d'autres lots en tiennent
+    // casserait la contiguïté. Le CORE_SCHEMA de `sqlite.rs` la porte aussi.
+    // Une base sans elle reste juste : la lecture rend « absent », et la
+    // passe des crédits interroge MusicBrainz comme avant.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (\
+            mbid TEXT PRIMARY KEY,\
+            inc TEXT NOT NULL,\
+            corps BLOB NOT NULL,\
+            fetched_at TEXT NOT NULL\
+        );",
+    )
+    .ok();
     // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
