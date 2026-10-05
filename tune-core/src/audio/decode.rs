@@ -2045,6 +2045,18 @@ fn borner_la_fin(
     relais_tx
 }
 
+/// Prefixe de l'erreur rendue quand symphonia ne reconnait aucun format dans
+/// le flux du decodeur progressif. Cette sonde precede l'en-tete WAV : une
+/// erreur qui le porte n'a donc encore rien ecrit dans la session.
+const PREFIXE_ECHEC_DE_SONDE: &str = "probe: ";
+
+/// #5553 — vrai si le decodeur progressif a echoue AVANT d'avoir envoye son
+/// premier octet (en-tete WAV compris), a la sonde du format. L'appelant peut
+/// alors reprendre la piste par un autre chemin sans rien avoir a defaire.
+pub fn echec_avant_le_premier_octet(erreur: &str) -> bool {
+    erreur.starts_with(PREFIXE_ECHEC_DE_SONDE)
+}
+
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
@@ -2443,7 +2455,7 @@ fn decode_to_pcm_streaming_inner(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|e| format!("probe: {e}"))?;
+        .map_err(|e| format!("{PREFIXE_ECHEC_DE_SONDE}{e}"))?;
 
     let track = format
         .default_track(TrackType::Audio)
