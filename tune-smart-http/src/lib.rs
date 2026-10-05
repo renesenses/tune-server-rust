@@ -7,6 +7,7 @@ use tune_core::db::backend::DbBackend;
 pub mod catalogue;
 pub mod collections_par_defaut;
 pub mod comptes;
+pub(crate) mod criteres;
 mod etiquettes_streaming;
 pub(crate) mod regles_sql;
 pub mod smart_ai;

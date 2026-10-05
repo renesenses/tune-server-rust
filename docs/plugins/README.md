@@ -5,9 +5,10 @@
 Tune supports plugins that react to server events, read/write configuration,
 and extend behaviour without modifying core code.  Plugins are implemented as
 Rust types that satisfy the `TunePlugin` trait in the native composition model
-described here. For the separate experimental audio/batch SDK and scaffolding,
-see [premium SDK status](premium-sdk.md) and [SDK usage](../../sdk/README.md).
-That SDK is not connected to the production host yet.
+described here. For the separate audio/batch SDK and scaffolding, see
+[premium SDK status](premium-sdk.md) and [SDK usage](../../sdk/README.md).
+That SDK is linked into the server: the equalizer, crossfeed, converter and
+de-click run through it, and signed native packages load at startup.
 
 ### Loading model
 
@@ -20,7 +21,7 @@ A separate **WASM runtime does exist**, behind `plugins-wasm`, in
 `tune-plugin-runtime-wasm` and `tune-server/src/plugins_host.rs`. It scans enabled
 plugin manifests and exposes a limited, permission-gated host API. The native
 `TunePlugin` model below and that WASM protocol are distinct; neither currently
-implements the experimental audio/batch SDK.
+implements the audio/batch SDK.
 
 One cargo constraint to know before you reference an out-of-tree plugin by
 path: **cargo resolves optional path dependencies while writing the lockfile**,

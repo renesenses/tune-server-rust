@@ -61,6 +61,11 @@ pub struct AppState {
     /// à la fois, son relevé lisible. Tenu ici et non en `static` : la route
     /// qui le lit a déjà l'état, et un test ne pollue pas le suivant.
     pub passe_dr: Arc<tune_core::audio::replaygain::plage_dynamique::PasseDr>,
+    /// Le dernier comptage « analysées / éligibles » de la bibliothèque pour
+    /// le ReplayGain (#5597), resservi une minute : l'écran État du serveur
+    /// sonde en boucle, et le comptage parcourt toute la table `tracks`.
+    pub bibliotheque_rg:
+        Arc<tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
@@ -423,9 +428,25 @@ impl AppState {
         );
         qobuz.set_proxy_first(qobuz_proxy_first);
         services.register(Box::new(qobuz));
+        // Fil 221 — le Client ID saisi dans Reglages (`spotify_client_id` en
+        // base) l'emporte sur `tune.toml`, mais pas sur `TUNE_SPOTIFY_CLIENT_ID`
+        // (voir `resolve_client_id`). `tune_config.spotify_client_id` porte
+        // deja la variable quand elle est posee : elle est relue ici pour
+        // passer AVANT le reglage.
+        let spotify_client_id = {
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+            let reglage = settings.get("spotify_client_id").ok().flatten();
+            let env = std::env::var("TUNE_SPOTIFY_CLIENT_ID").ok();
+            tune_core::streaming::spotify::resolve_client_id(
+                env.as_deref(),
+                reglage.as_deref(),
+                tune_config.spotify_client_id.as_deref(),
+            )
+        };
         services.register(Box::new(
             tune_core::streaming::spotify::SpotifyService::with_config(
-                tune_config.spotify_client_id.as_deref(),
+                spotify_client_id.as_deref(),
                 tune_config.spotify_redirect_uri.as_deref(),
                 // Le port REELLEMENT ecoute (`bootstrap.rs` lie `config.port`),
                 // pas le defaut de la caisse : l'URI de redirection envoyee a
@@ -529,6 +550,9 @@ impl AppState {
             comptes_collections,
             background_tasks,
             passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
+            bibliotheque_rg: Arc::new(
+                tune_core::audio::replaygain::bibliotheque::CacheBibliothequeReplayGain::new(),
+            ),
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,

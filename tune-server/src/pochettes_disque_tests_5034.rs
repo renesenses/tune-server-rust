@@ -550,11 +550,13 @@ pub(super) const CHANGEMENTS: &[Cas] = &[
         complet: None,
     },
     Cas {
+        // L'image du dossier passe avant la jaquette (#5685) : changer
+        // cette dernière ne change rien à l'écran.
         nom: "7b jaquette changee, cover.jpg present",
         avant: (Some(JAQUETTE), Some(COVER)),
         pochette: Avant::DuScan,
         apres: (Some(JAQUETTE_2), Some(COVER)),
-        attendu: Some(JAQUETTE_2),
+        attendu: Some(COVER),
         complet: None,
     },
     Cas {
@@ -566,13 +568,13 @@ pub(super) const CHANGEMENTS: &[Cas] = &[
         complet: None,
     },
     Cas {
-        // La jaquette intégrée passe avant le cover.jpg (#5035) : changer ce
-        // dernier ne change rien à l'écran.
+        // L'image du dossier passe avant la jaquette (#5685) : la changer
+        // change l'écran.
         nom: "9b cover.jpg change, jaquette presente",
         avant: (Some(JAQUETTE), Some(COVER)),
         pochette: Avant::DuScan,
         apres: (Some(JAQUETTE), Some(COVER_2)),
-        attendu: Some(JAQUETTE),
+        attendu: Some(COVER_2),
         complet: None,
     },
     Cas {
@@ -878,12 +880,13 @@ async fn un_dossier_fourre_tout_montre_la_jaquette_de_chaque_piste_1284_5034() {
     );
 }
 
-/// #5035 — l'hypothèse de l'enquête, AVÉRÉE : la PREMIÈRE piste lue n'a pas
-/// de jaquette, les autres en ont une, et le dossier porte un `cover.jpg`.
-/// Le `cover.jpg` gagnait — `albums_with_cover` le figeait pour tout le scan.
-/// La règle est « jaquette intégrée d'abord » : elle doit gagner.
+/// #5035 puis #5685 — la PREMIÈRE piste lue n'a pas de jaquette, les autres
+/// en ont une, et le dossier porte un `cover.jpg`. #5035 faisait gagner la
+/// jaquette ; la décision de Bertrand du 03/10/2026 (#5685, « l'image du
+/// dossier d'abord ») fait gagner le `cover.jpg`, quelle que soit la piste
+/// lue la première.
 #[tokio::test]
-async fn la_jaquette_passe_avant_le_cover_jpg_meme_si_la_premiere_piste_n_en_a_pas_5035() {
+async fn le_cover_jpg_passe_avant_la_jaquette_meme_si_la_premiere_piste_n_en_a_pas_5685() {
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
     for passe in [Passe::Rapide, Passe::Demarrage, Passe::Complete] {
         let (r, _dossier, pistes) = album_sur_disque(
@@ -909,8 +912,8 @@ async fn la_jaquette_passe_avant_le_cover_jpg_meme_si_la_premiere_piste_n_en_a_p
                     .cover_path
                     .as_deref()
             ),
-            "jaquette du FLAC",
-            "{passe:?} — #5035 : la jaquette de la piste 2 passe avant le cover.jpg"
+            "cover.jpg",
+            "{passe:?} — #5685 : le cover.jpg passe avant la jaquette de la piste 2"
         );
     }
 }

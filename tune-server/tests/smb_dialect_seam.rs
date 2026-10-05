@@ -85,13 +85,20 @@ fn le_garde_fou_deja_monte_ne_se_fie_pas_au_contenu_du_repertoire() {
     // Le corps de la fonction seul : `read_dir` a des usages parfaitement
     // legitimes ailleurs dans ce fichier, et une recherche globale rendrait ce
     // test faux au premier d'entre eux.
-    let corps = texte
-        .split_once("pub async fn remount_network_shares")
-        .map(|(_, apres)| apres)
-        .expect("remount_network_shares a disparu ou a ete renommee")
-        .split_once("\n}\n")
-        .map(|(corps, _)| corps)
-        .expect("fin de remount_network_shares introuvable");
+    //
+    // #5682 — l'essai d'UN partage est sorti dans `monter_un_partage`, pour
+    // etre rejoue par les nouveaux essais : les deux corps sont lus.
+    let corps_de = |signature: &str| -> String {
+        texte
+            .split_once(signature)
+            .map(|(_, apres)| apres)
+            .unwrap_or_else(|| panic!("`{signature}` a disparu ou a ete renommee"))
+            .split_once("\n}\n")
+            .map(|(corps, _)| corps.to_string())
+            .unwrap_or_else(|| panic!("fin de `{signature}` introuvable"))
+    };
+    let corps =
+        corps_de("pub async fn remount_network_shares") + &corps_de("async fn monter_un_partage");
 
     assert!(
         !corps.contains("read_dir"),
@@ -137,4 +144,41 @@ fn les_options_de_montage_ne_partent_jamais_au_journal() {
             );
         }
     }
+}
+
+/// #5682 (fil 2115) — le commentaire de `bootstrap.rs` annonçait « remonter
+/// les partages AVANT toute lecture de la bibliothèque », et le code lançait
+/// le scan de démarrage et le surveillant AVANT `remount_network_shares`. Un
+/// NAS monté une seconde trop tard laissait la bibliothèque vide jusqu'à la
+/// relance du serveur — puis les pochettes manquaient. L'ordre est gardé ici.
+#[test]
+fn le_scan_de_demarrage_attend_le_remontage_des_partages_5682() {
+    let texte = source("src/bootstrap.rs");
+    // Le code seul : un commentaire peut nommer les appels sans les faire.
+    let code: String = texte
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let position = |appel: &str| -> usize {
+        let trouves: Vec<usize> = code.match_indices(appel).map(|(i, _)| i).collect();
+        assert_eq!(
+            trouves.len(),
+            1,
+            "`{appel}` devrait apparaître une fois dans bootstrap.rs"
+        );
+        trouves[0]
+    };
+    let remontage = position("crate::startup::remount_network_shares(&state).await");
+    let scan = position("crate::auto_scan::spawn_auto_scan(");
+    let surveillant = position("crate::auto_scan::spawn_file_watcher(");
+    assert!(
+        remontage < scan,
+        "le scan de démarrage part avant le remontage des partages réseau : \
+         un NAS monté en retard est vu vide (#5682)"
+    );
+    assert!(
+        remontage < surveillant,
+        "le surveillant part avant le remontage des partages réseau (#5682)"
+    );
 }

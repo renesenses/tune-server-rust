@@ -1153,12 +1153,29 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #5034 — APRÈS la purge : même confrontation des pochettes à leur
         // fichier source que le scan manuel.
-        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
-            &db,
-            &cache_dir,
-            &[],
-            false,
-        );
+        // #5682 (fil 2115) — seulement si les racines ont répondu. Le NAS en
+        // retard au démarrage faisait voir chaque fichier source « disparu » :
+        // les pistes étaient conservées, mais les pochettes retirées.
+        if tune_core::library::pochette_disque::le_suivi_peut_conclure(
+            crate::routes::system::scan::scan_cancel_requested(),
+            &missing_dirs,
+            &racines_videes,
+        ) {
+            tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                &db,
+                &cache_dir,
+                &[],
+                &error_dirs,
+                false,
+            );
+        } else {
+            tracing::warn!(
+                missing = ?missing_dirs,
+                emptied = ?racines_videes,
+                "auto_scan_pochettes_non_suivies — racine absente ou vidée : les pochettes \
+                 tirées du disque sont CONSERVÉES (#5682)"
+            );
+        }
 
         // Clean up orphan albums with 0 tracks (ghost entries from
         // artist_id changes or interrupted scans) — bug #593.
@@ -1237,7 +1254,26 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             }
             // Coffrets automatiques (GO du 25/09/2026) — même passe qu'après
             // `POST /system/scan`.
-            tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto");
+            // #5685 — un coffret qui vient d'être réuni prend tout de suite
+            // l'image du dossier qui réunit ses disques, sans attendre le scan
+            // suivant.
+            // #5682 — même garde que la passe de fin de scan : rien n'est
+            // conclu d'une racine absente ou vidée.
+            if tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto").reunis > 0
+                && tune_core::library::pochette_disque::le_suivi_peut_conclure(
+                    crate::routes::system::scan::scan_cancel_requested(),
+                    &missing_dirs,
+                    &racines_videes,
+                )
+            {
+                tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+                    &db,
+                    &cache_dir,
+                    &[],
+                    &error_dirs,
+                    false,
+                );
+            }
         }
 
         info!(
@@ -2822,9 +2858,15 @@ fn suivre_les_images_de_pochette(
             .albums_sous_dossier(&dossier.to_string_lossy())
             .unwrap_or_default()
         {
-            // Les seuls fichiers DU dossier : une image ne décrit pas les
-            // sous-dossiers (`find_folder_cover` ne regarde que le parent).
-            if std::path::Path::new(&piste).parent() == Some(dossier) {
+            // Les fichiers DU dossier, et ceux des dossiers de disques qu'il
+            // réunit (#5685, `Coffret/CD1/…`, au plus `REMONTEE_MAX` niveaux) :
+            // la règle ne retient l'image commune que si le dossier n'abrite
+            // que cet album (`pochette_disque::dossier_commun`).
+            if std::path::Path::new(&piste).parent().is_some_and(|p| {
+                p.ancestors()
+                    .take(tune_core::library::pochette_disque::REMONTEE_MAX + 1)
+                    .any(|a| a == dossier)
+            }) {
                 albums.insert(album);
             }
         }
@@ -3349,6 +3391,10 @@ mod scan_feuille_cue_tests_5108;
 #[cfg(test)]
 #[path = "pochettes_disque_tests_5034.rs"]
 mod pochettes_disque_tests_5034;
+
+#[cfg(test)]
+#[path = "pochettes_nas_absent_tests_5682.rs"]
+mod pochettes_nas_absent_tests_5682;
 
 #[cfg(test)]
 #[path = "pochettes_majorite_tests_5454.rs"]

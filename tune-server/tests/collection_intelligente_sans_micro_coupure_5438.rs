@@ -22,7 +22,19 @@
 //! flux qui émet un bloc toutes les [`CADENCE_FLUX`] (il a besoin d'un fil
 //! libre pour chaque bloc, comme l'envoi du flux réel), lu par un « renderer »
 //! sur un fil système À PART. Pendant que la rafale du clic tourne, le plus
-//! grand silence du flux ne doit pas dépasser [`SEUIL_SILENCE`].
+//! grand silence du flux ne doit pas dépasser [`SEUIL_SILENCE`], et une tâche
+//! soumise à l'exécuteur ne doit pas attendre plus de [`SEUIL_EXECUTEUR`] un
+//! fil libre (la sonde de l'exécuteur, voir sa note).
+//!
+//! ⚠️ Le routeur est servi COMME EN PRODUCTION
+//! (`into_make_service_with_connect_info`, `bootstrap.rs`). Servi par
+//! `axum::serve(ecoute, app)`, axum reconstruit le routeur ENTIER à chaque
+//! connexion (`Router::with_state(())` sur toutes ses routes) : 27 ms par connexion
+//! en profil de test, contre 0,4 ms servi comme en production (mesuré le
+//! 02/10/2026 sur Shrek). Les 22 requêtes du clic ouvrent chacune leur
+//! connexion : ce coût, que la production ne paie pas, faisait à lui seul
+//! l'essentiel du silence mesuré (médiane 262 ms, 24 clics sur 100 au-delà de
+//! 300 ms, sans charge ajoutée) — d'où les rouges intermittents de #5438.
 //!
 //! ⚠️ `tune-server` porte `autotests = false` — ce fichier n'est compilé que
 //! par sa cible `[[test]]` dans `Cargo.toml`.
@@ -59,7 +71,36 @@ const CADENCE_FLUX: Duration = Duration::from_millis(5);
 /// Le plus long silence admis sur le flux pendant le clic. Un tampon de
 /// renderer tient couramment quelques centaines de millisecondes ; au-delà,
 /// c'est la micro-coupure.
-const SEUIL_SILENCE: Duration = Duration::from_millis(300);
+///
+/// ⚠️ 600 ms et non 300 : le test tourne en profil de test (`opt-level = 0`),
+/// où sérialiser la réponse de `/library/tracks?limit=2000` (1,5 Mo de JSON)
+/// prend 100 à 250 ms d'UN fil de l'exécuteur — une seule scrutation, que
+/// Tokio ne coupe pas — et le flux peut attendre derrière elle dans la file de
+/// ce fil. Mesuré le 02/10/2026 sur Shrek, code correct : pire silence
+/// 290 ms sous charge (8 boucles `yes`, charge 16 à 29), 375 ms sans charge
+/// ajoutée, sur 100 clics ; lecture synchrone réintroduite : 471 à 1 468 ms.
+/// La garde fine est [`SEUIL_EXECUTEUR`].
+const SEUIL_SILENCE: Duration = Duration::from_millis(600);
+
+/// La plus longue attente admise, pendant le clic, d'une tâche soumise à
+/// l'exécuteur depuis un fil système (la sonde). Tant qu'UN fil de
+/// l'exécuteur est libre il la prend aussitôt : la sonde ne mesure que les
+/// moments où une lecture synchrone tient TOUS les fils — le défaut de #5438 —,
+/// pas la sérialisation d'une grosse réponse sur l'un d'eux. Mesuré le
+/// 02/10/2026 sur Shrek, code correct : 40 ms au pire sur 85 clics sous charge ;
+/// lecture synchrone réintroduite (`hors_executeur` exécuté sur place) : 196 et
+/// 270 ms (2 exécutions rouges sur 3) ; un `std::thread::sleep(117 ms)` dans
+/// le gestionnaire des albums : 233, 338 et 381 ms (3 sur 3).
+const SEUIL_EXECUTEUR: Duration = Duration::from_millis(150);
+
+/// Clics mesurés, une annonce `library.updated` avant chacun : les comptes de
+/// la liste sont recalculés à chaque fois, comme au premier clic après un scan.
+/// Une lecture synchrone ne tient pas les deux fils à CHAQUE clic : quand le
+/// pool est plein, l'attente d'une connexion passe par `block_in_place`, qui
+/// rend le cœur de l'exécuteur, et ce qui suit dans la même scrutation tourne
+/// sur un fil qui ne le tient plus (voir [`FILS_EXECUTEUR`]). Lecture
+/// synchrone réintroduite, d'un clic à l'autre : 183 ms puis 1 362 ms.
+const CLICS: usize = 5;
 
 /// Pistes du testeur (Yves Corbat, 29/09/2026).
 const PISTES: i64 = 58_359;
@@ -254,7 +295,15 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
         let app = tune_server::routes::router(state).route("/banc/flux", get(flux));
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = ecoute.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        // Comme `bootstrap.rs` : le routeur est fini UNE fois, pas par connexion.
+        tokio::spawn(async move {
+            axum::serve(
+                ecoute,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
         (addr, albums, collections, backend, bus)
     });
     assert!(
@@ -302,6 +351,39 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
             pire
         }
     });
+    // La sonde de l'exécuteur : toutes les 5 ms, depuis un fil système, une
+    // tâche vide confiée à l'exécuteur ; combien attend-elle qu'un fil la
+    // prenne ? La file d'injection est vue par tout fil libre.
+    let sonde_executeur = std::thread::spawn({
+        let (arret, executeur) = (arret.clone(), rt.handle().clone());
+        move || {
+            let mut attentes = Vec::new();
+            while !arret.load(Ordering::Relaxed) {
+                let (fait, recu) = std::sync::mpsc::channel();
+                let t0 = Instant::now();
+                executeur.spawn(async move {
+                    let _ = fait.send(());
+                });
+                recu.recv().unwrap();
+                attentes.push((t0, t0.elapsed()));
+                std::thread::sleep(CADENCE_FLUX);
+            }
+            attentes
+        }
+    });
+    // Le témoin de l'ordonnanceur du SYSTÈME : un fil qui dort 5 ms en boucle.
+    // S'il se réveille tard, c'est la machine qui manque de cœurs, pas le code.
+    let temoin_systeme = std::thread::spawn({
+        let arret = arret.clone();
+        move || {
+            let mut reveils = Vec::new();
+            while !arret.load(Ordering::Relaxed) {
+                std::thread::sleep(CADENCE_FLUX);
+                reveils.push(Instant::now());
+            }
+            reveils
+        }
+    });
     // Laisser le flux prendre son rythme.
     std::thread::sleep(Duration::from_millis(300));
 
@@ -321,46 +403,89 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
         "/api/v1/library/tracks?collection={nom}&limit=2000"
     ));
 
-    let debut = Instant::now();
-    let requetes: Vec<_> = chemins
-        .iter()
-        .cloned()
-        .map(|c| {
-            std::thread::spawn(move || {
-                let t0 = Instant::now();
-                let r = obtenir(addr, &c);
-                (c, r, t0.elapsed())
+    let mut clics = Vec::new();
+    let mut premiere_rafale = None;
+    for clic in 0..CLICS {
+        if clic > 0 {
+            bus.emit_typed(
+                tune_core::event_types::EventType::LibraryUpdated,
+                serde_json::json!({ "source": "banc_5438" }),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let debut = Instant::now();
+        let requetes: Vec<_> = chemins
+            .iter()
+            .cloned()
+            .map(|c| {
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    let r = obtenir(addr, &c);
+                    (c, r, t0.elapsed())
+                })
             })
-        })
-        .collect();
-    let mut durees = Vec::new();
-    let reponses: Vec<(String, (u16, Value))> = requetes
-        .into_iter()
-        .map(|r| {
-            let (c, r, d) = r.join().unwrap();
-            durees.push((d, c.clone()));
-            (c, r)
-        })
-        .collect();
-    let fin = Instant::now();
+            .collect();
+        let mut durees = Vec::new();
+        let reponses: Vec<(String, (u16, Value))> = requetes
+            .into_iter()
+            .map(|r| {
+                let (c, r, d) = r.join().unwrap();
+                durees.push((d, c.clone()));
+                (c, r)
+            })
+            .collect();
+        let fin = Instant::now();
+        clics.push((debut, fin));
+        premiere_rafale.get_or_insert((reponses, durees));
+    }
+    let (reponses, mut durees) = premiere_rafale.unwrap();
     std::thread::sleep(Duration::from_millis(50));
     arret.store(true, Ordering::Relaxed);
     let arrivees = renderer.join().unwrap();
     let pire_lecture_triviale = sonde.join().unwrap();
+    let attentes = sonde_executeur.join().unwrap();
+    let reveils = temoin_systeme.join().unwrap();
 
-    // Le plus long silence du flux PENDANT la rafale.
-    let pire_silence = arrivees
-        .windows(2)
-        .filter(|w| w[1] >= debut && w[0] <= fin)
-        .map(|w| w[1] - w[0])
-        .max()
-        .unwrap_or_default();
+    // Le plus long écart entre deux instants PENDANT un clic.
+    let pire_ecart = |instants: &[Instant], (debut, fin): (Instant, Instant)| {
+        instants
+            .windows(2)
+            .filter(|w| w[1] >= debut && w[0] <= fin)
+            .map(|w| w[1] - w[0])
+            .max()
+            .unwrap_or_default()
+    };
+    let ms = |d: Duration| d.as_millis();
+    let silences: Vec<Duration> = clics.iter().map(|c| pire_ecart(&arrivees, *c)).collect();
+    let executeur: Vec<Duration> = clics
+        .iter()
+        .map(|(debut, fin)| {
+            attentes
+                .iter()
+                .filter(|(t, _)| t >= debut && t <= fin)
+                .map(|(_, attente)| *attente)
+                .max()
+                .unwrap_or_default()
+        })
+        .collect();
+    // Retard du réveil d'un fil qui dort 5 ms : la part du système.
+    let systeme: Vec<Duration> = clics
+        .iter()
+        .map(|c| pire_ecart(&reveils, *c).saturating_sub(CADENCE_FLUX))
+        .collect();
+    let pire_silence = silences.iter().copied().max().unwrap_or_default();
+    let pire_attente_executeur = executeur.iter().copied().max().unwrap_or_default();
+    let (debut, fin) = clics[0];
     eprintln!(
-        "#5438 : {} requêtes du clic en {:.0} ms ; pire silence du flux {:.0} ms \
-         ({FILS_EXECUTEUR} fils d'exécuteur, {PISTES} pistes, {albums} albums)",
+        "#5438 : {} requêtes par clic, premier clic en {:.0} ms ; sur {CLICS} clics, \
+         pire silence du flux {:?} ms, pire attente d'un fil de l'exécuteur {:?} ms, \
+         retard du système {:?} ms ({FILS_EXECUTEUR} fils d'exécuteur, {PISTES} pistes, \
+         {albums} albums)",
         chemins.len(),
         (fin - debut).as_secs_f64() * 1e3,
-        pire_silence.as_secs_f64() * 1e3,
+        silences.iter().map(|d| ms(*d)).collect::<Vec<_>>(),
+        executeur.iter().map(|d| ms(*d)).collect::<Vec<_>>(),
+        systeme.iter().map(|d| ms(*d)).collect::<Vec<_>>(),
     );
     eprintln!(
         "#5438 : pire attente d'une lecture triviale de la base pendant le clic : {:.0} ms",
@@ -416,13 +541,22 @@ fn un_clic_sur_une_collection_intelligente_ne_coupe_pas_le_flux() {
     // L'écran n'a plus à demander `/{id}/albums` pour CHAQUE collection.
     ouvrir_l_ecran_une_seconde_fois(addr, &collections, liste, &backend, &bus, albums);
 
-    // Le flux.
+    // L'exécuteur, puis le flux.
+    let retard_systeme = systeme.iter().copied().max().unwrap_or_default();
+    assert!(
+        pire_attente_executeur < SEUIL_EXECUTEUR,
+        "une tâche a attendu {} ms un fil de l'exécuteur pendant le clic sur une collection \
+         intelligente : une lecture synchrone tient les {FILS_EXECUTEUR} fils de \
+         l'exécuteur (#5438) — retard du système au même moment : {} ms",
+        pire_attente_executeur.as_millis(),
+        retard_systeme.as_millis()
+    );
     assert!(
         pire_silence < SEUIL_SILENCE,
         "le flux vers le renderer est resté muet {} ms pendant le clic sur une collection \
-         intelligente : une lecture synchrone tient les {FILS_EXECUTEUR} fils de \
-         l'exécuteur (#5438)",
-        pire_silence.as_millis()
+         intelligente (#5438) — retard du système au même moment : {} ms",
+        pire_silence.as_millis(),
+        retard_systeme.as_millis()
     );
 }
 

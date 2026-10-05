@@ -192,11 +192,13 @@ pub async fn run_with(opts: RunOptions) {
         .expect("Failed to install rustls CryptoProvider");
 
     let config = TuneConfig::load();
-    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
-    // pas la configuration sous la main.
-    crate::chemins_de_donnees::retenir(&config);
 
     let chemin_du_journal = installer_le_journal(&config.log_level);
+
+    // #5513 : pour `artwork_cache_dir()` et le rapport de scan, qui n'ont
+    // pas la configuration sous la main. #5596 : après le journal, pour que
+    // le choix du cache de pochettes de l'appareil s'y lise.
+    crate::chemins_de_donnees::retenir(&config);
 
     // #5461 — lancé depuis `<exe>.old` par une version affectée ? Le dire, et
     // relancer sur place le binaire installé quand c'est sûr. Avant tout fil,
@@ -245,13 +247,19 @@ pub async fn run_with(opts: RunOptions) {
         let mut ipv6_attempted = addr.is_ipv6();
         #[cfg(unix)]
         let mut reclaim_tried = false;
+        let mut instance_sondee = false;
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
                 // Premier échec sur la socket IPv6 : la pile est peut-être
                 // désactivée sur la machine. On repasse en IPv4 seule plutôt
                 // que d'épuiser les tentatives puis de sortir en erreur.
-                Err(e) if ipv6_attempted => {
+                // #5640 — sauf si le port est simplement PRIS : la pile IPv6
+                // marche, une autre instance tient le port (sous Windows,
+                // l'ancien processus d'un « Redémarrer » pendant ses derniers
+                // instants). On attend avec la socket double pile, sinon le
+                // serveur relancé n'écoutait plus qu'en IPv4 (#1321).
+                Err(e) if ipv6_attempted && crate::config::repli_ipv4_apres_echec(&e) => {
                     tracing::info!(error = %e, "bind IPv6 impossible, repli sur IPv4 seule");
                     ipv6_attempted = false;
                     socket = crate::config::ipv4_listen_socket();
@@ -259,6 +267,40 @@ pub async fn run_with(opts: RunOptions) {
                     continue;
                 }
                 Err(e) if attempt < 10 => {
+                    // #5640 — « Ouvrir l'instance existante » : lancé par le
+                    // raccourci alors qu'un Tune de la même version tient
+                    // déjà le port ? Ouvrir le navigateur dessus et s'arrêter
+                    // proprement, au lieu d'attendre 20 s puis d'échouer. Une
+                    // relance interne (« Redémarrer », mise à jour) attend,
+                    // elle, que l'ancien rende le port.
+                    if !instance_sondee && e.kind() == std::io::ErrorKind::AddrInUse {
+                        instance_sondee = true;
+                        use crate::instance_existante as ie;
+                        let en_place = ie::sonder_tune_sur_le_port(config.port);
+                        let conduite = ie::conduite_port_pris(
+                            ie::Lancement::depuis_l_environnement(),
+                            en_place.as_deref(),
+                            tune_core::version(),
+                        );
+                        if conduite == ie::ConduitePortPris::OuvrirLExistante {
+                            let url = format!("http://localhost:{}", config.port);
+                            let phrase = format!(
+                                "Tune tourne déjà sur le port {} : ouverture de l'instance existante ({url}), ce lancement s'arrête.",
+                                config.port
+                            );
+                            eprintln!("{phrase}");
+                            info!(%url, port = config.port, "instance_existante_ouverte — {phrase}");
+                            ie::ouvrir_le_navigateur(&url);
+                            std::process::exit(0);
+                        }
+                        if let Some(version) = en_place.as_deref() {
+                            info!(
+                                port = config.port,
+                                version_en_place = %version,
+                                "port_tenu_par_un_tune — relance interne ou autre version : on attend le port"
+                            );
+                        }
+                    }
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     // The port is held by another process. If it is a *stale*
                     // tune-server instance (an old build that wasn't stopped
@@ -360,6 +402,19 @@ pub async fn run_with(opts: RunOptions) {
         settings.set("server_last_alive_at", &now.to_string()).ok();
     }
 
+    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
+    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
+    // « 0 fichier » (#1692).
+    //
+    // #5682 (fil 2115) — le commentaire le disait, le code faisait l'inverse :
+    // le scan de démarrage et le surveillant partaient AVANT ce remontage, et
+    // un NAS monté une seconde trop tard laissait la bibliothèque vide jusqu'à
+    // la relance du serveur. Le PREMIER essai de chaque partage est attendu
+    // ici (borné par `smb::ESSAI_TIMEOUT` par dialecte) ; les nouveaux essais
+    // d'un partage injoignable partent en fond, sans retenir le serveur HTTP.
+    crate::boot_status::set_phase("partages réseau");
+    crate::startup::remount_network_shares(&state).await;
+
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
     let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
@@ -374,12 +429,6 @@ pub async fn run_with(opts: RunOptions) {
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
     crate::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done, state.event_bus.clone());
-
-    // Remonter les partages reseau AVANT toute lecture de la bibliotheque : un
-    // partage absent fait voir un repertoire vide, et le scan qui suit conclut
-    // « 0 fichier » (#1692).
-    crate::boot_status::set_phase("partages réseau");
-    crate::startup::remount_network_shares(&state).await;
 
     // Register local audio outputs (USB DAC, headphones, speakers)
     crate::boot_status::set_phase("sorties audio");
@@ -458,6 +507,7 @@ pub async fn run_with(opts: RunOptions) {
         port = config.port,
         db = %config.db_path,
         web = %crate::config::resolve_web_dir().display(),
+        fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
 
@@ -541,14 +591,7 @@ pub async fn run_with(opts: RunOptions) {
             }
             let url = format!("http://localhost:{port}");
             info!(url = %url, "opening_browser");
-            #[cfg(target_os = "macos")]
-            let _ = std::process::Command::new("open").arg(&url).spawn();
-            #[cfg(target_os = "windows")]
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .spawn();
-            #[cfg(target_os = "linux")]
-            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            crate::instance_existante::ouvrir_le_navigateur(&url);
         });
     }
 
