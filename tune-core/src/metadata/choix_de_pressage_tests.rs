@@ -471,7 +471,8 @@ async fn un_mbid_des_balises_qui_ne_colle_pas_rend_l_album_ambigu() {
             issue,
             IssueDuChoix::Ambigu {
                 raison: RaisonAmbigu::PistesIncompatibles,
-                source: SourceDuPressage::BaliseRelease
+                source: SourceDuPressage::BaliseRelease,
+                ..
             }
         ),
         "{issue:?}"
@@ -618,9 +619,80 @@ async fn sans_balise_la_recherche_ambigue_n_ecrit_rien() {
             issue,
             IssueDuChoix::Ambigu {
                 raison: RaisonAmbigu::AlbumsConcurrents,
-                source: SourceDuPressage::Recherche
+                source: SourceDuPressage::Recherche,
+                ..
             }
         ),
         "{issue:?}"
     );
+}
+
+/// L'album ambigu rend ses candidats : c'est la liste que le bouton
+/// « Ré-identifier » propose à l'utilisateur.
+#[tokio::test(start_paused = true)]
+async fn un_album_ambigu_rend_ses_candidats() {
+    let locales = pistes(4);
+    let issue = identifier_le_pressage(
+        entree(
+            "Symphony No. 9",
+            "Herbert von Karajan",
+            &locales,
+            &[],
+            &[],
+            &[],
+        ),
+        |_: String, _: usize| std::future::ready(Ok(recherche_dvorak_beethoven())),
+        |_: String, _: &'static str| std::future::ready(Ok(None)),
+    )
+    .await;
+    let IssueDuChoix::Ambigu { candidats, .. } = issue else {
+        panic!("ambigu attendu, obtenu {issue:?}");
+    };
+    let ids: Vec<&str> = candidats.iter().map(|c| c.release_id.as_str()).collect();
+    assert_eq!(ids, ["rel-dvorak", "rel-beethoven"]);
+}
+
+/// L'édition choisie par l'utilisateur est posée telle quelle, même si elle
+/// ne colle pas aux fichiers : la complétude est rendue pour information.
+#[tokio::test(start_paused = true)]
+async fn le_pressage_choisi_par_l_utilisateur_est_lu_et_retenu() {
+    let id = "1f7e3c2a-4b5d-4e6f-8a9b-0c1d2e3f4a5b";
+    let locales = pistes(15);
+    let lectures = RefCell::new(Vec::new());
+    let issue = lire_le_pressage_choisi(
+        &format!("https://musicbrainz.org/release/{id}"),
+        &locales,
+        |chemin: String, _: &'static str| {
+            lectures.borrow_mut().push(chemin);
+            std::future::ready(Ok(Some(detail_json(id, "rg-choisi", "Titre", 14))))
+        },
+    )
+    .await
+    .expect("un MBID valide");
+    assert_eq!(*lectures.borrow(), vec![format!("release/{id}")]);
+    match issue {
+        IssueDuChoix::Retenu {
+            pressage,
+            source,
+            completude,
+            ..
+        } => {
+            assert_eq!(source, SourceDuPressage::ChoixUtilisateur);
+            assert_eq!(pressage.release_id, id);
+            assert_eq!(completude.en_trop, 1);
+        }
+        autre => panic!("pressage choisi attendu, obtenu {autre:?}"),
+    }
+    // Un identifiant qui n'en est pas un ne part pas vers MusicBrainz.
+    let rien = lire_le_pressage_choisi(
+        "pas un mbid",
+        &locales,
+        |_: String,
+         _: &'static str|
+         -> std::future::Ready<Result<Option<Value>, RefusMusicBrainz>> {
+            panic!("aucune lecture attendue")
+        },
+    )
+    .await;
+    assert!(rien.is_none());
 }

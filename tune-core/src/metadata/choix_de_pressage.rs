@@ -567,6 +567,9 @@ pub enum SourceDuPressage {
     CodeBarres,
     /// La recherche par titre et artiste.
     Recherche,
+    /// L'édition choisie par l'utilisateur (`?release_id=`), après une
+    /// réponse `ambiguous` du bouton « Ré-identifier ».
+    ChoixUtilisateur,
 }
 
 impl SourceDuPressage {
@@ -576,6 +579,7 @@ impl SourceDuPressage {
             Self::BaliseEnregistrement => "balise_enregistrement",
             Self::CodeBarres => "code_barres",
             Self::Recherche => "recherche",
+            Self::ChoixUtilisateur => "choix_utilisateur",
         }
     }
 }
@@ -615,11 +619,47 @@ pub enum IssueDuChoix {
     Ambigu {
         raison: RaisonAmbigu,
         source: SourceDuPressage,
+        /// Les candidats que rien n'a départagés (ou le pressage refusé par
+        /// la garde), classés : ce que l'utilisateur peut choisir.
+        candidats: Vec<MBReleaseMatch>,
     },
     /// MusicBrainz a répondu, il n'a rien.
     Introuvable,
     /// MusicBrainz n'a pas répondu (#4991).
     Refus(RefusMusicBrainz),
+}
+
+/// La dernière ambiguïté vue par la cascade : sa raison, son étape, ses
+/// candidats.
+type Ambiguite = Option<(RaisonAmbigu, SourceDuPressage, Vec<MBReleaseMatch>)>;
+
+/// L'édition que l'utilisateur a CHOISIE (`?release_id=` du bouton
+/// « Ré-identifier », après une réponse `ambiguous`) : une lecture, et la pose
+/// sans la garde de complétude — c'est son choix, la complétude est rendue
+/// pour information. `None` : `release_id` n'est pas un MBID.
+pub async fn lire_le_pressage_choisi<L, FutL>(
+    release_id: &str,
+    pistes: &[LocalTrack],
+    mut lire: L,
+) -> Option<IssueDuChoix>
+where
+    L: FnMut(String, &'static str) -> FutL,
+    FutL: std::future::Future<Output = Result<Option<Value>, RefusMusicBrainz>>,
+{
+    let id = normaliser_mbid(release_id)?;
+    Some(match lire(format!("release/{id}"), INC_DETAIL).await {
+        Err(refus) => IssueDuChoix::Refus(refus),
+        Ok(None) => IssueDuChoix::Introuvable,
+        Ok(Some(data)) => match parse_release_detail(&data) {
+            None => IssueDuChoix::Introuvable,
+            Some(detail) => IssueDuChoix::Retenu {
+                pressage: pressage_du_detail(&data, &detail),
+                completude: completude(pistes, &detail.tracks),
+                detail,
+                source: SourceDuPressage::ChoixUtilisateur,
+            },
+        },
+    })
 }
 
 /// Une requête MusicBrainz sur deux au moins attend son créneau : la
@@ -726,7 +766,7 @@ where
     let n = entree.pistes.len() as u32;
     let pistes = (n > 0).then_some(n);
     let mut cadence = Cadence::default();
-    let mut ambiguite: Option<(RaisonAmbigu, SourceDuPressage)> = None;
+    let mut ambiguite: Ambiguite = None;
 
     // 1. Le MBID de release des balises.
     if let Some(id) = release_majoritaire(entree.releases_des_balises, entree.pistes.len()) {
@@ -747,6 +787,9 @@ where
                 .unwrap_or_else(|raison| IssueDuChoix::Ambigu {
                     raison,
                     source: SourceDuPressage::BaliseRelease,
+                    candidats: parse_release_detail(&data)
+                        .map(|d| vec![pressage_du_detail(&data, &d)])
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -764,7 +807,7 @@ where
         pistes: Option<u32>,
         cadence: &mut Cadence,
         lire: &mut L,
-        ambiguite: &mut Option<(RaisonAmbigu, SourceDuPressage)>,
+        ambiguite: &mut Ambiguite,
     ) -> Etape
     where
         L: FnMut(String, &'static str) -> FutL,
@@ -773,7 +816,7 @@ where
         match choisir_le_pressage(candidats, entree.titre, entree.artiste, pistes) {
             Choix::Aucun => Etape::Suivante,
             Choix::Ambigu => {
-                *ambiguite = Some((RaisonAmbigu::AlbumsConcurrents, source));
+                *ambiguite = Some((RaisonAmbigu::AlbumsConcurrents, source, candidats.to_vec()));
                 Etape::Suivante
             }
             Choix::Retenu(i) => {
@@ -782,14 +825,14 @@ where
                 match lire(format!("release/{}", retenu.release_id), INC_DETAIL).await {
                     Err(refus) => Etape::Conclue(IssueDuChoix::Refus(refus)),
                     Ok(None) => {
-                        *ambiguite = Some((RaisonAmbigu::DetailIndisponible, source));
+                        *ambiguite = Some((RaisonAmbigu::DetailIndisponible, source, vec![retenu]));
                         Etape::Suivante
                     }
                     Ok(Some(data)) => {
-                        match conclure(&data, Some(retenu), source, entree.pistes, true) {
+                        match conclure(&data, Some(retenu.clone()), source, entree.pistes, true) {
                             Ok(issue) => Etape::Conclue(issue),
                             Err(raison) => {
-                                *ambiguite = Some((raison, source));
+                                *ambiguite = Some((raison, source, vec![retenu]));
                                 Etape::Suivante
                             }
                         }
@@ -884,7 +927,11 @@ where
         return issue;
     }
     match ambiguite {
-        Some((raison, source)) => IssueDuChoix::Ambigu { raison, source },
+        Some((raison, source, candidats)) => IssueDuChoix::Ambigu {
+            raison,
+            source,
+            candidats,
+        },
         None => IssueDuChoix::Introuvable,
     }
 }

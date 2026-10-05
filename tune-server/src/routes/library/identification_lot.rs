@@ -159,9 +159,7 @@ use tune_core::metadata::musicbrainz_release::{self, LectureRelease};
 use tune_core::metadata::reidentify::combler_label_album;
 use tune_core::taches_de_fond::{Tache, est_en_pause};
 
-use super::reidentify::{
-    EchecIdentification, Identification, ModeIdentification, identifier_album,
-};
+use super::reidentify::{EchecIdentification, Identification, identifier_album};
 use crate::state::AppState;
 
 /// La clé de `settings` qui porte l'avancement, sur le modèle de
@@ -676,7 +674,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
             musicbrainz_release::rate_limit_delay().await;
         }
 
-        match identifier_album(&state, album_id, ModeIdentification::Lot).await {
+        match identifier_album(&state, album_id, None).await {
             Ok(issue) => {
                 // #4805 D — `ambiguous` est compté à part, et rien n'est posé.
                 compte.enregistrer(&issue);
