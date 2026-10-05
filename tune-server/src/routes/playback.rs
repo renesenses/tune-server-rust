@@ -1592,6 +1592,10 @@ mod sqlite_scan_queue_arbitration_tests {
     }
 }
 
+/// Ticket 190 — une écriture de file n'attend plus un lot de scan entier.
+#[cfg(test)]
+mod file_pendant_un_lot_de_scan_190;
+
 #[cfg(test)]
 mod refus_bitperfect_strict_3973 {
     use super::play_error_response;
