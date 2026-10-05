@@ -2011,7 +2011,18 @@ impl CompressedDecodeFailure {
 ///
 /// Rend `Err(motif)` plutôt que `None` : l'appelant doit pouvoir DIRE pourquoi
 /// il s'arrête (#3270), et un `Option` ne portait rien à dire.
-fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), CompressedDecodeFailure> {
+///
+/// `Ok(None)` : un arrêt est tombé PENDANT le décodage (#4295, fil 2006).
+/// `arret` est le `force_silent` de la lecture, relu à chaque paquet. Ce n'est
+/// pas un échec : rien n'est à dire à l'écran. Avant, la boucle décodait la
+/// piste ENTIÈRE quoi qu'il arrive : `stop()` attendait 2 000 ms, détachait le
+/// fil (`local_audio_stop_thread_detached`), puis `play_url` attendait encore
+/// 1 500 ms le PCM qu'il tenait (`local_audio_ouverture_forcee_…`). Sur une
+/// machine lente, ces 3,5 s s'entendaient entre deux morceaux.
+fn decode_compressed_stream(
+    data: &[u8],
+    arret: &AtomicBool,
+) -> Result<Option<(u16, u32, Vec<f32>)>, CompressedDecodeFailure> {
     use std::io::Cursor;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -2056,6 +2067,13 @@ fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), Compres
     let mut all_samples: Vec<f32> = Vec::new();
 
     loop {
+        if arret.load(Ordering::Relaxed) {
+            debug!(
+                samples = all_samples.len(),
+                "local_audio_decode_compressed_interrupted_by_stop"
+            );
+            return Ok(None);
+        }
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
@@ -2088,7 +2106,7 @@ fn decode_compressed_stream(data: &[u8]) -> Result<(u16, u32, Vec<f32>), Compres
         "local_audio_decoded_compressed_stream"
     );
 
-    Ok((channels, sample_rate, all_samples))
+    Ok(Some((channels, sample_rate, all_samples)))
 }
 
 /// WAV format tag constants.
@@ -5031,15 +5049,41 @@ impl OutputTarget for LocalOutput {
                 // #3270 : l'échec passe par `open_failure`, le canal que le
                 // sondeur draine. Un `return` nu laissait la zone s'arrêter
                 // sans que l'écran apprenne jamais pourquoi.
+                //
+                // #4295 (fil 2006) — le décodage relit `force_silent` à chaque
+                // paquet : un arrêt tombé ici rend la main tout de suite, au
+                // lieu de finir la piste entière pendant que `stop()` détache
+                // le fil et que la lecture suivante attend le périphérique.
                 let (dec_channels, dec_sample_rate, decoded_samples) =
-                    match decode_compressed_stream(&all_data) {
-                        Ok(decoded) => decoded,
+                    match decode_compressed_stream(&all_data, &force_silent) {
+                        Ok(Some(decoded)) => decoded,
                         Err(reason) => {
                             record_compressed_decode_failure(reason, &device_name, &open_failure);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
+                        Ok(None) => {
+                            if play_generation.load(Ordering::SeqCst) == my_generation {
+                                playing.store(false, Ordering::SeqCst);
+                            }
+                            return;
+                        }
                     };
+
+                // #4295 — même porte que le chemin PCM avant `ouvrir` : un
+                // arrêt reçu entre la fin du décodage et l'ouverture ne doit
+                // pas faire ouvrir le PCM `hw:` exclusif à un fil déjà
+                // congédié, pendant que la lecture suivante le réclame.
+                if !ouverture_encore_voulue(
+                    force_silent.load(Ordering::SeqCst),
+                    stop_rx.try_recv().is_ok(),
+                ) {
+                    debug!("local_audio_compressed_open_skipped_stop_received");
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
 
                 // Now play the decoded f32 samples using cpal shared mode
                 let dec_ch = dec_channels;
@@ -7219,6 +7263,10 @@ mod canaux_de_la_source_i3632;
 /// l'UPnP et les fichiers téléversés y passent sans transcodage WAV.
 #[cfg(test)]
 mod decode_failure_tests;
+// #4295 (fil 2006) — un arrêt pendant le décodage d'un flux compressé chargé
+// en entier rend la main au lieu de décoder toute la piste.
+#[cfg(test)]
+mod decodage_compresse_interrompu_4295;
 
 /// #3108 — « la zone reste figée à 2 s, sans message ».
 ///

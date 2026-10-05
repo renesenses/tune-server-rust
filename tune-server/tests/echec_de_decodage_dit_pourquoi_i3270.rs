@@ -32,7 +32,7 @@ const LOCAL: &str = include_str!("../../tune-core/src/outputs/local.rs");
 /// Le bras d'échec du décodage, du site d'appel jusqu'au premier `return;`.
 fn bras_d_echec_du_decodage() -> &'static str {
     let debut = LOCAL
-        .find("decode_compressed_stream(&all_data)")
+        .find("decode_compressed_stream(&all_data, &force_silent)")
         .expect("le site d'appel du décodeur a disparu de local.rs");
     let reste = &LOCAL[debut..];
     let fin = reste
