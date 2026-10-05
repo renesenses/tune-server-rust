@@ -2036,6 +2036,32 @@ impl PlaybackManager {
         });
     }
 
+    /// Fil 2062 / #5550 — pose une durée sur la piste en cours qui n'en avait
+    /// pas, et l'annonce (`track_changed`) pour que l'interface l'affiche.
+    /// Sans effet sur une piste dont la durée est déjà connue.
+    pub async fn adopter_la_duree_rapportee(&self, zone_id: i64, duration_ms: i64) -> bool {
+        if duration_ms <= 0 {
+            return false;
+        }
+        let data = {
+            let mut zones = self.zones.lock().await;
+            let Some(state) = zones.get_mut(&zone_id) else {
+                return false;
+            };
+            let Some(np) = state.now_playing.as_mut().filter(|np| np.duration_ms <= 0) else {
+                return false;
+            };
+            np.duration_ms = duration_ms;
+            now_playing_event_data(state)
+        };
+        self.emit(PlaybackEvent {
+            event: "track_changed".into(),
+            zone_id,
+            data,
+        });
+        true
+    }
+
     /// Update the NowPlaying metadata for a zone without resetting position.
     /// Used for radio streams where the track info changes while playing.
     pub async fn update_now_playing(&self, zone_id: i64, np: NowPlaying) {

@@ -956,6 +956,23 @@ pub fn position_confirms_transition(
                 && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
 }
 
+/// Fil 2062 / #5550 — la durée que la sortie RAPPORTE doit-elle devenir celle
+/// de la piste en cours ?
+///
+/// Seulement pour une piste de serveur UPnP (`source = "upnp"`) partie SANS
+/// durée (`duree_connue_ms == 0`) : une durée connue n'est jamais contredite,
+/// et une radio n'en a pas. Jamais une fois la suivante armée
+/// (`gapless_sent`) : le renderer peut alors déjà parler de la suivante.
+pub fn duree_rapportee_a_adopter(
+    source: Option<&str>,
+    duree_connue_ms: u64,
+    duree_rapportee_ms: u64,
+    gapless_sent: bool,
+) -> Option<u64> {
+    (source == Some("upnp") && duree_connue_ms == 0 && duree_rapportee_ms > 0 && !gapless_sent)
+        .then_some(duree_rapportee_ms)
+}
+
 /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
 /// the final `GAPLESS_WINDOW_MS` of the track and gapless is not yet armed?
 ///
