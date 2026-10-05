@@ -209,7 +209,7 @@ pub mod sql {
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
                 COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
-                q.track_number, q.disc_number, q.album_ref, t.album_id \
+                q.track_number, q.disc_number, q.album_ref, t.album_id, t.artist_id \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
          LEFT JOIN albums al ON t.album_id = al.id \
@@ -422,6 +422,16 @@ pub struct QueueEntry {
     /// autres JSON bâtis sur `QueueEntry` ne bouge pas.
     #[serde(default, skip_serializing)]
     pub album_id: Option<i64>,
+    /// L'artiste de BIBLIOTHÈQUE d'une ligne locale (`tracks.artist_id`), lu
+    /// par la jointure de `unified_select_base`. `None` pour une ligne de
+    /// service.
+    ///
+    /// Fil forum 2143 (#5758), le jumeau d'[`QueueEntry::album_id`] : le menu
+    /// d'un titre local de la file n'offrait pas « Aller à l'artiste », faute
+    /// de cet identifiant. Hors de la sérialisation pour la même raison :
+    /// `GET /zones/{id}/queue` le pose lui-même.
+    #[serde(default, skip_serializing)]
+    pub artist_id: Option<i64>,
 }
 
 impl QueueEntry {
@@ -1500,7 +1510,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     }
 }
 
-/// Maps a row from `sql::unified_select_base()` (20 columns) to a QueueEntry.
+/// Maps a row from `sql::unified_select_base()` (21 columns) to a QueueEntry.
 fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1523,6 +1533,7 @@ fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
         disc_number: cols.get(17).and_then(|v| v.as_i64()),
         album_ref: cols.get(18).and_then(|v| v.as_string()),
         album_id: cols.get(19).and_then(|v| v.as_i64()),
+        artist_id: cols.get(20).and_then(|v| v.as_i64()),
     }
 }
 
