@@ -174,16 +174,23 @@ const IDLE_SLEEP_SECS: u64 = 900;
 /// est repris tout seul.
 const PATH_UNRESOLVED_KEY: &str = "rg_path_unresolved";
 
-/// Ceiling on the ESTIMATED decoded footprint of one track before analysis.
+/// Le marqueur que posait l'ancien plafond `MAX_ANALYSIS_EST_BYTES` (#1109) :
+/// « piste trop grosse pour être décodée en mémoire ». Plus aucun code ne le
+/// pose (plafond-analyse) ; il ne sert plus qu'à retrouver, au démarrage, les
+/// pistes qu'il a écartées — voir [`reprendre_les_pistes_ecartees_pour_leur_taille`].
 ///
-/// `measure_loudness_and_peak` holds the whole track twice: the decoder's
-/// `Vec<i32>` (4 B/sample) plus the normalised `Vec<f64>` (8 B/sample) —
-/// 12 bytes per sample overall. A 30-minute 24/192 stereo track is ~690 M
-/// samples ≈ 8 GB: on a 6-7 GB box the OOM killer shoots the whole server
-/// in a loop (#1109, production 02/08). Until the analysis streams, any
-/// track whose estimate exceeds this budget is skipped (stamped, logged) —
-/// the overwhelming majority of libraries stays fully analysed.
-const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
+/// Ce plafond (1,2 Go estimés à 12 o par échantillon) datait d'avant
+/// l'analyse par segments de 30 s : il écartait tout 24/192 stéréo de plus de
+/// 4 min 20 et tout DSD64 de plus de 4 min 40. Mesuré sur Shrek le 05/10/2026
+/// (`examples/banc_memoire_analyse.rs`), le pic de mémoire de l'analyse d'un
+/// FLAC ou d'un WAV 24/192 ne dépend plus de la durée (≈ 390 Mio pour 5, 20 et
+/// 60 min : c'est la tête de 90 s de l'empreinte). Seul le DSD croissait
+/// encore, parce que chaque segment re-décodait le fichier depuis son début ;
+/// c'est corrigé dans `decode_dsd_to_pcm` (reprise au bloc). Ce qui croît
+/// encore avec la durée — un `f64` par bloc de 100 ms pour la sonie intégrée,
+/// un par bloc de 3 s et par canal pour la plage dynamique — pèse 288 Kio pour
+/// une heure : rien qui justifie un plafond.
+const OVERSIZED_KEY: &str = "rg_skipped_oversized";
 
 /// A single file must never stall the whole sweep. `measure_loudness_and_peak`
 /// decodes in segments via `spawn_blocking`; a pathological file (corrupt FLAC,
@@ -192,7 +199,92 @@ const MAX_ANALYSIS_EST_BYTES: u64 = 1_200_000_000;
 /// (« n'avance plus », Bilou #1155). Bound each track: on timeout we log, stamp
 /// it analysed and move on. Generous vs. a normal streaming analysis (seconds,
 /// up to ~2 min for a very long hi-res track), tight vs. an indefinite hang.
+///
+/// C'est le délai PLANCHER : [`delai_d_analyse`] y ajoute la durée de la piste.
 const PER_TRACK_ANALYSIS_TIMEOUT_SECS: u64 = 180;
+
+/// Le délai accordé à l'analyse d'UNE piste : le plancher de 180 s, plus la
+/// durée de la piste elle-même (plafond-analyse).
+///
+/// Un délai fixe de 180 s ne tenait que parce que le plafond de taille
+/// écartait les longues pistes haute résolution. Sans lui, une heure de
+/// 24/192 (80 s d'analyse sur Shrek chargé) ou vingt minutes de DSD256
+/// dépasseraient 180 s sur un Pi 4 — et une piste qui dépasse son délai est
+/// estampillée analysée SANS gain : le même trou qu'avant, en silence. La
+/// règle retenue : un hôte qui analyse au moins au temps réel — celui qu'il
+/// faut déjà pour LIRE la piste — finit toujours. Un vrai blocage (#1155)
+/// reste borné : à la durée de la piste plus trois minutes. Durée inconnue :
+/// le plancher seul, comme avant.
+fn delai_d_analyse(duration_ms: Option<i64>) -> std::time::Duration {
+    let duree_s = duration_ms
+        .filter(|&ms| ms > 0)
+        .map_or(0, |ms| ms as u64 / 1000);
+    std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS.saturating_add(duree_s))
+}
+
+/// L'estimation de l'ancien plafond, FIGÉE en SQL : 12 o par échantillon, la
+/// cadence DSD ramenée à celle du décodage, CD stéréo à défaut, au-delà de
+/// 1,2 Go. Elle ne sert qu'à retrouver les pistes que le rattrapage de la
+/// plage dynamique a marquées `dr_indisponible` pour leur seule taille.
+const ANCIEN_PLAFOND_DEPASSE_SQL: &str = "t.duration_ms > 0 \
+     AND CAST(t.duration_ms AS BIGINT) / 1000 \
+       * (CASE WHEN COALESCE(t.sample_rate, 0) <= 0 THEN 44100 \
+               WHEN t.sample_rate > 768000 THEN \
+                 CASE WHEN t.sample_rate >= 5000000 THEN 352800 ELSE 176400 END \
+               ELSE t.sample_rate END) \
+       * (CASE WHEN COALESCE(t.channels, 0) > 0 THEN t.channels ELSE 2 END) \
+       * 12 > 1200000000";
+
+/// Rattrapage des pistes que l'ancien plafond de taille a écartées
+/// (plafond-analyse). Rejoué à chaque démarrage de la passe, IDEMPOTENT : ce
+/// ne sont que des `DELETE`, et une fois les marqueurs partis il ne trouve
+/// plus rien. Rend le nombre de lignes effacées.
+///
+/// * le témoin `rg_analyzed` qu'il posait SANS gain sur une piste marquée
+///   [`OVERSIZED_KEY`] — la piste redevient candidate de la passe nominale, qui
+///   mesurera gain, crêtes ET plage dynamique ;
+/// * la marque `dr_indisponible` que le rattrapage de la plage dynamique
+///   posait pour la même raison (pistes au gain lu dans les tags, jamais
+///   décodées) : la piste redevient candidate du rattrapage. Ce n'est pas
+///   distinguable d'un vrai échec sur un long fichier haute résolution : un
+///   tel fichier sera réessayé UNE fois, puis re-marqué. Le prix est borné ;
+/// * le marqueur [`OVERSIZED_KEY`] lui-même, en dernier : tant qu'il reste,
+///   le premier `DELETE` le retrouve au démarrage suivant.
+///
+/// Les gains, crêtes et plages DÉJÀ présents ne sont jamais touchés.
+pub fn reprendre_les_pistes_ecartees_pour_leur_taille(
+    backend: &Arc<dyn DbBackend>,
+) -> Result<usize, String> {
+    let temoins = backend.execute(
+        &format!(
+            "DELETE FROM track_metadata WHERE key = 'rg_analyzed' \
+             AND track_id IN (SELECT s.track_id FROM track_metadata s WHERE s.key = '{OVERSIZED_KEY}') \
+             AND track_id NOT IN (SELECT g.track_id FROM track_metadata g WHERE g.key = 'rg_track_gain')"
+        ),
+        &[],
+    )?;
+    let plages = backend.execute(
+        &format!(
+            "DELETE FROM track_metadata WHERE key = '{DR_INDISPONIBLE_KEY}' \
+             AND track_id IN (SELECT t.id FROM tracks t WHERE {ANCIEN_PLAFOND_DEPASSE_SQL})"
+        ),
+        &[],
+    )?;
+    let marqueurs = backend.execute(
+        &format!("DELETE FROM track_metadata WHERE key = '{OVERSIZED_KEY}'"),
+        &[],
+    )?;
+    if temoins + plages + marqueurs > 0 {
+        info!(
+            temoins,
+            plages,
+            marqueurs,
+            "replaygain_reprise_des_pistes_trop_grosses — l'ancien plafond de taille est levé, \
+             ces pistes redeviennent candidates (plafond-analyse)"
+        );
+    }
+    Ok(temoins + plages + marqueurs)
+}
 
 /// Attente entre deux vérifications quand la machine est trop chaude (#1576).
 const THERMAL_RETRY_SECS: u64 = 120;
@@ -280,13 +372,11 @@ pub(crate) async fn analyser_ou_ceder<T>(
 /// le chemin d'E/S pendant des minutes.
 pub(crate) async fn mesurer_en_cedant_a_la_lecture<T>(
     backend: &Arc<dyn DbBackend>,
+    delai: std::time::Duration,
     travail: impl std::future::Future<Output = T>,
 ) -> Issue<Result<T, tokio::time::error::Elapsed>> {
     analyser_ou_ceder(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(PER_TRACK_ANALYSIS_TIMEOUT_SECS),
-            travail,
-        ),
+        tokio::time::timeout(delai, travail),
         veiller_lecture(backend.clone()),
     )
     .await
@@ -299,51 +389,6 @@ pub(crate) async fn mesurer_en_cedant_a_la_lecture<T>(
 /// morceau »). The pass yields entirely while anything plays, then rechecks.
 /// Shared with the audio-embedding sweep (#1515), which obeys the same rule.
 pub(crate) const PLAYBACK_BACKOFF_SECS: u64 = 30;
-
-/// The 12 B/sample estimate above, from the DB columns the scan filled.
-/// Unknown rate/channels fall back to CD stereo; unknown duration returns 0
-/// (no basis to refuse — the track is analysed as before).
-/// Au-dela de cette frequence, la valeur stockee ne peut pas etre une cadence
-/// PCM : le maximum rencontre en PCM est 768 kHz. C'est donc une cadence DSD
-/// brute (2,8 MHz pour du DSD64, 11,3 MHz pour du DSD256), et l'analyse ne
-/// decode pas a cette cadence-la.
-const MAX_PLAUSIBLE_PCM_RATE: i64 = 768_000;
-
-/// Cadence a laquelle l'analyse decodera reellement ce fichier.
-///
-/// `tracks.sample_rate` contient, pour du DSD, la cadence DSD BRUTE. La prendre
-/// pour une cadence PCM surestimait l'empreinte memoire d'un facteur 16 a 32 :
-/// le fichier DSD256 de Cyrille (#1330) etait annonce a 100 Go pour 6 minutes
-/// de musique, la ou le decodage PCM en represente 3. Consequence, tout fichier
-/// DSD etait ecarte de l'analyse comme « surdimensionne », y compris ceux qui
-/// tiennent largement dans le budget.
-fn effective_decode_rate(sample_rate: i64) -> i64 {
-    if sample_rate > MAX_PLAUSIBLE_PCM_RATE {
-        crate::audio::formats::AudioFormat::Dsd.dsd_output_sample_rate(sample_rate as u32) as i64
-    } else {
-        sample_rate
-    }
-}
-
-fn estimated_analysis_bytes(
-    duration_ms: Option<i64>,
-    sample_rate: Option<i64>,
-    channels: Option<i64>,
-) -> u64 {
-    let dur_s = match duration_ms {
-        Some(ms) if ms > 0 => ms as u64 / 1000,
-        _ => return 0,
-    };
-    let rate = sample_rate
-        .filter(|&r| r > 0)
-        .map(effective_decode_rate)
-        .unwrap_or(44_100) as u64;
-    let ch = channels.filter(|&c| c > 0).unwrap_or(2) as u64;
-    dur_s
-        .saturating_mul(rate)
-        .saturating_mul(ch)
-        .saturating_mul(12)
-}
 
 /// Réglage propre à la PASSE D'ANALYSE : absent/"true" ⇒ autorisée,
 /// "false" ⇒ coupée. Il ne décide pas seul — voir [`analysis_enabled`].
@@ -679,6 +724,20 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
     tokio::spawn(async move {
         // Let startup/scan settle before touching the disk hard.
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        // plafond-analyse — les pistes que l'ancien plafond de taille a
+        // écartées redeviennent candidates. Une fois par démarrage, hors des
+        // fils de l'exécuteur ; un échec n'empêche pas la passe.
+        {
+            let b = backend.clone();
+            if let Some(Err(e)) = crate::taches_de_fond::priorite::hors_du_fil_async(
+                crate::taches_de_fond::Tache::ReplayGain.id(),
+                move || reprendre_les_pistes_ecartees_pour_leur_taille(&b),
+            )
+            .await
+            {
+                warn!(error = %e, "replaygain_reprise_des_pistes_trop_grosses_echec");
+            }
+        }
         // Garde thermique de cette passe (#1576) : ReplayGain décode des
         // fichiers entiers, c'est l'autre moitié de la charge qui a éteint .18.
         let mut thermal = crate::audio::thermal::ThermalGate::new();
@@ -1111,7 +1170,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         },
         |r| analyser_une_piste(backend, &repo, r),
         |suite| match suite {
-            SuitePiste::Ignoree | SuitePiste::Ecartee => true,
+            SuitePiste::Ignoree => true,
             SuitePiste::Avancee { reportee } => {
                 done += 1;
                 if reportee {
@@ -1142,9 +1201,6 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
 enum SuitePiste {
     /// Ligne illisible : rien n'a été fait, rien n'est compté.
     Ignoree,
-    /// Témoin posé sans compter la piste dans le lot (fichier trop gros, #1109 :
-    /// c'est le contrat historique de la boucle, on n'y touche pas).
-    Ecartee,
     /// La piste a quitté le balayage. `reportee` : fichier introuvable (#1865).
     Avancee { reportee: bool },
     /// Abandonnée au profit de la lecture, SANS témoin : elle sera reprise.
@@ -1253,29 +1309,7 @@ async fn analyser_une_piste(
     // Un report qui traînait n'a plus lieu d'être : le fichier répond.
     let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
 
-    let est = estimated_analysis_bytes(
-        r.get(2).and_then(|v| v.as_i64()),
-        r.get(3).and_then(|v| v.as_i64()),
-        r.get(4).and_then(|v| v.as_i64()),
-    );
-    if est > MAX_ANALYSIS_EST_BYTES {
-        warn!(
-            track_id,
-            path = %path,
-            estimated_mb = est / 1_048_576,
-            "replaygain_skipped_oversized — full-decode analysis would risk \
-             OOM (#1109); will be analysed once streaming analysis lands"
-        );
-        let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
-        let _ = repo.set(track_id, "rg_skipped_oversized", "1");
-        // #4144 — le témoin `rg_analyzed` vient d'être posé : la piste sort
-        // des candidats, la jauge doit donc avancer. Ce chemin n'incrémente
-        // volontairement pas `done` (c'est le contrat de la boucle, on n'y
-        // touche pas) ; le compteur d'écran, lui, compte des PISTES sorties
-        // du balayage, pas des mesures réussies.
-        progression::avancer();
-        return SuitePiste::Ecartee;
-    }
+    let delai = delai_d_analyse(r.get(2).and_then(|v| v.as_i64()));
 
     // `sur_disque`, PAS `path` : c'est la graphie que le système a
     // reconnue. Le chemin de la base reste ce qu'il est (#1865).
@@ -1285,6 +1319,7 @@ async fn analyser_une_piste(
     // disque pendant des minutes.
     let measured = match mesurer_en_cedant_a_la_lecture(
         backend,
+        delai,
         crate::audio::analyzer::mesurer_intensite_plage_et_empreinte(&sur_disque),
     )
     .await
@@ -1360,7 +1395,7 @@ async fn analyser_une_piste(
             warn!(
                 track_id,
                 path = %path,
-                timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+                timeout_s = delai.as_secs(),
                 "replaygain_measure_timeout — file stalled analysis; skipping so the sweep advances (#1155)"
             );
         }
@@ -1638,9 +1673,6 @@ const DR_INDISPONIBLE_KEY: &str = "dr_indisponible";
 ///   la comparaison sur `TRIM(...) != ''` suit exactement cette règle, un tag
 ///   présent mais vide n'étant pas une valeur ;
 /// * [`DR_INDISPONIBLE_KEY`] — déjà essayé, en vain ;
-/// * `rg_skipped_oversized` — la passe nominale a refusé de décoder ce fichier
-///   pour ne pas saturer la mémoire (#1109) ; le rattrapage n'a aucune raison
-///   d'être moins prudent ;
 /// * un report de chemin encore frais (#1865).
 ///
 /// Paramètre : le seuil de report.
@@ -1659,8 +1691,6 @@ const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
                  WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'dr_indisponible') \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'rg_skipped_oversized') \
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
@@ -1767,7 +1797,7 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
         },
         |r| rattraper_une_piste(backend, &repo, r),
         |suite| match suite {
-            SuitePiste::Ignoree | SuitePiste::Ecartee => true,
+            SuitePiste::Ignoree => true,
             SuitePiste::Avancee { reportee } => {
                 done += 1;
                 if reportee {
@@ -1824,24 +1854,11 @@ async fn rattraper_une_piste(
     };
     let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
 
-    let est = estimated_analysis_bytes(
-        r.get(2).and_then(|v| v.as_i64()),
-        r.get(3).and_then(|v| v.as_i64()),
-        r.get(4).and_then(|v| v.as_i64()),
-    );
-    if est > MAX_ANALYSIS_EST_BYTES {
-        warn!(
-            track_id,
-            path = %path,
-            estimated_mb = est / 1_048_576,
-            "dr_rattrapage_fichier_trop_gros — decode complet ecarte (#1109)"
-        );
-        let _ = repo.set(track_id, DR_INDISPONIBLE_KEY, &now_epoch_secs().to_string());
-        return SuitePiste::Avancee { reportee: false };
-    }
+    let delai = delai_d_analyse(r.get(2).and_then(|v| v.as_i64()));
 
     let measured = match mesurer_en_cedant_a_la_lecture(
         backend,
+        delai,
         crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
     )
     .await
@@ -1893,7 +1910,7 @@ async fn rattraper_une_piste(
         Err(_elapsed) => warn!(
             track_id,
             path = %path,
-            timeout_s = PER_TRACK_ANALYSIS_TIMEOUT_SECS,
+            timeout_s = delai.as_secs(),
             "dr_rattrapage_timeout — fichier bloquant, marque pour que le lot AVANCE (#1155)"
         ),
     }
@@ -3626,54 +3643,128 @@ mod tests {
         );
     }
 
-    /// #1330 : la cadence DSD brute etait prise pour une cadence PCM, ce qui
-    /// gonflait l'estimation d'un facteur 16 a 32 et ecartait TOUT fichier DSD
-    /// de l'analyse.
+    /// plafond-analyse — le délai d'une piste suit sa durée : un hôte qui
+    /// analyse au temps réel finit toujours, un blocage reste borné.
     #[test]
-    fn dsd_rate_is_converted_to_the_real_decode_rate() {
-        // DSD256 (11,3 MHz) est decode a 352,8 kHz.
-        assert_eq!(effective_decode_rate(11_289_600), 352_800);
-        // DSD64 (2,8 MHz) est decode a 176,4 kHz.
-        assert_eq!(effective_decode_rate(2_822_400), 176_400);
-        // Une vraie cadence PCM n'est jamais touchee, y compris la plus haute.
-        assert_eq!(effective_decode_rate(44_100), 44_100);
-        assert_eq!(effective_decode_rate(768_000), 768_000);
-    }
-
-    /// Le cas exact de Cyrille : 6 minutes de DSD256 annoncees a ~100 Go.
-    #[test]
-    fn dsd256_estimate_is_no_longer_absurd() {
-        let dur_ms = Some(372_000);
-        let est = estimated_analysis_bytes(dur_ms, Some(11_289_600), Some(2));
-        let gb = est as f64 / 1e9;
-        assert!(
-            (2.5..4.0).contains(&gb),
-            "6 min de DSD256 devraient peser ~3 Go decodes, pas {gb} Go"
+    fn le_delai_d_analyse_suit_la_duree_de_la_piste() {
+        let s = |d: std::time::Duration| d.as_secs();
+        assert_eq!(s(delai_d_analyse(None)), PER_TRACK_ANALYSIS_TIMEOUT_SECS);
+        assert_eq!(s(delai_d_analyse(Some(0))), PER_TRACK_ANALYSIS_TIMEOUT_SECS);
+        assert_eq!(
+            s(delai_d_analyse(Some(-5))),
+            PER_TRACK_ANALYSIS_TIMEOUT_SECS
         );
+        assert_eq!(s(delai_d_analyse(Some(240_000))), 180 + 240);
+        assert_eq!(s(delai_d_analyse(Some(3_600_000))), 180 + 3600);
     }
 
-    /// Un DSD64 court entre desormais dans le budget, la ou il etait ecarte.
-    #[test]
-    fn short_dsd64_becomes_analysable() {
-        let est = estimated_analysis_bytes(Some(240_000), Some(2_822_400), Some(2));
+    /// Ce que l'ancien plafond écartait : la taille ESTIMÉE depuis les
+    /// colonnes de la base. 30 min de 24/192 stéréo (8,3 Go estimés) étaient
+    /// estampillées `rg_analyzed` + `rg_skipped_oversized`, sans gain ni plage.
+    fn declarer_trente_minutes_de_24_192(db: &crate::db::sqlite::SqliteDb) {
+        db.execute(
+            "UPDATE tracks SET duration_ms = 1800000, sample_rate = 192000, channels = 2 \
+             WHERE id = 42",
+            &[],
+        )
+        .unwrap();
+    }
+
+    /// plafond-analyse — la piste que le plafond écartait est désormais
+    /// MESURÉE : gain, crête et plage dynamique.
+    #[tokio::test]
+    async fn la_piste_anciennement_ecartee_pour_sa_taille_est_maintenant_mesuree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("longue.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        declarer_trente_minutes_de_24_192(&db);
+
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        let t = temoins(&db);
         assert!(
-            est < MAX_ANALYSIS_EST_BYTES,
-            "4 min de DSD64 devraient tenir dans le budget, estime a {est}"
+            !t.contains_key(OVERSIZED_KEY),
+            "aucune piste ne doit plus être écartée pour sa taille estimée : {t:?}"
         );
+        assert!(
+            t.contains_key("rg_track_gain"),
+            "la piste doit être mesurée, pas seulement estampillée : {t:?}"
+        );
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"), "{t:?}");
     }
 
-    #[test]
-    fn oversized_estimate_math() {
-        // 30 min of 24/192 stereo ≈ 8 GB decoded+normalised: must exceed the budget.
-        let est = estimated_analysis_bytes(Some(30 * 60 * 1000), Some(192_000), Some(2));
-        assert!(est > MAX_ANALYSIS_EST_BYTES, "{est}");
-        // A 5-minute CD track (~160 MB) sails under it.
-        let cd = estimated_analysis_bytes(Some(5 * 60 * 1000), Some(44_100), Some(2));
-        assert!(cd < MAX_ANALYSIS_EST_BYTES, "{cd}");
-        // Unknown duration → 0 → never refused on missing data.
-        assert_eq!(estimated_analysis_bytes(None, Some(192_000), Some(2)), 0);
-        // Unknown rate/channels fall back to CD stereo, not to zero.
-        assert!(estimated_analysis_bytes(Some(300_000), None, None) > 0);
+    /// plafond-analyse — le rattrapage efface les marques de l'ancien
+    /// plafond, et elles seules ; la passe reprend ensuite la piste.
+    #[tokio::test]
+    async fn le_rattrapage_rend_a_la_passe_les_pistes_ecartees_pour_leur_taille() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("longue.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        declarer_trente_minutes_de_24_192(&db);
+        let repo = TrackMetadataRepo::new(db.clone());
+        // 42 : ce que posait l'ancienne passe nominale.
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, OVERSIZED_KEY, "1").unwrap();
+        for (id, duree, cadence) in [
+            (43, 300_000, 44_100),
+            (44, 600_000, 2_822_400),
+            (45, 1_800_000, 192_000),
+        ] {
+            db.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+                     sample_rate, channels) VALUES ({id}, 'p{id}', 1, 1, '/nulle/part/{id}.flac', \
+                     {duree}, {cadence}, 2)"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        // 43 : un vrai échec de plage sur une piste CD — il reste.
+        repo.set(43, DR_INDISPONIBLE_KEY, "1700000000").unwrap();
+        // 44 : 10 min de DSD64 au gain lu dans les tags, que le rattrapage DR
+        // avait marquée indisponible pour sa taille (4,2 Go estimés).
+        repo.set(44, "rg_track_gain", "-3.00 dB").unwrap();
+        repo.set(44, DR_INDISPONIBLE_KEY, "1700000000").unwrap();
+        // 45 : marquée, mais déjà dotée d'un gain : son témoin ne bouge pas.
+        repo.set(45, "rg_track_gain", "-1.00 dB").unwrap();
+        repo.set(45, "rg_analyzed", "1700000000").unwrap();
+        repo.set(45, OVERSIZED_KEY, "1").unwrap();
+
+        let de = |id: i64| repo.get_all(id).unwrap();
+        // CONTRE-ÉPREUVE de l'utilité du rattrapage : sans lui, la piste 42
+        // reste hors du balayage pour toujours (les autres, introuvables,
+        // sont seulement reportées).
+        analyze_track_batch(&backend).await;
+        assert!(!de(42).contains_key("rg_track_gain"), "{:?}", de(42));
+
+        // Quatre lignes : le témoin de 42, la marque DR de 44, les deux
+        // marqueurs (42 et 45).
+        assert_eq!(
+            reprendre_les_pistes_ecartees_pour_leur_taille(&backend),
+            Ok(4)
+        );
+        assert!(!de(42).contains_key("rg_analyzed"), "{:?}", de(42));
+        assert!(!de(42).contains_key(OVERSIZED_KEY), "{:?}", de(42));
+        assert!(de(43).contains_key(DR_INDISPONIBLE_KEY), "{:?}", de(43));
+        assert!(!de(44).contains_key(DR_INDISPONIBLE_KEY), "{:?}", de(44));
+        assert_eq!(
+            de(44).get("rg_track_gain").map(String::as_str),
+            Some("-3.00 dB")
+        );
+        assert!(de(45).contains_key("rg_analyzed"), "{:?}", de(45));
+        assert!(!de(45).contains_key(OVERSIZED_KEY), "{:?}", de(45));
+        // Idempotent.
+        assert_eq!(
+            reprendre_les_pistes_ecartees_pour_leur_taille(&backend),
+            Ok(0)
+        );
+
+        // La passe reprend la piste 42 et la mesure.
+        analyze_track_batch(&backend).await;
+        assert!(de(42).contains_key("rg_track_gain"), "{:?}", de(42));
+        assert_eq!(de(42).get("dr_track").map(String::as_str), Some("10"));
     }
 
     #[test]
@@ -5172,8 +5263,12 @@ mod tests {
         // c'est-à-dire ALORS QUE le travail est déjà en cours.
         let backend = ZoneQuiDemarre::poser(interne, 1);
         let t0 = std::time::Instant::now();
-        let issue =
-            mesurer_en_cedant_a_la_lecture(&backend, tokio::time::sleep(TRAVAIL_LONG)).await;
+        let issue = mesurer_en_cedant_a_la_lecture(
+            &backend,
+            delai_d_analyse(None),
+            tokio::time::sleep(TRAVAIL_LONG),
+        )
+        .await;
         let apres = t0.elapsed();
 
         assert!(
