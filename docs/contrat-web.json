@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "f838cde2d4f65ce47d69519b49739b622d4fb636",
+    "web_sha": "f503b7f1df9e5e6c449c3e480cee877ea262b22d",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -3064,6 +3064,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -4174,14 +4175,17 @@
       "methode": "GET",
       "type": "(en ligne)",
       "liste": false,
-      "champs_obligatoires": [
-        "multicast_ssdp",
-        "port_8888",
-        "internet",
-        "dns_resolution",
-        "renderers"
-      ],
-      "champs_optionnels": []
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "discovered_devices",
+        "discovered_media_servers",
+        "registered_outputs",
+        "ssdp",
+        "slimproto",
+        "slimproto_udp",
+        "lms_cli",
+        "devices"
+      ]
     },
     {
       "route": "/system/dynamic-range/progress",
@@ -4267,7 +4271,8 @@
       "champs_optionnels": [
         "TUNE_PORT",
         "spotify_redirect_uri",
-        "spotify_redirect_uri_refus"
+        "spotify_redirect_uri_refus",
+        "spotify_client_id_configure"
       ]
     },
     {
@@ -4421,7 +4426,9 @@
         "enabled",
         "deferred",
         "waiting_reason",
-        "working"
+        "working",
+        "library_analyzed",
+        "library_eligible"
       ]
     },
     {
@@ -4766,6 +4773,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -4838,6 +4846,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -4976,6 +4985,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5048,6 +5058,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5241,6 +5252,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5325,6 +5337,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5433,6 +5446,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5547,6 +5561,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5666,6 +5681,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
@@ -5738,6 +5754,7 @@
         "recovery_attempts",
         "is_default",
         "dsd_mode",
+        "dsd_transport",
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",

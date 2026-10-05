@@ -1018,6 +1018,10 @@ name = "alarm_source_3715"
 path = "tests/alarm_source_3715.rs"
 
 [[test]]
+name = "alarm_days_5669"
+path = "tests/alarm_days_5669.rs"
+
+[[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
 
@@ -1384,6 +1388,13 @@ path = "tests/sso_deconnexion_efface_la_liaison_5326.rs"
 [[test]]
 name = "sso_modules_du_compte"
 path = "tests/sso_modules_du_compte.rs"
+
+# #5682 — les gardes du montage SMB (#1834, #1916) et l'ordre « remonter les
+# partages, PUIS scanner » de `bootstrap.rs`. Le fichier existait sans cible :
+# `autotests = false` ne l'avait jamais compilé (relevé pendant #5682).
+[[test]]
+name = "smb_dialect_seam"
+path = "tests/smb_dialect_seam.rs"
 
 # Reconnexion au compte après une attente imposée par le cloud : l'attente est
 # dite AVANT de rediriger, le navigateur reçoit une page et non du JSON, et un

@@ -104,7 +104,7 @@ impl TunePlugin for CdPlugin {
         false
     }
     /// Au catalogue (#4863) : l'écran « Lecture CD » du client web consomme
-    /// ses trois routes, donc la doctrine #2090 est remplie — le gestionnaire
+    /// ses routes, donc la doctrine #2090 est remplie — le gestionnaire
     /// peut proposer « Installer ». Gratuit, comme `bandcamp` (absent de
     /// `premium_plugins`).
     fn catalogued(&self) -> bool {
@@ -119,11 +119,13 @@ impl TunePlugin for CdPlugin {
             playback: self.services.playback.clone(),
         });
         let zones: ZonesDuDisque = Arc::default();
+        let reveil = Arc::new(tokio::sync::Notify::new());
         let etat_routes = routes::EtatRoutes {
             lecteur: lecteur.clone(),
             hote: hote.clone(),
             consultation: musicbrainz::MusicBrainz::new(),
             zones: zones.clone(),
+            reveil: reveil.clone(),
         };
         // #5065 — la source `cd` du registre commun des sources physiques.
         let publication = Arc::new(source::PublicationSource::new(
@@ -142,7 +144,8 @@ impl TunePlugin for CdPlugin {
                     .sources_pcm()
                     .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur: l.clone() }));
                 let s = Surveillant::new(l.clone(), hote.clone(), zones.clone())
-                    .avec_publication(publication);
+                    .avec_publication(publication)
+                    .avec_reveil(reveil);
                 self.surveillance = Some(tokio::spawn(s.tourner()));
             }
             None => tracing::info!(
