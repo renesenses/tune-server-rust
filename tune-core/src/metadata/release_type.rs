@@ -20,11 +20,34 @@
 //! .15** : sur la plupart des disques, MusicBrainz ne répondra pas. Le type
 //! reste alors `None`, la colonne reste NULLE, et le client lit « inconnu ».
 //!
-//! **Aucune heuristique** : ni le nombre de titres, ni la durée totale. Un
-//! disque de quatre titres peut être un album, un single peut en porter six
-//! avec ses remixes. C'est écrit dans l'issue : *un classement faux est pire
-//! qu'une section absente*. Ce module ne contient donc, délibérément, aucune
-//! fonction qui regarde `track_count`.
+//! # Une règle de repli, et elle ne remplace jamais une réponse (#5616)
+//!
+//! La 0.9.169 refusait toute heuristique (« un classement faux est pire
+//! qu'une section absente »). Bertrand revient sur ce choix le 05/10/2026
+//! (fil 2096, puis 2143 de FabienM) : sur la bibliothèque locale, le type est
+//! presque toujours inconnu, et la page d'un artiste mêlait ses singles à ses
+//! albums. La règle est donc :
+//!
+//! 1. **Le type explicite gagne toujours** : `albums.release_type`, écrit par
+//!    MusicBrainz, par le service, ou à la main (édition de l'album). Il n'est
+//!    jamais réécrit ni contredit.
+//! 2. **À défaut**, [`type_deduit`] range le disque d'après ses PISTES :
+//!    * single : de 1 à [`SINGLE_PISTES_MAX`] pistes et moins de
+//!      [`SINGLE_DUREE_MAX_MS`] au total ;
+//!    * EP : de [`EP_PISTES_MIN`] à [`EP_PISTES_MAX`] pistes et moins de
+//!      [`EP_DUREE_MAX_MS`] au total ;
+//!    * album sinon.
+//! 3. **Compilations exclues** : un disque `is_compilation` n'est jamais
+//!    déduit. Les albums live ne portent aucun drapeau dans Tune : un live
+//!    typé par MusicBrainz reste un `album` (règle 1) ; un live sans type
+//!    n'est pas reconnu comme tel, et la règle 2 s'y applique comme à tout
+//!    disque.
+//!
+//! Le type DÉDUIT n'est jamais écrit dans `albums.release_type` : il est
+//! calculé à la lecture et publié à part (`inferred_release_type`), pour que
+//! la réponse explicite garde son statut et que la règle reste réversible.
+//! Une durée de piste inconnue suspend la déduction : on ne compare pas une
+//! somme partielle à un seuil.
 //!
 //! # Les types secondaires ne décident de rien
 //!
@@ -195,6 +218,66 @@ pub async fn remplir_types_depuis_musicbrainz(
     (candidats.len(), remplis)
 }
 
+/// Seuils de la règle de repli (#5616). Bornes STRICTES pour les durées
+/// (« moins de »), inclusives pour les nombres de pistes.
+///
+/// Un single : 1 à 3 pistes.
+pub const SINGLE_PISTES_MAX: u32 = 3;
+/// … et moins de 15 minutes au total.
+pub const SINGLE_DUREE_MAX_MS: u64 = 15 * 60 * 1000;
+/// Un EP : 4 à 6 pistes…
+pub const EP_PISTES_MIN: u32 = 4;
+/// (borne haute incluse)
+pub const EP_PISTES_MAX: u32 = 6;
+/// … et moins de 30 minutes au total.
+pub const EP_DUREE_MAX_MS: u64 = 30 * 60 * 1000;
+
+/// Ce que la règle de repli sait des pistes d'un disque.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PistesDuDisque {
+    /// Nombre de pistes du disque.
+    pub nombre: u32,
+    /// Somme des durées connues, en millisecondes.
+    pub duree_totale_ms: u64,
+    /// Nombre de pistes dont la durée est inconnue (nulle ou absente).
+    pub durees_inconnues: u32,
+}
+
+/// La règle de repli seule : single, EP ou album, d'après les pistes.
+///
+/// `None` quand elle ne peut pas conclure : aucune piste, ou une durée
+/// inconnue (une somme partielle passerait un disque long sous un seuil).
+pub fn deduire_depuis_pistes(p: PistesDuDisque) -> Option<TypeDeSortie> {
+    if p.nombre == 0 || p.durees_inconnues > 0 {
+        return None;
+    }
+    if p.nombre <= SINGLE_PISTES_MAX && p.duree_totale_ms < SINGLE_DUREE_MAX_MS {
+        return Some(TypeDeSortie::Single);
+    }
+    if (EP_PISTES_MIN..=EP_PISTES_MAX).contains(&p.nombre) && p.duree_totale_ms < EP_DUREE_MAX_MS {
+        return Some(TypeDeSortie::Ep);
+    }
+    Some(TypeDeSortie::Album)
+}
+
+/// Le type DÉDUIT d'un disque, ou `None` quand il n'y a rien à déduire.
+///
+/// `None` dans trois cas, et c'est voulu :
+/// * le disque a un type explicite reconnu (`explicite`) : il gagne toujours,
+///   et rien n'est publié à côté ;
+/// * c'est une compilation : la règle ne la touche pas ;
+/// * la règle ne peut pas conclure (voir [`deduire_depuis_pistes`]).
+pub fn type_deduit(
+    explicite: Option<&str>,
+    est_compilation: bool,
+    pistes: Option<PistesDuDisque>,
+) -> Option<TypeDeSortie> {
+    if explicite.and_then(TypeDeSortie::depuis_mot).is_some() || est_compilation {
+        return None;
+    }
+    deduire_depuis_pistes(pistes?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +392,142 @@ mod tests {
                 t.as_str()
             );
         }
+    }
+    const MIN: u64 = 60 * 1000;
+
+    fn pistes(nombre: u32, minutes: u64) -> Option<PistesDuDisque> {
+        Some(PistesDuDisque {
+            nombre,
+            duree_totale_ms: minutes * MIN,
+            durees_inconnues: 0,
+        })
+    }
+
+    #[test]
+    fn le_type_explicite_gagne_toujours() {
+        // Un « album » MusicBrainz de 2 titres courts reste un album, et un
+        // « single » de 12 titres reste un single : rien n'est déduit.
+        assert_eq!(type_deduit(Some("album"), false, pistes(2, 8)), None);
+        assert_eq!(type_deduit(Some("SINGLE"), false, pistes(12, 70)), None);
+        assert_eq!(type_deduit(Some("ep"), false, pistes(1, 3)), None);
+        assert_eq!(type_deduit(Some("other"), false, pistes(1, 3)), None);
+    }
+
+    #[test]
+    fn un_type_vide_ou_inconnu_laisse_jouer_la_regle() {
+        assert_eq!(
+            type_deduit(Some(""), false, pistes(2, 8)),
+            Some(TypeDeSortie::Single)
+        );
+        assert_eq!(
+            type_deduit(Some("epMini"), false, pistes(5, 20)),
+            Some(TypeDeSortie::Ep)
+        );
+        assert_eq!(
+            type_deduit(None, false, pistes(10, 45)),
+            Some(TypeDeSortie::Album)
+        );
+    }
+
+    #[test]
+    fn les_seuils_du_single() {
+        assert_eq!(
+            deduire_depuis_pistes(pistes(1, 4).unwrap()),
+            Some(TypeDeSortie::Single)
+        );
+        assert_eq!(
+            deduire_depuis_pistes(pistes(3, 14).unwrap()),
+            Some(TypeDeSortie::Single)
+        );
+        // 15 min pile : la borne est stricte, ce n'est plus un single, et 3
+        // pistes ne font pas un EP → album.
+        let quinze = PistesDuDisque {
+            nombre: 3,
+            duree_totale_ms: SINGLE_DUREE_MAX_MS,
+            durees_inconnues: 0,
+        };
+        assert_eq!(deduire_depuis_pistes(quinze), Some(TypeDeSortie::Album));
+        let juste_sous = PistesDuDisque {
+            duree_totale_ms: SINGLE_DUREE_MAX_MS - 1,
+            ..quinze
+        };
+        assert_eq!(
+            deduire_depuis_pistes(juste_sous),
+            Some(TypeDeSortie::Single)
+        );
+    }
+
+    #[test]
+    fn les_seuils_de_l_ep() {
+        assert_eq!(
+            deduire_depuis_pistes(pistes(4, 10).unwrap()),
+            Some(TypeDeSortie::Ep)
+        );
+        assert_eq!(
+            deduire_depuis_pistes(pistes(6, 29).unwrap()),
+            Some(TypeDeSortie::Ep)
+        );
+        // 4 titres courts : EP, même sous le seuil du single.
+        assert_eq!(
+            deduire_depuis_pistes(pistes(4, 5).unwrap()),
+            Some(TypeDeSortie::Ep)
+        );
+        let trente = PistesDuDisque {
+            nombre: 6,
+            duree_totale_ms: EP_DUREE_MAX_MS,
+            durees_inconnues: 0,
+        };
+        assert_eq!(deduire_depuis_pistes(trente), Some(TypeDeSortie::Album));
+        let juste_sous = PistesDuDisque {
+            duree_totale_ms: EP_DUREE_MAX_MS - 1,
+            ..trente
+        };
+        assert_eq!(deduire_depuis_pistes(juste_sous), Some(TypeDeSortie::Ep));
+    }
+
+    #[test]
+    fn hors_des_fourchettes_c_est_un_album() {
+        // 7 pistes courtes : au-delà de l'EP.
+        assert_eq!(
+            deduire_depuis_pistes(pistes(7, 20).unwrap()),
+            Some(TypeDeSortie::Album)
+        );
+        // 5 pistes longues (jazz, classique) : album.
+        assert_eq!(
+            deduire_depuis_pistes(pistes(5, 42).unwrap()),
+            Some(TypeDeSortie::Album)
+        );
+        // 2 pistes de 20 min : album (pas de règle « EP long »).
+        assert_eq!(
+            deduire_depuis_pistes(pistes(2, 40).unwrap()),
+            Some(TypeDeSortie::Album)
+        );
+    }
+
+    #[test]
+    fn sans_pistes_ou_avec_une_duree_inconnue_on_ne_deduit_rien() {
+        assert_eq!(deduire_depuis_pistes(PistesDuDisque::default()), None);
+        let trou = PistesDuDisque {
+            nombre: 2,
+            duree_totale_ms: 4 * MIN,
+            durees_inconnues: 1,
+        };
+        assert_eq!(deduire_depuis_pistes(trou), None);
+        assert_eq!(type_deduit(None, false, None), None);
+    }
+
+    #[test]
+    fn une_compilation_n_est_jamais_deduite() {
+        assert_eq!(type_deduit(None, true, pistes(2, 8)), None);
+        assert_eq!(type_deduit(None, true, pistes(5, 20)), None);
+        assert_eq!(type_deduit(None, true, pistes(15, 70)), None);
+    }
+
+    #[test]
+    fn les_seuils_sont_ceux_de_la_regle_ecrite() {
+        assert_eq!(SINGLE_PISTES_MAX, 3);
+        assert_eq!(SINGLE_DUREE_MAX_MS, 900_000);
+        assert_eq!((EP_PISTES_MIN, EP_PISTES_MAX), (4, 6));
+        assert_eq!(EP_DUREE_MAX_MS, 1_800_000);
     }
 }

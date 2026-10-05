@@ -1197,6 +1197,11 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
 
+# #5616 — EP et singles déduits (pistes et durée) sur la fiche artiste.
+[[test]]
+name = "page_artiste_ep_singles_5616"
+path = "tests/page_artiste_ep_singles_5616.rs"
+
 # #1572 — crédits d’un album (GET /library/albums/{id}/credits), fil 1921.
 [[test]]
 name = "credits_album_1572"

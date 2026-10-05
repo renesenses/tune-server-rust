@@ -3079,6 +3079,99 @@ impl AlbumRepo {
         }
     }
 
+    /// Nombre de pistes et durée totale de chaque album demandé, en une
+    /// requête groupée (#5616) — l'entrée de la règle de repli
+    /// [`crate::metadata::release_type::type_deduit`].
+    ///
+    /// La durée passe par [`crate::db::home_queries::DUREE_MS`] : la colonne
+    /// est BIGINT en SQLite et peut être TEXT en PostgreSQL (`pg_migrate`),
+    /// où `SUM(text)` n'existe pas. `SUM` rend NUMERIC sur PostgreSQL : d'où
+    /// les `CAST(… AS BIGINT)`.
+    pub fn pistes_par_album(
+        &self,
+        ids: &[i64],
+    ) -> Result<
+        std::collections::HashMap<i64, crate::metadata::release_type::PistesDuDisque>,
+        TuneError,
+    > {
+        use crate::db::home_queries::DUREE_MS;
+        let mut par_id = std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT t.album_id, COUNT(*), \
+                        CAST(COALESCE(SUM(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT), \
+                        CAST(SUM(CASE WHEN COALESCE({DUREE_MS}, 0) > 0 THEN 0 ELSE 1 END) AS BIGINT) \
+                 FROM tracks t WHERE t.album_id IN ({id_list}) GROUP BY t.album_id"
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                let entier = |i: usize| row.get(i).and_then(|v| v.as_i64());
+                if let (Some(id), Some(n), Some(ms), Some(inconnues)) =
+                    (entier(0), entier(1), entier(2), entier(3))
+                {
+                    par_id.insert(
+                        id,
+                        crate::metadata::release_type::PistesDuDisque {
+                            nombre: u32::try_from(n).unwrap_or(u32::MAX),
+                            duree_totale_ms: u64::try_from(ms).unwrap_or(0),
+                            durees_inconnues: u32::try_from(inconnues).unwrap_or(u32::MAX),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
+    /// Le type DÉDUIT de chaque album qui en reçoit un (#5616), par
+    /// identifiant. Un album au type explicite, une compilation, un album
+    /// sans piste ou à durée inconnue n'y figurent pas. Un échec de lecture
+    /// rend une table vide : la page reste celle d'avant, rien n'est inventé.
+    pub fn types_deduits(
+        &self,
+        albums: &[Album],
+    ) -> std::collections::HashMap<i64, crate::metadata::release_type::TypeDeSortie> {
+        use crate::metadata::release_type::{TypeDeSortie, type_deduit};
+        // Seuls les albums qui POURRAIENT recevoir un type sont mesurés.
+        let candidats: Vec<i64> = albums
+            .iter()
+            .filter(|a| {
+                !a.is_compilation
+                    && a.release_type
+                        .as_deref()
+                        .and_then(TypeDeSortie::depuis_mot)
+                        .is_none()
+            })
+            .filter_map(|a| a.id)
+            .collect();
+        if candidats.is_empty() {
+            return Default::default();
+        }
+        let pistes = match self.pistes_par_album(&candidats) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "pistes_par_album a échoué — aucun type déduit");
+                return Default::default();
+            }
+        };
+        albums
+            .iter()
+            .filter_map(|a| {
+                let id = a.id?;
+                type_deduit(
+                    a.release_type.as_deref(),
+                    a.is_compilation,
+                    pistes.get(&id).copied(),
+                )
+                .map(|t| (id, t))
+            })
+            .collect()
+    }
+
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
     /// passe, exposé sous l'alias `dr.dr` (#2144).
     ///
