@@ -3,6 +3,7 @@ pub mod artist_split;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
+pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod credits_mb;
 pub mod credits_release;

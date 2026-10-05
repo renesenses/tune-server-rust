@@ -1267,6 +1267,12 @@ path = "tests/identification_lot_4805.rs"
 name = "labels_par_le_pilote_4836"
 path = "tests/labels_par_le_pilote_4836.rs"
 
+# #4805 D — le pilote part des identifiants des balises, et s'abstient quand
+# le pressage est ambigu (doublure MusicBrainz locale).
+[[test]]
+name = "identification_choix_4805"
+path = "tests/identification_choix_4805.rs"
+
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
 # le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne

@@ -46,7 +46,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::metadata::choix_de_pressage::{self, EntreeDIdentification, IssueDuChoix};
 use tune_core::metadata::musicbrainz_release;
 use tune_core::metadata::reidentify::{
     LocalTrack, apply_album_identification, clear_album_identification, map_recording_ids,
@@ -59,6 +61,20 @@ use crate::state::AppState;
 /// mieux classé — mais en demander plusieurs laisse au classement de quoi
 /// travailler.
 const CANDIDATS: usize = 5;
+
+/// Qui demande l'identification — et donc quelle règle s'applique (#4805).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModeIdentification {
+    /// Le bouton « Ré-identifier » d'un album. Inchangé : la recherche texte,
+    /// SANS les identifiants des balises (c'est eux qu'on soupçonne), et le
+    /// mieux classé. L'utilisateur voit le résultat et peut recommencer.
+    Manuel,
+    /// La passe `identify-all`, où personne ne regarde. Les identifiants des
+    /// balises d'abord, puis la recherche texte ; un pressage n'est écrit que
+    /// s'il est sûr et colle aux fichiers, sinon l'album est `ambiguous`
+    /// ([`choix_de_pressage::identifier_le_pressage`]).
+    Lot,
+}
 
 /// Ce qu'une identification d'album a donné, indépendamment du transport.
 ///
@@ -90,6 +106,11 @@ pub(super) struct Identification {
     /// les refus. Douze albums introuvables d'affilée ne sont pas une panne ;
     /// douze refus, si.
     pub refus_musicbrainz: bool,
+    /// D'où vient le pressage posé (mode lot seulement) : `balise_release`,
+    /// `balise_enregistrement`, `code_barres` ou `recherche`.
+    pub source: Option<&'static str>,
+    /// Pourquoi l'album est `ambiguous` (mode lot seulement).
+    pub raison_ambigu: Option<&'static str>,
 }
 
 /// Pourquoi une identification n'a même pas pu être tentée. À distinguer d'un
@@ -107,6 +128,7 @@ pub(super) enum EchecIdentification {
 pub(super) async fn identifier_album(
     state: &AppState,
     album_id: i64,
+    mode: ModeIdentification,
 ) -> Result<Identification, EchecIdentification> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(album_id) {
@@ -131,6 +153,8 @@ pub(super) async fn identifier_album(
             // MusicBrainz n'a même pas été interrogé : cet album n'apprend
             // rien sur sa santé.
             refus_musicbrainz: false,
+            source: None,
+            raison_ambigu: None,
         });
     }
 
@@ -149,6 +173,14 @@ pub(super) async fn identifier_album(
     let artist =
         musicbrainz_release::artiste_de_requete(album.artist_name.as_deref(), artiste_des_pistes);
 
+    // Les identifiants des balises, lus AVANT d'effacer (mode lot seulement).
+    let balises = match mode {
+        ModeIdentification::Lot => {
+            balises_de_l_album(&state.backend, &tracks, album.barcode.as_deref())
+        }
+        ModeIdentification::Manuel => BalisesDeLAlbum::default(),
+    };
+
     // 1. Effacer, en gardant le calque de ce qu'on efface.
     let cleared = match clear_album_identification(&state.backend, album_id) {
         Ok(c) => c,
@@ -157,6 +189,31 @@ pub(super) async fn identifier_album(
             return Err(EchecIdentification::Base(e));
         }
     };
+
+    let locales: Vec<LocalTrack> = tracks
+        .iter()
+        .filter_map(|t| {
+            Some(LocalTrack {
+                id: t.id?,
+                disc: t.disc_number,
+                position: t.track_number,
+                title: t.title.clone(),
+            })
+        })
+        .collect();
+
+    if mode == ModeIdentification::Lot {
+        return identifier_en_lot(
+            state,
+            album_id,
+            &album.title,
+            artist,
+            &locales,
+            &balises,
+            cleared,
+        )
+        .await;
+    }
 
     // 2. Chercher le pressage. Volontairement SANS le MBID d'avant : c'est lui
     //    qu'on soupçonne, et le scan a pu le lire dans des balises fausses
@@ -197,6 +254,8 @@ pub(super) async fn identifier_album(
             meilleur: None,
             applied: None,
             refus_musicbrainz,
+            source: None,
+            raison_ambigu: None,
         });
     };
 
@@ -204,17 +263,6 @@ pub(super) async fn identifier_album(
     let detail = musicbrainz_release::lookup_release_detail(&meilleur.release_id).await;
 
     // 3. Associer les pistes du pressage aux pistes locales.
-    let locales: Vec<LocalTrack> = tracks
-        .iter()
-        .filter_map(|t| {
-            Some(LocalTrack {
-                id: t.id?,
-                disc: t.disc_number,
-                position: t.track_number,
-                title: t.title.clone(),
-            })
-        })
-        .collect();
     let recordings = match detail.as_ref() {
         Some(d) => map_recording_ids(&locales, &d.tracks),
         None => Vec::new(),
@@ -269,6 +317,173 @@ pub(super) async fn identifier_album(
         applied: Some(applied),
         // MusicBrainz a répondu, et son pressage est posé.
         refus_musicbrainz: false,
+        source: None,
+        raison_ambigu: None,
+    })
+}
+
+/// Les identifiants que les balises des fichiers portent déjà, tels que le
+/// scan les a rangés en base (`track_metadata`, clés de
+/// `read_extended_metadata`). Idée : MetaRust (Xavier Joly), `resolve_release`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct BalisesDeLAlbum {
+    /// `mb_release_id` (`MUSICBRAINZ_ALBUMID`), une entrée par piste qui le porte.
+    pub releases: Vec<String>,
+    /// `mb_track_id` (`MUSICBRAINZ_TRACKID`), dans l'ordre des pistes.
+    pub enregistrements: Vec<String>,
+    /// `barcode` des pistes, puis celui de l'album.
+    pub codes_barres: Vec<String>,
+}
+
+/// Lit [`BalisesDeLAlbum`] : trois requêtes sur la clé primaire de
+/// `track_metadata`, aucune sur le réseau. Une panne de lecture rend une
+/// liste vide — la cascade passe alors à la recherche texte, comme avant.
+pub(super) fn balises_de_l_album(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    tracks: &[tune_core::db::models::Track],
+    barcode_album: Option<&str>,
+) -> BalisesDeLAlbum {
+    let ids: Vec<i64> = tracks.iter().filter_map(|t| t.id).collect();
+    let repo = TrackMetadataRepo::with_backend(backend.clone());
+    let lire = |cle: &str| -> Vec<String> {
+        let valeurs = repo.get_key_for_tracks(cle, &ids).unwrap_or_else(|e| {
+            warn!(cle, error = %e, "identification_balises_illisibles");
+            Default::default()
+        });
+        // Dans l'ordre des pistes de l'album.
+        ids.iter()
+            .filter_map(|id| valeurs.get(id).cloned())
+            .collect()
+    };
+    let mut codes_barres = lire("barcode");
+    codes_barres.extend(barcode_album.map(str::to_string));
+    BalisesDeLAlbum {
+        releases: lire("mb_release_id"),
+        enregistrements: lire("mb_track_id"),
+        codes_barres,
+    }
+}
+
+/// Le mode lot de [`identifier_album`] : la cascade de
+/// [`choix_de_pressage::identifier_le_pressage`], puis la même pose que le
+/// bouton. L'identification est déjà effacée (`cleared`) ; tout ce qui n'est
+/// pas un pressage sûr la repose telle quelle.
+async fn identifier_en_lot(
+    state: &AppState,
+    album_id: i64,
+    titre: &str,
+    artist: String,
+    locales: &[LocalTrack],
+    balises: &BalisesDeLAlbum,
+    cleared: tune_core::metadata::reidentify::ClearedIdentification,
+) -> Result<Identification, EchecIdentification> {
+    let issue = choix_de_pressage::identifier_le_pressage(
+        EntreeDIdentification {
+            titre,
+            artiste: &artist,
+            pistes: locales,
+            releases_des_balises: &balises.releases,
+            enregistrements_des_balises: &balises.enregistrements,
+            codes_barres: &balises.codes_barres,
+        },
+        musicbrainz_release::rechercher_sur_musicbrainz,
+        musicbrainz_release::lire_sur_musicbrainz,
+    )
+    .await;
+
+    let sans_pose = |verdict: &'static str, refus: bool, raison: Option<&'static str>| {
+        if let Err(e) = restore_album_identification(&state.backend, album_id, &cleared) {
+            warn!(album_id, error = %e, "reidentify_restore_failed");
+        }
+        Identification {
+            verdict,
+            tracks_total: locales.len(),
+            was_identified_before: cleared.was_identified(),
+            previous_release_id: cleared.release_id.clone(),
+            searched_title: titre.to_string(),
+            searched_artist: artist.clone(),
+            meilleur: None,
+            applied: None,
+            refus_musicbrainz: refus,
+            source: None,
+            raison_ambigu: raison,
+        }
+    };
+
+    let (pressage, detail, source) = match issue {
+        IssueDuChoix::Retenu {
+            pressage,
+            detail,
+            source,
+            ..
+        } => (pressage, detail, source),
+        IssueDuChoix::Ambigu { raison, source } => {
+            // 🔴 Rien n'est écrit : un pressage incertain remplacerait les
+            //    clés par celles d'un album que l'utilisateur n'a peut-être
+            //    pas. Le pilote le compte.
+            info!(
+                album_id,
+                title = %titre,
+                raison = raison.as_str(),
+                source = source.as_str(),
+                "identification_lot_ambigu"
+            );
+            return Ok(sans_pose("ambiguous", false, Some(raison.as_str())));
+        }
+        IssueDuChoix::Introuvable => {
+            info!(album_id, title = %titre, "reidentify_not_found");
+            return Ok(sans_pose("not_found", false, None));
+        }
+        IssueDuChoix::Refus(refus) => {
+            warn!(album_id, title = %titre, refus = %refus, "reidentify_musicbrainz_refuse");
+            return Ok(sans_pose("not_found", true, None));
+        }
+    };
+
+    let recordings = map_recording_ids(locales, &detail.tracks);
+    let applied = match apply_album_identification(
+        &state.backend,
+        album_id,
+        &pressage.release_id,
+        pressage.release_group_id.as_deref(),
+        &recordings,
+        locales.len(),
+        Some(&detail),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(album_id, error = %e, "reidentify_apply_failed");
+            if let Err(e2) = restore_album_identification(&state.backend, album_id, &cleared) {
+                warn!(album_id, error = %e2, "reidentify_restore_failed");
+            }
+            return Err(EchecIdentification::Base(e));
+        }
+    };
+    let verdict = if cleared.release_id.as_deref() == Some(pressage.release_id.as_str()) {
+        "unchanged"
+    } else {
+        "reidentified"
+    };
+    info!(
+        album_id,
+        verdict,
+        release_id = %pressage.release_id,
+        source = source.as_str(),
+        matched = applied.tracks_matched,
+        "reidentify_done"
+    );
+    Ok(Identification {
+        verdict,
+        tracks_total: locales.len(),
+        was_identified_before: cleared.was_identified(),
+        previous_release_id: cleared.release_id.clone(),
+        searched_title: titre.to_string(),
+        searched_artist: artist,
+        meilleur: Some(pressage),
+        applied: Some(applied),
+        refus_musicbrainz: false,
+        source: Some(source.as_str()),
+        raison_ambigu: None,
     })
 }
 
@@ -276,7 +491,7 @@ pub(super) async fn reidentify_album(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
 ) -> impl IntoResponse {
-    let issue = match identifier_album(&state, album_id).await {
+    let issue = match identifier_album(&state, album_id, ModeIdentification::Manuel).await {
         Ok(i) => i,
         Err(EchecIdentification::AlbumIntrouvable) => {
             return (
