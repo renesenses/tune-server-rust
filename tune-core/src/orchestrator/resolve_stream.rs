@@ -320,6 +320,11 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
+        // Un service désactivé dans les Réglages n'est plus interrogé, même
+        // pour une piste déjà dans la file (`ServiceRegistry::get_actif`).
+        if !svc.read().await.enabled() {
+            return Err(format!("service désactivé : {service_name}"));
+        }
         let mut svc = svc.write().await;
 
         // Chronomètre de la PREMIÈRE étape (#3568). Pour Tidal en DASH
