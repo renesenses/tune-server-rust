@@ -1193,6 +1193,14 @@ path = "tests/crossfeed_ombre_5081.rs"
 name = "pg_scan_converge_4602"
 path = "tests/pg_scan_converge_4602.rs"
 
+# Sur PostgreSQL, la règle de pochette d'album du scan par lots paniquait dans
+# le fil de lecture bornée (« there is no reactor running ») : pochette ni
+# posée ni suivie. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "pg_pochette_lecture_bornee"
+path = "tests/pg_pochette_lecture_bornee.rs"
+
 # #4907 — la même musique dans plusieurs répertoires : exemplaires, vues sans
 # doublon, identifiants conservés, sur SQLite et sur PostgreSQL
 # (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
