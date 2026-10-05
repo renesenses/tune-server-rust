@@ -33,6 +33,10 @@ pub struct SqliteDb {
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
+    /// Le repli du WAL tourne hors de la connexion d'écriture tant que ce
+    /// jeton vit ; `None` en mémoire, hors WAL, ou si le replieur n'a pas pu
+    /// s'ouvrir (voir [`crate::db::replieur_wal`]).
+    _replieur_wal: Option<crate::db::replieur_wal::Vigie>,
 }
 
 /// Une connexion de lecture EMPRUNTÉE au pool (#4800).
@@ -231,6 +235,15 @@ impl SqliteDb {
         // git reset, crash recovery, or external DB modifications).
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 
+        // Le repli du WAL, ensuite, quitte la connexion d'écriture : il la
+        // tenait le temps de copier et de synchroniser (5,4 s sur un disque
+        // lent). Hors WAL (`reliable_fs` faux), il n'y a rien à replier.
+        let replieur_wal = if reliable_fs {
+            crate::db::replieur_wal::armer(&conn, path)
+        } else {
+            None
+        };
+
         // Open a pool of read-only connections for concurrent read access
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
@@ -281,6 +294,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: replieur_wal,
         })
     }
 
@@ -300,6 +314,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: None,
         })
     }
 
@@ -469,6 +484,7 @@ impl Clone for SqliteDb {
             read_pool: self.read_pool.clone(),
             read_counter: self.read_counter.clone(),
             liberation: self.liberation.clone(),
+            _replieur_wal: self._replieur_wal.clone(),
         }
     }
 }
