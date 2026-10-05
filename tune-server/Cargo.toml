@@ -1454,3 +1454,11 @@ path = "tests/sso_reconnexion_apres_attente.rs"
 [[test]]
 name = "config_export_zones"
 path = "tests/config_export_zones.rs"
+
+# #5837 — une compilation dont l'artiste d'album change de résolution entre
+# deux scans garde sa ligne album, sur SQLite et sur PostgreSQL
+# (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "pg_compilation_reprise_5837"
+path = "tests/pg_compilation_reprise_5837.rs"

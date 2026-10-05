@@ -421,6 +421,10 @@ pub struct TrackImporter {
     types_de_sortie_poses: HashSet<i64>,
     /// Section « Live » — même marque pour les types SECONDAIRES de la balise.
     types_secondaires_poses: HashSet<i64>,
+    /// #5837 — les lignes album déjà tenues par une clé de `album_cache`
+    /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
+    /// une autre : ce serait fondre deux parutions en une.
+    albums_en_cache: HashSet<i64>,
     /// `(dossier, album)` dont la décision « compilation » a déjà été
     /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
     /// écrirait la même ligne huit cents fois.
@@ -562,6 +566,7 @@ impl TrackImporter {
             albums_reclasses: HashSet::new(),
             types_de_sortie_poses: HashSet::new(),
             types_secondaires_poses: HashSet::new(),
+            albums_en_cache: HashSet::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
@@ -847,6 +852,72 @@ impl TrackImporter {
                 }
             })
             .collect();
+    }
+
+    /// #5837 (fil 2153) — la ligne album que ce fichier occupe DÉJÀ, quand
+    /// seul son artiste d'album a changé de résolution depuis le scan qui l'a
+    /// posée.
+    ///
+    /// Sans cette reprise, la clé `(titre, artiste, année, MBID)` ne retrouve
+    /// pas la ligne d'origine — elle porte l'ancien artiste, par exemple
+    /// l'artiste d'album vide ou générique d'une compilation désormais rangée
+    /// sous « Various Artists » — et `get_or_create_for_folder_with_track` en
+    /// crée une NOUVELLE. L'ancienne garde titre, pochette et année, perd
+    /// toutes ses pistes, et reste dans la grille jusqu'à la purge des
+    /// orphelins de FIN de scan : des heures sur une grande bibliothèque, et
+    /// une fiche « 0 piste », sans artiste, pour qui l'ouvre entre-temps.
+    /// L'album changeait aussi d'identifiant.
+    ///
+    /// La voie par dossier fait déjà cette reprise (`find_id_by_folder`) ; elle
+    /// manque quand `quality_split` est coupé et quand la ligne n'a pas de
+    /// `folder_path` (base ancienne ou migrée). La reprise ne vaut que si :
+    ///
+    /// - le titre est le même (sans la casse), et l'année et le MBID de
+    ///   release ne se contredisent pas ;
+    /// - l'artiste diffère — sinon la voie normale retrouve la ligne seule, et
+    ///   coffrets, miroirs et compilations éparpillées gardent leurs règles ;
+    /// - la ligne n'appartient pas à un AUTRE dossier quand le dossier fait
+    ///   l'identité (`quality_split`) ;
+    /// - aucune autre clé ne la tient déjà pendant ce scan ;
+    /// - son artiste n'est pas tenu à la main (C3) : alors rien ne change.
+    fn album_du_fichier_a_reprendre(&mut self, chemin: &str, cle: &CleDAlbum) -> Option<Album> {
+        let (dossier, titre, artiste, annee, mbid) = cle;
+        let mut ancien = self.album_repo.album_du_fichier(chemin).ok().flatten()?;
+        let id = ancien.id?;
+        fn contredit<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            matches!((a, b), (Some(x), Some(y)) if x != y)
+        }
+        if ancien.artist_id == Some(*artiste)
+            || ancien.title.to_lowercase() != titre.to_lowercase()
+            || contredit(&ancien.year, annee)
+            || contredit(&ancien.musicbrainz_release_id, mbid)
+            || self.albums_en_cache.contains(&id)
+        {
+            return None;
+        }
+        if !dossier.is_empty()
+            && let Ok(Some(f)) = self.album_repo.folder_path_of(id)
+            && f != *dossier
+        {
+            return None;
+        }
+        // `false` : l'artiste est tenu à la main, la ligne ne bouge pas.
+        if !self
+            .album_repo
+            .realigner_sur_les_balises(id, None, Some(*artiste))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        tracing::info!(
+            album_id = id,
+            album = %titre,
+            ancien_artiste_id = ?ancien.artist_id,
+            nouvel_artiste_id = artiste,
+            "album_repris_sous_son_nouvel_artiste"
+        );
+        ancien.artist_id = Some(*artiste);
+        Some(ancien)
     }
 
     /// Resolve artist + album, extract album cover / artist image as a side
@@ -1575,6 +1646,15 @@ impl TrackImporter {
                     );
                 }
                 Some(c)
+            } else if let Some(reprise) = self.album_du_fichier_a_reprendre(&sf.path, key) {
+                // #5837 — la ligne que ce fichier occupe déjà, reprise sous
+                // son nouvel artiste : voir `album_du_fichier_a_reprendre`.
+                let a = Arc::new(reprise);
+                if let Some(id) = a.id {
+                    self.albums_en_cache.insert(id);
+                }
+                self.album_cache.insert(key.clone(), Arc::clone(&a));
+                Some(a)
             } else {
                 let result = self.album_repo.get_or_create_for_folder_with_track(
                     &key.0,
@@ -1613,6 +1693,9 @@ impl TrackImporter {
                             file = %sf.path,
                             "BUG_album_artist_mismatch"
                         );
+                    }
+                    if let Some(id) = a.id {
+                        self.albums_en_cache.insert(id);
                     }
                     self.album_cache.insert(key.clone(), Arc::clone(a));
                 }
