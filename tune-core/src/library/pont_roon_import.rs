@@ -29,8 +29,8 @@ use crate::db::models::Album;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::db::track_repo::TrackRepo;
 use crate::library::pont_roon::{
-    Candidat, Decision, ExportRoon, PisteLocale, Rapport, apparier_piste, cle_d_album,
-    credits_a_ecrire, decider, plier,
+    Candidat, Classement, Decision, ExportRoon, PisteLocale, Rapport, apparier_piste,
+    cle_courte_d_album, cle_d_album, credits_a_ecrire, decider, exemplaires_identiques, plier,
 };
 
 /// Marque d'origine, sur la piste : `track_metadata.credits_source = roon`.
@@ -223,13 +223,13 @@ pub fn appliquer(
             })
             .clone()
     };
-    let mut bibliotheque: Option<HashMap<String, Vec<Album>>> = None;
+    let mut bibliotheque: Option<Bibliotheque> = None;
 
     let mut r = Rapport {
         artistes_total: export.artistes.len(),
         ..Default::default()
     };
-    for ar in &export.artistes {
+    for (ia, ar) in export.artistes.iter().enumerate() {
         r.albums_total += ar.albums.len();
         r.pistes_total += ar.albums.iter().map(|a| a.pistes.len()).sum::<usize>();
         if ar.image.is_some() {
@@ -289,7 +289,7 @@ pub fn appliquer(
         // Niveau 2 : … plus ceux qui portent une de ses pistes (#4767).
         let mut presents: Option<Vec<Album>> = None;
 
-        for al in &ar.albums {
+        for (ja, al) in ar.albums.iter().enumerate() {
             r.images_nommees += usize::from(al.image.is_some());
             r.images_portees += usize::from(porte(&al.image));
             let nom_roon = format!("{} — {}", ar.nom, al.titre);
@@ -309,6 +309,9 @@ pub fn appliquer(
                     .filter_map(|(i, p)| apparier_piste(p, &locales).map(|l| (i, l.clone())))
                     .collect();
                 r.albums_apparies_strict += 1;
+                r.albums_par_strict
+                    .push(format!("{nom_roon} → [{id}] {}", seul.title));
+                classer(&mut r, ia, ja, "strict", vec![id]);
                 vec![((*seul).clone(), paires)]
             } else {
                 let candidats: Vec<Album> = if stricts.len() > 1 {
@@ -344,15 +347,30 @@ pub fn appliquer(
                         .filter(|a| cle_d_album(&a.title).0 == cle)
                         .cloned()
                         .collect();
+                    let biblio = bibliotheque.get_or_insert_with(|| Bibliotheque::lire(&albums));
                     if c.is_empty() {
                         // Dernier recours : l'artiste est inconnu ou mal
                         // orthographié d'un côté (« Holliday »). Les pistes
                         // décident seules, au même seuil.
-                        c = bibliotheque
-                            .get_or_insert_with(|| index_de_la_bibliotheque(&albums))
-                            .get(&cle)
+                        c = biblio.par_cle.get(&cle).cloned().unwrap_or_default();
+                    }
+                    if c.is_empty() {
+                        // Seconde clé, sans crochets : « Black Orpheus
+                        // [Original Soundtrack] » trouve « Black Orpheus ».
+                        // Mêmes étapes, mêmes pistes pour décider.
+                        let courte = cle_courte_d_album(&al.titre);
+                        c = pool
+                            .iter()
+                            .filter(|a| cle_courte_d_album(&a.title) == courte)
                             .cloned()
-                            .unwrap_or_default();
+                            .collect();
+                        if c.is_empty() {
+                            c = biblio
+                                .par_cle_courte
+                                .get(&courte)
+                                .cloned()
+                                .unwrap_or_default();
+                        }
                     }
                     c
                 };
@@ -371,11 +389,15 @@ pub fn appliquer(
                 let seuls: Vec<Candidat> = candidats.iter().map(|(_, c)| c.clone()).collect();
                 match decider(&al.pistes, &seuls) {
                     Decision::Apparie(choix) => {
-                        let titres: Vec<String> =
-                            choix.iter().map(|(k, _)| seuls[*k].titre.clone()).collect();
+                        let titres: Vec<String> = choix
+                            .iter()
+                            .map(|(k, _)| format!("[{}] {}", seuls[*k].id, seuls[*k].titre))
+                            .collect();
                         r.albums_par_contenu
                             .push(format!("{nom_roon} → {}", titres.join(" + ")));
                         r.albums_apparies_contenu += 1;
+                        let ids = choix.iter().map(|(k, _)| seuls[*k].id).collect();
+                        classer(&mut r, ia, ja, "contenu", ids);
                         choix
                             .into_iter()
                             .map(|(k, paires)| {
@@ -391,16 +413,28 @@ pub fn appliquer(
                             .collect()
                     }
                     Decision::Ambigu(ks) => {
-                        let titres: Vec<String> =
-                            ks.iter().map(|k| seuls[*k].titre.clone()).collect();
+                        let en_cause: Vec<&Candidat> = ks.iter().map(|k| &seuls[*k]).collect();
+                        let titres: Vec<String> = en_cause
+                            .iter()
+                            .map(|c| format!("[{}] {}", c.id, c.titre))
+                            .collect();
+                        let copies = exemplaires_identiques(&en_cause);
+                        let copies = if copies >= 2 {
+                            format!(" ; {copies} exemplaires identiques")
+                        } else {
+                            String::new()
+                        };
+                        let ids = en_cause.iter().map(|c| c.id).collect();
+                        classer(&mut r, ia, ja, "ambigu", ids);
                         r.albums_ambigus.push(format!(
-                            "{nom_roon} ({} candidats : {})",
+                            "{nom_roon} ({} candidats : {}{copies})",
                             ks.len(),
                             titres.join(" ; ")
                         ));
                         continue;
                     }
                     Decision::Introuvable => {
+                        classer(&mut r, ia, ja, "inconnu", Vec::new());
                         r.albums_inconnus.push(nom_roon);
                         continue;
                     }
@@ -468,6 +502,15 @@ pub fn appliquer(
     r
 }
 
+fn classer(r: &mut Rapport, i: usize, j: usize, classe: &'static str, ids_tune: Vec<i64>) {
+    r.classement.push(Classement {
+        i,
+        j,
+        classe,
+        ids_tune,
+    });
+}
+
 /// Signale un doublon, une fois : un album Roon présent quatre fois ne
 /// répète pas la ligne.
 fn doublon(r: &mut Rapport, ligne: String) {
@@ -486,16 +529,34 @@ fn ajouter_sans_double(liste: &mut Vec<Album>, lus: Result<Vec<Album>, crate::er
 }
 
 /// La bibliothèque visible (masqués exclus, comme `list_by_artist`), par clé
-/// de candidat ([`cle_d_album`]).
-fn index_de_la_bibliotheque(albums: &AlbumRepo) -> HashMap<String, Vec<Album>> {
-    let mut m: HashMap<String, Vec<Album>> = HashMap::new();
-    for a in albums
-        .list_filtered(1_000_000, 0, "title", "asc", None, None, None, false, None)
-        .unwrap_or_default()
-    {
-        m.entry(cle_d_album(&a.title).0).or_default().push(a);
+/// de candidat ([`cle_d_album`]) et par seconde clé ([`cle_courte_d_album`]).
+/// Lue une fois, au premier album qui en a besoin.
+struct Bibliotheque {
+    par_cle: HashMap<String, Vec<Album>>,
+    par_cle_courte: HashMap<String, Vec<Album>>,
+}
+
+impl Bibliotheque {
+    fn lire(albums: &AlbumRepo) -> Self {
+        let mut b = Bibliotheque {
+            par_cle: HashMap::new(),
+            par_cle_courte: HashMap::new(),
+        };
+        for a in albums
+            .list_filtered(1_000_000, 0, "title", "asc", None, None, None, false, None)
+            .unwrap_or_default()
+        {
+            b.par_cle_courte
+                .entry(cle_courte_d_album(&a.title))
+                .or_default()
+                .push(a.clone());
+            b.par_cle
+                .entry(cle_d_album(&a.title).0)
+                .or_default()
+                .push(a);
+        }
+        b
     }
-    m
 }
 
 /// Range des octets d'image dans le cache ; le condensat, ou `None` si le
@@ -628,8 +689,19 @@ mod tests {
         assert_eq!(r.artistes_inconnus, vec!["Nick Drake"]);
         assert_eq!((r.albums_total, r.albums_apparies), (2, 1));
         assert_eq!(r.albums_apparies_strict, 1);
+        assert_eq!(
+            r.albums_par_strict,
+            vec!["16 horsepower — FOLKLORE → [1] Folklore"]
+        );
         // L'album d'un artiste inconnu est COMPTÉ, pas passé sous silence.
         assert_eq!(r.albums_inconnus, vec!["Nick Drake — Pink Moon"]);
+        // La place de chaque album dans l'export, pour comparer deux
+        // appariements ligne à ligne.
+        let place = |c: &Classement| (c.i, c.j, c.classe, c.ids_tune.clone());
+        assert_eq!(
+            r.classement.iter().map(place).collect::<Vec<_>>(),
+            vec![(0, 0, "strict", vec![1]), (1, 0, "inconnu", vec![])]
+        );
         assert_eq!((r.pistes_total, r.pistes_appariees), (3, 2));
         assert_eq!(
             (r.credits_a_ecrire, r.credits_ecrits),
@@ -890,7 +962,7 @@ mod tests {
         );
         assert_eq!(
             r.albums_par_contenu,
-            vec!["Jan Garbarek Group — Dresden (Live-2007) → Dresden (Live-2007) (CD 1/2)"]
+            vec!["Jan Garbarek Group — Dresden (Live-2007) → [1] Dresden (Live-2007) (CD 1/2)"]
         );
         assert_eq!(
             (r.pistes_appariees, r.credits_a_ecrire, r.credits_ecrits),
@@ -1019,7 +1091,10 @@ mod tests {
         assert_eq!(r.albums_apparies, 0, "{r:?}");
         assert_eq!(
             r.albums_ambigus,
-            vec!["Arthur H — Mystic Rumba. (2 candidats : Mystic Rumba ; Mystic Rumba !)"]
+            vec![
+                "Arthur H — Mystic Rumba. (2 candidats : [1] Mystic Rumba ; [2] Mystic Rumba ! ; \
+                 2 exemplaires identiques)"
+            ]
         );
         assert_eq!((r.pistes_appariees, r.credits_ecrits), (0, 0));
         assert!(credits_de(&b, 100).is_empty() && credits_de(&b, 200).is_empty());
@@ -1062,13 +1137,104 @@ mod tests {
         );
         assert_eq!(
             r.albums_par_contenu,
-            vec!["The Beatles — Rubber Soul → Rubber Soul"]
+            vec!["The Beatles — Rubber Soul → [2] Rubber Soul"]
         );
         assert!(
             credits_de(&b, 100).is_empty(),
             "la première ligne n'a rien reçu"
         );
         assert_eq!(credits_de(&b, 200).len(), 1);
+    }
+
+    /// « Unknown Album », pistes « Track 01… » : la recherche globale trouve
+    /// un album de même clé, aux mêmes numéros, mais des titres génériques
+    /// ne prouvent rien. Il ne doit PAS s'apparier.
+    #[test]
+    fn un_album_aux_titres_generiques_ne_s_apparie_pas() {
+        let b = base();
+        artiste(&b, 1, "Divers");
+        album(&b, 1, "Unknown Album", 1, false);
+        pistes_de(
+            &b,
+            1,
+            &[
+                (1, 1, 1, "Track 01"),
+                (1, 1, 2, "Track 02"),
+                (1, 1, 3, "Track 03"),
+            ],
+        );
+        let e = export_un_album(
+            "Unknown Artist",
+            "Unknown Album",
+            &["1. Track 01", "2. Track 02", "3. Track 03"],
+        );
+        let r = appliquer(&b, &e, false, None);
+        assert_eq!(
+            (r.albums_apparies, r.pistes_appariees, r.credits_ecrits),
+            (0, 0, 0),
+            "{r:?}"
+        );
+        assert_eq!(r.albums_inconnus, vec!["Unknown Artist — Unknown Album"]);
+        assert!(credits_de(&b, 100).is_empty());
+    }
+
+    /// La seconde clé, sans crochets : « Black Orpheus [Original Soundtrack] »
+    /// chez Roon trouve « Black Orpheus » chez Tune, et les pistes décident.
+    #[test]
+    fn la_seconde_cle_sans_crochets_trouve_black_orpheus() {
+        let b = base();
+        artiste(&b, 1, "Antônio Carlos Jobim");
+        album(&b, 1, "Black Orpheus", 1, false);
+        pistes_de(
+            &b,
+            1,
+            &[
+                (1, 1, 1, "A Felicidade"),
+                (1, 1, 2, "Frevo"),
+                (1, 1, 3, "O Nosso Amor"),
+            ],
+        );
+        let e = export_un_album(
+            "Antônio Carlos Jobim",
+            "Black Orpheus [Original Soundtrack]",
+            &["1. A Felicidade", "2. Frevo", "3. O Nosso Amor"],
+        );
+        let r = appliquer(&b, &e, true, None);
+        assert_eq!(
+            r.albums_par_contenu,
+            vec!["Antônio Carlos Jobim — Black Orpheus [Original Soundtrack] → [1] Black Orpheus"],
+            "{r:?}"
+        );
+    }
+
+    /// Trois copies du même album sous le même titre : un doublon, et un
+    /// album ambigu qui le dit.
+    #[test]
+    fn des_copies_identiques_sont_ambigues_et_comptees() {
+        let b = base();
+        artiste(&b, 1, "Arthur H");
+        let p = [(1, 1, 1, "Lor Deros"), (1, 1, 2, "Le Paradis")];
+        for id in 1..=3 {
+            album(&b, id, "Lor Deros", 1, false);
+            pistes_de(&b, id, &p);
+        }
+        let e = export_un_album("Arthur H", "Lor Deros", &["1. Lor Deros", "2. Le Paradis"]);
+        let r = appliquer(&b, &e, false, None);
+        assert_eq!(
+            r.doublons,
+            vec!["album « Arthur H — Lor Deros » : 3 albums Tune de même titre (id 1, 2, 3)"],
+            "{r:?}"
+        );
+        assert_eq!(
+            r.albums_ambigus,
+            vec![
+                "Arthur H — Lor Deros (3 candidats : [1] Lor Deros ; [2] Lor Deros ; [3] Lor Deros ; \
+                 3 exemplaires identiques)"
+            ]
+        );
+        assert_eq!(r.credits_ecrits, 0);
+        assert_eq!(r.classement[0].ids_tune, vec![1, 2, 3]);
+        assert_eq!(r.classement[0].classe, "ambigu");
     }
 
     #[test]

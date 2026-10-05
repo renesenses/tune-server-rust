@@ -195,6 +195,17 @@ pub fn credits_a_ecrire(credits: &str, interpretes: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Une ligne de [`Rapport::classement`].
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct Classement {
+    /// Indice de l'artiste dans `artistes`, puis de l'album dans ses `albums`.
+    pub i: usize,
+    pub j: usize,
+    /// `strict`, `contenu`, `ambigu` ou `inconnu`.
+    pub classe: &'static str,
+    pub ids_tune: Vec<i64>,
+}
+
 /// Ce que l'appariement d'un export contre une bibliothèque a trouvé — les
 /// comptes que l'aperçu et le rapport affichent.
 #[derive(Debug, Default, Clone, serde::Serialize, PartialEq, Eq)]
@@ -207,13 +218,18 @@ pub struct Rapport {
     pub albums_apparies: usize,
     /// … par l'égalité stricte du titre replié, sous l'artiste (niveau 1).
     pub albums_apparies_strict: usize,
+    /// Le détail du niveau 1 : « Artiste — Titre Roon → [id] Titre Tune ».
+    pub albums_par_strict: Vec<String>,
     /// … par leurs pistes (niveau 2, voir [`decider`]).
     pub albums_apparies_contenu: usize,
     /// Albums de TUNE enrichis : un coffret Roon en compte un par disque.
     pub albums_tune_apparies: usize,
-    /// Le détail du niveau 2 : « Artiste — Titre Roon → Titre Tune [+ …] ».
+    /// Le détail du niveau 2 : « Artiste — Titre Roon → [id] Titre Tune
+    /// [+ [id] …] ».
     pub albums_par_contenu: Vec<String>,
-    /// Plusieurs candidats tiennent : rien n'est écrit.
+    /// Plusieurs candidats tiennent : rien n'est écrit. Chaque candidat porte
+    /// son id Tune ; des copies aux pistes identiques sont dites
+    /// (« N exemplaires identiques »).
     pub albums_ambigus: Vec<String>,
     /// Introuvables, artistes inconnus compris. Avec les trois autres
     /// catégories : `albums_total = strict + contenu + ambigus + inconnus`.
@@ -221,6 +237,11 @@ pub struct Rapport {
     /// Deux fiches Tune pour un même nom replié (artiste) ou un même titre
     /// replié (album) : signalées, jamais tranchées par l'ordre des lignes.
     pub doublons: Vec<String>,
+    /// Chaque album Roon À SA PLACE dans l'export (`artistes[i].albums[j]`),
+    /// avec sa catégorie et les id Tune retenus ou en cause : la clé de
+    /// jointure exacte pour comparer deux appariements du même export, même
+    /// quand Roon porte quatre fois le même titre.
+    pub classement: Vec<Classement>,
     pub pistes_total: usize,
     pub pistes_appariees: usize,
     /// Pistes dont la ligne Roon apporte au moins un nom de plus.
@@ -269,6 +290,11 @@ pub fn apparier_piste<'a>(roon: &PisteRoon, locales: &'a [PisteLocale]) -> Optio
             return Some(seule);
         }
     }
+    // Un titre générique (« Track 01 ») ne désigne rien : sans numéro, il
+    // n'apparie pas.
+    if titre_generique(&titre) {
+        return None;
+    }
     let voulu = plier(&titre);
     locales.iter().find(|p| plier(&p.titre) == voulu)
 }
@@ -282,6 +308,34 @@ pub const SEUIL_CONTENU_PCT: usize = 80;
 /// Niveau 2 — en dessous de deux pistes retrouvées, le contenu ne prouve rien
 /// (un single, une « Intro ») : l'album reste introuvable.
 pub const PISTES_MIN_CONTENU: usize = 2;
+/// Niveau 2 — écart MINIMAL, en points, entre la couverture du candidat retenu
+/// et celle du suivant. La couverture d'un candidat est la plus petite de ses
+/// deux parts, `min(m / pistes Roon, m / pistes Tune)` : 85 % contre 78 % est
+/// trop serré (ambigu), l'édition standard contre la deluxe (100 % contre
+/// 67 %) reste tranchée.
+pub const MARGE_CONTENU_PCT: usize = 10;
+
+/// Les titres de piste génériques, une fois repliés par [`plier_large`] : ils
+/// ne désignent aucun morceau, et deux albums mal étiquetés « Track 01…
+/// Track 12 » se ressembleraient parfaitement. Exclus du compte des pistes
+/// communes, à tous les niveaux, et jamais appariés par leur seul titre.
+///
+/// - vide, ou chiffres seuls (« 01 », « 1 2 ») ;
+/// - un mot de piste suivi ou non d'un numéro : `track`, `piste`, `titre`,
+///   `pista`, `traccia`, `titel` (« Track 01 »,
+///   « Track01 », « Piste 1 ») ;
+/// - `unknown`, `untitled`, `sans titre`, `no title`, `inconnu`, et tout titre
+///   qui contient `unknown title` ou `unknown track`.
+pub fn titre_generique(titre: &str) -> bool {
+    static GENERIQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(?:[\d ]*|(?:track|piste|titre|pista|traccia|titel) ?\d*|unknown|untitled|sans titre|no title|inconnu|inconnue)$",
+        )
+        .expect("regex des titres génériques")
+    });
+    let t = plier_large(titre);
+    GENERIQUE.is_match(&t) || t.contains("unknown title") || t.contains("unknown track")
+}
 
 static SUFFIXE_DISQUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
@@ -326,6 +380,38 @@ pub fn cle_d_album(titre: &str) -> (String, Option<u32>) {
     (plier_large(&t), disque)
 }
 
+static ENTRE_CROCHETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // Un groupe fermé, ou un groupe resté ouvert en fin de titre
+    // (« Britten - War Requiem [Decca Originals, »).
+    regex::Regex::new(r"\([^()]*(?:\)|$)|\[[^\[\]]*(?:\]|$)|\{[^{}]*(?:\}|$)")
+        .expect("regex des crochets")
+});
+
+/// La SECONDE clé de candidat : [`cle_d_album`] sans les crochets ni les
+/// parenthèses, contenu compris. « Black Orpheus [Original Soundtrack] » →
+/// `black orpheus`. Consultée seulement quand la clé normale ne trouve AUCUN
+/// candidat : elle rapproche des éditions que seules les pistes séparent.
+pub fn cle_courte_d_album(titre: &str) -> String {
+    let mut t = plier(titre);
+    while let Some(c) = SUFFIXE_DISQUE.find(&t) {
+        if c.start() == 0 {
+            break;
+        }
+        t.truncate(c.start());
+    }
+    let mut avant = String::new();
+    while avant != t {
+        avant = t.clone();
+        t = ENTRE_CROCHETS.replace_all(&t, " ").into_owned();
+    }
+    let court = plier_large(&t);
+    if court.is_empty() {
+        cle_d_album(titre).0
+    } else {
+        court
+    }
+}
+
 /// Un album de Tune candidat au niveau 2, avec ses pistes.
 #[derive(Debug, Clone)]
 pub struct Candidat {
@@ -335,23 +421,25 @@ pub struct Candidat {
 }
 
 /// Les pistes Roon retrouvées dans un album Tune, une à une : (indice Roon,
-/// indice local). Une piste se retrouve par son titre replié large ET, quand
+/// indice local). Les titres génériques ([`titre_generique`]) ne comptent
+/// jamais. Une piste se retrouve par son titre replié large ET, quand
 /// les deux côtés le donnent, par le même numéro et le même disque. Le disque
 /// local est celui du SUFFIXE du titre quand il en porte un : Tune range
 /// souvent « … (CD 2/2) » avec des pistes étiquetées disque 1.
 pub fn pistes_communes(roon: &[PisteRoon], c: &Candidat) -> Vec<(usize, usize)> {
     let disque_album = cle_d_album(&c.titre).1;
     let titres: Vec<String> = c.pistes.iter().map(|p| plier_large(&p.titre)).collect();
+    let generiques: Vec<bool> = c.pistes.iter().map(|p| titre_generique(&p.titre)).collect();
     let mut prises = vec![false; c.pistes.len()];
     let mut out = Vec::new();
     for (i, p) in roon.iter().enumerate() {
         let (num, titre) = numero_et_titre(&p.titre);
-        let voulu = plier_large(&titre);
-        if voulu.is_empty() {
+        if titre_generique(&titre) {
             continue;
         }
+        let voulu = plier_large(&titre);
         let trouve = c.pistes.iter().enumerate().position(|(j, l)| {
-            if prises[j] || titres[j] != voulu {
+            if prises[j] || titres[j] != voulu || generiques[j] {
                 return false;
             }
             let Some(n) = num else { return true };
@@ -371,6 +459,25 @@ pub fn pistes_communes(roon: &[PisteRoon], c: &Candidat) -> Vec<(usize, usize)> 
     out
 }
 
+/// Le plus grand nombre de candidats aux listes de pistes IDENTIQUES (même
+/// numéro, même titre replié large, dans l'ordre) : deux copies d'un même
+/// album. Le rapport le dit, pour que la bibliothèque soit dédoublonnée.
+pub fn exemplaires_identiques(candidats: &[&Candidat]) -> usize {
+    let empreinte = |c: &Candidat| -> Vec<(Option<i32>, String)> {
+        c.pistes
+            .iter()
+            .map(|p| (p.numero, plier_large(&p.titre)))
+            .collect()
+    };
+    let empreintes: Vec<_> = candidats.iter().map(|c| empreinte(c)).collect();
+    empreintes
+        .iter()
+        .filter(|e| !e.is_empty())
+        .map(|e| empreintes.iter().filter(|f| *f == e).count())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Ce que le niveau 2 conclut pour un album Roon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -382,6 +489,13 @@ pub enum Decision {
     Introuvable,
 }
 
+/// `a` couvre-t-il au moins `b − MARGE_CONTENU_PCT` ? Les couvertures sont
+/// des fractions `m / n` (n = le plus grand des deux albums), comparées en
+/// entiers.
+fn trop_proche((ma, na): (usize, usize), (mb, nb): (usize, usize)) -> bool {
+    na > 0 && nb > 0 && ma * 100 * nb + MARGE_CONTENU_PCT * na * nb >= mb * 100 * na
+}
+
 fn atteint(trouvees: usize, total: usize) -> bool {
     total > 0 && trouvees * 100 >= SEUIL_CONTENU_PCT * total
 }
@@ -390,7 +504,9 @@ fn atteint(trouvees: usize, total: usize) -> bool {
 ///
 /// 1. **Un seul album** : ≥ [`SEUIL_CONTENU_PCT`] des pistes Roon retrouvées
 ///    ET ≥ ce seuil des pistes du candidat, au moins [`PISTES_MIN_CONTENU`].
-///    Deux candidats qui tiennent ainsi → [`Decision::Ambigu`].
+///    Deux candidats qui tiennent ainsi → [`Decision::Ambigu`] ; de même
+///    quand un autre candidat, même sous le seuil, couvre à moins de
+///    [`MARGE_CONTENU_PCT`] points du retenu.
 /// 2. **Coffret** (aucun album seul ne tient) : plusieurs candidats dont
 ///    chacun est couvert au seuil, sans piste Roon commune entre eux, et qui
 ///    réunis couvrent le seuil des pistes Roon. Deux disques qui réclament la
@@ -409,8 +525,22 @@ pub fn decider(roon: &[PisteRoon], candidats: &[Candidat]) -> Decision {
                 && atteint(m, candidats[k].pistes.len())
         })
         .collect();
+    // Couverture d'un candidat : m / max(pistes Roon, pistes Tune).
+    let couverture = |k: usize| (paires[k].len(), roon.len().max(candidats[k].pistes.len()));
     match pleins.as_slice() {
-        [k] => return Decision::Apparie(vec![(*k, paires[*k].clone())]),
+        [k] => {
+            let proches: Vec<usize> = (0..candidats.len())
+                .filter(|&o| o != *k && !paires[o].is_empty())
+                .filter(|&o| trop_proche(couverture(o), couverture(*k)))
+                .collect();
+            if !proches.is_empty() {
+                let mut tous = vec![*k];
+                tous.extend(proches);
+                tous.sort_unstable();
+                return Decision::Ambigu(tous);
+            }
+            return Decision::Apparie(vec![(*k, paires[*k].clone())]);
+        }
         [_, _, ..] => return Decision::Ambigu(pleins),
         [] => {}
     }
@@ -741,6 +871,126 @@ mod tests {
             decider(&r, &[cd1, cd2, copie]),
             Decision::Ambigu(vec![0, 1, 2])
         );
+    }
+
+    #[test]
+    fn les_titres_generiques_sont_reconnus() {
+        for t in [
+            "Track 01",
+            "Track01",
+            "TRACK 1",
+            "track",
+            "Piste 1",
+            "Piste 12",
+            "Titre 3",
+            "Unknown Title",
+            "Unknown Title 7",
+            "unknown",
+            "Untitled",
+            "Sans titre",
+            "01",
+            "",
+            " - ",
+        ] {
+            assert!(titre_generique(t), "« {t} » est générique");
+        }
+        for t in [
+            "Paper Nut",
+            "Track of the Cat",
+            "Untitled Love",
+            "Pistes noires",
+        ] {
+            assert!(!titre_generique(t), "« {t} » n'est pas générique");
+        }
+        // Jamais apparié par son seul titre, ni compté au niveau 2.
+        let r = roon(&["1. Track 01", "2. Track 02", "Track 03"]);
+        let c = candidat(
+            1,
+            "Unknown Album",
+            &[(1, 1, "Track 01"), (1, 2, "Track 02"), (1, 3, "Track 03")],
+        );
+        assert!(pistes_communes(&r, &c).is_empty());
+        assert_eq!(decider(&r, std::slice::from_ref(&c)), Decision::Introuvable);
+        assert_eq!(apparier_piste(&r[2], &c.pistes), None);
+        // Le numéro, lui, reste une preuve au niveau 1.
+        assert_eq!(apparier_piste(&r[0], &c.pistes).map(|p| p.id), Some(100));
+    }
+
+    #[test]
+    fn la_seconde_cle_retire_crochets_et_parentheses() {
+        assert_eq!(
+            cle_courte_d_album("Black Orpheus [Original Soundtrack]"),
+            "black orpheus"
+        );
+        assert_eq!(
+            cle_courte_d_album("Britten - War Requiem [Decca Originals,"),
+            "britten war requiem"
+        );
+        assert_eq!(
+            cle_courte_d_album("Dresden (Live-2007) (CD 1/2)"),
+            "dresden"
+        );
+        assert_eq!(
+            cle_courte_d_album("Olympia 1985 (Live à l'Olympia / 1985)"),
+            "olympia 1985"
+        );
+        // Un titre tout entre crochets garde sa clé normale.
+        assert_eq!(cle_courte_d_album("[Untitled]"), "untitled");
+    }
+
+    /// Un album Roon de `n` pistes T1…Tn, et un candidat qui en porte `m`
+    /// (T1…Tm) plus `extra` pistes à lui.
+    fn serie(id: i64, m: usize, extra: usize) -> Candidat {
+        let titres: Vec<String> = (1..=m)
+            .map(|i| format!("T{i}"))
+            .chain((1..=extra).map(|i| format!("Bonus {i}")))
+            .collect();
+        let pistes: Vec<(i32, i32, &str)> = titres
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (1, i as i32 + 1, t.as_str()))
+            .collect();
+        candidat(id, "x", &pistes)
+    }
+
+    fn roon_serie(n: usize) -> Vec<PisteRoon> {
+        let t: Vec<String> = (1..=n).map(|i| format!("{i}. T{i}")).collect();
+        roon(&t.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn la_marge_rend_ambigu_un_second_trop_proche() {
+        let r = roon_serie(20);
+        // 85 % contre 75 % : dix points, pas plus — ambigu.
+        assert_eq!(
+            decider(&r, &[serie(1, 17, 0), serie(2, 15, 0)]),
+            Decision::Ambigu(vec![0, 1])
+        );
+        // 85 % contre 70 % : la marge est tenue.
+        assert!(matches!(
+            decider(&r, &[serie(1, 17, 0), serie(2, 14, 0)]),
+            Decision::Apparie(v) if v.len() == 1 && v[0].0 == 0
+        ));
+    }
+
+    #[test]
+    fn l_edition_standard_reste_tranchee_face_a_la_deluxe() {
+        // Roon a l'édition standard (10 pistes) ; Tune a la standard ET la
+        // deluxe (les 10 + 5 bonus) : 100 % contre 67 %, la standard gagne.
+        let r = roon_serie(10);
+        assert!(matches!(
+            decider(&r, &[serie(1, 10, 5), serie(2, 10, 0)]),
+            Decision::Apparie(v) if v.len() == 1 && v[0].0 == 1
+        ));
+    }
+
+    #[test]
+    fn les_exemplaires_identiques_se_comptent() {
+        let a = serie(1, 3, 0);
+        let b = serie(2, 3, 0);
+        let c = serie(3, 3, 1);
+        assert_eq!(exemplaires_identiques(&[&a, &b, &c]), 2);
+        assert_eq!(exemplaires_identiques(&[&a, &c]), 1);
     }
 
     /// L'export RÉEL de Fabien (16/09/2026), quand on l'a sous la main :
