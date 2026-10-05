@@ -1,18 +1,22 @@
 //! Le lecteur macOS : le volume `cddafs` que le système monte pour un CD
 //! audio, lu par [`crate::cddafs::LecteurVolume`].
 //!
-//! Deux appels au système seulement, sans commande shell :
+//! Pour LIRE, deux appels au système seulement, sans commande shell :
 //!
 //! * `getfsstat` : les volumes montés dont le type est `cddafs` — le disque ;
 //! * IOKit (`IOServiceMatching("IOCDBlockStorageDevice")`) : un lecteur
 //!   optique est-il branché ? C'est ce qui distingue « lecteur vide » de
 //!   « aucun lecteur ». Les lecteurs DVD et BD en héritent.
 //!
-//! `TUNE_CD_DEVICE` impose un DOSSIER de volume (essais, volume fabriqué).
+//! Pour ÉJECTER (fil 2135 : un Apple SuperDrive n'a pas de bouton), une
+//! commande : `diskutil eject <point de montage>` ([`ejecter_volume`]).
+//!
+//! `TUNE_CD_DEVICE` impose un DOSSIER de volume (essais, volume fabriqué) ;
+//! ce lecteur-là ne sait pas éjecter.
 
 use std::ffi::{CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cddafs::LecteurVolume;
 
@@ -90,6 +94,29 @@ pub fn lecteur_optique_branche() -> bool {
     }
 }
 
+/// Éjecte le disque dont le volume `cddafs` est monté en `volume`.
+///
+/// `diskutil eject` plutôt que `drutil eject` : `drutil` vise le PREMIER
+/// graveur de la machine, `diskutil` le disque de CE volume — celui que Tune
+/// lit, même avec deux lecteurs. Il passe par DiskArbitration, qui démonte
+/// puis éjecte, et refuse proprement si un autre programme tient le volume.
+pub fn ejecter_volume(volume: &Path) -> Result<(), String> {
+    let sortie = std::process::Command::new("/usr/sbin/diskutil")
+        .arg("eject")
+        .arg(volume)
+        .output()
+        .map_err(|e| format!("diskutil ne se lance pas : {e}"))?;
+    if sortie.status.success() {
+        tracing::info!(volume = %volume.display(), "cd_disque_ejecte");
+        return Ok(());
+    }
+    let mut raison = String::from_utf8_lossy(&sortie.stderr).trim().to_string();
+    if raison.is_empty() {
+        raison = String::from_utf8_lossy(&sortie.stdout).trim().to_string();
+    }
+    Err(format!("diskutil eject : {raison}"))
+}
+
 pub fn lecteur_du_systeme() -> LecteurVolume {
     if let Ok(dossier) = std::env::var("TUNE_CD_DEVICE") {
         return LecteurVolume::sur_dossier(PathBuf::from(dossier));
@@ -99,6 +126,7 @@ pub fn lecteur_du_systeme() -> LecteurVolume {
         || volumes_cddafs().into_iter().next(),
         lecteur_optique_branche,
     )
+    .avec_ejecteur(ejecter_volume)
 }
 
 #[cfg(test)]
