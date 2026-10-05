@@ -24,6 +24,7 @@ pub mod devices;
 pub mod diag_qobuz;
 pub mod digest;
 pub mod discogs;
+pub(crate) mod ecriture_fichiers;
 pub mod eq_pro;
 pub mod export;
 pub(crate) mod filtre_sources;

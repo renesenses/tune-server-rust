@@ -1111,6 +1111,15 @@ pub fn run_write_to_files(
         report.status = WriteStatus::Refused;
         return report;
     }
+    // L'étiquette embarquée réécrit le fichier AUDIO : elle exige en plus le
+    // réglage général « Écrire les modifications dans les fichiers audio »
+    // (désactivé par défaut). Le `.lrc` voisin n'ouvre pas le fichier audio,
+    // il reste sous le seul consentement ci-dessus.
+    if opts.target == WriteTarget::Tag && !crate::metadata::ecriture_fichiers::autorisee(db) {
+        info!("lyrics_write_tag_refused_file_writes_disabled");
+        report.status = WriteStatus::Refused;
+        return report;
+    }
 
     let meta = crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
     let mut after_id = 0i64;
@@ -2149,6 +2158,18 @@ mod tests {
         crate::lyrics::store_cache_entry(&db, id, "Reelle", "Artiste", None, Some("une ligne"));
         write_consent(&db, true);
 
+        // Consentement des paroles donné, mais « Écrire les modifications dans
+        // les fichiers audio » jamais coché : l'étiquette n'est pas écrite.
+        let refus = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
+        assert_eq!(refus.status, WriteStatus::Refused, "bilan : {refus:?}");
+        assert!(
+            crate::metadata::lyrics::read_embedded_lyrics(cible.to_str().unwrap()).is_none(),
+            "réglage général désactivé : le fichier audio a été réécrit"
+        );
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set(crate::metadata::ecriture_fichiers::CLE, "true")
+            .unwrap();
+
         let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
 
         assert_eq!((r.written, r.failed), (1, 0), "bilan : {r:?}");
@@ -2190,6 +2211,9 @@ mod tests {
         let id = TrackRepo::with_backend(db.clone()).create(&t).unwrap();
         crate::lyrics::store_cache_entry(&db, id, "Deja", "Artiste", None, Some("les notres"));
         write_consent(&db, true);
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set(crate::metadata::ecriture_fichiers::CLE, "true")
+            .unwrap();
 
         let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
 

@@ -50,7 +50,12 @@ const JALON_AVANCEMENT: i32 = 50;
 pub(crate) async fn write_tags_to_files(
     State(state): State<AppState>,
     Json(body): Json<WriteTagsRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // Cette passe n'a pas d'autre effet que d'écrire dans les fichiers :
+    // désactivée (le défaut), elle refuse sans rien toucher ni rien inscrire.
+    if !crate::routes::ecriture_fichiers::autorisee(&state) {
+        return crate::routes::ecriture_fichiers::refus("write_tags");
+    }
     let task_id = uuid::Uuid::new_v4().to_string();
     let backend = state.backend.clone();
 
@@ -389,6 +394,7 @@ pub(crate) async fn write_tags_to_files(
         StatusCode::ACCEPTED,
         Json(json!({"status": "accepted", "task_id": task_id})),
     )
+        .into_response()
 }
 
 /// GET /library/write-tags/status
@@ -417,7 +423,9 @@ mod tests_tache_de_fond_write_tags {
     use crate::state::AppState;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&state.backend);
+        state
     }
 
     fn demande() -> WriteTagsRequest {
@@ -450,6 +458,33 @@ mod tests_tache_de_fond_write_tags {
             "l'écriture des étiquettes doit figurer au registre des tâches de \
              fond, sinon le bandeau global ne peut pas l'afficher (#2129) — \
              registre observé : {ids:?}"
+        );
+    }
+
+    /// Réglage « Écrire les modifications dans les fichiers audio » jamais
+    /// touché : la passe refuse en 409, n'inscrit rien au registre et ne
+    /// publie aucun statut « running ».
+    #[tokio::test]
+    async fn reglage_absent_la_passe_refuse_sans_rien_lancer() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let reponse = write_tags_to_files(State(state.clone()), Json(demande())).await;
+        assert_eq!(reponse.status(), StatusCode::CONFLICT);
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps: Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(
+            corps["code"],
+            tune_core::metadata::ecriture_fichiers::CODE_REFUS
+        );
+        assert!(state.background_tasks.snapshot().is_empty());
+        let statut =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get("write_tags_status")
+                .unwrap();
+        assert!(
+            statut.is_none(),
+            "aucun statut ne doit être publié : {statut:?}"
         );
     }
 
