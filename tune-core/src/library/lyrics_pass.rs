@@ -1111,12 +1111,13 @@ pub fn run_write_to_files(
         report.status = WriteStatus::Refused;
         return report;
     }
-    // L'étiquette embarquée réécrit le fichier AUDIO : elle exige en plus le
-    // réglage général « Écrire les modifications dans les fichiers audio »
-    // (désactivé par défaut). Le `.lrc` voisin n'ouvre pas le fichier audio,
-    // il reste sous le seul consentement ci-dessus.
-    if opts.target == WriteTarget::Tag && !crate::metadata::ecriture_fichiers::autorisee(db) {
-        info!("lyrics_write_tag_refused_file_writes_disabled");
+    // Les deux cibles exigent en plus le réglage général « Écrire les
+    // modifications dans les fichiers audio » (désactivé par défaut) :
+    // l'étiquette réécrit le fichier audio, et le `.lrc` voisin — décision de
+    // Bertrand du 05/10/2026 — est lui aussi une écriture dans le dossier de
+    // musique de l'utilisateur.
+    if !crate::metadata::ecriture_fichiers::autorisee(db) {
+        info!(target = ?opts.target, "lyrics_write_refused_file_writes_disabled");
         report.status = WriteStatus::Refused;
         return report;
     }
@@ -1906,10 +1907,18 @@ mod tests {
 
     // -- Passe 3 : écriture dans les fichiers (#2172) -----------------------
 
+    /// Le consentement des paroles ET, quand il est donné, le réglage général
+    /// « Écrire les modifications dans les fichiers audio » que les deux
+    /// cibles exigent (05/10/2026).
     fn write_consent(db: &Arc<dyn DbBackend>, on: bool) {
         SettingsRepo::with_backend(db.clone())
             .set(SETTING_WRITE_ENABLED, if on { "true" } else { "false" })
             .unwrap();
+        if on {
+            SettingsRepo::with_backend(db.clone())
+                .set(crate::metadata::ecriture_fichiers::CLE, "true")
+                .unwrap();
+        }
     }
 
     /// Une piste avec un vrai fichier sur le disque et des paroles en cache —
@@ -1935,6 +1944,26 @@ mod tests {
         let id = TrackRepo::with_backend(db.clone()).create(&t).unwrap();
         crate::lyrics::store_cache_entry(db, id, nom, "Artiste", synced, plain);
         (id, chemin)
+    }
+
+    /// Décision de Bertrand du 05/10/2026 : le `.lrc` voisin passe AUSSI sous
+    /// « Écrire les modifications dans les fichiers audio ». Consentement des
+    /// paroles donné, réglage général absent : aucun `.lrc`.
+    #[test]
+    fn reglage_general_absent_aucun_lrc_voisin() {
+        let db = test_db();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_id, chemin) =
+            piste_avec_fichier(&db, &dir, "Voisin.flac", Some("[00:01.00] une ligne"), None);
+        SettingsRepo::with_backend(db.clone())
+            .set(SETTING_WRITE_ENABLED, "true")
+            .unwrap();
+
+        let r = run_write_to_files(&db, ExportOptions::production(WriteTarget::Sidecar), |_| {});
+
+        assert_eq!(r.status, WriteStatus::Refused);
+        assert!(crate::metadata::lyrics::find_sidecar_lrc(&chemin).is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -2159,7 +2188,10 @@ mod tests {
         write_consent(&db, true);
 
         // Consentement des paroles donné, mais « Écrire les modifications dans
-        // les fichiers audio » jamais coché : l'étiquette n'est pas écrite.
+        // les fichiers audio » décoché : l'étiquette n'est pas écrite.
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .delete(crate::metadata::ecriture_fichiers::CLE)
+            .unwrap();
         let refus = run_write_to_files(&db, ExportOptions::production(WriteTarget::Tag), |_| {});
         assert_eq!(refus.status, WriteStatus::Refused, "bilan : {refus:?}");
         assert!(
