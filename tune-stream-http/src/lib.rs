@@ -1738,6 +1738,23 @@ const PAS_DE_PERTE_MS: i64 = 1_000;
 /// en produirait des centaines.
 const PERTES_AU_JOURNAL: u32 = 3;
 
+/// Avance de livraison au-dessus de laquelle une perte de terrain ne menace
+/// pas la lecture : le renderer a encore tout cela devant lui.
+///
+/// Ticket 179 : le WARN sortait avec 145 s d'avance. Un renderer au tampon
+/// plein cesse de tirer, c'est normal, et l'avance recule au rythme de
+/// l'horloge sans que rien ne manque. Seul un renderer qui RATTRAPE le flux
+/// (avance tombée sous ce seuil) mérite le WARN ; les autres pertes restent
+/// au journal en DEBUG. Le cas qui a fait naître la mesure (#4645, darTZeel
+/// qui tire au rythme exact, avance proche de zéro) reste sous le seuil.
+const AVANCE_SANS_RISQUE_MS: i64 = 10_000;
+
+/// La perte de terrain mérite-t-elle un WARN ? Seulement si l'avance qui
+/// reste ne couvre plus la lecture (voir [`AVANCE_SANS_RISQUE_MS`]).
+fn perte_menace_la_lecture(avance_ms: i64) -> bool {
+    avance_ms < AVANCE_SANS_RISQUE_MS
+}
+
 /// Débit nominal d'un flux PCM servi en WAV, en octets par seconde.
 ///
 /// `None` hors WAV, et c'est délibéré : sur un format compressé la
@@ -1958,6 +1975,10 @@ struct ChronoServiceFichier {
     perte_signalee_ms: i64,
     /// Nombre de reculs franchis.
     pertes: u32,
+    /// Reculs portés au journal en WARN, c'est-à-dire ceux qui menaçaient la
+    /// lecture (ticket 179). Distinct de `pertes` : les reculs sans risque ne
+    /// doivent pas épuiser le budget de WARN d'une vraie famine.
+    alertes: u32,
     /// #4645 — comment le service s'est terminé. Posé à `ConsommateurParti`
     /// d'emblée : c'est la seule fin que le générateur ne peut pas écrire
     /// lui-même, puisqu'il ne reprend jamais la main pour le faire.
@@ -1977,6 +1998,7 @@ impl ChronoServiceFichier {
             avance_min_ms: 0,
             perte_signalee_ms: 0,
             pertes: 0,
+            alertes: 0,
             fin: FinDuService::ConsommateurParti,
         }
     }
@@ -2021,7 +2043,8 @@ impl ChronoServiceFichier {
         }
         self.perte_signalee_ms = perte;
         self.pertes += 1;
-        if self.pertes <= PERTES_AU_JOURNAL {
+        if perte_menace_la_lecture(avance) && self.alertes < PERTES_AU_JOURNAL {
+            self.alertes += 1;
             warn!(
                 stream_id = %self.stream_id,
                 perte_ms = perte,
@@ -5003,7 +5026,10 @@ mod reprise_navigateur_5426;
 /// 1 030 431 ms, connexion fermée après 239 140 864 octets et 929 402 ms.
 #[cfg(test)]
 mod terrain_perdu_4645 {
-    use super::{avance_de_livraison_ms, debit_nominal_octets_par_seconde, terrain_perdu_ms};
+    use super::{
+        AVANCE_SANS_RISQUE_MS, ChronoServiceFichier, avance_de_livraison_ms,
+        debit_nominal_octets_par_seconde, perte_menace_la_lecture, terrain_perdu_ms,
+    };
 
     /// Le nominal du WAV de Sevy : 44 100 × 2 × 3 = 264 600 octets/s.
     /// C'est ce chiffre qui a permis de lire son journal — comparé à lui, le
@@ -5073,6 +5099,56 @@ mod terrain_perdu_4645 {
     fn regagner_de_lavance_ne_compte_aucune_perte() {
         assert_eq!(terrain_perdu_ms(3_000, 3_000), 0);
         assert_eq!(terrain_perdu_ms(3_000, 9_000), 0);
+    }
+
+    /// Ticket 179 — la règle : une perte avec une avance confortable n'est pas
+    /// une menace ; une avance tombée sous le seuil, ou un retard, l'est.
+    #[test]
+    fn seule_une_avance_sous_le_seuil_menace_la_lecture() {
+        assert!(
+            !perte_menace_la_lecture(145_000),
+            "145 s d'avance : rien ne manque"
+        );
+        assert!(!perte_menace_la_lecture(AVANCE_SANS_RISQUE_MS));
+        assert!(perte_menace_la_lecture(AVANCE_SANS_RISQUE_MS - 1));
+        assert!(
+            perte_menace_la_lecture(0),
+            "le darTZeel qui tire au rythme exact"
+        );
+        assert!(perte_menace_la_lecture(-25_620), "le retard de Sevy");
+    }
+
+    /// Un service dont l'horloge a tourné de `ms` depuis son début.
+    fn chrono_vieilli_de(ms: u64, octets_par_seconde: u32) -> ChronoServiceFichier {
+        let mut chrono = ChronoServiceFichier::new("essai".into(), 0, Some(octets_par_seconde));
+        chrono.debut = std::time::Instant::now() - std::time::Duration::from_millis(ms);
+        chrono
+    }
+
+    /// Ticket 179 — un renderer au tampon plein cesse de tirer : l'avance
+    /// recule de 5 s mais en garde 145. La perte est comptée, pas alertée.
+    #[test]
+    fn un_renderer_au_tampon_plein_ne_declenche_pas_d_alerte() {
+        // 1000 octets/s : 150 000 octets servis d'emblée = 150 s d'avance.
+        let mut chrono = chrono_vieilli_de(0, 1_000);
+        chrono.compter(150_000);
+        // Il ne tire plus pendant 5 s.
+        chrono.debut -= std::time::Duration::from_millis(5_000);
+        chrono.compter(0);
+        assert_eq!(chrono.pertes, 1, "le recul est bien mesuré");
+        assert_eq!(chrono.alertes, 0, "mais 145 s d'avance ne menacent rien");
+    }
+
+    /// Le cas qui a fait naître la mesure (#4645) garde son WARN : un
+    /// renderer sans avance qui prend du retard.
+    #[test]
+    fn un_renderer_qui_rattrape_le_flux_declenche_l_alerte() {
+        let mut chrono = chrono_vieilli_de(0, 1_000);
+        chrono.compter(2_000);
+        chrono.debut -= std::time::Duration::from_millis(5_000);
+        chrono.compter(0);
+        assert_eq!(chrono.pertes, 1);
+        assert_eq!(chrono.alertes, 1, "avance passée sous zéro : alerte");
     }
 }
 
