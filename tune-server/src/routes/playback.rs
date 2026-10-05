@@ -5702,9 +5702,11 @@ async fn set_audiophile(
     // deux mondes, ni bit-perfect ni réglable.
     if !was_full_volume && will_be_full_volume {
         let device_id = get_zone_device_id(&state, zone_id);
+        // #5695 — le réglage n'est pas encore écrit : `set_volume` ne verrait
+        // pas le verrou et composerait le trim (100 % × −1,6 dB = 83 %).
         if let Err(error) = state
             .orchestrator
-            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .set_volume_pure_force(zone_id, device_id.as_deref())
             .await
         {
             return output_command_error_response(error);

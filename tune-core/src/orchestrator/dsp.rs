@@ -2241,6 +2241,37 @@ impl PlaybackOrchestrator {
         volume: f64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #5695 — le verrou PURE mord ICI, au point de passage unique : la
+        // route `POST /playback/{id}/volume` l'appliquait seule, et toutes les
+        // autres (`PUT /zones/{id}/volume` du client web, PATCH de zone,
+        // volume de groupe, alarmes…) le contournaient.
+        let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
+            && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
+        self.appliquer_volume(zone_id, volume, device_id, pure_force)
+            .await
+    }
+
+    /// #5695 — commande le plein volume d'une zone PURE verrouillée, SANS
+    /// trim de gain, comme [`Self::arm_fixed_volume`].
+    ///
+    /// Pour la route qui arme PURE : elle commande le 100 % AVANT d'écrire le
+    /// réglage (un refus de l'appareil ne doit rien persister), donc
+    /// [`Self::set_volume`] ne peut pas encore lire le verrou en base.
+    pub async fn set_volume_pure_force(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
+        self.appliquer_volume(zone_id, 1.0, device_id, true).await
+    }
+
+    async fn appliquer_volume(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+        pure_force: bool,
+    ) -> OutputCommandResult<()> {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -2262,7 +2293,17 @@ impl PlaybackOrchestrator {
         // zones fixed_volume ne passent jamais ici (early return ci-dessus).
         // Limite assumée : un trim positif est plafonné quand user_volume est
         // déjà haut (clamp 0..1).
-        let device_volume = volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id));
+        //
+        // #5695 — en PURE verrouillé, ni l'un ni l'autre : la consigne est
+        // 100 % et le trim n'est pas composé, comme dans `arm_fixed_volume`.
+        // Un trim de −1,6 dB faisait partir 0,83 vers le Devialet, que le
+        // sondeur rapatriait ensuite en base : « Volume 83 % » sous PURE.
+        let volume = if pure_force { 1.0 } else { volume };
+        let device_volume = if pure_force {
+            1.0
+        } else {
+            volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id))
+        };
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -2274,6 +2315,7 @@ impl PlaybackOrchestrator {
                 zone_id,
                 volume,
                 device_volume,
+                pure_force,
                 device_id = did,
                 "device_set_volume_sending"
             );

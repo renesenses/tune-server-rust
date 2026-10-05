@@ -157,7 +157,9 @@ impl PositionPoller {
                 // actually moved since the last poll (see decisions::
                 // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
+                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol)
+                    && !self.volume_pure_reimpose(zone_id, status.volume).await
+                {
                     self.playback.set_volume(zone_id, status.volume).await;
                     // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
                     // tombait a 0 sous 0,01 lineaire (-40 dB).
@@ -1129,6 +1131,7 @@ impl PositionPoller {
                             status.volume,
                             zone_state.volume,
                         )
+                        && !self.volume_pure_reimpose(zone_id, status.volume).await
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
                         // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
@@ -1467,6 +1470,7 @@ impl PositionPoller {
                     status.volume,
                     zone_state.volume,
                 )
+                && !self.volume_pure_reimpose(zone_id, status.volume).await
             {
                 self.playback.set_volume(zone_id, status.volume).await;
                 // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
