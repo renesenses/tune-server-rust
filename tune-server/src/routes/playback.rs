@@ -3361,6 +3361,43 @@ pub(crate) fn precedent_doit_relancer(position_ms: i64, vient_de_redemarrer: boo
     position_ms > SEUIL_RELANCE_MS && !vient_de_redemarrer
 }
 
+/// Position que « précédent » doit rejouer quand il RECULE (et ne relance pas).
+///
+/// Fil 2143 (Fabien, #5758) — en lecture aléatoire, « suivant » suit la
+/// permutation (`next_position_manual`), mais « précédent » reculait d'un rang
+/// dans l'ordre LINÉAIRE de la file : il jouait un titre qu'on n'avait pas
+/// entendu juste avant. Ici, l'aléatoire remonte le tirage : le titre joué
+/// avant le titre courant est celui qui le précède dans `shuffle_order`.
+///
+/// Au premier rang du tirage, rien n'a été joué avant : on reste sur la piste
+/// courante, comme `max(0)` le fait en lecture linéaire. Sans tirage
+/// matérialisé (ou si la position n'y figure pas), on retombe sur l'ordre
+/// linéaire, inchangé.
+pub(crate) fn position_precedente(zone_state: &tune_core::playback::ZoneState) -> i64 {
+    let lineaire = (zone_state.queue_position - 1).max(0);
+    if !zone_state.shuffle || zone_state.shuffle_order.is_empty() {
+        return lineaire;
+    }
+    let courant = zone_state.queue_position;
+    // Le curseur est resynchronisé à chaque changement de position
+    // (`update_queue_info`) ; on le vérifie quand même, et on cherche la
+    // position dans le tirage s'il ne pointe pas sur la piste courante.
+    let rang = usize::try_from(zone_state.shuffle_index)
+        .ok()
+        .filter(|&i| zone_state.shuffle_order.get(i).map(|&p| p as i64) == Some(courant))
+        .or_else(|| {
+            zone_state
+                .shuffle_order
+                .iter()
+                .position(|&p| p as i64 == courant)
+        });
+    match rang {
+        Some(0) => courant.max(0),
+        Some(i) => zone_state.shuffle_order[i - 1] as i64,
+        None => lineaire,
+    }
+}
+
 async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
@@ -3398,7 +3435,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
-    let prev_pos = (current.queue_position - 1).max(0);
+    let prev_pos = position_precedente(&current);
 
     let s = state.clone();
     tokio::spawn(async move {
@@ -8530,5 +8567,143 @@ mod minuteur_de_sommeil_arrete_la_sortie_5571 {
         assert!(fini.is_err(), "en pause, le minuteur ne doit pas échoir");
         assert_eq!(reste, Some(2), "en pause, pas une seconde décomptée");
         assert_eq!(arrets_recus(&state).await, 0);
+    }
+}
+
+/// Fil 2143 (#5758) — « précédent » en lecture aléatoire remonte l'ordre
+/// réellement joué (le tirage), pas l'ordre linéaire de la file.
+#[cfg(test)]
+mod precedent_aleatoire_tests {
+    use super::position_precedente;
+    use tune_core::playback::{RepeatMode, ZoneState};
+
+    fn aleatoire(position: i64, rang: i64) -> ZoneState {
+        ZoneState {
+            queue_position: position,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: rang,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn en_aleatoire_precedent_rend_le_titre_tire_juste_avant() {
+        // Tirage 3 → 1 → 4 : on écoute 4, le titre d'avant est 1 (pas 3).
+        assert_eq!(position_precedente(&aleatoire(4, 2)), 1);
+        // On écoute 0 (rang 3), le titre d'avant est 4 (pas -1 → 0).
+        assert_eq!(position_precedente(&aleatoire(0, 3)), 4);
+    }
+
+    #[test]
+    fn au_premier_rang_du_tirage_precedent_reste_sur_la_piste() {
+        assert_eq!(position_precedente(&aleatoire(3, 0)), 3);
+    }
+
+    #[test]
+    fn un_curseur_desynchronise_est_rattrape_par_la_position() {
+        // Curseur périmé (rang 0 = piste 3) alors que la piste 2 joue : la
+        // piste 2 est au rang 4, le titre d'avant est 0.
+        assert_eq!(position_precedente(&aleatoire(2, 0)), 0);
+        assert_eq!(position_precedente(&aleatoire(2, -1)), 0);
+    }
+
+    #[test]
+    fn sans_aleatoire_le_recul_lineaire_est_inchange() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle = false;
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+        s.queue_position = 0;
+        assert_eq!(position_precedente(&s), 0);
+    }
+
+    #[test]
+    fn aleatoire_sans_tirage_materialise_retombe_sur_le_lineaire() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+    }
+
+    /// Le handler `POST /previous` s'en sert bel et bien : la réponse annonce
+    /// la position du titre tiré juste avant.
+    #[tokio::test]
+    async fn la_route_previous_suit_le_tirage() {
+        use crate::state::AppState;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::playback::NowPlaying;
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", Some("mock"), Some("sortie-essai"))
+            .expect("creation de zone");
+        let longueur = 20i64;
+        let items: Vec<QueueInput> = (0..longueur)
+            .map(|i| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: format!("t{i}"),
+                title: format!("t{i}"),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "t0".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("t0".into()),
+                    duration_ms: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 0, longueur).await;
+        state.playback.set_shuffle(zid, true).await;
+        let ordre = state.playback.get_state(zid).await.shuffle_order;
+        assert_eq!(ordre.len() as i64, longueur);
+
+        // Un rang du tirage où le recul linéaire et le recul dans le tirage
+        // DIFFÈRENT, sinon le test ne prouverait rien.
+        let rang = (1..ordre.len())
+            .find(|&k| (ordre[k] as i64 - 1).max(0) != ordre[k - 1] as i64)
+            .expect("un tirage de 20 pistes n'est pas l'ordre linéaire");
+        // On « joue » le tirage jusqu'à ce rang, comme `next` l'aurait fait.
+        state
+            .playback
+            .update_queue_info(zid, ordre[rang] as i64, longueur)
+            .await;
+
+        let reponse = super::previous(State(state.clone()), Path(zid))
+            .await
+            .into_response();
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(
+            v.get("queue_position"),
+            Some(&serde_json::json!(ordre[rang - 1])),
+            "tirage {ordre:?}, piste courante {} (rang {rang}) : précédent \
+             doit rejouer {} (le titre tiré avant), pas {} (l'ordre linéaire) : {v}",
+            ordre[rang],
+            ordre[rang - 1],
+            (ordre[rang] as i64 - 1).max(0),
+        );
     }
 }
