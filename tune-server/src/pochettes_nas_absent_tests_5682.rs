@@ -99,3 +99,111 @@ async fn une_racine_injoignable_au_scan_ne_retire_aucune_pochette_5682() {
         "#5034 : une pochette dont le fichier source a quitté un disque JOIGNABLE suit"
     );
 }
+
+/// Une piste FLAC `<dossier>/<n> - Piste.flac`, taguée `ALBUM = album`,
+/// sans jaquette, datée d'hier.
+fn piste_dans(dossier: &Path, album: &str, n: usize) -> PathBuf {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+    std::fs::create_dir_all(dossier).unwrap();
+    let piste = dossier.join(format!("{n:03} - Piste.flac"));
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tune-core/tests/fixtures/test.flac"),
+        &piste,
+    )
+    .unwrap();
+    let mut f = std::fs::File::open(&piste).unwrap();
+    let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+    drop(f);
+    let mut vc = VorbisComments::default();
+    let titre = format!("Piste {n}");
+    let numero = n.to_string();
+    for (k, v) in [
+        ("TITLE", titre.as_str()),
+        ("ARTIST", "Didier"),
+        ("ALBUMARTIST", "Didier"),
+        ("ALBUM", album),
+        ("TRACKNUMBER", numero.as_str()),
+    ] {
+        vc.insert(k.to_string(), v.to_string());
+    }
+    flac.set_vorbis_comments(vc);
+    flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+    super::pochettes_disque_tests_5034::poser_jaquette(&piste, None);
+    std::fs::File::options()
+        .write(true)
+        .open(&piste)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400))
+        })
+        .unwrap();
+    piste
+}
+
+/// Suite de #5854 — un montage IMBRIQUÉ tombé (`<racine>/Montage`, plus de
+/// `SEUIL_SOUS_ARBRE_VIDE` pistes) laisse la racine répondre : ni
+/// `missing_dirs` ni `racines_videes` ne le voient, et la passe de #5034
+/// n'était gardée que par eux. La pochette d'un album tirée d'un `cover.jpg`
+/// sous ce montage passait pour « source disparue » ; l'album, dont une
+/// partie des pistes vit hors du montage, était relu sans son image et la
+/// perdait. Ses pistes, elles, étaient conservées (`ProtegeIllisible`).
+#[tokio::test]
+async fn un_montage_imbrique_tombe_ne_retire_pas_la_pochette_des_albums_qu_il_porte() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    let r = racine("montage-imbrique-5854");
+    let montage = r.join("Montage");
+    // Un album à cheval : un disque hors du montage, sans image ; l'autre
+    // sous le montage, avec son `cover.jpg` — la source de la pochette.
+    let hors_montage = piste_dans(&r.join("Local").join("Coffret CD1"), "Coffret", 1);
+    let dossier_cover = montage.join("Coffret CD2");
+    piste_dans(&dossier_cover, "Coffret", 2);
+    super::pochettes_disque_tests_5034::poser_cover(&dossier_cover, Some(COVER));
+    // De quoi dépasser le seuil du montage imbriqué.
+    let seuil = crate::routes::system::scan::SEUIL_SOUS_ARBRE_VIDE;
+    for n in 1..=seuil {
+        piste_dans(&montage.join("Remplissage"), "Remplissage", n);
+    }
+    let etat = etat_sur(&r);
+    let db = etat.backend.clone();
+    scan_manuel(&etat, false, None).await;
+    let pistes = [hors_montage.as_path()];
+    let attendu = vec![Some(content_hash(COVER))];
+    assert_eq!(pochettes(&db, &pistes), attendu, "montage de l'épreuve");
+
+    // Le montage tombe : son point de montage reste, VIDE, sous une racine
+    // qui répond. Remis AVANT de conclure.
+    let ailleurs = PathBuf::from(format!("{}-montage-absent", r.path().display()));
+    std::fs::rename(&montage, &ailleurs).unwrap();
+    std::fs::create_dir(&montage).unwrap();
+    scan_manuel(&etat, false, None).await;
+    let apres_rapide = pochettes(&db, &pistes);
+    scan_manuel(&etat, true, None).await;
+    let apres_complet = pochettes(&db, &pistes);
+    scan_de_demarrage(&db).await;
+    let apres_demarrage = pochettes(&db, &pistes);
+    std::fs::remove_dir(&montage).unwrap();
+    std::fs::rename(&ailleurs, &montage).unwrap();
+    assert_eq!(
+        apres_rapide, attendu,
+        "analyse rapide, montage imbriqué absent : la pochette est retirée"
+    );
+    assert_eq!(
+        apres_complet, attendu,
+        "analyse complète, montage imbriqué absent : la pochette est retirée"
+    );
+    assert_eq!(
+        apres_demarrage, attendu,
+        "scan de démarrage, montage imbriqué absent : la pochette est retirée"
+    );
+
+    // Le montage revient : la règle de #5034 vit toujours sous lui.
+    super::pochettes_disque_tests_5034::poser_cover(&dossier_cover, None);
+    scan_de_demarrage(&db).await;
+    assert_eq!(
+        pochettes(&db, &pistes),
+        vec![None],
+        "#5034 : un `cover.jpg` supprimé d'un montage PRÉSENT suit"
+    );
+}

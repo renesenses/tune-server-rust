@@ -959,6 +959,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Hissé pour la passe des pochettes : un montage imbriqué tombé laisse
+        // sa racine répondre, et ce qu'il contient n'est pas jugé.
+        let mut sous_arbres: Vec<String> = Vec::new();
         // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
         // émet lui aussi `library.scan.completed`. Son rapport ne portait
         // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
@@ -1001,7 +1004,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            let sous_arbres = crate::routes::system::scan::sous_arbres_vides(
+            sous_arbres = crate::routes::system::scan::sous_arbres_vides(
                 &music_dirs,
                 &existing_refs,
                 &discovered_paths,
@@ -1156,6 +1159,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #5034 — APRÈS la purge : même confrontation des pochettes à leur
         // fichier source que le scan manuel.
+        let exclus_pochettes: Vec<String> =
+            error_dirs.iter().chain(&sous_arbres).cloned().collect();
         // #5682 (fil 2115) — seulement si les racines ont répondu. Le NAS en
         // retard au démarrage faisait voir chaque fichier source « disparu » :
         // les pistes étaient conservées, mais les pochettes retirées.
@@ -1168,7 +1173,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 &db,
                 &cache_dir,
                 &[],
-                &error_dirs,
+                &exclus_pochettes,
                 false,
             );
         } else {
@@ -1273,7 +1278,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     &db,
                     &cache_dir,
                     &[],
-                    &error_dirs,
+                    &exclus_pochettes,
                     false,
                 );
             }
