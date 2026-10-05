@@ -943,6 +943,27 @@ pub fn journaliser_succes_hqplayer(
     }
 }
 
+/// Le recensement LMS mérite-t-il une ligne de journal ce tour-ci ?
+///
+/// Le sondeur interroge le LMS chaque minute, et chaque tour écrivait sa ligne
+/// `INFO` : `squeezebox_discover: no players found on LMS` quand le LMS ne
+/// connaissait aucun lecteur, `squeezebox_poll_discovered` quand il en
+/// connaissait. Chez un testeur dont le LMS tournait sur la machine même, sans
+/// lecteur branché, c'était 133 lignes sur les 1 000 d'un export de
+/// diagnostic, toutes identiques, qui repoussaient hors de la fenêtre les
+/// lignes utiles.
+///
+/// Le recensement reste utile — c'est lui qui fait apparaître un lecteur
+/// branché en moins d'une minute —, seule sa trace change : elle n'est écrite
+/// qu'à la première réponse du LMS et à chaque **changement** du nombre de
+/// lecteurs. `dernier` vaut `None` tant que le LMS n'a pas répondu, ou après
+/// un échec : son retour est alors annoncé à nouveau.
+pub fn recensement_squeezebox_a_annoncer(dernier: &mut Option<usize>, lecteurs: usize) -> bool {
+    let change = *dernier != Some(lecteurs);
+    *dernier = Some(lecteurs);
+    change
+}
+
 fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -957,6 +978,9 @@ fn spawn_squeezebox_poller(state: &AppState) {
         // Cadence partagée avec le sondeur HQPlayer : voir
         // `prochain_intervalle_sondage` (60 s de base, 600 s de plancher).
         let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+        // Dernier nombre de lecteurs annoncé : voir
+        // `recensement_squeezebox_a_annoncer`.
+        let mut dernier_recensement: Option<usize> = None;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -976,14 +1000,27 @@ fn spawn_squeezebox_poller(state: &AppState) {
             if enabled && !host.is_empty() {
                 match crate::routes::squeezebox::discover_and_register(&state).await {
                     Ok(players) => {
-                        if !players.is_empty() {
-                            info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
+                        if recensement_squeezebox_a_annoncer(
+                            &mut dernier_recensement,
+                            players.len(),
+                        ) {
+                            if players.is_empty() {
+                                info!(
+                                    lms = %host,
+                                    "squeezebox_poll_no_players — le LMS répond mais ne connaît \
+                                     aucun lecteur ; ce message ne se répète pas tant que rien \
+                                     ne change"
+                                );
+                            } else {
+                                info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
+                            }
                         }
                         // Reachable → back to normal cadence.
                         interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
                         interval_secs = prochain_intervalle_sondage(interval_secs, true);
+                        dernier_recensement = None;
                         tracing::debug!(
                             error = %e,
                             lms = %host,
@@ -996,6 +1033,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
                 // Integration off / no host configured — idle at base cadence so
                 // a freshly configured host is picked up promptly.
                 interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+                dernier_recensement = None;
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -4832,5 +4870,38 @@ mod compteurs_ssdp_du_demarrage_5226 {
             "les compteurs des renderers doivent rester lisibles et DISTINCTS \
              de celui des serveurs.\nligne : {ligne}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recensement_squeezebox_silencieux_tests {
+    use super::recensement_squeezebox_a_annoncer;
+
+    /// Une heure de LMS sans lecteur, puis un lecteur branché, puis débranché :
+    /// trois lignes, pas soixante-deux.
+    #[test]
+    fn le_recensement_ne_se_dit_qu_a_chaque_changement() {
+        let mut dernier = None;
+        let mut tours: Vec<usize> = vec![0; 60];
+        tours.push(1);
+        tours.push(1);
+        tours.push(0);
+        let annonces: Vec<usize> = tours
+            .iter()
+            .copied()
+            .filter(|n| recensement_squeezebox_a_annoncer(&mut dernier, *n))
+            .collect();
+        assert_eq!(annonces, vec![0, 1, 0]);
+    }
+
+    /// Après un échec, le sondeur remet `dernier` à `None` : le retour du LMS
+    /// est annoncé, même avec le même nombre de lecteurs qu'avant la panne.
+    #[test]
+    fn le_retour_apres_une_panne_est_annonce() {
+        let mut dernier = None;
+        assert!(recensement_squeezebox_a_annoncer(&mut dernier, 2));
+        assert!(!recensement_squeezebox_a_annoncer(&mut dernier, 2));
+        dernier = None;
+        assert!(recensement_squeezebox_a_annoncer(&mut dernier, 2));
     }
 }
