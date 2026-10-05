@@ -469,6 +469,15 @@ pub(super) fn output_stage_label(container: &str, sample_rate: i32, bit_depth: i
         }
         return dsd_resolution_label(sample_rate);
     }
+    // Fil 2119 — une source au format inconnu porte 0 : on n'écrit pas
+    // « 0Hz/0bit », on tait le chiffre qu'on ne connaît pas (même règle que
+    // l'étape Source).
+    if sample_rate <= 0 {
+        return container.to_string();
+    }
+    if bit_depth <= 0 {
+        return format!("{container} {sr}kHz", sr = sample_rate / 1000);
+    }
     if sample_rate >= 1000 {
         format!(
             "{container} {sr}kHz/{bit_depth}bit",
@@ -2222,11 +2231,17 @@ fn decrire_la_source<'w>(
             .flatten()
     });
 
+    // Fil 2119 — quand ni la lecture en cours ni la base ne nomment le
+    // format, il est INCONNU. Le repli « flac » / 44100 / 16 d'avant affirmait
+    // « FLAC 44kHz/16bit — Sans perte » pour un WAV 24/176,4 servi intact :
+    // une valeur inventée, publiée avec l'aplomb d'une mesure. Une chaîne
+    // vide ne se reconnaît comme aucun codec : `format_name` tombe sur
+    // [`CODEC_INCONNU`] (#4346), et fréquence et profondeur restent à 0.
     let fmt_str = np
         .format
         .clone()
         .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
-        .unwrap_or_else(|| "flac".into());
+        .unwrap_or_default();
     let source_format = AudioFormat::from_extension(&fmt_str);
     let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
     // For DSD files, prefer the track's original sample rate and bit depth
@@ -2250,7 +2265,8 @@ fn decrire_la_source<'w>(
             // même aplomb qu'une vraie mesure, et fausse dès que le fichier
             // était en Hi-Res (métadonnées non lues au scan).
             .or_else(|| wire_sample_rate.map(|v| v as i32))
-            .unwrap_or(44100)
+            // Fil 2119 — 0 veut dire « inconnu », jamais 44100.
+            .unwrap_or(0)
     };
     let bit_depth = if is_dsd {
         track
@@ -2263,7 +2279,8 @@ fn decrire_la_source<'w>(
             .or_else(|| np.bit_depth.map(|v| v as i32))
             .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
             .or_else(|| wire_bit_depth.map(|v| v as i32))
-            .unwrap_or(16)
+            // Fil 2119 — 0 veut dire « inconnu », jamais 16.
+            .unwrap_or(0)
     };
 
     let format_name = if is_dsd {

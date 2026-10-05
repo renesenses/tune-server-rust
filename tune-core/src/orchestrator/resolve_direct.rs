@@ -413,21 +413,11 @@ impl PlaybackOrchestrator {
         if req.track_id.is_some() {
             return;
         }
-        let Some(track_id) = req
+        let Some((track_id, piste)) = req
             .source_id
             .as_deref()
-            .and_then(track_id_dans_une_url_audio_de_tune)
+            .and_then(|uri| self.piste_de_bibliotheque_designee_par_l_uri(uri))
         else {
-            return;
-        };
-        let Some(piste) = crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
-            .get(track_id)
-            .ok()
-            .flatten()
-        else {
-            // L'URL a la bonne forme mais la ligne n'existe pas (piste
-            // supprimée, base d'un autre serveur derrière la même adresse) :
-            // rien n'est affirmé.
             return;
         };
         let titre_etait_vide = req.title.is_none();
@@ -454,6 +444,28 @@ impl PlaybackOrchestrator {
             titre = %piste.title,
             "uri_du_renderer_resolue_en_piste_de_bibliotheque"
         );
+    }
+
+    /// La ligne `tracks` que désigne une URI audio publiée par CETTE instance
+    /// ([`track_id_dans_une_url_audio_de_tune`]), avec son identifiant.
+    ///
+    /// Le cœur de [`Self::resoudre_l_uri_en_piste_de_bibliotheque`] (#4323),
+    /// partagé avec l'avance sans blanc (`advance_queue_metadata`, fil 2119) :
+    /// une seule lecture de l'URI, donc une seule règle d'hôte.
+    ///
+    /// `None` quand l'URI n'est pas la nôtre, ou quand l'URL a la bonne forme
+    /// mais que la ligne n'existe pas (piste supprimée, base d'un autre
+    /// serveur derrière la même adresse) : rien n'est affirmé.
+    pub(super) fn piste_de_bibliotheque_designee_par_l_uri(
+        &self,
+        uri: &str,
+    ) -> Option<(i64, crate::db::models::Track)> {
+        let track_id = track_id_dans_une_url_audio_de_tune(uri)?;
+        crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .ok()
+            .flatten()
+            .map(|piste| (track_id, piste))
     }
 
     /// #4362 — le serveur multimédia d'où vient cette piste est-il ABSENT, au
