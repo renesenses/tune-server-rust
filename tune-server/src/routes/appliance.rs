@@ -217,6 +217,63 @@ fn parse_device_status(raw: &str) -> (Vec<Value>, bool, bool) {
     (devices, ethernet_connected, wifi_connected)
 }
 
+/// Les cartes Wi-Fi PCI que voit le noyau, avec ou sans interface réseau.
+///
+/// `nmcli device` ne liste une carte que si son pilote a créé une interface.
+/// Or `iwlwifi` se charge, cherche son firmware, ne le trouve pas, et s'arrête
+/// là : la carte est sur le bus PCI, liée à son pilote, mais sans `wlan0`.
+/// Sans ce relevé, le client concluait « aucune carte Wi-Fi » sur un NUC
+/// DN2820FYKH dont la Wireless-N 7260 marchait sous une autre distribution
+/// (forum, fil 2159) — il manquait seulement `iwlwifi-mvm-firmware`.
+///
+/// Classe PCI `0x0280xx` : contrôleur réseau « autre », celle des cartes
+/// Wi-Fi Intel, Realtek, Broadcom, MediaTek et Qualcomm Atheros. Les clés USB
+/// ne sont pas couvertes : sans pilote, rien dans sysfs ne dit qu'une clé est
+/// une carte Wi-Fi.
+///
+/// `sys` est la racine de sysfs, en paramètre pour les tests.
+fn cartes_wifi_pci(sys: &std::path::Path) -> Vec<Value> {
+    let lire = |p: std::path::PathBuf| {
+        std::fs::read_to_string(p)
+            .map(|v| v.trim().trim_start_matches("0x").to_string())
+            .unwrap_or_default()
+    };
+    let Ok(entrees) = std::fs::read_dir(sys.join("bus/pci/devices")) else {
+        return Vec::new();
+    };
+    let mut cartes: Vec<(String, Value)> = entrees
+        .flatten()
+        .filter_map(|e| {
+            let dir = e.path();
+            if !lire(dir.join("class")).starts_with("0280") {
+                return None;
+            }
+            let slot = e.file_name().to_string_lossy().into_owned();
+            let pilote = std::fs::read_link(dir.join("driver"))
+                .ok()
+                .and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned()));
+            let mut interfaces: Vec<String> = std::fs::read_dir(dir.join("net"))
+                .map(|it| {
+                    it.flatten()
+                        .map(|n| n.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            interfaces.sort();
+            let carte = json!({
+                "bus": "pci",
+                "slot": slot,
+                "id": format!("{}:{}", lire(dir.join("vendor")), lire(dir.join("device"))),
+                "driver": pilote,
+                "interfaces": interfaces,
+            });
+            Some((slot, carte))
+        })
+        .collect();
+    cartes.sort_by(|a, b| a.0.cmp(&b.0));
+    cartes.into_iter().map(|(_, c)| c).collect()
+}
+
 fn validate_ssid(ssid: &str) -> Result<(), AppError> {
     if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(|c| c.is_control()) {
         return Err(AppError::bad_request("invalid ssid"));
@@ -276,14 +333,18 @@ async fn status(headers: HeaderMap) -> Result<Json<Value>, AppError> {
         wifi_ssid = active["ssid"].clone();
         wifi_signal = active["signal"].clone();
     }
-    Ok(Json(corps_du_statut(
+    let mut corps = corps_du_statut(
         devices,
         ethernet_connected,
         wifi_connected,
         wifi_ssid,
         wifi_signal,
         network_error,
-    )))
+    );
+    // Lu à part de nmcli : c'est justement quand nmcli ne voit pas la carte
+    // que ce relevé compte.
+    corps["wifi_hardware"] = json!(cartes_wifi_pci(std::path::Path::new("/sys")));
+    Ok(Json(corps))
 }
 
 /// Assembler la reponse de `/appliance/status`.
@@ -461,6 +522,107 @@ mod tests {
         assert!(eth);
         assert!(!wifi);
         assert_eq!(devices[1]["connection"], Value::Null);
+    }
+
+    /// Un faux sysfs : une carte PCI de classe `class`, liée à `pilote`, avec
+    /// les interfaces `interfaces`.
+    fn faux_pci(
+        sys: &std::path::Path,
+        slot: &str,
+        class: &str,
+        id: (&str, &str),
+        pilote: Option<&str>,
+        interfaces: &[&str],
+    ) {
+        let dir = sys.join("bus/pci/devices").join(slot);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("class"), format!("{class}\n")).unwrap();
+        std::fs::write(dir.join("vendor"), format!("{}\n", id.0)).unwrap();
+        std::fs::write(dir.join("device"), format!("{}\n", id.1)).unwrap();
+        if let Some(p) = pilote {
+            let cible = sys.join("bus/pci/drivers").join(p);
+            std::fs::create_dir_all(&cible).unwrap();
+            std::os::unix::fs::symlink(&cible, dir.join("driver")).unwrap();
+        }
+        for i in interfaces {
+            std::fs::create_dir_all(dir.join("net").join(i)).unwrap();
+        }
+    }
+
+    /// Fil 2159 : NUC DN2820FYKH, Wireless-N 7260 (8086:08b1) liée à iwlwifi
+    /// mais SANS interface, faute de firmware. nmcli ne la liste pas ; le
+    /// relevé PCI, si — et dit qu'elle n'a pas d'interface.
+    #[cfg(unix)]
+    #[test]
+    fn une_carte_wifi_sans_firmware_reste_visible_sur_le_bus_pci() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path();
+        faux_pci(
+            sys,
+            "0000:02:00.0",
+            "0x028000",
+            ("0x8086", "0x08b1"),
+            Some("iwlwifi"),
+            &[],
+        );
+        // Contrôleur Ethernet (0x0200) : n'est pas une carte Wi-Fi.
+        faux_pci(
+            sys,
+            "0000:03:00.0",
+            "0x020000",
+            ("0x10ec", "0x8168"),
+            Some("r8169"),
+            &["enp3s0"],
+        );
+
+        let cartes = cartes_wifi_pci(sys);
+        assert_eq!(cartes.len(), 1, "seule la carte Wi-Fi compte : {cartes:?}");
+        assert_eq!(cartes[0]["id"], "8086:08b1");
+        assert_eq!(cartes[0]["driver"], "iwlwifi");
+        assert_eq!(
+            cartes[0]["interfaces"],
+            json!([]),
+            "pas de firmware, pas d'interface"
+        );
+
+        // nmcli, lui, ne voit que l'Ethernet : c'est ce qui trompait l'écran.
+        let (devices, _, _) = parse_device_status("enp3s0:ethernet:connected:Filaire\n");
+        assert!(devices.iter().all(|d| d["type"] != "wifi"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn une_carte_wifi_qui_fonctionne_porte_son_interface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path();
+        faux_pci(
+            sys,
+            "0000:01:00.0",
+            "0x028000",
+            ("0x10ec", "0xc821"),
+            Some("rtw88_8821ce"),
+            &["wlp1s0"],
+        );
+        // Sans pilote du tout : présente, pilote nul.
+        faux_pci(
+            sys,
+            "0000:04:00.0",
+            "0x028000",
+            ("0x14e4", "0x43a0"),
+            None,
+            &[],
+        );
+        let cartes = cartes_wifi_pci(sys);
+        assert_eq!(cartes.len(), 2);
+        assert_eq!(cartes[0]["interfaces"], json!(["wlp1s0"]));
+        assert_eq!(cartes[1]["driver"], Value::Null);
+    }
+
+    /// Hors Linux, ou sysfs illisible : aucune carte, et pas d'erreur.
+    #[test]
+    fn sans_sysfs_le_releve_est_vide() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(cartes_wifi_pci(&tmp.path().join("absent")).is_empty());
     }
 
     #[test]
