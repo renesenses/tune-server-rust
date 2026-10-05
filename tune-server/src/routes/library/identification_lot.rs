@@ -114,11 +114,19 @@
 //! `POST /library/albums/{id}/reidentify` ne bouge pas : un refus y reste un
 //! `not_found`, comme avant.
 //!
-//! Reste ce que cette PR ne fait **pas** : même sans arrêt, un album introuvable
-//! le restera au lancement suivant et sera ré-interrogé. Éviter cette
-//! re-interrogation demande une marque « déjà tenté, rien trouvé », donc une
-//! migration — c'est une économie (~20 min par relance), pas un déblocage, et
-//! elle fait l'objet d'une PR distincte (#4991, point (b)).
+//! ## La marque « déjà tenté, rien trouvé » (#4991, point (b))
+//!
+//! Même sans arrêt, un album introuvable restait en tête de file : il ne reçoit
+//! pas de `musicbrainz_release_id`, et la sélection `ORDER BY al.id` le rendait
+//! au même rang à chaque relance. La reprise réattaquait donc l'amas qui venait
+//! d'échouer avant d'atteindre quoi que ce soit de neuf.
+//!
+//! Un album auquel MusicBrainz a répondu « je n'ai pas ce pressage » reçoit
+//! maintenant `albums.identification_tentee_le` (migration SQLite 116, PG 080),
+//! et la sélection range **d'abord les albums jamais tentés**, puis les tentés
+//! du plus ancien au plus récent. Un refus du service ne pose pas la marque :
+//! l'album n'a pas été jugé, il garde son rang. Aucun album n'est exclu : un
+//! album tenté reste candidat, il passe seulement derrière le neuf.
 
 //!
 //! # La passe « labels seulement » (#4836)
@@ -306,7 +314,40 @@ pub(super) fn sql_candidats_identification() -> &'static str {
          SELECT 1 FROM tracks t \
          WHERE t.album_id = al.id AND COALESCE(t.source, 'local') = 'local' \
        ) \
-     ORDER BY al.id"
+     ORDER BY CASE WHEN al.identification_tentee_le IS NULL THEN 0 ELSE 1 END, \
+       al.identification_tentee_le, al.id"
+}
+
+/// 🔴 #4991 (b) — l'album sort-il de ce tour marqué « déjà tenté, rien
+/// trouvé » ? Seulement si MusicBrainz a RÉPONDU sans pressage. Un refus
+/// (`503`, coupure, délai) ne dit rien de l'album : le marquer le ferait
+/// reculer en file pour une panne du service.
+pub(super) fn tente_sans_resultat(verdict: &str, refus_musicbrainz: bool) -> bool {
+    !refus_musicbrainz && verdict == "not_found"
+}
+
+/// Pose la marque de [`tente_sans_resultat`] quand elle s'applique. Un échec
+/// d'écriture est journalisé, jamais rendu : sans la marque, l'album garde son
+/// rang au prochain lancement, la passe en cours reste juste.
+pub(super) fn consigner_la_tentative(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    album_id: i64,
+    verdict: &str,
+    refus_musicbrainz: bool,
+) {
+    if !tente_sans_resultat(verdict, refus_musicbrainz) {
+        return;
+    }
+    // « Maintenant » écrit par le moteur, en ISO-8601 UTC sur les deux.
+    use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+    let maintenant = match backend.engine() {
+        Engine::Sqlite => SqliteDialect.now_iso8601(),
+        Engine::Postgres => PostgresDialect.now_iso8601(),
+    };
+    let sql = format!("UPDATE albums SET identification_tentee_le = {maintenant} WHERE id = ?");
+    if let Err(e) = backend.execute(&sql, &[&album_id as &dyn ToSqlValue]) {
+        warn!(album_id, error = %e, "identification_lot_marque_non_posee");
+    }
 }
 
 /// Le corps du refus Premium.
@@ -602,6 +643,14 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                         sans_correspondance += 1;
                     }
                 }
+                // #4991 (b) — un album que MusicBrainz n'a pas passe derrière
+                //    les albums jamais tentés au prochain lancement.
+                consigner_la_tentative(
+                    &state.backend,
+                    album_id,
+                    issue.verdict,
+                    issue.refus_musicbrainz,
+                );
                 // 🔴 #4991 — une SEULE expression décide, et elle est couverte
                 //    par ses témoins. Le compteur du disjoncteur ne se touche
                 //    nulle part ailleurs dans cette boucle.
@@ -1210,6 +1259,79 @@ mod tests {
     /// Le refus Premium nomme la route gratuite. Sans elle, le message dirait
     /// à l'utilisateur que l'identification est payante — l'inverse de la
     /// décision 4.
+    /// #4991 (b) — l'amas de douze introuvables puis un album trouvable, sur
+    /// une vraie base. Premier lancement : MusicBrainz répond « rien » pour
+    /// les douze, et la boucle consigne chacun par la MÊME fonction qu'elle
+    /// appelle. Relance : le trouvable (13) passe en tête, les douze déjà
+    /// tentés derrière lui, dans l'ordre de leur tentative.
+    fn base_amas() -> crate::state::AppState {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        for id in 1..=13i64 {
+            let titre = format!("Album {id}");
+            etat.backend
+                .execute(
+                    "INSERT INTO albums (id, title, source, musicbrainz_release_id) \
+                     VALUES (?, ?, 'local', NULL)",
+                    &[&id as &dyn ToSqlValue, &titre],
+                )
+                .unwrap();
+            let piste = id * 10;
+            etat.backend
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, source) VALUES (?, 'p', ?, 'local')",
+                    &[&piste as &dyn ToSqlValue, &id],
+                )
+                .unwrap();
+        }
+        etat
+    }
+
+    #[tokio::test]
+    async fn la_reprise_ne_reattaque_pas_l_amas_deja_tente() {
+        let etat = base_amas();
+        let premier = retenus(&etat);
+        assert_eq!(premier, (1..=13).collect::<Vec<i64>>());
+
+        // Premier lancement : la tête de file, douze `not_found` d'affilée.
+        for &album_id in &premier[..12] {
+            consigner_la_tentative(&etat.backend, album_id, "not_found", false);
+        }
+
+        let reprise = retenus(&etat);
+        assert_eq!(
+            reprise.first(),
+            Some(&13),
+            "le seul album jamais tenté doit passer en tête : sans la marque, la \
+             reprise rejoue les douze introuvables avant lui (#4991). Reçu : {reprise:?}"
+        );
+        assert_eq!(
+            reprise.len(),
+            13,
+            "aucun album n'est exclu : un album tenté reste candidat, derrière le neuf"
+        );
+        assert_eq!(&reprise[1..], &premier[..12]);
+    }
+
+    #[tokio::test]
+    async fn un_refus_ne_fait_pas_reculer_l_album() {
+        let etat = base_amas();
+        // MusicBrainz a refusé (503) : l'album n'a pas été jugé.
+        consigner_la_tentative(&etat.backend, 1, "not_found", true);
+        // Album identifié ou sans piste : rien à marquer.
+        consigner_la_tentative(&etat.backend, 2, "reidentified", false);
+        consigner_la_tentative(&etat.backend, 3, "no_tracks", false);
+        assert_eq!(retenus(&etat), (1..=13).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn seule_une_reponse_sans_pressage_pose_la_marque() {
+        assert!(tente_sans_resultat("not_found", false));
+        assert!(!tente_sans_resultat("not_found", true));
+        assert!(!tente_sans_resultat("reidentified", false));
+        assert!(!tente_sans_resultat("unchanged", false));
+        assert!(!tente_sans_resultat("no_tracks", false));
+    }
+
     #[test]
     fn le_refus_premium_nomme_la_route_gratuite() {
         let corps = refus_premium();
