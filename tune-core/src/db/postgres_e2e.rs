@@ -2960,3 +2960,14 @@ async fn pg_5413_bibliotheque_ancienne_rattrapee_au_demarrage() {
     pool.close().await;
     crate::db::album_repo::tests::scenario_bibliotheque_ancienne_5413_apres(db);
 }
+
+/// Fil 1684 — la recherche de l'écran Bibliothèque (`GET /library/albums?q=`)
+/// sur le VRAI moteur : quatre marqueurs `$n` de plus dans la séquence de
+/// `lister_filtre`, avant LIMIT/OFFSET, `unaccent` et la sous-requête des
+/// pistes. Même scénario que le témoin SQLite.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_1684_recherche_de_la_bibliotheque() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::album_repo::tests::scenario_recherche_de_la_bibliotheque_1684(db);
+}
