@@ -82,6 +82,10 @@ async fn entree_audio_est_propose_s_installe_repond_et_se_desinstalle() {
     );
     assert_eq!(carte["premium"], false, "gratuit, comme cd — {carte}");
     assert_eq!(carte["url"], "/api/v1/ext/entree-audio", "{carte}");
+    assert_eq!(
+        carte["display_name"], "Entrée audio",
+        "la carte proposée porte un nom lisible, pas l'identifiant — {carte}"
+    );
     let (code, _) = appel(&app, "GET", "/api/v1/ext/entree-audio/etat").await;
     assert_eq!(
         code,
@@ -108,6 +112,10 @@ async fn entree_audio_est_propose_s_installe_repond_et_se_desinstalle() {
     let carte = fiche(&app).await.expect("un greffon qui tourne est listé");
     assert_eq!(carte["installed"], true, "{carte}");
     assert_eq!(carte["enabled"], true, "{carte}");
+    assert_eq!(
+        carte["display_name"], "Entrée audio",
+        "la carte d'un greffon qui tourne garde son nom lisible — {carte}"
+    );
     let (code, v) = appel(&app, "GET", "/api/v1/ext/entree-audio/etat").await;
     assert_eq!(code, StatusCode::OK, "{v}");
     assert_eq!(v["active"], false, "{v}");

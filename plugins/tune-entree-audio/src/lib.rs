@@ -94,6 +94,10 @@ impl TunePlugin for EntreeAudioPlugin {
     fn name(&self) -> &str {
         "entree-audio"
     }
+    /// L'identifiant ne se lit pas sur la carte des extensions (#5296).
+    fn display_name(&self) -> &str {
+        "Entrée audio"
+    }
     fn version(&self) -> &str {
         tune_core::version()
     }
