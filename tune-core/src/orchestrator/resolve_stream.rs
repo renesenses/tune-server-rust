@@ -927,7 +927,12 @@ impl PlaybackOrchestrator {
             .await
             {
                 Ok(Ok(source)) => {
-                    info!("streaming_http_range_decode_selected");
+                    // La taille annoncee par la sonde : un FLAC de quelques
+                    // octets dit que le CDN a menti des la sonde (#5553).
+                    info!(
+                        taille = source.taille_annoncee(),
+                        "streaming_http_range_decode_selected"
+                    );
                     Some(source)
                 }
                 Ok(Err(e)) => {
@@ -943,117 +948,149 @@ impl PlaybackOrchestrator {
             None
         };
 
-        // Le fichier telecharge appartient a cette tache : son garde le
-        // supprime sur succes, erreur et annulation. Un fichier DASH appartient
-        // au cache du service et ne doit jamais etre supprime ici.
-        let mut downloaded_file = None;
-        let tmp_file = if ranged_source.is_some() {
-            None
-        } else if is_dash_local {
-            let file_path = upstream_url
-                .strip_prefix("file://")
-                .unwrap_or(&upstream_url)
-                .to_string();
-            let file_size = std::fs::metadata(&file_path)
-                .ok()
-                .map(|m| m.len())
-                .unwrap_or(0);
-            info!(path = %file_path, file_size, "streaming_dash_file_already_on_disk");
-            Some(file_path)
-        } else {
-            let debut_telechargement = std::time::Instant::now();
-            match download::telecharger_pour_session(
-                &streamer_for_eof,
-                &session_id_for_eof,
-                &upstream_url,
-                &upstream_headers,
-                &codec,
-                // tmp-autorise: base seule : telecharger_pour_session y crée un fichier tempfile au nom aléatoire.
-                &std::env::temp_dir(),
-            )
-            .await
-            {
-                Ok(Some((file, octets))) => {
-                    let ms = debut_telechargement.elapsed().as_millis() as u64;
-                    info!(
-                        stream_id = %session_id_for_eof,
-                        octets,
-                        elapsed_ms = ms,
-                        debit_kio_s = (octets * 1000 / 1024).checked_div(ms).unwrap_or(0),
-                        "streaming_download_complete"
-                    );
-                    let path = file.path().to_string_lossy().into_owned();
-                    downloaded_file = Some(file);
-                    Some(path)
-                }
-                Ok(None) => {
-                    info!(
-                        stream_id = %session_id_for_eof,
-                        zone_id,
-                        "streaming_download_cancelled_session_removed"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        stream_id = %session_id_for_eof,
-                        error = %e,
-                        "streaming_transcode_download_failed"
-                    );
-                    // Aucun producteur ne suivra : ne pas garder une session
-                    // vide que le gapless pourrait adopter (#3287).
-                    abandonner_la_session_de_transcodage(
-                        &streamer_for_eof,
-                        &session_id_for_eof,
-                        None,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        };
-
         // Troisieme etape chronometree (#3568) : le decodage vers du
         // PCM en WAV. Il est progressif — la session recoit ses
         // premiers octets bien avant la fin — mais rien ne disait
         // jusqu'ici combien il coute ni ou il commence.
-        let debut_transcodage = std::time::Instant::now();
-        let tx_for_decode = tx.clone();
-        // Drop the original sender so the channel closes when decode finishes.
-        drop(tx);
-        let decode_result = if let Some(source) = ranged_source {
-            tokio::task::spawn_blocking(move || {
+        //
+        // L'emetteur d'origine reste ici jusqu'a la fin du decodage : le
+        // chemin Range peut echouer AVANT son premier octet et laisser la
+        // place au telechargement complet, qui doit alors encore pouvoir
+        // ecrire dans la session (#5553). Il est lache des que le decodeur
+        // retenu a rendu la main, pour que le canal se ferme avec lui.
+        let mut debut_transcodage = std::time::Instant::now();
+        let mut decode_result = None;
+        if let Some(source) = ranged_source {
+            let tx_range = tx.clone();
+            let codec_range = codec.clone();
+            let ready_range = data_ready.clone();
+            let levels_range = levels_tx.clone();
+            let resultat = tokio::task::spawn_blocking(move || {
                 crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
                     source,
-                    &codec,
+                    &codec_range,
                     Some(sr),
                     Some(2),
                     Some(bd),
-                    tx_for_decode,
+                    tx_range,
                     32768,
-                    data_ready,
-                    levels_tx,
+                    ready_range,
+                    levels_range,
                     seek_s,
                 )
             })
-            .await
-        } else {
-            let tmp_file_clone = tmp_file.as_ref().unwrap().clone();
-            tokio::task::spawn_blocking(move || {
-                crate::audio::decode::decode_to_pcm_streaming_seeked(
-                    &tmp_file_clone,
-                    Some(sr),
-                    Some(2),
-                    Some(bd),
-                    tx_for_decode,
-                    32768,
-                    data_ready,
-                    levels_tx,
-                    seek_s,
-                )
-            })
-            .await
+            .await;
+            match resultat {
+                // #5553 : la sonde Range a reussi, mais le flux s'est tari
+                // avant qu'un format soit reconnu (« probe reached EOF at 1
+                // bytes »). Aucun octet WAV n'a rejoint la session : le
+                // repli historique par telechargement complet reste propre,
+                // et c'est lui que la piste aurait pris si la sonde avait
+                // echoue.
+                Ok(Err(e)) if crate::audio::decode::echec_avant_le_premier_octet(&e) => {
+                    warn!(
+                        stream_id = %session_id_for_eof,
+                        error = %e,
+                        "streaming_http_range_decode_failed_falling_back_to_download"
+                    );
+                }
+                autre => decode_result = Some(autre),
+            }
+        }
+
+        // Le fichier telecharge appartient a cette tache : son garde le
+        // supprime sur succes, erreur et annulation. Un fichier DASH appartient
+        // au cache du service et ne doit jamais etre supprime ici.
+        let mut downloaded_file = None;
+        let decode_result = match decode_result {
+            Some(resultat) => resultat,
+            None => {
+                let tmp_file = if is_dash_local {
+                    let file_path = upstream_url
+                        .strip_prefix("file://")
+                        .unwrap_or(&upstream_url)
+                        .to_string();
+                    let file_size = std::fs::metadata(&file_path)
+                        .ok()
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    info!(path = %file_path, file_size, "streaming_dash_file_already_on_disk");
+                    file_path
+                } else {
+                    let debut_telechargement = std::time::Instant::now();
+                    match download::telecharger_pour_session(
+                        &streamer_for_eof,
+                        &session_id_for_eof,
+                        &upstream_url,
+                        &upstream_headers,
+                        &codec,
+                        // tmp-autorise: base seule : telecharger_pour_session y crée un fichier tempfile au nom aléatoire.
+                        &std::env::temp_dir(),
+                    )
+                    .await
+                    {
+                        Ok(Some((file, octets))) => {
+                            let ms = debut_telechargement.elapsed().as_millis() as u64;
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                octets,
+                                elapsed_ms = ms,
+                                debit_kio_s = (octets * 1000 / 1024).checked_div(ms).unwrap_or(0),
+                                "streaming_download_complete"
+                            );
+                            let path = file.path().to_string_lossy().into_owned();
+                            downloaded_file = Some(file);
+                            path
+                        }
+                        Ok(None) => {
+                            info!(
+                                stream_id = %session_id_for_eof,
+                                zone_id,
+                                "streaming_download_cancelled_session_removed"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(
+                                stream_id = %session_id_for_eof,
+                                error = %e,
+                                "streaming_transcode_download_failed"
+                            );
+                            // Aucun producteur ne suivra : ne pas garder une session
+                            // vide que le gapless pourrait adopter (#3287).
+                            abandonner_la_session_de_transcodage(
+                                &streamer_for_eof,
+                                &session_id_for_eof,
+                                None,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                };
+                debut_transcodage = std::time::Instant::now();
+                let tx_for_decode = tx.clone();
+                let levels_for_decode = levels_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm_streaming_seeked(
+                        &tmp_file,
+                        Some(sr),
+                        Some(2),
+                        Some(bd),
+                        tx_for_decode,
+                        32768,
+                        data_ready,
+                        levels_for_decode,
+                        seek_s,
+                    )
+                })
+                .await
+            }
         };
+        // Le decodeur retenu a rendu la main : plus aucun emetteur ne doit
+        // garder le canal (ni celui des niveaux) ouvert.
+        drop(tx);
+        drop(levels_tx);
 
         // Le decodeur a rendu son fichier. Le garde ne possede que les
         // telechargements HTTP ; les fichiers DASH du cache restent intacts.

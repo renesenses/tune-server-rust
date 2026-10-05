@@ -61,7 +61,12 @@ impl HttpRangeSource {
             .header(ACCEPT_ENCODING, "identity")
             .header(RANGE, "bytes=0-0")
             .send()
-            .map_err(|e| format!("http range probe: {}", describe_http_error(&e)))?;
+            .map_err(|e| {
+                format!(
+                    "http range probe: {}",
+                    crate::http::client::decrire_erreur_http(&e)
+                )
+            })?;
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(format!(
                 "http range unsupported: probe returned {}",
@@ -94,6 +99,12 @@ impl HttpRangeSource {
         })
     }
 
+    /// Taille totale annoncee par la sonde (`Content-Range: bytes 0-0/<taille>`),
+    /// pour le journal du chemin Range (#5553).
+    pub fn taille_annoncee(&self) -> u64 {
+        self.len
+    }
+
     fn open_at_current_position(&mut self) -> io::Result<()> {
         if self.pos >= self.len {
             self.response = None;
@@ -104,7 +115,7 @@ impl HttpRangeSource {
             .header(ACCEPT_ENCODING, "identity")
             .header(RANGE, range)
             .send()
-            .map_err(|e| io::Error::other(describe_http_error(&e)))?;
+            .map_err(|e| io::Error::other(crate::http::client::decrire_erreur_http(&e)))?;
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(io::Error::other(format!(
                 "range resume at {} returned {}",
@@ -126,22 +137,6 @@ impl HttpRangeSource {
         }
         self.response = Some(response);
         Ok(())
-    }
-}
-
-/// Ne jamais recopier l'URL signee du CDN depuis `reqwest::Error` dans les
-/// journaux. Elle porte des parametres d'autorisation et doit rester secrete.
-fn describe_http_error(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connection failed"
-    } else if error.is_body() {
-        "response body failed"
-    } else if error.is_decode() {
-        "response decode failed"
-    } else {
-        "request failed"
     }
 }
 
