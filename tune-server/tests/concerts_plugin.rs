@@ -889,17 +889,26 @@ fn au_dela_de_200_artistes_le_decoupage_les_emmene_tous() {
 // bibliothèque de la même taille et lisent la VRAIE constante `PLAFOND`.
 // ---------------------------------------------------------------------------
 
-/// 12 000 artistes de remplissage, tous classés avant « G » par l'alphabet,
-/// puis les artistes que l'utilisateur écoute vraiment, de G à Z.
-fn bibliotheque_de_tades() -> AppState {
-    let state = new_state();
+/// `n` artistes de remplissage, tous classés avant « G » par l'alphabet
+/// (« Artiste 00000 », « Artiste 00001 »…).
+fn remplir_d_artistes(state: &AppState, n: usize) {
     state
         .backend
-        .execute_batch(
-            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 11999) \
+        .execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < {}) \
              INSERT INTO artists (name) SELECT printf('Artiste %05d', i) FROM n;",
-        )
-        .expect("12 000 artistes de remplissage");
+            n - 1
+        ))
+        .expect("artistes de remplissage");
+}
+
+/// Plus d'artistes de remplissage que le plafond n'en garde (`PLAFOND` +
+/// 2 000), tous classés avant « G » par l'alphabet, puis les artistes que
+/// l'utilisateur écoute vraiment, de G à Z. Le remplissage suit la VRAIE
+/// constante : relever le plafond ne fait pas passer la bibliothèque dessous.
+fn bibliotheque_de_tades() -> AppState {
+    let state = new_state();
+    remplir_d_artistes(&state, tune_concerts::PLAFOND + 2_000);
     for nom in ECOUTES_G_A_Z.iter().map(|(n, _)| n).chain([
         &"Yann Tiersen",
         &"Hubert-Felix Thiefaine",
@@ -971,9 +980,27 @@ const ECOUTES_G_A_Z: &[(&str, usize)] = &[
     ("Zaz", 9),
 ];
 
-/// ⭐ #5523 : les artistes écoutés de G à Z sont abonnés, malgré 12 000 noms
-/// qui les précèdent dans l'alphabet. Rouge avec l'ancien `ORDER BY name` :
-/// aucun d'eux n'entrait dans les `PLAFOND` premières places.
+/// ⭐ Le plafond relevé : une bibliothèque de la taille de celle de Tades
+/// (12 443 artistes, #5523) est abonnée EN ENTIER. Rouge avec l'ancien
+/// plafond de 5 000 : 7 443 artistes restaient sans concerts.
+#[test]
+fn une_bibliotheque_de_12_443_artistes_est_abonnee_en_entier() {
+    let state = new_state();
+    remplir_d_artistes(&state, 12_443);
+
+    let gardes = tune_concerts::artistes_de_la_bibliotheque(&state.backend).unwrap();
+
+    assert_eq!(
+        gardes.len(),
+        12_443,
+        "les 12 443 artistes de Tades doivent tous etre abonnes (plafond : {})",
+        tune_concerts::PLAFOND
+    );
+}
+
+/// ⭐ #5523 : les artistes écoutés de G à Z sont abonnés, malgré plus de
+/// `PLAFOND` noms qui les précèdent dans l'alphabet. Rouge avec l'ancien
+/// `ORDER BY name` : aucun d'eux n'entrait dans les `PLAFOND` premières places.
 #[test]
 fn au_dela_du_plafond_les_artistes_ecoutes_de_g_a_z_sont_gardes() {
     let state = bibliotheque_de_tades();
@@ -988,7 +1015,7 @@ fn au_dela_du_plafond_les_artistes_ecoutes_de_g_a_z_sont_gardes() {
     for (nom, _) in ECOUTES_G_A_Z {
         assert!(
             gardes.iter().any(|g| g == nom),
-            "{nom} est ecoute : il doit etre abonne, meme apres 12 000 noms en A"
+            "{nom} est ecoute : il doit etre abonne, meme apres plus de PLAFOND noms en A"
         );
     }
     assert!(
