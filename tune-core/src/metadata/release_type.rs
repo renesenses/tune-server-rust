@@ -29,14 +29,17 @@
 //! albums. La règle est donc :
 //!
 //! 1. **Le type explicite gagne toujours** : `albums.release_type`, écrit par
-//!    MusicBrainz, par le service, ou à la main (édition de l'album). Il n'est
-//!    jamais réécrit ni contredit.
+//!    la balise du fichier au scan ([`depuis_valeurs_de_tag`] : `RELEASETYPE`
+//!    et ses variantes, quand la colonne est vide), par MusicBrainz, par le
+//!    service, ou à la main (édition de l'album). Il n'est jamais contredit.
 //! 2. **À défaut**, [`type_deduit`] range le disque d'après ses PISTES :
 //!    * single : de 1 à [`SINGLE_PISTES_MAX`] pistes et moins de
 //!      [`SINGLE_DUREE_MAX_MS`] au total ;
 //!    * EP : de [`EP_PISTES_MIN`] à [`EP_PISTES_MAX`] pistes et moins de
 //!      [`EP_DUREE_MAX_MS`] au total ;
-//!    * album sinon.
+//!    * album sinon ;
+//!    * et jamais single ni EP si une piste dure plus de [`PISTE_LONGUE_MS`]
+//!      (10 min).
 //! 3. **Compilations exclues** : un disque `is_compilation` n'est jamais
 //!    déduit. Les albums live ne portent aucun drapeau dans Tune : un live
 //!    typé par MusicBrainz reste un `album` (règle 1) ; un live sans type
@@ -141,6 +144,65 @@ pub fn depuis_service(brut: &str) -> Option<TypeDeSortie> {
     TypeDeSortie::depuis_mot(brut)
 }
 
+/// Ce que dit la balise de type d'un fichier (#5616, décision du 05/10/2026).
+///
+/// Picard écrit le type MusicBrainz du groupe de sortie dans les fichiers :
+/// `RELEASETYPE` (Vorbis), `TXXX:MusicBrainz Album Type` (ID3v2),
+/// `----:com.apple.iTunes:MusicBrainz Album Type` (MP4), `MUSICBRAINZ_ALBUMTYPE`
+/// (APE). Lofty les rassemble sous `ItemKey::MusicBrainzReleaseType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeDuTag {
+    /// Le type primaire, celui qui va dans `albums.release_type`.
+    pub primaire: TypeDeSortie,
+    /// La balise dit `live` (type secondaire MusicBrainz).
+    pub live: bool,
+    /// La balise dit `compilation` (type secondaire MusicBrainz).
+    pub compilation: bool,
+}
+
+/// Lit les valeurs d'une balise de type de sortie.
+///
+/// Les valeurs peuvent venir en plusieurs champs (Vorbis : `RELEASETYPE=album`
+/// puis `RELEASETYPE=live`) ou en un seul, séparées par `;`, `/`, `,` ou le
+/// séparateur nul d'ID3v2.4 (`album; live`). La casse ne compte pas.
+///
+/// * Le premier mot PRIMAIRE (`album`, `ep`, `single`, `broadcast`, `other`)
+///   est le type.
+/// * `live` et `compilation` sont des types SECONDAIRES : ils ne changent pas
+///   le primaire (`album;live` reste un album, comme chez MusicBrainz). Seuls,
+///   sans primaire, ils désignent un album.
+/// * Tout autre mot est ignoré. Rien de reconnu : `None`, le type reste
+///   inconnu.
+pub fn depuis_valeurs_de_tag<'a>(valeurs: impl IntoIterator<Item = &'a str>) -> Option<TypeDuTag> {
+    let mut primaire = None;
+    let mut live = false;
+    let mut compilation = false;
+    for valeur in valeurs {
+        for mot in valeur.split([';', '/', ',', '\0']) {
+            let mot = mot.trim().to_lowercase();
+            match mot.as_str() {
+                "live" => live = true,
+                "compilation" => compilation = true,
+                _ => {
+                    if primaire.is_none() {
+                        primaire = TypeDeSortie::depuis_mot(&mot);
+                    }
+                }
+            }
+        }
+    }
+    let primaire = match primaire {
+        Some(p) => p,
+        None if live || compilation => TypeDeSortie::Album,
+        None => return None,
+    };
+    Some(TypeDuTag {
+        primaire,
+        live,
+        compilation,
+    })
+}
+
 /// Remplit `albums.release_type` depuis MusicBrainz, pour les disques dont le
 /// groupe de sortie est connu.
 ///
@@ -231,6 +293,9 @@ pub const EP_PISTES_MIN: u32 = 4;
 pub const EP_PISTES_MAX: u32 = 6;
 /// … et moins de 30 minutes au total.
 pub const EP_DUREE_MAX_MS: u64 = 30 * 60 * 1000;
+/// Une piste de PLUS de 10 minutes interdit single et EP : le disque est un
+/// album (exception du 05/10/2026, d'après la règle de FabienM, fil 2096).
+pub const PISTE_LONGUE_MS: u64 = 10 * 60 * 1000;
 
 /// Ce que la règle de repli sait des pistes d'un disque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -241,6 +306,8 @@ pub struct PistesDuDisque {
     pub duree_totale_ms: u64,
     /// Nombre de pistes dont la durée est inconnue (nulle ou absente).
     pub durees_inconnues: u32,
+    /// Durée de la piste la plus longue, en millisecondes.
+    pub piste_la_plus_longue_ms: u64,
 }
 
 /// La règle de repli seule : single, EP ou album, d'après les pistes.
@@ -250,6 +317,12 @@ pub struct PistesDuDisque {
 pub fn deduire_depuis_pistes(p: PistesDuDisque) -> Option<TypeDeSortie> {
     if p.nombre == 0 || p.durees_inconnues > 0 {
         return None;
+    }
+    // Exception des pistes longues (Bertrand, 05/10/2026) : un disque qui
+    // porte au moins une piste de plus de 10 minutes n'est jamais un single
+    // ni un EP.
+    if p.piste_la_plus_longue_ms > PISTE_LONGUE_MS {
+        return Some(TypeDeSortie::Album);
     }
     if p.nombre <= SINGLE_PISTES_MAX && p.duree_totale_ms < SINGLE_DUREE_MAX_MS {
         return Some(TypeDeSortie::Single);
@@ -396,10 +469,16 @@ mod tests {
     const MIN: u64 = 60 * 1000;
 
     fn pistes(nombre: u32, minutes: u64) -> Option<PistesDuDisque> {
+        // Pistes de durée égale : la plus longue vaut la moyenne.
         Some(PistesDuDisque {
             nombre,
             duree_totale_ms: minutes * MIN,
             durees_inconnues: 0,
+            piste_la_plus_longue_ms: if nombre == 0 {
+                0
+            } else {
+                minutes * MIN / nombre as u64
+            },
         })
     }
 
@@ -445,6 +524,7 @@ mod tests {
             nombre: 3,
             duree_totale_ms: SINGLE_DUREE_MAX_MS,
             durees_inconnues: 0,
+            piste_la_plus_longue_ms: 0,
         };
         assert_eq!(deduire_depuis_pistes(quinze), Some(TypeDeSortie::Album));
         let juste_sous = PistesDuDisque {
@@ -476,6 +556,7 @@ mod tests {
             nombre: 6,
             duree_totale_ms: EP_DUREE_MAX_MS,
             durees_inconnues: 0,
+            piste_la_plus_longue_ms: 0,
         };
         assert_eq!(deduire_depuis_pistes(trente), Some(TypeDeSortie::Album));
         let juste_sous = PistesDuDisque {
@@ -511,6 +592,7 @@ mod tests {
             nombre: 2,
             duree_totale_ms: 4 * MIN,
             durees_inconnues: 1,
+            piste_la_plus_longue_ms: 4 * MIN,
         };
         assert_eq!(deduire_depuis_pistes(trou), None);
         assert_eq!(type_deduit(None, false, None), None);
@@ -529,5 +611,82 @@ mod tests {
         assert_eq!(SINGLE_DUREE_MAX_MS, 900_000);
         assert_eq!((EP_PISTES_MIN, EP_PISTES_MAX), (4, 6));
         assert_eq!(EP_DUREE_MAX_MS, 1_800_000);
+    }
+    #[test]
+    fn une_piste_de_plus_de_dix_minutes_interdit_single_et_ep() {
+        let p = |nombre, total_min: u64, longue_ms: u64| PistesDuDisque {
+            nombre,
+            duree_totale_ms: total_min * MIN,
+            durees_inconnues: 0,
+            piste_la_plus_longue_ms: longue_ms,
+        };
+        // 1 piste de 12 min (< 15 min au total) : album, pas single.
+        assert_eq!(
+            deduire_depuis_pistes(p(1, 12, 12 * MIN)),
+            Some(TypeDeSortie::Album)
+        );
+        // 4 pistes, 25 min, dont une de 11 min : album, pas EP.
+        assert_eq!(
+            deduire_depuis_pistes(p(4, 25, 11 * MIN)),
+            Some(TypeDeSortie::Album)
+        );
+        // 10 min pile : la borne est stricte, la règle ordinaire s'applique.
+        assert_eq!(
+            deduire_depuis_pistes(p(1, 10, PISTE_LONGUE_MS)),
+            Some(TypeDeSortie::Single)
+        );
+        assert_eq!(
+            deduire_depuis_pistes(p(4, 25, PISTE_LONGUE_MS)),
+            Some(TypeDeSortie::Ep)
+        );
+        assert_eq!(PISTE_LONGUE_MS, 600_000);
+    }
+
+    #[test]
+    fn la_balise_de_type_se_lit_sous_toutes_ses_formes() {
+        let t = |v: &[&str]| depuis_valeurs_de_tag(v.iter().copied());
+        let simple = |p| {
+            Some(TypeDuTag {
+                primaire: p,
+                live: false,
+                compilation: false,
+            })
+        };
+        assert_eq!(t(&["album"]), simple(TypeDeSortie::Album));
+        assert_eq!(t(&["EP"]), simple(TypeDeSortie::Ep));
+        assert_eq!(t(&["Single"]), simple(TypeDeSortie::Single));
+        // Combinaisons en un champ (Picard, ID3v2.3) ou en plusieurs (Vorbis).
+        let live = Some(TypeDuTag {
+            primaire: TypeDeSortie::Album,
+            live: true,
+            compilation: false,
+        });
+        assert_eq!(t(&["album; live"]), live);
+        assert_eq!(t(&["album/live"]), live);
+        assert_eq!(t(&["album\0live"]), live);
+        assert_eq!(t(&["album", "live"]), live);
+        assert_eq!(t(&["live"]), live, "un live seul est un album live");
+        assert_eq!(
+            t(&["ep;live"]),
+            Some(TypeDuTag {
+                primaire: TypeDeSortie::Ep,
+                live: true,
+                compilation: false,
+            })
+        );
+        assert_eq!(
+            t(&["compilation"]),
+            Some(TypeDuTag {
+                primaire: TypeDeSortie::Album,
+                live: false,
+                compilation: true,
+            })
+        );
+        // Mot inconnu seul : rien.
+        assert_eq!(t(&["soundtrack"]), None);
+        assert_eq!(t(&[""]), None);
+        assert_eq!(t(&[]), None);
+        // Le premier primaire gagne ; un mot inconnu ne gêne pas.
+        assert_eq!(t(&["remix; single"]), simple(TypeDeSortie::Single));
     }
 }

@@ -51,13 +51,14 @@ const MIN: i64 = 60_000;
 /// | 6  | Compil courte    | —              | OUI     | 2 × 4 min          |
 /// | 7  | Durée inconnue   | —              | non     | 4 min + inconnue   |
 /// | 8  | Trois longs      | —              | non     | 3 × 5 min (15 pile)|
+/// | 9  | Une piste longue | —              | non     | 11 min + 2 min     |
 fn bibliotheque() -> axum::Router {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     exec(
         &state,
         "INSERT INTO artists (id, name) VALUES (1, 'Fabien M')",
     );
-    let albums: [(i64, &str, Option<&str>, i64, &[i64]); 8] = [
+    let albums: [(i64, &str, Option<&str>, i64, &[i64]); 9] = [
         (1, "Deux titres", None, 0, &[4 * MIN, 4 * MIN]),
         (2, "Cinq titres", None, 0, &[4 * MIN; 5]),
         (3, "Dix titres", None, 0, &[4 * MIN; 10]),
@@ -66,6 +67,8 @@ fn bibliotheque() -> axum::Router {
         (6, "Compil courte", None, 1, &[4 * MIN, 4 * MIN]),
         (7, "Duree inconnue", None, 0, &[4 * MIN, 0]),
         (8, "Trois longs", None, 0, &[5 * MIN; 3]),
+        // Exception du 05/10 : une piste de plus de 10 min interdit le single.
+        (9, "Une piste longue", None, 0, &[11 * MIN, 2 * MIN]),
     ];
     let mut piste = 0;
     for (id, titre, rt, compil, durees) in albums {
@@ -119,7 +122,7 @@ async fn verifier(path: &str) {
     let app = bibliotheque();
     let (status, body) = get(&app, path).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let attendu: [(&str, Option<&str>); 8] = [
+    let attendu: [(&str, Option<&str>); 9] = [
         ("Deux titres", Some("single")),
         ("Cinq titres", Some("ep")),
         ("Dix titres", Some("album")),
@@ -128,6 +131,7 @@ async fn verifier(path: &str) {
         ("Compil courte", None),
         ("Duree inconnue", None),
         ("Trois longs", Some("album")),
+        ("Une piste longue", Some("album")),
     ];
     for (titre, t) in attendu {
         assert_eq!(

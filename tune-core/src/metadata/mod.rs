@@ -112,6 +112,13 @@ pub struct TrackMetadata {
     pub musicbrainz_artist_id: Option<String>,
     pub musicbrainz_album_artist_id: Option<String>,
     pub musicbrainz_release_group_id: Option<String>,
+    /// #5616 — le type de sortie PRIMAIRE lu dans la balise du fichier
+    /// (`RELEASETYPE`, `TXXX:MusicBrainz Album Type`, `----:com.apple.iTunes:
+    /// MusicBrainz Album Type`, `MUSICBRAINZ_ALBUMTYPE`), dans le vocabulaire
+    /// de `albums.release_type`. Voir
+    /// [`crate::metadata::release_type::depuis_valeurs_de_tag`].
+    #[serde(default)]
+    pub release_type: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
     /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
@@ -2021,6 +2028,12 @@ fn dsf_dff_fallback_complete(
     } else {
         (None, None, None, None, None, None)
     };
+    // #5616 — `TXXX:MusicBrainz Album Type` (Picard), même vocabulaire.
+    let mb_release_type = id3_tags
+        .as_ref()
+        .and_then(|tags| tags.get_txxx("MusicBrainz Album Type"))
+        .and_then(|v| release_type::depuis_valeurs_de_tag([v]))
+        .map(|t| t.primaire.as_str().to_string());
 
     Some(TrackMetadata {
         title,
@@ -2058,6 +2071,7 @@ fn dsf_dff_fallback_complete(
         musicbrainz_artist_id: mb_artist_id,
         musicbrainz_album_artist_id: mb_album_artist_id,
         musicbrainz_release_group_id: mb_release_group_id,
+        release_type: mb_release_type,
         isrc,
         has_cover,
         cover_art: None,
@@ -2133,6 +2147,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2276,6 +2291,15 @@ pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u3
         Some(d) => Some(d),
         None => tag,
     }
+}
+
+/// #5616 — le type de sortie que porte un tag lofty, toutes valeurs lues
+/// (Vorbis en porte une par champ, ID3v2.4 les sépare par un nul).
+fn type_de_sortie_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
+    release_type::depuis_valeurs_de_tag(
+        tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
+    )
+    .map(|t| t.primaire.as_str().to_string())
 }
 
 /// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
@@ -2546,6 +2570,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2652,6 +2677,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2726,6 +2752,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -3524,6 +3551,8 @@ mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
 mod label_tests_4836;
+#[cfg(test)]
+mod type_de_sortie_tests_5616;
 
 /// Les balises d'un fichier, lues par lofty sans charger les images.
 ///
@@ -3870,6 +3899,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: get(ItemKey::MusicBrainzArtistId),
         musicbrainz_album_artist_id: get(ItemKey::MusicBrainzReleaseArtistId),
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
+        release_type: type_de_sortie_de_la_balise(tag),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         // Capture the embedded cover from this same lofty pass so the scanner

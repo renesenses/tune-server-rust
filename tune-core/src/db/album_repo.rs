@@ -662,6 +662,18 @@ pub mod sql {
         "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.release_type IS NULL OR a.release_type = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
     }
 
+    /// #5616 — le type lu dans la balise du fichier, posé SEULEMENT si la
+    /// colonne est vide : un type déjà connu (MusicBrainz, service, édition
+    /// manuelle, ou une balise lue avant) n'est jamais écrasé par un scan.
+    pub fn set_release_type_if_empty<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_type = {} WHERE id = {} \
+             AND (release_type IS NULL OR release_type = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// Écrit le type de sortie d'un album (#4767).
     ///
     /// Paramètre lié et non littéral, contrairement à [`set_compilation`] : la
@@ -2931,6 +2943,21 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #5616 — pose le type lu dans la balise d'un fichier, seulement si
+    /// l'album n'en a pas encore. Rend `true` quand la ligne a changé.
+    pub fn poser_type_de_sortie_si_vide(
+        &self,
+        album_id: i64,
+        type_de_sortie: &str,
+    ) -> Result<bool, TuneError> {
+        let sql = self.dialect_sql(
+            sql::set_release_type_if_empty,
+            sql::set_release_type_if_empty,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_recent, sql::list_recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -3105,13 +3132,14 @@ impl AlbumRepo {
             let sql = format!(
                 "SELECT t.album_id, COUNT(*), \
                         CAST(COALESCE(SUM(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT), \
-                        CAST(SUM(CASE WHEN COALESCE({DUREE_MS}, 0) > 0 THEN 0 ELSE 1 END) AS BIGINT) \
+                        CAST(SUM(CASE WHEN COALESCE({DUREE_MS}, 0) > 0 THEN 0 ELSE 1 END) AS BIGINT), \
+                        CAST(COALESCE(MAX(CASE WHEN {DUREE_MS} > 0 THEN {DUREE_MS} ELSE 0 END), 0) AS BIGINT) \
                  FROM tracks t WHERE t.album_id IN ({id_list}) GROUP BY t.album_id"
             );
             for row in &self.db.query_many(&sql, &[])? {
                 let entier = |i: usize| row.get(i).and_then(|v| v.as_i64());
-                if let (Some(id), Some(n), Some(ms), Some(inconnues)) =
-                    (entier(0), entier(1), entier(2), entier(3))
+                if let (Some(id), Some(n), Some(ms), Some(inconnues), Some(max_ms)) =
+                    (entier(0), entier(1), entier(2), entier(3), entier(4))
                 {
                     par_id.insert(
                         id,
@@ -3119,6 +3147,7 @@ impl AlbumRepo {
                             nombre: u32::try_from(n).unwrap_or(u32::MAX),
                             duree_totale_ms: u64::try_from(ms).unwrap_or(0),
                             durees_inconnues: u32::try_from(inconnues).unwrap_or(u32::MAX),
+                            piste_la_plus_longue_ms: u64::try_from(max_ms).unwrap_or(0),
                         },
                     );
                 }
