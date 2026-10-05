@@ -25,6 +25,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // première frontière au lieu de travailler. Un test de câblage garde la
     // ligne (`reprise_des_passes`).
     crate::reprise_des_passes::spawn(state);
+    // Fil 2137 : une gravure DR tuée par l'arrêt précédent a laissé
+    // `running` en base ; on la dit `interrupted` pour débloquer le bouton.
+    crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
     spawn_squeezebox_poller(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);

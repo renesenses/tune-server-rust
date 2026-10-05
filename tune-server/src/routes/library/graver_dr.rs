@@ -143,17 +143,78 @@ fn ecrire_statut(state_backend: &std::sync::Arc<dyn tune_core::db::backend::DbBa
         .ok();
 }
 
+/// État « la passe est morte avant d'avoir fini » (fil 2137, ticket 229).
+///
+/// Le réglage [`REGLAGE_STATUT`] est réécrit tous les [`JALON_AVANCEMENT`]
+/// pistes avec `status = running`. Une passe tuée en route (redémarrage,
+/// `kill`, panne) laisse donc derrière elle un `running` que plus personne ne
+/// viendra changer. Le renvoyer tel quel grisait le bouton « Graver » à vie,
+/// redémarrage compris. Les compteurs (`total`, `written`, `already`,
+/// `skipped`, `errors`) sont gardés : ce sont ceux du dernier jalon écrit.
+const ETAT_INTERROMPU: &str = "interrupted";
+
+/// Le dernier état enregistré, corrigé par le registre de CE processus.
+///
+/// * tâche au registre → `running`, quoi que dise la base ;
+/// * `running` en base sans tâche au registre → `interrupted`.
+///
+/// La relecture évite un faux « interrompu » à la fin normale d'une passe :
+/// celle-ci écrit `done` AVANT de lâcher sa garde de registre. Si la tâche a
+/// disparu entre la première lecture et le contrôle, la seconde lecture voit
+/// donc déjà `done`.
+fn statut_courant(state: &AppState) -> Value {
+    let mut v = lire_statut(state);
+    if en_cours(state) {
+        v["status"] = json!("running");
+        return v;
+    }
+    if v["status"] == "running" {
+        v = lire_statut(state);
+        if en_cours(state) {
+            v["status"] = json!("running");
+        } else if v["status"] == "running" {
+            v["status"] = json!(ETAT_INTERROMPU);
+        }
+    }
+    v
+}
+
+/// Au démarrage, aucune passe ne tourne encore dans ce processus : un
+/// `running` en base est forcément l'héritage d'un processus mort. On le
+/// réécrit `interrupted`, compteurs gardés, pour que la base dise la même
+/// chose que `GET /library/dr/gravure`. Appelé par
+/// `background::spawn_background_tasks`, avant que les routes ne servent.
+pub(crate) fn marquer_passe_interrompue_au_demarrage(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) {
+    let repo = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    let Some(mut v) = repo
+        .get(REGLAGE_STATUT)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return;
+    };
+    if v["status"] != "running" {
+        return;
+    }
+    v["status"] = json!(ETAT_INTERROMPU);
+    ecrire_statut(backend, &v);
+    info!(etat = %v, "graver_dr_passe_interrompue");
+}
+
 /// GET /library/dr/gravure
 ///
 /// L'inventaire du moment ET le dernier état de la passe, en une réponse :
 /// l'écran a besoin des deux pour dire « 1 234 à graver » avant, et
 /// « 1 234 gravées, 3 déjà présentes, 0 erreur » après.
+///
+/// `status` vaut `idle`, `running`, `done` ou `interrupted` (voir
+/// [`ETAT_INTERROMPU`]).
 pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
     let (inv, _) = inventaire(&state);
-    let mut v = lire_statut(&state);
-    if en_cours(&state) {
-        v["status"] = json!("running");
-    }
+    let mut v = statut_courant(&state);
     v["a_graver"] = json!(inv.a_graver);
     v["hors_format"] = json!(inv.hors_format);
     v["dans_les_fichiers"] = json!(deja_dans_les_fichiers(&state));
@@ -405,6 +466,77 @@ mod tests {
         // Plus rien à graver pour la piste 1 ; la 2 reste (introuvable ≠ gravée).
         let (inv, _) = inventaire(&s);
         assert_eq!(inv.a_graver, 1);
+    }
+}
+
+/// Fil 2137 / ticket 229 : une passe morte en route ne doit pas griser le
+/// bouton à vie.
+#[cfg(test)]
+mod tests_passe_interrompue_2137 {
+    use super::*;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// La photo qu'une passe tuée laisse en base : le jalon des 50 pistes.
+    fn photo_d_une_passe_morte(s: &AppState) {
+        ecrire_statut(
+            &s.backend,
+            &json!({"status": "running", "total": 4046, "written": 40,
+                    "already": 10, "skipped": 0, "errors": 0}),
+        );
+    }
+
+    #[tokio::test]
+    async fn running_sans_tache_au_registre_est_rendu_interrupted() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        assert!(!en_cours(&s));
+        let Json(v) = statut(State(s.clone())).await;
+        assert_eq!(v["status"], "interrupted", "{v}");
+        // Le dernier compteur est gardé, pour « interrompue à 50 / 4 046 ».
+        assert_eq!(v["total"], 4046, "{v}");
+        assert_eq!(v["written"], 40, "{v}");
+        assert_eq!(v["already"], 10, "{v}");
+        // Et la relance n'est pas refusée.
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+    }
+
+    /// L'AUTRE sens : une passe vivante reste `running`.
+    #[tokio::test]
+    async fn running_avec_tache_au_registre_reste_running() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        let _garde = s
+            .background_tasks
+            .begin(TACHE_GRAVER_DR, "Gravure", "maintenance");
+        let Json(v) = statut(State(s.clone())).await;
+        assert_eq!(v["status"], "running", "{v}");
+    }
+
+    #[test]
+    fn le_demarrage_reecrit_running_en_interrupted_compteurs_gardes() {
+        let s = etat();
+        photo_d_une_passe_morte(&s);
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        let v = lire_statut(&s);
+        assert_eq!(v["status"], "interrupted", "{v}");
+        assert_eq!(v["total"], 4046, "{v}");
+        assert_eq!(v["written"], 40, "{v}");
+    }
+
+    #[test]
+    fn le_demarrage_ne_touche_ni_done_ni_un_reglage_absent() {
+        let s = etat();
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        assert_eq!(lire_statut(&s), json!({"status": "idle"}));
+        let fini = json!({"status": "done", "total": 3, "written": 3,
+                          "already": 0, "skipped": 0, "errors": 0});
+        ecrire_statut(&s.backend, &fini);
+        marquer_passe_interrompue_au_demarrage(&s.backend);
+        assert_eq!(lire_statut(&s), fini);
     }
 }
 
