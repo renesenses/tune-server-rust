@@ -481,7 +481,21 @@ pub(super) async fn artist_albums(
     // La fiche artiste trie ses albums par date d'ajout (Bertrand,
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
-    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    // #5616 — le type DÉDUIT des disques sans type explicite (règle pistes et
+    // durée de `release_type`), publié À CÔTÉ de `release_type`, jamais à sa
+    // place. Clé absente quand rien n'est déduit. Champ additif : le tableau
+    // nu des clients natifs le porte aussi, sans changer de forme.
+    let deduits = repo.types_deduits(&items);
+    let items: Vec<Value> = items
+        .iter()
+        .map(|a| {
+            let mut v = a.to_json();
+            if let (Some(t), Some(o)) = (a.id.and_then(|id| deduits.get(&id)), v.as_object_mut()) {
+                o.insert("inferred_release_type".into(), json!(t.as_str()));
+            }
+            v
+        })
+        .collect();
 
     // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
     if !q
