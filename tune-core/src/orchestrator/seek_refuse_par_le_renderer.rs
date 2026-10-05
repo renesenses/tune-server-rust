@@ -74,6 +74,7 @@ struct Banc {
     orch: PlaybackOrchestrator,
     zone_id: i64,
     seeks_recus: Arc<AtomicU64>,
+    stops_recus: Arc<AtomicU64>,
     serveur: tokio::task::JoinHandle<()>,
     _scratch: crate::test_scratch::ScratchDir,
 }
@@ -88,13 +89,23 @@ impl Drop for Banc {
 /// session fichier (donc cherchable), dont le renderer répond au `Seek`
 /// `(statut, corps)`.
 async fn zone_dlna(statut: StatusCode, corps: String) -> Banc {
+    zone_dlna_session(statut, corps, true).await
+}
+
+/// `cherchable` à faux : la piste n'a pas de session identifiée, le saut de
+/// reprise prend alors le chemin SYNCHRONE (`Self::seek`), pas la tâche
+/// détachée.
+async fn zone_dlna_session(statut: StatusCode, corps: String, cherchable: bool) -> Banc {
     let seeks_recus = Arc::new(AtomicU64::new(0));
+    let stops_recus = Arc::new(AtomicU64::new(0));
     let compteur = seeks_recus.clone();
+    let compteur_stop = stops_recus.clone();
     let corps = Arc::new(corps);
     let app = Router::new().route(
         "/control",
         post(move |headers: axum::http::HeaderMap, _body: String| {
             let compteur = compteur.clone();
+            let compteur_stop = compteur_stop.clone();
             let corps = corps.clone();
             async move {
                 let action = headers
@@ -106,6 +117,9 @@ async fn zone_dlna(statut: StatusCode, corps: String) -> Banc {
                     compteur.fetch_add(1, Ordering::SeqCst);
                     (statut, (*corps).clone())
                 } else {
+                    if action.contains("#Stop") {
+                        compteur_stop.fetch_add(1, Ordering::SeqCst);
+                    }
                     (StatusCode::OK, "<u:Response/>".to_owned())
                 }
             }
@@ -161,7 +175,7 @@ async fn zone_dlna(statut: StatusCode, corps: String) -> Banc {
             NowPlaying {
                 title: "Piste".into(),
                 source: "local".into(),
-                stream_id: Some(sid),
+                stream_id: cherchable.then_some(sid),
                 duration_ms: DUREE_MS,
                 ..Default::default()
             },
@@ -172,6 +186,7 @@ async fn zone_dlna(statut: StatusCode, corps: String) -> Banc {
         orch,
         zone_id,
         seeks_recus,
+        stops_recus,
         serveur,
         _scratch: scratch,
     }
@@ -311,4 +326,77 @@ async fn un_saut_de_reprise_refuse_se_journalise_sans_boucle_ni_arret() {
         PlayState::Playing,
         "la zone continue"
     );
+}
+
+/// Décision de Bertrand (05/10) — chemin SYNCHRONE du saut après renderer
+/// calé (`poller/tick.rs`) : l'appareil REFUSE le saut. La zone ne s'arrête
+/// pas, la piste relancée continue depuis son début, et l'interface reçoit
+/// un message non fatal. Un seul `Seek`, aucun `Stop`.
+#[tokio::test]
+async fn un_saut_de_reprise_refuse_laisse_la_piste_jouer_depuis_le_debut() {
+    let b = zone_dlna_session(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        faute(711, "Illegal seek target"),
+        false,
+    )
+    .await;
+    // La piste vient d'être relancée par `play_from_queue` : elle est à 0.
+    b.orch.playback.seek(b.zone_id, 0).await;
+    let mut rx = b.orch.event_bus.as_ref().unwrap().subscribe();
+
+    let erreur = b
+        .orch
+        .sauter_apres_reprise_de_renderer_cale(b.zone_id, Some(APPAREIL), 194_000)
+        .await
+        .expect_err("le chemin synchrone rend le refus");
+    let continue_ = b
+        .orch
+        .conclure_saut_de_reprise_echoue(b.zone_id, Some(APPAREIL), 194_000, &erreur)
+        .await;
+
+    assert!(continue_, "un refus ne coupe pas la zone");
+    assert_eq!(
+        b.seeks_recus.load(Ordering::SeqCst),
+        1,
+        "une seule tentative"
+    );
+    assert_eq!(b.stops_recus.load(Ordering::SeqCst), 0, "aucun Stop envoyé");
+    let etat = b.orch.playback.get_state(b.zone_id).await;
+    assert_eq!(etat.state, PlayState::Playing, "la zone joue");
+    assert_eq!(etat.position_ms, 0, "la piste continue depuis son début");
+    let ev = rx.try_recv().expect("zone.playback_error attendu");
+    assert_eq!(ev.event_type, "zone.playback_error");
+    assert_eq!(ev.data["fatal"], false);
+    let texte = ev.data["error"].as_str().unwrap();
+    assert!(
+        texte.contains("refusé la reprise à la position 3:14")
+            && texte.contains("711")
+            && texte.contains("depuis son début"),
+        "message peu clair : {texte}"
+    );
+}
+
+/// Tout AUTRE échec du saut garde l'ancienne conduite : arrêt de la zone.
+#[tokio::test]
+async fn un_autre_echec_du_saut_de_reprise_coupe_toujours_la_zone() {
+    let b = zone_dlna_session(StatusCode::OK, "<u:SeekResponse/>".into(), false).await;
+    let mut rx = b.orch.event_bus.as_ref().unwrap().subscribe();
+    let erreur = OutputCommandError::failed(OutputCommand::Seek, "soap timeout: Seek");
+    let continue_ = b
+        .orch
+        .conclure_saut_de_reprise_echoue(b.zone_id, Some(APPAREIL), 194_000, &erreur)
+        .await;
+    assert!(!continue_);
+    assert_eq!(b.stops_recus.load(Ordering::SeqCst), 1, "Stop envoyé");
+    assert_ne!(
+        b.orch.playback.get_state(b.zone_id).await.state,
+        PlayState::Playing
+    );
+    while let Ok(ev) = rx.try_recv() {
+        assert!(
+            !(ev.event_type == "zone.playback_error" && ev.data["fatal"] == false),
+            "pas de message de refus pour un autre échec : {:?}",
+            ev.data
+        );
+    }
 }
