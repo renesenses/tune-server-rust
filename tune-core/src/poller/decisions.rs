@@ -421,6 +421,31 @@ pub fn horloge_de_piste_connue(track_started_at: Option<std::time::Instant>) -> 
     track_started_at.is_some()
 }
 
+/// Ticket 190 — un renderer qui sait rapporter sa position, à l'arrêt, sans
+/// avoir jamais quitté 0 sur cette piste, n'a rien joué.
+///
+/// Les deux patiences du bras `Stopped` supposent qu'une musique est encore
+/// en train de sortir du tampon du renderer :
+/// - #4661 attend la fin nominale de la piste (au plus
+///   `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`) quand le fichier a été servi en
+///   entier ;
+/// - #4480 attend l'avance de l'audio livrée sur la position annoncée (au
+///   plus `AVANCE_AUDIO_BORNE_HAUTE_SECS`).
+///
+/// Ce qui motive la règle (ticket 190) : fichier servi en entier, horloge de
+/// piste connue, renderer qui avait rapporté ses positions sur les pistes
+/// d'avant. Sur celle-ci, il est resté à 0, puis s'est dit arrêté. La zone
+/// restait « en lecture » sans un son pendant plusieurs minutes, jusqu'à la
+/// fin nominale de la piste.
+///
+/// `position_prouvee` est la preuve de #5522 (`zones_a_position_prouvee`) :
+/// sortie locale, ou renderer qui a déjà rapporté une position non nulle sur
+/// cette zone. Sans elle, `false` : certains renderers rendent 0 en permanence
+/// tout en jouant, et leur `Stopped` ne prouve rien.
+pub fn renderer_a_l_arret_sans_avoir_joue(peak_position_ms: u64, position_prouvee: bool) -> bool {
+    position_prouvee && peak_position_ms == 0
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must
