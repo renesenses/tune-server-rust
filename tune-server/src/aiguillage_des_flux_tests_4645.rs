@@ -66,14 +66,10 @@ fn moteur(nom: &'static str, fils: usize) -> tokio::runtime::Runtime {
 }
 
 /// Un WAV creux de [`TAILLE_DU_WAV`] octets, en-tête compris.
-fn wav_creux() -> std::path::PathBuf {
-    static RANG: AtomicUsize = AtomicUsize::new(0);
-    let chemin = std::env::temp_dir().join(format!(
-        "tune-4645-{}-{}.wav",
-        std::process::id(),
-        RANG.fetch_add(1, SeqCst)
-    ));
-    let mut f = std::fs::File::create(&chemin).unwrap();
+fn wav_creux() -> tune_core::test_scratch::ScratchFile {
+    // Unique par appel et supprimé par `Drop`, panique comprise.
+    let chemin = tune_core::test_scratch::scratch_file("tune-4645-flux", ".wav");
+    let mut f = std::fs::File::create(&*chemin).unwrap();
     f.write_all(&tune_core::audio::wav::build_wav_header(2, 44_100, 16))
         .unwrap();
     f.set_len(TAILLE_DU_WAV).unwrap();
@@ -118,13 +114,7 @@ struct Serveur {
     // Gardés vivants jusqu'à la fin du test.
     _principal: tokio::runtime::Runtime,
     _transport: tokio::runtime::Runtime,
-    wav: std::path::PathBuf,
-}
-
-impl Drop for Serveur {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.wav);
-    }
+    _wav: tune_core::test_scratch::ScratchFile,
 }
 
 fn demarrer() -> Serveur {
@@ -170,7 +160,7 @@ fn demarrer() -> Serveur {
         entrees,
         _principal: principal,
         _transport: transport,
-        wav,
+        _wav: wav,
     }
 }
 
