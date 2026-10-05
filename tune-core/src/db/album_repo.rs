@@ -2024,6 +2024,28 @@ impl AlbumRepo {
             .and_then(|row| row.first()?.as_i64()))
     }
 
+    /// #5837 — la ligne album que le fichier `chemin` occupe DÉJÀ en base,
+    /// `None` s'il n'est pas indexé ou n'a pas d'album.
+    ///
+    /// Lecture `_strong`, comme tout ce chemin : le scan tient sa transaction
+    /// de lot, et un lecteur du pool ne verrait pas ce qu'elle vient d'écrire.
+    pub fn album_du_fichier(&self, chemin: &str) -> Result<Option<Album>, TuneError> {
+        let ph = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "{} WHERE a.id = (SELECT tf.album_id FROM tracks tf WHERE tf.file_path = {ph} \
+             AND tf.album_id IS NOT NULL LIMIT 1)",
+            sql::select_album()
+        );
+        let params: [&dyn ToSqlValue; 1] = [&chemin];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .map(|row| row_to_album(&row)))
+    }
+
     /// The folder recorded for an album, `None` when it predates the column.
     pub fn folder_path_of(&self, album_id: i64) -> Result<Option<String>, TuneError> {
         let sql = self.dialect_sql(sql::get_folder_path, sql::get_folder_path);
