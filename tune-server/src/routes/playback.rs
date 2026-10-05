@@ -3361,12 +3361,92 @@ pub(crate) fn precedent_doit_relancer(position_ms: i64, vient_de_redemarrer: boo
     position_ms > SEUIL_RELANCE_MS && !vient_de_redemarrer
 }
 
-async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+/// Position que « précédent » doit rejouer quand il RECULE (et ne relance pas).
+///
+/// Fil 2143 (Fabien, #5758) — en lecture aléatoire, « suivant » suit la
+/// permutation (`next_position_manual`), mais « précédent » reculait d'un rang
+/// dans l'ordre LINÉAIRE de la file : il jouait un titre qu'on n'avait pas
+/// entendu juste avant. Ici, l'aléatoire remonte le tirage : le titre joué
+/// avant le titre courant est celui qui le précède dans `shuffle_order`.
+///
+/// Au premier rang du tirage, rien n'a été joué avant : on reste sur la piste
+/// courante, comme `max(0)` le fait en lecture linéaire. Sans tirage
+/// matérialisé (ou si la position n'y figure pas), on retombe sur l'ordre
+/// linéaire, inchangé.
+pub(crate) fn position_precedente(zone_state: &tune_core::playback::ZoneState) -> i64 {
+    let lineaire = (zone_state.queue_position - 1).max(0);
+    if !zone_state.shuffle || zone_state.shuffle_order.is_empty() {
+        return lineaire;
+    }
+    let courant = zone_state.queue_position;
+    // Le curseur est resynchronisé à chaque changement de position
+    // (`update_queue_info`) ; on le vérifie quand même, et on cherche la
+    // position dans le tirage s'il ne pointe pas sur la piste courante.
+    let rang = usize::try_from(zone_state.shuffle_index)
+        .ok()
+        .filter(|&i| zone_state.shuffle_order.get(i).map(|&p| p as i64) == Some(courant))
+        .or_else(|| {
+            zone_state
+                .shuffle_order
+                .iter()
+                .position(|&p| p as i64 == courant)
+        });
+    match rang {
+        Some(0) => courant.max(0),
+        Some(i) => zone_state.shuffle_order[i - 1] as i64,
+        None => lineaire,
+    }
+}
+
+/// Corps facultatif de `POST /zones/{id}/previous`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct PrecedentRequest {
+    /// Position de lecture vue par le CLIENT, en millisecondes. Lue seulement
+    /// pour une zone navigateur : voir [`position_vue_par_precedent`].
+    pub position_ms: Option<i64>,
+}
+
+/// La position sur laquelle « précédent » décide de relancer ou de reculer.
+///
+/// FabienM, fil 1476 (05/10/2026, rc2) : sur « Cet ordinateur », le premier
+/// appui ne relance jamais la piste, il saute à la précédente. Cause : une
+/// zone navigateur n'a pas de périphérique, le sondeur ne relève donc jamais
+/// sa position (`poller/tick.rs`, branche `None => … continue`). Le serveur
+/// croit la piste à 0 ms (ou à la cible du dernier déplacement), et la règle
+/// de #1929 recule toujours. Seul l'onglet qui joue connaît la vraie
+/// position : il l'envoie, et on la prend — pour une zone navigateur
+/// seulement. Ailleurs, la position relevée sur la sortie fait foi.
+pub(crate) fn position_vue_par_precedent(
+    zone_navigateur: bool,
+    position_serveur_ms: i64,
+    position_client_ms: Option<i64>,
+) -> i64 {
+    match position_client_ms {
+        Some(ms) if zone_navigateur && ms >= 0 => ms,
+        _ => position_serveur_ms,
+    }
+}
+
+async fn previous(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<PrecedentRequest>,
+) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
     let current = state.playback.get_state(zone_id).await;
+    let zone_navigateur = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let position_ms = position_vue_par_precedent(
+        zone_navigateur,
+        current.position_ms,
+        body.and_then(|b| b.position_ms),
+    );
 
     // Un second appui rapproché veut dire « recule », quoi que dise la
     // position. On consomme la marque : un troisième appui relancera de
@@ -3382,7 +3462,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         }
     };
 
-    if precedent_doit_relancer(current.position_ms, vient_de_redemarrer) {
+    if precedent_doit_relancer(position_ms, vient_de_redemarrer) {
         let device_id = get_zone_device_id(&state, zone_id);
         if let Err(error) = state
             .orchestrator
@@ -3398,7 +3478,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
-    let prev_pos = (current.queue_position - 1).max(0);
+    let prev_pos = position_precedente(&current);
 
     let s = state.clone();
     tokio::spawn(async move {
@@ -8560,5 +8640,258 @@ mod minuteur_de_sommeil_arrete_la_sortie_5571 {
         assert!(fini.is_err(), "en pause, le minuteur ne doit pas échoir");
         assert_eq!(reste, Some(2), "en pause, pas une seconde décomptée");
         assert_eq!(arrets_recus(&state).await, 0);
+    }
+}
+
+/// Fil 2143 (#5758) — « précédent » en lecture aléatoire remonte l'ordre
+/// réellement joué (le tirage), pas l'ordre linéaire de la file.
+#[cfg(test)]
+mod precedent_aleatoire_tests {
+    use super::position_precedente;
+    use tune_core::playback::{RepeatMode, ZoneState};
+
+    fn aleatoire(position: i64, rang: i64) -> ZoneState {
+        ZoneState {
+            queue_position: position,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: rang,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn en_aleatoire_precedent_rend_le_titre_tire_juste_avant() {
+        // Tirage 3 → 1 → 4 : on écoute 4, le titre d'avant est 1 (pas 3).
+        assert_eq!(position_precedente(&aleatoire(4, 2)), 1);
+        // On écoute 0 (rang 3), le titre d'avant est 4 (pas -1 → 0).
+        assert_eq!(position_precedente(&aleatoire(0, 3)), 4);
+    }
+
+    #[test]
+    fn au_premier_rang_du_tirage_precedent_reste_sur_la_piste() {
+        assert_eq!(position_precedente(&aleatoire(3, 0)), 3);
+    }
+
+    #[test]
+    fn un_curseur_desynchronise_est_rattrape_par_la_position() {
+        // Curseur périmé (rang 0 = piste 3) alors que la piste 2 joue : la
+        // piste 2 est au rang 4, le titre d'avant est 0.
+        assert_eq!(position_precedente(&aleatoire(2, 0)), 0);
+        assert_eq!(position_precedente(&aleatoire(2, -1)), 0);
+    }
+
+    #[test]
+    fn sans_aleatoire_le_recul_lineaire_est_inchange() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle = false;
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+        s.queue_position = 0;
+        assert_eq!(position_precedente(&s), 0);
+    }
+
+    #[test]
+    fn aleatoire_sans_tirage_materialise_retombe_sur_le_lineaire() {
+        let mut s = aleatoire(4, 2);
+        s.shuffle_order.clear();
+        assert_eq!(position_precedente(&s), 3);
+    }
+
+    /// Le handler `POST /previous` s'en sert bel et bien : la réponse annonce
+    /// la position du titre tiré juste avant.
+    #[tokio::test]
+    async fn la_route_previous_suit_le_tirage() {
+        use crate::state::AppState;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::playback::NowPlaying;
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", Some("mock"), Some("sortie-essai"))
+            .expect("creation de zone");
+        let longueur = 20i64;
+        let items: Vec<QueueInput> = (0..longueur)
+            .map(|i| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: format!("t{i}"),
+                title: format!("t{i}"),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "t0".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("t0".into()),
+                    duration_ms: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 0, longueur).await;
+        state.playback.set_shuffle(zid, true).await;
+        let ordre = state.playback.get_state(zid).await.shuffle_order;
+        assert_eq!(ordre.len() as i64, longueur);
+
+        // Un rang du tirage où le recul linéaire et le recul dans le tirage
+        // DIFFÈRENT, sinon le test ne prouverait rien.
+        let rang = (1..ordre.len())
+            .find(|&k| (ordre[k] as i64 - 1).max(0) != ordre[k - 1] as i64)
+            .expect("un tirage de 20 pistes n'est pas l'ordre linéaire");
+        // On « joue » le tirage jusqu'à ce rang, comme `next` l'aurait fait.
+        state
+            .playback
+            .update_queue_info(zid, ordre[rang] as i64, longueur)
+            .await;
+
+        let reponse = super::previous(
+            State(state.clone()),
+            Path(zid),
+            crate::routes::corps_json_optionnel::CorpsJsonOptionnel(None),
+        )
+        .await
+        .into_response();
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(
+            v.get("queue_position"),
+            Some(&serde_json::json!(ordre[rang - 1])),
+            "tirage {ordre:?}, piste courante {} (rang {rang}) : précédent \
+             doit rejouer {} (le titre tiré avant), pas {} (l'ordre linéaire) : {v}",
+            ordre[rang],
+            ordre[rang - 1],
+            (ordre[rang] as i64 - 1).max(0),
+        );
+    }
+}
+
+/// Fil 1476 (FabienM, rc2) — sur une zone navigateur, le serveur ne relève
+/// pas la position : « précédent » prend celle que l'onglet envoie.
+#[cfg(test)]
+mod precedent_zone_navigateur_tests {
+    use super::position_vue_par_precedent;
+    use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
+    use crate::state::AppState;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    #[test]
+    fn la_position_du_client_ne_compte_que_pour_une_zone_navigateur() {
+        assert_eq!(position_vue_par_precedent(true, 0, Some(45_000)), 45_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, None), 12_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, Some(-5)), 12_000);
+        assert_eq!(position_vue_par_precedent(false, 0, Some(45_000)), 0);
+    }
+
+    /// Une zone (navigateur ou non) qui joue la 2e piste d'une file de 3,
+    /// position serveur à 0 — ce que voit le serveur d'une zone navigateur.
+    async fn zone(type_de_sortie: &str, appareil: Option<&str>) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Cet ordinateur", Some(type_de_sortie), appareil)
+            .expect("zone");
+        let items: Vec<QueueInput> = ["a", "b", "c"]
+            .iter()
+            .map(|id| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: (*id).into(),
+                title: (*id).to_string(),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "b".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("b".into()),
+                    duration_ms: 197_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 1, 3).await;
+        (state, zid)
+    }
+
+    async fn appui(state: &AppState, zid: i64, corps: Option<i64>) -> serde_json::Value {
+        let corps = corps.map(|ms| super::PrecedentRequest {
+            position_ms: Some(ms),
+        });
+        let r = super::previous(State(state.clone()), Path(zid), CorpsJsonOptionnel(corps))
+            .await
+            .into_response();
+        let o = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&o).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sur_une_zone_navigateur_le_premier_appui_relance_puis_le_second_recule() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "restarted",
+            "45 s dans la piste : relance, pas recul : {v}"
+        );
+        // Second appui dans les 6 s (#1929) : on recule, quelle que soit la
+        // position annoncée.
+        let v = appui(&state, zid, Some(1_000)).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn sans_position_du_client_le_comportement_est_celui_d_avant() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, None).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn une_zone_avec_sortie_ignore_la_position_du_client() {
+        let (state, zid) = zone("mock", Some("sortie-essai")).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "playing",
+            "la position relevée (0) fait foi : {v}"
+        );
+        assert_eq!(v["queue_position"], 0, "{v}");
     }
 }
