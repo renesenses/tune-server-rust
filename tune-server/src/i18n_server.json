@@ -1975,6 +1975,54 @@
     "ro": "Serviciul online Tune a primit prea multe cereri de la acest server și le refuză deocamdată pe următoarele. Încearcă din nou peste {minutes} min.",
     "sv": "Tunes onlinetjänst har tagit emot för många förfrågningar från den här servern och avvisar tills vidare fler. Försök igen om {minutes} min."
   },
+  "cloud.ssoTitre": {
+    "fr": "Connexion au compte mozaiklabs impossible pour le moment",
+    "en": "Could not sign in to your mozaiklabs account for now",
+    "de": "Anmeldung beim mozaiklabs-Konto derzeit nicht möglich",
+    "es": "No se puede iniciar sesión en la cuenta de mozaiklabs por ahora",
+    "it": "Accesso all'account mozaiklabs al momento impossibile",
+    "zh": "暂时无法登录 mozaiklabs 账户",
+    "ja": "現在 mozaiklabs アカウントにサインインできません",
+    "ko": "지금은 mozaiklabs 계정에 로그인할 수 없습니다",
+    "ro": "Conectarea la contul mozaiklabs nu este posibilă deocamdată",
+    "sv": "Det går inte att logga in på mozaiklabs-kontot just nu"
+  },
+  "cloud.ssoNonLie": {
+    "fr": "Le compte n'a pas été lié à ce serveur. Relance la connexion depuis Tune.",
+    "en": "The account was not linked to this server. Start the sign-in again from Tune.",
+    "de": "Das Konto wurde nicht mit diesem Server verknüpft. Starte die Anmeldung erneut in Tune.",
+    "es": "La cuenta no se ha vinculado a este servidor. Vuelve a iniciar sesión desde Tune.",
+    "it": "L'account non è stato collegato a questo server. Riavvia l'accesso da Tune.",
+    "zh": "该账户未关联到此服务器。请在 Tune 中重新登录。",
+    "ja": "アカウントはこのサーバーにリンクされていません。Tune からもう一度サインインしてください。",
+    "ko": "계정이 이 서버에 연결되지 않았습니다. Tune에서 다시 로그인하세요.",
+    "ro": "Contul nu a fost asociat cu acest server. Reia conectarea din Tune.",
+    "sv": "Kontot har inte kopplats till den här servern. Logga in igen från Tune."
+  },
+  "cloud.ssoRetour": {
+    "fr": "Retour à Tune",
+    "en": "Back to Tune",
+    "de": "Zurück zu Tune",
+    "es": "Volver a Tune",
+    "it": "Torna a Tune",
+    "zh": "返回 Tune",
+    "ja": "Tune に戻る",
+    "ko": "Tune으로 돌아가기",
+    "ro": "Înapoi la Tune",
+    "sv": "Tillbaka till Tune"
+  },
+  "cloud.ssoEchec": {
+    "fr": "La connexion n'a pas abouti.",
+    "en": "The sign-in did not complete.",
+    "de": "Die Anmeldung wurde nicht abgeschlossen.",
+    "es": "El inicio de sesión no se ha completado.",
+    "it": "L'accesso non è andato a buon fine.",
+    "zh": "登录未完成。",
+    "ja": "サインインは完了しませんでした。",
+    "ko": "로그인이 완료되지 않았습니다.",
+    "ro": "Conectarea nu s-a finalizat.",
+    "sv": "Inloggningen slutfördes inte."
+  },
   "metadata.enrich.cleLastfmAbsente": {
     "fr": "L'enrichissement des biographies nécessite une clé API Last.fm. Renseignez le réglage « lastfm_api_key » pour l'activer.",
     "en": "Biography enrichment requires a Last.fm API key. Set the “lastfm_api_key” setting to enable it.",
