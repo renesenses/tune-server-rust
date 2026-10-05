@@ -1399,3 +1399,9 @@ path = "tests/sso_reconnexion_apres_attente.rs"
 [[test]]
 name = "config_export_zones"
 path = "tests/config_export_zones.rs"
+
+# #5530 — le marquage « généré par IA » envoyé avec un favori de service est
+# rangé et rendu. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "favori_marquage_ia_5530"
+path = "tests/favori_marquage_ia_5530.rs"

@@ -617,6 +617,58 @@ mod tests_dates {
     }
 
     /// `(service_id, first_seen_at)` — la date LOCALE, celle que TUNE pose.
+    /// #5530 — la reprise range le marquage IA que le service donne : à
+    /// l'ajout comme sur un favori déjà présent. Une absence ne l'efface pas.
+    #[test]
+    fn la_reprise_range_le_marquage_ia_5530() {
+        let backend = base();
+        let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+        let entree = |id: &str, ia: Option<bool>| Entree {
+            item_type: "album",
+            service_id: id.to_string(),
+            title: None,
+            artist: None,
+            album: None,
+            cover_url: None,
+            created_at: None,
+            ai_generated: ia,
+        };
+        enregistrer(
+            &repo,
+            1,
+            "qobuz",
+            vec![
+                entree("tj9je5zd70wsc", Some(true)),
+                entree("5099749522428", None),
+            ],
+        );
+        let ia = |id: &str| {
+            repo.list(1, Some("album"))
+                .unwrap()
+                .into_iter()
+                .find(|f| f.service_id == id)
+                .unwrap()
+                .ai_generated
+        };
+        assert_eq!(ia("tj9je5zd70wsc"), Some(true), "ajout : marquage perdu");
+        assert_eq!(ia("5099749522428"), None);
+        // Déjà présent : le service le dit maintenant pour le témoin.
+        enregistrer(
+            &repo,
+            1,
+            "qobuz",
+            vec![entree("5099749522428", Some(false))],
+        );
+        assert_eq!(
+            ia("5099749522428"),
+            Some(false),
+            "déjà présent : marquage perdu"
+        );
+        // Une reprise qui ne le répète pas ne l'efface pas.
+        enregistrer(&repo, 1, "qobuz", vec![entree("tj9je5zd70wsc", None)]);
+        assert_eq!(ia("tj9je5zd70wsc"), Some(true));
+    }
+
     fn vues(backend: &Arc<dyn DbBackend>) -> Vec<(String, String)> {
         colonne(backend, "first_seen_at")
     }
