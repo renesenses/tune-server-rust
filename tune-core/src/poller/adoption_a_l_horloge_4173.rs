@@ -697,6 +697,11 @@ fn la_surveillance_pure() {
 #[cfg(test)]
 mod eversolo_epingle_4382;
 
+/// #4382 (rc2, 05/10) — le blanc du DMP-A6 mesuré sondage par sondage : le
+/// `Next` ignoré se constate au premier sondage, puis n'est plus demandé.
+#[cfg(test)]
+mod blanc_du_dmp_a6_rc2_4382;
+
 /// #3967 — l'enchaînement VÉRIFIÉ : ce même banc, mais l'appareil a prouvé
 /// qu'il TIENT la suivante, et on la lui demande au lieu de tout relancer.
 #[cfg(test)]
