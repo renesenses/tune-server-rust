@@ -122,12 +122,24 @@ impl Banc {
 
     /// Vieillit la marque du dernier redémarrage, comme si `age` s'était
     /// écoulé depuis le premier appui.
+    ///
+    /// Aucune assertion sous le verrou : un échec y empoisonnerait le
+    /// `Mutex` global, et tous les `previous` suivants (d'autres tests
+    /// compris) tomberaient sur un `PoisonError` sans rapport.
     fn vieillir_la_marque(&self, age: Duration) {
-        let mut m = DERNIER_REDEMARRAGE.lock().unwrap();
-        let t = m.get_mut(&self.zone_id).expect("marque posée au 1er appui");
-        *t = Instant::now()
+        let vieille = Instant::now()
             .checked_sub(age)
             .expect("horloge assez avancée");
+        let posee = DERNIER_REDEMARRAGE
+            .lock()
+            .unwrap()
+            .get_mut(&self.zone_id)
+            .map(|t| *t = vieille)
+            .is_some();
+        assert!(
+            posee,
+            "le 1er appui a relancé sans poser la marque du redémarrage"
+        );
     }
 }
 
@@ -172,7 +184,11 @@ async fn une_position_perimee_au_second_appui_ne_defait_pas_la_marque() {
     assert!(b.state.playback.get_state(b.zone_id).await.position_ms > 3_000);
 
     let v = b.precedent().await;
-    assert_eq!(v["status"], "playing", "{v}");
+    assert_eq!(
+        v["status"], "playing",
+        "2e appui sous 6 s, position rapportée encore à 10,4 s : il doit \
+         reculer, pas relancer une seconde fois (#5770) : {v}"
+    );
     assert_eq!(v["queue_position"], 1, "{v}");
 }
 
