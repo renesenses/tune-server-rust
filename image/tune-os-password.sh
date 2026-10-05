@@ -154,6 +154,10 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# Executed, not sourced.  The server feeds this file on stdin (`bash -s --
+# <mode>`), where BASH_SOURCE is empty: without the default, `set -u` stops
+# the script here, before main (#5617).  When sourced by a test, BASH_SOURCE[0]
+# is this file and differs from $0.
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     main "$@"
 fi

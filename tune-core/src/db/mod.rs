@@ -25,6 +25,8 @@ pub mod history_repo;
 pub mod home_queries;
 /// Appareils ignorés (#1280) — faire taire un appareil, pas ses zones.
 pub mod ignored_device_repo;
+/// Lectures SQLite en cours, pour le relevé d'un gel de l'exécuteur (#5677).
+pub mod lectures_en_cours;
 /// Registre DURABLE des serveurs multimédia (#2219, phase 1) — sur le modèle
 /// de `network_mounts` : l'intention d'un côté, le constat de l'autre.
 pub mod media_server_repo;
@@ -54,6 +56,8 @@ mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
+/// Fil 2138 — rattrapage unique des dates d'ajout figées au premier scan.
+pub mod rattrapage_dates_ajout_2138;
 pub mod rattrapage_metadonnees_5043;
 /// La référence d'album d'une piste Bandcamp, retrouvée dans la file, les
 /// favoris ou l'historique pour resigner son URL de flux (fil 2121).

@@ -74,4 +74,21 @@ premier_acces
     || fail "avis de console resté après le changement"
 PREMIER_ACCES
 
+# main must be reached exactly as in production (#5617): the server pipes
+# this file into `/bin/bash -s -- <mode>`; images call it by path. A probe
+# mode stops at main's first check (root) or at its usage line: both prove
+# main ran, neither touches the account.
+for how in stdin path; do
+    if [[ "$how" == stdin ]]; then
+        out="$(/bin/bash -s -- --sonde < "${SCRIPT_DIR}/tune-os-password.sh" 2>&1)" || true
+    else
+        out="$(/bin/bash "${SCRIPT_DIR}/tune-os-password.sh" --sonde 2>&1)" || true
+    fi
+    if [[ "$out" == *"unbound variable"* ]] \
+        || [[ "$out" != *"exécutée par root"* && "$out" != *"usage:"* ]]; then
+        echo "politique lancée par ${how} : main jamais atteint (${out})" >&2
+        exit 1
+    fi
+done
+
 echo "Tune OS password policy: tests passed"

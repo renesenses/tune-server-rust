@@ -24,6 +24,7 @@ pub mod devices;
 pub mod diag_qobuz;
 pub mod digest;
 pub mod discogs;
+pub(crate) mod ecriture_fichiers;
 pub mod eq_pro;
 pub mod export;
 pub(crate) mod filtre_sources;
@@ -581,7 +582,12 @@ pub fn router_with_plugins(
             state.clone(),
             analytics_middleware,
         ))
-        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+        // #5677 : le relevé d'un gel dit quelle route calcule sur un fil de
+        // travail pris (gabarit seulement, jamais l'URL).
+        .layer(axum::middleware::from_fn(
+            crate::gel_executeur::travailleurs::surveiller_les_polls,
+        ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
     let upnp_routes = state

@@ -2667,12 +2667,7 @@ impl PlaybackOrchestrator {
     /// (tête [`crate::outputs::dlna::SEEK_REFUSE_PREFIX`]), `None` pour tout
     /// autre échec : ceux-là gardent la seule réponse HTTP, comme avant.
     pub fn message_deplacement_refuse(error: &OutputCommandError) -> Option<String> {
-        let OutputCommandError::Failed { message, .. } = error else {
-            return None;
-        };
-        let detail = message
-            .strip_prefix(crate::outputs::dlna::SEEK_REFUSE_PREFIX)?
-            .trim();
+        let detail = Self::detail_du_refus_de_seek(error)?;
         Some(format!(
             "L'appareil a refusé le déplacement dans la piste ({detail}). \
              La lecture continue à sa position actuelle."
@@ -2702,6 +2697,71 @@ impl PlaybackOrchestrator {
                 }),
             );
         }
+    }
+
+    /// Le saut de la reprise après décrochage (#4645, fil 2125) a ÉCHOUÉ :
+    /// faut-il couper la zone ?
+    ///
+    /// Décision de Bertrand (05/10) : si l'appareil a REFUSÉ le `Seek`
+    /// (tête [`crate::outputs::dlna::SEEK_REFUSE_PREFIX`]), la zone ne
+    /// s'arrête PAS. La piste vient d'être relancée par `play_from_queue` :
+    /// elle continue depuis son début, et toutes les télécommandes reçoivent
+    /// un `zone.playback_error` NON fatal qui le dit. Une seule tentative :
+    /// rien n'est renvoyé ici, et le sondeur compte la reprise comme faite
+    /// pour cette lecture de piste.
+    ///
+    /// Tout autre échec (sortie sans capacité `Seek`, sortie disparue,
+    /// timeout) garde l'ancienne conduite : arrêt de la zone.
+    ///
+    /// Rend `true` quand la zone continue.
+    pub async fn conclure_saut_de_reprise_echoue(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        position_ms: u64,
+        error: &OutputCommandError,
+    ) -> bool {
+        let Some(detail) = Self::detail_du_refus_de_seek(error) else {
+            self.stop(zone_id, device_id).await;
+            return false;
+        };
+        let secondes = position_ms / 1000;
+        let message = format!(
+            "L'appareil a refusé la reprise à la position {}:{:02} ({detail}). \
+             La piste continue depuis son début.",
+            secondes / 60,
+            secondes % 60
+        );
+        warn!(
+            zone_id,
+            position_ms,
+            error = %error,
+            "renderer_cale_reprise_refusee_lecture_depuis_le_debut"
+        );
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": false,
+                }),
+            );
+        }
+        true
+    }
+
+    /// Le détail d'un refus de `Seek` par l'appareil (code UPnP et sens),
+    /// `None` pour tout autre échec.
+    fn detail_du_refus_de_seek(error: &OutputCommandError) -> Option<&str> {
+        let OutputCommandError::Failed { message, .. } = error else {
+            return None;
+        };
+        Some(
+            message
+                .strip_prefix(crate::outputs::dlna::SEEK_REFUSE_PREFIX)?
+                .trim(),
+        )
     }
 
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {

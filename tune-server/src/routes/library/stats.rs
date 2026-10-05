@@ -202,7 +202,16 @@ pub(super) async fn completeness_stats(
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'analysis'), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'tag'), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_indisponible'), \
-         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'sidecar')";
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'sidecar'), \
+         (SELECT COUNT(DISTINCT s.track_id) FROM track_metadata s \
+          WHERE s.key = 'rg_skipped_oversized' \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata d \
+                  WHERE d.track_id = s.track_id AND d.key = 'dr_track' AND TRIM(d.value) != '') \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata i \
+                  WHERE i.track_id = s.track_id AND i.key = 'dr_indisponible')), \
+         (SELECT COUNT(*) FROM tracks t WHERE (t.file_path IS NULL OR t.file_path = '') \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata d \
+                  WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != ''))";
     let row = b
         .query_one(sql, &[])
         .map_err(AppError::internal)?
@@ -250,6 +259,22 @@ pub(super) async fn completeness_stats(
     // mesurées par Tune, ni écrites dans le fichier — un troisième
     // producteur, que la carte Santé doit nommer comme les deux autres.
     let dr_from_sidecar = get(17);
+    // #5834 (fil 2157, « bloquée à 97 % ») — deux populations sans DR que
+    // AUCUNE passe ne mesurera, et qu'aucun compteur ne nommait : la carte
+    // Santé les rangeait « en attente » et sa jauge ne finissait jamais.
+    //
+    // * Les pistes que la passe ReplayGain a refusé de décoder pour leur
+    //   taille estimée (`rg_skipped_oversized`, #1109). Elle les estampille
+    //   `rg_analyzed` SANS plage dynamique, et `CANDIDATS_DR_WHERE` les écarte
+    //   du rattrapage : elles ne reçoivent donc jamais `dr_indisponible`, et
+    //   `dynamic_range_unavailable` ne les compte pas. Comptées ici, à part,
+    //   et jamais deux fois : ni celles qui ont un DR (tag, rapport voisin),
+    //   ni celles déjà marquées indisponibles.
+    // * Les pistes sans fichier propre (`file_path` vide : images CUE),
+    //   hors de tous les prédicats d'analyse, à dessein (voir
+    //   `CANDIDATS_DR_WHERE`). Sauf DR lu ailleurs.
+    let dr_oversized = get(18);
+    let dr_without_file = get(19);
     // Et celles que la passe REPORTE parce que leur fichier ne répond pas
     // (#1865) : ni faites, ni écartées, ni à faire tant que le disque ne
     // revient pas. Sans ce chiffre la carte Santé les comptait « en attente
@@ -336,6 +361,8 @@ pub(super) async fn completeness_stats(
         "dynamic_range_from_sidecar_file": dr_from_sidecar,
         "dynamic_range_unavailable": dr_unavailable,
         "dynamic_range_deferred": dr_deferred,
+        "dynamic_range_oversized": dr_oversized,
+        "dynamic_range_without_file": dr_without_file,
         "dynamic_range_pct": if total_tracks > 0 {
             (with_dr as f64 / total_tracks as f64 * 100.0).round()
         } else {
