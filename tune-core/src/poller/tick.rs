@@ -2415,11 +2415,26 @@ impl PositionPoller {
                                     };
                                 let avance_audio_ms =
                                     fsm::avance_audio_ms(audio_servi_ms, ps.peak_position_ms);
-                                let famine_etablie = fsm::famine_etablie_malgre_l_avance(
-                                    avance_audio_ms,
-                                    ps.premier_arret_a.map(|t| t.elapsed()),
-                                    AVANCE_AUDIO_BORNE_HAUTE_SECS,
-                                );
+                                // Ticket 190 — un renderer qui sait rapporter
+                                // sa position et n'a jamais quitté 0 sur cette
+                                // piste n'a rien en train de jouer : aucune des
+                                // deux patiences ci-dessous ne s'applique.
+                                let a_l_arret_sans_avoir_joue =
+                                    decisions::renderer_a_l_arret_sans_avoir_joue(
+                                        ps.peak_position_ms,
+                                        device_id.starts_with("local:")
+                                            || self
+                                                .zones_a_position_prouvee
+                                                .lock()
+                                                .map(|z| z.contains(&zone_id))
+                                                .unwrap_or(false),
+                                    );
+                                let famine_etablie = a_l_arret_sans_avoir_joue
+                                    || fsm::famine_etablie_malgre_l_avance(
+                                        avance_audio_ms,
+                                        ps.premier_arret_a.map(|t| t.elapsed()),
+                                        AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                    );
                                 fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
                                 // 🔴 #4661 — la borne de #4480 est PLATE :
@@ -2469,6 +2484,7 @@ impl PositionPoller {
                                 let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
                                     flux_servi_en_entier,
                                     horloge_de_piste_connue
+                                        && !a_l_arret_sans_avoir_joue
                                         && decisions::tampon_du_renderer_peut_encore_jouer(
                                             wall_elapsed,
                                             track_duration_ms,
