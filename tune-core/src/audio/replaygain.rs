@@ -847,9 +847,20 @@ pub const ALBUMS_PAR_TOUR: usize = 4;
 /// La passe d'albums d'UN tour : jusqu'à [`ALBUMS_PAR_TOUR`] albums, tant
 /// qu'il y en a. Mêmes gardes que [`passe_d_album`], relues à chaque album.
 pub async fn passe_d_albums_du_tour(backend: &Arc<dyn DbBackend>, en_lecture: bool) -> usize {
+    albums_jusqu_a_la_borne(|| passe_d_album(backend, en_lecture)).await
+}
+
+/// La boucle de [`passe_d_albums_du_tour`], sans la base ni les gardes
+/// globales (pause, lecture) : elle se garde seule, sans dépendre de l'état
+/// que d'autres tests du processus posent.
+async fn albums_jusqu_a_la_borne<F, Fut>(mut un_album: F) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
     let mut faits = 0;
     for _ in 0..ALBUMS_PAR_TOUR {
-        let n = passe_d_album(backend, en_lecture).await;
+        let n = un_album().await;
         if n == 0 {
             break;
         }
@@ -4557,36 +4568,35 @@ mod tests {
     /// [`ALBUMS_PAR_TOUR`]. À un album par tour, la passe d'albums prenait du
     /// retard sur la passe de pistes (deux albums complets par lot de 25) et
     /// le rattrapait seule, à près de 4 s l'album sur une grande base.
+    ///
+    /// La BOUCLE est éprouvée sans `passe_d_album` : celle-ci lit des états
+    /// globaux du processus (pause de la tâche, zones qui jouent) que d'autres
+    /// tests de la suite posent, et rendait 0 dans la suite complète.
     #[tokio::test]
     async fn un_tour_fait_plusieurs_albums_jusqu_a_sa_borne() {
-        let (db, backend) = base_albums();
-        let meta = TrackMetadataRepo::with_backend(backend.clone());
-        // Six albums complets de deux pistes, toutes mesurées.
-        for album in 1..=6i64 {
-            for k in 0..2i64 {
-                let id = album * 10 + k;
-                piste(&db, id, album);
-                meta.set(id, "rg_track_gain", "-6.00 dB").unwrap();
-                meta.set(id, "rg_track_peak", "0.900000").unwrap();
-            }
-        }
         assert_eq!(ALBUMS_PAR_TOUR, 4);
+        // Six albums en attente : un tour en fait quatre, le suivant deux.
+        let mut restants = 6usize;
+        let mut un = || {
+            let n = usize::from(restants > 0);
+            restants -= n;
+            std::future::ready(n)
+        };
         assert_eq!(
-            passe_d_albums_du_tour(&backend, false).await,
+            albums_jusqu_a_la_borne(&mut un).await,
             4,
             "premier tour : quatre albums, pas un seul"
         );
-        assert_eq!(passe_d_albums_du_tour(&backend, false).await, 2);
-        assert_eq!(passe_d_albums_du_tour(&backend, false).await, 0);
-        for album in 1..=6i64 {
-            assert!(gain_album(&meta, album * 10).is_some(), "album {album}");
-        }
-        // Pendant la lecture, rien : la garde de `passe_d_album` tient.
-        let (db2, backend2) = base_albums();
-        let meta2 = TrackMetadataRepo::with_backend(backend2.clone());
-        piste(&db2, 1, 1);
-        meta2.set(1, "rg_track_gain", "-6.00 dB").unwrap();
-        assert_eq!(passe_d_albums_du_tour(&backend2, true).await, 0);
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 2);
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 0);
+        // Et elle s'arrête au premier « rien » (pause, lecture, plus d'album).
+        let mut appels = 0usize;
+        let rien = || {
+            appels += 1;
+            std::future::ready(0usize)
+        };
+        assert_eq!(albums_jusqu_a_la_borne(rien).await, 0);
+        assert_eq!(appels, 1, "un seul essai quand il n'y a rien");
     }
 
     /// #5519 — la pause entre deux tours suit la vitesse réglée : « Discret »
