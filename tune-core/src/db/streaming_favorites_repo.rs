@@ -45,7 +45,7 @@ pub struct StreamingFavorite {
     ///
     /// Pour un favori ALBUM, le marquage de l'album ; pour un favori PISTE,
     /// celui de son album (Qobuz marque l'album, pas la piste). `None` =
-    /// inconnu : ligne d'avant la migration 117, ou service qui ne dit rien.
+    /// inconnu : ligne d'avant la migration 118, ou service qui ne dit rien.
     /// Absent du JSON dans ce cas, pour que la forme rendue ne change pas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
@@ -712,7 +712,7 @@ fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
 
 /// La valeur rangée dans `streaming_favorites.ai_generated` (#5530).
 ///
-/// TEXT des deux côtés (voir la migration 117) : `'1'` marqué, `'0'` non.
+/// TEXT des deux côtés (voir la migration 118) : `'1'` marqué, `'0'` non.
 pub(crate) fn marquage_ia_ecrit(ia: bool) -> &'static str {
     if ia { "1" } else { "0" }
 }

@@ -713,7 +713,7 @@ ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
 -- Marque « déjà tenté, rien trouvé » de l'identification en lot (#4991,
 -- PG 080 / SQLite 116). En ALTER pour la même raison qu'au-dessus.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
--- Marquage IA d'un favori de service (#5530, PG 081 / SQLite 117). En ALTER
+-- Marquage IA d'un favori de service (#5530, PG 082 / SQLite 118). En ALTER
 -- pour la même raison qu'au-dessus.
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 -- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :

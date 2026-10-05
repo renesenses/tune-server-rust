@@ -282,8 +282,8 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
     // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
-    // #5530 — marquage IA d'un favori de service (PG 081). Ici AUSSI : une
-    // base de bascule ne rejoue pas la 081, et l'écriture comme la lecture
+    // #5530 — marquage IA d'un favori de service (PG 082). Ici AUSSI : une
+    // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
     // des favoris de service nomment la colonne. NULL = inconnu.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,

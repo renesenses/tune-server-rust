@@ -1,7 +1,7 @@
--- 081_streaming_favorites_ai_generated.sql
+-- 082_streaming_favorites_ai_generated.sql
 --
 -- #5530 (FabienM, fil 2053) : le marquage « généré par IA » de Qobuz, gardé
--- avec le favori de service. Jumelle de la migration SQLite 117.
+-- avec le favori de service. Jumelle de la migration SQLite 118.
 --
 -- Qobuz le porte au niveau de l'ALBUM (`album/get` : `"ai_generated": true`,
 -- relevé par la sonde `raw-keys` sur le .18 le 05/10/2026). '1' = marqué,
@@ -22,11 +22,11 @@ BEGIN
     IF to_regclass('streaming_favorites') IS NOT NULL THEN
         ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
     ELSE
-        RAISE NOTICE 'migration 081 : streaming_favorites absente';
+        RAISE NOTICE 'migration 082 : streaming_favorites absente';
     END IF;
 END $marquage_ia$;
 
-INSERT INTO schema_version (version, name) VALUES (81, 'streaming_favorites_ai_generated')
+INSERT INTO schema_version (version, name) VALUES (82, 'streaming_favorites_ai_generated')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;
