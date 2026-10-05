@@ -347,7 +347,7 @@ impl Banc {
 
 /// **Le cas A6 (#4382), non touché par #5411.** `Next` acquitté, l'appareil
 /// nomme encore N, sa position reste figée à la durée, et il tire le flux
-/// armé (~1,26× le temps réel, relevé de terrain). Le rejeu n'est PAS avéré
+/// armé au-delà du temps réel. Le rejeu n'est PAS avéré
 /// (la position n'a pas reculé) : rien d'anticipé dans le délai, et au délai,
 /// exactement le repli d'avant ce correctif — qui reste l'affaire de #4382.
 #[tokio::test]
@@ -364,8 +364,8 @@ async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avan
         Some(decisions::EnchainementArme::Bascule)
     );
 
-    // Dans le délai : figé, URI de N, flux armé tiré à ~1,26× le WAV.
-    banc.le_flux_adopte_est_tire_depuis(&flux, 222_000, 2).await;
+    // Dans le délai : figé, URI de N, flux armé tiré au-delà du débit WAV.
+    banc.le_flux_adopte_est_tire_depuis(&flux, 200_000, 2).await;
     banc.renderer_a(POSITION_GELEE_MS, 2).await;
     banc.tic().await;
     assert!(
@@ -386,7 +386,7 @@ async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avan
     );
 
     // Au délai : le repli d'avant ce correctif, mot pour mot (#4382 décidera).
-    banc.le_flux_adopte_est_tire_depuis(&flux, 222_000, BASCULE_DELAI_SECS + 1)
+    banc.le_flux_adopte_est_tire_depuis(&flux, 200_000, BASCULE_DELAI_SECS + 1)
         .await;
     banc.renderer_a(POSITION_GELEE_MS, BASCULE_DELAI_SECS + 1)
         .await;
