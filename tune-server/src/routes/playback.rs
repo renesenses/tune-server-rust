@@ -6,6 +6,9 @@ mod album_ref_bandcamp_2121_tests;
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
 mod session_message;
+#[cfg(test)]
+#[path = "playback/titre_seul_album_5372_tests.rs"]
+mod titre_seul_album_5372_tests;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -852,6 +855,68 @@ fn avertissements_de_lecture(
     SortieD4::depuis(output_type, output_device_id)
         .degradations()
         .to_vec()
+}
+
+/// #5372 — l'album d'un titre de service lancé SEUL, et la place du titre
+/// dedans.
+///
+/// Un titre de streaming lancé depuis une recherche, une tuile d'accueil ou
+/// l'historique arrive sans `streaming_album_id` : la route en faisait une
+/// file d'UN titre, qui s'arrêtait à sa fin (« piste suivante » grisée). La
+/// décision du 05/10 : jouer l'album à partir de ce titre, comme pour un titre
+/// de la bibliothèque.
+///
+/// `Err(motif)` dit pourquoi l'album n'a pas pu servir ; l'appelant garde
+/// alors la file d'un seul titre, comme avant.
+async fn album_du_titre_de_service(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+) -> Result<
+    (
+        String,
+        Vec<tune_core::streaming::traits::StreamTrack>,
+        usize,
+    ),
+    String,
+> {
+    /// Deux appels au service au plus ; au-delà, on ne fait pas attendre le
+    /// départ de la lecture pour une file plus longue.
+    const DELAI: std::time::Duration = std::time::Duration::from_secs(5);
+    let resolution = async {
+        let registry = state.services.lock().await;
+        let svc = registry
+            .get(source)
+            .ok_or_else(|| "service_absent".to_string())?;
+        let svc = svc.read().await;
+        let titre = svc
+            .get_track(source_id)
+            .await
+            .map_err(|e| format!("titre_illisible: {e}"))?;
+        let album_id = titre
+            .album_id
+            .filter(|a| !a.trim().is_empty())
+            .ok_or_else(|| "titre_sans_album".to_string())?;
+        let pistes = svc
+            .get_album_tracks(&album_id)
+            .await
+            .map_err(|e| format!("album_illisible: {e}"))?;
+        let index = position_du_titre_dans_l_album(&pistes, source_id)
+            .ok_or_else(|| "titre_absent_de_l_album".to_string())?;
+        Ok((album_id, pistes, index))
+    };
+    match tokio::time::timeout(DELAI, resolution).await {
+        Ok(r) => r,
+        Err(_) => Err("delai_depasse".to_string()),
+    }
+}
+
+/// La place de `source_id` dans les pistes d'un album de service.
+fn position_du_titre_dans_l_album(
+    pistes: &[tune_core::streaming::traits::StreamTrack],
+    source_id: &str,
+) -> Option<usize> {
+    pistes.iter().position(|t| t.id == source_id)
 }
 
 #[derive(Deserialize, Default)]
@@ -2076,26 +2141,83 @@ async fn play(
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
+    // #5372 — un titre de service lancé SEUL (recherche, tuile, historique) :
+    // s'il n'est pas déjà dans la file, jouer son ALBUM à partir de lui, comme
+    // pour un titre de la bibliothèque, au lieu d'une file d'un seul titre qui
+    // s'arrête à sa fin. Le titre déjà en file (Stop puis Play) et la base
+    // illisible (#2569) gardent leur chemin, plus bas ; un album introuvable
+    // aussi. Le contexte de session posé au-dessus reste celui du geste.
+    let mut body = body;
+    let mut pistes_de_l_album: Option<Vec<tune_core::streaming::traits::StreamTrack>> = None;
+    if let (Some(source), Some(source_id)) = (body.source.clone(), body.source_id.clone())
+        && body.track_id.is_none()
+        && body.track_ids.is_none()
+        && body.streaming_album_id.is_none()
+        && body.streaming_playlist_id.is_none()
+    {
+        let deja = file_deja_chargee(
+            queue_repo
+                .get_ordered(zone_id)
+                .as_deref()
+                .map_err(String::as_str),
+            Some(source.as_str()),
+            source_id.as_str(),
+        );
+        if deja == FileDejaChargee::RemplacerParCeTitre {
+            match album_du_titre_de_service(&state, &source, &source_id).await {
+                Ok((album_id, pistes, index)) => {
+                    info!(
+                        zone_id,
+                        source = %source,
+                        index,
+                        longueur = pistes.len(),
+                        "titre_seul_joue_dans_son_album"
+                    );
+                    body.streaming_album_id = Some(album_id);
+                    body.start_index = Some(index as i64);
+                    pistes_de_l_album = Some(pistes);
+                }
+                // Une source qui n'est pas un service (serveur de médias,
+                // radio) n'a pas d'album à chercher : rien à dire en INFO.
+                Err(motif) if motif == "service_absent" => {}
+                Err(motif) => {
+                    info!(
+                        zone_id,
+                        source = %source,
+                        motif = %motif,
+                        "titre_seul_album_introuvable_file_d_un_titre"
+                    );
+                }
+            }
+        }
+    }
+
     // --- Streaming album: fetch tracks from the service, queue them, play first ---
     if let (Some(source), Some(album_id)) = (&body.source, &body.streaming_album_id) {
-        let registry = state.services.lock().await;
-        let svc = match registry.get(source) {
-            Some(s) => s,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown service: {source}"),
-                )
-                    .into_response();
-            }
+        // #5372 — l'album déjà lu pour un titre seul ne se relit pas.
+        let tracks = if let Some(t) = pistes_de_l_album.take() {
+            t
+        } else {
+            let registry = state.services.lock().await;
+            let svc = match registry.get(source) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown service: {source}"),
+                    )
+                        .into_response();
+                }
+            };
+            let svc = svc.read().await;
+            let tracks = match svc.get_album_tracks(album_id).await {
+                Ok(t) => t,
+                Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            };
+            drop(svc);
+            drop(registry);
+            tracks
         };
-        let svc = svc.read().await;
-        let tracks = match svc.get_album_tracks(album_id).await {
-            Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-        };
-        drop(svc);
-        drop(registry);
 
         if tracks.is_empty() {
             return (StatusCode::BAD_REQUEST, "album has no tracks").into_response();
@@ -2170,6 +2292,16 @@ async fn play(
         {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
+        // #5372 — la branche prise et la longueur de la file, en INFO : sans
+        // elles, un rapport ne distingue pas un album d'un titre seul.
+        info!(
+            zone_id,
+            source = %source,
+            branche = "album_de_service",
+            position = start,
+            longueur = tracks.len(),
+            "file_de_lecture_ecrite"
+        );
         state
             .playback
             .update_queue_info(zone_id, start as i64, tracks.len() as i64)
@@ -2455,6 +2587,13 @@ async fn play(
                     FileDejaChargee::Garder { position, longueur } => {
                         // Keep the full queue, just move the current position onto it
                         // (its unified position, valid whether the queue is mixed).
+                        info!(
+                            zone_id,
+                            branche = "titre_seul_deja_en_file",
+                            position,
+                            longueur,
+                            "file_de_lecture_ecrite"
+                        );
                         state
                             .playback
                             .update_queue_info(zone_id, position, longueur)
@@ -2481,6 +2620,13 @@ async fn play(
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
                         }
+                        info!(
+                            zone_id,
+                            branche = "titre_seul",
+                            position = 0,
+                            longueur = 1,
+                            "file_de_lecture_ecrite"
+                        );
                         state.playback.update_queue_info(zone_id, 0, 1).await;
                         persist_queue_async(&state, zone_id);
                     }
