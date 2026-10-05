@@ -212,6 +212,12 @@ path = "tests/ordre_des_passes_5169.rs"
 name = "rattrapage_foo_dr_5168"
 path = "tests/rattrapage_foo_dr_5168.rs"
 
+# #5594 — la clé du signal PCM des FLAC et son rattrapage par en-tête. Binaire
+# à lui seul : la pause des tâches de fond est un état de PROCESSUS.
+[[test]]
+name = "cle_pcm_5594"
+path = "tests/cle_pcm_5594.rs"
+
 # #5246 — plage dynamique et empreintes MEME ReplayGain coupe. Binaire a lui
 # seul : pause, ordre des passes et verrou d analyse sont des etats de PROCESSUS.
 [[test]]

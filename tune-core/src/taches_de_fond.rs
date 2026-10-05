@@ -83,6 +83,9 @@ pub mod perimetre;
 /// La vitesse des passes qui décodent : fichiers à la fois (#5519).
 pub mod vitesse;
 
+/// La clé du signal PCM des FLAC, lue dans l'en-tête, sans décodage (#5594).
+pub mod cle_pcm;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir

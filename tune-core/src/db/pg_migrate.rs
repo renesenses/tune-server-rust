@@ -1214,6 +1214,11 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
+-- tracks: clé du signal PCM des FLAC et son témoin (SQLite migration v121 /
+-- PG 085, #5594). TEXT des deux côtés : la copie texte n'a rien à convertir.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT;
+CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key);
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

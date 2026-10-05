@@ -63,6 +63,34 @@ const TRACK_BATCH: usize = 25;
 /// valeur non marquée ne se distinguait pas d'une valeur d'avant la clef.
 const DR_SOURCE_ANALYSIS: &str = "analysis";
 
+/// #5594 (lot 2) — la clé de `track_metadata` qui dit QUEL algorithme a
+/// produit la mesure ReplayGain de piste (`rg_track_gain`, `rg_track_peak`,
+/// `rg_track_true_peak`).
+///
+/// Posée par la passe d'analyse, au moment de la mesure, et par elle seule.
+/// Une mesure faite avant cette clé reste SANS version : rien ne permet de
+/// dire après coup quel code l'a produite, et on n'invente pas. La clé ne se
+/// lit qu'avec `rg_track_source = analysis` : un gain venu des tags du
+/// fichier n'a pas de version Tune.
+pub const RG_ALGO_KEY: &str = "rg_algo";
+
+/// La version de la mesure ReplayGain de Tune : sonie intégrée EBU R128 /
+/// ITU-R BS.1770 (pondération K, double porte), pic d'échantillon, et true
+/// peak par suréchantillonnage 4× (#1694). À changer dès qu'une valeur
+/// rendue pour le même signal change — c'est ce qui permettra de ne comparer
+/// que des mesures comparables entre deux instances.
+pub const RG_ALGO: &str = "bs1770-tp4x-v1";
+
+/// #5594 (lot 2) — la clé de `track_metadata` qui dit quel algorithme a
+/// produit `dr_track`. Même règle que [`RG_ALGO_KEY`] : posée à la mesure,
+/// jamais rétroactivement, et lue seulement avec `dr_source = analysis`.
+pub const DR_ALGO_KEY: &str = "dr_algo";
+
+/// La version de la plage dynamique de Tune : la méthode du TT DR Meter
+/// (blocs de 3 s, 20 % des blocs les plus forts, deuxième pic), arrondie à
+/// l'entier.
+pub const DR_ALGO: &str = "tt-dr-v1";
+
 /// La plage calculée a-t-elle le droit de s'écrire ?
 ///
 /// 🔴 LE TAG DU FICHIER FAIT FOI. `dr_track` a DEUX producteurs : le scan, qui
@@ -105,6 +133,8 @@ fn ecrire_le_dr_mesure(repo: &TrackMetadataRepo, track_id: i64, dr: u32) {
     if peut_ecrire_le_dr(existant.as_deref()) {
         let _ = repo.set(track_id, "dr_track", &dr.to_string());
         let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+        // #5594 — la version de l'algorithme, écrite avec la mesure.
+        let _ = repo.set(track_id, DR_ALGO_KEY, DR_ALGO);
     }
 }
 
@@ -137,6 +167,9 @@ fn ecrire_la_mesure_de_piste(
     // qu'il applique, et « tags du fichier » affiché sur une mesure Tune
     // serait un affichage inventé.
     let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
+    // #5594 — la version de l'algorithme qui a produit ces trois valeurs,
+    // écrite avec elles. Une mesure d'avant cette clé reste sans version.
+    let _ = repo.set(track_id, RG_ALGO_KEY, RG_ALGO);
 
     // ── PLAGE DYNAMIQUE ──────────────────────────────────────────────────
     //
@@ -3324,6 +3357,97 @@ mod tests {
         let t = temoins(&db);
         assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
         assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #5594 (lot 2) — la VERSION de l'algorithme, écrite avec la mesure.
+    // ---------------------------------------------------------------------
+
+    /// La passe nominale mesure le gain ET la plage : les deux versions
+    /// s'écrivent avec les valeurs, sous leurs libellés exacts — ce sont eux
+    /// que deux instances compareront.
+    #[tokio::test]
+    async fn la_mesure_ecrit_la_version_de_ses_algorithmes_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        let t = temoins(&db);
+        assert!(t.contains_key("rg_track_gain"), "{t:?}");
+        assert_eq!(
+            t.get(TRACK_SOURCE_KEY).map(String::as_str),
+            Some("analysis")
+        );
+        assert_eq!(
+            t.get("rg_algo").map(String::as_str),
+            Some("bs1770-tp4x-v1"),
+            "la mesure ReplayGain doit porter la version de son algorithme : {t:?}"
+        );
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
+        assert_eq!(
+            t.get("dr_algo").map(String::as_str),
+            Some("tt-dr-v1"),
+            "la plage dynamique mesurée doit porter la version de son algorithme : {t:?}"
+        );
+    }
+
+    /// Le rattrapage de la plage dynamique écrit `dr_algo` avec la plage — et
+    /// JAMAIS `rg_algo` : le gain en place vient des tags, pas de Tune.
+    #[tokio::test]
+    async fn le_rattrapage_dr_ecrit_dr_algo_sans_inventer_rg_algo_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, "rg_track_gain", "-6.50 dB").unwrap();
+
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        let t = temoins(&db);
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert_eq!(t.get(DR_ALGO_KEY).map(String::as_str), Some(DR_ALGO));
+        assert!(
+            !t.contains_key(RG_ALGO_KEY),
+            "un gain lu dans les tags n'a pas de version Tune : {t:?}"
+        );
+    }
+
+    /// Les mesures déjà en base, faites sans version, RESTENT sans version :
+    /// aucune passe ne la pose après coup, et une valeur venue du disque n'en
+    /// reçoit jamais.
+    #[tokio::test]
+    async fn une_mesure_d_avant_la_version_reste_sans_version_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        // L'état d'une base d'avant #5594 : gain et plage mesurés par Tune,
+        // provenance posée, mais aucune version.
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, "rg_track_gain", "-6.12 dB").unwrap();
+        repo.set(42, "rg_track_peak", "0.912345").unwrap();
+        repo.set(42, TRACK_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        repo.set(42, "dr_track", "11").unwrap();
+        repo.set(42, "dr_source", "analysis").unwrap();
+
+        assert_eq!(analyze_track_batch(&backend).await, 0);
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+        let t = temoins(&db);
+        assert!(!t.contains_key(RG_ALGO_KEY), "{t:?}");
+        assert!(!t.contains_key(DR_ALGO_KEY), "{t:?}");
+        assert_eq!(t.get("rg_track_gain").map(String::as_str), Some("-6.12 dB"));
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("11"));
+
+        // Une plage lue dans les tags du fichier : ni écrasée, ni versionnée.
+        repo.set(42, "dr_track", "14").unwrap();
+        repo.set(42, "dr_source", "tag").unwrap();
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+        assert!(!temoins(&db).contains_key(DR_ALGO_KEY));
     }
 
     /// Un fichier introuvable se REPORTE, un fichier illisible se MARQUE. Sans
