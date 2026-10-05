@@ -688,8 +688,94 @@ pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEm
     }
 }
 
+/// Les accumulateurs d'une mesure en cours, d'un segment au suivant.
+///
+/// Ils voyagent DANS la tâche bloquante de chaque segment, puis en reviennent
+/// (#5519) : voir [`mesurer_a_partir_de`].
+#[derive(Default)]
+struct MesureEnCours {
+    acc: Option<LoudnessAccumulator>,
+    dr: Option<DrAccumulator>,
+}
+
+/// Ce qu'a donné UN segment de la mesure.
+enum Segment {
+    /// Le décodage a échoué : la mesure entière échoue, comme avant.
+    Echec,
+    /// Fin du fichier (segment vide ou plus court que demandé).
+    Fin,
+    /// Segment complet : le prochain commence `avance` secondes plus loin.
+    Suite(f64),
+}
+
+impl MesureEnCours {
+    /// Nourrir les deux accumulateurs d'un segment décodé. Synchrone, et
+    /// appelé sur le pool bloquant, jamais sur un fil de l'exécuteur.
+    fn nourrir(&mut self, decoded: super::decode::DecodedAudio, seg_seconds: f64) -> Segment {
+        #[cfg(test)]
+        tests::FILS_QUI_ONT_NOURRI
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        let sample_rate = decoded.sample_rate as usize;
+        let channels = decoded.channels as usize;
+        if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
+            return Segment::Fin; // EOF (or unreadable): done.
+        }
+
+        let scale = pcm_scale(decoded.bit_depth);
+        let samples: Vec<f64> = decoded
+            .samples_i32
+            .iter()
+            .map(|&s| s as f64 / scale)
+            .collect();
+        self.acc
+            .get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
+            .feed(&samples);
+        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
+        // dynamique ne coûte que son arithmétique.
+        self.dr
+            .get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
+            .feed(&samples);
+
+        // A segment shorter than requested means we reached the end. Advance the
+        // seek by the actual decoded duration so segments stay contiguous even if
+        // the decoder rounds the boundary.
+        let frames = decoded.samples_i32.len() / channels;
+        if (frames as f64) < seg_seconds * sample_rate as f64 {
+            return Segment::Fin;
+        }
+        Segment::Suite(frames as f64 / sample_rate as f64)
+    }
+
+    fn finir(self) -> Option<(f64, f64, f64, Option<u32>)> {
+        let (lufs, peak, true_peak) = self.acc?.finish()?;
+        // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
+        // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
+        // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
+        Some((lufs, peak, true_peak, self.dr.and_then(|d| d.finish())))
+    }
+}
+
 /// Le corps de [`mesurer_intensite_et_plage`]. `premier` : le premier segment
 /// déjà décodé (seek 0, 30 s, stéréo), ou `None` pour le décoder ici.
+///
+/// # #5519 — le calcul part sur le pool bloquant AVEC le décodage
+///
+/// Seul le décodage partait en `spawn_blocking` ; la conversion en `f64`, la
+/// pondération K, la crête vraie et la plage dynamique de chaque segment
+/// tournaient sur le fil de l'exécuteur qui attendait ce décodage. C'était le
+/// plus gros poste de la passe (0,67 s par piste sur 1,94, banc Shrek du
+/// 30/09). Or la passe lance ses fichiers « à plusieurs » DANS UNE SEULE tâche
+/// (`en_parallele_borne`) : ce calcul-là ne se parallélisait donc pas. À quatre
+/// fichiers à la fois, la passe n'allait que 1,6 fois plus vite qu'à un seul
+/// (banc étage B), et le fil de l'exécuteur restait occupé à plein — le
+/// `tokio-rt-worker` à 100 % du .18 (23/09).
+///
+/// Désormais chaque segment est décodé PUIS accumulé dans la même tâche
+/// bloquante ; les accumulateurs y entrent et en reviennent. Mêmes opérations,
+/// dans le même ordre : le résultat est identique au bit près. La frontière où
+/// la passe peut céder à la lecture (#2495) reste le segment.
 async fn mesurer_a_partir_de(
     file_path: &str,
     mut premier: Option<super::decode::DecodedAudio>,
@@ -707,8 +793,7 @@ async fn mesurer_a_partir_de(
     // — it only fires on a non-progressing decoder.
     const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
 
-    let mut acc: Option<LoudnessAccumulator> = None;
-    let mut dr: Option<DrAccumulator> = None;
+    let mut mesure = MesureEnCours::default();
     let mut seek = 0.0_f64;
 
     loop {
@@ -716,53 +801,33 @@ async fn mesurer_a_partir_de(
             warn!(file = file_path, seek, "loudness_analysis_seek_cap_hit");
             break;
         }
-        let decoded = match premier.take() {
-            Some(d) => d,
-            None => {
-                let path = file_path.to_string();
-                tokio::task::spawn_blocking(move || {
-                    super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
-                })
-                .await
-                .ok()?
-                .ok()?
-            }
-        };
-
-        let sample_rate = decoded.sample_rate as usize;
-        let channels = decoded.channels as usize;
-        if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
-            break; // EOF (or unreadable): done.
+        let path = file_path.to_string();
+        let deja_decode = premier.take();
+        let (rendue, segment) = tokio::task::spawn_blocking(move || {
+            let decoded = match deja_decode {
+                Some(d) => d,
+                None => match super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
+                {
+                    Ok(d) => d,
+                    Err(_) => return (mesure, Segment::Echec),
+                },
+            };
+            let segment = mesure.nourrir(decoded, SEG_SECONDS);
+            (mesure, segment)
+        })
+        .await
+        .ok()?;
+        mesure = rendue;
+        match segment {
+            Segment::Echec => return None,
+            Segment::Fin => break,
+            Segment::Suite(avance) => seek += avance,
         }
-
-        let scale = pcm_scale(decoded.bit_depth);
-        let samples: Vec<f64> = decoded
-            .samples_i32
-            .iter()
-            .map(|&s| s as f64 / scale)
-            .collect();
-        acc.get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
-            .feed(&samples);
-        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
-        // dynamique ne coûte que son arithmétique.
-        dr.get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
-            .feed(&samples);
-
-        // A segment shorter than requested means we reached the end. Advance the
-        // seek by the actual decoded duration so segments stay contiguous even if
-        // the decoder rounds the boundary.
-        let frames = decoded.samples_i32.len() / channels;
-        if (frames as f64) < SEG_SECONDS * sample_rate as f64 {
-            break;
-        }
-        seek += frames as f64 / sample_rate as f64;
     }
 
-    let (lufs, peak, true_peak) = acc?.finish()?;
-    // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
-    // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
-    // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
-    Some((lufs, peak, true_peak, dr.and_then(|d| d.finish())))
+    tokio::task::spawn_blocking(move || mesure.finir())
+        .await
+        .ok()?
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1101,50 @@ mod tests {
                 "{secondes} s : l'empreinte partagée diffère de empreinte_du_fichier"
             );
         }
+    }
+
+    /// Les fils sur lesquels [`MesureEnCours::nourrir`] a tourné (#5519).
+    pub(super) static FILS_QUI_ONT_NOURRI: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// #5519 — le calcul de la mesure (conversion, pondération K, crête vraie,
+    /// plage dynamique) tourne sur le pool BLOQUANT, jamais sur le fil de
+    /// l'exécuteur qui attend le décodage.
+    ///
+    /// Sur un exécuteur `current_thread`, tout ce qui est `async` tourne sur
+    /// le fil du test ; `spawn_blocking` part ailleurs. Si le calcul revenait
+    /// dans le corps `async`, il tournerait sur ce fil-ci — et la passe, qui
+    /// lance ses fichiers « à plusieurs » dans UNE tâche, ne paralléliserait
+    /// plus que le décodage (1,6× à quatre fichiers, banc du 30/09).
+    #[tokio::test(flavor = "current_thread")]
+    async fn le_calcul_de_la_mesure_ne_tourne_pas_sur_le_fil_de_l_executeur() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("module_75.wav");
+        ecrire_wav_module(&f, 75);
+        let chemin = f.to_str().unwrap();
+        let ici = std::thread::current().id();
+
+        let mesure = mesurer_intensite_et_plage(chemin).await;
+        let partagee = mesurer_intensite_plage_et_empreinte(chemin).await;
+        assert!(
+            mesure.is_some() && partagee.mesure.is_some(),
+            "les deux mesures existent"
+        );
+        assert_eq!(bits(partagee.mesure), bits(mesure));
+
+        let fils = FILS_QUI_ONT_NOURRI.lock().unwrap().clone();
+        assert!(
+            !fils.is_empty(),
+            "le témoin doit avoir vu des segments nourrir les accumulateurs"
+        );
+        assert!(
+            !fils.contains(&ici),
+            "#5519 : le calcul d'un segment a tourné sur le fil de l'exécuteur \
+             ({} segments sur {} nourris ici) — il doit partir sur le pool bloquant \
+             avec le décodage",
+            fils.iter().filter(|t| **t == ici).count(),
+            fils.len()
+        );
     }
 
     /// Un format hors du chemin partagé garde ses deux décodages : pas

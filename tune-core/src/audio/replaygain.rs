@@ -758,7 +758,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             let playing = playing || any_zone_playing(&backend);
             // Le gain d'album EST du ReplayGain : il reste coupé avec lui.
             let albums = if rg_armee {
-                passe_d_album(&backend, playing).await
+                passe_d_albums_du_tour(&backend, playing).await
             } else {
                 0
             };
@@ -800,12 +800,73 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             } else {
-                // More to do — loop again promptly (the per-file pauses
-                // already throttle the actual work).
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // More to do — loop again promptly.
+                tokio::time::sleep(pause_entre_deux_tours(&backend)).await;
             }
         }
     });
+}
+
+/// La pause de la boucle de fond entre deux tours qui ont travaillé (#5519).
+///
+/// Elle valait 2 s pour toutes les vitesses, « the per-file pauses already
+/// throttle the actual work » — or ces pauses par fichier ont été retirées
+/// (30/09). Mesurée sur Shrek (banc étage F, 500 000 pistes en base, 05/10),
+/// elle prenait 9 à 15 % du temps de la passe, et davantage à mesure que le
+/// tour raccourcit.
+///
+/// La vitesse réglée dit déjà combien l'utilisateur concède à l'analyse :
+/// « Discret » garde les 2 s d'avant, « Normal » et « Rapide » ne marquent
+/// qu'un court répit. Le verrou d'analyse (#1576) est relâché pendant ce
+/// répit, et `tokio::sync::Mutex` sert ses demandeurs dans l'ordre : le sweep
+/// acoustique qui attend son tour le prend, quelle que soit la durée.
+pub fn pause_entre_deux_tours(backend: &Arc<dyn DbBackend>) -> std::time::Duration {
+    pause_pour_la_vitesse(crate::taches_de_fond::vitesse::vitesse(backend))
+}
+
+/// [`pause_entre_deux_tours`], pour une vitesse donnée.
+pub fn pause_pour_la_vitesse(v: crate::taches_de_fond::vitesse::Vitesse) -> std::time::Duration {
+    use crate::taches_de_fond::vitesse::Vitesse;
+    match v {
+        Vitesse::Discrete => std::time::Duration::from_secs(2),
+        Vitesse::Normale | Vitesse::Rapide => std::time::Duration::from_millis(250),
+    }
+}
+
+/// Albums au plus par tour de la boucle de fond (#5519).
+///
+/// Un tour de la passe de pistes en mesure 25, soit environ deux albums
+/// complets ; la passe d'albums n'en faisait qu'UN par tour. Elle prenait donc
+/// du retard pendant toute la campagne, puis le rattrapait seule, un album par
+/// tour — tour de cascade, sélection et pause compris, soit près de 4 s par
+/// album sur une base de 500 000 pistes (banc étage F, 05/10). Pour les 33 000
+/// albums de Tades, c'étaient des heures de jauge immobile après la dernière
+/// piste.
+pub const ALBUMS_PAR_TOUR: usize = 4;
+
+/// La passe d'albums d'UN tour : jusqu'à [`ALBUMS_PAR_TOUR`] albums, tant
+/// qu'il y en a. Mêmes gardes que [`passe_d_album`], relues à chaque album.
+pub async fn passe_d_albums_du_tour(backend: &Arc<dyn DbBackend>, en_lecture: bool) -> usize {
+    albums_jusqu_a_la_borne(|| passe_d_album(backend, en_lecture)).await
+}
+
+/// La boucle de [`passe_d_albums_du_tour`], sans la base ni les gardes
+/// globales (pause, lecture) : elle se garde seule, sans dépendre de l'état
+/// que d'autres tests du processus posent.
+async fn albums_jusqu_a_la_borne<F, Fut>(mut un_album: F) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
+    let mut faits = 0;
+    for _ in 0..ALBUMS_PAR_TOUR {
+        let n = un_album().await;
+        if n == 0 {
+            break;
+        }
+        faits += n;
+    }
+    faits
 }
 
 /// Un tour de la passe d'ALBUMS, ou rien.
@@ -4536,6 +4597,74 @@ mod tests {
     /// aussitôt, mais la passe estampille quand même `rg_analyzed` et compte le
     /// fichier — c'est ce compteur qui dit combien de fichiers ont VRAIMENT été
     /// pris en charge, sans avoir à embarquer de l'audio dans le dépôt.
+    /// #5519 — un tour de la boucle fait PLUSIEURS albums, au plus
+    /// [`ALBUMS_PAR_TOUR`]. À un album par tour, la passe d'albums prenait du
+    /// retard sur la passe de pistes (deux albums complets par lot de 25) et
+    /// le rattrapait seule, à près de 4 s l'album sur une grande base.
+    ///
+    /// La BOUCLE est éprouvée sans `passe_d_album` : celle-ci lit des états
+    /// globaux du processus (pause de la tâche, zones qui jouent) que d'autres
+    /// tests de la suite posent, et rendait 0 dans la suite complète.
+    #[tokio::test]
+    async fn un_tour_fait_plusieurs_albums_jusqu_a_sa_borne() {
+        assert_eq!(ALBUMS_PAR_TOUR, 4);
+        // Six albums en attente : un tour en fait quatre, le suivant deux.
+        let mut restants = 6usize;
+        let mut un = || {
+            let n = usize::from(restants > 0);
+            restants -= n;
+            std::future::ready(n)
+        };
+        assert_eq!(
+            albums_jusqu_a_la_borne(&mut un).await,
+            4,
+            "premier tour : quatre albums, pas un seul"
+        );
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 2);
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 0);
+        // Et elle s'arrête au premier « rien » (pause, lecture, plus d'album).
+        let mut appels = 0usize;
+        let rien = || {
+            appels += 1;
+            std::future::ready(0usize)
+        };
+        assert_eq!(albums_jusqu_a_la_borne(rien).await, 0);
+        assert_eq!(appels, 1, "un seul essai quand il n'y a rien");
+    }
+
+    /// #5519 — la pause entre deux tours suit la vitesse réglée : « Discret »
+    /// garde les 2 s d'avant, « Normal » et « Rapide » un court répit.
+    #[test]
+    fn la_pause_entre_deux_tours_suit_la_vitesse() {
+        use crate::taches_de_fond::vitesse::Vitesse;
+        use std::time::Duration;
+        assert_eq!(
+            pause_pour_la_vitesse(Vitesse::Discrete),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            pause_pour_la_vitesse(Vitesse::Normale),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            pause_pour_la_vitesse(Vitesse::Rapide),
+            Duration::from_millis(250)
+        );
+        // Le réglage absent vaut « Normal ».
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                                    updated_at TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        let b: Arc<dyn DbBackend> = Arc::new(db);
+        assert_eq!(pause_entre_deux_tours(&b), Duration::from_millis(250));
+        SettingsRepo::with_backend(b.clone())
+            .set(crate::taches_de_fond::vitesse::CLE_REGLAGE, "discreet")
+            .unwrap();
+        assert_eq!(pause_entre_deux_tours(&b), Duration::from_secs(2));
+    }
+
     fn sweep_db(n: i64) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
         sweep_db_avec(n, None)
     }
