@@ -25,6 +25,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // première frontière au lieu de travailler. Un test de câblage garde la
     // ligne (`reprise_des_passes`).
     crate::reprise_des_passes::spawn(state);
+    // Fil 2137 : une gravure DR tuée par l'arrêt précédent a laissé
+    // `running` en base ; on la dit `interrupted` pour débloquer le bouton.
+    crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
     spawn_squeezebox_poller(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
@@ -39,7 +42,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
-    spawn_memory_diagnostics(state.outputs.clone(), state.streamer.clone());
+    spawn_memory_diagnostics(
+        state.outputs.clone(),
+        state.streamer.clone(),
+        state.backend.clone(),
+    );
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
@@ -495,6 +502,7 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                         media_format: None,
                         track_number: None,
                         disc_number: None,
+                        album_ref: None,
                     };
                     match orchestrator.play(req).await {
                         Ok(_) => {
@@ -2581,14 +2589,24 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// - `rss_delta_mb` : la croissance depuis le démarrage du serveur. Un seul
 ///   relevé ne dit rien ; c'est l'écart qui parle, et le lire dans la ligne
 ///   évite d'avoir à retrouver la première.
+/// - `rss_anon_mb`, `rss_file_mb`, `rss_shmem_mb` : la ventilation du RSS
+///   lue dans `/proc/self/status` ([`crate::releve_memoire`]). Le tas (anonyme)
+///   et les fichiers projetés (la base) ne se diagnostiquent pas pareil ; un
+///   champ que le noyau ne publie pas est absent de la ligne.
 ///
 /// Ce n'est PAS un correctif. Le ticket demande explicitement trois mesures du
 /// testeur avant de coder, parce qu'une fuite de lecture et une fuite de tâche
 /// de fond n'ont pas le même correctif. Ceci rend le prochain relevé
 /// exploitable, rien de plus.
+///
+/// Après le relevé, et à froid seulement, la mémoire libre que garde
+/// l'allocateur est rendue au système ([`crate::memoire_a_froid`]) : mesuré
+/// sur Shrek, 94 % du tas résident au repos était de la mémoire libre, et le
+/// relevé ne redescendait jamais.
 fn spawn_memory_diagnostics(
     outputs: Arc<tokio::sync::Mutex<OutputRegistry>>,
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
+    backend: Arc<dyn tune_core::db::backend::DbBackend>,
 ) {
     tokio::spawn(async move {
         // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
@@ -2612,18 +2630,56 @@ fn spawn_memory_diagnostics(
                 // Signé : un relevé sous la valeur de départ est une information
                 // (mémoire rendue), pas un débordement à cacher.
                 let rss_delta_mb = rss_mb as i64 - base as i64;
+                // Ventilation du RSS : un champ indisponible est omis de la
+                // ligne, jamais remplacé par un zéro.
+                let detail = crate::releve_memoire::lire().await;
                 info!(
                     rss_mb,
                     rss_delta_mb,
+                    rss_anon_mb = detail.anon_mb,
+                    rss_file_mb = detail.file_mb,
+                    rss_shmem_mb = detail.shmem_mb,
                     outputs_count = count,
                     stream_sessions,
                     "memory_diagnostics"
                 );
             }
+            purger_a_froid(&backend).await;
             let _ = (&outputs, &streamer); // keep alive on non-linux
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+/// Rend au système la mémoire libre gardée par l'allocateur, si aucune zone ne
+/// joue. Hors du fil asynchrone : le parcours des arènes prend quelques
+/// dizaines de millisecondes au pire.
+async fn purger_a_froid(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
+    // Hors glibc, rien à rendre : ne pas payer la requête des zones.
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return;
+    }
+    let backend = backend.clone();
+    let mesure = tokio::task::spawn_blocking(move || {
+        let une_zone_joue = tune_core::audio::replaygain::playing_zone_name(&backend).is_some();
+        if !crate::memoire_a_froid::purge_permise(une_zone_joue) {
+            return None;
+        }
+        let avant = crate::memoire_a_froid::rss_mb();
+        let debut = std::time::Instant::now();
+        let rendu = crate::memoire_a_froid::rendre_la_memoire_liberee();
+        let apres = crate::memoire_a_froid::rss_mb();
+        Some((avant, apres, rendu, debut.elapsed()))
+    })
+    .await;
+    if let Ok(Some((Some(avant), Some(apres), true, duree))) = mesure {
+        info!(
+            rss_avant_mb = avant,
+            rss_apres_mb = apres,
+            duree_ms = duree.as_millis() as u64,
+            "memoire_rendue_a_froid"
+        );
+    }
 }
 
 /// Periodically re-enumerate local audio devices to detect USB DACs that were

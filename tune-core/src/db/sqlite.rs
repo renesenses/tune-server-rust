@@ -33,6 +33,10 @@ pub struct SqliteDb {
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
+    /// Le repli du WAL tourne hors de la connexion d'écriture tant que ce
+    /// jeton vit ; `None` en mémoire, hors WAL, ou si le replieur n'a pas pu
+    /// s'ouvrir (voir [`crate::db::replieur_wal`]).
+    _replieur_wal: Option<crate::db::replieur_wal::Vigie>,
 }
 
 /// Une connexion de lecture EMPRUNTÉE au pool (#4800).
@@ -231,6 +235,15 @@ impl SqliteDb {
         // git reset, crash recovery, or external DB modifications).
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 
+        // Le repli du WAL, ensuite, quitte la connexion d'écriture : il la
+        // tenait le temps de copier et de synchroniser (5,4 s sur un disque
+        // lent). Hors WAL (`reliable_fs` faux), il n'y a rien à replier.
+        let replieur_wal = if reliable_fs {
+            crate::db::replieur_wal::armer(&conn, path)
+        } else {
+            None
+        };
+
         // Open a pool of read-only connections for concurrent read access
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
@@ -281,6 +294,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: replieur_wal,
         })
     }
 
@@ -300,6 +314,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: None,
         })
     }
 
@@ -469,6 +484,7 @@ impl Clone for SqliteDb {
             read_pool: self.read_pool.clone(),
             read_counter: self.read_counter.clone(),
             liberation: self.liberation.clone(),
+            _replieur_wal: self._replieur_wal.clone(),
         }
     }
 }
@@ -725,6 +741,11 @@ CREATE TABLE IF NOT EXISTS zones (
 -- local tracks (track_id set, source='local') and streaming tracks (source_id
 -- + inline metadata). Replaces the play_queue / streaming_queue split. Local
 -- display fields (title/artist/...) stay NULL and are joined from tracks.
+-- `album_ref` : référence d'album du service (`StreamTrack.album_id`) — pour
+-- Bandcamp, la page qui permet de resigner une URL de flux expirée (fil 2121).
+-- Jumelle de la migration SQLite 114 et de la PG 078. Commentaire HORS du
+-- CREATE : un commentaire entre deux colonnes casse `ALTER TABLE … DROP
+-- COLUMN` de SQLite (« incomplete input »).
 CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
@@ -739,7 +760,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     cover_url TEXT,
     duration_ms INTEGER DEFAULT 0,
     track_number INTEGER,
-    disc_number INTEGER
+    disc_number INTEGER,
+    album_ref TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);

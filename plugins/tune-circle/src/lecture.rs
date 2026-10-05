@@ -50,6 +50,7 @@ fn requete_de_lecture(
             duration_ms,
             track_number,
             disc_number,
+            album_ref,
         } => PlayRequest {
             zone_id,
             output_device_id,
@@ -62,6 +63,7 @@ fn requete_de_lecture(
             duration_ms: Some(*duration_ms),
             track_number: track_number.map(|n| n as u32),
             disc_number: disc_number.map(|n| n as u32),
+            album_ref: album_ref.clone(),
             ..Default::default()
         },
     }

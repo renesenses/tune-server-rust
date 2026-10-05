@@ -1334,6 +1334,26 @@ impl PlaybackManager {
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
+        let _ = self.play_en_rendant_le_flux_remplace(zone_id, np).await;
+    }
+
+    /// [`Self::play`], qui rend en plus la session de flux de la lecture
+    /// qu'elle REMPLACE, lue sous le même verrou que l'écriture.
+    ///
+    /// Ticket 134 : trois « suivant » rapprochés. Chaque
+    /// `play_inner` notait la session à fermer à son DÉPART. Les deux
+    /// dernières lectures ont donc noté la même (celle de la première) ; la
+    /// session de la deuxième, remplacée par la troisième, n'a été fermée par
+    /// personne. Son décodeur est resté bloqué sur un canal plein jusqu'au
+    /// délai d'envoi (300 s alors, 1 800 s depuis #4917).
+    ///
+    /// `None` quand rien n'était en lecture, quand la lecture remplacée
+    /// n'avait pas de session, ou quand c'est la même session.
+    pub async fn play_en_rendant_le_flux_remplace(
+        &self,
+        zone_id: i64,
+        np: NowPlaying,
+    ) -> Option<String> {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
             zone_id,
@@ -1417,6 +1437,11 @@ impl PlaybackManager {
         state.browser_unattended_at = None;
         // np is no longer read after this — the event payload is built from
         // `state` via now_playing_event_data() below — so move instead of clone.
+        let flux_remplace = state
+            .now_playing
+            .as_ref()
+            .and_then(|ancienne| ancienne.stream_id.clone())
+            .filter(|ancien| np.stream_id.as_deref() != Some(ancien.as_str()));
         state.now_playing = Some(np);
         // Nouveau morceau → nouvel ancrage temporel de métadonnée.
         state.metadata_changed_at_ms = Some(epoch_ms());
@@ -1435,6 +1460,7 @@ impl PlaybackManager {
             zone_id,
             data,
         });
+        flux_remplace
     }
 
     pub async fn pause(&self, zone_id: i64) {
@@ -2034,6 +2060,32 @@ impl PlaybackManager {
             zone_id,
             data: serde_json::json!({ "position_ms": position_ms }),
         });
+    }
+
+    /// Fil 2062 / #5550 — pose une durée sur la piste en cours qui n'en avait
+    /// pas, et l'annonce (`track_changed`) pour que l'interface l'affiche.
+    /// Sans effet sur une piste dont la durée est déjà connue.
+    pub async fn adopter_la_duree_rapportee(&self, zone_id: i64, duration_ms: i64) -> bool {
+        if duration_ms <= 0 {
+            return false;
+        }
+        let data = {
+            let mut zones = self.zones.lock().await;
+            let Some(state) = zones.get_mut(&zone_id) else {
+                return false;
+            };
+            let Some(np) = state.now_playing.as_mut().filter(|np| np.duration_ms <= 0) else {
+                return false;
+            };
+            np.duration_ms = duration_ms;
+            now_playing_event_data(state)
+        };
+        self.emit(PlaybackEvent {
+            event: "track_changed".into(),
+            zone_id,
+            data,
+        });
+        true
     }
 
     /// Update the NowPlaying metadata for a zone without resetting position.

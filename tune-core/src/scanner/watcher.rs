@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use notify::event::ModifyKind;
@@ -49,19 +50,134 @@ pub struct FileChange {
 
 pub struct FileWatcher {
     watcher: Option<RecommendedWatcher>,
-    /// Secondary watcher for network mounts, where the native backend gets no
-    /// events for remote changes. Built lazily, only when such a dir exists.
-    poll_watcher: Option<PollWatcher>,
+    /// Les racines réseau sondées, une sonde (`PollWatcher`) par racine — le
+    /// moteur natif ne reçoit rien des changements faits par une autre machine
+    /// sur un partage SMB/NFS. Voir [`Sondage`] : une sonde n'y entre qu'une
+    /// fois son relevé initial terminé, en tâche de fond.
+    sondage: Arc<Sondage>,
     event_tx: mpsc::Sender<FileChange>,
     event_rx: std::sync::Mutex<mpsc::Receiver<FileChange>>,
     /// Dirs currently watched by the native watcher.
     dirs: Vec<PathBuf>,
-    /// Dirs currently watched by the poll watcher (network mounts).
-    poll_dirs: Vec<PathBuf>,
     /// Requested dirs not currently watched (missing/unmounted at the time).
     /// `ensure_watches` retries them so a NAS mounted after boot — or
     /// remounted after a drop — gets picked up without a restart.
     pending: Vec<PathBuf>,
+}
+
+/// Les sondes des racines réseau, partagées avec les fils qui les amorcent.
+///
+/// `PollWatcher::watch` PARCOURT TOUT L'ARBRE avant de rendre la main : il y
+/// relève la date et la taille de chaque fichier pour comparer les passages
+/// suivants. Sur un grand partage SMB, ce relevé dure des minutes (Pierre M :
+/// 6 min 43 pour `K:\`). Il se faisait dans `FileWatcher::new`, donc AVANT la
+/// boucle du surveillant : tant qu'il durait, aucun changement n'était traité,
+/// même sur les racines locales déjà suivies par le moteur natif, et
+/// `auto_scan` jetait ensuite comme « rejoués » les événements accumulés
+/// entre-temps.
+///
+/// Le relevé d'une racine réseau part donc sur son propre fil : la sonde
+/// n'entre ici qu'une fois prête, et les racines locales sont suivies dès la
+/// création du surveillant. (Défaut relevé en instruisant le fil forum 2148 ;
+/// rien n'établit que c'est lui qui a retardé le surveillant de ce testeur.)
+#[derive(Default)]
+struct Sondage {
+    /// Sondes prêtes : leur relevé initial est fait, elles comparent.
+    pretes: Mutex<Vec<(PathBuf, PollWatcher)>>,
+    /// Racines dont le relevé initial est en cours sur un fil à part.
+    en_amorce: Mutex<Vec<PathBuf>>,
+    /// Racines dont la sonde n'a pas pu être posée : elles reviennent au
+    /// moteur natif, comme avant (`poll_watch_failed`).
+    repli_natif: Mutex<Vec<PathBuf>>,
+    /// Posé par `stop` : une amorce qui se termine après ne pose rien.
+    arrete: AtomicBool,
+}
+
+fn verrou<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Épreuves : simuler une racine réseau sur un système de fichiers local, et
+/// retenir son relevé initial aussi longtemps qu'on veut.
+#[cfg(test)]
+mod simulation_reseau {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex};
+
+    pub(super) static RACINES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    pub(super) static RETENUES: (Mutex<Vec<PathBuf>>, Condvar) =
+        (Mutex::new(Vec::new()), Condvar::new());
+
+    pub(super) fn simulee(dir: &Path) -> bool {
+        RACINES.lock().unwrap().iter().any(|r| r == dir)
+    }
+
+    pub(super) fn attendre_la_liberation(dir: &Path) {
+        let (verrou, signal) = &RETENUES;
+        let mut retenues = verrou.lock().unwrap();
+        while retenues.iter().any(|r| r == dir) {
+            retenues = signal.wait(retenues).unwrap();
+        }
+    }
+
+    pub(super) fn liberer(dir: &Path) {
+        let (verrou, signal) = &RETENUES;
+        verrou.lock().unwrap().retain(|r| r != dir);
+        signal.notify_all();
+    }
+}
+
+fn est_une_racine_reseau(dir: &Path) -> bool {
+    #[cfg(test)]
+    if simulation_reseau::simulee(dir) {
+        return true;
+    }
+    is_network_path(dir)
+}
+
+/// Le relevé initial d'une racine réseau, sur son propre fil (voir
+/// [`Sondage`]). Il peut durer des heures sur un grand partage SMB.
+fn amorcer_la_sonde(sondage: Arc<Sondage>, event_tx: mpsc::Sender<FileChange>, dir: PathBuf) {
+    let fil = std::thread::Builder::new()
+        .name("tune-sonde-reseau".into())
+        .spawn({
+            let sondage = sondage.clone();
+            let dir = dir.clone();
+            move || {
+                #[cfg(test)]
+                simulation_reseau::attendre_la_liberation(&dir);
+                let debut = std::time::Instant::now();
+                let sonde = PollWatcher::new(
+                    make_event_handler(event_tx),
+                    Config::default().with_poll_interval(NETWORK_POLL_INTERVAL),
+                )
+                .and_then(|mut pw| pw.watch(&dir, RecursiveMode::Recursive).map(|()| pw));
+                verrou(&sondage.en_amorce).retain(|d| d != &dir);
+                match sonde {
+                    Ok(pw) if !sondage.arrete.load(Ordering::Acquire) => {
+                        info!(
+                            dir = %dir.display(),
+                            interval_secs = NETWORK_POLL_INTERVAL.as_secs(),
+                            releve_ms = debut.elapsed().as_millis() as u64,
+                            "watching_directory_poll — network mount, using polling"
+                        );
+                        verrou(&sondage.pretes).push((dir, pw));
+                    }
+                    // Surveillant arrêté pendant le relevé : la sonde est
+                    // abandonnée (son `Drop` arrête son fil).
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(dir = %dir.display(), error = %e, "poll_watch_failed — falling back to native watch");
+                        verrou(&sondage.repli_natif).push(dir);
+                    }
+                }
+            }
+        });
+    if let Err(e) = fil {
+        warn!(dir = %dir.display(), error = %e, "poll_watch_failed — falling back to native watch");
+        verrou(&sondage.en_amorce).retain(|d| d != &dir);
+        verrou(&sondage.repli_natif).push(dir);
+    }
 }
 
 /// Shared notify event handler: translate raw events into FileChange messages.
@@ -293,19 +409,30 @@ impl FileWatcher {
 
         let mut this = Self {
             watcher: Some(watcher),
-            poll_watcher: None,
+            sondage: Arc::new(Sondage::default()),
             event_tx: tx,
             event_rx: std::sync::Mutex::new(rx),
             dirs: Vec::new(),
-            poll_dirs: Vec::new(),
             pending: requested.clone(),
         };
         this.ensure_watches();
 
-        if this.dirs.is_empty() && this.poll_dirs.is_empty() && !requested.is_empty() {
+        // Une racine réseau dont le relevé est en cours compte comme suivie :
+        // elle le sera dès que sa sonde sera prête.
+        let sondees =
+            !verrou(&this.sondage.pretes).is_empty() || !verrou(&this.sondage.en_amorce).is_empty();
+        if this.dirs.is_empty() && !sondees && !requested.is_empty() {
             return Err("no music directory could be watched".to_string());
         }
         Ok(this)
+    }
+
+    /// Les racines réseau dont la sonde est prête (relevé initial terminé).
+    pub fn racines_sondees(&self) -> Vec<PathBuf> {
+        verrou(&self.sondage.pretes)
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect()
     }
 
     /// Try to watch every pending dir, and detect watched dirs whose mount
@@ -330,52 +457,49 @@ impl FileWatcher {
             }
         }
         self.dirs = still_watched;
-        let mut still_polled = Vec::new();
-        for dir in std::mem::take(&mut self.poll_dirs) {
-            if std::fs::read_dir(&dir).is_ok() {
-                still_polled.push(dir);
-            } else {
-                warn!(dir = %dir.display(), "watch_dir_lost — unmounted or unreadable, will re-watch when it returns");
-                if let Some(w) = self.poll_watcher.as_mut() {
-                    let _ = w.unwatch(&dir);
+        {
+            let mut pretes = verrou(&self.sondage.pretes);
+            let mut still_polled = Vec::new();
+            for (dir, mut pw) in std::mem::take(&mut *pretes) {
+                if std::fs::read_dir(&dir).is_ok() {
+                    still_polled.push((dir, pw));
+                } else {
+                    warn!(dir = %dir.display(), "watch_dir_lost — unmounted or unreadable, will re-watch when it returns");
+                    let _ = pw.unwatch(&dir);
+                    self.pending.push(dir);
                 }
-                self.pending.push(dir);
             }
+            *pretes = still_polled;
         }
-        self.poll_dirs = still_polled;
+
+        // Une sonde qui n'a pas pu être posée : la racine revient au moteur
+        // natif, sans repasser par la sonde.
+        let repli: Vec<PathBuf> = std::mem::take(&mut *verrou(&self.sondage.repli_natif));
 
         // Retry pending dirs.
-        for dir in std::mem::take(&mut self.pending) {
+        let a_reprendre: Vec<(PathBuf, bool)> = std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|d| (d, false))
+            .chain(repli.into_iter().map(|d| (d, true)))
+            .collect();
+        for (dir, natif_impose) in a_reprendre {
             if std::fs::read_dir(&dir).is_err() {
                 self.pending.push(dir);
                 continue;
             }
-            if is_network_path(&dir) {
+            if !natif_impose && est_une_racine_reseau(&dir) {
                 // Native backends receive no events for changes made by other
-                // machines on an SMB/NFS share — poll instead.
-                if self.poll_watcher.is_none() {
-                    match PollWatcher::new(
-                        make_event_handler(self.event_tx.clone()),
-                        Config::default().with_poll_interval(NETWORK_POLL_INTERVAL),
-                    ) {
-                        Ok(pw) => self.poll_watcher = Some(pw),
-                        Err(e) => {
-                            warn!(error = %e, "poll_watcher_init_failed — falling back to native watch");
-                        }
-                    }
+                // machines on an SMB/NFS share — poll instead. Le relevé
+                // initial de la sonde part sur son propre fil (fil 2148) :
+                // il ne retient ni la création du surveillant ni sa boucle.
+                let mut en_amorce = verrou(&self.sondage.en_amorce);
+                if !en_amorce.contains(&dir) {
+                    en_amorce.push(dir.clone());
+                    drop(en_amorce);
+                    info!(dir = %dir.display(), "watching_directory_poll_amorce — network mount, baseline walk in background");
+                    amorcer_la_sonde(self.sondage.clone(), self.event_tx.clone(), dir);
                 }
-                if let Some(pw) = self.poll_watcher.as_mut() {
-                    match pw.watch(&dir, RecursiveMode::Recursive) {
-                        Ok(()) => {
-                            info!(dir = %dir.display(), interval_secs = NETWORK_POLL_INTERVAL.as_secs(), "watching_directory_poll — network mount, using polling");
-                            self.poll_dirs.push(dir);
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(dir = %dir.display(), error = %e, "poll_watch_failed — falling back to native watch");
-                        }
-                    }
-                }
+                continue;
             }
             if let Some(w) = self.watcher.as_mut() {
                 match w.watch(&dir, RecursiveMode::Recursive) {
@@ -441,10 +565,9 @@ impl FileWatcher {
                 let _ = w.unwatch(dir);
             }
         }
-        if let Some(mut w) = self.poll_watcher.take() {
-            for dir in &self.poll_dirs {
-                let _ = w.unwatch(dir);
-            }
+        self.sondage.arrete.store(true, Ordering::Release);
+        for (dir, mut pw) in std::mem::take(&mut *verrou(&self.sondage.pretes)) {
+            let _ = pw.unwatch(&dir);
         }
         info!("file_watcher_stopped");
     }
@@ -866,6 +989,124 @@ mod tests {
         }
 
         watcher.stop();
+    }
+
+    /// Fil forum 2148 — le relevé initial d'une racine RÉSEAU ne retient plus
+    /// le surveillant. `PollWatcher::watch` parcourt tout l'arbre avant de
+    /// rendre la main ; fait dans `FileWatcher::new`, ce parcours retardait
+    /// d'autant la boucle du surveillant, dossiers locaux compris. Ici le
+    /// relevé est RETENU indéfiniment : la création doit rendre la main quand
+    /// même, la racine locale doit être suivie, et la sonde n'entre en service
+    /// qu'une fois son relevé libéré.
+    #[test]
+    fn le_releve_d_une_racine_reseau_ne_retient_ni_la_creation_ni_les_racines_locales_2148() {
+        let racine = crate::test_scratch::scratch_dir("watcher-releve-reseau-2148");
+        let locale = racine.join("locale");
+        let reseau = racine.join("partage");
+        fs::create_dir_all(&locale).unwrap();
+        fs::create_dir_all(&reseau).unwrap();
+        fs::write(reseau.join("deja-la.flac"), b"x").unwrap();
+        simulation_reseau::RACINES
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+        simulation_reseau::RETENUES
+            .0
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+
+        let dirs = vec![
+            reseau.to_string_lossy().to_string(),
+            locale.to_string_lossy().to_string(),
+        ];
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(FileWatcher::new(dirs));
+        });
+        let cree = rx.recv_timeout(Duration::from_secs(20));
+        // Libérer AVANT d'affirmer : un échec ne doit pas laisser de fil
+        // suspendu derrière lui.
+        simulation_reseau::liberer(&reseau);
+        let mut watcher = cree
+            .expect(
+                "🔴 fil 2148 — FileWatcher::new attend la fin du relevé initial \
+                 de la racine réseau : la boucle du surveillant ne démarre pas, \
+                 et aucune racine locale n'est suivie pendant ce temps",
+            )
+            .expect("le surveillant se crée");
+        assert!(
+            watcher.dirs.contains(&locale),
+            "la racine locale est suivie par le moteur natif dès la création : {:?}",
+            watcher.dirs
+        );
+        assert!(
+            !watcher.dirs.contains(&reseau),
+            "la racine réseau n'est pas confiée au moteur natif : {:?}",
+            watcher.dirs
+        );
+
+        // Le relevé libéré, la sonde entre en service.
+        let limite = std::time::Instant::now() + Duration::from_secs(20);
+        while !watcher.racines_sondees().contains(&reseau) {
+            assert!(
+                std::time::Instant::now() < limite,
+                "la sonde de la racine réseau n'est jamais entrée en service"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Un second passage de `ensure_watches` ne relance pas d'amorce.
+        watcher.ensure_watches();
+        assert_eq!(
+            watcher
+                .racines_sondees()
+                .iter()
+                .filter(|d| **d == reseau)
+                .count(),
+            1,
+            "une seule sonde par racine réseau"
+        );
+        assert!(verrou(&watcher.sondage.en_amorce).is_empty());
+        watcher.stop();
+        assert!(
+            watcher.racines_sondees().is_empty(),
+            "stop retire les sondes"
+        );
+    }
+
+    /// Fil forum 2148 — un surveillant arrêté pendant le relevé initial d'une
+    /// racine réseau ne voit pas cette sonde se poser après coup.
+    #[test]
+    fn un_releve_qui_finit_apres_l_arret_ne_pose_aucune_sonde_2148() {
+        let racine = crate::test_scratch::scratch_dir("watcher-releve-apres-arret-2148");
+        let reseau = racine.join("partage");
+        fs::create_dir_all(&reseau).unwrap();
+        simulation_reseau::RACINES
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+        simulation_reseau::RETENUES
+            .0
+            .lock()
+            .unwrap()
+            .push(reseau.clone());
+
+        let mut watcher = FileWatcher::new(vec![reseau.to_string_lossy().to_string()])
+            .expect("une racine réseau en cours de relevé compte comme suivie");
+        watcher.stop();
+        simulation_reseau::liberer(&reseau);
+        let limite = std::time::Instant::now() + Duration::from_secs(20);
+        while !verrou(&watcher.sondage.en_amorce).is_empty() {
+            assert!(
+                std::time::Instant::now() < limite,
+                "le relevé ne s'est pas terminé"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            watcher.racines_sondees().is_empty(),
+            "une sonde finie après l'arrêt ne doit pas se poser"
+        );
     }
 
     /// #5168 — un `foo_dr.txt` posé ou réécrit dans un dossier d'album doit

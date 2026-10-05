@@ -233,6 +233,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // base existante ou la colonne est deja TEXT, cet ADD est un no-op et c'est
     // la migration 047 qui la convertit.
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id BIGINT",
+    // Fil 2130 — l'index de `album_id` (PG 079), JUSTE APRÈS la colonne : la
+    // 079 le saute quand la colonne n'existe pas encore (base neuve, où seul
+    // ce tableau la pose), et une base de bascule (`schema_version = 99`) ne
+    // rejoue jamais la 079. Sans lui, « Reprendre l'écoute » reste juste mais
+    // lent.
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)",
     // BIGINT, pas TEXT : `profiles.id` est BIGINT et `history_repo` filtre par
     // `profile_id = <entier>`. En TEXT, PostgreSQL rend `operator does not
     // exist: text = bigint` et l'historique du profil rend une liste vide.
@@ -272,6 +278,16 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // 077, alors que `tag_item` nomme la colonne. TEXT comme côté SQLite, NULL
     // pour l'existant.
     "ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT",
+    // #4991 (b) — marque « déjà tenté, rien trouvé » de l'identification en
+    // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
+    // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
+    "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
+    // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
+    // même raison : une base de bascule ne rejouera jamais la 078, alors que
+    // l'écriture de la file, des favoris et de l'historique nomme la colonne.
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
+    "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT",
 ];
 
 #[derive(Clone)]

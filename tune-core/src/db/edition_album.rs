@@ -341,6 +341,20 @@ pub fn tenir_la_disposition(
     figer(db, album_id, &heritage)
 }
 
+/// Fil 2094 — après que des noms de disque ont été posés sur un album DÉJÀ
+/// composé (rattrapage des coffrets) : si sa disposition est tenue, elle est
+/// retenue à nouveau depuis les pistes actuelles, noms de disque compris, et
+/// ses renommages de pistes sont repris. Sinon la relecture des fichiers
+/// rendrait à chaque disque le nom retenu AVANT, c'est-à-dire aucun. Un
+/// album sans disposition tenue n'est pas touché : on n'en crée pas.
+pub fn retenir_les_noms_de_disque(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<(), TuneError> {
+    let tenue = lire_edition(db, album_id)?;
+    if !tenue.disposition {
+        return Ok(());
+    }
+    figer(db, album_id, &[&tenue])
+}
+
 // ---------------------------------------------------------------------------
 // Les TENUES — ce que les analyses n'écrasent plus
 // ---------------------------------------------------------------------------
@@ -1499,6 +1513,11 @@ pub fn defaire_coffret_manuel(
             ne_plus_tenir(db, album_id, "title")?;
         }
     }
+    // Fil 2094 — les sous-titres que la composition avait posés.
+    let rendus: Vec<i64> = std::iter::once(album_id)
+        .chain(recrees.iter().copied())
+        .collect();
+    super::coffrets_auto::retirer_les_sous_titres(db, &rendus, &marqueur)?;
     AlbumMetadataRepo::with_backend(db.clone()).delete(album_id, CLE_COFFRET)?;
 
     // Plus de disposition tenue ; les renommages de pistes suivent la piste.
@@ -1548,6 +1567,8 @@ struct Balises {
     annee: Option<i32>,
     genre: Option<String>,
     label: Option<String>,
+    /// #5616 — le type de sortie de la balise (`RELEASETYPE` et variantes).
+    type_de_sortie: Option<String>,
     disque: Option<i32>,
     numero: Option<i32>,
     nom_disque: Option<String>,
@@ -1592,6 +1613,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 }),
                 genre: non_vide(a.genre.clone()),
                 label: None,
+                type_de_sortie: None,
                 disque: Some(1),
                 numero: Some(p.numero as i32),
                 nom_disque: None,
@@ -1608,6 +1630,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 annee: m.year.map(|y| y as i32).filter(|y| *y > 0),
                 genre: non_vide(m.genre),
                 label: non_vide(m.label),
+                type_de_sortie: m.release_type,
                 disque: m.disc_number.map(|d| d as i32),
                 numero: m.track_number.map(|n| n as i32),
                 nom_disque: non_vide(m.disc_subtitle),
@@ -1655,8 +1678,9 @@ pub const CHAMPS_RETABLISSABLES: [&str; 9] = [
 ///   piste qui ouvre l'album (disque, puis numéro). Sans balise, `year`,
 ///   `label` et `genre` sont vidés ; `title` et `album_artist` gardent leur
 ///   valeur — un album a toujours un titre et un artiste.
-/// - `release_type` : aucune balise ne le porte ; il est vidé, et
-///   l'enrichissement pourra le reposer.
+/// - `release_type` : la valeur de la balise `RELEASETYPE` (et variantes,
+///   #5616) ; sans balise, il est vidé, et l'enrichissement pourra le
+///   reposer.
 /// - `compilation_mode` : le mode revient à `auto` (la règle juge).
 /// - `tracks` : titres et artistes de pistes renommés reprennent ceux des
 ///   balises. La disposition des disques, si elle est tenue, reste.
@@ -1805,7 +1829,11 @@ pub fn retablir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(
                 "title" => ("title", "title", texte(|b| b.album.clone())),
                 "label" => ("label", "label", texte(|b| b.label.clone())),
                 "genre" => ("genre", "genre", texte(|b| b.genre.clone())),
-                "release_type" => ("release_type", "release_type", None),
+                "release_type" => (
+                    "release_type",
+                    "release_type",
+                    texte(|b| b.type_de_sortie.clone()),
+                ),
                 "year" => ("year", "year", None),
                 _ => ("artist", "artist_id", None),
             };

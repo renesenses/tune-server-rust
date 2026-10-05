@@ -403,6 +403,11 @@ pub(super) struct AdoptionHorloge {
     /// flux (≈ le débit de lecture) ou s'il ne fait que le garder en tampon
     /// (≈ rien) — la position gelée ne le dit pas.
     pub(super) octets_a_l_adoption: Option<u64>,
+    /// #5411 — le flux de la piste FINIE, celle que l'écran vient de
+    /// quitter. Un renderer qui le nomme encore pendant la surveillance la
+    /// rejoue : son mouvement ne confirme rien
+    /// ([`decisions::suite_de_l_adoption`]).
+    pub(super) flux_fini: Option<String>,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

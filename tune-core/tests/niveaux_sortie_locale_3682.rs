@@ -233,6 +233,7 @@ impl Banc {
                 media_format: Some(f.format.into()),
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             })
             .await?;
         self.playback

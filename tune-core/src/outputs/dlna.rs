@@ -146,6 +146,32 @@ pub const URI_RESTEE_VIDE_PREFIX: &str =
 /// acquittement, et la zone « jouait » une piste que le renderer n'avait
 /// jamais reçue.
 pub(crate) const SOAP_HTTP_SANS_CORPS_PREFIX: &str = "soap http sans corps:";
+
+/// Tête des erreurs « le renderer a REFUSÉ le `Seek` » : une faute SOAP
+/// (701 « Transition not available », 710 « Seek mode not supported »,
+/// 711 « Illegal seek target »…) en réponse au `Seek`.
+///
+/// La commande a été reçue et rejetée : la position de l'appareil n'a pas
+/// bougé. L'orchestrateur ne déplace donc pas la position publique, et
+/// `PlaybackOrchestrator::dire_deplacement_refuse` reconnaît cette tête pour
+/// le dire à l'interface.
+pub const SEEK_REFUSE_PREFIX: &str = "seek refusé par le renderer:";
+
+/// L'erreur rendue par `DlnaOutput::seek` pour une faute SOAP : la tête
+/// [`SEEK_REFUSE_PREFIX`], puis le code UPnP et son sens.
+pub(crate) fn refus_de_seek(response: &str) -> String {
+    let code = extract_tag(response, "errorCode");
+    let motif = match code.as_deref().map(str::trim) {
+        Some("701") => "transition impossible pour l'instant",
+        Some("710") => "mode de déplacement non pris en charge",
+        Some("711") => "position hors de portée",
+        _ => "commande refusée",
+    };
+    format!(
+        "{SEEK_REFUSE_PREFIX} code UPnP {} ({motif})",
+        code.as_deref().unwrap_or("inconnu")
+    )
+}
 /// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
 /// Kept short (2s) because we don't need the response — SetAVTransportURI
 /// implicitly stops the current track on compliant renderers.
@@ -2364,11 +2390,28 @@ impl OutputTarget for DlnaOutput {
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         let target = Self::format_time(position_ms);
-        self.av_action(
-            "Seek",
-            &format!("<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"),
-        )
-        .await?;
+        let response = self
+            .av_action(
+                "Seek",
+                &format!(
+                    "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"
+                ),
+            )
+            .await?;
+        // Même modèle que pause/resume (#4258) : une faute SOAP est un REFUS,
+        // pas un acquittement. Avant, un 701/710/711 passait pour un succès,
+        // l'ancre bougeait et l'interface affichait une position que
+        // l'appareil n'avait jamais prise.
+        if faute_commande_soap(&response) {
+            let refus = refus_de_seek(&response);
+            warn!(
+                device = %self.name,
+                position_ms,
+                upnp_code = extract_tag(&response, "errorCode").as_deref().unwrap_or("unknown"),
+                "dlna_seek_refuse"
+            );
+            return Err(refus);
+        }
         // Seul déplacement que le mode silence voit tout de suite : celui qui
         // passe par Tune. Celui fait sur la façade de l'appareil attendra le
         // prochain évènement — c'est le prix annoncé de l'option.

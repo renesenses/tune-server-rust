@@ -112,6 +112,13 @@ pub struct TrackMetadata {
     pub musicbrainz_artist_id: Option<String>,
     pub musicbrainz_album_artist_id: Option<String>,
     pub musicbrainz_release_group_id: Option<String>,
+    /// #5616 — le type de sortie PRIMAIRE lu dans la balise du fichier
+    /// (`RELEASETYPE`, `TXXX:MusicBrainz Album Type`, `----:com.apple.iTunes:
+    /// MusicBrainz Album Type`, `MUSICBRAINZ_ALBUMTYPE`), dans le vocabulaire
+    /// de `albums.release_type`. Voir
+    /// [`crate::metadata::release_type::depuis_valeurs_de_tag`].
+    #[serde(default)]
+    pub release_type: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
     /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
@@ -492,11 +499,21 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
         // exactement le défaut d'origine sous un autre nom.
         "mp4" | "m4a" => {
             // ALAC (Apple Lossless) files in M4A containers report a bit depth
-            // (typically 16 or 24), while AAC (lossy) does not.
+            // (typically 16 or 24).
+            //
+            // 🔴 Fil 2126 (#5710) — SANS profondeur, rien n'est mesuré : ni
+            // lofty ni cette fonction ne savent si c'est de l'AAC. Ce bras
+            // rendait « aac » par défaut, et un album ALAC que lofty et
+            // symphonia ne savaient pas lire s'affichait « LOSSY AAC », 0
+            // canal. Il rend désormais « m4a » : le CONTENEUR, codec non
+            // déterminé (`AudioFormat::M4a`, #3605), la valeur que
+            // `tagless_fallback_no_props` écrit déjà. Seule la sonde
+            // (`probe_m4a_props`) écrit « aac » ou « alac », quand elle a lu le
+            // codec.
             if bit_depth.is_some() {
                 "alac".to_string()
             } else {
-                "aac".to_string()
+                "m4a".to_string()
             }
         }
         // lofty may report "alac" directly for some M4A files
@@ -542,9 +559,25 @@ pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> 
         })
 }
 
+/// [`probe_m4a_props`] pour le SCANNER : un échec de la sonde est journalisé
+/// (`m4a_sonde_echouee`, avec le chemin), et l'appelant garde le format
+/// « m4a » — conteneur, codec non déterminé — au lieu d'un « aac » inventé
+/// (fil 2126, #5710).
+fn sonder_m4a_pour_le_scan(path: &std::path::Path) -> Option<(String, Option<u16>)> {
+    let sonde = probe_m4a_props(path);
+    if sonde.is_none() {
+        tracing::warn!(
+            path = %path.display(),
+            "m4a_sonde_echouee : codec non lu (ni lofty ni symphonia), format \
+             enregistré « m4a » (conteneur, codec non déterminé), pas « aac »"
+        );
+    }
+    sonde
+}
+
 fn probe_m4a_props_inner(path: &std::path::Path) -> Option<(String, Option<u16>)> {
     use symphonia::core::codecs::CodecParameters;
-    use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+    use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC};
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
@@ -566,12 +599,20 @@ fn probe_m4a_props_inner(path: &std::path::Path) -> Option<(String, Option<u16>)
 
     // Match on the codec id (0x2003 for ALAC) rather than a Debug string — the
     // Debug form of the codec parameters doesn't spell out "Alac".
+    //
+    // 🔴 Fil 2126 — « aac » seulement quand le codec LU est l'AAC. Une piste
+    // sans paramètres audio, ou d'un codec que symphonia n'identifie pas,
+    // n'a PAS été analysée : elle rend « m4a » (conteneur, codec non
+    // déterminé), et non plus « aac » par défaut.
     let params = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p,
-        _ => return Some(("aac".to_string(), None)),
+        _ => return Some(("m4a".to_string(), None)),
     };
-    if params.codec != CODEC_ID_ALAC {
+    if params.codec == CODEC_ID_AAC {
         return Some(("aac".to_string(), None));
+    }
+    if params.codec != CODEC_ID_ALAC {
+        return Some(("m4a".to_string(), None));
     }
 
     let bit_depth = params
@@ -1987,6 +2028,12 @@ fn dsf_dff_fallback_complete(
     } else {
         (None, None, None, None, None, None)
     };
+    // #5616 — `TXXX:MusicBrainz Album Type` (Picard), même vocabulaire.
+    let mb_release_type = id3_tags
+        .as_ref()
+        .and_then(|tags| tags.get_txxx("MusicBrainz Album Type"))
+        .and_then(|v| release_type::depuis_valeurs_de_tag([v]))
+        .map(|t| t.primaire.as_str().to_string());
 
     Some(TrackMetadata {
         title,
@@ -2024,6 +2071,7 @@ fn dsf_dff_fallback_complete(
         musicbrainz_artist_id: mb_artist_id,
         musicbrainz_album_artist_id: mb_album_artist_id,
         musicbrainz_release_group_id: mb_release_group_id,
+        release_type: mb_release_type,
         isrc,
         has_cover,
         cover_art: None,
@@ -2099,6 +2147,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2242,6 +2291,15 @@ pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u3
         Some(d) => Some(d),
         None => tag,
     }
+}
+
+/// #5616 — le type de sortie que porte un tag lofty, toutes valeurs lues
+/// (Vorbis en porte une par champ, ID3v2.4 les sépare par un nul).
+fn type_de_sortie_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
+    release_type::depuis_valeurs_de_tag(
+        tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
+    )
+    .map(|t| t.primaire.as_str().to_string())
 }
 
 /// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
@@ -2452,10 +2510,11 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     let mut probed_bit_depth: Option<u16> = None;
     let format = {
         let mut fmt = normalize_format(&ext, props.bit_depth());
-        if fmt == "aac"
+        // « m4a » : conteneur sans profondeur, codec à sonder (fil 2126).
+        if fmt == "m4a"
             && (ext == "m4a" || ext == "mp4")
             && props.bit_depth().is_none()
-            && let Some((probed, bd)) = probe_m4a_props(path)
+            && let Some((probed, bd)) = sonder_m4a_pour_le_scan(path)
         {
             fmt = probed;
             probed_bit_depth = bd;
@@ -2511,6 +2570,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2617,6 +2677,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2691,6 +2752,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_artist_id: None,
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
+        release_type: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -3489,6 +3551,8 @@ mod coffret_multicanal_tests_4846;
 
 #[cfg(test)]
 mod label_tests_4836;
+#[cfg(test)]
+mod type_de_sortie_tests_5616;
 
 /// Les balises d'un fichier, lues par lofty sans charger les images.
 ///
@@ -3690,7 +3754,9 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let m4a_probe = if (file_ext == "m4a" || file_ext == "mp4" || file_ext == "m4b")
         && props.bit_depth().is_none()
     {
-        probe_m4a_props(path)
+        // Sonde en échec : `normalize_format` rend alors « m4a », jamais
+        // « aac » (fil 2126).
+        sonder_m4a_pour_le_scan(path)
     } else {
         None
     };
@@ -3833,6 +3899,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_artist_id: get(ItemKey::MusicBrainzArtistId),
         musicbrainz_album_artist_id: get(ItemKey::MusicBrainzReleaseArtistId),
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
+        release_type: type_de_sortie_de_la_balise(tag),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         // Capture the embedded cover from this same lofty pass so the scanner
@@ -3884,6 +3951,22 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     };
 
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
+    // #5160 — une clé de crédit REPÉTABLE. Vorbis (et APE, MP4) écrivent un
+    // interprète par trame : `PERFORMER=A (bass)`, `PERFORMER=B (drums)`.
+    // `get_string` ne rend que la première, et les suivantes étaient perdues à
+    // l'ingestion. Toutes les trames sont gardées, dans l'ordre du fichier,
+    // jointes par « ; » — le séparateur que la route des crédits découpe déjà
+    // (`routes/library/credits.rs`). Une trame unique est rendue telle quelle,
+    // `;` compris. Les doublons exacts et les trames vides sont écartés.
+    let toutes = |key: ItemKey| -> Option<String> {
+        let mut valeurs: Vec<&str> = Vec::new();
+        for v in tag.get_strings(key).map(str::trim) {
+            if !v.is_empty() && !valeurs.contains(&v) {
+                valeurs.push(v);
+            }
+        }
+        (!valeurs.is_empty()).then(|| valeurs.join("; "))
+    };
 
     // Sort-order fields
     if let Some(v) = get(ItemKey::TrackArtistSortOrder) {
@@ -3906,7 +3989,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Lyricist) {
         meta.insert("lyricist".into(), v);
     }
-    if let Some(v) = get(ItemKey::Performer) {
+    if let Some(v) = toutes(ItemKey::Performer) {
         meta.insert("performer".into(), v);
     }
     if let Some(v) = get(ItemKey::Remixer) {
@@ -3915,7 +3998,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
-    if let Some(v) = get(ItemKey::Producer) {
+    if let Some(v) = toutes(ItemKey::Producer) {
         meta.insert("producer".into(), v);
     }
 
@@ -4722,6 +4805,72 @@ mod tests {
         assert_eq!(clean.title.as_deref(), Some("A B"));
         assert_eq!(clean.artist.as_deref(), Some("Artist"));
         assert_eq!(corrections.len(), 2);
+    }
+
+    /// Fil 2126 (#5710) — un `.m4a` dont le codec ne se lit pas n'est PAS
+    /// enregistré « aac ».
+    ///
+    /// Le fichier : l'ALAC de référence (`tests/fixtures/alac`), balisé, dont
+    /// l'entrée d'échantillon `alac` de la boîte `stsd` est renommée en un
+    /// code que ni lofty ni symphonia ne connaissent — la forme du défaut
+    /// d'Yves : étiquettes lisibles, description audio illisible, 0 canal.
+    /// Avant le correctif, ce fichier sortait « aac » ; il sort « m4a »,
+    /// conteneur, codec non déterminé.
+    #[test]
+    fn un_m4a_dont_la_sonde_echoue_n_est_pas_aac() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/alac/ref_16_44100_stereo.m4a"
+        );
+        let mut octets = std::fs::read(fixture).unwrap();
+        // L'entrée de la `stsd` : taille sur 4 octets puis `alac`, juste après
+        // l'en-tête de la `stsd` (taille, `stsd`, version+drapeaux, compte).
+        let stsd = octets
+            .windows(4)
+            .position(|w| w == b"stsd")
+            .expect("la fixture porte une boîte stsd");
+        let entree = stsd + 4 + 4 + 4 + 4;
+        assert_eq!(
+            &octets[entree..entree + 4],
+            b"alac",
+            "la fixture a changé : l'entrée de la stsd n'est plus `alac`"
+        );
+        octets[entree..entree + 4].copy_from_slice(b"zzzz");
+
+        let dossier = tempfile::TempDir::new().unwrap();
+        let chemin = dossier.path().join("01 - Piste.m4a");
+        std::fs::write(&chemin, &octets).unwrap();
+
+        // Témoin du banc : l'ALAC n'est plus reconnu sur ce fichier.
+        assert!(
+            !matches!(probe_m4a_props(&chemin), Some((ref f, _)) if f == "alac"),
+            "la sonde ne doit plus reconnaître l'ALAC sur ce fichier"
+        );
+        let meta = read_metadata(&chemin).expect("les étiquettes restent lisibles");
+        assert_ne!(
+            meta.format.as_deref(),
+            Some("aac"),
+            "un .m4a dont le codec n'a pas été lu est enregistré « aac » — \
+             c'est le « LOSSY AAC » du fil 2126"
+        );
+        assert_eq!(
+            meta.format.as_deref(),
+            Some("m4a"),
+            "attendu : le conteneur, codec non déterminé"
+        );
+    }
+
+    /// Contre-témoin : l'ALAC de référence intact reste « alac » — le
+    /// correctif ne touche que ce qui n'a pas été lu.
+    #[test]
+    fn un_alac_lisible_reste_alac() {
+        let fixture = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/alac/ref_16_44100_stereo.m4a"
+        ));
+        let meta = read_metadata(fixture).expect("fixture lisible");
+        assert_eq!(meta.format.as_deref(), Some("alac"));
+        assert_eq!(meta.bit_depth, Some(16));
     }
 
     #[test]
@@ -5639,11 +5788,19 @@ mod tests {
         }
     }
 
+    /// Fil 2126 (#5710) — sans profondeur de bits, le codec d'un MP4 n'est
+    /// PAS connu : c'était « aac » par défaut, d'où un album ALAC illisible
+    /// affiché « LOSSY AAC ». C'est le conteneur, « m4a » : seule la sonde
+    /// (`probe_m4a_props`) dit « aac » ou « alac ».
     #[test]
-    fn normalize_format_mp4_aac_no_bit_depth() {
-        // AAC (lossy) in M4A container: lofty reports no bit depth
-        assert_eq!(normalize_format("mp4", None), "aac");
-        assert_eq!(normalize_format("m4a", None), "aac");
+    fn normalize_format_mp4_sans_profondeur_n_est_pas_aac() {
+        assert_eq!(normalize_format("mp4", None), "m4a");
+        assert_eq!(normalize_format("m4a", None), "m4a");
+        assert_eq!(
+            crate::audio::formats::AudioFormat::from_extension(&normalize_format("mp4", None)),
+            Some(crate::audio::formats::AudioFormat::M4a),
+            "la valeur écrite doit être reconnue : conteneur MP4, codec non déterminé"
+        );
     }
 
     #[test]
@@ -7088,6 +7245,107 @@ mod tests_drapeau_compilation {
             try_read_metadata(&faux).unwrap().compilation,
             Some(false),
             "cpil=0 doit rendre faux"
+        );
+    }
+}
+
+/// #5160 — des trames PERFORMER et PRODUCER RÉPÉTÉES, sans « ; », sur un vrai
+/// FLAC (la fixture du dépôt, retaguée par lofty) relu par la fonction de
+/// production. Avant le correctif, seule la première trame de chaque clé
+/// entrait dans `track_metadata`.
+#[cfg(test)]
+mod credits_repetes_5160 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+
+    /// Une copie de la fixture FLAC portant les trames données, une par
+    /// entrée, dans cet ordre.
+    fn flac_avec_trames(
+        epreuve: &str,
+        trames: &[(&str, &str)],
+    ) -> crate::test_scratch::ScratchFile {
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let copie =
+            crate::test_scratch::scratch_file(&format!("credits5160-{epreuve}"), "-test.flac");
+        std::fs::copy(&source, &copie).expect("copie du gabarit");
+        let chemin: &std::path::Path = &copie;
+        let mut fh = std::fs::File::open(chemin).expect("ouverture du gabarit");
+        let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+        drop(fh);
+        if flac.vorbis_comments().is_none() {
+            flac.set_vorbis_comments(VorbisComments::default());
+        }
+        let vc = flac.vorbis_comments_mut().expect("bloc Vorbis Comment");
+        for (cle, valeur) in trames {
+            // `push` et non `insert` : `insert` REMPLACE la trame existante,
+            // et le témoin n'aurait plus qu'une valeur à relire.
+            vc.push((*cle).to_string(), (*valeur).to_string());
+        }
+        flac.save_to_path(chemin, WriteOptions::default())
+            .expect("écriture du tag");
+        copie
+    }
+
+    #[test]
+    fn les_trames_repetees_sans_point_virgule_sont_toutes_gardees() {
+        let chemin = flac_avec_trames(
+            "repetees",
+            &[
+                ("PERFORMER", "Christian McBride (bass)"),
+                ("PERFORMER", "Nasheet Waits (drums)"),
+                ("PRODUCER", "Christian McBride"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)"),
+            "#5160 — la seconde trame PERFORMER est perdue. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Christian McBride; Todd Whitelock"),
+            "#5160 — la seconde trame PRODUCER est perdue. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN VERT — une trame unique qui porte déjà ses « ; » sort telle
+    /// quelle : le format de Reivax66 (fil 1965) ne bouge pas.
+    #[test]
+    fn une_trame_unique_avec_point_virgule_sort_intacte() {
+        let chemin = flac_avec_trames(
+            "unique",
+            &[(
+                "PERFORMER",
+                "Christian McBride (bass); Nasheet Waits (drums)",
+            )],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("performer").map(String::as_str),
+            Some("Christian McBride (bass); Nasheet Waits (drums)")
+        );
+        assert_eq!(meta.get("producer"), None, "aucun producteur inventé");
+    }
+
+    /// Une trame répétée à l'identique ne fabrique pas un doublon.
+    #[test]
+    fn une_trame_dupliquee_ne_se_compte_qu_une_fois() {
+        let chemin = flac_avec_trames(
+            "doublon",
+            &[
+                ("PRODUCER", "Todd Whitelock"),
+                ("PRODUCER", "Todd Whitelock"),
+            ],
+        );
+        let meta = super::read_extended_metadata(&chemin);
+        assert_eq!(
+            meta.get("producer").map(String::as_str),
+            Some("Todd Whitelock")
         );
     }
 }

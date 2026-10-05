@@ -140,8 +140,9 @@ fn jouer(serveur: &ServeurMultimediaFactice, dac: &Peripherique) -> Lecture {
         "un FLAC n'est pas un WAV : c'est bien la branche compressée"
     );
 
-    let (dec_ch, dec_sr, echantillons) =
-        decode_compressed_stream(&octets).expect("le FLAC se décode");
+    let (dec_ch, dec_sr, echantillons) = decode_compressed_stream(&octets, &AtomicBool::new(false))
+        .expect("le FLAC se décode")
+        .expect("aucun arrêt n'a été demandé");
 
     let defaut = dac.defaut_sr.map(|sr| config_de_flux(dec_ch, sr));
     let enumeree = if dac.defaut_sr == Some(dec_sr) || !dac.annonce_la_source {

@@ -1100,3 +1100,213 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         "local_audio_asio_exclusive_stopped"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// #5643, lot C — le DSD natif.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Ce que `play_url` confie au bras DSD natif : un flux `audio::dsd_brut`
+/// dont l'en-tête est déjà lu.
+pub(super) struct EntreesDsdNatif {
+    pub(super) device_name: String,
+    pub(super) url: String,
+    pub(super) entete: crate::audio::dsd_brut::EnteteDsdBrut,
+    /// Les octets lus avec l'en-tête : ce qui suit `ENTETE_LEN` est le début
+    /// du flux DSD.
+    pub(super) header_buf: Vec<u8>,
+    pub(super) reader: super::LecteurHttpAnnulable,
+    /// Le producteur a déjà appliqué le déplacement : la position de départ
+    /// n'est qu'un affichage, aucun octet n'est sauté ici.
+    pub(super) seek_offset: u64,
+    pub(super) my_generation: u64,
+    pub(super) paused: Arc<AtomicBool>,
+    pub(super) playing: Arc<AtomicBool>,
+    pub(super) force_silent: Arc<AtomicBool>,
+    pub(super) stop_rx: std::sync::mpsc::Receiver<()>,
+    pub(super) open_failure: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) position_ms: Arc<AtomicU64>,
+    pub(super) play_generation: Arc<AtomicU64>,
+    pub(super) track_ended_naturally: Arc<AtomicBool>,
+    pub(super) track_ended_generation: Arc<AtomicU64>,
+    pub(super) dop_active: Arc<AtomicBool>,
+    pub(super) chain_exhausted: Arc<AtomicBool>,
+}
+
+/// Joue un flux DSD brut sur le pilote ASIO basculé en DSD natif, jusqu'à la
+/// fin du flux ou l'ordre d'arrêt. Terminal.
+///
+/// Rien ne touche aux octets : pas de volume, pas de ReplayGain, pas d'EQ,
+/// de convolution ni de crossfeed — le DSD natif n'a pas d'échantillon PCM à
+/// traiter. Pas d'enchaînement sans blanc non plus : la piste suivante
+/// rouvre le pilote (`chain_exhausted` est levé dès l'ouverture).
+pub(super) fn jouer_dsd_natif_via_asio(entrees: EntreesDsdNatif) {
+    use crate::outputs::asio_exclusive::AsioDsdNatifOutput;
+
+    let EntreesDsdNatif {
+        device_name,
+        url,
+        entete,
+        header_buf,
+        reader,
+        seek_offset,
+        my_generation,
+        paused,
+        playing,
+        force_silent,
+        stop_rx,
+        open_failure,
+        position_ms,
+        play_generation,
+        track_ended_naturally,
+        track_ended_generation,
+        dop_active,
+        chain_exhausted,
+    } = entrees;
+    let canaux = usize::from(entete.canaux);
+
+    // Aucun DoP ici : l'état d'une piste précédente ne doit pas survivre.
+    dop_active.store(false, Ordering::SeqCst);
+
+    let sortie = match AsioDsdNatifOutput::ouvrir(
+        &device_name,
+        entete.cadence,
+        entete.canaux,
+        paused.clone(),
+    )
+    .and_then(|mut s| s.start().map(|()| s))
+    {
+        Ok(s) => s,
+        Err(erreur) => {
+            // Le pilote avait déclaré cette cadence au sondage : on la
+            // retire, la piste suivante partira en DoP au lieu d'échouer
+            // encore.
+            crate::outputs::capacite_dsd_natif::oublier_cadence(&device_name, entete.cadence);
+            if play_generation.load(Ordering::SeqCst) == my_generation {
+                RefusDOuverture::OuvertureExclusiveRefusee {
+                    backend: "ASIO",
+                    erreur,
+                }
+                .rapporter(&device_name, &open_failure);
+                playing.store(false, Ordering::SeqCst);
+            } else {
+                warn!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_stale_exclusive_open_failure_ignored"
+                );
+            }
+            return;
+        }
+    };
+    if doit_declarer_chaine_epuisee(
+        force_silent.load(Ordering::Relaxed),
+        play_generation.load(Ordering::SeqCst),
+        my_generation,
+    ) {
+        chain_exhausted.store(true, Ordering::SeqCst);
+    }
+    info!(
+        device = %device_name,
+        url = %url,
+        cadence = entete.cadence,
+        canaux,
+        "local_audio_asio_dsd_natif_playing"
+    );
+    note_opened_device("ASIO", &device_name, sortie.opened_device_name(), None);
+
+    let anneau = sortie.anneau().clone();
+    let etat_de_l_anneau = || (anneau.disponible(), anneau.contenance());
+    let mut source = SourcePompee::demarrer(reader, &etat_de_l_anneau);
+
+    // Ce qui suit l'en-tête dans la première lecture, puis le flux.
+    let mut en_attente: Vec<u8> = header_buf
+        .get(crate::audio::dsd_brut::ENTETE_LEN..)
+        .unwrap_or_default()
+        .to_vec();
+    let mut octets_par_canal: u64 = 0;
+    let mut tampon = vec![0u8; 65536];
+    let mut fin_de_flux = false;
+    'alimentation: loop {
+        // Pousse les trames entières en attente, en attendant la place.
+        while en_attente.len() >= canaux {
+            if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+                break 'alimentation;
+            }
+            let entier = en_attente.len() - en_attente.len() % canaux;
+            let n = anneau.pousser_trames(&en_attente[..entier], canaux);
+            if n == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            en_attente.drain(..n);
+            octets_par_canal += (n / canaux) as u64;
+            // La position publiée suit ce qui est JOUÉ : alimenté moins ce
+            // qui attend encore dans l'anneau.
+            let joue = octets_par_canal.saturating_sub((anneau.disponible() / canaux) as u64);
+            position_ms.store(
+                seek_offset + entete.ms_pour_octets_par_canal(joue),
+                Ordering::Relaxed,
+            );
+        }
+        if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+            break;
+        }
+        match source.read(&mut tampon) {
+            Ok(0) => {
+                fin_de_flux = true;
+                break;
+            }
+            Ok(n) => en_attente.extend_from_slice(&tampon[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => {
+                warn!(error = %e, device = %device_name, "local_audio_asio_dsd_natif_read_error");
+                break;
+            }
+        }
+    }
+    drop(source);
+
+    if fin_de_flux {
+        track_ended_naturally.store(true, Ordering::SeqCst);
+        track_ended_generation.store(my_generation, Ordering::SeqCst);
+        TRACK_END_NOTIFY.notify_one();
+        // Laisser jouer ce que l'anneau retient, borné : deux fois sa durée,
+        // et abandon si rien ne bouge en 1,5 s (pilote figé).
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut dernier = anneau.disponible();
+        let mut progres = std::time::Instant::now();
+        while anneau.disponible() > 0 && std::time::Instant::now() < echeance {
+            if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+                break;
+            }
+            let dispo = anneau.disponible();
+            if dispo < dernier {
+                dernier = dispo;
+                progres = std::time::Instant::now();
+            } else if progres.elapsed() >= std::time::Duration::from_millis(1500) {
+                warn!(device = %device_name, restant = dispo, "asio_dsd_natif_drain_timeout");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        position_ms.store(
+            seek_offset + entete.ms_pour_octets_par_canal(octets_par_canal),
+            Ordering::Relaxed,
+        );
+    }
+
+    // Rend le pilote : retour au PCM, puis le verrou de périphérique.
+    drop(sortie);
+    if play_generation.load(Ordering::SeqCst) == my_generation {
+        playing.store(false, Ordering::SeqCst);
+    }
+    info!(
+        device = %device_name,
+        octets_par_canal,
+        "local_audio_asio_dsd_natif_stopped"
+    );
+}

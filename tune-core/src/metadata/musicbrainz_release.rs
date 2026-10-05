@@ -639,6 +639,266 @@ pub fn titre_de_requete(titre: &str) -> Option<String> {
     Some(courant.to_string())
 }
 
+/// Les noms de compositeurs qui, placés EN TÊTE d'un titre d'album
+/// (`Beethoven: Symphony No. 9`, `Chopin - Nocturnes`), font échouer la
+/// recherche MusicBrainz (#4805).
+///
+/// Le style des balises classiques met le compositeur devant l'œuvre ; celui
+/// de MusicBrainz le met dans le crédit d'artiste (`Beethoven; Berliner
+/// Philharmoniker, Herbert von Karajan`) et titre l'œuvre seule (`Symphony
+/// no. 9`). La requête Lucene cherche la phrase entière du titre : un seul mot
+/// de trop, et elle rend zéro pressage. Vérifié le 05/10/2026 contre
+/// MusicBrainz : `release:"Beethoven: Symphony No. 9" AND artist:"Herbert von
+/// Karajan"` → 0 ; sans le préfixe → 22.
+///
+/// Comparés au DERNIER mot du préfixe normalisé (`J.S. Bach` → `bach`,
+/// `Ludwig van Beethoven` → `beethoven`), avec et sans diacritiques. La liste
+/// ne sert qu'à reconnaître un préfixe : elle ne décide d'aucune identification,
+/// [`plausible`] juge toujours l'artiste.
+const COMPOSITEURS_EN_PREFIXE: &[&str] = &[
+    "albeniz",
+    "albéniz",
+    "albinoni",
+    "bach",
+    "bartok",
+    "bartók",
+    "beethoven",
+    "bellini",
+    "berlioz",
+    "bernstein",
+    "bizet",
+    "borodin",
+    "brahms",
+    "britten",
+    "bruch",
+    "bruckner",
+    "buxtehude",
+    "byrd",
+    "charpentier",
+    "chopin",
+    "copland",
+    "corelli",
+    "couperin",
+    "debussy",
+    "delius",
+    "donizetti",
+    "dowland",
+    "dukas",
+    "dvorak",
+    "dvořák",
+    "elgar",
+    "falla",
+    "faure",
+    "fauré",
+    "franck",
+    "gershwin",
+    "glazunov",
+    "glinka",
+    "gluck",
+    "gorecki",
+    "górecki",
+    "gounod",
+    "granados",
+    "grieg",
+    "handel",
+    "händel",
+    "haendel",
+    "haydn",
+    "hindemith",
+    "holst",
+    "honegger",
+    "janacek",
+    "janáček",
+    "liszt",
+    "lully",
+    "mahler",
+    "massenet",
+    "mendelssohn",
+    "messiaen",
+    "monteverdi",
+    "mozart",
+    "mussorgsky",
+    "moussorgski",
+    "offenbach",
+    "orff",
+    "paganini",
+    "pärt",
+    "pergolesi",
+    "poulenc",
+    "prokofiev",
+    "prokofieff",
+    "puccini",
+    "purcell",
+    "rachmaninov",
+    "rachmaninoff",
+    "rameau",
+    "ravel",
+    "respighi",
+    "rimskykorsakov",
+    "rossini",
+    "saintsaens",
+    "saintsaëns",
+    "satie",
+    "scarlatti",
+    "schoenberg",
+    "schönberg",
+    "schubert",
+    "schumann",
+    "schutz",
+    "schütz",
+    "scriabin",
+    "shostakovich",
+    "chostakovitch",
+    "sibelius",
+    "smetana",
+    "stravinsky",
+    "strawinsky",
+    "tchaikovsky",
+    "tchaïkovski",
+    "tchaikovski",
+    "telemann",
+    "verdi",
+    "vivaldi",
+    "wagner",
+    "weber",
+];
+
+/// Les séparateurs entre un préfixe (artiste, compositeur) et le titre.
+const SEPARATEURS_DE_PREFIXE: &[&str] = &[": ", " - ", " – ", " — "];
+
+/// Retire UN préfixe de tête — `Pink Floyd - The Wall`, `Beethoven: Symphony
+/// No. 9` — quand ce préfixe est l'ARTISTE interrogé ou un compositeur connu.
+///
+/// Un préfixe quelconque reste en place : `Smash the System: Singles and More`
+/// ou `Back To Mine - Talvin Singh` sont des titres entiers. Rend `None` quand
+/// il n'y a rien à retirer.
+fn retire_un_prefixe(titre: &str, artiste: &str) -> Option<String> {
+    let (pos, sep) = SEPARATEURS_DE_PREFIXE
+        .iter()
+        .filter_map(|s| titre.find(s).map(|p| (p, *s)))
+        .min_by_key(|(p, _)| *p)?;
+    let prefixe = normalize(&titre[..pos]);
+    let reste = titre[pos + sep.len()..].trim();
+    if prefixe.is_empty() || reste.is_empty() {
+        return None;
+    }
+    let artiste = normalize(artiste);
+    let est_l_artiste = !artiste.is_empty() && prefixe == artiste;
+    // Un compositeur se nomme en un à quatre mots : au-delà, c'est une phrase.
+    let mots: Vec<&str> = prefixe.split_whitespace().collect();
+    let est_un_compositeur = mots.len() <= 4
+        && mots
+            .last()
+            .is_some_and(|dernier| COMPOSITEURS_EN_PREFIXE.contains(dernier));
+    if est_l_artiste || est_un_compositeur {
+        Some(reste.to_string())
+    } else {
+        None
+    }
+}
+
+/// [`titre_de_requete`], plus le préfixe de tête quand c'est l'artiste
+/// interrogé ou un compositeur (#4805).
+///
+/// Deux formes de balises que la recherche par phrase ne retrouve pas :
+/// `Artiste - Album` (le nom du dossier recopié dans la balise d'album) et
+/// `Compositeur: Œuvre` (le style des balises classiques). Comme pour les
+/// suffixes, seule la REQUÊTE change : la donnée stockée n'est jamais
+/// réécrite.
+pub fn titre_de_requete_pour(titre: &str, artiste: &str) -> Option<String> {
+    let mut courant = titre.trim().to_string();
+    for _ in 0..6 {
+        match retire_un_suffixe(&courant).or_else(|| retire_un_prefixe(&courant, artiste)) {
+            Some(plus_court) => courant = plus_court,
+            None => break,
+        }
+    }
+    let courant = courant.trim();
+    if courant.is_empty() || courant == titre.trim() {
+        return None;
+    }
+    Some(courant.to_string())
+}
+
+/// Les artistes d'album qui désignent une COMPILATION sous un autre nom que
+/// celui de MusicBrainz, `Various Artists` (#4805). Normalisés par
+/// [`normalize`]. `Various` seul est absent : Lucene le retrouve déjà dans
+/// `Various Artists`.
+const ALIAS_DE_COMPILATION: &[&str] = &[
+    "va",
+    "v a",
+    "various artist",
+    "artistes divers",
+    "artistes variés",
+    "artistes varies",
+    "divers",
+    "divers artistes",
+    "multi artistes",
+    "multiartistes",
+    "compilation",
+    "verschiedene",
+    "verschiedene interpreten",
+    "varios artistas",
+    "vários artistas",
+    "artisti vari",
+];
+
+/// Les artistes qui n'en sont pas : ce que pose un logiciel d'extraction ou
+/// notre scanner quand la balise manque (#4805). Normalisés par [`normalize`].
+const ARTISTES_FICTIFS: &[&str] = &[
+    "unknown",
+    "unknown artist",
+    "artiste inconnu",
+    "inconnu",
+    "no artist",
+    "sans artiste",
+    "unbekannter künstler",
+    "artista desconocido",
+];
+
+/// `true` pour un artiste qui n'en est pas (`Unknown Artist`, chaîne vide…).
+pub fn est_un_artiste_fictif(nom: &str) -> bool {
+    let n = normalize(nom);
+    n.is_empty() || ARTISTES_FICTIFS.contains(&n.as_str())
+}
+
+/// L'artiste à mettre dans la requête MusicBrainz d'un album (#4805).
+///
+/// - un alias de compilation (`VA`, `Artistes divers`…) devient `Various
+///   Artists`, le nom sous lequel MusicBrainz crédite les compilations ;
+/// - un artiste fictif (`Unknown Artist`, `Artiste inconnu`…) cède la place à
+///   celui des pistes, quand elles en portent un vrai ;
+/// - sinon, l'artiste de l'album tel quel, à défaut celui des pistes.
+///
+/// Ne change que la REQUÊTE. Quand rien de mieux n'est connu, l'artiste
+/// d'origine est rendu tel quel : la recherche se comporte alors comme avant.
+pub fn artiste_de_requete(artiste_album: Option<&str>, artiste_pistes: Option<&str>) -> String {
+    let canonique = |nom: &str| -> String {
+        if ALIAS_DE_COMPILATION.contains(&normalize(nom).as_str()) {
+            "Various Artists".to_string()
+        } else {
+            nom.trim().to_string()
+        }
+    };
+    match (artiste_album, artiste_pistes) {
+        (Some(a), _) if !est_un_artiste_fictif(a) => canonique(a),
+        (_, Some(p)) if !est_un_artiste_fictif(p) => canonique(p),
+        (Some(a), _) => a.trim().to_string(),
+        (None, Some(p)) => p.trim().to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// La requête Lucene d'une recherche de pressage : la phrase du titre, et
+/// celle de l'artiste quand il est connu.
+fn requete_lucene(titre: &str, artiste: &str) -> String {
+    let mut query_parts = vec![format!("release:\"{titre}\"")];
+    if !artiste.trim().is_empty() {
+        query_parts.push(format!("artist:\"{artiste}\""));
+    }
+    query_parts.join(" AND ")
+}
+
 /// Every plausible release for an album, for the user to choose from.
 ///
 /// The query is deliberately loose — only title and artist. Constraining on the
@@ -747,15 +1007,9 @@ where
     let fetch = (limit * 3).clamp(10, 100);
 
     // La requête Lucene. `interroge` porte le titre ENVOYÉ à MusicBrainz ; le
-    // tri de plausibilité, lui, juge toujours contre `title`, celui de la
+    // tri de plausibilité juge d'abord contre `title`, celui de la
     // bibliothèque.
-    let requete = |interroge: &str| -> String {
-        let mut query_parts = vec![format!("release:\"{interroge}\"")];
-        if !artist.trim().is_empty() {
-            query_parts.push(format!("artist:\"{artist}\""));
-        }
-        query_parts.join(" AND ")
-    };
+    let requete = |interroge: &str| -> String { requete_lucene(interroge, artist) };
 
     let mut candidates = match interroger(requete(title), fetch).await {
         Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
@@ -772,9 +1026,11 @@ where
     // Second essai, et seulement sur échec : le titre débarrassé de son suffixe
     // de pressage. Mesuré à +15,4 points sur le .18 (#4805). Le coût — une
     // requête de 1,1 s — n'est payé que par le tiers d'albums qui a échoué, et
-    // pas du tout quand il n'y a rien à retirer.
+    // pas du tout quand il n'y a rien à retirer. Depuis le 05/10/2026, le
+    // préfixe de tête s'en va aussi quand c'est l'artiste ou un compositeur
+    // (`Pink Floyd - The Wall`, `Beethoven: Symphony No. 9`).
     let second_essai = if candidates.is_empty() {
-        titre_de_requete(title)
+        titre_de_requete_pour(title, artist)
     } else {
         None
     };
@@ -786,7 +1042,17 @@ where
         );
         rate_limit_delay().await;
         candidates = match interroger(requete(&nettoye), fetch).await {
-            Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
+            // Plausible face au titre d'origine d'abord. À défaut, face au
+            // titre interrogé : un préfixe retiré n'est plus inclus dans le
+            // pressage (`Bach: Goldberg Variations` face à `The Goldberg
+            // Variations`), alors que l'œuvre et l'artiste, eux, concordent.
+            Ok(data) => {
+                let mut trouves = parse_search_results(&data, title, artist);
+                if trouves.is_empty() {
+                    trouves = parse_search_results(&data, &nettoye, artist);
+                }
+                rank_candidates(trouves, track_hint)
+            }
             Err(refus) => {
                 debug!(title = title, refus = %refus, "mb_release_candidates_refus");
                 return RechercheDePressages::refusee(refus);
@@ -1665,4 +1931,204 @@ mod tests {
         assert!(!recherche.service_refuse());
         assert!(recherche.candidats.is_empty());
     }
+
+    // -- #4805, 05/10/2026 : préfixe de tête et artiste de requête --
+
+    /// Les deux formes de préfixe que la recherche par phrase ne retrouve pas.
+    #[test]
+    fn titre_de_requete_pour_retire_le_prefixe_d_artiste_ou_de_compositeur() {
+        for (brut, artiste, attendu) in [
+            ("Pink Floyd - The Wall", "Pink Floyd", "The Wall"),
+            (
+                "Beethoven: Symphony No. 9",
+                "Herbert von Karajan",
+                "Symphony No. 9",
+            ),
+            ("Chopin - Nocturnes", "Maria João Pires", "Nocturnes"),
+            (
+                "J.S. Bach: Goldberg Variations",
+                "Glenn Gould",
+                "Goldberg Variations",
+            ),
+            (
+                "Saint-Saëns – Carnaval des animaux",
+                "Martha Argerich",
+                "Carnaval des animaux",
+            ),
+            // Préfixe ET suffixe, dans les deux ordres possibles de retrait.
+            ("Pink Floyd - Animals (Remastered)", "Pink Floyd", "Animals"),
+        ] {
+            assert_eq!(
+                titre_de_requete_pour(brut, artiste).as_deref(),
+                Some(attendu),
+                "le préfixe de « {brut} » n'a pas été retiré"
+            );
+        }
+    }
+
+    /// Un préfixe qui n'est ni l'artiste ni un compositeur fait partie du
+    /// titre : `Smash the System: Singles and More` reste entier.
+    #[test]
+    fn titre_de_requete_pour_garde_un_prefixe_qui_fait_partie_du_titre() {
+        for (propre, artiste) in [
+            ("Smash the System: Singles and More", "Saint Etienne"),
+            ("Back To Mine - Talvin Singh", "Talvin Singh"),
+            (
+                "The Best of Miles Davis & John Coltrane: 1955-1961",
+                "Miles Davis",
+            ),
+            ("Kind of Blue", "Miles Davis"),
+            ("Pink Floyd -", "Pink Floyd"),
+        ] {
+            assert_eq!(
+                titre_de_requete_pour(propre, artiste),
+                None,
+                "« {propre} » a été amputé alors que son préfixe fait partie du titre"
+            );
+        }
+    }
+
+    /// Sans préfixe, le comportement de #4805 (suffixes) est inchangé.
+    #[test]
+    fn titre_de_requete_pour_garde_le_nettoyage_des_suffixes() {
+        assert_eq!(
+            titre_de_requete_pour("Somethin' Else (192kHz/24bit)", "Cannonball Adderley")
+                .as_deref(),
+            Some("Somethin' Else")
+        );
+        assert_eq!(
+            titre_de_requete_pour(
+                "Radio Nova - La boite Jaune - 1992, Disc 12",
+                "Various Artists"
+            )
+            .as_deref(),
+            Some("Radio Nova - La boite Jaune - 1992")
+        );
+    }
+
+    #[test]
+    fn artiste_de_requete_nomme_les_compilations_comme_musicbrainz() {
+        for alias in [
+            "VA",
+            "V.A.",
+            "Artistes divers",
+            "Varios Artistas",
+            "Compilation",
+        ] {
+            assert_eq!(
+                artiste_de_requete(Some(alias), None),
+                "Various Artists",
+                "{alias}"
+            );
+        }
+        assert_eq!(
+            artiste_de_requete(Some("Various Artists"), None),
+            "Various Artists"
+        );
+        // Un vrai nom n'est jamais réécrit, même court.
+        assert_eq!(artiste_de_requete(Some("Air"), None), "Air");
+        assert_eq!(artiste_de_requete(Some("Divers Gens"), None), "Divers Gens");
+    }
+
+    #[test]
+    fn artiste_de_requete_prefere_l_artiste_des_pistes_a_un_artiste_fictif() {
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), Some("Air")),
+            "Air"
+        );
+        assert_eq!(
+            artiste_de_requete(Some("Artiste inconnu"), Some("Björk")),
+            "Björk"
+        );
+        assert_eq!(artiste_de_requete(Some(""), Some("Air")), "Air");
+        assert_eq!(artiste_de_requete(None, Some("VA")), "Various Artists");
+        // Rien de mieux : l'artiste d'origine, comme avant.
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), Some("Unknown Artist")),
+            "Unknown Artist"
+        );
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), None),
+            "Unknown Artist"
+        );
+        assert_eq!(artiste_de_requete(None, None), "");
+        // Un vrai artiste d'album n'est jamais remplacé par celui des pistes.
+        assert_eq!(
+            artiste_de_requete(Some("Miles Davis"), Some("John Coltrane")),
+            "Miles Davis"
+        );
+    }
+
+    /// Le préfixe retiré, le pressage de MusicBrainz n'est plus inclus dans le
+    /// titre d'origine (`The Goldberg Variations` face à `Bach: Goldberg
+    /// Variations`). Le second essai juge alors contre le titre interrogé.
+    #[tokio::test(start_paused = true)]
+    async fn le_second_essai_juge_aussi_contre_le_titre_interroge() {
+        let requetes = std::cell::RefCell::new(Vec::<String>::new());
+        let recherche = recherche_de_pressages(
+            "Bach: Goldberg Variations",
+            "Glenn Gould",
+            Some(32),
+            5,
+            |requete, _fetch| {
+                requetes.borrow_mut().push(requete.clone());
+                let premier = requetes.borrow().len() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Ok(reponse_avec_un_pressage(
+                            "The Goldberg Variations",
+                            "Bach; Glenn Gould",
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            requetes.borrow().last().map(String::as_str),
+            Some("release:\"Goldberg Variations\" AND artist:\"Glenn Gould\"")
+        );
+        assert_eq!(
+            recherche.candidats.len(),
+            1,
+            "le pressage de l'œuvre a été écarté"
+        );
+    }
+
+    /// Et l'artiste reste jugé : un autre interprète de la même œuvre ne passe
+    /// pas, même au second essai.
+    #[tokio::test(start_paused = true)]
+    async fn le_second_essai_juge_toujours_l_artiste() {
+        let appels = std::cell::Cell::new(0usize);
+        let recherche = recherche_de_pressages(
+            "Bach: Goldberg Variations",
+            "Glenn Gould",
+            Some(32),
+            5,
+            |_requete, _fetch| {
+                appels.set(appels.get() + 1);
+                let premier = appels.get() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Ok(reponse_avec_un_pressage(
+                            "Goldberg Variations",
+                            "Bach; András Schiff",
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(appels.get(), 2);
+        assert!(recherche.candidats.is_empty());
+    }
 }
+
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_4805.rs"]
+mod banc_4805;

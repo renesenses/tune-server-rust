@@ -57,6 +57,27 @@ fn frame_aligned_chunk_len(preferred: usize, bit_depth: u16, channels: u16) -> u
     if aligned == 0 { frame } else { aligned }
 }
 
+/// Nombre d'échantillons entrelacés d'une fenêtre de `max_duration_s`
+/// secondes, arrondi à un nombre ENTIER de trames (fil 2133).
+///
+/// L'ancien calcul `(durée × débit × canaux) as usize` arrondissait le
+/// produit entier : une piste CUE de 263,346 s en stéréo 44,1 kHz donnait
+/// 23 227 117 échantillons, un nombre impair, et la découpe vers un fichier
+/// temporaire (zone Sonos) échouait ensuite dans
+/// `validate_channel_adaptation` (« PCM sample count … is not aligned to 2
+/// source channels »). On arrondit d'abord en trames, puis on multiplie par
+/// les canaux, comme le chemin DSD le faisait déjà.
+///
+/// `max_duration_s <= 0.0` est la convention « pas de limite » : `usize::MAX`.
+pub(crate) fn echantillons_de_la_fenetre(max_duration_s: f64, rate: u32, channels: u32) -> usize {
+    if max_duration_s > 0.0 {
+        let trames = (max_duration_s * f64::from(rate)) as usize;
+        trames.saturating_mul(channels.max(1) as usize)
+    } else {
+        usize::MAX
+    }
+}
+
 /// Resolve the actual audio bit depth from codec parameters.
 ///
 /// Symphonia's ISOMP4 demuxer does not populate `bits_per_sample` for ALAC
@@ -2024,6 +2045,18 @@ fn borner_la_fin(
     relais_tx
 }
 
+/// Prefixe de l'erreur rendue quand symphonia ne reconnait aucun format dans
+/// le flux du decodeur progressif. Cette sonde precede l'en-tete WAV : une
+/// erreur qui le porte n'a donc encore rien ecrit dans la session.
+const PREFIXE_ECHEC_DE_SONDE: &str = "probe: ";
+
+/// #5553 — vrai si le decodeur progressif a echoue AVANT d'avoir envoye son
+/// premier octet (en-tete WAV compris), a la sonde du format. L'appelant peut
+/// alors reprendre la piste par un autre chemin sans rien avoir a defaire.
+pub fn echec_avant_le_premier_octet(erreur: &str) -> bool {
+    erreur.starts_with(PREFIXE_ECHEC_DE_SONDE)
+}
+
 /// Variante HTTP seekable du decodeur progressif. La source a deja prouve le
 /// support de `Range`; Symphonia peut donc lire l'atome `moov` a la fin d'un
 /// M4A puis revenir aux premiers paquets sans telecharger tout le media (#1885).
@@ -2422,7 +2455,7 @@ fn decode_to_pcm_streaming_inner(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(|e| format!("probe: {e}"))?;
+        .map_err(|e| format!("{PREFIXE_ECHEC_DE_SONDE}{e}"))?;
 
     let track = format
         .default_track(TrackType::Audio)
@@ -3050,11 +3083,11 @@ fn decode_ape_to_pcm(
     let (start_frame, mut skip_interleaved) = ape_start_position(&mut decoder, &header, seek_s)?;
     // `max_duration_s` borne le décodage : on s'arrête dès que la fenêtre est
     // pleine, sans décoder la fin de la piste pour la jeter ensuite.
-    let max_samples: usize = if max_duration_s > 0.0 {
-        (max_duration_s * header.sample_rate as f64 * header.channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_samples: usize = echantillons_de_la_fenetre(
+        max_duration_s,
+        header.sample_rate,
+        u32::from(header.channels),
+    );
     let start_sample = (start_frame as u64).saturating_mul(u64::from(header.blocks_per_frame));
     let expected_out = (header
         .total_samples
@@ -3792,11 +3825,7 @@ fn decode_symphonia(
     }
 
     let mut all_samples: Vec<i32> = Vec::new();
-    let max_samples = if max_duration_s > 0.0 {
-        (max_duration_s * source_rate as f64 * source_channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_samples = echantillons_de_la_fenetre(max_duration_s, source_rate, source_channels);
     // 🔴 #2218 T4 — les deux `Err(_)` muets de cette boucle sont la CAUSE
     // mesurée du défaut FLAC : un octet abîmé au milieu des trames coûtait
     // 23,2 % de la piste, `decode_to_pcm` rendait `Ok(_)`, et pas une ligne
@@ -6139,6 +6168,46 @@ mod borne_de_fin_tests {
         assert_eq!(octets_pour(0.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(-1.0, Some(44_100), Some(2), Some(16)), None);
         assert_eq!(octets_pour(f64::NAN, Some(44_100), Some(2), Some(16)), None);
+    }
+
+    /// Fil 2133 (Levente Toth, zone Sonos) : la piste « Draw the Line »
+    /// d'un album FLAC + CUE dure 263,346 s. L'ancien calcul de la fenêtre
+    /// donnait 23 227 117 échantillons entrelacés, un nombre IMPAIR en
+    /// stéréo : la découpe vers le fichier temporaire échouait en
+    /// « PCM sample count … is not aligned to 2 source channels ».
+    #[test]
+    fn fenetre_cue_2133_compte_des_trames_entieres() {
+        assert_eq!(
+            echantillons_de_la_fenetre(263.346, TAUX, 2),
+            11_613_558 * 2,
+            "263,346 s en stéréo 44,1 kHz : 11 613 558 trames entières"
+        );
+        assert_eq!(echantillons_de_la_fenetre(0.0, TAUX, 2), usize::MAX);
+    }
+
+    /// Fil 2133, de bout en bout : une tranche CUE dont les bornes donnent un
+    /// nombre impair d'échantillons (1,007 s × 88 200 = 88 817,4) se découpe
+    /// par `decode_to_pcm`, le chemin du fichier temporaire d'une zone Sonos,
+    /// sans erreur et à la bonne longueur : 44 408 trames, 88 816 échantillons.
+    #[test]
+    fn tranche_cue_a_bornes_impaires_se_decoupe_en_trames_2133() {
+        let d = tempfile::TempDir::new().unwrap();
+        let f = d.path().join("image.wav");
+        ecrire_wav(&f, 3_000);
+        let duree_s = 1_007.0 / 1000.0;
+        assert_eq!(
+            (duree_s * TAUX as f64 * 2.0) as usize % 2,
+            1,
+            "témoin : l'ancien calcul doit tomber sur un nombre impair"
+        );
+        let decode = decode_to_pcm(&f.to_string_lossy(), Some(TAUX), Some(2), 0.5, duree_s)
+            .expect("une tranche CUE à bornes impaires doit se découper sans erreur");
+        assert_eq!(decode.channels, 2);
+        assert_eq!(
+            decode.samples_i32.len(),
+            44_408 * 2,
+            "la tranche doit compter des trames entières"
+        );
     }
 }
 

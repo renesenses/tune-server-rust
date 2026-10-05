@@ -1699,8 +1699,8 @@ fn sql_figer_toutes_les_premieres_vues(engine: Engine) -> String {
     }
 }
 
-/// Première vue « maintenant » d'un chemin qui entre dans la bibliothèque.
-fn sql_premiere_vue_maintenant(engine: Engine) -> &'static str {
+/// Première vue d'un chemin qui entre dans la bibliothèque ([`premiere_vue_du_fichier`]).
+fn sql_premiere_vue(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => {
             "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
@@ -1721,6 +1721,57 @@ fn maintenant_epoch() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// La première vue d'un fichier qui ENTRE dans la bibliothèque (fil 2138).
+///
+/// Avant, c'était « maintenant » : juste sur une base existante, où seul un
+/// fichier réellement nouveau entre ; faux sur une base NEUVE, où le premier
+/// scan voit tout en même temps. Tous les albums y recevaient la date du scan,
+/// et le tri « date d'ajout » retombait sur l'ordre de parcours des dossiers.
+///
+/// Décision de Bertrand (05/10/2026, « modification d'abord ») : la date de
+/// MODIFICATION du fichier (relue sur le disque, sinon le `file_mtime` du
+/// scan), et la date de CRÉATION (btime : `statx` sous Linux, `st_birthtime`
+/// sous macOS, `ftCreationTime` sous Windows) seulement si le `mtime` manque
+/// ou n'est pas valable. Le tout borné à maintenant : une horloge fausse ou
+/// une date à venir ne doit pas coller un album en tête pour des années.
+///
+/// Pourquoi pas la création d'abord : sous Linux, `cp -a` / `rsync -a` ne
+/// conservent pas le btime. Une bibliothèque recopiée d'un bloc sur un disque
+/// neuf serait datée par sa copie, et triée dans l'ordre de la copie. Le
+/// `mtime`, lui, survit à la copie. C'est aussi ce que datait le scan avant
+/// #4546.
+///
+/// #4546 tient : la ligne n'est écrite QU'UNE fois (`INSERT OR IGNORE` /
+/// `ON CONFLICT DO NOTHING`), une retouche ultérieure ne la change plus.
+fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant: f64) -> f64 {
+    let meta = std::fs::metadata(chemin).ok();
+    let en_epoch = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64())
+    };
+    let creation = meta
+        .as_ref()
+        .and_then(|m| m.created().ok())
+        .and_then(en_epoch);
+    let modification = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(en_epoch)
+        .or(mtime_du_scan);
+    choisir_premiere_vue(creation, modification, maintenant)
+}
+
+/// Le choix seul, sans disque : modification, sinon création, bornée à
+/// `maintenant`. Une date nulle, négative ou non finie ne compte pas.
+fn choisir_premiere_vue(creation: Option<f64>, modification: Option<f64>, maintenant: f64) -> f64 {
+    let valable = |d: &f64| d.is_finite() && *d > 0.0;
+    modification
+        .filter(valable)
+        .or(creation.filter(valable))
+        .map_or(maintenant, |d| d.min(maintenant))
 }
 
 impl TrackRepo {
@@ -2081,11 +2132,11 @@ impl TrackRepo {
         // tracks/albums but not file_first_seen). Best-effort: never fail track
         // creation over this. Streaming tracks (http URLs / no path) are skipped.
         if let Some(path) = chemin_local(track.file_path.as_deref()) {
-            let now = maintenant_epoch();
+            let now = premiere_vue_du_fichier(path, track.file_mtime, maintenant_epoch());
             let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
             let _ = self
                 .db
-                .execute(sql_premiere_vue_maintenant(self.db.engine()), &fs_params);
+                .execute(sql_premiere_vue(self.db.engine()), &fs_params);
         }
 
         Ok(id)
@@ -3290,7 +3341,8 @@ impl TrackRepo {
                 Ok(_) => {
                     count += 1;
                     if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
-                        premieres_vues.push(vec![chemin.to_sql_value(), maintenant.to_sql_value()]);
+                        let date = premiere_vue_du_fichier(chemin, track.file_mtime, maintenant);
+                        premieres_vues.push(vec![chemin.to_sql_value(), date.to_sql_value()]);
                     }
                 }
                 // Previously this failure was swallowed silently: the scanner
@@ -3331,10 +3383,9 @@ impl TrackRepo {
         // sans elle la date d'ajout retombait sur un `mtime` que chaque
         // retouche d'étiquettes fait avancer. Au mieux, jamais bloquant.
         if !premieres_vues.is_empty() {
-            let _ = self.db.execute_many(
-                sql_premiere_vue_maintenant(self.db.engine()),
-                &premieres_vues,
-            );
+            let _ = self
+                .db
+                .execute_many(sql_premiere_vue(self.db.engine()), &premieres_vues);
         }
         // ── Ce que la sonde retirée voulait voir (#2890) ──────────────────
         //
@@ -5276,12 +5327,152 @@ mod tests {
             .unwrap()
             .and_then(|c| c.first().and_then(|v| v.as_i64()));
         assert_eq!(lignes, Some(2), "create_batch doit dater ses pistes");
-        let date = date_d_ajout(&repo, ancien).unwrap();
-        assert!(
-            date > 1_000_000_000.0,
-            "la date d'ajout d'une piste scannée est sa première vue, pas son \
-             mtime (1000) : {date}"
+        // Fil 2138 : la première vue d'un fichier ABSENT du disque retombe sur
+        // le `file_mtime` du scan — elle est écrite, et figée, dès l'insertion.
+        assert_eq!(date_d_ajout(&repo, ancien), Some(1_000.0));
+    }
+
+    // ── Fil 2138 : un premier scan date les pistes par leurs fichiers ─────
+
+    fn fichier_date(dir: &std::path::Path, nom: &str, mtime_epoch: u64) -> String {
+        let chemin = dir.join(nom);
+        let f = std::fs::File::create(&chemin).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_epoch))
+            .unwrap();
+        chemin.to_str().unwrap().to_string()
+    }
+
+    fn album_avec_piste(db: &SqliteDb, titre: &str, chemin: &str, mtime: f64) -> (i64, Track) {
+        let album = AlbumRepo::new(db.clone())
+            .create(&Album::new(titre.into()))
+            .unwrap();
+        let mut t = Track::new("t".into());
+        t.album_id = Some(album);
+        t.file_path = Some(chemin.into());
+        t.file_mtime = Some(mtime);
+        (album, t)
+    }
+
+    /// Base NEUVE, deux fichiers datés différemment, scannés dans l'ordre
+    /// INVERSE de leurs dates (l'ordre de parcours des dossiers) : le tri
+    /// « date d'ajout » suit les fichiers, pas le parcours.
+    ///
+    /// Le fichier « ancien » porte le `mtime` le plus ancien : c'est lui qui
+    /// fait foi (« modification d'abord », 05/10).
+    ///
+    /// Rouge avant le correctif : les deux pistes du lot recevaient le même
+    /// « maintenant », à égalité.
+    #[test]
+    fn premier_scan_trie_par_la_date_des_fichiers_2138() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancien_f = fichier_date(dir.path(), "b-ancien.flac", 1_500_000_000);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let recent_f = fichier_date(dir.path(), "a-recent.flac", 1_600_000_000);
+
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (recent, t_recent) = album_avec_piste(&db, "Récent", &recent_f, 1_600_000_000.0);
+        let (ancien, t_ancien) = album_avec_piste(&db, "Ancien", &ancien_f, 1_500_000_000.0);
+        // L'ordre du parcours : `a-…` avant `b-…`.
+        assert_eq!(repo.create_batch(&[t_recent, t_ancien]).unwrap(), 2);
+
+        let maintenant = maintenant_epoch();
+        let (d_ancien, d_recent) = (
+            date_d_ajout(&repo, ancien).unwrap(),
+            date_d_ajout(&repo, recent).unwrap(),
         );
+        assert!(
+            d_ancien < d_recent,
+            "l'album au fichier le plus ancien doit être daté avant l'autre : \
+             ancien {d_ancien}, récent {d_recent}"
+        );
+        assert!(d_recent <= maintenant, "{d_recent} > {maintenant}");
+
+        let sql = crate::db::home_queries::nouveautes(Engine::Sqlite);
+        let limite: i64 = 10;
+        let p: [&dyn ToSqlValue; 1] = [&limite];
+        let ordre: Vec<String> = repo
+            .backend()
+            .query_many(&sql, &p)
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.get(1).and_then(|v| v.as_string()))
+            .collect();
+        assert_eq!(ordre, vec!["Récent".to_string(), "Ancien".to_string()]);
+    }
+
+    /// La COPIE EN BLOC : une bibliothèque recopiée sur un disque neuf
+    /// (`cp -a`, `rsync -a`) garde ses `mtime`, mais ses dates de création
+    /// sont celles de la copie, dans l'ordre de la copie. Ici le fichier au
+    /// `mtime` le plus ancien est recopié EN DERNIER : son btime est le plus
+    /// récent. Le tri doit suivre les `mtime`, pas l'ordre de la copie.
+    ///
+    /// Rouge avec « création d'abord » sur un système qui a un btime
+    /// (ext4, APFS, NTFS) ; rouge avec « maintenant » (égalité).
+    #[test]
+    fn copie_en_bloc_triee_par_les_mtime_conserves_2138() {
+        let dir = tempfile::tempdir().unwrap();
+        let recent_f = fichier_date(dir.path(), "a-recent.flac", 1_600_000_000);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let ancien_f = fichier_date(dir.path(), "b-ancien.flac", 1_500_000_000);
+
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (recent, t_recent) = album_avec_piste(&db, "Récent", &recent_f, 1_600_000_000.0);
+        let (ancien, t_ancien) = album_avec_piste(&db, "Ancien", &ancien_f, 1_500_000_000.0);
+        assert_eq!(repo.create_batch(&[t_recent, t_ancien]).unwrap(), 2);
+
+        assert_eq!(date_d_ajout(&repo, ancien), Some(1_500_000_000.0));
+        assert_eq!(date_d_ajout(&repo, recent), Some(1_600_000_000.0));
+    }
+
+    /// Une piste DÉJÀ datée garde sa date : vider puis rescanner (le rescan
+    /// complet) ne la remplace pas par celle du fichier.
+    #[test]
+    fn une_piste_deja_datee_garde_sa_date_au_rescan_2138() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fichier_date(dir.path(), "x.flac", 1_500_000_000);
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (_, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        repo.create_batch(std::slice::from_ref(&t)).unwrap();
+        let p: [&dyn ToSqlValue; 1] = [&f];
+        repo.backend()
+            .execute(
+                "UPDATE file_first_seen SET first_seen_at = 500.0 WHERE file_path = ?",
+                &p,
+            )
+            .unwrap();
+        repo.delete_all().unwrap();
+        let (album, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        repo.create_batch(&[t]).unwrap();
+        assert_eq!(date_d_ajout(&repo, album), Some(500.0));
+    }
+
+    /// Un fichier daté dans le futur ne passe pas devant tout le monde.
+    #[test]
+    fn la_premiere_vue_est_bornee_a_maintenant_2138() {
+        let dir = tempfile::tempdir().unwrap();
+        let futur = 4_000_000_000u64; // 2096
+        let f = fichier_date(dir.path(), "futur.flac", futur);
+        let avant = maintenant_epoch();
+        let date = premiere_vue_du_fichier(&f, Some(futur as f64), avant);
+        assert!(date <= avant, "{date} > {avant}");
+        // Le choix seul, sans disque.
+        // Modification d'abord, même quand la création est plus ancienne.
+        assert_eq!(choisir_premiere_vue(Some(5.0), Some(10.0), 100.0), 10.0);
+        assert_eq!(choisir_premiere_vue(Some(20.0), Some(10.0), 100.0), 10.0);
+        // Bornée à maintenant.
+        assert_eq!(choisir_premiere_vue(Some(10.0), Some(9e9), 100.0), 100.0);
+        // La création seulement si le mtime manque ou n'est pas valable.
+        assert_eq!(choisir_premiere_vue(Some(20.0), None, 100.0), 20.0);
+        assert_eq!(choisir_premiere_vue(Some(20.0), Some(0.0), 100.0), 20.0);
+        assert_eq!(
+            choisir_premiere_vue(Some(20.0), Some(f64::NAN), 100.0),
+            20.0
+        );
+        assert_eq!(choisir_premiere_vue(Some(9e9), None, 100.0), 100.0);
+        assert_eq!(choisir_premiere_vue(None, None, 100.0), 100.0);
     }
 
     /// Le cas de Jean Valjean, sur les TROIS chemins qui récrivent le

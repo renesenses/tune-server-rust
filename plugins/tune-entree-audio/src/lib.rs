@@ -94,6 +94,10 @@ impl TunePlugin for EntreeAudioPlugin {
     fn name(&self) -> &str {
         "entree-audio"
     }
+    /// L'identifiant ne se lit pas sur la carte des extensions (#5296).
+    fn display_name(&self) -> &str {
+        "Entrée audio"
+    }
     fn version(&self) -> &str {
         tune_core::version()
     }
@@ -104,10 +108,14 @@ impl TunePlugin for EntreeAudioPlugin {
     fn default_enabled(&self) -> bool {
         false
     }
-    /// Hors catalogue : aucun écran ne consomme encore ses routes (doctrine
-    /// #2090).
+    /// Au catalogue (#5296, go de Bertrand du 27/09), comme `cd` (#4863) :
+    /// la rubrique Sources du client web (#5065) montre les entrées que ce
+    /// greffon publie, donc la doctrine #2090 est remplie. Le gestionnaire
+    /// propose « Installer », puis `POST /api/v1/plugins/entree-audio/install`
+    /// et un redémarrage — au lieu d'un `curl` à la main. Gratuit : absent de
+    /// `premium_plugins`, aucun module déclaré.
     fn catalogued(&self) -> bool {
-        false
+        true
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {

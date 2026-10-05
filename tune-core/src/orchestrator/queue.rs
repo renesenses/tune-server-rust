@@ -284,7 +284,7 @@ impl PlaybackOrchestrator {
             // worth caching — a direct proxy stream isn't transcoded.
             let stream_data = {
                 let registry = services.lock().await;
-                let Some(svc) = registry.get(&source) else {
+                let Some(svc) = registry.get_actif(&source).await else {
                     return;
                 };
                 let svc = svc.read().await;
@@ -648,6 +648,7 @@ impl PlaybackOrchestrator {
                 media_format: None,
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
+                album_ref: None,
             }
         } else {
             // Streaming track.
@@ -724,6 +725,7 @@ impl PlaybackOrchestrator {
                 media_format: None,
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
+                album_ref: entry.album_ref.clone(),
             }
         };
 
@@ -996,6 +998,7 @@ impl PlaybackOrchestrator {
                     titre: etat.session_context_title.as_deref(),
                     pochette: etat.session_context_cover.as_deref(),
                 },
+                None,
             );
         }
 
@@ -1107,7 +1110,7 @@ impl PlaybackOrchestrator {
                         preference_de_qualite(&db, zone_id).service_token(&source);
                     let resolved = {
                         let registry = services.lock().await;
-                        let Some(svc) = registry.get(&source) else {
+                        let Some(svc) = registry.get_actif(&source).await else {
                             return;
                         };
                         let svc = svc.clone();
@@ -1195,6 +1198,7 @@ impl PlaybackOrchestrator {
                 media_format: None,
                 track_number: None,
                 disc_number: None,
+                album_ref: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -1269,6 +1273,7 @@ impl PlaybackOrchestrator {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: entry.album_ref.clone(),
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {

@@ -1423,6 +1423,79 @@ fn replaygain_active_shows_step_and_breaks_bit_perfect() {
     assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
 }
 
+/// #5683 — l'étape ReplayGain se décide sur PURE, jamais sur le curseur de
+/// volume. Le constructeur du panneau est relu à 100 %, à 35 % puis de
+/// nouveau à 100 % : l'étape est là, identique, les trois fois ; et PURE
+/// l'éteint aux deux volumes. (Le défaut observé venait d'une zone non
+/// relue après la bascule PURE : voir le test d'orchestrateur
+/// `toute_bascule_pure_annonce_la_zone_au_client_5683`.)
+fn chemin_au_volume_5683(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    ps: &ZoneState,
+    pct: f64,
+) -> Value {
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_volume(zone_id, pct).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    build_signal_path(
+        ps,
+        &zone,
+        backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn l_etape_replaygain_suit_pure_et_jamais_le_curseur_de_volume_5683() {
+    let (backend, zone) = dlna_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let attendu = Some("ReplayGain (track, -4.2 dB, tags du fichier)".to_string());
+    // (1) PURE inactif, volume 100 %, tags présents : l'étape est là.
+    let plein = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&plein, "ReplayGain"),
+        attendu,
+        "volume 100 % : {plein}"
+    );
+    assert_eq!(step_desc(&plein, "Volume"), None);
+    // (2) Bouger le curseur ne la fait ni apparaître ni disparaître.
+    let bas = chemin_au_volume_5683(&backend, zone_id, &ps, 35.0);
+    assert_eq!(
+        step_desc(&bas, "ReplayGain"),
+        attendu,
+        "volume 35 % : {bas}"
+    );
+    assert_eq!(step_desc(&bas, "Volume").as_deref(), Some("Volume 35%"));
+    let retour = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
+    assert_eq!(
+        step_desc(&retour, "ReplayGain"),
+        attendu,
+        "retour à 100 % : {retour}"
+    );
+
+    // PURE éteint l'étape, quel que soit le curseur.
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    for pct in [100.0, 35.0] {
+        let pur = chemin_au_volume_5683(&backend, zone_id, &ps, pct);
+        assert_eq!(
+            step_desc(&pur, "ReplayGain"),
+            None,
+            "PURE à {pct} % : {pur}"
+        );
+    }
+}
+
 // RG off (défaut) : la même piste taguée n'affiche rien et reste
 // bit-perfect — le réglage, pas le tag, décide.
 #[test]
