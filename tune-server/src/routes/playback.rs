@@ -3398,12 +3398,55 @@ pub(crate) fn position_precedente(zone_state: &tune_core::playback::ZoneState) -
     }
 }
 
-async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+/// Corps facultatif de `POST /zones/{id}/previous`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct PrecedentRequest {
+    /// Position de lecture vue par le CLIENT, en millisecondes. Lue seulement
+    /// pour une zone navigateur : voir [`position_vue_par_precedent`].
+    pub position_ms: Option<i64>,
+}
+
+/// La position sur laquelle « précédent » décide de relancer ou de reculer.
+///
+/// FabienM, fil 1476 (05/10/2026, rc2) : sur « Cet ordinateur », le premier
+/// appui ne relance jamais la piste, il saute à la précédente. Cause : une
+/// zone navigateur n'a pas de périphérique, le sondeur ne relève donc jamais
+/// sa position (`poller/tick.rs`, branche `None => … continue`). Le serveur
+/// croit la piste à 0 ms (ou à la cible du dernier déplacement), et la règle
+/// de #1929 recule toujours. Seul l'onglet qui joue connaît la vraie
+/// position : il l'envoie, et on la prend — pour une zone navigateur
+/// seulement. Ailleurs, la position relevée sur la sortie fait foi.
+pub(crate) fn position_vue_par_precedent(
+    zone_navigateur: bool,
+    position_serveur_ms: i64,
+    position_client_ms: Option<i64>,
+) -> i64 {
+    match position_client_ms {
+        Some(ms) if zone_navigateur && ms >= 0 => ms,
+        _ => position_serveur_ms,
+    }
+}
+
+async fn previous(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<PrecedentRequest>,
+) -> impl IntoResponse {
     info!(zone_id = zone_id, "api_previous_requested");
     if let Some(resp) = reject_if_zone_has_no_output_device(&state, zone_id) {
         return resp;
     }
     let current = state.playback.get_state(zone_id).await;
+    let zone_navigateur = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let position_ms = position_vue_par_precedent(
+        zone_navigateur,
+        current.position_ms,
+        body.and_then(|b| b.position_ms),
+    );
 
     // Un second appui rapproché veut dire « recule », quoi que dise la
     // position. On consomme la marque : un troisième appui relancera de
@@ -3419,7 +3462,7 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
         }
     };
 
-    if precedent_doit_relancer(current.position_ms, vient_de_redemarrer) {
+    if precedent_doit_relancer(position_ms, vient_de_redemarrer) {
         let device_id = get_zone_device_id(&state, zone_id);
         if let Err(error) = state
             .orchestrator
@@ -8689,9 +8732,13 @@ mod precedent_aleatoire_tests {
             .update_queue_info(zid, ordre[rang] as i64, longueur)
             .await;
 
-        let reponse = super::previous(State(state.clone()), Path(zid))
-            .await
-            .into_response();
+        let reponse = super::previous(
+            State(state.clone()),
+            Path(zid),
+            crate::routes::corps_json_optionnel::CorpsJsonOptionnel(None),
+        )
+        .await
+        .into_response();
         let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
             .await
             .unwrap();
@@ -8705,5 +8752,116 @@ mod precedent_aleatoire_tests {
             ordre[rang - 1],
             (ordre[rang] as i64 - 1).max(0),
         );
+    }
+}
+
+/// Fil 1476 (FabienM, rc2) — sur une zone navigateur, le serveur ne relève
+/// pas la position : « précédent » prend celle que l'onglet envoie.
+#[cfg(test)]
+mod precedent_zone_navigateur_tests {
+    use super::position_vue_par_precedent;
+    use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
+    use crate::state::AppState;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    #[test]
+    fn la_position_du_client_ne_compte_que_pour_une_zone_navigateur() {
+        assert_eq!(position_vue_par_precedent(true, 0, Some(45_000)), 45_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, None), 12_000);
+        assert_eq!(position_vue_par_precedent(true, 12_000, Some(-5)), 12_000);
+        assert_eq!(position_vue_par_precedent(false, 0, Some(45_000)), 0);
+    }
+
+    /// Une zone (navigateur ou non) qui joue la 2e piste d'une file de 3,
+    /// position serveur à 0 — ce que voit le serveur d'une zone navigateur.
+    async fn zone(type_de_sortie: &str, appareil: Option<&str>) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zid = ZoneRepo::with_backend(state.backend.clone())
+            .create("Cet ordinateur", Some(type_de_sortie), appareil)
+            .expect("zone");
+        let items: Vec<QueueInput> = ["a", "b", "c"]
+            .iter()
+            .map(|id| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: (*id).into(),
+                title: (*id).to_string(),
+                artist: "Fabien".into(),
+                album: None,
+                duration_ms: 197_000,
+                cover_url: None,
+                track_number: None,
+                disc_number: None,
+                album_ref: None,
+            })
+            .collect();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zid, &items)
+            .expect("file");
+        state
+            .playback
+            .play(
+                zid,
+                NowPlaying {
+                    title: "b".into(),
+                    source: "qobuz".into(),
+                    source_id: Some("b".into()),
+                    duration_ms: 197_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zid, 1, 3).await;
+        (state, zid)
+    }
+
+    async fn appui(state: &AppState, zid: i64, corps: Option<i64>) -> serde_json::Value {
+        let corps = corps.map(|ms| super::PrecedentRequest {
+            position_ms: Some(ms),
+        });
+        let r = super::previous(State(state.clone()), Path(zid), CorpsJsonOptionnel(corps))
+            .await
+            .into_response();
+        let o = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&o).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sur_une_zone_navigateur_le_premier_appui_relance_puis_le_second_recule() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "restarted",
+            "45 s dans la piste : relance, pas recul : {v}"
+        );
+        // Second appui dans les 6 s (#1929) : on recule, quelle que soit la
+        // position annoncée.
+        let v = appui(&state, zid, Some(1_000)).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn sans_position_du_client_le_comportement_est_celui_d_avant() {
+        let (state, zid) = zone("browser", None).await;
+        let v = appui(&state, zid, None).await;
+        assert_eq!(v["status"], "playing", "{v}");
+        assert_eq!(v["queue_position"], 0, "{v}");
+    }
+
+    #[tokio::test]
+    async fn une_zone_avec_sortie_ignore_la_position_du_client() {
+        let (state, zid) = zone("mock", Some("sortie-essai")).await;
+        let v = appui(&state, zid, Some(45_000)).await;
+        assert_eq!(
+            v["status"], "playing",
+            "la position relevée (0) fait foi : {v}"
+        );
+        assert_eq!(v["queue_position"], 0, "{v}");
     }
 }
