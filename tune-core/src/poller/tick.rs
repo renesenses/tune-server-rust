@@ -1541,11 +1541,31 @@ impl PositionPoller {
                     self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
                         .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
+                    // #5411 — le rejeu de la piste finie, AVÉRÉ seulement :
+                    // URI de la piste finie, position revenue près de zéro,
+                    // et rien de soutenu tiré du flux adopté.
+                    let octets_depuis = decisions::octets_depuis_adoption(
+                        self.orchestrator.streamer_bytes_sent(&adoption.flux).await,
+                        adoption.octets_a_l_adoption,
+                    );
+                    let debit = decisions::debit_soutenu(
+                        octets_depuis,
+                        adoption.depuis.elapsed().as_millis() as u64,
+                    );
+                    let rejeu_avere = decisions::rejeu_de_la_piste_finie_avere(
+                        status.current_uri.as_deref(),
+                        adoption.flux_fini.as_deref(),
+                        &adoption.flux,
+                        status.position_ms,
+                        adoption.position_figee_ms,
+                        debit,
+                    );
                     match decisions::suite_de_l_adoption(
                         status.position_ms,
                         adoption.position_figee_ms,
                         status.current_uri.as_deref(),
                         &adoption.flux,
+                        rejeu_avere,
                         // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
                         status.state == TransportState::Stopped,
                         age_secs,
@@ -1573,6 +1593,10 @@ impl PositionPoller {
                                 uri = ?status.current_uri,
                                 preuve = ?adoption.preuve,
                                 stream_id = %adoption.flux,
+                                flux_fini = ?adoption.flux_fini,
+                                rejeu_avere,
+                                debit_soutenu = debit,
+                                octets_depuis_adoption = ?octets_depuis,
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
@@ -1787,15 +1811,30 @@ impl PositionPoller {
                         .position_a_avancer(zone_id, zone_state, arme_avant)
                         .await
                     {
+                        // #5411 — lu AVANT l'avance, qui fait adopter le flux
+                        // armé à la zone.
+                        let rejeu = self
+                            .rejeu_de_la_piste_finie(
+                                zone_id,
+                                zone_state,
+                                &status,
+                                track_duration_ms,
+                            )
+                            .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
-                        if let Err(e) = self
+                        let avance = self
                             .orchestrator
                             .advance_queue_metadata(zone_id, next_pos)
-                            .await
-                        {
+                            .await;
+                        if let Err(e) = &avance {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
+                        // Surveiller une avance qui n'a pas eu lieu relancerait
+                        // la piste finie.
+                        if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                            ps.adoption_horloge = Some(surveillance);
+                        }
                         // The identity-keyed latch re-arms by itself on the new
                         // track; clearing it here additionally covers gapless
                         // repeat-one, where the advanced track has the same
@@ -2673,15 +2712,27 @@ impl PositionPoller {
                         if let Some(next_pos) =
                             Self::prochaine_position_jouable(&self.db, zone_id, zone_state)
                         {
+                            // #5411 — même lecture qu'à la retombée de position.
+                            let rejeu = self
+                                .rejeu_de_la_piste_finie(
+                                    zone_id,
+                                    zone_state,
+                                    &status,
+                                    track_duration_ms,
+                                )
+                                .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            if let Err(e) = self
+                            let avance = self
                                 .orchestrator
                                 .advance_queue_metadata(zone_id, next_pos)
-                                .await
-                            {
+                                .await;
+                            if let Err(e) = &avance {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
+                            if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                                ps.adoption_horloge = Some(surveillance);
+                            }
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
