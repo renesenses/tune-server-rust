@@ -342,6 +342,15 @@ pub(super) async fn get_config(
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
+        // « Écrire les modifications dans les fichiers audio » (Bertrand,
+        // 05/10/2026 : inactif par défaut). Publié même absent de la base,
+        // pour que l'interface affiche la case DÉCOCHÉE plutôt que « je ne
+        // sais pas » : une clé absente vaut désactivé, côté serveur aussi
+        // (`tune_core::metadata::ecriture_fichiers`).
+        (
+            tune_core::metadata::ecriture_fichiers::CLE,
+            json!(tune_core::metadata::ecriture_fichiers::DEFAUT),
+        ),
         // Default on (unchanged behaviour); scan.rs treats unset as enabled.
         // The web toggle writes "false" to opt out (JF Paquet).
         ("enrich_on_scan", json!(true)),

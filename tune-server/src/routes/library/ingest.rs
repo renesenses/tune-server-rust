@@ -58,6 +58,11 @@ pub(super) struct IngestSettings {
     pub dest_root: Option<String>,
     pub conflict_policy: ConflictPolicy,
     /// Write corrected album fields back into the files after placing them.
+    ///
+    /// Faux par défaut (05/10/2026, « inactif par défaut ») : une clé
+    /// `ingest_write_tags` absente ne vaut plus « oui ». Et même vrai, il ne
+    /// suffit pas : le réglage général « Écrire les modifications dans les
+    /// fichiers audio » doit aussi être coché (`apply`).
     pub write_tags: bool,
 }
 
@@ -68,7 +73,7 @@ impl Default for IngestSettings {
             template: ingest::DEFAULT_TEMPLATE.to_string(),
             dest_root: None,
             conflict_policy: ConflictPolicy::Skip,
-            write_tags: true,
+            write_tags: false,
         }
     }
 }
@@ -92,8 +97,10 @@ fn load_settings(state: &AppState) -> IngestSettings {
             _ => ConflictPolicy::Skip,
         };
     }
+    // Seul un « true » explicite active : une valeur absente ou illisible
+    // laisse les fichiers importés tels quels.
     if let Some(v) = get(KEY_WRITE_TAGS) {
-        s.write_tags = v != "false";
+        s.write_tags = v.trim() == "true";
     }
     s
 }
@@ -169,6 +176,10 @@ pub(super) async fn get_ingest_settings(
         "music_dirs": dirs,
         "conflict_policy": settings.conflict_policy,
         "write_tags": settings.write_tags,
+        // Le réglage général « Écrire les modifications dans les fichiers
+        // audio » : décoché, `write_tags` ne suffit pas, rien n'est écrit.
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE:
+            crate::routes::ecriture_fichiers::autorisee(&state),
     })))
 }
 
@@ -606,7 +617,11 @@ pub(super) async fn apply(
         }
         None => settings.conflict_policy,
     };
-    let write_tags = body.write_tags.unwrap_or(settings.write_tags);
+    // Le choix de l'import (`write_tags`) s'ajoute au réglage général « Écrire
+    // les modifications dans les fichiers audio », il ne le remplace pas :
+    // désactivé (le défaut), les fichiers placés ne sont pas retouchés.
+    let write_tags = body.write_tags.unwrap_or(settings.write_tags)
+        && crate::routes::ecriture_fichiers::autorisee(&state);
 
     let job_id = new_job_id();
     save_job(
@@ -1010,6 +1025,24 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
     use tune_core::library::ingest::{IngestReport, MovedFile};
+
+    /// 05/10/2026 — « inactif par défaut » : une installation qui n'a jamais
+    /// touché `ingest_write_tags` n'écrit plus dans les fichiers importés, et
+    /// un `true` explicite ne suffit pas sans le réglage général.
+    #[test]
+    fn l_import_n_ecrit_pas_les_balises_par_defaut() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(!IngestSettings::default().write_tags);
+        assert!(!load_settings(&state).write_tags);
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(KEY_WRITE_TAGS, "true")
+            .unwrap();
+        assert!(load_settings(&state).write_tags);
+        assert!(
+            !crate::routes::ecriture_fichiers::autorisee(&state),
+            "le réglage général reste désactivé : l'import n'écrira pas"
+        );
+    }
 
     /// L'identifiant retenu pour un fichier doit finir INSCRIT dans le
     /// fichier posé. C'est le câblage qui compte : le parcours déclenché
