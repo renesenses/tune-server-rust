@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::lecteur::{ErreurCd, LecteurDisque, Presence};
+use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
 use crate::toc::{OCTETS_PAR_SECTEUR, Toc};
 
 #[derive(Default)]
@@ -25,6 +25,11 @@ struct Etat {
     ejecte: bool,
     /// Le lecteur lui-même a disparu (#5161 : câble USB retiré).
     debranche: bool,
+    /// Éjections COMMANDÉES (`ejecter_disque`), pour prouver qu'elles ont
+    /// eu lieu — ou pas.
+    ejections: u32,
+    /// L'éjection commandée échoue avec ce message (disque occupé…).
+    refus_ejection: Option<String>,
 }
 
 pub struct LecteurSimule {
@@ -79,6 +84,16 @@ impl LecteurSimule {
     /// Le lecteur est débranché : il se dit « aucun lecteur ».
     pub fn debrancher(&self) {
         self.etat.lock().unwrap().debranche = true;
+    }
+
+    /// Nombre d'éjections commandées par `ejecter_disque` et réussies.
+    pub fn ejections(&self) -> u32 {
+        self.etat.lock().unwrap().ejections
+    }
+
+    /// La prochaine éjection commandée échouera avec `raison`.
+    pub fn refuser_ejection(&self, raison: &str) {
+        self.etat.lock().unwrap().refus_ejection = Some(raison.into());
     }
 
     pub fn tentatives(&self, lba: u32) -> u32 {
@@ -145,6 +160,22 @@ impl LecteurDisque for LecteurSimule {
             }
         }
         sortie.copy_from_slice(&contenu_des_secteurs(lba, nombre));
+        Ok(())
+    }
+
+    fn ejecter_disque(&self) -> Result<(), ErreurEjection> {
+        let mut e = self.etat.lock().unwrap();
+        if e.debranche {
+            return Err(ErreurEjection::AucunLecteur);
+        }
+        if e.ejecte {
+            return Err(ErreurEjection::AucunDisque);
+        }
+        if let Some(r) = e.refus_ejection.take() {
+            return Err(ErreurEjection::Echec(r));
+        }
+        e.ejecte = true;
+        e.ejections += 1;
         Ok(())
     }
 }

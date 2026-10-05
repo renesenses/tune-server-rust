@@ -860,17 +860,49 @@ impl PlaybackOrchestrator {
             let qualite = self
                 .reprendre_la_qualite_pre_armee(zone_id, flux_adopte.as_deref())
                 .await;
-            let (format, sample_rate, bit_depth, bitrate_kbps) = qualite
-                .map(|q| (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps))
+            // Fil 2119 — la règle de #4323, appliquée à l'enchaînement.
+            //
+            // Un album lancé depuis le serveur multimédia de Tune LUI-MÊME
+            // met en file des entrées `upnp` sans `track_id`, dont l'URI est
+            // `http://<nous>:8888/api/v1/library/tracks/<id>/audio`. Au
+            // démarrage, `play_inner` relit le `track_id` dans cette URI ; à
+            // l'avance sans blanc, personne : l'URL est servie directement
+            // (aucun flux pré-armé, `stream_id="absent"`), la qualité restait
+            // `None`, et le chemin du signal annonçait « FLAC 44kHz/16bit »
+            // pour un WAV 24/176,4 servi intact. Même fonction qu'au
+            // démarrage ; `source` et `source_id` restent ceux de la file.
+            let fiche = entry
+                .source_id
+                .as_deref()
+                .and_then(|uri| self.piste_de_bibliotheque_designee_par_l_uri(uri))
+                .map(|(_, piste)| crate::playback::NowPlaying::from_track(&piste))
                 .unwrap_or_default();
+            // Ce que le flux pré-armé a réellement servi prime ; la fiche de
+            // bibliothèque ne comble que son absence.
+            let (format, sample_rate, bit_depth, bitrate_kbps) = match qualite {
+                Some(q) => (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps),
+                None => (
+                    fiche.format.clone(),
+                    fiche.sample_rate,
+                    fiche.bit_depth,
+                    fiche.bitrate_kbps,
+                ),
+            };
             crate::playback::NowPlaying {
-                track_id: None,
-                title: entry.title.clone().unwrap_or_default(),
-                artist_name: entry.artist_name.clone(),
-                album_title: entry.album_title.clone(),
+                track_id: fiche.track_id,
+                title: entry
+                    .title
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| fiche.title.clone()),
+                artist_name: entry.artist_name.clone().or(fiche.artist_name.clone()),
+                album_title: entry.album_title.clone().or(fiche.album_title.clone()),
                 // #4446 — même règle : la valeur de la file, non résolue.
-                cover_path: entry.cover_path.clone(),
-                duration_ms: entry.duration_ms.unwrap_or(0),
+                cover_path: entry.cover_path.clone().or(fiche.cover_path.clone()),
+                duration_ms: entry
+                    .duration_ms
+                    .filter(|d| *d > 0)
+                    .unwrap_or(fiche.duration_ms),
                 source,
                 source_id: entry.source_id.clone(),
                 // #3442 — le `None` en dur qui perdait le flux pre-arme.
@@ -879,7 +911,7 @@ impl PlaybackOrchestrator {
                 sample_rate,
                 bit_depth,
                 bitrate_kbps,
-                ..Default::default()
+                ..fiche
             }
         };
 

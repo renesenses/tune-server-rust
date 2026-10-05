@@ -51,9 +51,12 @@ impl Banc {
         }
     }
 
+    /// `cover` : `cover.jpg` a bougé (posé, remplacé ou retiré) dans ce lot.
     fn surveiller(&self, cover: bool) {
         let covers = if cover {
-            vec![(self.image.parent().unwrap().join("cover.jpg"), true)]
+            let chemin = self.image.parent().unwrap().join("cover.jpg");
+            let existe = chemin.exists();
+            vec![(chemin, existe)]
         } else {
             vec![]
         };
@@ -103,12 +106,18 @@ impl Banc {
     }
 
     async fn passer(&self, passe: Passe) {
+        self.passer_avec(passe, false).await;
+    }
+
+    /// `cover` : le geste a touché `cover.jpg` (le surveillant en reçoit
+    /// l'événement).
+    async fn passer_avec(&self, passe: Passe, cover: bool) {
         match passe {
             Passe::Rapide => scan_manuel(&self.etat, false, None).await,
             Passe::Repertoires => scan_manuel(&self.etat, false, self.image.parent()).await,
             Passe::Complete => scan_manuel(&self.etat, true, None).await,
             Passe::Demarrage => scan_de_demarrage(&self.etat.backend).await,
-            Passe::Surveillant => self.surveiller(false),
+            Passe::Surveillant => self.surveiller(cover),
         }
     }
 }
@@ -116,6 +125,9 @@ impl Banc {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cue_import_surveillant_pose_la_jaquette_5222() {
     let b = Banc::nouveau("cue-import-5222", Some(JAQUETTE));
+    // Sans `cover.jpg` : l'image du dossier passe avant la jaquette (#5685),
+    // c'est donc seule que la jaquette de l'image CUE doit être lue.
+    poser_cover(b.image.parent().unwrap(), None);
     b.surveiller(false);
     b.verifier(
         JAQUETTE,
@@ -126,18 +138,27 @@ async fn cue_import_surveillant_pose_la_jaquette_5222() {
 
 async fn reprendre_cover(passe: Passe) {
     let b = Banc::nouveau(&format!("cue-reprise-{passe:?}-5222"), None);
+    let dossier = b.image.parent().unwrap().to_path_buf();
     b.surveiller(true);
     b.verifier(
         COVER,
         SourcePochette::Dossier,
         "montage : cover.jpg doit être en place",
     );
+    // #5685 — l'image du dossier passe avant la jaquette intégrée.
     poser_jaquette(&b.image, Some(JAQUETTE));
     b.passer(passe).await;
     b.verifier(
+        COVER,
+        SourcePochette::Dossier,
+        &format!("{passe:?} : cover.jpg doit rester devant la jaquette CUE (#5685)"),
+    );
+    poser_cover(&dossier, None);
+    b.passer_avec(passe, true).await;
+    b.verifier(
         JAQUETTE,
         SourcePochette::Integree,
-        &format!("{passe:?} garde cover.jpg malgré la jaquette CUE"),
+        &format!("{passe:?} : le retrait de cover.jpg doit reprendre la jaquette CUE"),
     );
     poser_jaquette(&b.image, Some(JAQUETTE_2));
     b.passer(passe).await;
@@ -146,12 +167,12 @@ async fn reprendre_cover(passe: Passe) {
         SourcePochette::Integree,
         "la jaquette CUE retouchée doit suivre le disque",
     );
-    poser_jaquette(&b.image, None);
-    b.passer(passe).await;
+    poser_cover(&dossier, Some(COVER));
+    b.passer_avec(passe, true).await;
     b.verifier(
         COVER,
         SourcePochette::Dossier,
-        "le retrait de jaquette doit reprendre cover.jpg",
+        &format!("{passe:?} : cover.jpg reposé doit repasser devant la jaquette CUE"),
     );
 }
 
