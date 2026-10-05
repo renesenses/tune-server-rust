@@ -79,11 +79,43 @@ fn dedup_ranked_tracks(
 /// les pistes trouvées par leurs seules métadonnées restent sur la première
 /// page (voir `routes/search.rs`, « Extended metadata search »). Un client
 /// qui ne lit que les tableaux voit exactement ce qu'il voyait.
+/// `GET /library/search`.
+///
+/// 🔴 Fil 1936 (Sevy Tabroc, 1.0.0-rc2, darTZeel LHC-208 en DLNA) : « dans
+/// Recherche, je cherche un groupe, je lance un album ; la flèche Retour de
+/// la page de l'artiste, ou effacer le champ, coupe la musique environ 5 s ».
+/// Les deux gestes relancent CETTE route — au remontage de l'écran pour le
+/// premier, à chaque préfixe pour le second — alors que la musique joue déjà.
+///
+/// Toutes ses lectures sont synchrones (rusqlite), et l'une est un balayage :
+/// `track_metadata.search_by_value` fait un `LOWER(value) LIKE '%…%'` sur les
+/// paroles et les commentaires de toute la bibliothèque (109 152 pistes chez
+/// le testeur). Posées sur un fil de l'exécuteur, elles le tenaient pour tout
+/// le serveur, y compris le service du flux au renderer — le défaut de #5138
+/// sur `/library/tracks` et de #4800 sur la grille d'albums, réglé là par
+/// `spawn_blocking`. Même remède ici.
 pub(super) async fn search(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<SearchQuery>,
 ) -> Json<Value> {
+    let (limit, offset) = (q.limit.unwrap_or(20), q.offset.unwrap_or(0).max(0));
+    let profile_id = profile.id();
+    match tokio::task::spawn_blocking(move || chercher_en_bibliotheque(&state, profile_id, q)).await
+    {
+        Ok(corps) => Json(corps),
+        Err(e) => {
+            tracing::error!(error = %e, "library_search_tache_bloquante_perdue");
+            Json(json!({
+                "artists": [], "albums": [], "labels": [], "tracks": [],
+                "limit": limit, "offset": offset,
+            }))
+        }
+    }
+}
+
+/// Le corps de `GET /library/search`, exécuté HORS de l'exécuteur async.
+fn chercher_en_bibliotheque(state: &AppState, profile_id: i64, q: SearchQuery) -> Value {
     let limit = q.limit.unwrap_or(20);
     let offset = q.offset.unwrap_or(0).max(0);
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
@@ -202,7 +234,7 @@ pub(super) async fn search(
     let n_extra = extra_tracks.len();
     let toutes: Vec<tune_core::db::models::Track> =
         tracks.into_iter().chain(extra_tracks).collect();
-    let mut track_results = super::tracks::joindre_dr_par_piste(&state, profile.id(), toutes);
+    let mut track_results = super::tracks::joindre_dr_par_piste(state, profile_id, toutes);
 
     // L'annotation propre à cette route se pose APRÈS, sur le JSON déjà
     // enrichi : les pistes trouvées par leurs métadonnées disent laquelle a
@@ -219,7 +251,7 @@ pub(super) async fn search(
         }
     }
 
-    Json(json!({
+    json!({
         "artists": artists,
         "albums": albums,
         "labels": labels,
@@ -243,7 +275,7 @@ pub(super) async fn search(
         },
         "limit": limit,
         "offset": offset,
-    }))
+    })
 }
 
 /// POST /library/search/acoustic — natural-language acoustic search (Phase 3).
@@ -697,6 +729,46 @@ mod totaux_4663 {
         assert_eq!(corps["has_more"]["tracks"], true);
         assert_eq!(corps["totals_capped"]["tracks"], false);
         assert_eq!(corps["offset"], 0);
+    }
+
+    /// 🔴 Fil 1936 — la recherche ne tient plus l'exécuteur.
+    ///
+    /// `#[tokio::test]` monte un exécuteur à UN fil. Un battement de cœur y
+    /// tourne en `yield_now`. Une route synchrone se termine en un seul
+    /// `poll` : le battement ne bat pas une fois pendant qu'elle travaille —
+    /// c'est ce qui privait le flux du renderer. Sur le pool bloquant, la route
+    /// rend la main tant que la base travaille, et le battement continue.
+    #[tokio::test]
+    async fn fil_1936_la_recherche_rend_la_main_a_l_executeur() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let state = etat_45_pistes();
+        let battements = Arc::new(AtomicU64::new(0));
+        let arret = Arc::new(AtomicBool::new(false));
+        let coeur = {
+            let (b, a) = (battements.clone(), arret.clone());
+            tokio::spawn(async move {
+                while !a.load(Ordering::Relaxed) {
+                    b.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        let avant = battements.load(Ordering::Relaxed);
+        let corps = appeler(&state, "q=autumn%20leaves&limit=40").await;
+        let pendant = battements.load(Ordering::Relaxed) - avant;
+        arret.store(true, Ordering::Relaxed);
+        coeur.await.unwrap();
+        assert_eq!(
+            corps["tracks"].as_array().unwrap().len(),
+            40,
+            "la réponse ne change pas"
+        );
+        assert!(
+            pendant > 0,
+            "le battement n'a pas battu pendant la recherche : la route tient l'exécuteur (fil 1936)"
+        );
     }
 
     /// La suite se demande par `?offset=` et ne redonne rien de la page 1.
