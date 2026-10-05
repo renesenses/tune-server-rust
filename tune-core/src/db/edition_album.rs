@@ -1548,6 +1548,8 @@ struct Balises {
     annee: Option<i32>,
     genre: Option<String>,
     label: Option<String>,
+    /// #5616 — le type de sortie de la balise (`RELEASETYPE` et variantes).
+    type_de_sortie: Option<String>,
     disque: Option<i32>,
     numero: Option<i32>,
     nom_disque: Option<String>,
@@ -1592,6 +1594,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 }),
                 genre: non_vide(a.genre.clone()),
                 label: None,
+                type_de_sortie: None,
                 disque: Some(1),
                 numero: Some(p.numero as i32),
                 nom_disque: None,
@@ -1608,6 +1611,7 @@ fn relire_les_balises(lignes: &[Ligne]) -> HashMap<i64, Balises> {
                 annee: m.year.map(|y| y as i32).filter(|y| *y > 0),
                 genre: non_vide(m.genre),
                 label: non_vide(m.label),
+                type_de_sortie: m.release_type,
                 disque: m.disc_number.map(|d| d as i32),
                 numero: m.track_number.map(|n| n as i32),
                 nom_disque: non_vide(m.disc_subtitle),
@@ -1655,8 +1659,9 @@ pub const CHAMPS_RETABLISSABLES: [&str; 9] = [
 ///   piste qui ouvre l'album (disque, puis numéro). Sans balise, `year`,
 ///   `label` et `genre` sont vidés ; `title` et `album_artist` gardent leur
 ///   valeur — un album a toujours un titre et un artiste.
-/// - `release_type` : aucune balise ne le porte ; il est vidé, et
-///   l'enrichissement pourra le reposer.
+/// - `release_type` : la valeur de la balise `RELEASETYPE` (et variantes,
+///   #5616) ; sans balise, il est vidé, et l'enrichissement pourra le
+///   reposer.
 /// - `compilation_mode` : le mode revient à `auto` (la règle juge).
 /// - `tracks` : titres et artistes de pistes renommés reprennent ceux des
 ///   balises. La disposition des disques, si elle est tenue, reste.
@@ -1805,7 +1810,11 @@ pub fn retablir(db: &Arc<dyn DbBackend>, album_id: i64, champ: &str) -> Result<(
                 "title" => ("title", "title", texte(|b| b.album.clone())),
                 "label" => ("label", "label", texte(|b| b.label.clone())),
                 "genre" => ("genre", "genre", texte(|b| b.genre.clone())),
-                "release_type" => ("release_type", "release_type", None),
+                "release_type" => (
+                    "release_type",
+                    "release_type",
+                    texte(|b| b.type_de_sortie.clone()),
+                ),
                 "year" => ("year", "year", None),
                 _ => ("artist", "artist_id", None),
             };
