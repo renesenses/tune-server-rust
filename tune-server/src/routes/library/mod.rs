@@ -436,6 +436,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
+        .route(
+            "/tracks/{id}/tenues",
+            get(tracks::champs_tenus_get).delete(tracks::champs_tenus_retablir),
+        )
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))

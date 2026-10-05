@@ -8,6 +8,7 @@ pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+pub mod champs_tenus;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
