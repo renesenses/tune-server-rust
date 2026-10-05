@@ -1,25 +1,25 @@
 //! 🔴 #4645 — les flux audio ne dépendent plus de l'exécuteur principal.
 //!
-//! ## Ce qui coupait le darTZeel
+//! ## Ce qui prive le darTZeel
 //!
 //! Le darTZeel LHC-208 d'Yves (tickets 151, 157, 161, 169, 170) tire le WAV au
 //! rythme exact de la lecture : quelques secondes d'avance au plus
-//! (`avance_max_ms` de 2,4 à 3,2 s dans ses journaux). La moindre panne de
-//! livraison plus longue que ce tampon s'entend : micro-coupure, puis, au-delà
-//! d'une vingtaine de secondes sans données, le renderer referme la connexion
-//! et s'arrête (`fin="consommateur_parti"`, fils 1871, 1892, 1935).
+//! (`avance_max_ms` de 2,4 à 3,2 s dans ses journaux). Une panne de livraison
+//! plus longue que ce tampon s'entend : micro-coupure, puis, au-delà d'une
+//! vingtaine de secondes sans données, le renderer referme la connexion
+//! (`fin="consommateur_parti"`).
 //!
-//! Or le service de ce corps vivait sur le MÊME exécuteur tokio que tout le
-//! reste du serveur : la connexion HTTP du renderer, la lecture du fichier
-//! temporaire, la réponse à une reprise `Range`. Un gestionnaire qui bloque un
-//! fil (lecture SQLite synchrone d'une collection intelligente, #5438 ; gels
-//! de 10 à 30 s mesurés, #4924 et #5677) gèle aussi, au passage, la livraison
-//! au renderer. Les journaux d'Yves en portent la trace : quatre sondes de
-//! diagnostic sur `localhost` tombées ensemble pendant que le darTZeel était
-//! figé (fil 1911, #5086 — `localhost` ne passe pas par le Wi-Fi) ; une
-//! connexion qui n'est plus lue pendant 20 s puis se referme dans la même
-//! milliseconde qu'une rafale de lignes (fil 1935) ; une coupure au clic dans
-//! l'interface (ticket 171, #5017).
+//! Deux choses le privent. Le lien réseau du testeur (Mac en Wi-Fi) : la
+//! livraison reste sous le nominal (fils 1871, 1892), et ce n'est pas l'affaire
+//! de ce module. Et un gel de l'exécuteur tokio de Tune, que ce module traite.
+//! Le corps du flux vivait sur le MÊME exécuteur que tout le reste du serveur :
+//! la connexion HTTP du renderer, la lecture du fichier temporaire, la réponse
+//! à une reprise `Range`. Un gestionnaire qui bloque un fil (lecture SQLite
+//! synchrone d'une collection intelligente, #5438) gelait aussi la livraison.
+//! Chez Yves, le chien de garde a vu l'exécuteur figé 12 s, et le darTZeel a
+//! lâché le flux puis l'a repris par `Range` (fil 2046, #5545). Un gel de
+//! 41,6 s est relevé dans le fil 2051 (#5526), et d'autres ailleurs (#4924,
+//! #5677).
 //!
 //! ## Ce que fait ce module
 //!
@@ -54,7 +54,7 @@ use axum::response::{IntoResponse, Response};
 use axum::serve::IncomingStream;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
-use tower::Service;
+use tower_service::Service;
 
 /// Préfixe des URL que Tune donne aux renderers pour le corps d'une piste
 /// (`/stream/<id>.wav`, voir `tune_stream_http::router`).

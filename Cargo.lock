@@ -5631,6 +5631,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "tune-bandcamp",

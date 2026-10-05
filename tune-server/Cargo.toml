@@ -109,6 +109,9 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { workspace = true }
+# #4645 — le trait `Service` que `axum::serve` attend du service d'aiguillage
+# (`src/aiguillage_des_flux.rs`). Déjà dans l'arbre, par axum.
+tower-service = "0.3"
 toml = { workspace = true }
 reqwest = { workspace = true }
 async-stream = { workspace = true }

@@ -18,7 +18,8 @@
 //! Le flux doit continuer, et la reprise demandée en plein gel doit recevoir
 //! son `206`. Avant le correctif, le serveur entier (connexions comprises)
 //! tournait sur l'exécuteur gelé : le faux renderer n'avait plus rien pendant
-//! tout le gel et refermait la connexion — l'arrêt d'Yves.
+//! tout le gel et refermait la connexion — ce que le darTZeel d'Yves a fait
+//! pendant le gel de 12 s du fil 2046.
 //!
 //! Tout le pilotage du test se fait sur des `std::thread` et des sockets
 //! bloquantes : rien de ce qui mesure ne dépend d'un exécuteur tokio.
@@ -241,7 +242,7 @@ struct Bilan {
 
 /// Le faux darTZeel : lit au rythme fixé jusqu'à `jusqu_a` ; reprend une fois
 /// par `Range` quand `reprendre_apres` est atteint. Rend `Err` dès qu'il
-/// referme la connexion faute de données — c'est l'arrêt d'Yves.
+/// referme la connexion faute de données.
 fn faux_renderer(
     adresse: SocketAddr,
     reprendre_apres: Arc<Mutex<Option<Instant>>>,
