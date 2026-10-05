@@ -25,6 +25,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // première frontière au lieu de travailler. Un test de câblage garde la
     // ligne (`reprise_des_passes`).
     crate::reprise_des_passes::spawn(state);
+    // Fil 2137 : une gravure DR tuée par l'arrêt précédent a laissé
+    // `running` en base ; on la dit `interrupted` pour débloquer le bouton.
+    crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
     spawn_squeezebox_poller(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
@@ -2725,7 +2728,19 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // requested device is no longer available") → 10s decoder timeout → total
     // stop (DEvir, Win11 WASAPI fallback). Hotplug detection resumes on the next
     // cycle once playback stops. This also protects any active ASIO output.
-    if any_local_output_playing(state).await {
+    let lecture_locale_en_cours = any_local_output_playing(state).await;
+
+    // #5353 — un démarrage replié sur WASAPI alors qu'ASIO est choisi n'y
+    // restait jusqu'ici que jusqu'au redémarrage… sauf que rien, après le
+    // démarrage, n'enregistrait jamais une sortie ASIO : `GET /devices/audio`
+    // énumère ASIO sans enregistrer, et ce rescan-ci enregistre sans énumérer
+    // ASIO. La bascule (une sonde ASIO par processus, différée tant qu'une
+    // sortie locale joue) passe par le chemin d'enregistrement du démarrage.
+    if crate::startup::basculer_le_repli_wasapi_sur_asio(state, lecture_locale_en_cours).await {
+        return;
+    }
+
+    if lecture_locale_en_cours {
         debug!("local_audio_rescan_skipped_active_playback");
         return;
     }

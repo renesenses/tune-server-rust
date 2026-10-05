@@ -1941,6 +1941,9 @@ mod adoption_du_flux_pre_arme_3442;
 #[cfg(test)]
 mod qualite_piste_de_service_3365;
 
+#[cfg(test)]
+mod format_a_l_enchainement_upnp_2119;
+
 /// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
 ///
 /// Hors de toute `feature` : `refus_de_zone_hors_ligne` est une fonction pure

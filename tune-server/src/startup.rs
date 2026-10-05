@@ -181,6 +181,110 @@ fn asio_warm_disabled_by_env() -> bool {
         .unwrap_or(false)
 }
 
+/// #5353 — où en est le préchauffage ASIO de CE processus.
+///
+/// Le préchauffage tient `ASIO_DEVICE_LOCK` du début à la fin de son balayage
+/// (`list_asio_devices` passe par `try_with_asio_device_lock`). Pendant ce
+/// temps, l'énumération de démarrage (`list_audio_devices_with_backend("asio")`)
+/// voit le pilote « occupé » et sert le dernier parc connu (#1267) : vide, sur
+/// un processus neuf. C'est cette liste vide qui faisait conclure « ASIO n'a
+/// rien » et figer les zones locales sur WASAPI, alors que le préchauffage
+/// trouvait les pilotes une à trois secondes plus tard (Jean-François, fil
+/// 2018, 1.0.0-rc1 ; Didier, fil 2107).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) enum EtatPrechauffageAsio {
+    /// Pas lancé : hors Windows, sans hôte ASIO, ou coupé (environnement,
+    /// témoin de plantage). Rien à attendre.
+    Absent,
+    /// Le balayage tourne et tient le pilote.
+    EnCours,
+    /// Le balayage est revenu (ou son fil s'est arrêté) : le pilote est libre.
+    Termine,
+}
+
+/// Ce que le démarrage fait d'une énumération ASIO de démarrage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuiteEnumerationDeDemarrage {
+    /// Le parc énuméré est gardé tel quel (non vide, backend non ASIO, ou
+    /// énumération en échec — pas de repli dans ce dernier cas, voir
+    /// `register_local_outputs`).
+    Garder,
+    /// La liste vide vient du préchauffage qui tient le pilote : attendre sa
+    /// fin (bornée), puis énumérer ASIO de nouveau.
+    AttendreLePrechauffage,
+    /// ASIO a vraiment répondu « aucun appareil » : repli WASAPI.
+    RepliWasapi,
+}
+
+/// #5353 — la décision, sans effet de bord, testable hors Windows.
+///
+/// `appareils` vaut `None` quand l'énumération a expiré ou paniqué : on ne
+/// replie pas (inchangé), puisqu'une sonde ASIO bloquée bloquerait la suivante.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn suite_de_l_enumeration_de_demarrage(
+    backend: &str,
+    appareils: Option<usize>,
+    prechauffage: EtatPrechauffageAsio,
+) -> SuiteEnumerationDeDemarrage {
+    match appareils {
+        Some(0) if backend.eq_ignore_ascii_case("asio") => {
+            if prechauffage == EtatPrechauffageAsio::EnCours {
+                SuiteEnumerationDeDemarrage::AttendreLePrechauffage
+            } else {
+                SuiteEnumerationDeDemarrage::RepliWasapi
+            }
+        }
+        _ => SuiteEnumerationDeDemarrage::Garder,
+    }
+}
+
+/// Borne de l'attente du préchauffage par l'énumération de démarrage. La même
+/// que l'énumération elle-même (`scan_devices`) : au-delà, on se replie comme
+/// avant. Le serveur HTTP n'est pas muet pendant ce temps : le répondeur de
+/// démarrage (`boot_status`) sert la page d'attente, phase « sorties audio ».
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+const ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO: std::time::Duration = std::time::Duration::from_secs(8);
+
+static PRECHAUFFAGE_ASIO: std::sync::LazyLock<tokio::sync::watch::Sender<EtatPrechauffageAsio>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(EtatPrechauffageAsio::Absent).0);
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn noter_le_prechauffage_asio(etat: EtatPrechauffageAsio) {
+    PRECHAUFFAGE_ASIO.send_replace(etat);
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn etat_du_prechauffage_asio() -> EtatPrechauffageAsio {
+    *PRECHAUFFAGE_ASIO.borrow()
+}
+
+/// Attend que le préchauffage ne soit plus `EnCours`, au plus `delai`.
+/// Rend `true` s'il a rendu la main dans le délai.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+async fn attendre_la_fin_du_prechauffage_asio(delai: std::time::Duration) -> bool {
+    let mut rx = PRECHAUFFAGE_ASIO.subscribe();
+    matches!(
+        tokio::time::timeout(
+            delai,
+            rx.wait_for(|etat| *etat != EtatPrechauffageAsio::EnCours)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Passe le préchauffage à `Termine` quand son fil s'arrête, panique comprise :
+/// une attente ne doit jamais dépendre d'un balayage qui n'écrira plus rien.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+struct FinDuPrechauffageAsio;
+
+impl Drop for FinDuPrechauffageAsio {
+    fn drop(&mut self) {
+        noter_le_prechauffage_asio(EtatPrechauffageAsio::Termine);
+    }
+}
+
 /// Lance le préchauffage du cache ASIO, protégé par le témoin de plantage.
 #[cfg(feature = "local-audio")]
 fn spawn_asio_warm_scan() {
@@ -202,7 +306,10 @@ fn spawn_asio_warm_scan() {
     // ni nommer la cause ni indiquer le geste, et l'utilisateur lit « vérifiez
     // qu'elle est branchée et allumée » pour un DAC parfaitement branché.
     match decision {
-        AsioWarmDecision::Run => {}
+        // #5353 — EnCours AVANT de lancer le fil, pour la même raison que la
+        // porte ci-dessous : l'énumération de démarrage ne doit pas profiter
+        // du délai de démarrage du fil pour conclure « rien à attendre ».
+        AsioWarmDecision::Run => noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours),
         AsioWarmDecision::SkippedByEnv => {
             tune_core::outputs::local::block_asio_device_enumeration(
                 tune_core::outputs::asio_blocage_4556::MotifDeBlocage::ParEnvironnement,
@@ -233,6 +340,8 @@ fn spawn_asio_warm_scan() {
             );
         }
         AsioWarmDecision::Run => {
+            // #5353 — `Termine` à la sortie de ce bras, panique comprise.
+            let _fin = FinDuPrechauffageAsio;
             if let Some(dir) = sentinel.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -244,6 +353,7 @@ fn spawn_asio_warm_scan() {
             let devices = tune_core::outputs::local::list_asio_devices();
 
             let _ = std::fs::remove_file(&sentinel);
+            APPAREILS_DU_PRECHAUFFAGE.store(devices.len(), std::sync::atomic::Ordering::Release);
             info!(count = devices.len(), "asio_warm_scan_complete");
         }
     });
@@ -1555,6 +1665,46 @@ pub(crate) fn local_zone_action(
     }
 }
 
+// Enumerate output devices OFF the async runtime and under a hard timeout.
+//
+// Enumerating ASIO opens each driver to read its formats, and an ASIO driver
+// can only be opened by ONE process at a time: if another app (JRiver, foobar,
+// a DSD ASIO proxy…) already holds it, the open BLOCKS — potentially forever.
+// This call sits on the critical boot path *before* the HTTP listener starts
+// serving, so a blocked ASIO probe used to wedge the whole server: the port was
+// bound but nothing accepted connections → completely blank web UI (JP
+// Borderies, Denafrips USB DAC in ASIO with JRiver open). Running it in
+// `spawn_blocking` under a timeout guarantees the web UI always comes up; if the
+// scan does not respond we start WITHOUT local zones for this boot rather than
+// hang. The device becomes usable again once its driver is free (close the other
+// app) and Tune is relaunched.
+#[cfg(feature = "local-audio")]
+async fn scan_devices(backend: String) -> Option<Vec<tune_core::outputs::local::AudioDevice>> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::task::spawn_blocking(move || {
+            tune_core::outputs::local::list_audio_devices_with_backend(&backend)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(devices)) => Some(devices),
+        Ok(Err(_)) => {
+            warn!("local_audio_enumeration_panicked — starting without local zones this boot");
+            None
+        }
+        Err(_) => {
+            warn!(
+                "local_audio_enumeration_timeout — an audio driver (most likely an ASIO device \
+                 held by another application such as JRiver) did not respond within 8s. Starting \
+                 the server WITHOUT local zones so the web UI stays available; close the other app \
+                 and relaunch Tune to use the device."
+            );
+            None
+        }
+    }
+}
+
 /// Register local audio output devices (USB DAC, headphones, speakers).
 ///
 /// Sur une base neuve, seule la sortie système reçoit automatiquement une
@@ -1565,61 +1715,10 @@ pub async fn register_local_outputs(state: &AppState) {
     // Prefer DB-persisted backend (set via UI) over config/env default
     let audio_backend_owned = state.effective_audio_backend();
     let audio_backend = &audio_backend_owned;
-    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
-    //
-    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
-    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
-    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
-    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
-    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
-    // sorties qui ne sont pas ASIO.
-    let exclusive_demande = state.requested_exclusive_mode();
-    // #5353 — l'écho du forçage ASIO n'est pas une demande pour une sortie
-    // qui ne s'ouvrira pas en ASIO.
-    let exclusif_arme_par_asio = state.exclusif_arme_par_asio();
     // Publish it: this is the value the outputs below are built with, and the
     // only honest answer for the signal path until the next restart.
     if let Ok(mut slot) = state.active_audio_backend.write() {
         *slot = Some(audio_backend_owned.clone());
-    }
-
-    // Enumerate output devices OFF the async runtime and under a hard timeout.
-    //
-    // Enumerating ASIO opens each driver to read its formats, and an ASIO driver
-    // can only be opened by ONE process at a time: if another app (JRiver, foobar,
-    // a DSD ASIO proxy…) already holds it, the open BLOCKS — potentially forever.
-    // This call sits on the critical boot path *before* the HTTP listener starts
-    // serving, so a blocked ASIO probe used to wedge the whole server: the port was
-    // bound but nothing accepted connections → completely blank web UI (JP
-    // Borderies, Denafrips USB DAC in ASIO with JRiver open). Running it in
-    // `spawn_blocking` under a timeout guarantees the web UI always comes up; if the
-    // scan does not respond we start WITHOUT local zones for this boot rather than
-    // hang. The device becomes usable again once its driver is free (close the other
-    // app) and Tune is relaunched.
-    async fn scan_devices(backend: String) -> Option<Vec<tune_core::outputs::local::AudioDevice>> {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            tokio::task::spawn_blocking(move || {
-                tune_core::outputs::local::list_audio_devices_with_backend(&backend)
-            }),
-        )
-        .await
-        {
-            Ok(Ok(devices)) => Some(devices),
-            Ok(Err(_)) => {
-                warn!("local_audio_enumeration_panicked — starting without local zones this boot");
-                None
-            }
-            Err(_) => {
-                warn!(
-                    "local_audio_enumeration_timeout — an audio driver (most likely an ASIO device \
-                     held by another application such as JRiver) did not respond within 8s. Starting \
-                     the server WITHOUT local zones so the web UI stays available; close the other app \
-                     and relaunch Tune to use the device."
-                );
-                None
-            }
-        }
     }
 
     // `None` means the scan timed out or panicked. When that happens we do NOT
@@ -1627,11 +1726,50 @@ pub async fn register_local_outputs(state: &AppState) {
     // lock, so a second enumeration would only block (and time out) again — better
     // to bring the UI up now and let the next relaunch (with the driver free) pick
     // the device up.
-    let scan = scan_devices(audio_backend_owned.clone()).await;
+    let mut scan = scan_devices(audio_backend_owned.clone()).await;
+    // #5353 — une liste ASIO vide pendant le préchauffage ne dit rien des
+    // pilotes : elle vient du cache servi parce que le préchauffage tient le
+    // pilote (#1267), et ce cache est vide sur un processus neuf. On attend
+    // donc la fin du préchauffage — bornée, et le répondeur de démarrage
+    // continue de servir la page d'attente — puis on énumère ASIO de nouveau,
+    // pilote libre. Jamais deux sondes ASIO en même temps : c'est ce que la
+    // garde #1267 protège, et l'attente la respecte.
+    if suite_de_l_enumeration_de_demarrage(
+        audio_backend,
+        scan.as_ref().map(Vec::len),
+        etat_du_prechauffage_asio(),
+    ) == SuiteEnumerationDeDemarrage::AttendreLePrechauffage
+    {
+        info!("asio_enumeration_waiting_for_warm_scan");
+        crate::boot_status::set_current(Some("préchauffage ASIO"));
+        let termine = attendre_la_fin_du_prechauffage_asio(ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO).await;
+        crate::boot_status::set_current(None);
+        if termine {
+            scan = scan_devices(audio_backend_owned.clone()).await;
+            info!(
+                devices = scan.as_ref().map(Vec::len),
+                "asio_enumeration_after_warm_scan"
+            );
+        } else {
+            warn!(
+                attente_max_secs = ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO.as_secs(),
+                "asio_warm_scan_wait_timeout — le préchauffage ASIO n'a pas rendu la main à \
+                 temps : repli WASAPI pour ce démarrage"
+            );
+        }
+    }
     let mut devices = scan.clone().unwrap_or_default();
+    let mut repli_wasapi = false;
     // When ASIO is selected AND the host actually responded but exposed no devices,
     // also enumerate WASAPI so the user still has fallback outputs available.
-    if devices.is_empty() && scan.is_some() && audio_backend.eq_ignore_ascii_case("asio") {
+    // (#5353 : après l'attente ci-dessus ; un préchauffage encore en cours à ce
+    // stade, c'est l'attente expirée, et l'on se replie comme avant.)
+    if suite_de_l_enumeration_de_demarrage(
+        audio_backend,
+        scan.as_ref().map(Vec::len),
+        etat_du_prechauffage_asio(),
+    ) != SuiteEnumerationDeDemarrage::Garder
+    {
         // #4556 — dire POURQUOI l'hôte ASIO n'a rien rendu.
         //
         // Deux causes très différentes tombaient sur la même ligne : l'hôte a
@@ -1649,241 +1787,532 @@ pub async fn register_local_outputs(state: &AppState) {
             tune_core::outputs::asio_blocage_4556::noter_repli_wasapi_apres_blocage();
         }
         devices = scan_devices("wasapi".to_string()).await.unwrap_or_default();
+        repli_wasapi = true;
     }
     if !devices.is_empty() {
-        let mut outputs = state.outputs.lock().await;
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
-        // créer quoi que ce soit.
-        //
-        // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
-        // renomme l'endpoint — Windows le fait au changement de taux
-        // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
-        // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
-        // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
-        // fait suivre la zone à son appareil, par l'identifiant d'endpoint
-        // stable qu'elle a enregistré.
-        //
-        // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
-        // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
-        // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
-        // fait que lui donner le parc et journaliser ce qu'elle a décidé.
-        //
-        // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
-        // absent de `devices` reste introuvable, identifiant ou pas.
-        let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> =
-            devices
-                .iter()
-                .map(
-                    |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
-                        nom: dev.name.clone(),
-                        endpoint_id: dev.endpoint_id.clone(),
-                    },
-                )
-                .collect();
-        match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
-            Ok(rapport) => {
-                for r in &rapport.reassociees {
-                    info!(
-                        zone_id = r.zone_id,
-                        ancien = %r.ancien_device_id,
-                        nouveau = %r.nouveau_device_id,
-                        endpoint_id = %r.endpoint_id,
-                        "zone_locale_reassociee_par_identifiant_stable"
-                    );
-                }
-                // Les refus sont DITS. Une zone qui ne retrouve pas son
-                // appareil alors qu'elle en connaît l'identifiant est
-                // exactement ce qu'un rapport de bogue doit pouvoir nommer.
-                for (zone_id, motif) in &rapport.refus {
-                    warn!(
-                        zone_id,
-                        motif = %motif,
-                        "reassociation_de_zone_locale_refusee"
-                    );
-                }
-                if !rapport.apprises.is_empty() {
-                    info!(
-                        zones = rapport.apprises.len(),
-                        "identifiant_de_sortie_locale_appris"
-                    );
-                }
-            }
-            Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+        enregistrer_les_sorties_locales(state, &devices).await;
+        // #5353 — retenir les sorties de repli : si ASIO se révèle plus tard
+        // (rescan à chaud), ce sont elles que la bascule remplace.
+        if repli_wasapi {
+            noter_le_repli_wasapi_de_demarrage(
+                devices
+                    .iter()
+                    .map(|dev| format!("local:{}", dev.name))
+                    .collect(),
+            );
         }
-        // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
-        // règle propre — `local_zone_action` autorise la sortie système par
-        // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
-        // lui-même.
-        let auto_create = zone_repo.zone_auto_create_autorise();
-        // Un backend est censé marquer une seule sortie par défaut. `find`
-        // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
-        let system_default_device_id = first_system_default_name(
-            devices
-                .iter()
-                .map(|dev| (dev.name.as_str(), dev.is_default)),
-        )
-        .map(|name| format!("local:{name}"));
-
-        for dev in &devices {
-            let device_id = format!("local:{}", dev.name);
-            // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
-            // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
-            // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
-            // WASAPI alors que la lecture demandera toujours l'hôte « asio »
-            // (#3230).
-            // #3245 — la contrainte de plateforme se pose sur le backend
-            // OUVRABLE de CE périphérique, pas sur le réglage global. Même
-            // rectification que `with_origin_host` juste en dessous, et pour
-            // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
-            // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
-            // le son de toutes les autres applications de la machine.
-            let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
-                audio_backend,
-                Some(dev.backend.as_str()),
-                exclusive_demande,
-                exclusif_arme_par_asio,
-            );
-            let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
-                dev.name.clone(),
-                (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
-                statut_exclusif.effective,
-                audio_backend,
-            )
-            .with_origin_host(&dev.backend);
-            info!(
-                device_id = %device_id,
-                hote_origine = %dev.backend,
-                demande = exclusive_demande,
-                effectif = statut_exclusif.effective,
-                impose = statut_exclusif.forced,
-                "local_output_exclusive_mode_par_peripherique"
-            );
-            // Ensemencer la sortie avec le volume stocké.
-            //
-            // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
-            // `restore_zone_volumes` ne touche que la copie mémoire du
-            // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
-            // ne réimpose plus le volume enregistré à la lecture. Une zone locale
-            // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
-            // après un redémarrage — c'est précisément le réveil brutal que
-            // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
-            //
-            // Ce compromis-là ne s'applique pas ici : il protège le niveau
-            // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
-            // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
-            // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
-            // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
-            if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
-                tune_core::orchestrator::ensemencer_le_volume_local(
-                    &state.backend,
-                    &zone,
-                    &device_id,
-                    &local_out,
-                )
-                .await;
-            }
-            outputs.register(Box::new(local_out));
-            info!(
-                name = %dev.name,
-                device_id = %device_id,
-                default = dev.is_default,
-                channels = dev.max_channels,
-                rates = ?dev.sample_rates,
-                "local_audio_output_registered"
-            );
-
-            // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
-            // de moteur audio change le NOM du périphérique système, donc son
-            // `device_id`, donc la ligne en base — et la sortie système WASAPI
-            // se voyait offrir un second « This Computer » à côté de celui
-            // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
-            // sa propre zone ne doit pas compter contre lui.
-            let generique_deja_pris = zone_repo
-                .etiquette_generique_locale_prise(&device_id)
-                .unwrap_or(false);
-            let zone_name = tune_core::config::nom_de_zone_locale(
-                &dev.name,
-                dev.is_default,
-                generique_deja_pris,
-            );
-
-            let zone_exists = zone_repo
-                .get_by_device_id(&device_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
-            let action = local_zone_action(zone_exists, auto_create, is_system_default);
-            if action == LocalZoneAction::Skip {
-                info!(
-                    name = %zone_name,
-                    device_id = %device_id,
-                    default = is_system_default,
-                    auto_create,
-                    "local_audio_zone_manual_creation_required"
-                );
-                continue;
-            }
-
-            match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
-                Ok((zid, true)) => {
-                    info!(
-                        name = %zone_name,
-                        zone_id = zid,
-                        device_id = %device_id,
-                        "local_audio_zone_auto_created"
-                    );
-                }
-                Ok((zid, false)) => {
-                    let _ = zone_repo.set_online_by_device(&device_id, true);
-                    // Zones héritées : les anciennes versions nommaient TOUTES
-                    // les zones locales « This Computer » — deux DAC devenaient
-                    // des jumelles indiscernables (forum #1233, Alain). Un DAC
-                    // non-défaut coincé sur l'étiquette générique prend le nom
-                    // du périphérique ; un nom personnalisé n'est jamais touché.
-                    if !dev.is_default
-                        && let Ok(n) = zone_repo.rename_generic_local_label(zid, &dev.name)
-                        && n > 0
-                    {
-                        info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
-                    }
-                    // Device par défaut : le device_id étant dérivé du NOM du
-                    // périphérique (`local:<name>`), un renommage du Mac ou un
-                    // changement de locale macOS crée une SECONDE zone par
-                    // défaut portant l'étiquette générique de l'autre langue
-                    // (« This Computer » ⇄ « Cet ordinateur »). get_or_create /
-                    // deduplicate matchent sur device_id et ne fusionnent jamais
-                    // ces jumelles → les deux restent dans le sélecteur (Philippe
-                    // Vella). On masque les jumelles génériques, en gardant celle
-                    // liée au device vivant. Étiquettes génériques uniquement —
-                    // une zone renommée par l'utilisateur n'est jamais touchée.
-                    if dev.is_default
-                        && let Ok(n) = zone_repo.hide_duplicate_generic_local(zid)
-                        && n > 0
-                    {
-                        info!(
-                            zone_id = zid,
-                            hidden = n,
-                            "local_default_zone_duplicates_hidden"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        name = %zone_name,
-                        device_id = %device_id,
-                        error = %e,
-                        "local_audio_zone_create_failed"
-                    );
-                }
-            }
-        }
-
-        info!(count = devices.len(), "local_audio_devices_registered");
     } else {
         info!("no_local_audio_devices_found");
     }
+}
+
+/// Enregistre `devices` comme sorties locales et leur donne une zone selon la
+/// règle du démarrage (#1770) : c'est LE chemin d'enregistrement du démarrage,
+/// partagé avec la bascule à chaud d'un repli WASAPI vers ASIO (#5353).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn enregistrer_les_sorties_locales(
+    state: &AppState,
+    devices: &[tune_core::outputs::local::AudioDevice],
+) {
+    let audio_backend_owned = state.effective_audio_backend();
+    let audio_backend = &audio_backend_owned;
+    // #3245 — le mode exclusif se décide PAR PÉRIPHÉRIQUE, dans la boucle.
+    //
+    // Ce qui est lu ici, c'est la DEMANDE : la contrainte de plateforme, elle,
+    // dépend du backend sous lequel CHAQUE sortie sera ouverte, et ce backend
+    // n'est pas le réglage global (`openable_local_backend`, #1770). Calculer
+    // `effective_exclusive_mode()` une fois puis le passer identique à chaque
+    // `LocalOutput` faisait déborder « ASIO est exclusif par nature » sur des
+    // sorties qui ne sont pas ASIO.
+    let exclusive_demande = state.requested_exclusive_mode();
+    // #5353 — l'écho du forçage ASIO n'est pas une demande pour une sortie
+    // qui ne s'ouvrira pas en ASIO.
+    let exclusif_arme_par_asio = state.exclusif_arme_par_asio();
+    let mut outputs = state.outputs.lock().await;
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    // #2269 — l'identité des sorties locales, AVANT d'enregistrer ou de
+    // créer quoi que ce soit.
+    //
+    // Une zone locale est identifiée par `local:{nom}`. Quand le pilote
+    // renomme l'endpoint — Windows le fait au changement de taux
+    // d'échantillonnage — la boucle ci-dessous ne reconnaît plus
+    // `local:{nouveau nom}` et offre à l'appareil une zone NEUVE, à côté
+    // de l'ancienne restée orpheline avec tous ses réglages. Cette passe
+    // fait suivre la zone à son appareil, par l'identifiant d'endpoint
+    // stable qu'elle a enregistré.
+    //
+    // La RÈGLE est ailleurs — `outputs::identite_de_sortie`, une fonction
+    // pure : liste BLANCHE de backends (WASAPI et CoreAudio seulement, cf.
+    // sa table), quatre refus nommés, aucune fusion de zones. Ici on ne
+    // fait que lui donner le parc et journaliser ce qu'elle a décidé.
+    //
+    // ⚠️ Elle ne fait pas revenir un appareil DÉBRANCHÉ : un périphérique
+    // absent de `devices` reste introuvable, identifiant ou pas.
+    let parc_pour_identite: Vec<tune_core::outputs::identite_de_sortie::SortieEnumeree> = devices
+        .iter()
+        .map(
+            |dev| tune_core::outputs::identite_de_sortie::SortieEnumeree {
+                nom: dev.name.clone(),
+                endpoint_id: dev.endpoint_id.clone(),
+            },
+        )
+        .collect();
+    match zone_repo.appliquer_identite_de_sortie(&parc_pour_identite) {
+        Ok(rapport) => {
+            for r in &rapport.reassociees {
+                info!(
+                    zone_id = r.zone_id,
+                    ancien = %r.ancien_device_id,
+                    nouveau = %r.nouveau_device_id,
+                    endpoint_id = %r.endpoint_id,
+                    "zone_locale_reassociee_par_identifiant_stable"
+                );
+            }
+            // Les refus sont DITS. Une zone qui ne retrouve pas son
+            // appareil alors qu'elle en connaît l'identifiant est
+            // exactement ce qu'un rapport de bogue doit pouvoir nommer.
+            for (zone_id, motif) in &rapport.refus {
+                warn!(
+                    zone_id,
+                    motif = %motif,
+                    "reassociation_de_zone_locale_refusee"
+                );
+            }
+            if !rapport.apprises.is_empty() {
+                info!(
+                    zones = rapport.apprises.len(),
+                    "identifiant_de_sortie_locale_appris"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "identite_de_sortie_locale_non_appliquee"),
+    }
+    // #3529 : lecture unique, portée par `ZoneRepo`. Ce chemin-ci garde sa
+    // règle propre — `local_zone_action` autorise la sortie système par
+    // défaut, c'est le sens de #1770 — mais il ne relit plus le réglage
+    // lui-même.
+    let auto_create = zone_repo.zone_auto_create_autorise();
+    // Un backend est censé marquer une seule sortie par défaut. `find`
+    // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
+    let system_default_device_id = first_system_default_name(
+        devices
+            .iter()
+            .map(|dev| (dev.name.as_str(), dev.is_default)),
+    )
+    .map(|name| format!("local:{name}"));
+
+    for dev in devices {
+        let device_id = format!("local:{}", dev.name);
+        // `dev.backend` est l'hôte qui a énuméré ce nom. Il compte ici plus
+        // qu'ailleurs : quand ASIO n'expose rien, la boucle ci-dessus a
+        // ré-énuméré en WASAPI, si bien que ces noms-là sont des noms
+        // WASAPI alors que la lecture demandera toujours l'hôte « asio »
+        // (#3230).
+        // #3245 — la contrainte de plateforme se pose sur le backend
+        // OUVRABLE de CE périphérique, pas sur le réglage global. Même
+        // rectification que `with_origin_host` juste en dessous, et pour
+        // la même raison : sans elle, un nom WASAPI héritait de l'exclusif
+        // imposé par ASIO et Tune ouvrait WASAPI en mode exclusif, coupant
+        // le son de toutes les autres applications de la machine.
+        let statut_exclusif = tune_core::config::local_exclusive_mode_du_peripherique(
+            audio_backend,
+            Some(dev.backend.as_str()),
+            exclusive_demande,
+            exclusif_arme_par_asio,
+        );
+        let local_out = tune_core::outputs::local::LocalOutput::with_options_and_endpoint(
+            dev.name.clone(),
+            (!dev.endpoint_id.is_empty()).then(|| dev.endpoint_id.clone()),
+            statut_exclusif.effective,
+            audio_backend,
+        )
+        .with_origin_host(&dev.backend);
+        info!(
+            device_id = %device_id,
+            hote_origine = %dev.backend,
+            demande = exclusive_demande,
+            effectif = statut_exclusif.effective,
+            impose = statut_exclusif.forced,
+            "local_output_exclusive_mode_par_peripherique"
+        );
+        // Ensemencer la sortie avec le volume stocké.
+        //
+        // `LocalOutput` naît à `user_volume = 1.0` et rien ne le rectifiait :
+        // `restore_zone_volumes` ne touche que la copie mémoire du
+        // PlaybackManager, et depuis le compromis « Fabien » l'orchestrateur
+        // ne réimpose plus le volume enregistré à la lecture. Une zone locale
+        // réglée à 30 % repartait donc à PLEIN VOLUME au premier morceau
+        // après un redémarrage — c'est précisément le réveil brutal que
+        // l'écrêtage à 20 % prétendait empêcher sans jamais y toucher (#1596).
+        //
+        // Ce compromis-là ne s'applique pas ici : il protège le niveau
+        // *physique* d'un appareil externe, que Tune ne connaît pas. Le gain
+        // logiciel local, lui, n'appartient qu'à Tune, et sa valeur de départ
+        // n'a aucune raison d'être 100 % plutôt que ce que l'utilisateur a
+        // réglé. Une zone « Volume fixe » reste à 1.0 : c'est son contrat.
+        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
+            tune_core::orchestrator::ensemencer_le_volume_local(
+                &state.backend,
+                &zone,
+                &device_id,
+                &local_out,
+            )
+            .await;
+        }
+        outputs.register(Box::new(local_out));
+        info!(
+            name = %dev.name,
+            device_id = %device_id,
+            default = dev.is_default,
+            channels = dev.max_channels,
+            rates = ?dev.sample_rates,
+            "local_audio_output_registered"
+        );
+
+        // #1770 : l'étiquette générique ne se minte qu'une fois. Changer
+        // de moteur audio change le NOM du périphérique système, donc son
+        // `device_id`, donc la ligne en base — et la sortie système WASAPI
+        // se voyait offrir un second « This Computer » à côté de celui
+        // d'ASIO (jfpaquet, 0.9.130). La mesure exclut l'appareil courant :
+        // sa propre zone ne doit pas compter contre lui.
+        let generique_deja_pris = zone_repo
+            .etiquette_generique_locale_prise(&device_id)
+            .unwrap_or(false);
+        let zone_name =
+            tune_core::config::nom_de_zone_locale(&dev.name, dev.is_default, generique_deja_pris);
+
+        let zone_exists = zone_repo
+            .get_by_device_id(&device_id)
+            .ok()
+            .flatten()
+            .is_some();
+        let is_system_default = system_default_device_id.as_deref() == Some(device_id.as_str());
+        let action = local_zone_action(zone_exists, auto_create, is_system_default);
+        if action == LocalZoneAction::Skip {
+            info!(
+                name = %zone_name,
+                device_id = %device_id,
+                default = is_system_default,
+                auto_create,
+                "local_audio_zone_manual_creation_required"
+            );
+            continue;
+        }
+
+        match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
+            Ok((zid, true)) => {
+                info!(
+                    name = %zone_name,
+                    zone_id = zid,
+                    device_id = %device_id,
+                    "local_audio_zone_auto_created"
+                );
+            }
+            Ok((zid, false)) => {
+                let _ = zone_repo.set_online_by_device(&device_id, true);
+                // Zones héritées : les anciennes versions nommaient TOUTES
+                // les zones locales « This Computer » — deux DAC devenaient
+                // des jumelles indiscernables (forum #1233, Alain). Un DAC
+                // non-défaut coincé sur l'étiquette générique prend le nom
+                // du périphérique ; un nom personnalisé n'est jamais touché.
+                if !dev.is_default
+                    && let Ok(n) = zone_repo.rename_generic_local_label(zid, &dev.name)
+                    && n > 0
+                {
+                    info!(zone_id = zid, name = %dev.name, "local_zone_generic_label_healed");
+                }
+                // Device par défaut : le device_id étant dérivé du NOM du
+                // périphérique (`local:<name>`), un renommage du Mac ou un
+                // changement de locale macOS crée une SECONDE zone par
+                // défaut portant l'étiquette générique de l'autre langue
+                // (« This Computer » ⇄ « Cet ordinateur »). get_or_create /
+                // deduplicate matchent sur device_id et ne fusionnent jamais
+                // ces jumelles → les deux restent dans le sélecteur (Philippe
+                // Vella). On masque les jumelles génériques, en gardant celle
+                // liée au device vivant. Étiquettes génériques uniquement —
+                // une zone renommée par l'utilisateur n'est jamais touchée.
+                if dev.is_default
+                    && let Ok(n) = zone_repo.hide_duplicate_generic_local(zid)
+                    && n > 0
+                {
+                    info!(
+                        zone_id = zid,
+                        hidden = n,
+                        "local_default_zone_duplicates_hidden"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    name = %zone_name,
+                    device_id = %device_id,
+                    error = %e,
+                    "local_audio_zone_create_failed"
+                );
+            }
+        }
+    }
+
+    info!(count = devices.len(), "local_audio_devices_registered");
+}
+
+// ---------------------------------------------------------------------------
+// #5353 — bascule à chaud d'un repli WASAPI de démarrage vers ASIO
+// ---------------------------------------------------------------------------
+//
+// Ce qui manquait (journal RC1 de Jean-François, 01/10, 12:58:42 et 12:59:51) :
+// après le démarrage, AUCUN chemin n'énumère ASIO ET n'enregistre ce qu'il
+// trouve. `GET /devices/audio` (l'écran des réglages) énumère bien l'hôte ASIO
+// — `local_audio_host_selected backend="asio" devices=4` — mais ne fait que
+// lister. Le rescan (`POST /devices/rescan` et la tâche périodique), lui,
+// enregistre, mais FORCE WASAPI dès qu'ASIO est choisi (re-sonder ASIO peut
+// emporter le processus) et ne crée aucune zone. Un démarrage qui s'était replié
+// sur WASAPI y restait donc jusqu'au redémarrage suivant, quoi que l'écran
+// affiche.
+//
+// La bascule ne re-sonde ASIO qu'une seule fois par processus, et seulement si
+// le préchauffage du démarrage a déjà ouvert ces pilotes sans dommage et en a
+// trouvé au moins un.
+
+/// Sorties enregistrées par le repli WASAPI du démarrage, tant qu'ASIO ne les a
+/// pas remplacées. `None` : pas de repli (ou bascule faite).
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static REPLI_WASAPI_DE_DEMARRAGE: std::sync::Mutex<Option<Vec<String>>> =
+    std::sync::Mutex::new(None);
+
+/// La seule sonde ASIO à chaud de ce processus a-t-elle été consommée ?
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static BASCULE_ASIO_TENTEE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Combien de pilotes le préchauffage de ce processus a trouvés.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static APPAREILS_DU_PRECHAUFFAGE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// La première bascule différée se dit à l'INFO, les suivantes au DEBUG (le
+/// rescan repasse toutes les deux minutes pendant toute l'écoute).
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+static BASCULE_DIFFEREE_DITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn noter_le_repli_wasapi_de_demarrage(sorties: Vec<String>) {
+    *REPLI_WASAPI_DE_DEMARRAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(sorties);
+}
+
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn repli_wasapi_de_demarrage() -> Option<Vec<String>> {
+    REPLI_WASAPI_DE_DEMARRAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Ce que le rescan à chaud fait d'un repli WASAPI de démarrage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) enum SuiteDuRescanAsio {
+    /// Rien à basculer : le rescan WASAPI habituel suit.
+    RienABasculer,
+    /// La bascule est due mais pas maintenant ; le rescan suivant la retente.
+    Differer(&'static str),
+    /// Sonder ASIO (une fois) et remplacer les sorties de repli.
+    Basculer,
+}
+
+/// #5353 — la décision, sans effet de bord, testable hors Windows.
+///
+/// Une lecture locale en cours DIFFÈRE la bascule au lieu de l'annuler : la
+/// sonde ASIO et le retrait d'une sortie sont exactement ce qui coupe un flux
+/// (DEvir, #1267). Le rescan, qui repasse toutes les deux minutes sous Windows,
+/// la fera au premier passage où rien ne joue — c'est le plus sûr : rien ne
+/// touche au flux en cours, et l'utilisateur n'a pas à redémarrer.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn suite_du_rescan_asio(
+    backend: &str,
+    repli_de_demarrage: bool,
+    sonde_deja_consommee: bool,
+    coupe_circuit: bool,
+    prechauffage: EtatPrechauffageAsio,
+    appareils_du_prechauffage: usize,
+    lecture_locale_en_cours: bool,
+) -> SuiteDuRescanAsio {
+    if !backend.eq_ignore_ascii_case("asio") || !repli_de_demarrage || sonde_deja_consommee {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    // Coupe-circuit (environnement, témoin de plantage) : l'énumération ASIO
+    // servirait le cache sans rien ouvrir, et ce processus ne doit pas rouvrir
+    // un pilote soupçonné de l'avoir déjà tué (#4168, #4556).
+    if coupe_circuit {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    match prechauffage {
+        // Pas de préchauffage : ASIO absent de ce binaire, ou coupé.
+        EtatPrechauffageAsio::Absent => return SuiteDuRescanAsio::RienABasculer,
+        // Il tient le pilote : jamais deux sondes ASIO à la fois (#1267).
+        EtatPrechauffageAsio::EnCours => {
+            return SuiteDuRescanAsio::Differer("prechauffage_asio_en_cours");
+        }
+        EtatPrechauffageAsio::Termine => {}
+    }
+    // Le préchauffage n'a rien trouvé : le repli du démarrage était juste.
+    if appareils_du_prechauffage == 0 {
+        return SuiteDuRescanAsio::RienABasculer;
+    }
+    if lecture_locale_en_cours {
+        return SuiteDuRescanAsio::Differer("lecture_locale_en_cours");
+    }
+    SuiteDuRescanAsio::Basculer
+}
+
+/// Ce que la bascule a fait, pour le journal et les témoins.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) struct RapportDeBascule {
+    pub(crate) enregistrees: Vec<String>,
+    pub(crate) retirees: Vec<String>,
+    /// Sorties de repli gardées parce qu'elles jouaient au moment du retrait.
+    pub(crate) gardees_en_lecture: Vec<String>,
+}
+
+/// Enregistre `asio` par le chemin du démarrage, puis retire les sorties du
+/// repli WASAPI qu'elles remplacent (zone hors ligne, comme après un
+/// débranchement — #1626). Une sortie de repli qui joue n'est jamais retirée.
+#[cfg(feature = "local-audio")]
+pub(crate) async fn remplacer_le_repli_wasapi(
+    state: &AppState,
+    asio: &[tune_core::outputs::local::AudioDevice],
+    repli: &[String],
+) -> RapportDeBascule {
+    enregistrer_les_sorties_locales(state, asio).await;
+    let enregistrees: Vec<String> = asio.iter().map(|d| format!("local:{}", d.name)).collect();
+
+    let mut rapport = RapportDeBascule {
+        enregistrees: enregistrees.clone(),
+        ..Default::default()
+    };
+    {
+        let mut outputs = state.outputs.lock().await;
+        for id in repli {
+            // Même nom des deux côtés : la sortie ASIO vient de prendre sa
+            // place dans le registre, sous le même identifiant.
+            if enregistrees.contains(id) || !outputs.contains(id) {
+                continue;
+            }
+            let en_lecture = match outputs.get(id) {
+                Some(sortie) => matches!(
+                    sortie.lock().await.get_status().await,
+                    Ok(status) if status.state == tune_core::outputs::traits::TransportState::Playing
+                ),
+                None => false,
+            };
+            if en_lecture {
+                rapport.gardees_en_lecture.push(id.clone());
+                continue;
+            }
+            outputs.remove(id);
+            rapport.retirees.push(id.clone());
+        }
+    }
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    for id in &rapport.retirees {
+        let _ = zone_repo.set_online_by_device(id, false);
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::ZoneUpdated,
+            serde_json::json!({ "device_id": id, "online": false }),
+        );
+    }
+    for (id, dev) in enregistrees.iter().zip(asio) {
+        state.event_bus.emit(
+            "device.discovered",
+            serde_json::json!({ "id": id, "name": dev.name, "type": "local", "hotplug": true }),
+        );
+    }
+    rapport
+}
+
+/// #5353 — à appeler par le rescan à chaud, AVANT son énumération WASAPI.
+/// Rend `true` quand la bascule a eu lieu (le rescan WASAPI de ce passage est
+/// alors inutile : l'énumération vient d'avoir lieu).
+#[cfg(feature = "local-audio")]
+pub(crate) async fn basculer_le_repli_wasapi_sur_asio(
+    state: &AppState,
+    lecture_locale_en_cours: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let backend = state.effective_audio_backend();
+    let repli = repli_wasapi_de_demarrage();
+    let suite = suite_du_rescan_asio(
+        &backend,
+        repli.is_some(),
+        BASCULE_ASIO_TENTEE.load(Ordering::Acquire),
+        tune_core::outputs::asio_blocage_4556::enumeration_bloquee(),
+        etat_du_prechauffage_asio(),
+        APPAREILS_DU_PRECHAUFFAGE.load(Ordering::Acquire),
+        lecture_locale_en_cours,
+    );
+    match suite {
+        SuiteDuRescanAsio::RienABasculer => return false,
+        SuiteDuRescanAsio::Differer(motif) => {
+            if !BASCULE_DIFFEREE_DITE.swap(true, Ordering::AcqRel) {
+                info!(
+                    motif,
+                    "asio_bascule_a_chaud_differee — sorties ASIO trouvées par le \
+                     préchauffage, zones encore sur le repli WASAPI : bascule au \
+                     prochain rescan où rien ne joue"
+                );
+            } else {
+                tracing::debug!(motif, "asio_bascule_a_chaud_differee");
+            }
+            return false;
+        }
+        SuiteDuRescanAsio::Basculer => {}
+    }
+
+    let scan = scan_devices("asio".to_string()).await;
+    let asio: Vec<_> = scan
+        .iter()
+        .flatten()
+        .filter(|d| d.backend.eq_ignore_ascii_case("asio"))
+        .cloned()
+        .collect();
+    if asio.is_empty() {
+        // Une liste non vide SANS appareil ASIO, c'est le parc WASAPI des 5 s
+        // de `SCAN_GUARD`, servi sans rien sonder : on retentera. Une liste
+        // vide ou une sonde expirée, elle, consomme l'unique tentative — on ne
+        // rouvre pas en boucle un pilote qui ne répond pas.
+        let parc_d_un_autre_hote = scan.as_ref().is_some_and(|l| !l.is_empty());
+        if !parc_d_un_autre_hote {
+            BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
+        }
+        warn!(
+            sonde_expiree = scan.is_none(),
+            parc_d_un_autre_hote,
+            "asio_bascule_a_chaud_sans_appareil — le repli WASAPI est conservé"
+        );
+        return false;
+    }
+    BASCULE_ASIO_TENTEE.store(true, Ordering::Release);
+    let repli = repli.unwrap_or_default();
+    let rapport = remplacer_le_repli_wasapi(state, &asio, &repli).await;
+    if rapport.gardees_en_lecture.is_empty() {
+        *REPLI_WASAPI_DE_DEMARRAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    } else {
+        noter_le_repli_wasapi_de_demarrage(rapport.gardees_en_lecture.clone());
+    }
+    info!(
+        enregistrees = ?rapport.enregistrees,
+        retirees = ?rapport.retirees,
+        gardees_en_lecture = ?rapport.gardees_en_lecture,
+        "asio_bascule_a_chaud_faite — sorties ASIO enregistrées à la place du repli WASAPI \
+         du démarrage"
+    );
+    true
 }
 
 /// Remonte les partages reseau enregistres, avant que quoi que ce soit ne lise
@@ -1923,6 +2352,7 @@ pub async fn remount_network_shares(state: &AppState) {
         return;
     }
     info!(count = rows.len(), "remounting_network_shares");
+    let mut a_retenter: Vec<PartageEnregistre> = Vec::new();
     for r in rows {
         let host = r.first().and_then(|v| v.as_string()).unwrap_or_default();
         let share = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
@@ -1930,130 +2360,263 @@ pub async fn remount_network_shares(state: &AppState) {
         if host.is_empty() || share.is_empty() || path.is_empty() {
             continue;
         }
-        let id = r.get(5).and_then(|v| v.as_i64());
-        // Deja monte (redemarrage du seul service, systeme reste debout) :
-        // ne pas empiler un second montage sur le meme point.
-        //
-        // Le test etait « le repertoire contient-il quelque chose ? ». Un point
-        // de montage non monte mais portant des residus — un scan a ecrit
-        // dedans pendant que le NAS etait tombe — faisait donc sauter le
-        // remontage SANS UN MOT, et l'utilisateur se retrouvait avec une
-        // bibliotheque a moitie lisible que rien n'expliquait. On demande
-        // desormais s'il s'agit reellement d'un point de montage (#1916).
-        if crate::smb::est_un_point_de_montage(std::path::Path::new(&path)) {
-            tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_mounted_skipping");
-            noter_montage(state, id, "mounted", None, None).await;
-            continue;
+        let partage = PartageEnregistre {
+            host,
+            share,
+            path,
+            user: r.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+            pass: r.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+            id: r.get(5).and_then(|v| v.as_i64()),
+            connu: r.get(6).and_then(|v| v.as_string()).unwrap_or_default(),
+        };
+        if monter_un_partage(state, &partage).await == IssueMontage::Echec {
+            a_retenter.push(partage);
         }
-        let user = r.get(3).and_then(|v| v.as_string()).unwrap_or_default();
-        let pass = r.get(4).and_then(|v| v.as_string()).unwrap_or_default();
-        let connu = r.get(6).and_then(|v| v.as_string()).unwrap_or_default();
+    }
+    // #5682 (fil 2115) — un seul essai, et un NAS pas encore prêt au
+    // démarrage (bail DHCP, disques qui s'éveillent) le restait jusqu'à la
+    // relance du serveur. Les nouveaux essais partent EN FOND : le démarrage,
+    // et le serveur HTTP, n'attendent pas un NAS éteint.
+    for partage in a_retenter {
+        let state = state.clone();
+        tokio::spawn(async move {
+            retenter_en_fond(state, partage).await;
+        });
+    }
+}
 
-        // La RESTITUTION reste propre a chaque appelant — la route rend des
-        // erreurs HTTP a un humain qui attend, celle-ci journalise et passe au
-        // suivant. La STRATEGIE de montage, elle, est commune (`crate::smb`) :
-        // recopiee, elle avait diverge, et ce code imposait encore `vers=3.0`
-        // quand la route avait appris a negocier. Le partage SMB 1.0 de
-        // Philippe Landes montait donc depuis l'assistant, et le premier
-        // redemarrage le lui reprenait (#1834).
-        let (result, dialecte_retenu) = if cfg!(target_os = "macos") {
-            let creds = if user.is_empty() {
-                "guest@".to_string()
-            } else if pass.is_empty() {
-                format!("{user}@")
-            } else {
-                format!("{user}:{pass}@")
-            };
-            let unc = format!("//{creds}{host}/{share}");
+/// Un partage SMB enregistré (`network_mounts`), tel que le remontage le lit.
+struct PartageEnregistre {
+    host: String,
+    share: String,
+    path: String,
+    user: String,
+    pass: String,
+    id: Option<i64>,
+    /// Le dialecte déjà retenu, vide s'il est inconnu.
+    connu: String,
+}
+
+/// L'issue d'un essai de montage, pour décider d'un nouvel essai (#5682).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueMontage {
+    /// Monté — ou déjà monté par quelqu'un d'autre.
+    Monte,
+    /// Un nouvel essai n'y changera rien : identifiants refusés, ou
+    /// `mount.cifs` absent.
+    Definitif,
+    /// Réseau pas prêt, NAS muet, délai dépassé : un nouvel essai peut réussir.
+    Echec,
+}
+
+/// Un essai de montage d'UN partage, son issue écrite sur sa ligne.
+async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMontage {
+    let (host, share, path, id) = (p.host.clone(), p.share.clone(), p.path.clone(), p.id);
+    // Deja monte (redemarrage du seul service, systeme reste debout) :
+    // ne pas empiler un second montage sur le meme point.
+    //
+    // Le test etait « le repertoire contient-il quelque chose ? ». Un point
+    // de montage non monte mais portant des residus — un scan a ecrit
+    // dedans pendant que le NAS etait tombe — faisait donc sauter le
+    // remontage SANS UN MOT, et l'utilisateur se retrouvait avec une
+    // bibliotheque a moitie lisible que rien n'expliquait. On demande
+    // desormais s'il s'agit reellement d'un point de montage (#1916).
+    if crate::smb::est_un_point_de_montage(std::path::Path::new(&path)) {
+        tracing::debug!(host = %host, share = %share, path = %path, "network_share_already_mounted_skipping");
+        noter_montage(state, id, "mounted", None, None).await;
+        return IssueMontage::Monte;
+    }
+    let (user, pass, connu) = (p.user.clone(), p.pass.clone(), p.connu.clone());
+
+    // La RESTITUTION reste propre a chaque appelant — la route rend des
+    // erreurs HTTP a un humain qui attend, celle-ci journalise et passe au
+    // suivant. La STRATEGIE de montage, elle, est commune (`crate::smb`) :
+    // recopiee, elle avait diverge, et ce code imposait encore `vers=3.0`
+    // quand la route avait appris a negocier. Le partage SMB 1.0 de
+    // Philippe Landes montait donc depuis l'assistant, et le premier
+    // redemarrage le lui reprenait (#1834).
+    let (result, dialecte_retenu) = if cfg!(target_os = "macos") {
+        let creds = if user.is_empty() {
+            "guest@".to_string()
+        } else if pass.is_empty() {
+            format!("{user}@")
+        } else {
+            format!("{user}:{pass}@")
+        };
+        let unc = format!("//{creds}{host}/{share}");
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new("mount_smbfs")
+                .args([&unc, &path])
+                .output(),
+        )
+        .await;
+        (res, None)
+    } else {
+        let u = if user.is_empty() { "guest" } else { &user };
+        let unc = format!("//{host}/{share}");
+        // Le dialecte deja retenu passe en premier : sans cela, un partage
+        // SMB 1.0 rejouerait deux essais voues a l'echec a CHAQUE
+        // demarrage, soit vingt secondes avant que sa musique ne soit
+        // lisible. Le reste de l'echelle suit quand meme — un NAS mis a
+        // jour ne doit pas rester prisonnier de ce qu'il repondait avant.
+        let echelle = crate::smb::echelle(if connu.is_empty() {
+            None
+        } else {
+            Some(connu.as_str())
+        });
+        let mut dernier = None;
+        let mut gagnant = None;
+        for dialecte in echelle {
+            let mut opts = format!("username={u},password={pass}");
+            if let Some(v) = dialecte {
+                opts.push_str(&format!(",vers={v}"));
+            }
+            // JAMAIS `opts` dans une trace : il porte le mot de passe.
             let res = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                tokio::process::Command::new("mount_smbfs")
-                    .args([&unc, &path])
+                crate::smb::ESSAI_TIMEOUT,
+                tokio::process::Command::new("mount.cifs")
+                    .args([&unc, &path, "-o", &opts])
                     .output(),
             )
             .await;
-            (res, None)
-        } else {
-            let u = if user.is_empty() { "guest" } else { &user };
-            let unc = format!("//{host}/{share}");
-            // Le dialecte deja retenu passe en premier : sans cela, un partage
-            // SMB 1.0 rejouerait deux essais voues a l'echec a CHAQUE
-            // demarrage, soit vingt secondes avant que sa musique ne soit
-            // lisible. Le reste de l'echelle suit quand meme — un NAS mis a
-            // jour ne doit pas rester prisonnier de ce qu'il repondait avant.
-            let echelle = crate::smb::echelle(if connu.is_empty() {
-                None
-            } else {
-                Some(connu.as_str())
-            });
-            let mut dernier = None;
-            let mut gagnant = None;
-            for dialecte in echelle {
-                let mut opts = format!("username={u},password={pass}");
-                if let Some(v) = dialecte {
-                    opts.push_str(&format!(",vers={v}"));
+            let arreter = match &res {
+                Ok(Ok(out)) if out.status.success() => {
+                    gagnant = Some(crate::smb::etiquette(dialecte).to_string());
+                    true
                 }
-                // JAMAIS `opts` dans une trace : il porte le mot de passe.
-                let res = tokio::time::timeout(
-                    crate::smb::ESSAI_TIMEOUT,
-                    tokio::process::Command::new("mount.cifs")
-                        .args([&unc, &path, "-o", &opts])
-                        .output(),
-                )
-                .await;
-                let arreter = match &res {
-                    Ok(Ok(out)) if out.status.success() => {
-                        gagnant = Some(crate::smb::etiquette(dialecte).to_string());
-                        true
-                    }
-                    Ok(Ok(out)) => crate::smb::est_refus_d_authentification(
-                        &String::from_utf8_lossy(&out.stderr),
-                    ),
-                    // mount.cifs absent ou non executable : changer de dialecte
-                    // n'y fera rien.
-                    Ok(Err(_)) => true,
-                    Err(_) => false,
-                };
-                dernier = Some(res);
-                if arreter {
-                    break;
+                Ok(Ok(out)) => {
+                    crate::smb::est_refus_d_authentification(&String::from_utf8_lossy(&out.stderr))
                 }
-            }
-            (dernier.expect("l'echelle n'est jamais vide"), gagnant)
-        };
-
-        // Chaque issue est desormais ECRITE, pas seulement journalisee. C'est
-        // tout l'objet de #1916 : le remontage echouait, seul le journal le
-        // savait, l'interface continuait d'afficher le partage comme monte, et
-        // la lecture rendait une erreur reseau qui ne nommait jamais la cause.
-        // Eric (`ricouxxx`) a du trouver le contournement seul, sur un forum.
-        match result {
-            Ok(Ok(out)) if out.status.success() => {
-                info!(
-                    host = %host, share = %share, path = %path,
-                    dialect = dialecte_retenu.as_deref().unwrap_or("negocie"),
-                    "network_share_remounted"
-                );
-                noter_montage(state, id, "mounted", None, dialecte_retenu.as_deref()).await;
-            }
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                warn!(
-                    host = %host, share = %share, error = %stderr,
-                    "network_share_remount_failed"
-                );
-                noter_montage(state, id, "failed", Some(&stderr), None).await;
-            }
-            Ok(Err(e)) => {
-                warn!(host = %host, share = %share, error = %e, "network_share_remount_failed");
-                noter_montage(state, id, "failed", Some(&e.to_string()), None).await;
-            }
-            Err(_) => {
-                warn!(host = %host, share = %share, "network_share_remount_timeout");
-                noter_montage(state, id, "failed", Some("délai dépassé au montage"), None).await;
+                // mount.cifs absent ou non executable : changer de dialecte
+                // n'y fera rien.
+                Ok(Err(_)) => true,
+                Err(_) => false,
+            };
+            dernier = Some(res);
+            if arreter {
+                break;
             }
         }
+        (dernier.expect("l'echelle n'est jamais vide"), gagnant)
+    };
+
+    // Chaque issue est desormais ECRITE, pas seulement journalisee. C'est
+    // tout l'objet de #1916 : le remontage echouait, seul le journal le
+    // savait, l'interface continuait d'afficher le partage comme monte, et
+    // la lecture rendait une erreur reseau qui ne nommait jamais la cause.
+    // Eric (`ricouxxx`) a du trouver le contournement seul, sur un forum.
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            info!(
+                host = %host, share = %share, path = %path,
+                dialect = dialecte_retenu.as_deref().unwrap_or("negocie"),
+                "network_share_remounted"
+            );
+            noter_montage(state, id, "mounted", None, dialecte_retenu.as_deref()).await;
+            IssueMontage::Monte
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            warn!(
+                host = %host, share = %share, error = %stderr,
+                "network_share_remount_failed"
+            );
+            noter_montage(state, id, "failed", Some(&stderr), None).await;
+            issue_d_un_refus(&stderr)
+        }
+        Ok(Err(e)) => {
+            warn!(host = %host, share = %share, error = %e, "network_share_remount_failed");
+            noter_montage(state, id, "failed", Some(&e.to_string()), None).await;
+            // `mount.cifs` absent ou non exécutable : rien ne changera.
+            IssueMontage::Definitif
+        }
+        Err(_) => {
+            warn!(host = %host, share = %share, "network_share_remount_timeout");
+            noter_montage(state, id, "failed", Some("délai dépassé au montage"), None).await;
+            IssueMontage::Echec
+        }
     }
+}
+
+/// Un refus de `mount.cifs`/`mount_smbfs` : définitif s'il porte sur les
+/// identifiants (réessayer ne ferait que resservir la même réponse), sinon
+/// un nouvel essai peut réussir (#5682).
+pub(crate) fn issue_d_un_refus(stderr: &str) -> IssueMontage {
+    if crate::smb::est_refus_d_authentification(stderr) {
+        IssueMontage::Definitif
+    } else {
+        IssueMontage::Echec
+    }
+}
+
+/// #5682 — les délais avant chaque nouvel essai de montage : croissants, et
+/// bornés (un peu plus de 5 minutes en tout), le temps qu'un NAS allumé avec
+/// l'appareil finisse de s'éveiller. Au-delà, le partage reste en échec sur
+/// sa ligne, comme avant, et l'écran des partages permet de le remonter.
+pub(crate) const DELAIS_DE_REESSAI_SECS: [u64; 8] = [5, 10, 20, 40, 60, 60, 60, 60];
+
+/// Le délai avant le nouvel essai n° `n + 1` (le premier vaut `n = 0`) ;
+/// `None` : on n'essaie plus.
+pub(crate) fn delai_avant_l_essai(n: usize) -> Option<std::time::Duration> {
+    DELAIS_DE_REESSAI_SECS
+        .get(n)
+        .map(|s| std::time::Duration::from_secs(*s))
+}
+
+/// Les nouveaux essais d'un montage, l'horloge INJECTÉE (`dormir`) pour
+/// l'épreuve. Rend le numéro du nouvel essai qui a monté le partage, `None`
+/// s'il a fallu renoncer (refus définitif, ou délais épuisés).
+pub(crate) async fn reessayer_le_montage<E, F, D, G>(mut essai: E, mut dormir: D) -> Option<usize>
+where
+    E: FnMut(usize) -> F,
+    F: std::future::Future<Output = IssueMontage>,
+    D: FnMut(std::time::Duration) -> G,
+    G: std::future::Future<Output = ()>,
+{
+    let mut n = 0;
+    while let Some(delai) = delai_avant_l_essai(n) {
+        dormir(delai).await;
+        n += 1;
+        match essai(n).await {
+            IssueMontage::Monte => return Some(n),
+            IssueMontage::Definitif => return None,
+            IssueMontage::Echec => {}
+        }
+    }
+    None
+}
+
+/// En fond : les nouveaux essais d'un partage resté démonté au démarrage,
+/// puis, s'il finit par monter, un scan de la bibliothèque — celui du
+/// démarrage a trouvé sa racine absente et n'a rien pu en lire.
+async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
+    let monte =
+        reessayer_le_montage(|_| monter_un_partage(&state, &partage), tokio::time::sleep).await;
+    let Some(essai) = monte else {
+        warn!(
+            host = %partage.host, share = %partage.share,
+            "network_share_remount_abandoned — le partage reste démonté (#5682)"
+        );
+        return;
+    };
+    info!(
+        host = %partage.host, share = %partage.share, path = %partage.path, essai,
+        "network_share_mounted_late (#5682)"
+    );
+    if !state.config.auto_scan {
+        return;
+    }
+    // Le scan de démarrage peut encore tenir le droit de scanner : on attend
+    // qu'il le rende, sans fin de délai déraisonnable.
+    for _ in 0..40 {
+        if crate::routes::system::scan::spawn_library_scan(state.clone(), false, None).await {
+            info!(path = %partage.path, "scan_after_late_mount_started (#5682)");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+    warn!(path = %partage.path, "scan_after_late_mount_skipped — un scan tenait le droit (#5682)");
 }
 
 /// Ecrit le constat du dernier montage sur la ligne du partage.
@@ -3128,6 +3691,394 @@ mod asio_blocage_4556_guard {
             garde < note,
             "la note doit être GARDÉE par l'état du coupe-circuit, sinon un parc \
              WASAPI légitime ferait accuser ASIO"
+        );
+    }
+}
+
+/// #5353 — la course entre le préchauffage ASIO et l'énumération de démarrage.
+///
+/// HORS de `feature = "local-audio"`, comme `asio_blocage_4556_guard` : la
+/// décision est pure et doit s'exécuter dans le job `test` de la CI.
+#[cfg(test)]
+mod prechauffage_asio_5353_tests {
+    use super::{
+        EtatPrechauffageAsio as Etat, SuiteEnumerationDeDemarrage as Suite,
+        suite_de_l_enumeration_de_demarrage as suite,
+    };
+
+    /// Le cas des deux journaux (Jean-François, Didier) : ASIO choisi, liste
+    /// vide, préchauffage en cours. Figer sur WASAPI ici, c'est le défaut.
+    #[test]
+    fn asio_vide_pendant_le_prechauffage_attend_au_lieu_de_replier() {
+        for backend in ["asio", "ASIO", "Asio"] {
+            assert_eq!(
+                suite(backend, Some(0), Etat::EnCours),
+                Suite::AttendreLePrechauffage,
+                "backend {backend} : une liste vide servie pendant le préchauffage ne prouve \
+                 pas qu'ASIO n'a rien — les zones partiraient sur WASAPI (#5353)"
+            );
+        }
+    }
+
+    /// Le repli d'avant reste entier là où ASIO a vraiment répondu « rien ».
+    #[test]
+    fn asio_vide_sans_prechauffage_en_cours_se_replie_sur_wasapi() {
+        for etat in [Etat::Absent, Etat::Termine] {
+            assert_eq!(suite("asio", Some(0), etat), Suite::RepliWasapi, "{etat:?}");
+        }
+    }
+
+    #[test]
+    fn un_parc_non_vide_ou_une_enumeration_en_echec_est_garde() {
+        for etat in [Etat::Absent, Etat::EnCours, Etat::Termine] {
+            assert_eq!(suite("asio", Some(4), etat), Suite::Garder, "{etat:?}");
+            // Expiration ou panique : pas de repli, inchangé (sonde bloquée).
+            assert_eq!(suite("asio", None, etat), Suite::Garder, "{etat:?}");
+            // Hors ASIO, le préchauffage ne concerne pas la liste.
+            for backend in ["wasapi", "auto", ""] {
+                assert_eq!(
+                    suite(backend, Some(0), etat),
+                    Suite::Garder,
+                    "{backend} {etat:?}"
+                );
+            }
+        }
+    }
+
+    /// L'attente rend la main dès la fin du préchauffage, et ne dépasse pas sa
+    /// borne s'il ne revient jamais. Un seul test : l'état est global.
+    #[tokio::test]
+    async fn l_attente_suit_le_prechauffage_et_reste_bornee() {
+        use std::time::Duration;
+        super::noter_le_prechauffage_asio(Etat::EnCours);
+        let debut = std::time::Instant::now();
+        assert!(
+            !super::attendre_la_fin_du_prechauffage_asio(Duration::from_millis(80)).await,
+            "un préchauffage qui ne revient pas doit faire expirer l'attente"
+        );
+        assert!(debut.elapsed() < Duration::from_secs(2));
+
+        let fin = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Comme le fil du préchauffage : la garde passe à `Termine` en tombant.
+            drop(super::FinDuPrechauffageAsio);
+        });
+        assert!(
+            super::attendre_la_fin_du_prechauffage_asio(Duration::from_secs(5)).await,
+            "la fin du préchauffage doit libérer l'attente"
+        );
+        fin.await.unwrap();
+        assert_eq!(super::etat_du_prechauffage_asio(), Etat::Termine);
+        super::noter_le_prechauffage_asio(Etat::Absent);
+    }
+
+    /// Les deux branchements que la décision suppose, sous `cfg(windows)` en
+    /// pratique et donc invisibles d'une porte Linux.
+    #[test]
+    fn le_demarrage_attend_le_prechauffage_avant_de_replier() {
+        let source = include_str!("startup.rs");
+        let corps = source
+            .split_once("pub async fn register_local_outputs(")
+            .expect("register_local_outputs introuvable")
+            .1;
+        let attente = corps
+            .find("attendre_la_fin_du_prechauffage_asio(ATTENTE_MAX_DU_PRECHAUFFAGE_ASIO)")
+            .expect("register_local_outputs n'attend plus le préchauffage ASIO (#5353)");
+        let repli = corps
+            .find("asio_returned_no_devices")
+            .expect("le repli WASAPI a disparu");
+        assert!(
+            attente < repli,
+            "l'attente doit précéder le repli WASAPI (#5353)"
+        );
+
+        let lancement = source
+            .split_once("fn spawn_asio_warm_scan()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let en_cours = lancement
+            .find("noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours)")
+            .expect("le préchauffage n'est plus noté EnCours (#5353)");
+        let fil = lancement.find("spawn_blocking").expect("spawn_blocking");
+        assert!(
+            en_cours < fil,
+            "EnCours doit être posé AVANT le lancement du fil, sinon l'énumération \
+             de démarrage peut passer avant (#5353)"
+        );
+        assert!(lancement.contains("let _fin = FinDuPrechauffageAsio;"));
+    }
+}
+
+/// #5682 (fil 2115) — les nouveaux essais de montage d'un partage resté
+/// démonté au démarrage, l'horloge injectée.
+#[cfg(test)]
+mod nouveaux_essais_de_montage_tests_5682 {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    /// Rejoue `reessayer_le_montage` avec des issues écrites d'avance ; rend
+    /// le résultat, le nombre d'essais faits et les délais attendus.
+    fn rejouer(issues: &[IssueMontage]) -> (Option<usize>, usize, Vec<Duration>) {
+        let essais = RefCell::new(0usize);
+        let delais = RefCell::new(Vec::new());
+        let horloge = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = horloge.block_on(reessayer_le_montage(
+            |n| {
+                *essais.borrow_mut() += 1;
+                assert_eq!(n, *essais.borrow(), "essais numérotés à partir de 1");
+                let issue = issues.get(n - 1).copied().unwrap_or(IssueMontage::Echec);
+                async move { issue }
+            },
+            |d| {
+                delais.borrow_mut().push(d);
+                async {}
+            },
+        ));
+        (r, essais.into_inner(), delais.into_inner())
+    }
+
+    #[test]
+    fn deux_echecs_puis_le_nas_repond_5682() {
+        use IssueMontage::*;
+        let (r, essais, delais) = rejouer(&[Echec, Echec, Monte]);
+        assert_eq!(r, Some(3), "monté au troisième nouvel essai");
+        assert_eq!(essais, 3, "on s'arrête dès que le partage est monté");
+        assert_eq!(
+            delais,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20)
+            ],
+            "un délai CROISSANT avant chaque essai"
+        );
+    }
+
+    #[test]
+    fn un_refus_d_identifiants_n_est_pas_retente_5682() {
+        let (r, essais, _) = rejouer(&[IssueMontage::Definitif]);
+        assert_eq!(r, None);
+        assert_eq!(
+            essais, 1,
+            "un mot de passe refusé ne se répare pas en réessayant"
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(13): Permission denied"),
+            IssueMontage::Definitif
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(112): Host is down"),
+            IssueMontage::Echec
+        );
+        assert_eq!(
+            issue_d_un_refus("mount error(101): Network is unreachable"),
+            IssueMontage::Echec
+        );
+    }
+
+    #[test]
+    fn un_nas_eteint_n_est_pas_retente_sans_fin_5682() {
+        let (r, essais, delais) = rejouer(&[]);
+        assert_eq!(r, None);
+        assert_eq!(essais, DELAIS_DE_REESSAI_SECS.len());
+        let total: Duration = delais.iter().sum();
+        assert!(
+            total <= Duration::from_secs(6 * 60),
+            "les nouveaux essais sont BORNÉS ({total:?})"
+        );
+        assert!(
+            delais.windows(2).all(|w| w[0] <= w[1]),
+            "délais croissants : {delais:?}"
+        );
+    }
+}
+
+/// #5353 — rescan à chaud : un repli WASAPI de démarrage doit céder la place
+/// aux sorties ASIO que le préchauffage a trouvées.
+#[cfg(test)]
+mod bascule_asio_a_chaud_5353_tests {
+    use super::{
+        EtatPrechauffageAsio as Etat, SuiteDuRescanAsio as Suite, suite_du_rescan_asio as suite,
+    };
+
+    /// Le journal de Jean-François après le démarrage : ASIO choisi, repli
+    /// WASAPI, préchauffage terminé avec 4 pilotes, rien ne joue. Avant le
+    /// correctif, le rescan enumérait WASAPI et s'arrêtait là.
+    #[test]
+    fn repli_wasapi_et_pilotes_asio_connus_basculent() {
+        for backend in ["asio", "ASIO"] {
+            assert_eq!(
+                suite(backend, true, false, false, Etat::Termine, 4, false),
+                Suite::Basculer,
+                "{backend} : les zones resteraient sur le repli WASAPI (#5353)"
+            );
+        }
+    }
+
+    /// Une lecture locale en cours, ou le préchauffage qui tient le pilote,
+    /// diffèrent — jamais d'annulation, jamais de sonde pendant un flux.
+    #[test]
+    fn la_lecture_ou_le_prechauffage_differe_la_bascule() {
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Termine, 4, true),
+            Suite::Differer("lecture_locale_en_cours")
+        );
+        assert_eq!(
+            suite("asio", true, false, false, Etat::EnCours, 0, false),
+            Suite::Differer("prechauffage_asio_en_cours")
+        );
+    }
+
+    #[test]
+    fn rien_a_basculer_hors_du_cas_vise() {
+        // Backend non ASIO, ou démarrage sans repli.
+        for backend in ["wasapi", "auto", ""] {
+            assert_eq!(
+                suite(backend, true, false, false, Etat::Termine, 4, false),
+                Suite::RienABasculer
+            );
+        }
+        assert_eq!(
+            suite("asio", false, false, false, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Une seule sonde ASIO à chaud par processus.
+        assert_eq!(
+            suite("asio", true, true, false, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Coupe-circuit : ne pas rouvrir un pilote soupçonné (#4168, #4556).
+        assert_eq!(
+            suite("asio", true, false, true, Etat::Termine, 4, false),
+            Suite::RienABasculer
+        );
+        // Pas de préchauffage, ou préchauffage sans pilote : le repli était juste.
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Absent, 4, false),
+            Suite::RienABasculer
+        );
+        assert_eq!(
+            suite("asio", true, false, false, Etat::Termine, 0, false),
+            Suite::RienABasculer
+        );
+    }
+
+    #[cfg(feature = "local-audio")]
+    fn appareil_asio(nom: &str, defaut: bool) -> tune_core::outputs::local::AudioDevice {
+        tune_core::outputs::local::AudioDevice {
+            name: nom.into(),
+            endpoint_id: format!("asio:{nom}"),
+            is_default: defaut,
+            max_channels: 2,
+            sample_rates: vec![44100, 96000],
+            sample_rates_measured: true,
+            backend: "ASIO".into(),
+            hardware_detail: None,
+        }
+    }
+
+    /// Le geste lui-même, sur le registre et la base : les sorties ASIO sont
+    /// enregistrées par le chemin du démarrage (zone de la sortie système
+    /// comprise), les sorties du repli disparaissent et leurs zones passent
+    /// hors ligne.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn la_bascule_remplace_les_sorties_de_repli_par_les_sorties_asio() {
+        use tune_core::db::zone_repo::ZoneRepo;
+        use tune_core::outputs::local::LocalOutput;
+
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_speakers = repo
+            .create("Speakers", Some("local"), Some("local:Speakers"))
+            .unwrap();
+        repo.set_online_by_device("local:Speakers", true).unwrap();
+        {
+            let mut outputs = state.outputs.lock().await;
+            outputs.register(Box::new(LocalOutput::new("Speakers".into())));
+            outputs.register(Box::new(LocalOutput::new("G247HYU".into())));
+        }
+        let repli = vec!["local:Speakers".to_string(), "local:G247HYU".to_string()];
+        let asio = vec![
+            appareil_asio("ASIO4ALL v2", true),
+            appareil_asio("NU Audio", false),
+        ];
+
+        let rapport = super::remplacer_le_repli_wasapi(&state, &asio, &repli).await;
+
+        let outputs = state.outputs.lock().await;
+        for id in ["local:ASIO4ALL v2", "local:NU Audio"] {
+            assert!(
+                outputs.contains(id),
+                "{id} absente du registre après la bascule"
+            );
+        }
+        for id in &repli {
+            assert!(
+                !outputs.contains(id),
+                "{id} : la sortie de repli est restée"
+            );
+        }
+        drop(outputs);
+        assert_eq!(rapport.retirees, repli);
+        assert!(rapport.gardees_en_lecture.is_empty());
+
+        let speakers = repo.get(zone_speakers).unwrap().unwrap();
+        assert!(!speakers.online, "la zone de repli doit passer hors ligne");
+        // Règle du démarrage (#1770) : la sortie système ASIO reçoit sa zone,
+        // les autres restent offertes à la création manuelle.
+        assert!(
+            repo.get_by_device_id("local:ASIO4ALL v2")
+                .unwrap()
+                .is_some()
+        );
+        assert!(repo.get_by_device_id("local:NU Audio").unwrap().is_none());
+    }
+
+    /// Les branchements, invisibles d'une porte Linux (pas d'hôte ASIO).
+    #[test]
+    fn le_rescan_et_le_demarrage_sont_branches_sur_la_bascule() {
+        let fond = include_str!("background.rs");
+        let rescan = fond
+            .split_once("pub async fn rescan_local_audio_devices(")
+            .expect("rescan_local_audio_devices introuvable")
+            .1;
+        let bascule = rescan
+            .find(
+                "crate::startup::basculer_le_repli_wasapi_sur_asio(state, lecture_locale_en_cours)",
+            )
+            .expect("le rescan à chaud n'appelle plus la bascule ASIO (#5353)");
+        let garde = rescan
+            .find("local_audio_rescan_skipped_active_playback")
+            .expect("garde de lecture");
+        let wasapi = rescan
+            .find("list_audio_devices_with_backend(")
+            .expect("énumération du rescan");
+        assert!(bascule < garde && bascule < wasapi);
+
+        let source = include_str!("startup.rs");
+        let demarrage = source
+            .split_once("pub async fn register_local_outputs(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(demarrage.contains("enregistrer_les_sorties_locales(state, &devices).await"));
+        assert!(demarrage.contains("noter_le_repli_wasapi_de_demarrage("));
+        let bascule = source
+            .split_once("pub(crate) async fn remplacer_le_repli_wasapi(")
+            .unwrap()
+            .1;
+        assert!(
+            bascule.contains("enregistrer_les_sorties_locales(state, asio).await"),
+            "la bascule doit réutiliser le chemin d'enregistrement du démarrage"
         );
     }
 }
