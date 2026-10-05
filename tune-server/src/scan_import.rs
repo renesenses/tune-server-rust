@@ -1332,7 +1332,20 @@ impl TrackImporter {
             );
         }
 
-        let album_artist_name = if is_compilation {
+        // 🔴 Fil 1881 (Bertrand, 05/10/2026) — `ALBUMARTIST` générique
+        // (« Various », « VA », « Divers »… : [`is_various_artists`]) SUR un
+        // fichier qui dit `COMPILATION=0`. C1 tient : l'album n'est pas une
+        // compilation, la balise à faux fait foi. Mais la valeur générique
+        // n'est pas un artiste : l'album prend l'artiste d'album NEUTRE de la
+        // convention (« Various Artists », la ligne `artists` des
+        // compilations, et non une ligne « Various » de plus à la lettre V),
+        // et chaque piste GARDE son ARTIST au lieu de prendre cet artiste
+        // d'album. Avant, l'album naissait sous « Various » et toutes ses
+        // pistes avec lui.
+        let artiste_d_album_neutre =
+            !is_compilation && meta.album_artist.as_deref().is_some_and(is_various_artists);
+
+        let album_artist_name = if is_compilation || artiste_d_album_neutre {
             // 🔴 C2 (Bertrand, 14/09/2026) — l'artiste d'album TAGUÉ s'il
             // existe, « Various Artists » seulement à défaut. Un coffret d'un
             // seul chef d'orchestre ne part plus sous « Various Artists »
@@ -1380,6 +1393,7 @@ impl TrackImporter {
             // la convention reprend la main, sous sa graphie canonique.
             self.folder_tagged_artist
                 .get(&album_dir)
+                .filter(|_| !artiste_d_album_neutre)
                 .filter(|a| !is_various_artists(a.as_str()))
                 .cloned()
                 .unwrap_or_else(|| "Various Artists".to_string())
@@ -1430,7 +1444,9 @@ impl TrackImporter {
             .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME)
             .to_string();
 
-        let album_artist_mbid = if is_compilation {
+        // L'artiste d'album neutre ne prend pas l'identifiant MusicBrainz de
+        // l'artiste de la piste (fil 1881) : ce n'est pas lui.
+        let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
             None
         } else {
             meta.musicbrainz_album_artist_id
@@ -1457,7 +1473,9 @@ impl TrackImporter {
         };
         let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-        let track_artist = if is_compilation && track_artist_name != album_artist_name {
+        let track_artist = if (is_compilation || artiste_d_album_neutre)
+            && track_artist_name != album_artist_name
+        {
             if let Some(cached) = self.artist_cache.get(&track_artist_name) {
                 Some(Arc::clone(cached))
             } else {
@@ -2989,6 +3007,156 @@ mod tests {
                 ("Fritz Reiner", true),
                 "témoin C2 : sur une compilation aussi, un artiste d'album tagué \
                  qui n'est PAS la convention reste l'artiste de l'album ({chemin})"
+            );
+        }
+    }
+
+    /// Fil 1881 (Bertrand, 05/10/2026) — `ALBUMARTIST` générique ET
+    /// `COMPILATION=0` : l'album garde les artistes de ses pistes.
+    ///
+    /// C1 passe avant (a) dans LA règle : la balise à faux fait foi, l'album
+    /// n'est pas une compilation. Avant ce correctif, il naissait alors sous
+    /// un artiste nommé « Various » (la branche « artiste d'album tagué ») et
+    /// chaque piste prenait cet artiste-là au lieu de son ARTIST : Miles
+    /// Davis, John Coltrane et Bill Evans devenaient tous « Various ».
+    ///
+    /// Rend, par chemin, `(artiste d'album, compilation, artiste de piste,
+    /// identifiant d'album)`.
+    fn importer_avec_artiste_de_piste(
+        fichiers: &[ScannedFile],
+        cache: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, (String, bool, String, i64)> {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::artist_repo::ArtistRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let artistes = ArtistRepo::with_backend(backend.clone());
+        let mut imp = TrackImporter::new(
+            backend.clone(),
+            true,
+            cache.to_path_buf(),
+            PorteeDuScan::TOUT,
+        );
+        imp.begin_batch(fichiers);
+        let nom = |id: Option<i64>| artistes.get(id.expect("un artiste")).unwrap().unwrap().name;
+        fichiers
+            .iter()
+            .map(|f| {
+                let (piste, album_id) = imp.import(f).expect("import");
+                let album_id = album_id.expect("un album");
+                let album = albums.get(album_id).unwrap().unwrap();
+                (
+                    f.path.clone(),
+                    (
+                        nom(album.artist_id),
+                        album.is_compilation,
+                        nom(piste.artist_id),
+                        album_id,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn un_album_artist_generique_n_ecrase_plus_l_artiste_des_pistes_1881() {
+        let scratch = tune_core::test_scratch::scratch_dir("scan_import_1881");
+        let racine = scratch.path();
+        let piste = |chemin: &str, artiste: &str, aa: &str, album: &str, n: u32, tag| {
+            let mut f = sf(chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{album} {n}")),
+                artist: Some(artiste.to_string()),
+                album: Some(album.to_string()),
+                album_artist: Some(aa.to_string()),
+                track_number: Some(n),
+                compilation: tag,
+                ..Default::default()
+            });
+            f
+        };
+        let trois = |dossier: &str, aa: &str, tag: Option<bool>| {
+            let d = racine.join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let c = |n: &str| d.join(n).to_string_lossy().into_owned();
+            vec![
+                piste(&c("01.flac"), "Miles Davis", aa, dossier, 1, tag),
+                piste(&c("02.flac"), "John Coltrane", aa, dossier, 2, tag),
+                piste(&c("03.flac"), "Bill Evans", aa, dossier, 3, tag),
+            ]
+        };
+        let artiste_attendu = |chemin: &str| {
+            if chemin.ends_with("01.flac") {
+                "Miles Davis"
+            } else if chemin.ends_with("02.flac") {
+                "John Coltrane"
+            } else {
+                "Bill Evans"
+            }
+        };
+
+        // LE CAS DU FIL — chaque graphie générique, `COMPILATION=0`.
+        for graphie in [
+            "Various",
+            "Various Artists",
+            "VA",
+            "Divers",
+            "Artistes divers",
+        ] {
+            let dossier = format!("Nuits {graphie}");
+            let rendu = importer_avec_artiste_de_piste(
+                &trois(&dossier, graphie, Some(false)),
+                &racine.join(format!("cache-{graphie}")),
+            );
+            assert_eq!(rendu.len(), 3);
+            for (chemin, (aa, compilation, artiste, _)) in &rendu {
+                assert_eq!(
+                    artiste.as_str(),
+                    artiste_attendu(chemin),
+                    "ALBUMARTIST = « {graphie} », COMPILATION=0 : la piste garde son \
+                     ARTIST ({chemin})"
+                );
+                assert_eq!(
+                    (aa.as_str(), *compilation),
+                    ("Various Artists", false),
+                    "C1 tient (pas une compilation) et l'artiste d'album est le \
+                     neutre de la convention, pas « {graphie} » ({chemin})"
+                );
+            }
+            let ids: std::collections::BTreeSet<i64> = rendu.values().map(|v| v.3).collect();
+            assert_eq!(ids.len(), 1, "un seul album pour les trois pistes");
+        }
+
+        // TÉMOIN — `COMPILATION=1` : inchangé, une compilation, chaque piste
+        // son artiste.
+        let rendu = importer_avec_artiste_de_piste(
+            &trois("Nuits Compilation", "Various", Some(true)),
+            &racine.join("cache-oui"),
+        );
+        for (chemin, (aa, compilation, artiste, _)) in &rendu {
+            assert_eq!(
+                (aa.as_str(), *compilation, artiste.as_str()),
+                ("Various Artists", true, artiste_attendu(chemin)),
+                "témoin COMPILATION=1 ({chemin})"
+            );
+        }
+
+        // TÉMOIN — un VRAI artiste d'album et `COMPILATION=0` : inchangé,
+        // l'artiste d'album fait l'album et ses pistes.
+        let rendu = importer_avec_artiste_de_piste(
+            &trois("Coffret Reiner", "Fritz Reiner", Some(false)),
+            &racine.join("cache-reiner"),
+        );
+        for (chemin, (aa, compilation, artiste, _)) in &rendu {
+            assert_eq!(
+                (aa.as_str(), *compilation, artiste.as_str()),
+                ("Fritz Reiner", false, "Fritz Reiner"),
+                "témoin artiste d'album réel ({chemin})"
             );
         }
     }
