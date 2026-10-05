@@ -3489,6 +3489,10 @@ mod scan_realigne_tests_4896;
 mod scan_metadonnees_etendues_tests_5043;
 
 #[cfg(test)]
+#[path = "conservation_replaygain_tests_5597.rs"]
+mod conservation_replaygain_tests_5597;
+
+#[cfg(test)]
 #[path = "surveillant_pendant_un_lot_de_scan_tests.rs"]
 mod surveillant_pendant_un_lot_de_scan_tests;
 
