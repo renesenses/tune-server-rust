@@ -137,11 +137,17 @@ pub(super) async fn identifier_album(
     // L'artiste à interroger : celui de l'album quand il est connu, sinon
     // celui de la première piste. Une compilation sans artiste d'album ne doit
     // pas partir avec une chaîne vide, qui rendrait la recherche inexploitable.
-    let artist = album
-        .artist_name
-        .clone()
-        .or_else(|| tracks.iter().find_map(|t| t.artist_name.clone()))
-        .unwrap_or_default();
+    // #4805 — `Unknown Artist` cède la place à l'artiste des pistes quand
+    // elles en portent un vrai, et `VA` / `Artistes divers` deviennent
+    // `Various Artists`, le nom sous lequel MusicBrainz crédite les
+    // compilations : sous leur nom brut, ces albums ne rendaient rien.
+    let artiste_des_pistes = tracks
+        .iter()
+        .filter_map(|t| t.artist_name.as_deref())
+        .find(|nom| !musicbrainz_release::est_un_artiste_fictif(nom))
+        .or_else(|| tracks.iter().find_map(|t| t.artist_name.as_deref()));
+    let artist =
+        musicbrainz_release::artiste_de_requete(album.artist_name.as_deref(), artiste_des_pistes);
 
     // 1. Effacer, en gardant le calque de ce qu'on efface.
     let cleared = match clear_album_identification(&state.backend, album_id) {
