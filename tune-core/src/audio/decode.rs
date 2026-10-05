@@ -3795,32 +3795,47 @@ fn decode_symphonia(
     // error by returning an EMPTY segment: the analyzers break on the resulting
     // `is_empty()`. The first segment (seek_s == 0.0, no seek) always decodes
     // normally, so the analysis still runs over the head of the track.
+    //
+    // 🔴 Le démultiplexeur se pose sur le DÉBUT du paquet qui contient la
+    // cible (`actual_ts <= required_ts`) : trame FLAC de 4 096 échantillons,
+    // paquet simulé du WAV. Sans rogner le résidu `required_ts - actual_ts`,
+    // la fenêtre rendue commençait jusqu'à un paquet AVANT `seek_s`. L'analyse
+    // par segments de 30 s (`analyzer::mesurer_a_partir_de`) avance son seek
+    // du nombre exact de trames reçues : chaque jonction rejouait donc la fin
+    // du segment précédent — échantillons comptés deux fois, et une
+    // discontinuité que le suréchantillonnage 4× du vrai pic lisait comme un
+    // over (FLAC 20 min : 0,507 au lieu de 0,455). Même rognage que le chemin
+    // de lecture en continu (`decode_to_pcm_streaming_inner`).
+    let mut trames_a_sauter: u64 = 0;
     if seek_s > 0.0 {
         let seconds = seek_s as i64;
         let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
         let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        if format
-            .seek(
-                SeekMode::Coarse,
-                SeekTo::Time {
-                    time,
-                    track_id: Some(track_id),
-                },
-            )
-            .is_err()
-        {
-            debug!(
-                file = file_path,
-                seek_s, "decode_symphonia_seek_failed_returning_empty"
-            );
-            return Ok(DecodedAudio {
-                samples_i32: Vec::new(),
-                bit_depth: source_bd,
-                sample_rate: source_rate,
-                channels: source_channels,
-                duration_s: 0.0,
-                integrite: Default::default(),
-            });
+        match format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(track_id),
+            },
+        ) {
+            Ok(seeked) => {
+                trames_a_sauter = (seeked.required_ts.get() - seeked.actual_ts.get()).max(0) as u64;
+                decoder.reset();
+            }
+            Err(_) => {
+                debug!(
+                    file = file_path,
+                    seek_s, "decode_symphonia_seek_failed_returning_empty"
+                );
+                return Ok(DecodedAudio {
+                    samples_i32: Vec::new(),
+                    bit_depth: source_bd,
+                    sample_rate: source_rate,
+                    channels: source_channels,
+                    duration_s: 0.0,
+                    integrite: Default::default(),
+                });
+            }
         }
     }
 
@@ -3892,7 +3907,16 @@ fn decode_symphonia(
 
         let mut packet_samples: Vec<i32> = Vec::new();
         decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
-        all_samples.extend_from_slice(&packet_samples);
+        // Rognage à l'échantillon près des trames qui précèdent `seek_s`.
+        let mut debut = 0usize;
+        if trames_a_sauter > 0 {
+            let ch = source_channels.max(1) as usize;
+            let trames = (packet_samples.len() / ch) as u64;
+            let rognees = trames_a_sauter.min(trames);
+            trames_a_sauter -= rognees;
+            debut = rognees as usize * ch;
+        }
+        all_samples.extend_from_slice(&packet_samples[debut..]);
         // Débit de décodage observable sans coût (#3140) : un paquet FLAC vaut
         // quelques dizaines de millisecondes d'audio. Inerte sans balise.
         super::decode_progress::publier(
