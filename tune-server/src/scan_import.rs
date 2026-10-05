@@ -468,6 +468,10 @@ pub struct TrackImporter {
     /// `Some` dans un lot de scan : le travail de pochette mis de côté par
     /// `import`, fait après le `COMMIT` (#5202). `None` : fait sur-le-champ.
     pochettes_differees: Option<Vec<PochetteAFaire>>,
+    /// Sous-arbres d'un montage imbriqué tombé, vus avant l'import (suite de
+    /// #5854). Une pochette dont le fichier source vit dessous n'est ni
+    /// relue ni retirée : ce sous-arbre n'a pas été vu.
+    sous_arbres_proteges: Vec<String>,
 }
 
 /// Ce que la pochette d'une piste importée doit savoir d'elle (#5202).
@@ -564,6 +568,7 @@ impl TrackImporter {
             force_artwork: false,
             tenues,
             pochettes_differees: None,
+            sous_arbres_proteges: Vec::new(),
         }
     }
 
@@ -690,6 +695,32 @@ impl TrackImporter {
     pub fn with_force_artwork(mut self, force: bool) -> Self {
         self.force_artwork = force;
         self
+    }
+
+    /// Voir [`TrackImporter::sous_arbres_proteges`].
+    #[must_use]
+    pub fn avec_sous_arbres_proteges(mut self, sous_arbres: Vec<String>) -> Self {
+        self.sous_arbres_proteges = sous_arbres;
+        self
+    }
+
+    /// La pochette de l'album vient-elle d'un fichier situé sous un
+    /// sous-arbre protégé ? Rien n'y est conclu : elle est gardée telle
+    /// quelle.
+    fn pochette_sous_un_sous_arbre_protege(&self, album_id: i64) -> bool {
+        if self.sous_arbres_proteges.is_empty() {
+            return false;
+        }
+        self.album_repo
+            .etat_pochette(album_id)
+            .ok()
+            .flatten()
+            .and_then(|e| e.fichier)
+            .is_some_and(|f| {
+                self.sous_arbres_proteges
+                    .iter()
+                    .any(|d| crate::routes::system::scan::sous_le_dossier(&f, d))
+            })
     }
 
     /// Number of album covers extracted so far (for the scan report).
@@ -915,6 +946,14 @@ impl TrackImporter {
             }
         };
 
+        // Suite de #5854 — la pochette tirée d'un fichier sous un montage
+        // imbriqué tombé est gardée : l'album est tenu pour tranché.
+        if let Some(aid) = album_id
+            && !self.albums_with_cover.contains(&aid)
+            && self.pochette_sous_un_sous_arbre_protege(aid)
+        {
+            self.albums_with_cover.insert(aid);
+        }
         if let Some(aid) = album_id
             && !self.albums_with_cover.contains(&aid)
         {

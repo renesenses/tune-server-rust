@@ -546,6 +546,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 ecartes: &files_ecartes,
             },
         )
+        .avec_sous_arbres_proteges(crate::routes::system::scan::sous_arbres_vides_avant_import(
+            &music_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
         // #5202 — les métadonnées étendues se relisent AVANT la transaction du
         // lot, chaque fichier sous délai, comme dans le scan manuel.

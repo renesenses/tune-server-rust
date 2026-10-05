@@ -156,9 +156,19 @@ async fn un_montage_imbrique_tombe_ne_retire_pas_la_pochette_des_albums_qu_il_po
     let montage = r.join("Montage");
     // Un album à cheval : un disque hors du montage, sans image ; l'autre
     // sous le montage, avec son `cover.jpg` — la source de la pochette.
-    let hors_montage = piste_dans(&r.join("Local").join("Coffret CD1"), "Coffret", 1);
+    //
+    // Le disque hors du montage a DEUX pistes, l'autre une seule : la fusion
+    // des doublons conserve l'album le plus fourni, donc celui du disque hors
+    // du montage, quel que soit l'ordre dans lequel le parcours rend les
+    // dossiers. L'analyse complète relit alors ses pistes DANS l'album dont la
+    // pochette vit sous le montage. À égalité, l'album conservé dépendait de
+    // l'ordre de `readdir` : vert sur Shrek (l'import forcé créait un album
+    // neuf), rouge en CI (#5862).
+    let dossier_local = r.join("Local").join("Coffret CD1");
+    let hors_montage = piste_dans(&dossier_local, "Coffret", 1);
+    piste_dans(&dossier_local, "Coffret", 2);
     let dossier_cover = montage.join("Coffret CD2");
-    piste_dans(&dossier_cover, "Coffret", 2);
+    piste_dans(&dossier_cover, "Coffret", 3);
     super::pochettes_disque_tests_5034::poser_cover(&dossier_cover, Some(COVER));
     // De quoi dépasser le seuil du montage imbriqué.
     let seuil = crate::routes::system::scan::SEUIL_SOUS_ARBRE_VIDE;
