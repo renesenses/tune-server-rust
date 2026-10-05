@@ -328,8 +328,8 @@ fn analyser_tt_dr(texte: &str) -> RapportDr {
 }
 
 /// Le total d'un rapport TT DR : `Official DR value: DR9` en anglais,
-/// `Реальные значения DR:	DR13` dans le foobar2000 russe (#5573, pièce
-/// jointe de Tades, fil 2050, réponse 7412).
+/// `Реальные значения DR:\tDR13` (`\t` : une tabulation) dans le foobar2000
+/// russe (#5573, pièce jointe de Tades, fil 2050, réponse 7412).
 ///
 /// Lu par sa STRUCTURE, pas par son libellé : un libellé qui contient le mot
 /// `DR`, deux-points, puis une valeur `DR<n>` et rien d'autre. Le libellé
@@ -1721,7 +1721,10 @@ Official EP/Album DR: 8"#;
     #[test]
     fn le_rapport_russe_en_windows_1251_se_lit_par_sa_structure_5573() {
         assert!(
-            std::str::from_utf8(RUSSE_CP1251).is_err(),
+            // `black_box` : le témoin est une constante, et rustc refuse
+            // (`invalid_from_utf8`) un `from_utf8` dont il sait déjà qu'il
+            // échoue. C'est justement ce que l'assertion veut établir.
+            std::str::from_utf8(std::hint::black_box(RUSSE_CP1251)).is_err(),
             "le témoin n'est pas UTF-8"
         );
         verifier_le_rapport_russe(&analyser_octets(RUSSE_CP1251), "Windows-1251");

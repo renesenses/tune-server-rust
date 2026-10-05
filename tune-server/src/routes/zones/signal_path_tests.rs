@@ -1220,11 +1220,12 @@ fn decoded_radio_source_uses_the_detected_source_rate() {
     assert_eq!(step_desc(&sp, "Source").as_deref(), Some("MP3 48kHz"));
 }
 
-// Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
-// celui d'avant. Ce test existe pour que la suppression du repli soit un
-// choix explicite si elle a lieu un jour, pas un effet de bord.
+// Sans session ET sans métadonnées, il n'y a rien à lire. Le repli en dur
+// 44100/16 a été retiré EXPRÈS (fil 2119 : un WAV 24/176,4 annoncé
+// « FLAC 44kHz/16bit ») : le codec connu s'affiche seul, sans chiffres
+// inventés.
 #[test]
-fn no_wire_no_metadata_still_falls_back() {
+fn no_wire_no_metadata_does_not_invent_rate_2119() {
     let (backend, zone) = dlna_zone();
     let np = NowPlaying {
         title: "Track".into(),
@@ -1239,10 +1240,7 @@ fn no_wire_no_metadata_still_falls_back() {
         ..Default::default()
     };
     let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
-    assert_eq!(
-        step_desc(&sp, "Source").as_deref(),
-        Some("FLAC 44kHz/16bit")
-    );
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("FLAC"));
 }
 
 // Le fil prime sur la règle. Ici la zone force le LPCM 16 bits, mais la
@@ -4438,4 +4436,45 @@ async fn frequence_max_5524_auto_ne_change_rien() {
         assert_eq!(r.bit_depth, Some(24));
         assert_eq!(step_desc(&sp, "Resampler"), None, "Auto, {source} : {sp}");
     }
+}
+
+/// Fil 2119 — une source dont ni la lecture en cours, ni la base, ni le fil
+/// ne nomment le format est INCONNUE. Elle était annoncée « FLAC 44kHz/16bit »
+/// et « Sans perte » par un repli en dur, pour un WAV 24/176,4 servi intact.
+#[test]
+fn source_inconnue_n_est_plus_annoncee_flac_16_44_2119() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "03 - Eugen Jochum - 3. Veris leta facies".into(),
+            source: "upnp".into(),
+            source_id: Some("http://203.0.113.9:8888/api/v1/library/tracks/24011/audio".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("My Devialet"), "none", None).unwrap();
+    let source = step_desc(&sp, "Source").unwrap();
+    assert!(
+        !source.contains("FLAC") && !source.contains("44kHz") && !source.contains("16bit"),
+        "aucun format inventé pour une source inconnue, vu : {source}"
+    );
+    assert_eq!(source, CODEC_INCONNU);
+    assert_eq!(
+        step_field(&sp, "Source", "code").and_then(|v| v.as_str()),
+        Some("source_codec_unknown"),
+        "l'étape Source doit DIRE que le codec est inconnu (#4346)"
+    );
+    assert_eq!(
+        sp["lossless"],
+        Value::Null,
+        "inconnu, ni sans perte ni avec"
+    );
+    let tout = sp.to_string();
+    assert!(
+        !tout.contains("0Hz/0bit") && !tout.contains("0kHz/0bit"),
+        "pas de chiffres nuls affichés : {tout}"
+    );
 }
