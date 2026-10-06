@@ -59,6 +59,7 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             created_at TEXT,\
             position TEXT,\
             first_seen_at TEXT,\
+            ai_generated TEXT,\
             UNIQUE(profile_id, item_type, service, service_id)\
         )",
     // Rang manuel (#2001 piste 2) sur une base ou la table PRE-EXISTE : le
@@ -71,6 +72,11 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // travail de la migration 067, qui ne tourne qu'une fois ; laisser NULL
     // fait simplement retomber le client sur la date du service.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT",
+    // #5530 — marquage IA d'un favori de service (PG 082), que `SELECT_COLS`
+    // NOMME : sans lui, une table montée par ce seul chemin (base neuve,
+    // banc `pg_3715_*`) rendait « column ai_generated does not exist » à la
+    // première lecture des favoris. Même raison que `first_seen_at`.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -282,6 +288,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
     // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
+    // #5530 — marquage IA d'un favori de service (PG 082). Ici AUSSI : une
+    // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
+    // des favoris de service nomment la colonne. NULL = inconnu.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

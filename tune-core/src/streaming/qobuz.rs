@@ -1417,6 +1417,18 @@ impl QobuzService {
             brut,
             Self::CLES_DATE_FAVORI,
         );
+        // #5530 — une piste favorite hérite du marquage IA de son ALBUM, si
+        // l'objet `album` imbriqué le porte. `StreamTrack` n'a pas ce champ
+        // (le marquage est d'album) : il voyage à côté, sous un nom qui dit
+        // d'où il vient, jusqu'à la reprise des favoris.
+        if fav_type == "tracks"
+            && let (Some(objet), Some(ia)) = (
+                element.as_object_mut(),
+                brut["album"]["ai_generated"].as_bool(),
+            )
+        {
+            objet.insert("album_ai_generated".into(), serde_json::Value::Bool(ia));
+        }
         element
     }
 
@@ -1546,6 +1558,10 @@ impl QobuzService {
             // pistes répondent « no url » : l'écran a besoin de la date pour
             // le dire, la lecture pour le refuser proprement.
             released_at: item["released_at"].as_i64(),
+            // #5530 — le marquage « généré par IA » de Qobuz, au niveau de
+            // l'album, tel que `album/get` le rend (booléen). Une autre forme
+            // ou l'absence : on ne conclut rien.
+            ai_generated: item["ai_generated"].as_bool(),
         }
     }
 
@@ -4123,6 +4139,62 @@ mod tests {
             "release_date_original": "1959-12-14",
         }));
         assert_eq!(sans.released_at, None);
+    }
+
+    /// #5530 — la FORME relevée par la sonde `raw-keys` sur le .18 (05/10/2026)
+    /// pour un album que Qobuz marque comme IA : `ai_generated` booléen à la
+    /// racine de `album/get`, `release_tags` tableau vide. Seuls le titre et
+    /// l'identifiant de l'album sont repris ; aucune autre donnée de la réponse.
+    fn album_ia_releve() -> serde_json::Value {
+        json!({
+            "id": "tj9je5zd70wsc",
+            "title": "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album",
+            "ai_generated": true,
+            "release_tags": [],
+        })
+    }
+
+    #[test]
+    fn map_album_lit_le_marquage_ia_de_qobuz_5530() {
+        let album = QobuzService::map_album(&album_ia_releve());
+        assert_eq!(album.ai_generated, Some(true));
+        // Et l'API le rend au client sous ce nom.
+        let rendu = serde_json::to_value(&album).unwrap();
+        assert_eq!(rendu["ai_generated"], json!(true));
+    }
+
+    /// L'album témoin (Kind of Blue) ne porte PAS la clé : rien n'est conclu,
+    /// et rien n'est sérialisé.
+    #[test]
+    fn un_album_sans_la_cle_n_est_pas_marque_5530() {
+        let album =
+            QobuzService::map_album(&json!({"id": "5099749522428", "title": "Kind of Blue"}));
+        assert_eq!(album.ai_generated, None);
+        let rendu = serde_json::to_value(&album).unwrap();
+        assert!(rendu.get("ai_generated").is_none(), "{rendu}");
+        // `false` explicite se lit tel quel ; une chaîne ne vaut rien.
+        let non = QobuzService::map_album(&json!({"id": "1", "ai_generated": false}));
+        assert_eq!(non.ai_generated, Some(false));
+        let chaine = QobuzService::map_album(&json!({"id": "1", "ai_generated": "true"}));
+        assert_eq!(chaine.ai_generated, None);
+    }
+
+    /// Un favori PISTE emporte le marquage de son album imbriqué ; un favori
+    /// ALBUM le porte sous `ai_generated`.
+    #[test]
+    fn le_favori_emporte_le_marquage_ia_5530() {
+        let album = QobuzService::favori_date(&album_ia_releve(), "albums");
+        assert_eq!(album["ai_generated"], json!(true));
+        let piste = QobuzService::favori_date(
+            &json!({"id": 7, "title": "Piste", "album": album_ia_releve()}),
+            "tracks",
+        );
+        assert_eq!(piste["album_ai_generated"], json!(true));
+        let sans = QobuzService::favori_date(
+            &json!({"id": 8, "title": "Piste", "album": {"id": "x"}}),
+            "tracks",
+        );
+        assert!(sans.get("album_ai_generated").is_none(), "{sans}");
     }
 
     #[test]

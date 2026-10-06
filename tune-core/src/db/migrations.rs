@@ -2293,6 +2293,28 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "albums_types_secondaires",
         up: "",
     },
+    // #5530 (FabienM, fil 2053) — le marquage « généré par IA » de Qobuz,
+    // gardé avec le favori de service : `streaming_favorites.ai_generated`.
+    // '1' = marqué, '0' = le service dit non, NULL = inconnu (toute ligne
+    // existante, et tout service qui ne dit rien). TEXT, comme `album_ref` :
+    // une base PostgreSQL de bascule part d'un schéma tout-TEXT, où une
+    // colonne numérique ajoutée par `ADD COLUMN IF NOT EXISTS` resterait TEXT
+    // (voir `pg_sqlite_type_parity`) — le même type partout, donc aucun écart. C'est ce qui permet à une
+    // règle « Généré par IA : non » d'écarter un favori Qobuz marqué.
+    //
+    // Numérotée 118 / PG 082 : la 116 / PG 080 est prise par #5763 (#4991),
+    // sur laquelle cette branche est empilée, et la 117 / PG 081 par #5822
+    // (section Live, #5616), en PR en même temps. Dernière sur
+    // `batch/feat-rc3-20261002` le 05/10 : 115 / PG 079. Ordre de fusion
+    // EXIGÉ : #5763 → … → #5822 → celle-ci (garde de contiguïté).
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 082.
+    Migration {
+        version: 118,
+        name: "streaming_favorites_ai_generated",
+        up: "",
+    },
 ];
 
 /// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
@@ -3341,6 +3363,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // relit ses fichiers les pose depuis la balise.
             add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
         }
+        if migration.version == 118 {
+            // Marquage IA d'un favori de service (#5530). Sans défaut : NULL =
+            // INCONNU pour toute ligne existante.
+            add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3868,6 +3895,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : la sélection de `identify-all` la NOMME, et une base arrivée
     // sans elle ne pourrait plus lancer la passe. PG : migration 080.
     add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
+    // Marquage IA d'un favori de service (migration 118, #5530) — posé ICI
+    // aussi : l'écriture et la lecture des favoris de service la NOMMENT.
+    // PG : migration 082.
+    add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4617,6 +4648,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         81,
         "albums_types_secondaires",
         include_str!("../../migrations/postgres/081_albums_types_secondaires.sql"),
+    ),
+    // Jumelle de la SQLite 118 (#5530) : `streaming_favorites.ai_generated`,
+    // NULL pour l'existant. EXIGE la 80 (#5763) et la 81 (#5822) avant elle.
+    (
+        82,
+        "streaming_favorites_ai_generated",
+        include_str!("../../migrations/postgres/082_streaming_favorites_ai_generated.sql"),
     ),
 ];
 
@@ -6546,6 +6584,83 @@ mod tests {
         );
     }
 
+    /// #5530 — la migration 118 pose `streaming_favorites.ai_generated`,
+    /// nullable, sur une base neuve comme sur une base montée, sans rien
+    /// inventer pour les favoris existants ; la jumelle PG 082 est enregistrée
+    /// et la colonne est aussi garantie par les deux schémas PostgreSQL.
+    #[test]
+    fn la_migration_118_pose_le_marquage_ia_des_favoris_5530() {
+        let colonne = |db: &SqliteDb| -> Option<bool> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(streaming_favorites)")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _)| nom == "ai_generated")
+                .map(|(_, non_nul)| non_nul != 0)
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(
+            colonne(&neuve),
+            Some(false),
+            "base neuve : colonne nullable"
+        );
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "ALTER TABLE streaming_favorites DROP COLUMN ai_generated;
+                 DELETE FROM _migrations WHERE version >= 118;
+                 INSERT INTO streaming_favorites (profile_id, item_type, service, service_id)
+                     VALUES (1, 'album', 'qobuz', 'tj9je5zd70wsc');",
+            )
+            .unwrap();
+        assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
+        assert_eq!(current_version(&montee).unwrap(), 117);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(
+            colonne(&montee),
+            Some(false),
+            "base montée : colonne nullable"
+        );
+        {
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, renseignees): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(ai_generated) FROM streaming_favorites",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((lignes, renseignees), (1, 0), "aucun marquage inventé");
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "082_streaming_favorites_ai_generated.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (82, 'streaming_favorites_ai_generated')"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let alter = "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT";
+        assert!(sql_pg.contains("to_regclass('streaming_favorites')") && sql_pg.contains(alter));
+        assert!(
+            include_str!("pg_migrate.rs").contains(alter),
+            "PG_FULL_SCHEMA"
+        );
+        assert!(
+            include_str!("postgres.rs").contains(alter),
+            "ENSURE_COLUMNS"
+        );
+    }
+
     /// Fil 2121 — la migration 114 pose `album_ref` (la référence d'album du
     /// service, pour Bandcamp l'adresse de la page) sur les trois tables qui
     /// gardent une piste de service, sur une base NEUVE comme sur une base
@@ -7431,11 +7546,15 @@ mod tests {
         // SQLite 115. L'index de `listen_history.album_id` que la jointure de
         // « Reprendre l'écoute » réécrite en `UNION ALL` emprunte. La 78 est
         // celle de #5706.
-        // 80 : `albums_identification_tentee_le` (#5763).
+        // 80 : `albums_identification_tentee_le` (#4991 b), jumelle de la
+        // SQLite 116. La marque « déjà tenté, rien trouvé » que la sélection
+        // de `identify-all` NOMME.
         // 81 : `albums_types_secondaires` (section « Live »), jumelle de la
         // SQLite 117. Pose `albums.release_secondary_types`, que la fiche
         // artiste NOMME.
-        assert_eq!(pg_latest_version(), 81, "latest PG migration must be 81");
+        // 82 : `streaming_favorites_ai_generated` (#5530), jumelle de la
+        // SQLite 118. Le marquage « généré par IA » d'un favori de service.
+        assert_eq!(pg_latest_version(), 82, "latest PG migration must be 82");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

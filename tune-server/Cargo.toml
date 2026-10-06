@@ -1473,3 +1473,9 @@ path = "tests/config_export_zones.rs"
 [[test]]
 name = "pg_compilation_reprise_5837"
 path = "tests/pg_compilation_reprise_5837.rs"
+
+# #5530 — le marquage « généré par IA » envoyé avec un favori de service est
+# rangé et rendu. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "favori_marquage_ia_5530"
+path = "tests/favori_marquage_ia_5530.rs"

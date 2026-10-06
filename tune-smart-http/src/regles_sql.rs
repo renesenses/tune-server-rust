@@ -441,6 +441,32 @@ pub(crate) fn condition_note(
 /// La condition à poser quand rien ne se traduit : FAUX.
 pub(crate) const FAUX: &str = "1 = 0";
 
+/// #5530 — « Généré par IA » sur une ligne de la BIBLIOTHÈQUE.
+///
+/// Le marquage est celui que Qobuz pose sur un album de son catalogue ; un
+/// fichier local n'en porte aucun. « non » retient donc toute la bibliothèque,
+/// « oui » n'en retient rien. Ce ne sont pas des règles REFUSÉES : la réponse
+/// est connue, elle est simplement constante — d'où des littéraux distincts de
+/// [`FAUX`], que les rapports d'aperçu lisent comme « intraduisible ».
+pub(crate) fn condition_marquage_ia_bibliotheque(op: &str) -> Option<&'static str> {
+    match op {
+        "is_false" => Some("1 = 1"),
+        "is_true" => Some("0 = 1"),
+        _ => None,
+    }
+}
+
+/// #5530 — la même règle sur une colonne `ai_generated` d'un favori de
+/// service (TEXT : `'1'` marqué, `'0'` non, NULL inconnu). Un marquage
+/// inconnu n'est PAS un marquage : « non » retient la ligne.
+pub(crate) fn condition_marquage_ia_colonne(col: &str, op: &str) -> Option<String> {
+    match op {
+        "is_false" => Some(format!("({col} IS NULL OR {col} != '1')")),
+        "is_true" => Some(format!("{col} = '1'")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

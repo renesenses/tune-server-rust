@@ -105,6 +105,21 @@ pub struct StreamAlbum {
     /// le client n'ait qu'une liste de mots à connaître.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_type: Option<String>,
+    /// Le service marque-t-il cet album comme GÉNÉRÉ PAR IA ? (#5530)
+    ///
+    /// Qobuz porte ce marquage au niveau de l'ALBUM, pas de la piste (article
+    /// d'aide Qobuz « How do I know whether a track is AI-generated? »). Le
+    /// champ a été relevé par la sonde `raw-keys` sur le .18 le 05/10/2026 :
+    /// `album/get` rend `"ai_generated": true` pour « Psychedelic Mongolian
+    /// Trip Hop (…) AI Album », et ne porte PAS la clé pour un album témoin
+    /// (Kind of Blue).
+    ///
+    /// `Some(true)` = marqué ; `Some(false)` = le service dit « non » ;
+    /// `None` = le service ne dit rien. La règle d'affichage et de filtre est
+    /// « `Some(true)` seul vaut IA » : une absence n'est pas un marquage. Les
+    /// autres services laissent `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_generated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -962,6 +977,7 @@ mod tests {
     #[test]
     fn stream_album_serialization() {
         let album = StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: "789".into(),
             title: "Kind of Blue".into(),
