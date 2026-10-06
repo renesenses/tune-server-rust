@@ -103,3 +103,98 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
                 == Some(tune_core::taches_de_fond::ordre::Rang::ReplayGain),
     }))
 }
+
+/// Le relevé de la remesure (#5882) : combien de mesures de Tune sont
+/// d'avant la version courante, et si une campagne les rend à la passe.
+/// Compté sur le pool bloquant : le `COUNT` parcourt `tracks`.
+async fn releve_de_remesure(state: &AppState) -> Value {
+    let backend = state.backend.clone();
+    let perimees = tokio::task::spawn_blocking(move || {
+        tune_core::audio::replaygain::remesure::compter_les_mesures_perimees(&backend)
+    })
+    .await
+    .ok()
+    .flatten();
+    json!({
+        "stale": perimees,
+        "running": tune_core::audio::replaygain::remesure::en_cours(),
+        "algo": tune_core::audio::replaygain::RG_ALGO,
+        "enabled": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+    })
+}
+
+/// `GET /system/replaygain/reanalyze` — le relevé de la remesure.
+///
+/// - `stale` : mesures ReplayGain de Tune d'avant `algo` (sans version, ou
+///   d'une version plus ancienne), périmètre des analyses compris. `null` si
+///   le comptage échoue ;
+/// - `running` : une campagne les rend à la passe, par lots ;
+/// - `algo` : la version courante de la mesure ;
+/// - `enabled` : l'analyse ReplayGain est armée. Sans elle, rien ne
+///   remesurerait.
+pub(crate) async fn replaygain_reanalyze_status(State(state): State<AppState>) -> Json<Value> {
+    Json(releve_de_remesure(&state).await)
+}
+
+/// `POST /system/replaygain/reanalyze` — refaire les mesures ReplayGain et
+/// true peak prises avant le correctif des jonctions de segments (#5882).
+///
+/// Rien n'est mesuré ici et aucun fichier audio n'est écrit : la campagne
+/// efface en base, par lots, les mesures périmées, et la passe ReplayGain les
+/// refait à son rythme. Les gains lus dans les tags ne sont jamais touchés.
+///
+/// Réponses :
+/// - **202** `{"status":"started", …relevé}` ;
+/// - **200** `{"status":"nothing_to_do", …relevé}` : aucune mesure périmée ;
+/// - **409** `{"status":"already_running", …relevé}` ;
+/// - **409** `{"status":"analysis_disabled", …relevé}` : l'analyse ReplayGain
+///   est coupée, rien ne remesurerait ;
+/// - **500** `{"status":"error", "error": …}`.
+pub(crate) async fn replaygain_reanalyze(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    use tune_core::audio::replaygain::remesure;
+
+    let avec_statut = |statut: &str, mut releve: Value| {
+        if let Some(obj) = releve.as_object_mut() {
+            obj.insert("status".into(), json!(statut));
+        }
+        Json(releve)
+    };
+    if remesure::en_cours() {
+        let releve = releve_de_remesure(&state).await;
+        return (StatusCode::CONFLICT, avec_statut("already_running", releve));
+    }
+    let releve = releve_de_remesure(&state).await;
+    if !tune_core::audio::replaygain::analysis_enabled(&state.backend) {
+        return (
+            StatusCode::CONFLICT,
+            avec_statut("analysis_disabled", releve),
+        );
+    }
+    if releve.get("stale").and_then(Value::as_i64) == Some(0) {
+        return (StatusCode::OK, avec_statut("nothing_to_do", releve));
+    }
+    let backend = state.backend.clone();
+    match tokio::task::spawn_blocking(move || remesure::demander(&backend)).await {
+        Ok(Ok(remesure::Demande::Lancee)) => {
+            let mut releve = releve;
+            if let Some(obj) = releve.as_object_mut() {
+                obj.insert("running".into(), json!(true));
+            }
+            (StatusCode::ACCEPTED, avec_statut("started", releve))
+        }
+        Ok(Ok(remesure::Demande::DejaEnCours)) => {
+            (StatusCode::CONFLICT, avec_statut("already_running", releve))
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "error": e})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "error": e.to_string()})),
+        ),
+    }
+}

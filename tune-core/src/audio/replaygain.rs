@@ -35,6 +35,10 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
+/// (#5882) : la campagne qui les rend à la passe, par lots.
+pub mod remesure;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -79,7 +83,13 @@ pub const RG_ALGO_KEY: &str = "rg_algo";
 /// peak par suréchantillonnage 4× (#1694). À changer dès qu'une valeur
 /// rendue pour le même signal change — c'est ce qui permettra de ne comparer
 /// que des mesures comparables entre deux instances.
-pub const RG_ALGO: &str = "bs1770-tp4x-v1";
+///
+/// `v2` : le seek de l'analyse rogne au bon échantillon (#5882). Avant, chaque
+/// jonction de segments rejouait la fin du segment précédent, et le true peak
+/// lisait ce saut comme un over (0,507 au lieu de 0,456 sur le même signal).
+/// `v1` a pu être écrite sans ce correctif : la branche de #5594 ne le
+/// contenait pas. Voir [`remesure`].
+pub const RG_ALGO: &str = "bs1770-tp4x-v2";
 
 /// #5594 (lot 2) — la clé de `track_metadata` qui dit quel algorithme a
 /// produit `dr_track`. Même règle que [`RG_ALGO_KEY`] : posée à la mesure,
@@ -3460,7 +3470,7 @@ mod tests {
         );
         assert_eq!(
             t.get("rg_algo").map(String::as_str),
-            Some("bs1770-tp4x-v1"),
+            Some("bs1770-tp4x-v2"),
             "la mesure ReplayGain doit porter la version de son algorithme : {t:?}"
         );
         assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
