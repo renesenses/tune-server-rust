@@ -4506,6 +4506,11 @@ async fn queue_add(
     }
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
+    // #5770 — une insertion AVANT la piste en cours (« Lire à partir d'ici »
+    // remet les titres précédents en tête, `position: 0`) la décale : le
+    // curseur la suit. Garder l'ancien curseur le faisait pointer sur une
+    // ligne insérée.
+    let current_pos = bilan.curseur_apres(current_pos, total - count as i64);
     state
         .playback
         .update_queue_info(zone_id, current_pos, total)
@@ -4533,6 +4538,7 @@ async fn queue_add(
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
         }),
     );
     (
@@ -4556,10 +4562,17 @@ async fn queue_add(
         // `unresolved` (#4261) est additif lui aussi : la liste des pistes de
         // service enfilées sous « Unknown » faute de réponse du service, avec
         // le motif. Vide quand tout est résolu.
+        //
+        // `queue_position` (#5770) est additif aussi : le curseur de lecture
+        // APRÈS l'insertion. Sa présence dit au client que ce serveur fait
+        // suivre la piste en cours quand on insère avant elle ; un serveur
+        // plus ancien ne l'envoie pas, et le client s'abstient alors d'insérer
+        // en tête.
         Json(json!({
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
             "items": enfiles,
             "unresolved": non_resolues,
         })),

@@ -1507,3 +1507,9 @@ path = "tests/favori_marquage_ia_5530.rs"
 [[test]]
 name = "credits_apres_identification_4805"
 path = "tests/credits_apres_identification_4805.rs"
+
+# #5770 — une insertion avant la piste en cours fait suivre le curseur.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "insertion_avant_la_piste_en_cours_5770"
+path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
