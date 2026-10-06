@@ -109,6 +109,12 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #5882 — refaire, sur demande, les mesures prises avant le correctif
+        // du vrai pic. Le `POST` rend les mesures périmées à la passe, par lots.
+        .route(
+            "/replaygain/reanalyze",
+            get(replaygain::replaygain_reanalyze_status).post(replaygain::replaygain_reanalyze),
+        )
         // #4185 — la plage dynamique n'avait AUCUN geste : sa mesure était le
         // troisième rang de la cascade de fond, après le ReplayGain et les
         // empreintes. Le `POST` la lance tout de suite (202 / 409), le `GET`
