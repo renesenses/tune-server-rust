@@ -117,10 +117,8 @@ async fn inserer_en_tete_fait_suivre_la_piste_en_cours() {
     let f = file(&app, zone_id).await;
     assert_eq!(f["position"], 3, "{f}");
     assert_eq!(f["tracks"][3]["title"], "B", "le curseur pointe B : {f}");
-    assert_eq!(
-        f["tracks"][2]["source_id"], "p2",
-        "et B a sa précédente : {f}"
-    );
+    assert_eq!(f["tracks"][0]["source_id"], "p1", "en tête : {f}");
+    assert_eq!(f["tracks"][1]["source_id"], "p2", "dans l'ordre : {f}");
 }
 
 #[tokio::test]
