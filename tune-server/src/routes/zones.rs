@@ -863,7 +863,12 @@ pub(super) async fn album_en_cours(
     // La référence d'album enregistrée avec la ligne qui joue (#5706,
     // migration 114) — lue AVANT l'appel au service, servie APRÈS lui.
     let album_de_la_file =
-        album_de_la_ligne_qui_joue(&state, id, ps.queue_position, source, source_id);
+        album_de_la_ligne_qui_joue(&state, id, ps.queue_position, source, source_id)
+            .map(|album| (album, "queue_entry"))
+            .or_else(|| {
+                reference_rangee_bandcamp(&state, source, source_id)
+                    .map(|album| (album, "stored_reference"))
+            });
 
     let registre = state.services.lock().await;
     let Some(svc) = registre.get(source) else {
@@ -900,10 +905,34 @@ pub(super) async fn album_en_cours(
     //    l'album ». La ligne de file qui joue, elle, sait son album depuis
     //    l'enfilage. Le service passe d'abord, parce qu'il nomme aussi
     //    l'artiste ; la file ne sert que quand il n'a rien dit.
+    //
+    //    Web#1923 et web#1924 : un titre Bandcamp rejoué SEUL (historique,
+    //    favori, « Lire ») entrait en file sans référence d'album, et la ligne
+    //    ne savait donc rien. La référence que Tune a déjà rangée pour cette
+    //    piste (file, favoris, historique : `reference_d_album_bandcamp`, la
+    //    même recherche que la resignature du flux) prend alors le relais.
     match album_de_la_file {
-        Some(album) => Json(reponse(id, source, &album, None, "queue_entry")).into_response(),
+        Some((album, origine)) => Json(reponse(id, source, &album, None, origine)).into_response(),
         None => rien(id, raison),
     }
+}
+
+/// La référence d'album qu'une piste Bandcamp a déjà laissée dans la base
+/// (file, favoris, historique), ou `None` pour toute autre source.
+///
+/// Bandcamp ne donne jamais la fiche d'une piste seule : l'adresse de la page
+/// de l'album est la seule identité d'album qu'on lui connaisse, et elle n'est
+/// connue que si Tune l'a rangée en enfilant, en mettant en favori ou en
+/// écoutant cette piste (migration 114). Web#1923, web#1924, web#1926.
+pub(crate) fn reference_rangee_bandcamp(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+) -> Option<String> {
+    if source != "bandcamp" {
+        return None;
+    }
+    tune_core::db::reference_d_album::reference_d_album_bandcamp(&state.backend, source_id)
 }
 
 /// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
