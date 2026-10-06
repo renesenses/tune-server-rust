@@ -30,6 +30,11 @@ pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
 pub mod local;
+/// #4357 — le masque de canaux (`dwChannelMask`) de l'ouverture WASAPI
+/// exclusive. Hors FFI comme `negociation_format_exclusif_3837`, dont il
+/// déroule la négociation pour chaque masque : jugé par `cargo test`.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod masque_de_canaux_4357;
 pub mod mock;
 /// #3837 — la négociation de format de la sortie WASAPI exclusive. Sans FFI
 /// ni `cfg` de plateforme dans son corps : aucun job de CI n'exécute WASAPI,
