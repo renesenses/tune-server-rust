@@ -286,6 +286,143 @@ pub fn map_recording_ids(
     out
 }
 
+/// Un titre réduit à ce qui le désigne : sans parenthèses ni crochets
+/// (`(Remastered 2011)`, `[Live]`), sans suffixe ` - 2011 Remaster`, en
+/// minuscules et sans ponctuation ([`normalize_title`]).
+fn titre_essentiel(s: &str) -> String {
+    let mut sans = String::with_capacity(s.len());
+    let mut profondeur = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => profondeur += 1,
+            ')' | ']' => profondeur = profondeur.saturating_sub(1),
+            _ if profondeur == 0 => sans.push(c),
+            _ => {}
+        }
+    }
+    // ` - 2011 Remaster`, ` - Remastered`, ` - Live` : le suffixe de réédition
+    // des plateformes, après le DERNIER tiret entouré d'espaces.
+    if let Some(pos) = sans.rfind(" - ") {
+        let suffixe = sans[pos + 3..].to_lowercase();
+        if [
+            "remaster", "live", "mono", "stereo", "version", "mix", "edit",
+        ]
+        .iter()
+        .any(|m| suffixe.contains(m))
+        {
+            sans.truncate(pos);
+        }
+    }
+    normalize_title(&sans)
+}
+
+/// Deux titres de piste désignent-ils la même œuvre ?
+///
+/// - égaux une fois réduits ([`titre_essentiel`]), espaces compris ou non ;
+/// - ou l'un contient l'autre, s'il fait au moins 4 lettres : `I. Allegro ma
+///   non troppo` est dans `Symphony no. 9 …: I. Allegro ma non troppo`.
+///
+/// 🔴 Pas de recouvrement de mots : sur le classique, le titre de l'œuvre
+/// (`Symphony no. 9 in … minor, op. …`) se répète sur chaque piste et fait
+/// concorder un mouvement de Dvořák avec un mouvement de Beethoven (banc de
+/// précision, 06/10/2026 : 2 enregistrements faux passaient la garde). Le prix :
+/// `Symphony No.9 - 1. Allegro…` ne se reconnaît pas dans le titre
+/// MusicBrainz du même mouvement.
+pub fn titres_concordent(local: &str, mb: &str) -> bool {
+    let a = titre_essentiel(local);
+    let b = titre_essentiel(mb);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let ca: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+    let cb: String = b.chars().filter(|c| !c.is_whitespace()).collect();
+    if ca == cb {
+        return true;
+    }
+    let (court, long) = if ca.chars().count() <= cb.chars().count() {
+        (&ca, &cb)
+    } else {
+        (&cb, &ca)
+    };
+    court.chars().count() >= 4 && long.contains(court.as_str())
+}
+
+/// 🔴 Seuil de la garde des enregistrements (#4805, étape D) : le TIERS des
+/// fichiers de l'album, au moins, doit porter le titre de la piste du pressage
+/// à laquelle l'appariement l'attribue.
+///
+/// Pourquoi un tiers (banc de précision, `banc_precision_4805d_avant_apres`,
+/// 06/10/2026) :
+///
+/// - sur un pressage qui porte les bons enregistrements, le plus bas relevé
+///   est **6/12** : `The Four Seasons` de Kennedy, dont un autre pressage
+///   écrit autrement la moitié des titres (mêmes enregistrements) ;
+/// - sur un autre album ou une autre édition décalée, le plus haut est
+///   **1/30** (`Carmen` face au pressage de 39 pistes) ; les huit autres sont
+///   à 0 (`Buddha-Bar` contre `Buddha‐Bar XXIV`, `Nevermind` contre le
+///   coffret, Dvořák contre Beethoven… ; l'un d'eux a des titres locaux
+///   synthétiques).
+///
+/// La moitié collerait au plus bas des bons cas ; or les titres réels sont
+/// plus sales que ceux du banc, calqués sur le pressage de référence. Un tiers
+/// garde de la marge des deux côtés.
+pub const SEUIL_CONCORDANCE_DES_TITRES: (usize, usize) = (1, 3);
+
+/// Ce que la garde des enregistrements a vu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConcordanceDesTitres {
+    /// Fichiers de l'album.
+    pub fichiers: usize,
+    /// Fichiers appariés à une piste du pressage ([`map_recording_ids`]).
+    pub apparies: usize,
+    /// Fichiers appariés dont le titre concorde avec celui de leur piste.
+    pub concordants: usize,
+}
+
+impl ConcordanceDesTitres {
+    /// Assez de titres concordent pour écrire les enregistrements.
+    pub fn suffisante(&self) -> bool {
+        let (num, den) = SEUIL_CONCORDANCE_DES_TITRES;
+        self.fichiers > 0 && self.concordants * den >= self.fichiers * num
+    }
+}
+
+/// 🔴 La garde des enregistrements (#4805, étape D).
+///
+/// [`map_recording_ids`] apparie au rang : sur une mauvaise édition, toutes
+/// les pistes reçoivent l'enregistrement de leur voisine, et le
+/// `musicbrainz_recording_id` est REMPLACÉ. Ici, on confronte chaque fichier
+/// apparié au titre de sa piste du pressage. Si trop peu concordent
+/// ([`ConcordanceDesTitres::suffisante`]), aucun enregistrement n'est rendu :
+/// l'album peut rester identifié, ses pistes ne reçoivent pas de MBID.
+pub fn enregistrements_si_les_titres_concordent(
+    local: &[LocalTrack],
+    mb: &[crate::metadata::musicbrainz_release::MBTrack],
+) -> (Vec<(i64, String)>, ConcordanceDesTitres) {
+    let apparies = map_recording_ids(local, mb);
+    let concordants = apparies
+        .iter()
+        .filter(|(id, rid)| {
+            let Some(l) = local.iter().find(|l| l.id == *id) else {
+                return false;
+            };
+            mb.iter()
+                .filter(|m| m.recording_id.as_deref() == Some(rid.as_str()))
+                .any(|m| titres_concordent(&l.title, &m.title))
+        })
+        .count();
+    let concordance = ConcordanceDesTitres {
+        fichiers: local.len(),
+        apparies: apparies.len(),
+        concordants,
+    };
+    if concordance.suffisante() {
+        (apparies, concordance)
+    } else {
+        (Vec::new(), concordance)
+    }
+}
+
 /// Ce que la nouvelle identification a effectivement écrit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppliedIdentification {
@@ -790,6 +927,139 @@ mod tests {
         let m = vec![mb_track(1, 1, "A bis", Some("r1"))];
         // La piste 1 prend r1 par le rang ; la piste 2 ne peut pas le reprendre.
         assert_eq!(map_recording_ids(&l, &m), vec![(1, "r1".to_string())]);
+    }
+
+    // ---- garde des enregistrements (#4805, étape D) --------------------
+
+    #[test]
+    fn des_titres_qui_concordent() {
+        for (l, m) in [
+            ("So What", "So What"),
+            ("'Round Midnight!", "Round Midnight"),
+            ("Money (2011 Remaster)", "Money"),
+            ("Time - 2011 Remaster", "Time"),
+            ("Mindstate", "Mind State"),
+            (
+                "I. Allegro ma non troppo, un poco maestoso",
+                "Symphony no. 9 in D minor, op. 125 \"Choral\": I. Allegro ma non troppo, un poco maestoso",
+            ),
+        ] {
+            assert!(titres_concordent(l, m), "« {l} » / « {m} »");
+        }
+        // Le prix de la prudence : une autre écriture du même mouvement ne se
+        // reconnaît pas.
+        assert!(!titres_concordent(
+            "Symphony No.9 - 1. Allegro ma non troppo",
+            "Symphony no. 9 in D minor, op. 125: I. Allegro ma non troppo, un poco maestoso",
+        ));
+        for (l, m) in [
+            ("Venus", "Run"),
+            ("Piste 1", "So What"),
+            ("", "So What"),
+            (
+                "Symphony No.9 - 2. Molto vivace",
+                "Symphony no. 9 in D minor, op. 125: I. Allegro ma non troppo, un poco maestoso",
+            ),
+            // Deux neuvièmes : même œuvre en tête, autre compositeur.
+            (
+                "Symphony no. 9 in E minor, op. 95 \"From the New World\": I. Adagio – Allegro molto",
+                "Symphony no. 9 in D minor, op. 125: I. Allegro ma non troppo, un poco maestoso",
+            ),
+        ] {
+            assert!(!titres_concordent(l, m), "« {l} » / « {m} »");
+        }
+    }
+
+    /// 🔴 Une autre édition, décalée d'une piste : chaque fichier recevrait
+    /// l'enregistrement de sa voisine. Aucun n'est rendu.
+    #[test]
+    fn une_edition_decalee_ne_recoit_aucun_enregistrement() {
+        let l = vec![
+            local(1, 1, 1, "Speak to Me"),
+            local(2, 1, 2, "Breathe"),
+            local(3, 1, 3, "On the Run"),
+            local(4, 1, 4, "Time"),
+        ];
+        let m = vec![
+            mb_track(1, 1, "Intro (bonus)", Some("r0")),
+            mb_track(1, 2, "Speak to Me", Some("r1")),
+            mb_track(1, 3, "Breathe", Some("r2")),
+            mb_track(1, 4, "On the Run", Some("r3")),
+            mb_track(1, 5, "Time", Some("r4")),
+        ];
+        // L'appariement seul : quatre MBID, tous faux.
+        assert_eq!(map_recording_ids(&l, &m).len(), 4);
+        let (rendus, c) = enregistrements_si_les_titres_concordent(&l, &m);
+        assert!(
+            rendus.is_empty(),
+            "titres discordants, enregistrements rendus : {rendus:?} ({c:?})"
+        );
+        assert_eq!(
+            c,
+            ConcordanceDesTitres {
+                fichiers: 4,
+                apparies: 4,
+                concordants: 0
+            }
+        );
+    }
+
+    #[test]
+    fn le_bon_pressage_rend_ses_enregistrements() {
+        let l = vec![
+            local(1, 1, 1, "Speak to Me"),
+            local(2, 1, 2, "Breathe (In the Air)"),
+            local(3, 1, 3, "Piste 3"),
+            local(4, 1, 4, "Time"),
+        ];
+        let m = vec![
+            mb_track(1, 1, "Speak to Me", Some("r1")),
+            mb_track(1, 2, "Breathe", Some("r2")),
+            mb_track(1, 3, "On the Run", Some("r3")),
+            mb_track(1, 4, "Time", Some("r4")),
+        ];
+        let (rendus, c) = enregistrements_si_les_titres_concordent(&l, &m);
+        // Trois sur quatre concordent : au-dessus du seuil, TOUS les
+        // fichiers appariés reçoivent leur enregistrement, même « Piste 3 ».
+        assert_eq!(c.concordants, 3);
+        assert_eq!(rendus.len(), 4);
+    }
+
+    /// Le seuil est le tiers des FICHIERS : deux sur six suffisent, un ne
+    /// suffit pas.
+    #[test]
+    fn le_seuil_est_le_tiers_des_fichiers() {
+        let m: Vec<MBTrack> = (1..=6)
+            .map(|i| mb_track(1, i, &format!("Titre {i}"), Some(&format!("r{i}"))))
+            .collect();
+        let fichiers = |concordants: u32| -> Vec<LocalTrack> {
+            (1..=6)
+                .map(|i| {
+                    let titre = if i <= concordants {
+                        format!("Titre {i}")
+                    } else {
+                        format!("Autre {i}")
+                    };
+                    local(i as i64, 1, i as i32, &titre)
+                })
+                .collect()
+        };
+        assert_eq!(
+            enregistrements_si_les_titres_concordent(&fichiers(2), &m)
+                .0
+                .len(),
+            6
+        );
+        assert!(
+            enregistrements_si_les_titres_concordent(&fichiers(1), &m)
+                .0
+                .is_empty()
+        );
+        assert!(
+            enregistrements_si_les_titres_concordent(&[], &m)
+                .0
+                .is_empty()
+        );
     }
 
     // ---- pose de la nouvelle identification ---------------------------

@@ -275,7 +275,7 @@ fn artiste_brut(album: &str, pistes: Option<&str>) -> String {
 
 /// Réduit une réponse `/release?query=` aux champs que lit
 /// [`parse_search_results`] : la fixture reste lisible et petite.
-fn reduire(data: &Value) -> Value {
+pub(super) fn reduire(data: &Value) -> Value {
     let garder = |r: &Value| {
         let mut o = serde_json::Map::new();
         for k in [

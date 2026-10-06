@@ -48,7 +48,7 @@ use crate::metadata::reidentify::LocalTrack;
 /// `=` en tête : titre exact (`Kid A` n'est pas `Kid A Mnesia`). `None` :
 /// aucun album juste dans MusicBrainz, tout pressage retenu est faux.
 #[allow(clippy::type_complexity)]
-const ATTENDUS: &[(&str, Option<(&[&str], &str)>)] = &[
+pub(super) const ATTENDUS: &[(&str, Option<(&[&str], &str)>)] = &[
     ("Kind of Blue", Some((&["kindofblue"], "miles davis"))),
     ("A Love Supreme", Some((&["alovesupreme"], "coltrane"))),
     (
@@ -167,7 +167,7 @@ fn attendu(titre: &str) -> Option<(&'static [&'static str], &'static str)> {
         .1
 }
 
-fn bon_album(c: &MBReleaseMatch, attendu: Option<(&[&str], &str)>) -> bool {
+pub(super) fn bon_album(c: &MBReleaseMatch, attendu: Option<(&[&str], &str)>) -> bool {
     let Some((titres, mot)) = attendu else {
         return false;
     };
@@ -348,6 +348,7 @@ async fn banc_choix_de_l_edition_avant_apres() {
                 releases_des_balises: &[],
                 enregistrements_des_balises: &[],
                 codes_barres: &[],
+                compositeurs_des_balises: &[],
             },
             rejouer(&reponses),
             |chemin: String, _inc: &'static str| {

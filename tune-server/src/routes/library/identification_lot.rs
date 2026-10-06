@@ -392,6 +392,7 @@ fn etat_au_repos() -> Value {
         "sans_correspondance": 0,
         "ambigus": 0,
         "pistes_identifiees": 0,
+        "albums_sans_enregistrements": 0,
         "sources": {},
         "raison": Value::Null,
     })
@@ -409,6 +410,10 @@ pub(super) struct CompteDuLot {
     /// répondu sans qu'aucun pressage soit sûr (#4805 D). Rien n'est écrit.
     pub ambigus: usize,
     pub pistes: usize,
+    /// Parmi `identifies`, les albums posés SANS enregistrements : trop peu
+    /// de titres concordaient avec le pressage (#4805 D, garde des
+    /// enregistrements).
+    pub albums_sans_enregistrements: usize,
     /// Les identifiés, par origine du pressage (`balise_release`,
     /// `balise_enregistrement`, `code_barres`, `recherche`).
     pub sources: std::collections::BTreeMap<&'static str, usize>,
@@ -426,6 +431,9 @@ impl CompteDuLot {
             "reidentified" | "unchanged" => {
                 self.identifies += 1;
                 self.pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
+                if issue.concordance.is_some_and(|c| !c.suffisante()) {
+                    self.albums_sans_enregistrements += 1;
+                }
                 if let Some(source) = issue.source {
                     *self.sources.entry(source).or_default() += 1;
                 }
@@ -469,6 +477,7 @@ fn ecrire_etat(
                 "sans_correspondance": compte.sans_correspondance,
                 "ambigus": compte.ambigus,
                 "pistes_identifiees": compte.pistes,
+                "albums_sans_enregistrements": compte.albums_sans_enregistrements,
                 "sources": compte.sources,
                 "raison": raison,
             })
@@ -759,6 +768,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
         sans_correspondance = compte.sans_correspondance,
         ambigus = compte.ambigus,
         pistes_identifiees = compte.pistes,
+        albums_sans_enregistrements = compte.albums_sans_enregistrements,
         artistes_mbid_poses = compte.artistes_mbid_poses,
         artistes_ambigus = compte.artistes_ambigus,
         "identification_lot_termine"

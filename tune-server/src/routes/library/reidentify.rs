@@ -55,8 +55,8 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::metadata::choix_de_pressage::{self, EntreeDIdentification, IssueDuChoix};
 use tune_core::metadata::musicbrainz_release;
 use tune_core::metadata::reidentify::{
-    LocalTrack, apply_album_identification, clear_album_identification, map_recording_ids,
-    restore_album_identification,
+    ConcordanceDesTitres, LocalTrack, apply_album_identification, clear_album_identification,
+    enregistrements_si_les_titres_concordent, restore_album_identification,
 };
 
 use crate::state::AppState;
@@ -109,6 +109,9 @@ pub(super) struct Identification {
     /// Sur `ambiguous` : les éditions entre lesquelles rien n'a tranché, pour
     /// que l'utilisateur choisisse (`?release_id=`).
     pub candidats: Vec<musicbrainz_release::MBReleaseMatch>,
+    /// La garde des enregistrements (#4805, étape D) : combien de titres
+    /// concordent avec le pressage posé. `None` quand rien n'est posé.
+    pub concordance: Option<ConcordanceDesTitres>,
     /// Le rattachement des artistes au pressage (#4805, étape B). `None` quand
     /// rien n'a été identifié.
     pub artistes: Option<tune_core::metadata::artistes_du_pressage::BilanArtistes>,
@@ -166,6 +169,7 @@ pub(super) async fn identifier_album(
             source: None,
             raison_ambigu: None,
             candidats: Vec::new(),
+            concordance: None,
             artistes: None,
         });
     }
@@ -222,6 +226,17 @@ pub(super) async fn identifier_album(
     .await
 }
 
+/// `tracks.composer` des pistes (balise `COMPOSER`), une entrée par piste qui
+/// le porte : la matière de `choix_de_pressage::compositeur_majoritaire`.
+fn compositeurs_des_pistes(tracks: &[tune_core::db::models::Track]) -> Vec<String> {
+    tracks
+        .iter()
+        .filter_map(|t| t.composer.as_deref().map(str::trim))
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Les identifiants que les balises des fichiers portent déjà, tels que le
 /// scan les a rangés en base (`track_metadata`, clés de
 /// `read_extended_metadata`). Idée : MetaRust (Xavier Joly), `resolve_release`.
@@ -233,6 +248,8 @@ pub(super) struct BalisesDeLAlbum {
     pub enregistrements: Vec<String>,
     /// `barcode` des pistes, puis celui de l'album.
     pub codes_barres: Vec<String>,
+    /// `tracks.composer` des pistes (balise `COMPOSER`).
+    pub compositeurs: Vec<String>,
 }
 
 /// Lit [`BalisesDeLAlbum`] : trois requêtes sur la clé primaire de
@@ -261,6 +278,7 @@ pub(super) fn balises_de_l_album(
         releases: lire("mb_release_id"),
         enregistrements: lire("mb_track_id"),
         codes_barres,
+        compositeurs: compositeurs_des_pistes(tracks),
     }
 }
 
@@ -297,6 +315,7 @@ async fn poser_le_pressage(
                     releases_des_balises: &balises.releases,
                     enregistrements_des_balises: &balises.enregistrements,
                     codes_barres: &balises.codes_barres,
+                    compositeurs_des_balises: &balises.compositeurs,
                 },
                 musicbrainz_release::rechercher_sur_musicbrainz,
                 musicbrainz_release::lire_sur_musicbrainz,
@@ -325,6 +344,7 @@ async fn poser_le_pressage(
             source: None,
             raison_ambigu: raison,
             candidats,
+            concordance: None,
             artistes: None,
         }
     };
@@ -368,7 +388,22 @@ async fn poser_le_pressage(
         }
     };
 
-    let recordings = map_recording_ids(locales, &detail.tracks);
+    // 🔴 #4805, étape D : l'appariement se fait au rang. Si trop peu de
+    //    titres concordent avec ceux du pressage, l'album est posé mais ses
+    //    pistes ne reçoivent AUCUN enregistrement : le rang d'une autre
+    //    édition donnerait à chaque fichier l'enregistrement de sa voisine.
+    let (recordings, concordance) =
+        enregistrements_si_les_titres_concordent(locales, &detail.tracks);
+    if !concordance.suffisante() {
+        info!(
+            album_id,
+            release_id = %pressage.release_id,
+            fichiers = concordance.fichiers,
+            apparies = concordance.apparies,
+            concordants = concordance.concordants,
+            "reidentify_enregistrements_retenus"
+        );
+    }
     let applied = match apply_album_identification(
         &state.backend,
         album_id,
@@ -444,6 +479,7 @@ async fn poser_le_pressage(
         source: Some(source.as_str()),
         raison_ambigu: None,
         candidats: Vec::new(),
+        concordance: Some(concordance),
         artistes,
     })
 }
@@ -535,6 +571,10 @@ pub(super) async fn reidentify_album(
             "tracks_total": issue.tracks_total,
             "tracks_matched": applied.tracks_matched,
             "tracks_unmatched": applied.tracks_unmatched,
+            // #4805 D : les titres qui concordent avec le pressage, et si les
+            // enregistrements ont été retenus faute de concordance.
+            "tracks_titles_matching": issue.concordance.map(|c| c.concordants),
+            "recordings_withheld": issue.concordance.is_some_and(|c| !c.suffisante()),
             // Ce que Tune a refusé d'écraser, nommément. Sans cette liste,
             // l'utilisateur croirait la ré-identification incomplète.
             "fields_left_as_is": applied.fields_left_as_is,
