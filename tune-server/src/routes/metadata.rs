@@ -786,11 +786,17 @@ async fn edit_artist(
     if let Some(ref v) = body.sort_name {
         artist.sort_name = Some(v.clone());
     }
+    let bio_avant = artist.bio.clone();
     if let Some(ref v) = body.bio {
         artist.bio = Some(v.clone());
     }
 
-    repo.update(&artist).ok();
+    if repo.update(&artist).is_ok()
+        && let Err(e) =
+            repo.oublier_provenance_si_bio_reecrite(id, bio_avant.as_deref(), artist.bio.as_deref())
+    {
+        tracing::warn!(artist_id = id, error = %e, "artist_bio_provenance_clear_failed");
+    }
 
     Json(json!({ "status": "ok", "artist_id": id })).into_response()
 }
