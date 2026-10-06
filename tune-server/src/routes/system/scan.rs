@@ -3136,6 +3136,13 @@ async fn spawn_library_scan_avec_lecteur(
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "post_scan_duplicate_albums_merge_failed"),
         }
+        // Un album réparti en dossiers frères aux noms libres, sans DISCNUMBER,
+        // et réuni sous un seul titre — par la fusion ci-dessus, ou au scan
+        // quand la séparation par dossier est coupée — avait toutes ses pistes
+        // au disque 1, numéros en double. Un disque par dossier, dans l'ordre
+        // naturel des noms, en base seulement. APRÈS la fusion des doublons,
+        // et à chaque scan : une piste relue au disque 1 reprend le sien.
+        tune_core::db::disques_par_dossier::passe_journalisee(&db, "apres_scan");
 
         // Backfill embedded cover art for local albums still missing a cover.
         // The incremental scan only extracts covers from files it re-processed;

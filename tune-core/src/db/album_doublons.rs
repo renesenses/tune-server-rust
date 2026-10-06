@@ -210,6 +210,12 @@ impl FusionDesDoublons {
                 }
             }
         }
+        // Un album né de la fusion de dossiers frères sans DISCNUMBER montrait
+        // toutes ses pistes au disque 1, numéros en double : un disque par
+        // dossier, en base seulement ([`super::disques_par_dossier`]).
+        if bilan.fusionnes > 0 {
+            super::disques_par_dossier::passe_journalisee(&self.db, declencheur.nom());
+        }
         if bilan.fusionnes > 0 || bilan.proteges > 0 || bilan.suspendus > 0 {
             tracing::info!(
                 declencheur = declencheur.nom(),
