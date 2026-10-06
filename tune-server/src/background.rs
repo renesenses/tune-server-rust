@@ -2647,7 +2647,7 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// de fond n'ont pas le même correctif. Ceci rend le prochain relevé
 /// exploitable, rien de plus.
 ///
-/// Après le relevé, et à froid seulement, la mémoire libre que garde
+/// Après le relevé, et sans sortie locale en lecture, la mémoire libre que garde
 /// l'allocateur est rendue au système ([`crate::memoire_a_froid`]) : mesuré
 /// sur Shrek, 94 % du tas résident au repos était de la mémoire libre, et le
 /// relevé ne redescendait jamais.
@@ -2699,8 +2699,8 @@ fn spawn_memory_diagnostics(
     });
 }
 
-/// Rend au système la mémoire libre gardée par l'allocateur, si aucune zone ne
-/// joue. Hors du fil asynchrone : le parcours des arènes prend quelques
+/// Rend au système la mémoire libre gardée par l'allocateur, si aucune sortie
+/// locale ne joue (fil 2167). Hors du fil asynchrone : le parcours des arènes prend quelques
 /// dizaines de millisecondes au pire.
 async fn purger_a_froid(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
     // Hors glibc, rien à rendre : ne pas payer la requête des zones.
@@ -2709,8 +2709,10 @@ async fn purger_a_froid(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
     }
     let backend = backend.clone();
     let mesure = tokio::task::spawn_blocking(move || {
-        let une_zone_joue = tune_core::audio::replaygain::playing_zone_name(&backend).is_some();
-        if !crate::memoire_a_froid::purge_permise(une_zone_joue) {
+        // Fil 2167 — seule une sortie LOCALE en lecture retient la purge : une
+        // zone réseau qui joue sans arrêt ne la bloque plus pour toujours.
+        let locale = crate::memoire_a_froid::une_sortie_locale_joue(&backend);
+        if !crate::memoire_a_froid::purge_permise(locale) {
             return None;
         }
         let avant = crate::memoire_a_froid::rss_mb();

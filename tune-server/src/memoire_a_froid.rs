@@ -30,9 +30,29 @@
 //! minutes) : de 0 à 59 ms par purge ; RSS au repos 666 Mo sans la purge,
 //! 255 à 293 Mo avec (anonyme : 537 Mo contre 132 à 170 Mo).
 //!
-//! Il n'est fait qu'À FROID — aucune zone en lecture — parce qu'il tient le
-//! verrou de chaque arène pendant qu'il la parcourt : un fil de lecture qui
-//! allouerait à cet instant attendrait. Au repos, personne n'attend.
+//! Il n'est fait qu'À FROID — aucune SORTIE LOCALE en lecture — parce qu'il
+//! tient le verrou de chaque arène pendant qu'il la parcourt : un fil de
+//! lecture qui allouerait à cet instant attendrait.
+//!
+//! # Une zone réseau qui joue n'empêche plus la purge (fil 2167)
+//!
+//! La première version refusait la purge dès qu'UNE zone jouait. Or une
+//! écoute continue sur une zone réseau (DLNA, OpenHome, AirPlay…) est
+//! justement le cas où le tas monte le plus : chaque piste y est décodée,
+//! traitée et ré-encodée en entier, et ses fenêtres de niveaux sont gardées
+//! le temps de la piste. Relevé de terrain : un serveur qui joue sans arrêt
+//! vers une zone DLNA avec égaliseur passe de 449 Mo à 4,1 Go de RSS en
+//! 2 h 40, et la purge ne s'est jamais déclenchée.
+//!
+//! Le renderer réseau tire un FICHIER ou un flux HTTP tamponné de plusieurs
+//! secondes : quelques dizaines de millisecondes d'attente d'un fil du
+//! serveur ne s'entendent pas. Seule une sortie LOCALE (la carte son de la
+//! machine, son rappel temps réel) mérite qu'on ne la fasse pas attendre ;
+//! elle seule bloque désormais la purge — y compris quand elle suit, dans un
+//! groupe, une zone réseau qui joue. Banc du fil 2167 (zone réseau avec
+//! égaliseur, pistes de 9 à 20 min) : jusqu'à 375 Mo d'anonyme entre deux
+//! pistes sans la purge, 100 à 165 Mo avec ; la mémoire réellement en usage
+//! reste de 95 à 156 Mo dans les deux cas.
 //!
 //! Hors glibc (macOS, Windows, musl), la fonction ne fait rien : leurs
 //! allocateurs ont leur propre politique, et ce relevé ne les concerne pas.
@@ -68,7 +88,30 @@ pub fn rendre_la_memoire_liberee() -> bool {
     }
 }
 
-/// La purge n'a lieu qu'à froid : aucune zone ne joue.
-pub fn purge_permise(une_zone_joue: bool) -> bool {
-    !une_zone_joue
+/// La purge n'a lieu qu'à froid : aucune sortie LOCALE ne joue (fil 2167).
+pub fn purge_permise(une_sortie_locale_joue: bool) -> bool {
+    !une_sortie_locale_joue
+}
+
+/// Une zone qui joue retient-elle la purge ? Oui quand elle est locale, quand
+/// son type est inconnu, ou quand elle partage son groupe avec une zone
+/// locale (une suiveuse locale peut ne pas porter elle-même `playing`).
+/// SQL standard : la même requête sert SQLite et PostgreSQL.
+pub const REQUETE_SORTIE_LOCALE_EN_LECTURE: &str = "SELECT p.id FROM zones p \
+     WHERE p.last_play_state = 'playing' AND ( \
+       p.output_type IS NULL OR p.output_type = '' OR p.output_type = 'local' \
+       OR (p.group_id IS NOT NULL AND EXISTS ( \
+         SELECT 1 FROM zones l WHERE l.group_id = p.group_id \
+           AND (l.output_type IS NULL OR l.output_type = '' OR l.output_type = 'local'))) \
+     ) LIMIT 1";
+
+/// Vrai quand une sortie locale joue (voir [`REQUETE_SORTIE_LOCALE_EN_LECTURE`]).
+/// Une requête qui échoue répond `true` : dans le doute, on ne purge pas.
+pub fn une_sortie_locale_joue(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    match backend.query_one(REQUETE_SORTIE_LOCALE_EN_LECTURE, &[]) {
+        Ok(ligne) => ligne.is_some(),
+        Err(_) => true,
+    }
 }

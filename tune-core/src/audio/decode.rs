@@ -926,11 +926,33 @@ impl StageCache {
 /// Budget disque du cache de staging (octets). Assez pour une longue session
 /// d'écoute ALAC (celle d'Yves : 1,3 Go), borné pour ne pas saturer le disque
 /// système. Surchargeable par `TUNE_STAGE_CACHE_BYTES`.
+///
+/// Fil 2167 — les copies vivent dans le dossier temporaire : quand c'est un
+/// `tmpfs`, les 3 Go seraient de la RAM. Sans réglage explicite, le budget
+/// suit alors la mémoire de la machine
+/// ([`crate::chemins_de_travail::plafond_de_cache`]).
 fn stage_cache_budget() -> u64 {
-    std::env::var("TUNE_STAGE_CACHE_BYTES")
+    let reglage = std::env::var("TUNE_STAGE_CACHE_BYTES")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3 * 1024 * 1024 * 1024) // 3 Go
+        .and_then(|v| v.parse().ok());
+    stage_cache_budget_dans(
+        // tmp-autorise: on LIT le type du système de fichiers, rien n'y est créé.
+        &std::env::temp_dir(),
+        reglage,
+        crate::chemins_de_travail::memoire_vive_totale(),
+    )
+}
+
+/// [`stage_cache_budget`] avec le dossier, le réglage et la RAM PASSÉS (garde
+/// du fil 2167).
+fn stage_cache_budget_dans(dossier: &Path, reglage: Option<u64>, ram: Option<u64>) -> u64 {
+    crate::chemins_de_travail::plafond_de_cache_pour(
+        dossier,
+        "prechargement",
+        3 * 1024 * 1024 * 1024, // 3 Go
+        reglage,
+        ram,
+    )
 }
 
 static STAGE_CACHE: LazyLock<Mutex<StageCache>> =
@@ -4878,6 +4900,37 @@ mod decode_integration_tests {
             mtime: 0,
             size: 0,
         }
+    }
+
+    /// Fil 2167 — TÉMOIN : sur un `tmpfs`, les copies de préchargement ne
+    /// tiennent pas plus d'un trente-deuxième de la RAM.
+    ///
+    /// Le budget est calculé pour un VRAI `tmpfs` (`/dev/shm`) et 16 Gio de
+    /// RAM, puis quarante copies de 100 Mio entrent dans le cache — une
+    /// longue écoute depuis un partage réseau. Avant le correctif : budget de
+    /// 3 Gio, soit 3 Gio de RAM tenus. Après : au plus 512 Mio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sur_tmpfs_le_cache_de_prechargement_reste_borne_par_la_ram() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !crate::chemins_de_travail::est_en_memoire(shm) {
+            eprintln!("témoin ignoré : /dev/shm n'est pas un tmpfs sur cette machine");
+            return;
+        }
+        const MIO: u64 = 1024 * 1024;
+        let budget = super::stage_cache_budget_dans(shm, None, Some(16 * 1024 * MIO));
+        let mut c = super::StageCache::new(budget);
+        for i in 0..40 {
+            c.insert(cle(&format!("piste-{i}")), faux_stage(100 * MIO));
+        }
+        assert!(
+            c.bytes <= 512 * MIO,
+            "les copies de préchargement tiennent {} Mio sur un tmpfs (16 Gio de RAM) : \
+             plus de 512 Mio de mémoire vive",
+            c.bytes / MIO
+        );
+        // Un réglage explicite l'emporte toujours.
+        assert_eq!(super::stage_cache_budget_dans(shm, Some(7), None), 7);
     }
 
     #[test]
