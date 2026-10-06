@@ -575,6 +575,8 @@ mod fusion_tests;
 #[cfg(test)]
 mod identite_appareil_tests;
 #[cfg(test)]
+mod page_d_album_bandcamp_tests;
+#[cfg(test)]
 mod sante_reseau_de_zone_tests;
 #[cfg(test)]
 mod zone_masquee_en_lecture_affichee_5077;
@@ -933,6 +935,77 @@ pub(crate) fn reference_rangee_bandcamp(
         return None;
     }
     tune_core::db::reference_d_album::reference_d_album_bandcamp(&state.backend, source_id)
+}
+
+/// La plus longue adresse de page d'album acceptée du client. Une page
+/// Bandcamp tient en une centaine de caractères ; au-delà, ce n'en est pas une.
+const LONGUEUR_MAX_PAGE_BANDCAMP: usize = 2048;
+
+/// L'adresse de page d'album Bandcamp que le CLIENT a envoyée, si elle est sûre.
+///
+/// Elle finit en base (`queue_items.album_ref`), puis le serveur l'ouvre lui-même
+/// pour resigner un flux ou servir l'album en cours (`album_depuis_url`). On n'y
+/// laisse donc entrer que ce qu'il aurait accepté d'ouvrir, en plus strict :
+///
+/// - schéma `https://`, seul admis par `album_depuis_url` ;
+/// - hôte `bandcamp.com` ou `*.bandcamp.com`, comparé par COMPOSANT comme
+///   `est_un_flux_bandcamp` : `evilbandcamp.com` et `bandcamp.com.exemple`
+///   n'entrent pas, alors qu'un `contains("bandcamp.com")` les laisserait ;
+/// - ni identifiants (`@`), ni port (`:`), ni blanc ni caractère de contrôle ;
+/// - un chemin après l'hôte (`/album/…` ou `/track/…`).
+///
+/// `None` pour tout le reste : la demande se poursuit alors comme avant, sur la
+/// référence que Tune a rangée s'il en a une. Web#1923, web#1924.
+pub(crate) fn page_d_album_bandcamp_sure(brute: Option<&str>) -> Option<String> {
+    let page = brute?.trim();
+    if page.is_empty()
+        || page.len() > LONGUEUR_MAX_PAGE_BANDCAMP
+        || page.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let reste = page.strip_prefix("https://")?;
+    let fin_hote = reste.find(['/', '?', '#'])?;
+    let (hote, chemin) = reste.split_at(fin_hote);
+    if hote.contains(['@', ':', '\\']) {
+        return None;
+    }
+    let hote = hote.to_ascii_lowercase();
+    let bon_domaine = hote == "bandcamp.com"
+        || hote.strip_suffix(".bandcamp.com").is_some_and(|sous| {
+            !sous.is_empty()
+                && sous.split('.').all(|etiquette| {
+                    !etiquette.is_empty()
+                        && etiquette
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        });
+    if !bon_domaine || !chemin.starts_with('/') || chemin.len() < 2 {
+        return None;
+    }
+    Some(page.to_string())
+}
+
+/// La référence d'album à ranger avec une piste Bandcamp demandée SEULE
+/// (`POST /zones/{id}/play`, `POST /zones/{id}/queue/add`).
+///
+/// La page envoyée par le client d'abord, si elle est sûre : c'est elle qui
+/// sert un titre que Tune n'a JAMAIS vu (un résultat de recherche lancé seul),
+/// que ni la file, ni les favoris, ni l'historique ne connaissent. Sinon, celle
+/// que Tune a rangée (#5922). `None` pour toute autre source que Bandcamp : le
+/// champ y est ignoré, la ligne de file ne prend pas une page étrangère.
+pub(crate) fn reference_d_album_de_la_demande(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    fournie: Option<&str>,
+) -> Option<String> {
+    if source != "bandcamp" {
+        return None;
+    }
+    page_d_album_bandcamp_sure(fournie)
+        .or_else(|| reference_rangee_bandcamp(state, source, source_id))
 }
 
 /// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
