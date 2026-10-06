@@ -36,11 +36,11 @@ use super::{
 };
 
 /// Ce que `identifier_album` demande : 5 candidats, donc 15 à MusicBrainz.
-const CANDIDATS: usize = 5;
+pub(super) const CANDIDATS: usize = 5;
 const FETCH: usize = 15;
 
 /// `(classe, titre, artiste de l'album, artiste des pistes, nombre de pistes)`.
-const ALBUMS: &[(&str, &str, &str, Option<&str>, u32)] = &[
+pub(super) const ALBUMS: &[(&str, &str, &str, Option<&str>, u32)] = &[
     // Titres propres : trouvés avant comme après.
     ("propre", "Kind of Blue", "Miles Davis", None, 5),
     ("propre", "A Love Supreme", "John Coltrane", None, 4),
@@ -258,7 +258,7 @@ const ALBUMS: &[(&str, &str, &str, Option<&str>, u32)] = &[
     ("irreductible", "Disque 1", "Unknown Artist", None, 12),
 ];
 
-fn chemin_fixture() -> std::path::PathBuf {
+pub(super) fn chemin_fixture() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/musicbrainz/banc_identification_4805.json")
 }
@@ -365,7 +365,7 @@ where
     (Some(!r.candidats.is_empty()), meilleur)
 }
 
-fn rejouer(
+pub(super) fn rejouer(
     reponses: &BTreeMap<String, Value>,
 ) -> impl FnMut(String, usize) -> std::future::Ready<Result<Value, RefusMusicBrainz>> + '_ {
     move |requete, _fetch| {
