@@ -276,6 +276,9 @@ const SECONDES_PAR_ALBUM_LABELS: f64 = 1.3;
 pub(super) struct ParametresLot {
     #[serde(default)]
     mode: Option<String>,
+    /// `mode=artistes` (#4805, étape C) : au plus tant de fiches par tour.
+    #[serde(default)]
+    limite: Option<usize>,
 }
 
 /// La sélection de la passe « labels seulement » (#4836) : les albums locaux
@@ -446,6 +449,8 @@ pub(super) async fn identification_lot_start(
     let labels_seulement = match parametres.mode.as_deref() {
         None | Some("") | Some("identification") => false,
         Some("labels") => true,
+        // #4805, étape C — la passe artistes, aiguillée après les gardes.
+        Some("artistes") => false,
         Some(autre) => {
             // Un mode inconnu ne retombe pas sur l'identification : ce serait
             // lancer trois heures de requêtes que personne n'a demandées.
@@ -455,7 +460,7 @@ pub(super) async fn identification_lot_start(
                     "code": "mode_inconnu",
                     "error": "mode_inconnu",
                     "mode": autre,
-                    "modes": ["identification", "labels"],
+                    "modes": ["identification", "labels", "artistes"],
                 })),
             );
         }
@@ -517,6 +522,9 @@ pub(super) async fn identification_lot_start(
 
     if labels_seulement {
         return lancer_la_passe_labels(state, deja).await;
+    }
+    if parametres.mode.as_deref() == Some("artistes") {
+        return artistes::lancer_la_passe_artistes(state, deja, parametres.limite).await;
     }
 
     // 4. La sélection réussit AVANT le 202 : une panne SQL n'est pas une
@@ -593,6 +601,10 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
     let mut identifies = 0usize;
     let mut sans_correspondance = 0usize;
     let mut pistes = 0usize;
+    // #4805, étape B — artistes munis d'un MBID par les crédits du pressage,
+    // et cas ambigus laissés sans écriture. Journal de fin de passe seulement.
+    let mut artistes_mbid_poses = 0usize;
+    let mut artistes_ambigus = 0usize;
     let mut disjoncteur = Disjoncteur::default();
 
     for (rang, album_id) in albums.into_iter().enumerate() {
@@ -637,6 +649,10 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                     "reidentified" | "unchanged" => {
                         identifies += 1;
                         pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
+                        if let Some(b) = issue.artistes.as_ref() {
+                            artistes_mbid_poses += b.ecrits;
+                            artistes_ambigus += b.ambigus;
+                        }
                     }
                     _ => {
                         // `not_found` comme `no_tracks` : rien n'a été posé.
@@ -720,6 +736,8 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
         identifies,
         sans_correspondance,
         pistes_identifiees = pistes,
+        artistes_mbid_poses,
+        artistes_ambigus,
         "identification_lot_termine"
     );
     ecrire_etat(
@@ -1342,3 +1360,7 @@ mod tests {
         );
     }
 }
+
+// #4805, étape C — la passe artistes par le réseau, sous le même pilote.
+#[path = "identification_artistes.rs"]
+mod artistes;

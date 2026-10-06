@@ -1542,7 +1542,8 @@ impl PositionPoller {
                 } else {
                     // #4382 — ce que le renderer fait pendant la fenêtre, au
                     // journal de terrain. Lecture seule, avant la décision.
-                    self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
+                    let next_ignore = self
+                        .echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
                         .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
                     // #5411 — le rejeu de la piste finie, AVÉRÉ seulement :
@@ -1573,7 +1574,9 @@ impl PositionPoller {
                         // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
                         status.state == TransportState::Stopped,
                         age_secs,
-                        adoption.delai_secs,
+                        // #4382 — le transport a dit « `Next` ignoré » : plus
+                        // rien à attendre, le délai tombe à zéro.
+                        if next_ignore { 0 } else { adoption.delai_secs },
                     ) {
                         decisions::SuiteAdoption::EnAttente => {}
                         decisions::SuiteAdoption::Confirmee => {
@@ -3252,6 +3255,7 @@ impl PositionPoller {
                                 flux_arme.as_deref(),
                                 enchainement,
                             )
+                            && !self.next_deja_ignore(zone_id, &device_id)
                             && self.demander_la_bascule(zone_id, &device_id).await
                         {
                             decisions::EnchainementArme::Bascule

@@ -40,7 +40,7 @@ docker run -d \
   -v /path/to/music:/music:ro \
   -v tune-data:/data \
   -e TUNE_AUTO_SCAN=true \
-  renesenses/tune:dev
+  renesenses/tune:latest
 ```
 
 ### docker-compose

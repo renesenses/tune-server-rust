@@ -688,8 +688,94 @@ pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEm
     }
 }
 
+/// Les accumulateurs d'une mesure en cours, d'un segment au suivant.
+///
+/// Ils voyagent DANS la tâche bloquante de chaque segment, puis en reviennent
+/// (#5519) : voir [`mesurer_a_partir_de`].
+#[derive(Default)]
+struct MesureEnCours {
+    acc: Option<LoudnessAccumulator>,
+    dr: Option<DrAccumulator>,
+}
+
+/// Ce qu'a donné UN segment de la mesure.
+enum Segment {
+    /// Le décodage a échoué : la mesure entière échoue, comme avant.
+    Echec,
+    /// Fin du fichier (segment vide ou plus court que demandé).
+    Fin,
+    /// Segment complet : le prochain commence `avance` secondes plus loin.
+    Suite(f64),
+}
+
+impl MesureEnCours {
+    /// Nourrir les deux accumulateurs d'un segment décodé. Synchrone, et
+    /// appelé sur le pool bloquant, jamais sur un fil de l'exécuteur.
+    fn nourrir(&mut self, decoded: super::decode::DecodedAudio, seg_seconds: f64) -> Segment {
+        #[cfg(test)]
+        tests::FILS_QUI_ONT_NOURRI
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        let sample_rate = decoded.sample_rate as usize;
+        let channels = decoded.channels as usize;
+        if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
+            return Segment::Fin; // EOF (or unreadable): done.
+        }
+
+        let scale = pcm_scale(decoded.bit_depth);
+        let samples: Vec<f64> = decoded
+            .samples_i32
+            .iter()
+            .map(|&s| s as f64 / scale)
+            .collect();
+        self.acc
+            .get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
+            .feed(&samples);
+        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
+        // dynamique ne coûte que son arithmétique.
+        self.dr
+            .get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
+            .feed(&samples);
+
+        // A segment shorter than requested means we reached the end. Advance the
+        // seek by the actual decoded duration so segments stay contiguous even if
+        // the decoder rounds the boundary.
+        let frames = decoded.samples_i32.len() / channels;
+        if (frames as f64) < seg_seconds * sample_rate as f64 {
+            return Segment::Fin;
+        }
+        Segment::Suite(frames as f64 / sample_rate as f64)
+    }
+
+    fn finir(self) -> Option<(f64, f64, f64, Option<u32>)> {
+        let (lufs, peak, true_peak) = self.acc?.finish()?;
+        // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
+        // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
+        // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
+        Some((lufs, peak, true_peak, self.dr.and_then(|d| d.finish())))
+    }
+}
+
 /// Le corps de [`mesurer_intensite_et_plage`]. `premier` : le premier segment
 /// déjà décodé (seek 0, 30 s, stéréo), ou `None` pour le décoder ici.
+///
+/// # #5519 — le calcul part sur le pool bloquant AVEC le décodage
+///
+/// Seul le décodage partait en `spawn_blocking` ; la conversion en `f64`, la
+/// pondération K, la crête vraie et la plage dynamique de chaque segment
+/// tournaient sur le fil de l'exécuteur qui attendait ce décodage. C'était le
+/// plus gros poste de la passe (0,67 s par piste sur 1,94, banc Shrek du
+/// 30/09). Or la passe lance ses fichiers « à plusieurs » DANS UNE SEULE tâche
+/// (`en_parallele_borne`) : ce calcul-là ne se parallélisait donc pas. À quatre
+/// fichiers à la fois, la passe n'allait que 1,6 fois plus vite qu'à un seul
+/// (banc étage B), et le fil de l'exécuteur restait occupé à plein — le
+/// `tokio-rt-worker` à 100 % du .18 (23/09).
+///
+/// Désormais chaque segment est décodé PUIS accumulé dans la même tâche
+/// bloquante ; les accumulateurs y entrent et en reviennent. Mêmes opérations,
+/// dans le même ordre : le résultat est identique au bit près. La frontière où
+/// la passe peut céder à la lecture (#2495) reste le segment.
 async fn mesurer_a_partir_de(
     file_path: &str,
     mut premier: Option<super::decode::DecodedAudio>,
@@ -707,8 +793,7 @@ async fn mesurer_a_partir_de(
     // — it only fires on a non-progressing decoder.
     const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
 
-    let mut acc: Option<LoudnessAccumulator> = None;
-    let mut dr: Option<DrAccumulator> = None;
+    let mut mesure = MesureEnCours::default();
     let mut seek = 0.0_f64;
 
     loop {
@@ -716,53 +801,33 @@ async fn mesurer_a_partir_de(
             warn!(file = file_path, seek, "loudness_analysis_seek_cap_hit");
             break;
         }
-        let decoded = match premier.take() {
-            Some(d) => d,
-            None => {
-                let path = file_path.to_string();
-                tokio::task::spawn_blocking(move || {
-                    super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
-                })
-                .await
-                .ok()?
-                .ok()?
-            }
-        };
-
-        let sample_rate = decoded.sample_rate as usize;
-        let channels = decoded.channels as usize;
-        if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
-            break; // EOF (or unreadable): done.
+        let path = file_path.to_string();
+        let deja_decode = premier.take();
+        let (rendue, segment) = tokio::task::spawn_blocking(move || {
+            let decoded = match deja_decode {
+                Some(d) => d,
+                None => match super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)
+                {
+                    Ok(d) => d,
+                    Err(_) => return (mesure, Segment::Echec),
+                },
+            };
+            let segment = mesure.nourrir(decoded, SEG_SECONDS);
+            (mesure, segment)
+        })
+        .await
+        .ok()?;
+        mesure = rendue;
+        match segment {
+            Segment::Echec => return None,
+            Segment::Fin => break,
+            Segment::Suite(avance) => seek += avance,
         }
-
-        let scale = pcm_scale(decoded.bit_depth);
-        let samples: Vec<f64> = decoded
-            .samples_i32
-            .iter()
-            .map(|&s| s as f64 / scale)
-            .collect();
-        acc.get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
-            .feed(&samples);
-        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
-        // dynamique ne coûte que son arithmétique.
-        dr.get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
-            .feed(&samples);
-
-        // A segment shorter than requested means we reached the end. Advance the
-        // seek by the actual decoded duration so segments stay contiguous even if
-        // the decoder rounds the boundary.
-        let frames = decoded.samples_i32.len() / channels;
-        if (frames as f64) < SEG_SECONDS * sample_rate as f64 {
-            break;
-        }
-        seek += frames as f64 / sample_rate as f64;
     }
 
-    let (lufs, peak, true_peak) = acc?.finish()?;
-    // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
-    // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
-    // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
-    Some((lufs, peak, true_peak, dr.and_then(|d| d.finish())))
+    tokio::task::spawn_blocking(move || mesure.finir())
+        .await
+        .ok()?
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1101,50 @@ mod tests {
                 "{secondes} s : l'empreinte partagée diffère de empreinte_du_fichier"
             );
         }
+    }
+
+    /// Les fils sur lesquels [`MesureEnCours::nourrir`] a tourné (#5519).
+    pub(super) static FILS_QUI_ONT_NOURRI: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// #5519 — le calcul de la mesure (conversion, pondération K, crête vraie,
+    /// plage dynamique) tourne sur le pool BLOQUANT, jamais sur le fil de
+    /// l'exécuteur qui attend le décodage.
+    ///
+    /// Sur un exécuteur `current_thread`, tout ce qui est `async` tourne sur
+    /// le fil du test ; `spawn_blocking` part ailleurs. Si le calcul revenait
+    /// dans le corps `async`, il tournerait sur ce fil-ci — et la passe, qui
+    /// lance ses fichiers « à plusieurs » dans UNE tâche, ne paralléliserait
+    /// plus que le décodage (1,6× à quatre fichiers, banc du 30/09).
+    #[tokio::test(flavor = "current_thread")]
+    async fn le_calcul_de_la_mesure_ne_tourne_pas_sur_le_fil_de_l_executeur() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("module_75.wav");
+        ecrire_wav_module(&f, 75);
+        let chemin = f.to_str().unwrap();
+        let ici = std::thread::current().id();
+
+        let mesure = mesurer_intensite_et_plage(chemin).await;
+        let partagee = mesurer_intensite_plage_et_empreinte(chemin).await;
+        assert!(
+            mesure.is_some() && partagee.mesure.is_some(),
+            "les deux mesures existent"
+        );
+        assert_eq!(bits(partagee.mesure), bits(mesure));
+
+        let fils = FILS_QUI_ONT_NOURRI.lock().unwrap().clone();
+        assert!(
+            !fils.is_empty(),
+            "le témoin doit avoir vu des segments nourrir les accumulateurs"
+        );
+        assert!(
+            !fils.contains(&ici),
+            "#5519 : le calcul d'un segment a tourné sur le fil de l'exécuteur \
+             ({} segments sur {} nourris ici) — il doit partir sur le pool bloquant \
+             avec le décodage",
+            fils.iter().filter(|t| **t == ici).count(),
+            fils.len()
+        );
     }
 
     /// Un format hors du chemin partagé garde ses deux décodages : pas
@@ -1813,5 +1922,342 @@ mod tests {
         let mut acc1 = DrAccumulator::new(sr, 1);
         acc1.feed(&mono);
         assert_eq!(Some(deux_canaux), acc1.finish());
+    }
+
+    /// Pic de mémoire résidente du processus (`VmHWM`, Linux), en Kio.
+    #[cfg(target_os = "linux")]
+    fn pic_residente_kio() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// WAV 24/192 stéréo, écrit au fil de l'eau : un sinus à 997 Hz.
+    #[cfg(target_os = "linux")]
+    fn ecrire_wav_24_192(chemin: &std::path::Path, secondes: u64) {
+        use std::io::Write;
+        let rate = 192_000u64;
+        let data = secondes * rate * 6;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(chemin).unwrap());
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&((36 + data) as u32).to_le_bytes()).unwrap();
+        f.write_all(b"WAVEfmt ").unwrap();
+        for v in [16u32] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [1u16, 2] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [rate as u32, rate as u32 * 6] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for v in [6u16, 24] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"data").unwrap();
+        f.write_all(&(data as u32).to_le_bytes()).unwrap();
+        for i in 0..secondes * rate {
+            let a = 0.1 + 0.4 * ((i / (rate * 7)) % 2) as f64;
+            let v = (a
+                * (i as f64 * 997.0 * std::f64::consts::TAU / rate as f64).sin()
+                * 8_388_607.0) as i32;
+            let b = v.to_le_bytes();
+            f.write_all(&b[..3]).unwrap();
+            f.write_all(&b[..3]).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    /// DSF DSD64 stéréo, octets pseudo-aléatoires, écrit au fil de l'eau.
+    #[cfg(target_os = "linux")]
+    fn ecrire_dsf_64(chemin: &std::path::Path, secondes: u64) {
+        use std::io::Write;
+        const BLOC: u64 = 4096;
+        let total = secondes * 2_822_400;
+        let blocs = (total / 8).div_ceil(BLOC);
+        let data = blocs * BLOC * 2;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(chemin).unwrap());
+        f.write_all(b"DSD ").unwrap();
+        for v in [28u64, 28 + 52 + 12 + data, 0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&52u64.to_le_bytes()).unwrap();
+        for v in [1u32, 0, 2, 2, 2_822_400, 1] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(&total.to_le_bytes()).unwrap();
+        for v in [BLOC as u32, 0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        f.write_all(b"data").unwrap();
+        f.write_all(&(12 + data).to_le_bytes()).unwrap();
+        let mut graine = 0xb209u32;
+        let mut bloc = vec![0u8; BLOC as usize];
+        for _ in 0..blocs * 2 {
+            for o in bloc.iter_mut() {
+                graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *o = (graine >> 24) as u8;
+            }
+            f.write_all(&bloc).unwrap();
+        }
+        f.flush().unwrap();
+    }
+
+    /// plafond-analyse — la mémoire de l'analyse ne dépend PAS de la durée.
+    ///
+    /// Mesuré par le PIC de mémoire résidente du processus : la piste courte
+    /// d'abord, la longue ensuite ; le pic ne doit presque pas bouger entre
+    /// les deux. Avant la reprise au bloc des DSF, chaque segment de 30 s
+    /// re-décodait la piste depuis son début : 10 min de DSD64 montaient le
+    /// pic de plus de 600 Mio au-dessus de 2 min.
+    ///
+    /// Ignoré par défaut : il écrit ~2,3 Go de fichiers temporaires et dure
+    /// plusieurs minutes. À lancer SEUL, pour que le pic soit le sien :
+    /// `cargo test --release -p tune-core --lib -- --ignored --exact
+    /// audio::analyzer::tests::la_memoire_de_l_analyse_ne_depend_pas_de_la_duree`
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn la_memoire_de_l_analyse_ne_depend_pas_de_la_duree() {
+        const MARGE_KIO: u64 = 64 * 1024;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (nom, court, long) in [("dsf", 120u64, 600u64), ("wav", 120, 720)] {
+            let c = dir.path().join(format!("court.{nom}"));
+            let l = dir.path().join(format!("long.{nom}"));
+            if nom == "wav" {
+                ecrire_wav_24_192(&c, court);
+                ecrire_wav_24_192(&l, long);
+            } else {
+                ecrire_dsf_64(&c, court);
+                ecrire_dsf_64(&l, long);
+            }
+            let m = mesurer_intensite_plage_et_empreinte(c.to_str().unwrap()).await;
+            assert!(m.mesure.is_some(), "{nom} court : mesure attendue");
+            let apres_court = pic_residente_kio();
+            let m = mesurer_intensite_plage_et_empreinte(l.to_str().unwrap()).await;
+            assert!(m.mesure.is_some(), "{nom} long : mesure attendue");
+            let apres_long = pic_residente_kio();
+            eprintln!(
+                "{nom} : pic après {court} s = {apres_court} Kio, après {long} s = {apres_long} Kio"
+            );
+            assert!(
+                apres_long <= apres_court + MARGE_KIO,
+                "{nom} : la mémoire de l'analyse croît avec la durée — pic {apres_court} Kio \
+                 pour {court} s, {apres_long} Kio pour {long} s"
+            );
+            let _ = std::fs::remove_file(&c);
+            let _ = std::fs::remove_file(&l);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vrai pic d'un FLAC analysé par segments (lot truepeak-flac-b209)
+    // -----------------------------------------------------------------------
+
+    const HZ_TP: u32 = 44_100;
+
+    /// Stéréo 16 bits entrelacé : un sinus dont la fréquence dérive (la
+    /// phase n'est donc jamais la même d'une trame FLAC à l'autre), crête
+    /// 0,45 — loin de toute saturation.
+    fn signal_tp(secondes: usize) -> Vec<i16> {
+        let frames = HZ_TP as usize * secondes;
+        let mut v = Vec::with_capacity(frames * 2);
+        let mut phase = 0.0f64;
+        for i in 0..frames {
+            let t = i as f64 / HZ_TP as f64;
+            let f = 440.0 + 220.0 * (t * 0.05).sin();
+            phase += std::f64::consts::TAU * f / HZ_TP as f64;
+            let x = 0.45 * phase.sin();
+            v.push((x * 32_767.0) as i16);
+            v.push((x * 0.8 * 32_767.0) as i16);
+        }
+        v
+    }
+
+    fn pcm_octets(pcm: &[i16]) -> Vec<u8> {
+        pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    fn ecrire_wav_tp(chemin: &std::path::Path, pcm: &[i16]) {
+        let donnees = pcm_octets(pcm);
+        let mut w = Vec::with_capacity(donnees.len() + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&HZ_TP.to_le_bytes());
+        w.extend_from_slice(&(HZ_TP * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(chemin, w).unwrap();
+    }
+
+    /// FLAC de l'encodeur maison : blocs fixes de 4 096 trames, AUCUNE
+    /// SEEKTABLE (STREAMINFO puis VORBIS_COMMENT).
+    fn flac_tp(pcm: &[i16]) -> Vec<u8> {
+        let mut enc = crate::audio::encoder::AudioEncoder::new("flac", HZ_TP, 16, 2);
+        enc.start_sync().unwrap();
+        enc.write_sync(&pcm_octets(pcm)).unwrap();
+        enc.finish_sync().unwrap()
+    }
+
+    fn crc8_flac(octets: &[u8]) -> u8 {
+        octets.iter().fold(0u8, |mut crc, &b| {
+            crc ^= b;
+            for _ in 0..8 {
+                crc = if crc & 0x80 != 0 {
+                    (crc << 1) ^ 0x07
+                } else {
+                    crc << 1
+                };
+            }
+            crc
+        })
+    }
+
+    /// Le même FLAC, AVEC une SEEKTABLE (un point toutes les 10 s) insérée
+    /// juste après STREAMINFO. Les décalages sont ceux des en-têtes de trame
+    /// réels, retrouvés par leur octet exact (synchro, codes, numéro UTF-8,
+    /// CRC-8) : l'index est juste, comme celui que pose `flac`.
+    fn avec_seektable(flac: &[u8]) -> Vec<u8> {
+        // fLaC (4) + en-tête STREAMINFO (4) + STREAMINFO (34) ; puis
+        // VORBIS_COMMENT, dernier bloc : les trames suivent.
+        let apres_streaminfo = 4 + 4 + 34;
+        let lg_vc = u32::from_be_bytes([0, flac[43], flac[44], flac[45]]) as usize;
+        let premiere_trame = apres_streaminfo + 4 + lg_vc;
+        let en_tete = |k: u32| {
+            // 4 096 trames (12), 44,1 kHz (9), stéréo G/D (1), 16 bits (4).
+            let mut h = vec![0xFF, 0xF8, 0xC9, 0x18];
+            let mut tampon = [0u8; 4];
+            h.extend_from_slice(
+                char::from_u32(k)
+                    .unwrap()
+                    .encode_utf8(&mut tampon)
+                    .as_bytes(),
+            );
+            h.push(crc8_flac(&h));
+            h
+        };
+        let trames_par_point = (10 * HZ_TP as usize) / 4096;
+        let mut points = Vec::new();
+        let mut depuis = premiere_trame;
+        let mut k = 0u32;
+        loop {
+            let h = en_tete(k);
+            let Some(pos) = flac[depuis..]
+                .windows(h.len())
+                .position(|w| w == h.as_slice())
+            else {
+                break;
+            };
+            let off = depuis + pos;
+            points.push(((k as u64) * 4096, (off - premiere_trame) as u64));
+            depuis = off + 1;
+            k += trames_par_point as u32;
+        }
+        assert!(
+            points.len() >= 3,
+            "seektable : trop peu de points ({})",
+            points.len()
+        );
+        let mut bloc = Vec::new();
+        for (echantillon, decalage) in &points {
+            bloc.extend_from_slice(&echantillon.to_be_bytes());
+            bloc.extend_from_slice(&decalage.to_be_bytes());
+            bloc.extend_from_slice(&4096u16.to_be_bytes());
+        }
+        let mut out = flac[..apres_streaminfo].to_vec();
+        out.push(3); // SEEKTABLE, pas le dernier bloc
+        out.extend_from_slice(&(bloc.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&bloc);
+        out.extend_from_slice(&flac[apres_streaminfo..]);
+        out
+    }
+
+    /// La mesure de VÉRITÉ : tout le PCM d'un seul tenant, sans décodeur ni
+    /// seek, par les mêmes accumulateurs.
+    fn mesure_d_un_seul_tenant(pcm: &[i16]) -> Option<(f64, f64, f64, Option<u32>)> {
+        let mut m = MesureEnCours::default();
+        let d = crate::audio::decode::DecodedAudio {
+            samples_i32: pcm.iter().map(|&s| s as i32).collect(),
+            bit_depth: 16,
+            sample_rate: HZ_TP,
+            channels: 2,
+            duration_s: pcm.len() as f64 / 2.0 / HZ_TP as f64,
+            integrite: Default::default(),
+        };
+        let _ = m.nourrir(d, f64::MAX);
+        m.finir()
+    }
+
+    /// Un FLAC (avec ou sans SEEKTABLE) et le WAV du même PCM rendent le MÊME
+    /// vrai pic, le même pic, la même sonie et la même plage dynamique que le
+    /// PCM mesuré d'un seul tenant.
+    ///
+    /// La mesure découpe la piste en segments de 30 s, chacun décodé par un
+    /// `seek`. Le démultiplexeur se pose au début du paquet qui contient la
+    /// cible (trame FLAC de 4 096, paquet simulé du WAV) ; tant que
+    /// `decode_symphonia` ne rognait pas ce résidu, chaque jonction rejouait
+    /// la fin du segment précédent — et le saut de phase qui en résulte, le
+    /// suréchantillonnage 4× le lisait comme un over (0,507 au lieu de 0,455
+    /// sur un FLAC de 20 min).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_vrai_pic_d_un_flac_par_segments_est_celui_du_wav() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 65 s : trois segments, deux jonctions ; 30 s × 44 100 n'est pas un
+        // multiple de 4 096, la jonction tombe au milieu d'une trame FLAC.
+        let pcm = signal_tp(65);
+        let verite = mesure_d_un_seul_tenant(&pcm).expect("mesure de référence");
+
+        let wav = dir.path().join("tp.wav");
+        ecrire_wav_tp(&wav, &pcm);
+        let brut = flac_tp(&pcm);
+        let sans = dir.path().join("tp_sans_seektable.flac");
+        std::fs::write(&sans, &brut).unwrap();
+        let avec = dir.path().join("tp_avec_seektable.flac");
+        std::fs::write(&avec, avec_seektable(&brut)).unwrap();
+
+        for f in [&wav, &sans, &avec] {
+            let nom = f.file_name().unwrap().to_string_lossy().into_owned();
+            let (lufs, pic, tp, dr) = mesurer_intensite_et_plage(f.to_str().unwrap())
+                .await
+                .unwrap_or_else(|| panic!("{nom} : mesure attendue"));
+            eprintln!("{nom} : tp={tp:.6} pic={pic:.6} lufs={lufs} dr={dr:?} (vérité {verite:?})");
+            assert!(
+                (tp - verite.2).abs() <= 1e-3,
+                "{nom} : vrai pic {tp:.6}, {:.6} d'un seul tenant",
+                verite.2
+            );
+            assert!(
+                (pic - verite.1).abs() <= 1e-3,
+                "{nom} : pic {pic:.6}, {:.6} d'un seul tenant",
+                verite.1
+            );
+            assert_eq!(lufs, verite.0, "{nom} : sonie");
+            assert_eq!(dr, verite.3, "{nom} : plage dynamique");
+            // La passe nominale (tête partagée avec l'empreinte) aussi.
+            let passe = mesurer_intensite_plage_et_empreinte(f.to_str().unwrap())
+                .await
+                .mesure
+                .unwrap_or_else(|| panic!("{nom} : mesure de la passe attendue"));
+            assert!(
+                (passe.2 - verite.2).abs() <= 1e-3,
+                "{nom} : vrai pic de la passe {:.6}, {:.6} d'un seul tenant",
+                passe.2,
+                verite.2
+            );
+        }
     }
 }

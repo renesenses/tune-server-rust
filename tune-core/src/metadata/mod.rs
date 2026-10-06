@@ -1,5 +1,6 @@
 pub mod artist_enrichment;
 pub mod artist_split;
+pub mod artistes_du_pressage;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
@@ -22,6 +23,8 @@ pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
 pub mod suggestions;
+// Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
+pub mod artistes_par_le_reseau;
 pub mod tag_writer;
 
 use serde::{Deserialize, Serialize};

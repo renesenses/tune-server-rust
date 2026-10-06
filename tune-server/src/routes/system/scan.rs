@@ -611,6 +611,29 @@ pub(crate) fn sous_arbres_vides(
     retenus
 }
 
+/// [`sous_arbres_vides`] vu AVANT l'import : les pistes que la base connaît
+/// (locales et exemplaires) face à ce que le parcours a trouvé.
+///
+/// L'import d'un scan forcé relit la pochette de chaque album (`complet`) ;
+/// face à un montage imbriqué tombé, il voyait le fichier source « disparu »
+/// et retirait la pochette d'un album dont une partie des pistes vit hors du
+/// montage (suite de #5854). Il lui faut donc les sous-arbres protégés dès le
+/// départ, pas seulement à la purge.
+pub(crate) fn sous_arbres_vides_avant_import(
+    racines: &[String],
+    existants: &std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>,
+    copies: &CarteDesChemins,
+    decouverts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let refs: Vec<&str> = existants
+        .iter()
+        .filter(|(_, info)| info.est_locale())
+        .map(|(chemin, _)| chemin.as_str())
+        .chain(copies.keys().map(String::as_str))
+        .collect();
+    sous_arbres_vides(racines, &refs, decouverts)
+}
+
 pub(crate) fn roots_gone_empty(
     roots: &[String],
     existing_paths: &[&str],
@@ -2095,6 +2118,12 @@ async fn spawn_library_scan_avec_lecteur(
             },
         )
         .with_force_artwork(force)
+        .avec_sous_arbres_proteges(sous_arbres_vides_avant_import(
+            &scan_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
@@ -2902,6 +2931,9 @@ async fn spawn_library_scan_avec_lecteur(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        // Un montage IMBRIQUÉ tombé laisse sa racine répondre : `le_suivi_peut_conclure`
+        // ne le voit pas. Son sous-arbre n'a pas été vu, rien n'y est conclu.
+        let exclus_pochettes: Vec<String> = error_dirs.iter().chain(&sous_arbres_proteges).cloned().collect();
         // #5682 (fil 2115) — pas quand une racine manquait ou s'est vidée : un
         // partage pas encore monté faisait voir chaque fichier source
         // « disparu », et retirait les pochettes de pistes pourtant conservées.
@@ -2914,7 +2946,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &portee_pochettes,
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         } else if !scan_cancel_requested() {
@@ -3075,7 +3107,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &[],
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         }
