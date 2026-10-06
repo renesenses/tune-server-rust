@@ -361,6 +361,7 @@ pub async fn rechercher_l_enregistrement(
         .query(&[("query", query.as_str()), ("limit", "5"), ("fmt", "json")])
         .send()
         .await
+        .inspect(super::musicbrainz_release::constater_reponse_musicbrainz)
         .ok()?;
     if !resp.status().is_success() {
         return None;

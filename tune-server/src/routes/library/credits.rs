@@ -390,7 +390,13 @@ pub(super) async fn enrich_track_credits(
     // Créneau du limiteur MusicBrainz PARTAGÉ (#4767) — pas de cadence locale.
     tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
     let resp =
-        match state.http_client.get(&url).send().await {
+        match state
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .inspect(tune_core::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
                 Err(_) => {
@@ -446,7 +452,13 @@ pub(super) async fn enrich_album_credits(
         );
 
         tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
-        let resp = match state.http_client.get(&url).send().await {
+        let resp = match state
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .inspect(tune_core::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
                 Err(_) => {
@@ -611,7 +623,13 @@ pub(super) async fn enrich_all_credits(
             );
 
             tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
-            match state.http_client.get(&url).send().await {
+            match state
+                .http_client
+                .get(&url)
+                .send()
+                .await
+                .inspect(tune_core::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+            {
                 Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                     Ok(data) => {
                         let lignes = lignes_credits(&data);
@@ -938,7 +956,9 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                     "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
                 );
                 tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
-                match state.http_client.get(&url).send().await {
+                match state.http_client.get(&url).send().await.inspect(
+                    tune_core::metadata::musicbrainz_release::constater_reponse_musicbrainz,
+                ) {
                     Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                         Ok(data) => {
                             let lignes = lignes_credits(&data);

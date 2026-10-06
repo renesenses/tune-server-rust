@@ -197,7 +197,9 @@ pub struct MBReleaseDetail {
     pub artist_credits: Vec<CreditArtiste>,
 }
 
-fn normalize(s: &str) -> String {
+/// Casse, ponctuation et espaces neutralisés. Partagée avec la passe AcoustID
+/// (`acoustid_picard`), pour qu'un titre se compare de la même façon partout.
+pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
@@ -526,6 +528,7 @@ async fn mb_get(path: &str, params: &[(&str, String)]) -> Result<Value, RefusMus
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
         .map_err(|e| {
             debug!(path = path, error = %e, "mb_request_transport_error");
             RefusMusicBrainz::Transport
@@ -1215,6 +1218,15 @@ pub async fn rate_limit_delay() {
         .await;
 }
 
+/// Rend compte d'une réponse MusicBrainz au limiteur partagé (#4805, 4 bis) :
+/// un `503`/`429` double l'intervalle de la clé [`CLE_LIMITEUR_MUSICBRAINZ`]
+/// (jusqu'à 5 s) en respectant `Retry-After`, un succès le ramène à 1 s.
+/// S'emploie juste après le `send`, souvent en `.inspect(...)` sur le
+/// `Result`.
+pub fn constater_reponse_musicbrainz(reponse: &reqwest::Response) {
+    crate::http::fetch::MUSICBRAINZ.constater_reponse(CLE_LIMITEUR_MUSICBRAINZ, reponse);
+}
+
 /// Issue d'une lecture de release pour la passe des crédits (#4767).
 ///
 /// Trois cas, parce que l'appelant ne fait pas la même chose : une réponse
@@ -1341,6 +1353,7 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
         .timeout(std::time::Duration::from_secs(delai_s))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
     {
         Ok(r) => r,
         Err(e) => return LectureRelease::Panne(e.to_string()),

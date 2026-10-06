@@ -1,0 +1,197 @@
+{
+ "album": {
+  "titre": "Nuit Blanche",
+  "artiste": "Collectif Nocturne"
+ },
+ "pistes": [
+  {
+   "track_id": 201,
+   "titre": "Piste 1",
+   "artiste": null,
+   "duree_s": 222,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000018",
+      "score": 0.91,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000014",
+        "title": "Prélude",
+        "duration": 221,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000000f",
+          "name": "Collectif Nocturne"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000010",
+          "title": "Nuit Blanche",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000011",
+            "country": "FR",
+            "date": {
+             "year": 1999
+            },
+            "medium_count": 1,
+            "track_count": 3,
+            "title": "Nuit Blanche"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "id": "a0c00000-0000-4000-8000-000000000019",
+      "score": 0.89,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000015",
+        "title": "Prélude (live)",
+        "duration": 224,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000000f",
+          "name": "Collectif Nocturne"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000012",
+          "title": "Concert de minuit",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000013",
+            "country": "BE",
+            "date": {
+             "year": 2001
+            },
+            "medium_count": 1,
+            "track_count": 11,
+            "title": "Concert de minuit"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-201"
+  },
+  {
+   "track_id": 202,
+   "titre": "Piste 2",
+   "artiste": null,
+   "duree_s": 305,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000001a",
+      "score": 0.42,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000016",
+        "title": "Insomnie",
+        "duration": 304,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000000f",
+          "name": "Collectif Nocturne"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000010",
+          "title": "Nuit Blanche",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000011",
+            "country": "FR",
+            "date": {
+             "year": 1999
+            },
+            "medium_count": 1,
+            "track_count": 3,
+            "title": "Nuit Blanche"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-202"
+  },
+  {
+   "track_id": 203,
+   "titre": "Réverbère",
+   "artiste": "Collectif Nocturne",
+   "duree_s": 198,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000001b",
+      "score": 0.95,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000017",
+        "title": "Réverbère",
+        "duration": 197,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000000f",
+          "name": "Collectif Nocturne"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000010",
+          "title": "Nuit Blanche",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000011",
+            "country": "FR",
+            "date": {
+             "year": 1999
+            },
+            "medium_count": 1,
+            "track_count": 3,
+            "title": "Nuit Blanche"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-203"
+  }
+ ],
+ "attendu": {
+  "release_id": null,
+  "enregistrements": {}
+ },
+ "verite": {
+  "201": "5ec00000-0000-4000-8000-000000000015",
+  "202": null,
+  "203": "5ec00000-0000-4000-8000-000000000017"
+ }
+}

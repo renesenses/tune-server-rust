@@ -1211,9 +1211,11 @@ pub(super) async fn identify_track(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    let api_key = match state.config.acoustid_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
+    // La même clé que la passe de lot (#4805) : le réglage en base, sinon la
+    // configuration.
+    let api_key = match super::identification_lot::acoustid::cle_acoustid(&state) {
+        Some(k) => k,
+        None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"})),

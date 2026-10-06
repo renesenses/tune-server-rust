@@ -1298,6 +1298,13 @@ path = "tests/identification_lot_4805.rs"
 name = "labels_par_le_pilote_4836"
 path = "tests/labels_par_le_pilote_4836.rs"
 
+# #4805 (idée 4) — la passe par empreinte AcoustID, par la route montée, sur
+# des réponses enregistrées et un faux `fpcalc`. `autotests = false` en tête de
+# ce manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "acoustid_par_le_pilote_4805"
+path = "tests/acoustid_par_le_pilote_4805.rs"
+
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
 # le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne

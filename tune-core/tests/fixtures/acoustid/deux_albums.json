@@ -1,0 +1,146 @@
+{
+ "album": {
+  "titre": "Sans Titre",
+  "artiste": "Ensemble Sans Nom"
+ },
+ "pistes": [
+  {
+   "track_id": 701,
+   "titre": "Lueur",
+   "artiste": "Ensemble Sans Nom",
+   "duree_s": 230,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000053",
+      "score": 0.94,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000051",
+        "title": "Lueur",
+        "duration": 230,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000004c",
+          "name": "Ensemble Sans Nom"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000004d",
+          "title": "Première Lumière",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000004e",
+            "country": "FR",
+            "date": {
+             "year": 2002
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Première Lumière"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-00000000004f",
+          "title": "Seconde Lumière",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000050",
+            "country": "FR",
+            "date": {
+             "year": 2003
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Seconde Lumière"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-701"
+  },
+  {
+   "track_id": 702,
+   "titre": "Reflet",
+   "artiste": "Ensemble Sans Nom",
+   "duree_s": 250,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000054",
+      "score": 0.92,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000052",
+        "title": "Reflet",
+        "duration": 251,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000004c",
+          "name": "Ensemble Sans Nom"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000004d",
+          "title": "Première Lumière",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000004e",
+            "country": "FR",
+            "date": {
+             "year": 2002
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Première Lumière"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-00000000004f",
+          "title": "Seconde Lumière",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000050",
+            "country": "FR",
+            "date": {
+             "year": 2003
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Seconde Lumière"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-702"
+  }
+ ],
+ "attendu": {
+  "release_id": null,
+  "enregistrements": {}
+ },
+ "verite": {
+  "701": "5ec00000-0000-4000-8000-000000000051",
+  "702": "5ec00000-0000-4000-8000-000000000052"
+ }
+}

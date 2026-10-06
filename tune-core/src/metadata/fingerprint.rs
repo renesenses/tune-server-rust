@@ -18,11 +18,41 @@ pub struct AcoustIdMatch {
     pub score: f64,
 }
 
+/// Le binaire `fpcalc` remplacé — une doublure dans les tests (#4805). `None`
+/// en service : `fpcalc` est cherché dans le `PATH`.
+static FPCALC_REMPLACE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// **Tests seulement.** Fait lancer `chemin` à la place de `fpcalc`, et vide le
+/// cache de [`fpcalc_disponible`].
+#[doc(hidden)]
+pub fn remplacer_fpcalc(chemin: Option<std::path::PathBuf>) {
+    if let Ok(mut f) = FPCALC_REMPLACE.write() {
+        *f = chemin;
+    }
+    if let Ok(mut c) = DISPONIBILITE.lock() {
+        *c = None;
+    }
+}
+
+fn binaire_fpcalc() -> std::ffi::OsString {
+    FPCALC_REMPLACE
+        .read()
+        .ok()
+        .and_then(|f| f.clone())
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| "fpcalc".into())
+}
+
 pub async fn generate_fingerprint(file_path: &str) -> Result<FingerprintResult, String> {
-    let output = tokio::process::Command::new("fpcalc")
+    // `fpcalc` lit les 120 premières secondes par défaut, comme Picard.
+    // `kill_on_drop` : une passe qui abandonne une empreinte trop longue
+    // (fichier sur un partage qui ne répond plus) ne laisse pas de processus.
+    let output = tokio::process::Command::new(binaire_fpcalc())
         .args(["-json", file_path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("fpcalc: {e}"))?;
@@ -54,6 +84,11 @@ pub async fn lookup_acoustid(
     fingerprint: &str,
     duration: f64,
 ) -> Result<Vec<AcoustIdMatch>, String> {
+    // Même cadence que la passe de lot (#4805) : 3 requêtes/s au plus, par le
+    // limiteur PARTAGÉ.
+    crate::http::fetch::ACOUSTID
+        .acquire(crate::http::fetch::CLE_ACOUSTID)
+        .await;
     let client = crate::http::client::shared();
     let resp = client
         .post(ACOUSTID_API)
@@ -65,6 +100,9 @@ pub async fn lookup_acoustid(
         ])
         .send()
         .await
+        .inspect(|r| {
+            crate::http::fetch::ACOUSTID.constater_reponse(crate::http::fetch::CLE_ACOUSTID, r)
+        })
         .map_err(|e| format!("acoustid: {e}"))?;
 
     let data: serde_json::Value = resp
@@ -111,12 +149,36 @@ pub async fn lookup_acoustid(
 }
 
 pub fn fpcalc_available() -> bool {
-    std::process::Command::new("fpcalc")
+    std::process::Command::new(binaire_fpcalc())
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok()
+}
+
+/// Durée de validité de [`fpcalc_disponible`]. L'écran Santé sonde en
+/// boucle : lancer un processus à chaque sondage serait absurde, mais un
+/// `fpcalc` installé pendant que le serveur tourne doit être vu sans
+/// redémarrage.
+const DISPONIBILITE_VALIDE: std::time::Duration = std::time::Duration::from_secs(60);
+
+static DISPONIBILITE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+    std::sync::Mutex::new(None);
+
+/// [`fpcalc_available`], mis en cache [`DISPONIBILITE_VALIDE`].
+pub fn fpcalc_disponible() -> bool {
+    if let Ok(c) = DISPONIBILITE.lock()
+        && let Some((quand, dispo)) = *c
+        && quand.elapsed() < DISPONIBILITE_VALIDE
+    {
+        return dispo;
+    }
+    let dispo = fpcalc_available();
+    if let Ok(mut c) = DISPONIBILITE.lock() {
+        *c = Some((std::time::Instant::now(), dispo));
+    }
+    dispo
 }
 
 #[cfg(test)]

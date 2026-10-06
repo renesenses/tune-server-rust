@@ -33,7 +33,7 @@ mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
-mod identification_lot;
+pub(crate) mod identification_lot;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
