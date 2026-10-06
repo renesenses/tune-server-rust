@@ -263,6 +263,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "compteur de revision du catalogue UPnP, remis a zero par le script PG 066 ; \
          les clients UPnP relisent le catalogue",
     ),
+    (
+        "musicbrainz_release_cache",
+        "reponses MusicBrainz gardees (#4805) : un cache de 90 jours, que la passe \
+         des credits reconstitue",
+    ),
 ];
 
 /// The complete PG schema DDL. Creates all tables that exist in SQLite.
@@ -774,6 +779,9 @@ ALTER TABLE item_tags ADD COLUMN IF NOT EXISTS created_at TEXT;
 -- Marque « déjà tenté, rien trouvé » de l'identification en lot (#4991,
 -- PG 080 / SQLite 116). En ALTER pour la même raison qu'au-dessus.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
+-- Marquage IA d'un favori de service (#5530, PG 082 / SQLite 118). En ALTER
+-- pour la même raison qu'au-dessus.
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 -- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :
 -- l'adresse de la page Bandcamp qui permet de resigner une URL de flux
 -- expirée. En ALTER pour la même raison que juste au-dessus : les trois tables
@@ -1057,6 +1065,16 @@ CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_t
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+-- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3 de
+-- MetaRust). Sans script numéroté : présente ici (bascule) ET dans
+-- `ENSURE_TABLES` (toute base, à chaque démarrage). Non copiée à la bascule :
+-- c'est un cache, la passe des crédits le reconstitue.
+CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
+    mbid TEXT PRIMARY KEY,
+    inc TEXT NOT NULL,
+    corps BYTEA NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upnp_library_sources (
     source_key TEXT PRIMARY KEY,
     udn TEXT NOT NULL,
@@ -1214,6 +1232,11 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_media_path TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_start_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS cue_end_ms BIGINT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
+-- tracks: clé du signal PCM des FLAC et son témoin (SQLite migration v119 /
+-- PG 083, #5594). TEXT des deux côtés : la copie texte n'a rien à convertir.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT;
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT;
+CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key);
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE

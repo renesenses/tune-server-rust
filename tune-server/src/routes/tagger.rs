@@ -211,6 +211,30 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
             )
             .ok();
     }
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    {
+        use tune_core::db::champs_tenus::{Champ, tenir_par_id};
+        let mut champs = Vec::new();
+        if fields.title.is_some() {
+            champs.push(Champ::Titre);
+        }
+        if fields.artist.is_some() {
+            champs.push(Champ::Artiste);
+        }
+        if fields.album.is_some() {
+            champs.push(Champ::Album);
+        }
+        if fields.genre.is_some() {
+            champs.push(Champ::Genre);
+        }
+        if fields.year.is_some() {
+            champs.push(Champ::Annee);
+        }
+        if fields.album_artist.is_some() {
+            champs.push(Champ::ArtisteAlbum);
+        }
+        tenir_par_id(&state.backend, track_id, &champs);
+    }
     Ok(())
 }
 
@@ -313,6 +337,11 @@ async fn auto_number_album(
                 &[&track_num as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
             )
             .map_err(AppError::internal)?;
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::NumeroPiste],
+        );
 
         results.push(json!({
             "track_id": track_id,
@@ -389,6 +418,14 @@ async fn set_album_genre(
         )
         .map_err(AppError::internal)?;
 
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    for (track_id, _) in &paths {
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::Genre],
+        );
+    }
     let mut file_errors: Vec<Value> = Vec::new();
     let ecrire = ecriture_fichiers::autorisee(&state);
     for (track_id, path) in paths.iter().filter(|_| ecrire) {
@@ -453,6 +490,14 @@ async fn set_album_year(
         .map_err(AppError::internal)?;
 
     let year_num: Option<u16> = body.year.parse().ok();
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    for (track_id, _) in &paths {
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::Annee],
+        );
+    }
     let mut file_errors: Vec<Value> = Vec::new();
     let ecrire = ecriture_fichiers::autorisee(&state);
     for (track_id, path) in paths.iter().filter(|_| ecrire) {

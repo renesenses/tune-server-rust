@@ -904,6 +904,7 @@ impl TidalService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            ai_generated: None,
             // #4767 — Tidal porte le type dans `type` : `ALBUM`, `EP`,
             // `SINGLE`. Même décodeur que Qobuz, donc même vocabulaire de
             // sortie ; la casse est absorbée par `depuis_service`.

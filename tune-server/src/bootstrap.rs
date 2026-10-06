@@ -383,6 +383,12 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
 
+    // Dossier de données non inscriptible (image Docker sous `tune`, `/data`
+    // monté depuis un dossier de l'hôte appartenant à root) : un rapport
+    // lisible et une sortie `EX_CONFIG`, au lieu d'une panique dans
+    // `AppState::new` et d'une boucle de redémarrage muette.
+    crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
+
     crate::boot_status::set_phase("base de données");
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");

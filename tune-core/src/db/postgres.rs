@@ -59,6 +59,7 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             created_at TEXT,\
             position TEXT,\
             first_seen_at TEXT,\
+            ai_generated TEXT,\
             UNIQUE(profile_id, item_type, service, service_id)\
         )",
     // Rang manuel (#2001 piste 2) sur une base ou la table PRE-EXISTE : le
@@ -71,6 +72,11 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // travail de la migration 067, qui ne tourne qu'une fois ; laisser NULL
     // fait simplement retomber le client sur la date du service.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT",
+    // #5530 — marquage IA d'un favori de service (PG 082), que `SELECT_COLS`
+    // NOMME : sans lui, une table montée par ce seul chemin (base neuve,
+    // banc `pg_3715_*`) rendait « column ai_generated does not exist » à la
+    // première lecture des favoris. Même raison que `first_seen_at`.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -191,7 +197,16 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at)",
     "CREATE TABLE IF NOT EXISTS upnp_library_sources (\n    source_key TEXT PRIMARY KEY,\n    udn TEXT NOT NULL,\n    container TEXT NOT NULL,\n    state_json TEXT NOT NULL\n)",
     "CREATE TABLE IF NOT EXISTS upnp_library_members (\n    source_key TEXT NOT NULL REFERENCES upnp_library_sources(source_key) ON DELETE CASCADE,\n    track_id BIGINT NOT NULL,\n    generation TEXT NOT NULL,\n    PRIMARY KEY (source_key, track_id)\n)",
-    "CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id)",
+    "CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id)", // Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
+    // de MetaRust). Sans script numéroté : ce rattrapage la pose sur TOUTE
+    // base PostgreSQL, neuve ou convertie (schema_version 99), à chaque
+    // démarrage. `PG_FULL_SCHEMA` la porte aussi, à l'identique.
+    "CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (\
+            mbid TEXT PRIMARY KEY,\
+            inc TEXT NOT NULL,\
+            corps BYTEA NOT NULL,\
+            fetched_at TEXT NOT NULL\
+        )",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
@@ -282,6 +297,17 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
     // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
+    // #5530 — marquage IA d'un favori de service (PG 082). Ici AUSSI : une
+    // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
+    // des favoris de service nomment la colonne. NULL = inconnu.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
+    // #5594 — clé du signal PCM des FLAC et son témoin de lecture (PG 083).
+    // Ici AUSSI : une base de bascule ne rejoue pas la 083, et la passe
+    // `taches_de_fond::cle_pcm` nomme les deux colonnes. TEXT des deux côtés,
+    // NULL pour l'existant. L'index JUSTE APRÈS les colonnes.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT",
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

@@ -901,6 +901,14 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
                 error = %e,
                 "compositeur_colonne_non_ecrite"
             );
+        } else if !ecrire_fichiers {
+            // Pas de balise derrière la colonne : sans tenue, la prochaine
+            // analyse complète remettrait la valeur du fichier.
+            tune_core::db::champs_tenus::tenir_par_id(
+                &state.backend,
+                candidat.id,
+                &[tune_core::db::champs_tenus::Champ::Compositeur],
+            );
         }
         match verdict {
             Verdict::Rempli => c.rempli += 1,

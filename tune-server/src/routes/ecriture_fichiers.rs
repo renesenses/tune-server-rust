@@ -91,6 +91,8 @@ mod garde_ecriture_fichiers {
         "apply_tags_to_file(",
         "ecrire_par_tag(",
         "ecrire_par_tag_generique(",
+        // Le `.lrc` voisin (décision du 05/10/2026 : sous le même réglage).
+        "write_sidecar_lrc(",
     ];
 
     /// Où les écrivains sont DÉFINIS : le réglage se lit chez leurs appelants,
@@ -98,6 +100,7 @@ mod garde_ecriture_fichiers {
     const DEFINITIONS: &[&str] = &[
         "tune-core/src/metadata/tag_writer.rs",
         "tune-core/src/metadata/mod.rs",
+        "tune-core/src/metadata/lyrics.rs",
     ];
 
     /// Exemptions, chacune avec sa raison.
@@ -124,7 +127,8 @@ mod garde_ecriture_fichiers {
     /// Appels recensés au 05/10/2026, par fichier. Un écart fait échouer.
     const RECENSEMENT: &[(&str, usize)] = &[
         ("tune-core/src/audio/iso9660/epreuves_5299.rs", 2),
-        ("tune-core/src/library/lyrics_pass.rs", 1),
+        ("tune-core/src/library/lyrics_pass.rs", 2),
+        ("tune-core/src/metadata/lyrics.rs", 1),
         ("tune-core/src/metadata/mod.rs", 2),
         ("tune-core/src/metadata/tag_writer.rs", 21),
         ("tune-core/src/queue_persistence.rs", 2),

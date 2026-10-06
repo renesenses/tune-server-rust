@@ -2578,6 +2578,9 @@ fn spawn_replaygain_analysis(state: &AppState) {
     // porte ; il ne dépend PAS de l'interrupteur d'analyse : lire un rapport
     // ne décode rien, exactement comme le scan qui le lit déjà.
     tune_core::taches_de_fond::rapports_dr::spawn(state.backend.clone());
+    // #5594 — la clé du signal PCM des FLAC (`tracks.audio_pcm_key`), lue
+    // dans l'en-tête : rien n'est décodé, rien n'est écrit dans les fichiers.
+    tune_core::taches_de_fond::cle_pcm::spawn(state.backend.clone());
 }
 
 /// #2172 — le rattrapage des paroles.
