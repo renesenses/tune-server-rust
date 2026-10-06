@@ -686,6 +686,13 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                     issue.verdict,
                     issue.refus_musicbrainz,
                 );
+                // #4805 — les crédits du pressage posé, lus aussitôt dans la
+                //    release gardée en base, sur une tâche à part.
+                super::credits_apres_identification::apres_identification(
+                    &state,
+                    album_id,
+                    issue.verdict,
+                );
                 // 🔴 #4991 — une SEULE expression décide, et elle est couverte
                 //    par ses témoins. Le compteur du disjoncteur ne se touche
                 //    nulle part ailleurs dans cette boucle.
