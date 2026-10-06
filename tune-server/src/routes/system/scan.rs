@@ -546,11 +546,26 @@ pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
 ///
 /// Rend les dossiers les plus HAUTS qui qualifient — inutile de lister aussi
 /// leurs enfants, `sous_le_dossier` les couvre.
+///
+/// `racines` : ce que CE scan a parcouru — le dossier visé par un scan ciblé,
+/// toutes les racines sinon. Une piste hors de ce périmètre n'a pas été
+/// cherchée : son absence de `decouverts` ne dit rien de son montage. Sans ce
+/// filtre, un scan ciblé sur `/data/recordings/Qobuz` déclarait « vidés »
+/// `/data/music`, `/data/recordings/Tidal` et `/mnt` — 36 669 pistes qui
+/// n'avaient simplement pas été parcourues (.18, 05/10/2026). Les pistes
+/// restaient conservées, mais l'alarme `post_scan_sous_arbre_vide` et
+/// `protected_subtrees` mentaient, et une vraie alarme se serait noyée dans
+/// le bruit. Pour la même raison, un dossier rendu est toujours une racine du
+/// périmètre ou l'un de ses descendants, jamais un ancêtre (`/mnt` pour la
+/// racine `/mnt/recordings_usb`).
 pub(crate) fn sous_arbres_vides(
+    racines: &[String],
     existants: &[&str],
     decouverts: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
+
+    let dans_le_perimetre = |chemin: &str| racines.iter().any(|r| sous_le_dossier(chemin, r));
 
     // Dossiers qui présentent encore au moins un fichier : eux vont bien.
     let mut vivants: HashSet<&str> = HashSet::new();
@@ -567,7 +582,7 @@ pub(crate) fn sous_arbres_vides(
     // Pistes perdues par dossier, tous niveaux confondus.
     let mut perdues: HashMap<&str, usize> = HashMap::new();
     for p in existants {
-        if decouverts.contains(*p) {
+        if decouverts.contains(*p) || !dans_le_perimetre(p) {
             continue;
         }
         let mut cur = *p;
@@ -579,7 +594,9 @@ pub(crate) fn sous_arbres_vides(
 
     let mut candidats: Vec<&str> = perdues
         .into_iter()
-        .filter(|(d, n)| *n >= SEUIL_SOUS_ARBRE_VIDE && !vivants.contains(*d))
+        .filter(|(d, n)| {
+            *n >= SEUIL_SOUS_ARBRE_VIDE && !vivants.contains(*d) && dans_le_perimetre(d)
+        })
         .map(|(d, _)| d)
         .collect();
     // Du plus court au plus long, pour ne garder que les ancêtres.
@@ -592,6 +609,29 @@ pub(crate) fn sous_arbres_vides(
     }
     retenus.sort();
     retenus
+}
+
+/// [`sous_arbres_vides`] vu AVANT l'import : les pistes que la base connaît
+/// (locales et exemplaires) face à ce que le parcours a trouvé.
+///
+/// L'import d'un scan forcé relit la pochette de chaque album (`complet`) ;
+/// face à un montage imbriqué tombé, il voyait le fichier source « disparu »
+/// et retirait la pochette d'un album dont une partie des pistes vit hors du
+/// montage (suite de #5854). Il lui faut donc les sous-arbres protégés dès le
+/// départ, pas seulement à la purge.
+pub(crate) fn sous_arbres_vides_avant_import(
+    racines: &[String],
+    existants: &std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>,
+    copies: &CarteDesChemins,
+    decouverts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let refs: Vec<&str> = existants
+        .iter()
+        .filter(|(_, info)| info.est_locale())
+        .map(|(chemin, _)| chemin.as_str())
+        .chain(copies.keys().map(String::as_str))
+        .collect();
+    sous_arbres_vides(racines, &refs, decouverts)
 }
 
 pub(crate) fn roots_gone_empty(
@@ -2078,6 +2118,12 @@ async fn spawn_library_scan_avec_lecteur(
             },
         )
         .with_force_artwork(force)
+        .avec_sous_arbres_proteges(sous_arbres_vides_avant_import(
+            &scan_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
@@ -2593,7 +2639,7 @@ async fn spawn_library_scan_avec_lecteur(
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            sous_arbres_proteges = sous_arbres_vides(&existing_refs, &discovered_paths);
+            sous_arbres_proteges = sous_arbres_vides(&scan_dirs, &existing_refs, &discovered_paths);
             let sous_arbres = &sous_arbres_proteges;
             if !sous_arbres.is_empty() {
                 tracing::error!(
@@ -2885,6 +2931,9 @@ async fn spawn_library_scan_avec_lecteur(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        // Un montage IMBRIQUÉ tombé laisse sa racine répondre : `le_suivi_peut_conclure`
+        // ne le voit pas. Son sous-arbre n'a pas été vu, rien n'y est conclu.
+        let exclus_pochettes: Vec<String> = error_dirs.iter().chain(&sous_arbres_proteges).cloned().collect();
         // #5682 (fil 2115) — pas quand une racine manquait ou s'est vidée : un
         // partage pas encore monté faisait voir chaque fichier source
         // « disparu », et retirait les pochettes de pistes pourtant conservées.
@@ -2897,7 +2946,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &portee_pochettes,
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         } else if !scan_cancel_requested() {
@@ -3058,7 +3107,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &[],
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         }
@@ -4117,7 +4166,7 @@ mod roots_gone_empty_tests {
         let trouvees: HashSet<String> = decouvertes.iter().cloned().collect();
 
         let racines_videes = roots_gone_empty(&racines, &refs, &trouvees);
-        let sous_arbres = sous_arbres_vides(&refs, &trouvees);
+        let sous_arbres = sous_arbres_vides(&racines, &refs, &trouvees);
 
         let (mut candidats, mut protegees, mut hors_perimetre) = (0usize, 0usize, 0usize);
         let examinees = en_base.len();
@@ -4334,7 +4383,7 @@ mod roots_gone_empty_tests {
         // Le garde par racine ne bronche pas :
         assert!(roots_gone_empty(&["/mnt/music".to_string()], &refs, &decouverts).is_empty());
         // Celui par sous-arbre, si :
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert!(
             v.iter()
                 .any(|d| d == "/mnt/music/nas/Jazz" || d == "/mnt/music/nas"),
@@ -4352,7 +4401,7 @@ mod roots_gone_empty_tests {
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/autre/ok.flac"]);
         assert!(
-            sous_arbres_vides(&refs, &decouverts).is_empty(),
+            sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts).is_empty(),
             "sous le seuil, on laisse nettoyer"
         );
     }
@@ -4364,11 +4413,92 @@ mod roots_gone_empty_tests {
         let chemins = perdues("/mnt/music/nas/Jazz", 200);
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/nas/Jazz/0000.flac"]);
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert!(
             !v.iter().any(|d| d == "/mnt/music/nas/Jazz"),
             "un dossier vivant ne se protege pas, obtenu {v:?}"
         );
+    }
+
+    /// La configuration du .18 au 05/10/2026 (base : `music_dirs` =
+    /// `/data/music`, `/data/recordings`, `/mnt/recordings_usb`,
+    /// `/home/bertrand/Music/DIVERS`), et un scan CIBLÉ sur
+    /// `/data/recordings/Qobuz`. Le parcours ne voit que Qobuz : tout le
+    /// reste de la base est absent de `decouverts` sans avoir été cherché.
+    fn base_du_18() -> (Vec<String>, Vec<String>) {
+        let mut en_base = perdues("/data/music/Jazz", 150);
+        en_base.extend(perdues("/data/recordings/Tidal/Album", 150));
+        en_base.extend(perdues("/mnt/recordings_usb/Rips", 150));
+        en_base.extend(perdues("/home/bertrand/Music/DIVERS", 13));
+        let qobuz = perdues("/data/recordings/Qobuz/Album", 150);
+        en_base.extend(qobuz.iter().cloned());
+        (en_base, qobuz)
+    }
+
+    #[test]
+    fn un_scan_cible_ne_declare_pas_vides_les_dossiers_qu_il_n_a_pas_parcourus() {
+        // Journal du .18, 05/10 19 h 09 : `post_scan_sous_arbre_vide
+        // dossiers=["/data/music", "/data/recordings/Tidal", "/mnt"]` après un
+        // scan ciblé sur Qobuz dont les 10 268 fichiers avaient TOUS été vus.
+        let (en_base, qobuz) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let decouverts: HashSet<String> = qobuz.into_iter().collect();
+        let cible = vec!["/data/recordings/Qobuz".to_string()];
+        let v = sous_arbres_vides(&cible, &refs, &decouverts);
+        assert!(
+            v.is_empty(),
+            "un scan ciblé ne juge que son dossier ; obtenu {v:?} — des dossiers \
+             jamais parcourus déclarés « vidés »"
+        );
+    }
+
+    #[test]
+    fn un_scan_cible_voit_encore_un_montage_imbrique_tombe_sous_sa_cible() {
+        // Le filtre ne doit pas éteindre le garde-fou là où il sert : sous la
+        // cible, un montage imbriqué qui tombe reste protégé.
+        let (en_base, qobuz) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let decouverts: HashSet<String> = qobuz.into_iter().collect();
+        let cible = vec!["/data/recordings".to_string()];
+        let v = sous_arbres_vides(&cible, &refs, &decouverts);
+        assert_eq!(v, vec!["/data/recordings/Tidal".to_string()]);
+        // Et la piste perdue y est CONSERVÉE.
+        assert_eq!(
+            verdict_purge(
+                "/data/recordings/Tidal/Album/0007.flac",
+                &cible,
+                &[],
+                &[],
+                &[],
+                &v,
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+    }
+
+    #[test]
+    fn un_dossier_protege_n_est_jamais_un_ancetre_des_racines() {
+        // Scan complet, `/mnt/recordings_usb` démonté mais point de montage
+        // lisible et vide : l'ancien code rendait `/mnt`, un dossier que
+        // personne n'a configuré.
+        let (en_base, _) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let racines: Vec<String> = [
+            "/data/music",
+            "/data/recordings",
+            "/mnt/recordings_usb",
+            "/home/bertrand/Music/DIVERS",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let decouverts: HashSet<String> = en_base
+            .iter()
+            .filter(|p| !p.starts_with("/mnt/"))
+            .cloned()
+            .collect();
+        let v = sous_arbres_vides(&racines, &refs, &decouverts);
+        assert_eq!(v, vec!["/mnt/recordings_usb".to_string()]);
     }
 
     #[test]
@@ -4380,7 +4510,7 @@ mod roots_gone_empty_tests {
         chemins.push("/mnt/music/local/ok.flac".to_string());
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/local/ok.flac"]);
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert_eq!(v.len(), 1, "un seul ancetre attendu, obtenu {v:?}");
         assert_eq!(v[0], "/mnt/music/nas");
     }

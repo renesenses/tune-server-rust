@@ -109,6 +109,9 @@ pub(super) struct Identification {
     /// Sur `ambiguous` : les éditions entre lesquelles rien n'a tranché, pour
     /// que l'utilisateur choisisse (`?release_id=`).
     pub candidats: Vec<musicbrainz_release::MBReleaseMatch>,
+    /// Le rattachement des artistes au pressage (#4805, étape B). `None` quand
+    /// rien n'a été identifié.
+    pub artistes: Option<tune_core::metadata::artistes_du_pressage::BilanArtistes>,
 }
 
 /// Pourquoi une identification n'a même pas pu être tentée. À distinguer d'un
@@ -163,6 +166,7 @@ pub(super) async fn identifier_album(
             source: None,
             raison_ambigu: None,
             candidats: Vec::new(),
+            artistes: None,
         });
     }
 
@@ -321,6 +325,7 @@ async fn poser_le_pressage(
             source: None,
             raison_ambigu: raison,
             candidats,
+            artistes: None,
         }
     };
 
@@ -382,6 +387,37 @@ async fn poser_le_pressage(
             return Err(EchecIdentification::Base(e));
         }
     };
+    // #4805, étape B — le MBID des artistes, tiré des crédits du pressage que
+    // l'on vient de recevoir : aucune requête de plus. Jamais d'écrasement,
+    // rien sur une ambiguïté. Un échec ici ne défait pas l'identification de
+    // l'album, qui est posée : il se dit et c'est tout.
+    let artistes =
+        match tune_core::metadata::artistes_du_pressage::rattacher_les_artistes_de_l_album(
+            &state.backend,
+            album_id,
+            &detail,
+            &recordings,
+        ) {
+            Ok(b) => {
+                info!(
+                    album_id,
+                    ecrits = b.ecrits,
+                    deja_poses = b.deja_poses,
+                    desaccords = b.desaccords,
+                    ambigus = b.ambigus,
+                    sans_correspondance = b.sans_correspondance,
+                    ecartes = b.ecartes,
+                    refuses_par_la_base = b.refuses_par_la_base,
+                    "reidentify_artistes"
+                );
+                Some(b)
+            }
+            Err(e) => {
+                warn!(album_id, error = %e, "reidentify_artistes_failed");
+                None
+            }
+        };
+
     let verdict = if cleared.release_id.as_deref() == Some(pressage.release_id.as_str()) {
         "unchanged"
     } else {
@@ -408,6 +444,7 @@ async fn poser_le_pressage(
         source: Some(source.as_str()),
         raison_ambigu: None,
         candidats: Vec::new(),
+        artistes,
     })
 }
 

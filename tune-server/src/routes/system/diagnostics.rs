@@ -986,6 +986,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "platform": std::env::consts::OS,
         "pid": std::process::id(),
         "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        // #5677 : le nombre réel de fils de l'exécuteur (plancher de #5718).
+        "worker_threads": crate::fils_de_travail::retenu(),
         "db": {
             "engine": db_backend,
             "migration_version": db_version,
@@ -2501,6 +2503,16 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
     // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
     md.push_str(&section_famine_anneau(&ring_starvation));
+    // #5677 : les relevés de gel restaient sur la machine du testeur (tickets
+    // 223, 224) ; le rapport joint désormais les deux plus récents. Lus hors
+    // de l'exécuteur : ce sont des fichiers.
+    md.push_str(
+        &tokio::task::spawn_blocking(|| {
+            crate::gel_executeur::section_du_rapport(crate::gel_executeur::dossier_retenu(), 2)
+        })
+        .await
+        .unwrap_or_default(),
+    );
     // #3479 : sans cette section, un etage d'egalisation qui rend du SILENCE
     // ne laissait aucune trace dans ce que le testeur depose — ni ici, ni dans
     // le journal. Reivax66 a fourni 25 lignes `eq_change_journal` toutes

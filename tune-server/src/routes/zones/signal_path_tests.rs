@@ -3318,25 +3318,101 @@ fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
 fn wasapi_sans_contrat_exclusif_se_nomme_partage_et_n_est_pas_bit_perfect_4172() {
     use super::signal_path::{etiquette_du_transport_local, transport_partage_est_intact};
     assert_eq!(
-        etiquette_du_transport_local("WASAPI", false),
+        etiquette_du_transport_local("WASAPI", false, None),
         "WASAPI (shared \u{2014} Windows mixer)"
     );
     assert_eq!(
-        etiquette_du_transport_local("WASAPI", true),
+        etiquette_du_transport_local("WASAPI", true, None),
         "WASAPI (exclusive)"
     );
     assert_eq!(
-        etiquette_du_transport_local("ASIO", true),
+        etiquette_du_transport_local("ASIO", true, None),
         "ASIO (exclusive)"
     );
     assert_eq!(
-        etiquette_du_transport_local("CoreAudio", false),
+        etiquette_du_transport_local("CoreAudio", false, None),
         "CoreAudio"
     );
-    assert_eq!(etiquette_du_transport_local("ALSA", false), "ALSA");
-    assert!(!transport_partage_est_intact("WASAPI"), "mixeur Windows");
-    assert!(transport_partage_est_intact("CoreAudio"), "inchangé");
-    assert!(transport_partage_est_intact("ALSA"), "inchangé");
+    assert_eq!(etiquette_du_transport_local("ALSA", false, None), "ALSA");
+    assert!(
+        !transport_partage_est_intact("WASAPI", None),
+        "mixeur Windows"
+    );
+    assert!(transport_partage_est_intact("CoreAudio", None), "inchangé");
+    assert!(
+        transport_partage_est_intact("ALSA", None),
+        "PCM inconnu : inchangé"
+    );
+}
+
+// ── Fil 2161 — ALSA sur un greffon (`default`, `dmix:`…) n'est pas le DAC ──
+
+/// Le témoin du fil 2161 : une zone ALSA dont le PCM est `alsa:default` (Tune
+/// OS : `plug` → `dmix` à 48 kHz sur la carte 0, l'Eversolo DAC-Z8) ne se dit
+/// plus « ALSA » intact. Le DAC affichait 48 kHz pendant que le panneau
+/// annonçait 44,1 kHz bit-perfect.
+#[test]
+fn alsa_sur_un_greffon_se_nomme_partage_et_n_est_pas_intact_2161() {
+    use super::signal_path::{
+        etiquette_du_transport_local, pcm_alsa_est_un_greffon, transport_partage_est_intact,
+    };
+    for greffon in [
+        "alsa:default",
+        "default",
+        "alsa:dmix:CARD=DACZ8,DEV=0",
+        "alsa:plughw:CARD=0,DEV=0",
+        "alsa:sysdefault:CARD=0",
+        "alsa:pipewire",
+        "alsa:pulse",
+    ] {
+        assert!(pcm_alsa_est_un_greffon(Some(greffon)), "{greffon}");
+        assert!(
+            !transport_partage_est_intact("ALSA", Some(greffon)),
+            "{greffon} convertit à sa propre cadence : pas intact"
+        );
+        assert_eq!(
+            etiquette_du_transport_local("ALSA", false, Some(greffon)),
+            "ALSA (shared \u{2014} software mixer)",
+            "{greffon}"
+        );
+    }
+    // Le PCM matériel, celui que #1655 fait retenir pour l'Eversolo : intact.
+    for materiel in ["alsa:hw:CARD=0,DEV=0", "hw:CARD=DACZ8,DEV=0", "Alsa:HW:1,0"] {
+        assert!(!pcm_alsa_est_un_greffon(Some(materiel)), "{materiel}");
+        assert!(
+            transport_partage_est_intact("ALSA", Some(materiel)),
+            "{materiel}"
+        );
+        assert_eq!(
+            etiquette_du_transport_local("ALSA", false, Some(materiel)),
+            "ALSA"
+        );
+    }
+    // Inconnu ou vide : rien n'est conclu, le verdict d'avant reste.
+    assert!(!pcm_alsa_est_un_greffon(None));
+    assert!(!pcm_alsa_est_un_greffon(Some("")));
+    // Le PCM ne concerne qu'ALSA : il ne change rien ailleurs.
+    assert!(transport_partage_est_intact(
+        "CoreAudio",
+        Some("alsa:default")
+    ));
+    assert_eq!(
+        etiquette_du_transport_local("CoreAudio", false, Some("alsa:default")),
+        "CoreAudio"
+    );
+}
+
+/// Le PCM d'une zone se lit dans le parc publié, et seulement pour une zone
+/// `local:` : un identifiant DLNA ou absent ne rend rien.
+#[test]
+fn le_pcm_d_une_zone_non_locale_est_inconnu_2161() {
+    use super::signal_path::pcm_de_la_zone_locale;
+    assert_eq!(pcm_de_la_zone_locale(None), None);
+    assert_eq!(pcm_de_la_zone_locale(Some("uuid:diretta-renderer")), None);
+    assert_eq!(
+        pcm_de_la_zone_locale(Some("local:appareil-absent-du-parc-2161")),
+        None
+    );
 }
 
 /// La garde du BRANCHEMENT : le bras `"local"` de `decrire_le_transport`
@@ -3347,12 +3423,21 @@ fn le_transport_local_dit_son_mode_et_son_verdict_4172() {
     let bras = src.find("\"local\" => {").expect("le bras local");
     let bloc = &src[bras..bras + 1_500];
     assert!(
-        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe)"),
-        "le nom vient de l'étiquette"
+        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe, pcm_local)"),
+        "le nom vient de l'étiquette, PCM compris (fil 2161)"
     );
     assert!(
-        bloc.contains("None => transport_partage_est_intact(audio_backend)"),
-        "sans contrat, le verdict est celui du mode partagé"
+        bloc.contains("None => transport_partage_est_intact(audio_backend, pcm_local)"),
+        "sans contrat, le verdict est celui du mode partagé, PCM compris (fil 2161)"
+    );
+    // Fil 2161 — le PCM qui arrive au bras est celui du parc, pour la zone.
+    assert!(
+        src.contains("pcm_de_la_zone_locale(zone.output_device_id.as_deref())"),
+        "le PCM de la zone est lu dans le parc publié"
+    );
+    assert!(
+        src.contains("pcm_local.as_deref(),"),
+        "et il est passé à decrire_le_transport"
     );
 }
 

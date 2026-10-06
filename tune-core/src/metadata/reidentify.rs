@@ -684,6 +684,7 @@ mod tests {
             length_ms: None,
             recording_id: rid.map(str::to_string),
             artist: None,
+            artist_credits: Vec::new(),
         }
     }
 
@@ -810,6 +811,7 @@ mod tests {
             catalog_number: catalog.map(str::to_string),
             disc_count: 1,
             tracks: Vec::new(),
+            artist_credits: Vec::new(),
         }
     }
 

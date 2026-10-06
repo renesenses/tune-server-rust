@@ -585,7 +585,10 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
+        // #5677 : visible du relevé d'un gel pendant l'attente ET la lecture.
+        let en_cours = super::lectures_en_cours::inscrire(sql);
         let conn = self.read_connection();
+        en_cours.executer();
         let debut = std::time::Instant::now();
         let resultat = sqlite_lire_lignes(&conn, sql, &refs, Some(1)).map(|mut l| l.pop());
         signaler_lecture_lente(sql, conn.attente(), debut.elapsed());
@@ -602,7 +605,10 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
+        // #5677 : visible du relevé d'un gel pendant l'attente ET la lecture.
+        let en_cours = super::lectures_en_cours::inscrire(sql);
         let conn = self.read_connection();
+        en_cours.executer();
         let debut = std::time::Instant::now();
         let resultat = sqlite_lire_lignes(&conn, sql, &refs, None);
         signaler_lecture_lente(sql, conn.attente(), debut.elapsed());

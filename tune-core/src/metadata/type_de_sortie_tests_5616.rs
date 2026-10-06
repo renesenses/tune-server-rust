@@ -98,3 +98,53 @@ fn un_m4a_musicbrainz_album_type_est_lu_5616() {
     let meta = read_metadata(&chemin).expect("lecture du M4A");
     assert_eq!(meta.release_type.as_deref(), Some("ep"));
 }
+
+// ── Section « Live » (Bertrand, 05/10/2026) : les types SECONDAIRES ──────
+
+#[test]
+fn un_flac_album_point_virgule_live_porte_le_secondaire_live() {
+    let chemin = flac_avec("live-un-champ", &[("RELEASETYPE", "album;live")]);
+    let meta = read_metadata(&chemin).expect("lecture du FLAC");
+    assert_eq!(meta.release_type.as_deref(), Some("album"));
+    assert_eq!(meta.release_secondary_types.as_deref(), Some("live"));
+}
+
+#[test]
+fn un_flac_album_puis_live_en_deux_champs_porte_le_secondaire_live() {
+    let chemin = flac_avec(
+        "live-deux-champs",
+        &[
+            ("RELEASETYPE", "album"),
+            ("RELEASETYPE", "live"),
+            ("RELEASETYPE", "remix"),
+        ],
+    );
+    let meta = read_metadata(&chemin).expect("lecture du FLAC");
+    assert_eq!(meta.release_type.as_deref(), Some("album"));
+    assert_eq!(meta.release_secondary_types.as_deref(), Some("live;remix"));
+}
+
+#[test]
+fn un_mp3_txxx_album_point_virgule_live_porte_le_secondaire_live() {
+    let chemin = generique_avec("test.mp3", "mp3-live", "album;live");
+    let meta = read_metadata(&chemin).expect("lecture du MP3");
+    assert_eq!(meta.release_type.as_deref(), Some("album"));
+    assert_eq!(meta.release_secondary_types.as_deref(), Some("live"));
+}
+
+#[test]
+fn un_m4a_ep_live_porte_le_secondaire_live() {
+    let chemin = generique_avec("test.m4a", "m4a-live", "ep; live");
+    let meta = read_metadata(&chemin).expect("lecture du M4A");
+    assert_eq!(meta.release_type.as_deref(), Some("ep"));
+    assert_eq!(meta.release_secondary_types.as_deref(), Some("live"));
+}
+
+/// TÉMOIN — un type primaire seul ne fabrique aucun secondaire.
+#[test]
+fn un_flac_album_seul_n_a_aucun_type_secondaire() {
+    let chemin = flac_avec("album-seul", &[("RELEASETYPE", "album")]);
+    let meta = read_metadata(&chemin).expect("lecture du FLAC");
+    assert_eq!(meta.release_type.as_deref(), Some("album"));
+    assert_eq!(meta.release_secondary_types, None);
+}

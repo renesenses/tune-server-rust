@@ -7,6 +7,9 @@
 #![allow(clippy::result_large_err)]
 
 mod adresse_d_accueil;
+pub mod aiguillage_des_flux;
+#[cfg(test)]
+mod aiguillage_des_flux_tests_4645;
 pub mod auth;
 pub mod auto_resume;
 pub mod auto_scan;

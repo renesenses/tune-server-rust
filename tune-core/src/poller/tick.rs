@@ -1542,7 +1542,8 @@ impl PositionPoller {
                 } else {
                     // #4382 — ce que le renderer fait pendant la fenêtre, au
                     // journal de terrain. Lecture seule, avant la décision.
-                    self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
+                    let next_ignore = self
+                        .echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
                         .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
                     // #5411 — le rejeu de la piste finie, AVÉRÉ seulement :
@@ -1573,7 +1574,9 @@ impl PositionPoller {
                         // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
                         status.state == TransportState::Stopped,
                         age_secs,
-                        adoption.delai_secs,
+                        // #4382 — le transport a dit « `Next` ignoré » : plus
+                        // rien à attendre, le délai tombe à zéro.
+                        if next_ignore { 0 } else { adoption.delai_secs },
                     ) {
                         decisions::SuiteAdoption::EnAttente => {}
                         decisions::SuiteAdoption::Confirmee => {
@@ -3252,6 +3255,7 @@ impl PositionPoller {
                                 flux_arme.as_deref(),
                                 enchainement,
                             )
+                            && !self.next_deja_ignore(zone_id, &device_id)
                             && self.demander_la_bascule(zone_id, &device_id).await
                         {
                             decisions::EnchainementArme::Bascule
@@ -3686,9 +3690,32 @@ impl PositionPoller {
                                     error = %e,
                                     "renderer_cale_reprise_saut_echoue"
                                 );
-                                self.orchestrator
-                                    .stop(zone_id, device_id_ref.as_deref())
-                                    .await;
+                                // Décision du 05/10 : un saut REFUSÉ par
+                                // l'appareil laisse la piste jouer depuis son
+                                // début, avec un message non fatal ; tout
+                                // autre échec coupe la zone, comme avant.
+                                if self
+                                    .orchestrator
+                                    .conclure_saut_de_reprise_echoue(
+                                        zone_id,
+                                        device_id_ref.as_deref(),
+                                        position_ms,
+                                        &e,
+                                    )
+                                    .await
+                                {
+                                    // Une seule tentative : la reprise compte
+                                    // pour la lecture RELANCÉE, un nouveau
+                                    // décrochage coupera la zone.
+                                    let generation =
+                                        self.playback.get_state(zone_id).await.track_generation;
+                                    if let Some(r) =
+                                        self.reprises_renderer_cale.lock().await.get_mut(&zone_id)
+                                    {
+                                        r.generation = generation;
+                                        r.cible_ms = position_ms;
+                                    }
+                                }
                             }
                         },
                         Err(e) => {

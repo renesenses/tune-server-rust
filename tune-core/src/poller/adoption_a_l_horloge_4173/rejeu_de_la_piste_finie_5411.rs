@@ -345,13 +345,14 @@ impl Banc {
     }
 }
 
-/// **Le cas A6 (#4382), non touché par #5411.** `Next` acquitté, l'appareil
-/// nomme encore N, sa position reste figée à la durée, et il tire le flux
-/// armé au-delà du temps réel. Le rejeu n'est PAS avéré
-/// (la position n'a pas reculé) : rien d'anticipé dans le délai, et au délai,
-/// exactement le repli d'avant ce correctif — qui reste l'affaire de #4382.
+/// **Le cas A6 (#4382), réconcilié avec #5411.** `Next` acquitté, l'appareil
+/// nomme encore N, sa position reste figée à la durée, il tire le flux armé
+/// au-delà du temps réel, et son transport (`GetMediaInfo`) rend toujours N en
+/// `CurrentURI` et la suivante en `NextURI`. Ce n'est PAS un rejeu au sens de
+/// #5411 (la position n'a pas reculé) ; c'est le `Next` ignoré de #4382 : la
+/// relance de la piste ADOPTÉE part au premier sondage, sans attendre le délai.
 #[tokio::test]
-async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avant() {
+async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_est_relance_au_premier_sondage() {
     let mut banc = Banc::monter().await;
     banc.la_suivante_est_tenue_et_le_next_ignore().await;
     let (flux, _) = banc.armer().await;
@@ -363,16 +364,6 @@ async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avan
         banc.surveillance().map(|s| s.preuve),
         Some(decisions::EnchainementArme::Bascule)
     );
-
-    // Dans le délai : figé, URI de N, flux armé tiré au-delà du débit WAV.
-    banc.le_flux_adopte_est_tire_depuis(&flux, 200_000, 2).await;
-    banc.renderer_a(POSITION_GELEE_MS, 2).await;
-    banc.tic().await;
-    assert!(
-        banc.surveillance().is_some(),
-        "aucune infirmation anticipée : on attend le délai, comme avant"
-    );
-    assert_eq!(banc.play_complets().await, Vec::<String>::new());
     assert!(
         !decisions::rejeu_de_la_piste_finie_avere(
             Some(&uri_finie),
@@ -385,13 +376,19 @@ async fn le_dmp_a6_fige_sur_n_qui_tire_le_flux_arme_garde_le_comportement_d_avan
         "figé en fin de piste : pas un rejeu au sens de #5411"
     );
 
-    // Au délai : le repli d'avant ce correctif, mot pour mot (#4382 décidera).
-    banc.le_flux_adopte_est_tire_depuis(&flux, 200_000, BASCULE_DELAI_SECS + 1)
-        .await;
-    banc.renderer_a(POSITION_GELEE_MS, BASCULE_DELAI_SECS + 1)
-        .await;
+    // Premier sondage de la fenêtre : figé, URI de N, flux armé tiré au-delà
+    // du débit WAV, transport qui tient toujours la suivante en attente.
+    banc.le_flux_adopte_est_tire_depuis(&flux, 200_000, 1).await;
+    banc.renderer_a(POSITION_GELEE_MS, 1).await;
     banc.tic().await;
-    assert_eq!(banc.play_complets().await, vec![ARMEE.to_string()]);
+    assert_eq!(
+        banc.play_complets().await,
+        vec![ARMEE.to_string()],
+        "#4382 : le transport déclare le `Next` ignoré — la piste adoptée est relancée \
+         au premier sondage, et aucune piste n'est sautée"
+    );
+    let (position, titre, _) = banc.ecran().await;
+    assert_eq!((position, titre.as_str()), (1, ARMEE));
 }
 
 /// **Vrai enchaînement, URI en retard (bascule).** L'appareil a bien changé

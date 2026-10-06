@@ -775,6 +775,10 @@ pub(crate) async fn lancer(
 /// colonne.
 async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mut c: Comptes) {
     let total = candidats.len();
+    // « Écrire les modifications dans les fichiers audio » — désactivé par
+    // défaut : la passe corrige alors la colonne seule, sans ouvrir un
+    // fichier. Lu une fois : une passe ne change pas de règle en chemin.
+    let ecrire_fichiers = crate::routes::ecriture_fichiers::autorisee(&state);
     let taches = state.background_tasks.clone();
     // Les cas que la garde retient, consignés au fil de l'eau : ils partent
     // dans l'état à chaque publication, donc une passe interrompue laisse
@@ -858,7 +862,12 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
             composer: Some(candidat.attendu.clone()),
             ..Default::default()
         };
-        match write_tags(&candidat.chemin, &maj).await {
+        let ecriture = if ecrire_fichiers {
+            write_tags(&candidat.chemin, &maj).await.map(|_| ())
+        } else {
+            Ok(())
+        };
+        match ecriture {
             Ok(_) => {}
             Err(e) if e == "file not found" => {
                 c.sans_fichier += 1;
@@ -981,7 +990,9 @@ mod tests {
     use tune_core::test_scratch::scratch_dir;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        s
     }
 
     fn fixture(nom: &str) -> std::path::PathBuf {
@@ -1332,6 +1343,31 @@ mod tests {
     // 🟢 LE BANC — sur de VRAIS fichiers. Colonne vide ⇒ remplie ; colonne
     //    divergente ⇒ CORRIGÉE ; et la balise relue après écriture.
     // ------------------------------------------------------------------
+
+    /// « Écrire les modifications dans les fichiers audio » jamais touché :
+    /// la colonne est corrigée, le fichier n'est pas ouvert.
+    #[tokio::test]
+    async fn reglage_absent_la_colonne_seule_est_corrigee() {
+        let dir = scratch_dir("tune-compositeur-credits-sans-ecriture");
+        let vide = dir.join("vide.flac");
+        std::fs::copy(fixture("test.flac"), &vide).unwrap();
+        let avant = std::fs::read(&vide).unwrap();
+
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        piste(&s, 1, vide.to_str(), None, Some("local"));
+        credit(&s, 11, 1, "composer", "Peter de Rose", 1);
+
+        let reponse = lancer(State(s.clone()), None).await.into_response();
+        assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+        attendre_la_fin(&s).await;
+
+        assert_eq!(colonne(&s, 1).as_deref(), Some("Peter de Rose"));
+        assert_eq!(
+            std::fs::read(&vide).unwrap(),
+            avant,
+            "réglage désactivé : le fichier a été réécrit"
+        );
+    }
 
     #[tokio::test]
     async fn la_passe_remplit_corrige_et_grave_la_balise() {

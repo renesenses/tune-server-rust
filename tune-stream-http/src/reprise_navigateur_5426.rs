@@ -534,3 +534,97 @@ fn le_direct_est_situe_a_son_vrai_depart_meme_au_milieu_d_un_bloc() {
     trouee.extend_from_slice(&source[depart + 6 * 32_768..depart + 12 * 32_768]);
     assert_eq!(situer_dans_la_source(&source, &trouee), None);
 }
+
+// ── La borne de fin d'un `Range: bytes=N-M` sur une conversion ────────────
+
+/// `Range: bytes={debut}-{fin}`, borne de fin INCLUSE.
+async fn demander_tranche(url: &str, debut: u64, fin: u64) -> reqwest::Response {
+    tune_core::http::client::builder()
+        .build()
+        .expect("client HTTP")
+        .get(url)
+        .header("User-Agent", NAVIGATEUR)
+        .header("Range", format!("bytes={debut}-{fin}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("`Range: bytes={debut}-{fin}` : aucune réponse — {e:?}"))
+}
+
+/// LE CAS DU .18 (05/10, curl sur une conversion Qobuz → WAV) :
+/// `bytes=2000044-2001043` recevait un 206 `bytes 2000044-<fin>/<taille>` et
+/// tout le reste du flux. RFC 9110 §14.2 : les 1 000 octets demandés, et un
+/// `Content-Range` qui les décrit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_tranche_fermee_ne_rend_que_les_octets_demandes() {
+    let source = flux_source(5_997_600);
+    let total = source.len() as u64;
+    let (url, _session, producteur) = servir("tranche-18", 34_000, source).await;
+
+    let r = demander_tranche(&url, 2_000_044, 2_001_043).await;
+    assert_eq!(r.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        entete(&r, "Content-Range"),
+        format!("bytes 2000044-2001043/{total}"),
+        "le Content-Range doit décrire la tranche DEMANDÉE"
+    );
+    assert_eq!(entete(&r, "Content-Length"), "1000");
+    let corps = lire_jusqu_au_bout(r)
+        .await
+        .unwrap_or_else(|e| panic!("tranche fermée : {e}"));
+    assert_eq!(
+        corps.len(),
+        1_000,
+        "`bytes=2000044-2001043` : {} octets reçus au lieu de 1 000 — la borne de fin est \
+         ignorée",
+        corps.len()
+    );
+    producteur.abort();
+}
+
+/// Un client qui lit PAR TRANCHES fermées, l'une après l'autre : chaque
+/// tranche est exacte, et la suivante repart à l'octet. Ce que le corps a
+/// tiré du tuyau au-delà de la borne est dans la retenue (#5426), pas perdu.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn des_tranches_fermees_successives_se_suivent_a_l_octet() {
+    let source = flux_source(5_997_600);
+    let total = source.len() as u64;
+    let (url, _session, producteur) = servir("tranches-suivies", 34_000, source.clone()).await;
+
+    let mut recu: Vec<u8> = Vec::new();
+    for (debut, fin) in [
+        (0u64, 999_999u64),
+        (1_000_000, 1_000_999),
+        (1_001_000, 1_500_000),
+    ] {
+        let r = demander_tranche(&url, debut, fin).await;
+        assert_eq!(r.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            entete(&r, "Content-Range"),
+            format!("bytes {debut}-{fin}/{total}")
+        );
+        assert_eq!(entete(&r, "Content-Length"), (fin - debut + 1).to_string());
+        let corps = lire_jusqu_au_bout(r)
+            .await
+            .unwrap_or_else(|e| panic!("tranche {debut}-{fin} : {e}"));
+        assert_eq!(corps.len() as u64, fin - debut + 1, "tranche {debut}-{fin}");
+        if let Some(i) = premier_ecart(&corps, &source[debut as usize..]) {
+            panic!(
+                "tranche {debut}-{fin} : l'octet {} du flux diffère",
+                debut as usize + i
+            );
+        }
+        recu.extend_from_slice(&corps);
+    }
+
+    // Une reprise OUVERTE après la dernière tranche va, elle, jusqu'au bout.
+    let suite = lire_jusqu_au_bout(demander(&url, 1_500_001, "reprise ouverte").await)
+        .await
+        .unwrap_or_else(|e| panic!("reprise ouverte : {e}"));
+    recu.extend_from_slice(&suite);
+    assert_eq!(recu.len(), source.len());
+    assert!(
+        premier_ecart(&recu, &source).is_none(),
+        "le flux recousu des tranches doit être le flux source"
+    );
+    producteur.await.unwrap();
+}
