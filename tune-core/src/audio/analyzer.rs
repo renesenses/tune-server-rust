@@ -2056,4 +2056,208 @@ mod tests {
             let _ = std::fs::remove_file(&l);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Vrai pic d'un FLAC analysé par segments (lot truepeak-flac-b209)
+    // -----------------------------------------------------------------------
+
+    const HZ_TP: u32 = 44_100;
+
+    /// Stéréo 16 bits entrelacé : un sinus dont la fréquence dérive (la
+    /// phase n'est donc jamais la même d'une trame FLAC à l'autre), crête
+    /// 0,45 — loin de toute saturation.
+    fn signal_tp(secondes: usize) -> Vec<i16> {
+        let frames = HZ_TP as usize * secondes;
+        let mut v = Vec::with_capacity(frames * 2);
+        let mut phase = 0.0f64;
+        for i in 0..frames {
+            let t = i as f64 / HZ_TP as f64;
+            let f = 440.0 + 220.0 * (t * 0.05).sin();
+            phase += std::f64::consts::TAU * f / HZ_TP as f64;
+            let x = 0.45 * phase.sin();
+            v.push((x * 32_767.0) as i16);
+            v.push((x * 0.8 * 32_767.0) as i16);
+        }
+        v
+    }
+
+    fn pcm_octets(pcm: &[i16]) -> Vec<u8> {
+        pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    fn ecrire_wav_tp(chemin: &std::path::Path, pcm: &[i16]) {
+        let donnees = pcm_octets(pcm);
+        let mut w = Vec::with_capacity(donnees.len() + 44);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&HZ_TP.to_le_bytes());
+        w.extend_from_slice(&(HZ_TP * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(chemin, w).unwrap();
+    }
+
+    /// FLAC de l'encodeur maison : blocs fixes de 4 096 trames, AUCUNE
+    /// SEEKTABLE (STREAMINFO puis VORBIS_COMMENT).
+    fn flac_tp(pcm: &[i16]) -> Vec<u8> {
+        let mut enc = crate::audio::encoder::AudioEncoder::new("flac", HZ_TP, 16, 2);
+        enc.start_sync().unwrap();
+        enc.write_sync(&pcm_octets(pcm)).unwrap();
+        enc.finish_sync().unwrap()
+    }
+
+    fn crc8_flac(octets: &[u8]) -> u8 {
+        octets.iter().fold(0u8, |mut crc, &b| {
+            crc ^= b;
+            for _ in 0..8 {
+                crc = if crc & 0x80 != 0 {
+                    (crc << 1) ^ 0x07
+                } else {
+                    crc << 1
+                };
+            }
+            crc
+        })
+    }
+
+    /// Le même FLAC, AVEC une SEEKTABLE (un point toutes les 10 s) insérée
+    /// juste après STREAMINFO. Les décalages sont ceux des en-têtes de trame
+    /// réels, retrouvés par leur octet exact (synchro, codes, numéro UTF-8,
+    /// CRC-8) : l'index est juste, comme celui que pose `flac`.
+    fn avec_seektable(flac: &[u8]) -> Vec<u8> {
+        // fLaC (4) + en-tête STREAMINFO (4) + STREAMINFO (34) ; puis
+        // VORBIS_COMMENT, dernier bloc : les trames suivent.
+        let apres_streaminfo = 4 + 4 + 34;
+        let lg_vc = u32::from_be_bytes([0, flac[43], flac[44], flac[45]]) as usize;
+        let premiere_trame = apres_streaminfo + 4 + lg_vc;
+        let en_tete = |k: u32| {
+            // 4 096 trames (12), 44,1 kHz (9), stéréo G/D (1), 16 bits (4).
+            let mut h = vec![0xFF, 0xF8, 0xC9, 0x18];
+            let mut tampon = [0u8; 4];
+            h.extend_from_slice(
+                char::from_u32(k)
+                    .unwrap()
+                    .encode_utf8(&mut tampon)
+                    .as_bytes(),
+            );
+            h.push(crc8_flac(&h));
+            h
+        };
+        let trames_par_point = (10 * HZ_TP as usize) / 4096;
+        let mut points = Vec::new();
+        let mut depuis = premiere_trame;
+        let mut k = 0u32;
+        loop {
+            let h = en_tete(k);
+            let Some(pos) = flac[depuis..]
+                .windows(h.len())
+                .position(|w| w == h.as_slice())
+            else {
+                break;
+            };
+            let off = depuis + pos;
+            points.push(((k as u64) * 4096, (off - premiere_trame) as u64));
+            depuis = off + 1;
+            k += trames_par_point as u32;
+        }
+        assert!(
+            points.len() >= 3,
+            "seektable : trop peu de points ({})",
+            points.len()
+        );
+        let mut bloc = Vec::new();
+        for (echantillon, decalage) in &points {
+            bloc.extend_from_slice(&echantillon.to_be_bytes());
+            bloc.extend_from_slice(&decalage.to_be_bytes());
+            bloc.extend_from_slice(&4096u16.to_be_bytes());
+        }
+        let mut out = flac[..apres_streaminfo].to_vec();
+        out.push(3); // SEEKTABLE, pas le dernier bloc
+        out.extend_from_slice(&(bloc.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(&bloc);
+        out.extend_from_slice(&flac[apres_streaminfo..]);
+        out
+    }
+
+    /// La mesure de VÉRITÉ : tout le PCM d'un seul tenant, sans décodeur ni
+    /// seek, par les mêmes accumulateurs.
+    fn mesure_d_un_seul_tenant(pcm: &[i16]) -> Option<(f64, f64, f64, Option<u32>)> {
+        let mut m = MesureEnCours::default();
+        let d = crate::audio::decode::DecodedAudio {
+            samples_i32: pcm.iter().map(|&s| s as i32).collect(),
+            bit_depth: 16,
+            sample_rate: HZ_TP,
+            channels: 2,
+            duration_s: pcm.len() as f64 / 2.0 / HZ_TP as f64,
+            integrite: Default::default(),
+        };
+        let _ = m.nourrir(d, f64::MAX);
+        m.finir()
+    }
+
+    /// Un FLAC (avec ou sans SEEKTABLE) et le WAV du même PCM rendent le MÊME
+    /// vrai pic, le même pic, la même sonie et la même plage dynamique que le
+    /// PCM mesuré d'un seul tenant.
+    ///
+    /// La mesure découpe la piste en segments de 30 s, chacun décodé par un
+    /// `seek`. Le démultiplexeur se pose au début du paquet qui contient la
+    /// cible (trame FLAC de 4 096, paquet simulé du WAV) ; tant que
+    /// `decode_symphonia` ne rognait pas ce résidu, chaque jonction rejouait
+    /// la fin du segment précédent — et le saut de phase qui en résulte, le
+    /// suréchantillonnage 4× le lisait comme un over (0,507 au lieu de 0,455
+    /// sur un FLAC de 20 min).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_vrai_pic_d_un_flac_par_segments_est_celui_du_wav() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 65 s : trois segments, deux jonctions ; 30 s × 44 100 n'est pas un
+        // multiple de 4 096, la jonction tombe au milieu d'une trame FLAC.
+        let pcm = signal_tp(65);
+        let verite = mesure_d_un_seul_tenant(&pcm).expect("mesure de référence");
+
+        let wav = dir.path().join("tp.wav");
+        ecrire_wav_tp(&wav, &pcm);
+        let brut = flac_tp(&pcm);
+        let sans = dir.path().join("tp_sans_seektable.flac");
+        std::fs::write(&sans, &brut).unwrap();
+        let avec = dir.path().join("tp_avec_seektable.flac");
+        std::fs::write(&avec, avec_seektable(&brut)).unwrap();
+
+        for f in [&wav, &sans, &avec] {
+            let nom = f.file_name().unwrap().to_string_lossy().into_owned();
+            let (lufs, pic, tp, dr) = mesurer_intensite_et_plage(f.to_str().unwrap())
+                .await
+                .unwrap_or_else(|| panic!("{nom} : mesure attendue"));
+            eprintln!("{nom} : tp={tp:.6} pic={pic:.6} lufs={lufs} dr={dr:?} (vérité {verite:?})");
+            assert!(
+                (tp - verite.2).abs() <= 1e-3,
+                "{nom} : vrai pic {tp:.6}, {:.6} d'un seul tenant",
+                verite.2
+            );
+            assert!(
+                (pic - verite.1).abs() <= 1e-3,
+                "{nom} : pic {pic:.6}, {:.6} d'un seul tenant",
+                verite.1
+            );
+            assert_eq!(lufs, verite.0, "{nom} : sonie");
+            assert_eq!(dr, verite.3, "{nom} : plage dynamique");
+            // La passe nominale (tête partagée avec l'empreinte) aussi.
+            let passe = mesurer_intensite_plage_et_empreinte(f.to_str().unwrap())
+                .await
+                .mesure
+                .unwrap_or_else(|| panic!("{nom} : mesure de la passe attendue"));
+            assert!(
+                (passe.2 - verite.2).abs() <= 1e-3,
+                "{nom} : vrai pic de la passe {:.6}, {:.6} d'un seul tenant",
+                passe.2,
+                verite.2
+            );
+        }
+    }
 }
