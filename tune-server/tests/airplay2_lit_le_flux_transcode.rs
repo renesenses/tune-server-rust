@@ -112,8 +112,11 @@ fn airplay2_ne_lit_aucun_chemin_de_fichier_du_media() {
 #[test]
 fn airplay2_envoie_l_adresse_du_flux_au_daemon() {
     let code = code_seul(AIRPLAY2);
+    // Sans blancs : rustfmt coupe l'appel sur plusieurs lignes, et la garde
+    // ne doit pas dependre de la mise en page.
+    let compact: String = code.split_whitespace().collect();
     assert_eq!(
-        code.matches("copier_le_flux(media.url,").count(),
+        compact.matches("copier_le_flux(media.url,").count(),
         1,
         "airplay2/mod.rs ne construit plus le fichier remis au daemon depuis \
          `media.url`. Verifier `chemin_lisible_par_le_daemon`."

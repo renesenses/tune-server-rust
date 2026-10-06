@@ -618,9 +618,10 @@ fn est_une_adresse_http(url: &str) -> bool {
     debut.starts_with("http://") || debut.starts_with("https://")
 }
 
-/// Dossier des copies locales de flux, sous le dossier temporaire du systeme.
+/// Dossier des copies locales de flux : la racine de travail du compte qui
+/// execute (#4770), jamais un nom fixe partage sous le dossier temporaire.
 fn dossier_des_copies() -> PathBuf {
-    std::env::temp_dir().join("tune-airplay2")
+    crate::chemins_de_travail::racine_de_travail("tune-airplay2")
 }
 
 /// Extension qui sert d'indice de format au daemon (`Hint::with_extension`).
