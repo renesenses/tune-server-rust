@@ -196,6 +196,24 @@ jobs:
           print("cloud-relay bien present dans les deux binaires de l'image")
           VERIF_CLOUD_RELAY
 
+      # Les deux binaires doivent porter la version du TAG (`1.0.0-rc2`), lue
+      # par `tune_core::version()` dans TUNE_VERSION a la compilation : posee
+      # en tete de ce fichier pour l'amd64, transmise au conteneur `cross` par
+      # Cross.toml pour l'arm64. Un binaire qui l'aurait perdue se dirait
+      # `X.Y.Z-dev`, et l'image annoncerait une autre version que son tag.
+      - name: Verify the tag version is compiled into both image binaries
+        shell: bash
+        run: |
+          test -n "$TUNE_VERSION" || { echo "::error::TUNE_VERSION vide"; exit 1; }
+          for b in dist/amd64/tune-server dist/arm64/tune-server; do
+            n="$(LC_ALL=C grep -a -F -c "$TUNE_VERSION" "$b" || true)"
+            echo "$b : $n occurrence(s) de $TUNE_VERSION"
+            if [ "${n:-0}" = "0" ]; then
+              echo "::error::$b ne porte pas la version $TUNE_VERSION"
+              exit 1
+            fi
+          done
+
       # librespot (Spotify Connect): real binary on amd64, empty placeholder on
       # arm64 (best-effort — the previous image also fell back to an empty file).
       - name: Build librespot (amd64)

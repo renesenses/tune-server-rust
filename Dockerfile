@@ -58,6 +58,14 @@ COPY tune-server/ tune-server/
 COPY tune-cli/ tune-cli/
 COPY tune-ffi/ tune-ffi/
 COPY tune-bridge/ tune-bridge/
+# Version affichée par le binaire : `tune_core::version()` lit TUNE_VERSION À LA
+# COMPILATION. Sans lui, l'image se dit `X.Y.Z-dev` (jamais `X.Y.Z` tout court,
+# qui passerait devant les RC du même numéro et bloquerait la mise à jour).
+# Pour une image d'une version précise :
+#   docker build --build-arg TUNE_VERSION=1.0.0-rc3 .
+# Posé ICI, après le cache des dépendances : le changer ne recompile que Tune.
+ARG TUNE_VERSION=
+ENV TUNE_VERSION=${TUNE_VERSION}
 # Même jeu de features que .github/workflows/docker.yml : une image construite
 # depuis ce Dockerfile sans audio-embedding renvoyait available:false et l'entrée
 # Ambiance disparaissait de l'UI sans aucun message (#19 de la revue 2026-08-15).
