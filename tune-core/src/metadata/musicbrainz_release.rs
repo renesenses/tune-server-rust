@@ -940,6 +940,16 @@ const COMPOSITEURS_EN_PREFIXE: &[&str] = &[
     "weber",
 ];
 
+/// `mot` (sans diacritiques, comme le rend [`normalize_sans_diacritiques`])
+/// est-il le nom d'un compositeur de [`COMPOSITEURS_EN_PREFIXE`] ? Sert au veto
+/// du compositeur de `choix_de_pressage` (#4805, étape D).
+pub(crate) fn est_un_compositeur_connu(mot: &str) -> bool {
+    !mot.is_empty()
+        && COMPOSITEURS_EN_PREFIXE
+            .iter()
+            .any(|c| normalize_sans_diacritiques(c) == mot)
+}
+
 /// Les séparateurs entre un préfixe (artiste, compositeur) et le titre.
 const SEPARATEURS_DE_PREFIXE: &[&str] = &[": ", " - ", " – ", " — "];
 
@@ -2640,3 +2650,7 @@ mod banc_4805;
 #[cfg(test)]
 #[path = "musicbrainz_release_banc_choix.rs"]
 mod banc_choix;
+
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_precision.rs"]
+mod banc_precision;

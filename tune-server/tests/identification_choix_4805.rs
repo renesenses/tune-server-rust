@@ -64,6 +64,13 @@ fn reponse_recherche(requete: &str) -> Value {
             hit("rel-xxiv", "Buddha‐Bar XXIV", "Various Artists", 2),
             hit(MBID_OCEAN, "Buddha-Bar: Ocean", "Various Artists", 2),
         ]})
+    } else if requete.contains("Symphony No. 9") {
+        // #4805 D — deux neuvièmes à 100, deux compositeurs : seul le
+        // compositeur des balises départage.
+        json!({ "releases": [
+            hit("rel-beethoven", "Symphony no. 9", "Beethoven; Berliner Philharmoniker", 2),
+            hit("rel-dvorak", "Symphony no. 9", "Antonín Dvořák; Berliner Philharmoniker", 2),
+        ]})
     } else if requete.contains("Kind of Blue") {
         json!({ "releases": [hit("rel-kob", "Kind of Blue", "Miles Davis", 2)] })
     } else {
@@ -76,6 +83,8 @@ fn reponse_release(id: &str) -> Option<Value> {
         MBID_BALISE => ("Nefertiti", "rg-balise"),
         "rel-kob" => ("Kind of Blue", "rg-rel-kob"),
         MBID_OCEAN => ("Buddha-Bar: Ocean", "rg-ocean"),
+        "rel-beethoven" => ("Symphony no. 9", "rg-rel-beethoven"),
+        "rel-dvorak" => ("Symphony no. 9", "rg-rel-dvorak"),
         _ => return None,
     };
     Some(json!({
@@ -354,6 +363,90 @@ async fn le_bouton_dit_l_ambiguite_et_laisse_choisir_l_edition() {
     assert_eq!(corps["source"], "balise_release", "{corps}");
     assert_eq!(colonne(&state, release, 1).as_deref(), Some(MBID_BALISE));
     assert_eq!(nb_prefixe(&compteur, "recherche:"), recherches);
+}
+
+/// #4805 D, précision — deux témoins par la vraie route du bouton :
+///
+/// 1. la balise `COMPOSER` des pistes (`tracks.composer`) départage deux
+///    neuvièmes à 100 que le titre ne départage pas ;
+/// 2. un pressage dont les titres ne concordent pas avec les fichiers est
+///    posé, mais ses pistes ne reçoivent AUCUN enregistrement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_compositeur_des_balises_departage_et_les_titres_gardent_les_enregistrements() {
+    let _serie = SERIE.lock().await;
+    let _compteur = doublure().await;
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    for requete in [
+        // 5 — « Symphony No. 9 », pistes balisées Dvořák.
+        "INSERT INTO albums (id, title, source) VALUES (5, 'Symphony No. 9', 'local')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number, composer) \
+         VALUES (50, 'Un', 5, 'local', 1, 1, 'Antonín Dvořák')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number, composer) \
+         VALUES (51, 'Deux', 5, 'local', 2, 1, 'Dvořák, Antonín')",
+        // 6 — le même, sans balise COMPOSER : ambigu, comme avant.
+        "INSERT INTO albums (id, title, source) VALUES (6, 'Symphony No. 9', 'local')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (60, 'Un', 6, 'local', 1, 1)",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (61, 'Deux', 6, 'local', 2, 1)",
+        // 7 — balisé MBID_BALISE (pistes « Un », « Deux »), mais les fichiers
+        //     portent d'autres titres : une autre édition, ou une autre œuvre.
+        "INSERT INTO albums (id, title, source) VALUES (7, 'Dossier 2004', 'local')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (70, 'Venus', 7, 'local', 1, 1)",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (71, 'Run', 7, 'local', 2, 1)",
+    ] {
+        state.backend.execute(requete, &[]).unwrap();
+    }
+    for piste in [70i64, 71] {
+        state
+            .backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'mb_release_id', ?)",
+                &[&piste as &dyn ToSqlValue, &MBID_BALISE as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+    let app = tune_server::routes::router(state.clone());
+    let release = "SELECT musicbrainz_release_id FROM albums WHERE id = ?";
+    let enregistrement = "SELECT musicbrainz_recording_id FROM tracks WHERE id = ?";
+
+    // 1. Le compositeur des balises désigne Dvořák.
+    let (status, corps) = appeler(&app, "POST", "/api/v1/library/albums/5/reidentify").await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["verdict"], "reidentified", "{corps}");
+    assert_eq!(
+        colonne(&state, release, 5).as_deref(),
+        Some("rel-dvorak"),
+        "la balise COMPOSER (Dvořák) n'a pas départagé : {corps}"
+    );
+    assert_eq!(corps["recordings_withheld"], false, "{corps}");
+    assert_eq!(
+        colonne(&state, enregistrement, 50).as_deref(),
+        Some("rec-rel-dvorak-1")
+    );
+
+    // Témoin : sans la balise, rien ne départage.
+    let (_, corps) = appeler(&app, "POST", "/api/v1/library/albums/6/reidentify").await;
+    assert_eq!(corps["verdict"], "ambiguous", "{corps}");
+    assert_eq!(colonne(&state, release, 6), None);
+
+    // 2. Les titres ne concordent pas : l'album est posé, ses pistes non.
+    let (status, corps) = appeler(&app, "POST", "/api/v1/library/albums/7/reidentify").await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["verdict"], "reidentified", "{corps}");
+    assert_eq!(colonne(&state, release, 7).as_deref(), Some(MBID_BALISE));
+    assert_eq!(corps["recordings_withheld"], true, "{corps}");
+    assert_eq!(corps["tracks_titles_matching"], 0, "{corps}");
+    assert_eq!(corps["tracks_matched"], 0, "{corps}");
+    for piste in [70i64, 71] {
+        assert_eq!(
+            colonne(&state, enregistrement, piste),
+            None,
+            "piste {piste} : un enregistrement a été posé alors qu'aucun titre ne concorde"
+        );
+    }
 }
 
 /// #4767 / #4805 E — la ré-identification qui CHANGE de pressage remet

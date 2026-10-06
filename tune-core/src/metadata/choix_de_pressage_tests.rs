@@ -413,6 +413,7 @@ fn entree<'a>(
         releases_des_balises: releases,
         enregistrements_des_balises: enregistrements,
         codes_barres: codes,
+        compositeurs_des_balises: &[],
     }
 }
 
@@ -695,4 +696,184 @@ async fn le_pressage_choisi_par_l_utilisateur_est_lu_et_retenu() {
     )
     .await;
     assert!(rien.is_none());
+}
+
+// -- Le compositeur des balises (#4805, étape D, précision) --
+
+#[test]
+fn la_cle_d_un_compositeur_de_balise_est_son_nom_de_famille() {
+    for (balise, cle) in [
+        ("Ludwig van Beethoven", "beethoven"),
+        ("Beethoven, Ludwig van", "beethoven"),
+        ("Antonín Dvořák", "dvorak"),
+        ("Dvořák, Antonín", "dvorak"),
+        ("J.S. Bach", "bach"),
+        ("Johann Strauss II", "strauss"),
+        ("Camille Saint-Saëns", "saintsaens"),
+        ("Lennon/McCartney", "lennon"),
+        ("Bach; Gounod", "bach"),
+    ] {
+        assert_eq!(cle_de_compositeur(balise).as_deref(), Some(cle), "{balise}");
+    }
+    assert_eq!(cle_de_compositeur(""), None);
+    assert_eq!(cle_de_compositeur("Wu"), None);
+}
+
+#[test]
+fn le_compositeur_majoritaire_des_balises() {
+    let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        compositeur_majoritaire(&b(&["Antonín Dvořák", "Dvořák, Antonín", "Dvorak"]), 3).as_deref(),
+        Some("dvorak")
+    );
+    // La moitié suffit ; moins, non.
+    assert_eq!(
+        compositeur_majoritaire(&b(&["Brahms", "Brahms"]), 4).as_deref(),
+        Some("brahms")
+    );
+    assert_eq!(compositeur_majoritaire(&b(&["Brahms"]), 4), None);
+    // Une compilation à parts égales n'en désigne aucun.
+    assert_eq!(
+        compositeur_majoritaire(&b(&["Mozart", "Mozart", "Haydn", "Haydn"]), 4),
+        None
+    );
+    assert_eq!(compositeur_majoritaire(&[], 0), None);
+}
+
+/// 🔴 L'exemple du plan : « Symphony No. 9 » sans compositeur dans le titre.
+/// La balise COMPOSER des pistes départage Beethoven et Dvořák.
+#[test]
+fn la_balise_compositeur_departage_quand_le_titre_ne_dit_rien() {
+    let c = parse_search_results(
+        &recherche_dvorak_beethoven(),
+        "Symphony No. 9",
+        "Herbert von Karajan",
+    );
+    assert_eq!(c.len(), 2);
+    for (balise, attendu) in [("beethoven", "rel-beethoven"), ("dvorak", "rel-dvorak")] {
+        match choisir_le_pressage_selon(
+            &c,
+            "Symphony No. 9",
+            "Herbert von Karajan",
+            Some(4),
+            Some(balise),
+        ) {
+            Choix::Retenu(i) => assert_eq!(c[i].release_id, attendu, "balise {balise}"),
+            autre => panic!("balise {balise} : {attendu} attendu, obtenu {autre:?}"),
+        }
+    }
+    // Sans balise : ambigu, comme avant.
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Symphony No. 9", "Herbert von Karajan", Some(4), None),
+        Choix::Ambigu
+    );
+}
+
+/// 🔴 Le veto : un album « nettement devant » qui nomme un AUTRE compositeur
+/// connu n'est pas retenu. `Requiem` / Karajan : Mozart 100, Brahms 90.
+#[test]
+fn un_album_qui_nomme_un_autre_compositeur_est_ecarte_meme_devant() {
+    let c = [
+        candidat(
+            "mozart",
+            "g1",
+            "Requiem",
+            "Mozart; Herbert von Karajan",
+            100,
+        ),
+        candidat(
+            "brahms",
+            "g2",
+            "Ein deutsches Requiem",
+            "Brahms; Herbert von Karajan",
+            90,
+        ),
+    ];
+    // Sans balise : Mozart, sur son score (inchangé).
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, None),
+        Choix::Retenu(0)
+    );
+    // Balisé Mozart : Mozart.
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, Some("mozart")),
+        Choix::Retenu(0)
+    );
+    // Balisé Brahms : Mozart est écarté ; Brahms reste, seul, et il est retenu.
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, Some("brahms")),
+        Choix::Retenu(1)
+    );
+    // Balisé Verdi : tout est contredit, rien n'est écrit.
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, Some("verdi")),
+        Choix::Ambigu
+    );
+}
+
+/// Le veto ne joue que pour un compositeur CONNU : un parolier de variété ne
+/// fait rien écarter, et un crédit qui ne nomme aucun compositeur connu
+/// (`W.A.Mozart` se lit pourtant `mozart`) n'est pas contredit.
+#[test]
+fn le_veto_ne_joue_que_pour_un_compositeur_connu() {
+    // Le crédit nomme `bach`, mais la balise (`lennon`) n'est pas un
+    // compositeur connu : pas de veto, le candidat seul est retenu.
+    let c = [candidat("a", "g1", "Abbey Road", "Sebastian Bach", 60)];
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Abbey Road", "Sebastian Bach", None, Some("lennon")),
+        Choix::Retenu(0)
+    );
+    let c = [candidat(
+        "a",
+        "g1",
+        "Requiem",
+        "W.A.Mozart, Berliner Philharmoniker, Herbert von Karajan",
+        78,
+    )];
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, Some("mozart")),
+        Choix::Retenu(0)
+    );
+    assert_eq!(
+        choisir_le_pressage_selon(&c, "Requiem", "Herbert von Karajan", None, Some("brahms")),
+        Choix::Ambigu,
+        "`W.A.Mozart` nomme Mozart : balisé Brahms, il est contredit"
+    );
+}
+
+/// Par la cascade : la balise COMPOSER des pistes passe par
+/// `EntreeDIdentification::compositeurs_des_balises`.
+#[tokio::test(start_paused = true)]
+async fn la_cascade_lit_la_balise_compositeur() {
+    let locales = pistes(4);
+    let compositeurs: Vec<String> = vec!["Antonín Dvořák".into(); 4];
+    let mut e = entree(
+        "Symphony No. 9",
+        "Herbert von Karajan",
+        &locales,
+        &[],
+        &[],
+        &[],
+    );
+    e.compositeurs_des_balises = &compositeurs;
+    let issue = identifier_le_pressage(
+        e,
+        |_q: String, _n: usize| {
+            std::future::ready(Ok::<_, RefusMusicBrainz>(recherche_dvorak_beethoven()))
+        },
+        |chemin: String, _inc: &'static str| {
+            let id = chemin.trim_start_matches("release/").to_string();
+            std::future::ready(Ok::<_, RefusMusicBrainz>(Some(detail_json(
+                &id,
+                &format!("rg-{id}"),
+                "Symphony no. 9",
+                4,
+            ))))
+        },
+    )
+    .await;
+    match issue {
+        IssueDuChoix::Retenu { pressage, .. } => assert_eq!(pressage.release_id, "rel-dvorak"),
+        autre => panic!("Dvořák attendu, obtenu {autre:?}"),
+    }
 }

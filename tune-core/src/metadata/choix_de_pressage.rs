@@ -43,6 +43,22 @@
 //! releases, puis code-barres. Le scan les a rangés en base
 //! (`track_metadata` : `mb_release_id`, `mb_track_id`, `barcode`). Une étape
 //! ne coûte une requête que si la balise existe.
+//!
+//! # Le compositeur des balises (#4805, étape D, précision)
+//!
+//! Le titre ne nomme pas toujours le compositeur : `Symphony No. 9` /
+//! `Herbert von Karajan` rend des neuvièmes de Beethoven, de Dvořák et de
+//! Bruckner. La balise `COMPOSER` des pistes ([`compositeur_majoritaire`])
+//! s'ajoute au compositeur en tête du titre, à deux places :
+//!
+//! - au **départage** ([`compositeur_ok`]), comme le compositeur du titre ;
+//! - en **veto**, avant même la règle du score : un album dont le crédit nomme
+//!   un compositeur connu, et aucun des nôtres, est écarté. Sans lui, un
+//!   `Requiem` de Brahms balisé `Johannes Brahms` laissait passer le `Requiem`
+//!   de Mozart, noté 100 contre 90 (« nettement devant »). Le veto ne joue que
+//!   pour un compositeur de la liste connue
+//!   ([`mb::est_un_compositeur_connu`]) : `Lennon/McCartney` ne fait rien
+//!   écarter.
 
 use serde_json::Value;
 use tracing::debug;
@@ -99,13 +115,19 @@ struct Indices {
     titres: Vec<String>,
     /// Les suffixes d'édition, compacts (`30thanniversary`).
     editions: Vec<String>,
-    /// Le compositeur en tête du titre, sans diacritiques.
-    compositeur: Option<String>,
+    /// Les compositeurs de l'album, sans diacritiques : celui en tête du
+    /// titre, puis celui des balises `COMPOSER` ([`compositeur_majoritaire`]).
+    compositeurs: Vec<String>,
     pistes: Option<u32>,
 }
 
 impl Indices {
-    fn depuis(titre: &str, artiste: &str, pistes: Option<u32>) -> Self {
+    fn depuis(
+        titre: &str,
+        artiste: &str,
+        pistes: Option<u32>,
+        compositeur_des_balises: Option<&str>,
+    ) -> Self {
         let mut titres = vec![normalize_compact(titre)];
         let mut base = titre.trim().to_string();
         let editions: Vec<String> = mb::editions_du_titre(titre)
@@ -130,10 +152,16 @@ impl Indices {
         }
         titres.retain(|t| !t.is_empty());
         titres.dedup();
+        let mut compositeurs: Vec<String> = mb::compositeur_en_prefixe(titre).into_iter().collect();
+        if let Some(k) = compositeur_des_balises
+            && !compositeurs.iter().any(|c| c == k)
+        {
+            compositeurs.push(k.to_string());
+        }
         Indices {
             titres,
             editions,
-            compositeur: mb::compositeur_en_prefixe(titre),
+            compositeurs,
             pistes,
         }
     }
@@ -154,13 +182,49 @@ fn edition_ok(c: &MBReleaseMatch, i: &Indices) -> bool {
         .any(|e| desamb.contains(e.as_str()) || titre.contains(e.as_str()))
 }
 
-fn compositeur_ok(c: &MBReleaseMatch, i: &Indices) -> bool {
-    let Some(k) = i.compositeur.as_deref() else {
-        return false;
-    };
-    normalize_sans_diacritiques(&c.artist)
+/// Les mots d'un crédit d'artiste, sans diacritiques, coupés aussi à la
+/// ponctuation : `W.A.Mozart` donne `wamozart`, `w`, `a` et `mozart`,
+/// `Rimsky-Korsakov` donne `rimskykorsakov`, `rimsky` et `korsakov`.
+fn mots_du_credit(credit: &str) -> Vec<String> {
+    let mut mots: Vec<String> = normalize_sans_diacritiques(credit)
         .split_whitespace()
-        .any(|mot| mot == k)
+        .map(str::to_string)
+        .collect();
+    let coupe: String = credit
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    for m in normalize_sans_diacritiques(&coupe).split_whitespace() {
+        if !mots.iter().any(|x| x == m) {
+            mots.push(m.to_string());
+        }
+    }
+    mots
+}
+
+/// Le crédit nomme-t-il l'un des compositeurs de l'album ?
+fn compositeur_ok(c: &MBReleaseMatch, i: &Indices) -> bool {
+    if i.compositeurs.is_empty() {
+        return false;
+    }
+    let mots = mots_du_credit(&c.artist);
+    i.compositeurs.iter().any(|k| mots.iter().any(|m| m == k))
+}
+
+/// 🔴 Le crédit CONTREDIT-il nos compositeurs ? Il nomme un compositeur
+/// connu, et aucun des nôtres. Ne joue que si l'un des nôtres est lui-même
+/// connu : un parolier de variété ne fait rien écarter.
+fn compositeur_contredit(c: &MBReleaseMatch, i: &Indices) -> bool {
+    if !i
+        .compositeurs
+        .iter()
+        .any(|k| mb::est_un_compositeur_connu(k))
+    {
+        return false;
+    }
+    let mots = mots_du_credit(&c.artist);
+    let nomme_un_connu = mots.iter().any(|m| mb::est_un_compositeur_connu(m));
+    nomme_un_connu && !i.compositeurs.iter().any(|k| mots.iter().any(|m| m == k))
 }
 
 fn pistes_ok(c: &MBReleaseMatch, i: &Indices) -> bool {
@@ -228,20 +292,48 @@ fn grouper(candidats: &[MBReleaseMatch]) -> Vec<Groupe> {
 /// d'abord), ou [`Choix::Ambigu`] quand plusieurs albums se valent.
 ///
 /// `titre` et `artiste` sont ceux de la bibliothèque ; `pistes` le nombre de
-/// pistes locales. Voir l'en-tête du module pour la règle.
+/// pistes locales. Voir l'en-tête du module pour la règle. Sans balise
+/// `COMPOSER` : [`choisir_le_pressage_selon`] avec `None`.
 pub fn choisir_le_pressage(
     candidats: &[MBReleaseMatch],
     titre: &str,
     artiste: &str,
     pistes: Option<u32>,
 ) -> Choix {
-    match candidats.len() {
-        0 => return Choix::Aucun,
-        1 => return Choix::Retenu(0),
-        _ => {}
+    choisir_le_pressage_selon(candidats, titre, artiste, pistes, None)
+}
+
+/// [`choisir_le_pressage`], avec le compositeur des balises
+/// ([`compositeur_majoritaire`]) : veto des albums qui le contredisent, puis
+/// départage (en-tête du module).
+pub fn choisir_le_pressage_selon(
+    candidats: &[MBReleaseMatch],
+    titre: &str,
+    artiste: &str,
+    pistes: Option<u32>,
+    compositeur_des_balises: Option<&str>,
+) -> Choix {
+    if candidats.is_empty() {
+        return Choix::Aucun;
     }
-    let indices = Indices::depuis(titre, artiste, pistes);
-    let groupes = grouper(candidats);
+    let indices = Indices::depuis(titre, artiste, pistes, compositeur_des_balises);
+    let mut groupes = grouper(candidats);
+    // Le veto du compositeur, AVANT la règle du score : un album noté 100 qui
+    // nomme un autre compositeur n'est pas « nettement devant », il est hors
+    // course.
+    let avant_veto = groupes.len();
+    groupes.retain(|g| {
+        !g.membres
+            .iter()
+            .all(|m| compositeur_contredit(&candidats[*m], &indices))
+    });
+    if groupes.is_empty() {
+        debug!(
+            avant_veto,
+            "choix_pressage_tous_contredits_par_le_compositeur"
+        );
+        return Choix::Ambigu;
+    }
 
     let gagnant =
         if groupes.len() == 1 || score_nettement_devant(groupes[0].score, groupes[1].score) {
@@ -488,6 +580,55 @@ fn code_barres_de_l_album(balises: &[String]) -> Option<String> {
     comptes.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
 }
 
+/// Les mots qui suivent un nom sans le désigner : `Johann Strauss II`,
+/// `Harry Connick Jr.`.
+const SUFFIXES_DE_NOM: &[&str] = &["i", "ii", "iii", "iv", "jr", "sr", "fils", "pere"];
+
+/// La clé d'un compositeur de balise : son nom de famille, sans diacritiques.
+/// `Ludwig van Beethoven` et `Beethoven, Ludwig van` donnent `beethoven` ;
+/// `Johann Strauss II` donne `strauss` ; une liste (`Lennon/McCartney`,
+/// `Bach; Gounod`) donne son premier nom. Moins de trois lettres : `None`.
+pub fn cle_de_compositeur(nom: &str) -> Option<String> {
+    let premier = nom.split([';', '/', '&', '|']).next()?.trim();
+    let premier = premier
+        .split(" and ")
+        .next()
+        .unwrap_or(premier)
+        .split(" et ")
+        .next()
+        .unwrap_or(premier);
+    // « Nom, Prénom » : le nom est avant la virgule.
+    let base = premier.split(',').next().unwrap_or(premier);
+    let normalise = normalize_sans_diacritiques(base);
+    let dernier = normalise
+        .split_whitespace()
+        .rev()
+        .find(|m| !SUFFIXES_DE_NOM.contains(m))?;
+    (dernier.chars().count() >= 3).then(|| dernier.to_string())
+}
+
+/// Le compositeur que porte **la majorité** des pistes d'un album (balise
+/// `COMPOSER`, `tracks.composer`) : sa clé ([`cle_de_compositeur`]) revient
+/// sur au moins la moitié des `pistes`, et strictement plus que toute autre.
+/// Une compilation de compositeurs mêlés n'en désigne aucun.
+pub fn compositeur_majoritaire(balises: &[String], pistes: usize) -> Option<String> {
+    use std::collections::BTreeMap;
+    if pistes == 0 {
+        return None;
+    }
+    let mut comptes: BTreeMap<String, usize> = BTreeMap::new();
+    for b in balises {
+        if let Some(k) = cle_de_compositeur(b) {
+            *comptes.entry(k).or_default() += 1;
+        }
+    }
+    let mut tries: Vec<(String, usize)> = comptes.into_iter().collect();
+    tries.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let (cle, n) = tries.first()?.clone();
+    let second = tries.get(1).map_or(0, |(_, n)| *n);
+    (n * 2 >= pistes && n > second).then_some(cle)
+}
+
 /// Les releases d'une réponse `/recording/{id}?inc=releases`, plausibles pour
 /// cet album. Repris de MetaRust (`parse_recording_releases`), aux types de
 /// Tune : chaque release vaut 100, la réponse ne note pas.
@@ -554,6 +695,9 @@ pub struct EntreeDIdentification<'a> {
     pub enregistrements_des_balises: &'a [String],
     /// `track_metadata.barcode` des pistes, puis `albums.barcode`.
     pub codes_barres: &'a [String],
+    /// `tracks.composer` des pistes (balise `COMPOSER`), une entrée par piste
+    /// qui le porte : [`compositeur_majoritaire`] en tire le compositeur.
+    pub compositeurs_des_balises: &'a [String],
 }
 
 /// D'où vient le pressage retenu.
@@ -767,6 +911,7 @@ where
     let pistes = (n > 0).then_some(n);
     let mut cadence = Cadence::default();
     let mut ambiguite: Ambiguite = None;
+    let compositeur = compositeur_majoritaire(entree.compositeurs_des_balises, entree.pistes.len());
 
     // 1. Le MBID de release des balises.
     if let Some(id) = release_majoritaire(entree.releases_des_balises, entree.pistes.len()) {
@@ -800,11 +945,13 @@ where
         Conclue(IssueDuChoix),
         Suivante,
     }
+    #[allow(clippy::too_many_arguments)]
     async fn juger<L, FutL>(
         candidats: &[MBReleaseMatch],
         source: SourceDuPressage,
         entree: &EntreeDIdentification<'_>,
         pistes: Option<u32>,
+        compositeur: Option<&str>,
         cadence: &mut Cadence,
         lire: &mut L,
         ambiguite: &mut Ambiguite,
@@ -813,7 +960,13 @@ where
         L: FnMut(String, &'static str) -> FutL,
         FutL: std::future::Future<Output = Result<Option<Value>, RefusMusicBrainz>>,
     {
-        match choisir_le_pressage(candidats, entree.titre, entree.artiste, pistes) {
+        match choisir_le_pressage_selon(
+            candidats,
+            entree.titre,
+            entree.artiste,
+            pistes,
+            compositeur,
+        ) {
             Choix::Aucun => Etape::Suivante,
             Choix::Ambigu => {
                 *ambiguite = Some((RaisonAmbigu::AlbumsConcurrents, source, candidats.to_vec()));
@@ -859,6 +1012,7 @@ where
                     SourceDuPressage::BaliseEnregistrement,
                     &entree,
                     pistes,
+                    compositeur.as_deref(),
                     &mut cadence,
                     &mut lire,
                     &mut ambiguite,
@@ -888,6 +1042,7 @@ where
                     SourceDuPressage::CodeBarres,
                     &entree,
                     pistes,
+                    compositeur.as_deref(),
                     &mut cadence,
                     &mut lire,
                     &mut ambiguite,
@@ -918,6 +1073,7 @@ where
         SourceDuPressage::Recherche,
         &entree,
         pistes,
+        compositeur.as_deref(),
         &mut cadence,
         &mut lire,
         &mut ambiguite,
