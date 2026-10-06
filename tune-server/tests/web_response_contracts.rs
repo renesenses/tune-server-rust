@@ -1144,5 +1144,47 @@ async fn la_completude_nomme_les_pistes_que_la_plage_dynamique_ne_mesurera_jamai
     assert_eq!(p["total_tracks"], 6, "payload={p}");
 }
 
+/// Fil 2157 — une piste sans DR d'une racine EXCLUE des analyses (#5593)
+/// n'est candidate d'aucune passe, ni comptée par aucun des compteurs
+/// ci-dessus. La route la nomme à part : sans quoi la carte Santé l'attend
+/// pour toujours, la passe au repos.
+#[tokio::test]
+async fn la_completude_nomme_les_pistes_sans_dr_hors_du_perimetre_2157() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let poser = |chemin: &str| {
+        let mut t = tune_core::db::models::Track::new(chemin.into());
+        t.file_path = Some(chemin.to_string());
+        pistes.create(&t).expect("piste temoin")
+    };
+    poser("/music/a.flac");
+    poser("/nas/b.flac");
+    poser("/nas/c.flac");
+
+    let app = tune_server::routes::router(etat.clone());
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_out_of_scope"], 0,
+        "rien d'exclu, rien hors périmètre. payload={p}"
+    );
+
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            r#"["/nas"]"#,
+        )
+        .expect("reglage");
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_out_of_scope"], 2,
+        "les deux pistes de la racine exclue n'attendent aucune passe. payload={p}"
+    );
+}
+
 #[path = "web_contracts/album_tracks_1897.rs"]
 mod album_tracks_1897;

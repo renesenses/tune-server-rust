@@ -281,6 +281,12 @@ pub(super) async fn completeness_stats(
     // derrière ReplayGain » — faux sur un partage démonté (#4254).
     let dr_deferred =
         tune_core::audio::replaygain::compter_les_reportees_par_chemin(&state.backend);
+    // Fil 2157 — et celles d'une racine EXCLUE des analyses (#5593) : le
+    // périmètre les retire de toutes les passes et de tous les compteurs
+    // ci-dessus, mais pas du total. Sans ce chiffre, la carte Santé les
+    // attendait pour toujours, la passe au repos. `0` sans racine exclue.
+    let dr_out_of_scope =
+        tune_core::audio::replaygain::compter_les_sans_dr_hors_perimetre(&state.backend);
     // Le client affiche ce nombre dans la pastille « Métadonnées douteuses ».
     // Réutiliser le compteur de la route `/metadata/doubtful` garantit que la
     // pastille et la liste comptent exactement la même population (#1897).
@@ -363,6 +369,7 @@ pub(super) async fn completeness_stats(
         "dynamic_range_deferred": dr_deferred,
         "dynamic_range_oversized": dr_oversized,
         "dynamic_range_without_file": dr_without_file,
+        "dynamic_range_out_of_scope": dr_out_of_scope,
         "dynamic_range_pct": if total_tracks > 0 {
             (with_dr as f64 / total_tracks as f64 * 100.0).round()
         } else {

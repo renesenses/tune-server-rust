@@ -2096,6 +2096,44 @@ pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
     }
 }
 
+/// Combien de pistes SANS plage dynamique dorment dans une racine exclue des
+/// analyses (#5593) — fil 2157, « bloquée à 97 % ».
+///
+/// Le périmètre retire ces pistes de toutes les passes qui décodent, ET de
+/// leurs compteurs ([`compter_les_candidats_dr`], [`compter_les_reportees_par_chemin`]).
+/// Elles n'étaient donc comptées nulle part, sauf au total de la
+/// bibliothèque : l'écran Santé les rangeait « en attente » et sa jauge ne
+/// finissait jamais, la passe au repos. Les compter ici, par la clause même
+/// qui les écarte, ferme ce trou.
+///
+/// Jamais deux fois : ni une piste qui a un DR, ni une piste déjà comptée
+/// ailleurs — `dr_indisponible` (`dynamic_range_unavailable`),
+/// `rg_skipped_oversized` (`dynamic_range_oversized`), sans fichier
+/// (`dynamic_range_without_file`). Aucune racine exclue : `0` sans requête.
+pub fn compter_les_sans_dr_hors_perimetre(backend: &Arc<dyn DbBackend>) -> i64 {
+    let hors = crate::taches_de_fond::perimetre::clause_hors_perimetre_decodage(backend);
+    if hors.is_empty() {
+        return 0;
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM tracks t \
+         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key IN ('dr_indisponible', '{OVERSIZED_KEY}')){hors}"
+    );
+    match backend.query_one(&sql, &[]) {
+        Ok(row) => row
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0),
+        Err(e) => {
+            warn!(error = %e, "dr_hors_perimetre_count_failed");
+            0
+        }
+    }
+}
+
 /// Calcule la plage dynamique d'un lot de pistes que la passe nominale a
 /// laissées derrière elle. Rend combien de lignes ont AVANCÉ (0 ⇒ plus rien).
 ///

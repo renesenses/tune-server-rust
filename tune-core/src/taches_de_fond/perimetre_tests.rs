@@ -226,6 +226,64 @@ fn une_reportee_d_une_racine_exclue_n_attend_plus_son_disque() {
     assert_eq!(replaygain::compter_les_reportees_par_chemin(&backend), 1);
 }
 
+/// Fil 2157 — une piste sans plage dynamique d'une racine exclue n'est
+/// candidate d'aucune passe : elle doit être comptée À PART, sinon la carte
+/// Santé l'attend pour toujours et sa jauge ne finit jamais.
+///
+/// Le test vérifie la PARTITION : toute piste sans DR est candidate, ou
+/// nommée par un compteur — jamais les deux, jamais aucun.
+#[test]
+fn une_piste_sans_dr_d_une_racine_exclue_est_comptee_a_part() {
+    let (db, backend) = base();
+    piste(&db, 1, "/local/a.flac");
+    piste(&db, 2, "/nas/musique/b.flac");
+    piste(&db, 3, "/nas/musique/c.flac");
+    piste(&db, 4, "/nas/musique/d.flac");
+    piste(&db, 5, "/nas/musique/e.flac");
+    // Même préfixe sans le séparateur : PAS dans la racine.
+    piste(&db, 6, "/nas/musique2/f.flac");
+    let meta = TrackMetadataRepo::new(db.clone());
+    meta.set(3, "dr_track", "8").unwrap();
+    meta.set(4, "dr_indisponible", "1").unwrap();
+    meta.set(5, "rg_skipped_oversized", "1").unwrap();
+    meta.set(5, "rg_analyzed", "1").unwrap();
+
+    // Rien d'exclu : zéro, sans requête.
+    assert_eq!(replaygain::compter_les_sans_dr_hors_perimetre(&backend), 0);
+
+    regler(
+        &backend,
+        CLE_RACINES_EXCLUES,
+        serde_json::json!(["/nas/musique"]),
+    );
+    // Seule la piste 2 : la 3 a son DR, la 4 est comptée « indisponible »,
+    // la 5 « trop longue », la 6 est hors de la racine.
+    assert_eq!(replaygain::compter_les_sans_dr_hors_perimetre(&backend), 1);
+    // La partition : 1 et 6 candidates, 2 hors périmètre, 4 indisponible,
+    // 5 trop longue — cinq pistes sans DR, cinq places, aucune en double.
+    let candidates = replaygain::compter_les_candidats_dr(&backend);
+    assert_eq!(candidates, 2);
+    let sans_dr = backend
+        .query_one(
+            "SELECT COUNT(*) FROM tracks t WHERE NOT EXISTS (SELECT 1 FROM track_metadata m \
+             WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '')",
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap();
+    assert_eq!(
+        sans_dr,
+        candidates + replaygain::compter_les_sans_dr_hors_perimetre(&backend) + 1 + 1,
+        "chaque piste sans DR doit avoir UNE place"
+    );
+
+    // Contre-épreuve : l'exclusion levée, la piste 2 redevient du travail.
+    regler(&backend, CLE_RACINES_EXCLUES, serde_json::json!([]));
+    assert_eq!(replaygain::compter_les_sans_dr_hors_perimetre(&backend), 0);
+    assert!(replaygain::compter_les_candidats_dr(&backend) >= 3);
+}
+
 /// Le numérateur de la jauge CLAP suit le dénominateur : une piste traitée
 /// AVANT son exclusion sort des deux à la fois.
 #[test]

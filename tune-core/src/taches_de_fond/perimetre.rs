@@ -140,6 +140,29 @@ fn normaliser_les_separateurs(chemin: &str) -> String {
 /// La casse compte : la racine réglée vient de `music_dirs`, la même chaîne
 /// que le scan a mise en tête des chemins.
 pub fn clause_hors_racines(expr: &str, racines: &[String]) -> String {
+    match termes_des_racines(expr, racines) {
+        Some(termes) => format!(" AND NOT ({termes})"),
+        None => String::new(),
+    }
+}
+
+/// `" AND (…)"` : l'inverse exact de [`clause_hors_racines`], sur les MÊMES
+/// termes — les pistes dont `expr` est l'une des `racines` ou se trouve
+/// dessous. Vide si aucune racine.
+///
+/// Fil 2157 : une piste d'une racine exclue n'est candidate d'aucune passe,
+/// mais elle reste « sans plage dynamique ». La compter à part, avec le texte
+/// même qui l'écarte, est la seule façon qu'une jauge ne l'attende pas.
+pub fn clause_dans_les_racines(expr: &str, racines: &[String]) -> String {
+    match termes_des_racines(expr, racines) {
+        Some(termes) => format!(" AND ({termes})"),
+        None => String::new(),
+    }
+}
+
+/// Les termes partagés par [`clause_hors_racines`] et
+/// [`clause_dans_les_racines`], joints par `OR`. `None` si aucune racine.
+fn termes_des_racines(expr: &str, racines: &[String]) -> Option<String> {
     let chemin = format!("REPLACE(COALESCE({expr}, ''), '\\', '/')");
     let termes: Vec<String> = racines
         .iter()
@@ -162,15 +185,21 @@ pub fn clause_hors_racines(expr: &str, racines: &[String]) -> String {
         })
         .collect();
     if termes.is_empty() {
-        return String::new();
+        return None;
     }
-    format!(" AND NOT ({})", termes.join(" OR "))
+    Some(termes.join(" OR "))
 }
 
 /// La clause du périmètre pour ReplayGain, plage dynamique et empreintes : les
 /// racines exclues, sur `t.file_path`.
 pub fn clause_decodage(backend: &Arc<dyn DbBackend>) -> String {
     clause_hors_racines("t.file_path", &racines_exclues(backend))
+}
+
+/// L'inverse de [`clause_decodage`] : `" AND (…)"` sur les pistes des racines
+/// exclues, vide si aucune racine n'est exclue.
+pub fn clause_hors_perimetre_decodage(backend: &Arc<dyn DbBackend>) -> String {
+    clause_dans_les_racines("t.file_path", &racines_exclues(backend))
 }
 
 /// La clause du périmètre du CLAP : les racines exclues, sur le chemin
