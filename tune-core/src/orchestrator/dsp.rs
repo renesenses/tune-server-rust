@@ -2109,6 +2109,91 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #4384 — repousser le facteur ReplayGain (préampli compris) à la sortie
+    /// locale qui joue, sans attendre la piste suivante.
+    ///
+    /// Le facteur n'était posé qu'au lancement d'une piste (`transport.rs`) et
+    /// à la bascule PURE ([`Self::refresh_zone_pure_dsp`]). Un préampli changé
+    /// dans les réglages en cours d'écoute était donc écrit en base, renvoyé
+    /// comme un succès, et n'atteignait ni le son ni le crête-mètre avant la
+    /// piste suivante : à −6 dB, l'aiguille ne bougeait pas, parce que rien
+    /// n'avait bougé (GgB, fil 1797). Le forwarder de niveaux lit le gain de
+    /// rendu à chaque fenêtre : le repousser ici suffit pour que l'aiguille
+    /// suive dans la seconde.
+    ///
+    /// Même expression que le chemin de lecture : 1,0 sous PURE ou sans piste
+    /// identifiée. Aucune garde sur `current_format()` : un scalaire n'a pas
+    /// de filtre à bâtir pour un débit donné (même raison que
+    /// [`Self::refresh_zone_mono_downmix`]). Rend `true` quand une sortie
+    /// locale l'a reçu.
+    pub async fn refresh_zone_replaygain(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            // Lu AVANT le verrou de la sortie, comme dans
+            // `refresh_zone_pure_dsp` : `get_state` prend ses propres verrous.
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let pure = self.zone_audiophile(zone_id);
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let rg = match (pure, track_id) {
+                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+                _ => 1.0,
+            };
+            local_output.set_replaygain_factor(rg);
+            // Idempotent : le même `Arc` que la lecture a déjà branché.
+            self.playback
+                .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
+            info!(zone_id, device_id = %device_id, rg, "zone_replaygain_refreshed_live");
+            true
+        }
+    }
+
+    /// #4384 — un réglage ReplayGain GLOBAL vient de changer (mode, préampli,
+    /// anti-écrêtage…) : le repousser à toutes les sorties locales. Rend le
+    /// nombre de zones servies à chaud. Une zone réseau a son gain cuit dans
+    /// le flux : elle l'entendra à la piste suivante, comme avant.
+    pub async fn refresh_replaygain_toutes_zones(&self) -> usize {
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut servies = 0;
+        for zone_id in zones.into_iter().filter_map(|z| z.id) {
+            if self.refresh_zone_replaygain(zone_id).await {
+                servies += 1;
+            }
+        }
+        servies
+    }
+
     /// #5071 — l'interrupteur de compensation vient de changer : le faire
     /// entendre, sur une sortie locale comme sur une zone réseau.
     ///

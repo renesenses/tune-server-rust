@@ -1213,6 +1213,13 @@ fn normaliser_intervalle_reseau(
     Ok(Some(secs))
 }
 
+/// #4384 — le patch a-t-il touché un réglage dont dépend le facteur
+/// ReplayGain de lecture ? Toutes ces clés partagent le préfixe
+/// `replaygain_` (`audio::replaygain::{MODE_KEY, PREAMP_KEY, …}`).
+fn touche_le_replaygain(cles_posees: &[String]) -> bool {
+    cles_posees.iter().any(|c| c.starts_with("replaygain_"))
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     profile: ActiveProfile,
@@ -1412,6 +1419,17 @@ pub(super) async fn update_config(
             "reglages_ecrits"
         );
     }
+    // #4384 — un réglage ReplayGain (préampli, mode, anti-écrêtage…) vaut
+    // MAINTENANT sur les sorties locales qui jouent, pas à la piste suivante.
+    // Sans cela, le préampli changé en écoutant ne bougeait ni le son ni le
+    // crête-mètre, et l'écran ne disait pas pourquoi (fil 1797).
+    let replaygain_applique_a_chaud = if touche_le_replaygain(&cles_posees) {
+        let servies = state.orchestrator.refresh_replaygain_toutes_zones().await;
+        tracing::info!(zones = servies, "replaygain_reapplique_a_chaud");
+        Some(servies)
+    } else {
+        None
+    };
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
@@ -1422,6 +1440,12 @@ pub(super) async fn update_config(
     }
 
     let mut reponse = json!({"ok": true});
+    // Champ ADDITIF : combien de sorties locales ont reçu le nouveau facteur
+    // ReplayGain tout de suite. `0` = rien ne jouait en local ; une zone
+    // réseau l'entendra à la piste suivante.
+    if let Some(servies) = replaygain_applique_a_chaud {
+        reponse["replaygain_applied_live_zones"] = json!(servies);
+    }
     if exclusif_desarme_avec_asio {
         // Le client a envoyé `local_exclusive_mode: true` (l'écho du forçage
         // ASIO) : il doit apprendre ce qui a été écrit.
@@ -1641,6 +1665,9 @@ mod intervalle_reseau_tests_2148 {
     }
 }
 
+#[cfg(test)]
+#[path = "replaygain_a_chaud_tests_4384.rs"]
+mod replaygain_a_chaud_tests_4384;
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
