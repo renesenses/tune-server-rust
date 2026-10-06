@@ -373,6 +373,35 @@ pub(super) fn replaygain_ignore_par_pure(
     }))
 }
 
+/// #4384 — ReplayGain armé, mais aucun gain stocké pour la piste en cours :
+/// le facteur reste 1,0 et le préampli n'est PAS appliqué (il s'ajoute au
+/// tag, il ne le remplace pas — `gain_factor_detail`).
+///
+/// Rend `{ "mode", "preamp_db" }`, ou `None` en mode off, sans piste
+/// identifiée, ou quand la piste porte un gain. La garde PURE est à
+/// l'appelant.
+pub(super) fn replaygain_sans_gain_tague(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    track_id: Option<i64>,
+) -> Option<Value> {
+    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, stored_gain_with_peak};
+    let settings = ReplayGainSettings::load(backend);
+    if settings.mode == ReplayGainMode::Off {
+        return None;
+    }
+    let tid = track_id?;
+    if stored_gain_with_peak(backend, tid, settings.mode).is_some() {
+        return None;
+    }
+    Some(json!({
+        "mode": match settings.mode {
+            ReplayGainMode::Album => "album",
+            _ => "track",
+        },
+        "preamp_db": (settings.preamp_db * 100.0).round() / 100.0 + 0.0,
+    }))
+}
+
 /// L'étape ReplayGain du chemin du signal, description ET faits bruts.
 ///
 /// Les champs structurés sont ADDITIFS : le client qui ne lit que
@@ -804,6 +833,14 @@ pub(super) fn build_signal_path(
         {
             v["pure_replaygain_ignored"] = rg;
         }
+        // #4384 — ReplayGain armé, piste sans gain stocké : le facteur reste
+        // 1,0 et le préampli n'est PAS appliqué. Sans cette clé, l'étape
+        // ReplayGain disparaissait sans un mot, et un préampli réglé
+        // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
+        // la piste a un gain.
+        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.track_id) {
+            v["replaygain_untagged"] = rg;
+        }
         v
     })
 }
@@ -1228,6 +1265,11 @@ fn assembler_les_etapes(
             "peak_headroom_db": rg.peak_headroom_db,
             // #5633 — additif : le gain en nombre.
             "gain_db": (rg.gain_db * 100.0).round() / 100.0 + 0.0,
+            // #4384 — additif : OÙ le gain est appliqué. Sur une sortie
+            // locale, il est composé avec le volume puis raboté à l'unité
+            // (`playback.audio_levels` dit ce qui en reste) ; sur un rendu
+            // réseau, il est cuit dans le flux envoyé.
+            "applied_in": if output_type == "local" { "local_output" } else { "stream" },
             "metrics": replaygain_ecretage_metrics(),
         }));
     }

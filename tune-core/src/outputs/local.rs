@@ -1039,6 +1039,18 @@ impl LocalOutput {
         self.volume.clone()
     }
 
+    /// #4384 — ce que cette sortie DEMANDE avant le rabot à l'unité
+    /// d'[`effective_volume_units`] : ses propres `Arc` (volume utilisateur,
+    /// facteur de rendu, bascule DoP), relus à chaque appel. Voir
+    /// `PlaybackManager::gain_demande_units`.
+    pub fn gain_demande(&self) -> crate::playback::GainDemande {
+        crate::playback::GainDemande {
+            volume_utilisateur: self.user_volume.clone(),
+            facteur_de_rendu: self.rg_factor.clone(),
+            dop: self.dop_active.clone(),
+        }
+    }
+
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         Self::with_options(device_name, exclusive_mode, "auto")

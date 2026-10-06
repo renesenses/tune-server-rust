@@ -1397,6 +1397,10 @@ mod signal_path_ombre_5081_tests;
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;
 
+// #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
+#[cfg(test)]
+mod signal_path_gain_sortie_4384_tests;
+
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
 /// Deux situations produisent le même symptôme (file remplie, position qui
