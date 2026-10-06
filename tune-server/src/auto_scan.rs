@@ -3571,6 +3571,10 @@ mod compteur_demarrage_tests_5371;
 mod coffret_manuel_scan_tests_5319;
 
 #[cfg(test)]
+#[path = "champs_tenus_scan_tests.rs"]
+mod champs_tenus_scan_tests;
+
+#[cfg(test)]
 #[path = "arret_du_scan_de_demarrage_tests_5552.rs"]
 mod arret_du_scan_de_demarrage_tests_5552;
 

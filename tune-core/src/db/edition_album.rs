@@ -408,19 +408,25 @@ pub struct Tenues {
     /// par album (marqueur `genre_pistes`, voir
     /// [`super::genre_album_pistes`]).
     genres_par_album: HashMap<i64, (String, String)>,
+    /// 05/10/2026 — les champs d'une piste corrigés à la main (édition de
+    /// piste, tagger, compositeur…), appliqués EN DERNIER : c'est la
+    /// correction la plus précise. Voir [`super::champs_tenus`].
+    champs: super::champs_tenus::Registre,
 }
 
 impl Tenues {
     /// Un défaut de lecture rend un ensemble VIDE en le disant au journal :
     /// on ne bloque pas un scan sur une table de métadonnées illisible.
     pub fn charger(db: &Arc<dyn DbBackend>) -> Self {
-        match Self::essayer(db) {
+        let mut t = match Self::essayer(db) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(erreur = %e, "editions_tenues_illisibles");
                 Self::default()
             }
-        }
+        };
+        t.champs = super::champs_tenus::Registre::charger(db);
+        t
     }
 
     fn essayer(db: &Arc<dyn DbBackend>) -> Result<Self, TuneError> {
@@ -511,7 +517,10 @@ impl Tenues {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.par_chemin.is_empty() && self.par_cue.is_empty() && self.genres_par_album.is_empty()
+        self.par_chemin.is_empty()
+            && self.par_cue.is_empty()
+            && self.genres_par_album.is_empty()
+            && self.champs.is_empty()
     }
 
     pub fn get(&self, chemin: &str) -> Option<&Tenue> {
@@ -573,7 +582,7 @@ impl Tenues {
     pub fn appliquer(&self, track: &mut Track) -> bool {
         // Par chemin, sinon par identité CUE (#5319).
         let tenue = self.de_la_piste(track);
-        let change = tenue.is_some();
+        let mut change = tenue.is_some();
         if let Some(t) = tenue {
             self.appliquer_tenue(t, track);
         }
@@ -582,7 +591,11 @@ impl Tenues {
         if let Some((genre, genres)) = track.album_id.and_then(|a| self.genres_par_album.get(&a)) {
             track.genre = Some(genre.clone());
             track.genres = Some(genres.clone());
-            return true;
+            change = true;
+        }
+        // 05/10/2026 — les champs corrigés à la main sur la piste, en dernier.
+        if self.champs.appliquer(track) {
+            change = true;
         }
         change
     }

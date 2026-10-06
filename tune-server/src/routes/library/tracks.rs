@@ -920,6 +920,32 @@ pub(super) async fn rescan_track(
     }
 }
 
+/// `GET /library/tracks/{id}/tenues` — les champs de la piste corrigés à la
+/// main, que les analyses ne défont pas (`tune_core::db::champs_tenus`).
+pub(super) async fn champs_tenus_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let t = tune_core::db::champs_tenus::de_la_piste(&state.backend, id);
+    Json(json!({
+        "track_id": id,
+        "fields": t.as_ref().map(|t| t.noms()).unwrap_or_default(),
+    }))
+}
+
+/// `DELETE /library/tracks/{id}/tenues` — « Rétablir depuis le fichier » : la
+/// piste oublie ses champs tenus et relit tout de suite les balises de son
+/// fichier (même relecture que `POST …/rescan`).
+pub(super) async fn champs_tenus_retablir(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if let Err(e) = tune_core::db::champs_tenus::retablir(&state.backend, id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    rescan_track(State(state), Path(id)).await.into_response()
+}
+
 pub(super) async fn quick_fav_track(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
@@ -1575,7 +1601,12 @@ pub(super) async fn track_metadata_get(
 
     let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     match repo.get_all(id) {
-        Ok(meta) => Json(json!(meta)).into_response(),
+        Ok(mut meta) => {
+            // Mémoire interne des champs tenus, pas une balise : elle a sa
+            // route (`…/tenues`).
+            meta.remove(tune_core::db::champs_tenus::CLE);
+            Json(json!(meta)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
