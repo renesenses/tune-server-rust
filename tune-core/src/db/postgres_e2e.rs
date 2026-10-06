@@ -197,6 +197,18 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
     crate::db::coffrets_auto::tests::scenario_complet(&db);
 }
 
+/// Un album sans DISCNUMBER réparti en dossiers frères aux noms libres : LE
+/// MÊME scénario que `dossiers_freres_sans_discnumber_sur_sqlite`, fusion des
+/// doublons comprise, sur le VRAI moteur. `COUNT(DISTINCT expression)`, la
+/// garde `NOT EXISTS` sur `album_metadata` et l'écriture en transaction y
+/// passent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_disques_deduits_des_dossiers_freres() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::disques_par_dossier::tests::scenario_dossiers_freres(&db);
+}
+
 /// #5317 — un coffret né de deux feuilles CUE (pistes sans `file_path`) :
 /// LE MÊME scénario que `cue_deux_disques_sur_sqlite`, écrivain CUE du scan
 /// compris, sur le VRAI moteur. `COALESCE(NULLIF(…), NULLIF(…))` dans
