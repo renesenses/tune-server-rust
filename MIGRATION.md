@@ -215,7 +215,7 @@ Configuration via `tune.toml` or environment variables (env vars take precedence
 | `TUNE_WEB_DIR` | web | Web client directory |
 | `TUNE_ARTWORK_DIR` | artwork_cache | Artwork cache directory |
 | `TUNE_MUSIC_DIRS` | [] | JSON array or comma-separated paths |
-| `TUNE_AUTO_SCAN` | false | Scan music dirs on startup |
+| `TUNE_AUTO_SCAN` | false | Scan music dirs on startup. Overridden by Settings › Library › « Scan library on startup » once the user sets it (setting `library_scan_on_startup`; order: user setting, then `TUNE_AUTO_SCAN` / `auto_scan` in `tune.toml`, then `false`; applies at the next start) |
 | `TUNE_AUTO_UPDATE` | false | Check for new releases every 6 h and record the notice (never installs) |
 | `TUNE_LOG_LEVEL` | info | Log level (trace/debug/info/warn/error) |
 | `QOBUZ_APP_ID` | | Qobuz API app ID |

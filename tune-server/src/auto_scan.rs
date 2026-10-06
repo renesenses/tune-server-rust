@@ -1468,6 +1468,56 @@ fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
 /// forcée a arrêté un scan : il reprend alors en incrémental
 /// (`file_needs_scan` saute les fichiers inchangés).
 pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let voulu = scan_au_demarrage_voulu(auto_scan, db);
+    if voulu != auto_scan {
+        info!(
+            voulu,
+            deploiement = auto_scan,
+            "auto_scan_regle_par_l_utilisateur — le réglage « library_scan_on_startup » prime sur la configuration de déploiement"
+        );
+    }
+    scan_au_demarrage_ou_reprise(voulu, db)
+}
+
+/// Réglage utilisateur « Analyser la bibliothèque au démarrage »
+/// (Réglages › Bibliothèque), rangé dans la table `settings`.
+///
+/// Ordre de précédence, du plus fort au plus faible :
+///
+/// 1. ce réglage, s'il a été posé (`"true"` ou `"false"`) ;
+/// 2. sinon la configuration de déploiement : `TUNE_AUTO_SCAN`, ou
+///    `auto_scan` dans `tune.toml` (`config.auto_scan`) ;
+/// 3. sinon `false`, le défaut du binaire.
+///
+/// Une installation où personne n'a touché à l'interrupteur n'a pas la ligne :
+/// elle garde donc exactement le comportement de sa configuration. La valeur
+/// est lue au démarrage ; la changer prend effet au démarrage suivant.
+pub const CLE_SCAN_AU_DEMARRAGE: &str = "library_scan_on_startup";
+
+/// Le choix de l'utilisateur, lu dans la valeur brute de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `None` : pas de choix lisible, la configuration
+/// de déploiement décide.
+pub fn choix_utilisateur_scan_au_demarrage(brut: Option<&str>) -> Option<bool> {
+    let texte = brut?.trim().trim_matches('"').trim().to_ascii_lowercase();
+    match texte.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Le scan de démarrage voulu, selon l'ordre de précédence de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `auto_scan` est la valeur de déploiement.
+pub fn scan_au_demarrage_voulu(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(CLE_SCAN_AU_DEMARRAGE)
+        .ok()
+        .flatten();
+    choix_utilisateur_scan_au_demarrage(brut.as_deref()).unwrap_or(auto_scan)
+}
+
+/// Le scan voulu, ou la reprise d'un scan arrêté par une mise à jour (#5531).
+fn scan_au_demarrage_ou_reprise(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
     if auto_scan {
         return true;
     }
@@ -3593,3 +3643,7 @@ mod surveillant_annonces_tests_2134;
 #[cfg(test)]
 #[path = "coffret_auto_relu_tests_2094.rs"]
 mod coffret_auto_relu_tests_2094;
+
+#[cfg(test)]
+#[path = "scan_au_demarrage_reglage_tests.rs"]
+mod scan_au_demarrage_reglage_tests;

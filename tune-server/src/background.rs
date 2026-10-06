@@ -69,7 +69,14 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
-    crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
+    //
+    // Le drapeau dit « un scan de démarrage a été voulu » : il suit donc le
+    // même ordre de précédence que `bootstrap` (réglage utilisateur, puis
+    // `config.auto_scan`), par la même fonction.
+    crate::routes::system::scan::spawn_scan_scheduler(
+        state.clone(),
+        crate::auto_scan::scan_au_demarrage_voulu(config.auto_scan, &state.backend),
+    );
     // Vérificateur périodique de mises à jour (#3217). Même défaut que la ligne
     // ci-dessus, et même remède : `UpdateChecker::spawn_periodic` n'avait qu'UNE
     // occurrence dans tout le dépôt — sa définition — et `TUNE_AUTO_UPDATE`

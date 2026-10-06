@@ -453,6 +453,36 @@ pub(super) async fn get_config(
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
+    // « Analyser la bibliothèque au démarrage » (Réglages › Bibliothèque) :
+    // la valeur qui vaudra au PROCHAIN démarrage, selon l'ordre de précédence
+    // de `auto_scan::CLE_SCAN_AU_DEMARRAGE` — le choix de l'utilisateur, sinon
+    // la configuration de déploiement (`TUNE_AUTO_SCAN`, `tune.toml`), sinon
+    // `false`. Toujours publiée : un client y lit que le serveur connaît le
+    // réglage. `_source` dit qui décide : `user` ou `deployment`.
+    {
+        use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+        let choix = choix_utilisateur_scan_au_demarrage(
+            config
+                .get(CLE_SCAN_AU_DEMARRAGE)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(
+            CLE_SCAN_AU_DEMARRAGE.to_string(),
+            json!(choix.unwrap_or(state.config.auto_scan)),
+        );
+        config.insert(
+            format!("{CLE_SCAN_AU_DEMARRAGE}_source"),
+            json!(if choix.is_some() {
+                "user"
+            } else {
+                "deployment"
+            }),
+        );
+    }
     // #5519 — combien de fichiers chaque vitesse décode à la fois SUR CETTE
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
@@ -1192,6 +1222,38 @@ fn normaliser_plafond_aleatoire(
     Ok(())
 }
 
+/// « Analyser la bibliothèque au démarrage » : un booléen (ou `"true"` /
+/// `"false"`), écrit normalisé ; `null` efface le choix et rend la décision à
+/// la configuration de déploiement. Toute autre valeur est REFUSÉE. Rend
+/// `Some(())` quand le choix est à effacer.
+fn normaliser_scan_au_demarrage(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<()>, AppError> {
+    use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+    let Some(brut) = values.get(CLE_SCAN_AU_DEMARRAGE) else {
+        return Ok(None);
+    };
+    if brut.is_null() {
+        values.remove(CLE_SCAN_AU_DEMARRAGE);
+        return Ok(Some(()));
+    }
+    let choix = match brut {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => choix_utilisateur_scan_au_demarrage(Some(s)),
+        _ => None,
+    };
+    let Some(choix) = choix else {
+        return Err(AppError::bad_request(format!(
+            "{CLE_SCAN_AU_DEMARRAGE} attend true, false ou null"
+        )));
+    };
+    values.insert(
+        CLE_SCAN_AU_DEMARRAGE.to_string(),
+        Value::String(choix.to_string()),
+    );
+    Ok(None)
+}
+
 /// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
 /// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
 /// après l'écriture.
@@ -1269,6 +1331,7 @@ pub(super) async fn update_config(
     normaliser_vitesse_des_analyses(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
+    let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1404,6 +1467,14 @@ pub(super) async fn update_config(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
         cles_posees.push(key);
+    }
+    if scan_au_demarrage_efface {
+        let cle = crate::auto_scan::CLE_SCAN_AU_DEMARRAGE;
+        if let Err(e) = settings.delete(cle) {
+            tracing::error!(reglage = %cle, erreur = %e, "reglage_non_efface");
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
+        }
+        cles_posees.push(cle.to_string());
     }
     // #5593 — le total de la jauge ReplayGain est compté UNE fois, à
     // l'ouverture de la campagne. Un périmètre changé en cours de route le

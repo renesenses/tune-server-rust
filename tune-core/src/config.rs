@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 pub struct TuneConfig {
     // Library
     pub music_dirs: Vec<String>,
+    /// ⚠️ Ne pilote RIEN, comme `auto_update` plus bas : cette structure n'est
+    /// pas celle que le serveur charge. Le scan de démarrage se décide dans
+    /// `tune_server::auto_scan::scan_au_demarrage` — réglage
+    /// `library_scan_on_startup`, sinon `auto_scan` (`TUNE_AUTO_SCAN`,
+    /// `tune.toml`), sinon `false`. `TUNE_SCAN_ON_STARTUP` est sans effet.
     pub scan_on_startup: bool,
     pub scan_schedule: Option<String>,
     pub quality_split: bool,
