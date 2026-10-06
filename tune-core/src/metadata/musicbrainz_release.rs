@@ -155,6 +155,27 @@ pub struct MBTrack {
     /// Set only when the track credits someone other than the release artist —
     /// the useful case being a compilation.
     pub artist: Option<String>,
+    /// Les artistes crédités sur la piste, un par entrée, avec leur MBID
+    /// (#4805, étape B). `#[serde(skip)]` : ce champ ne sert qu'à rattacher
+    /// les artistes en base, et n'entre pas dans les réponses JSON qui
+    /// sérialisent déjà les pistes (`/ingest/release-tracks`).
+    #[serde(skip)]
+    pub artist_credits: Vec<CreditArtiste>,
+}
+
+/// Un artiste crédité par MusicBrainz, réduit à ce qui sert à le rattacher à
+/// une fiche locale (#4805, étape B).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreditArtiste {
+    /// Le MBID de l'artiste (`artist-credit[].artist.id`).
+    pub mbid: String,
+    /// Le nom de la fiche MusicBrainz (`artist.name`).
+    pub nom: String,
+    /// Le nom sous lequel il est crédité ici (`artist-credit[].name`), qui
+    /// peut différer : « Karajan » pour « Herbert von Karajan ».
+    pub nom_credite: String,
+    /// Le nom de tri de la fiche (`artist.sort-name`), « Beatles, The ».
+    pub nom_de_tri: String,
 }
 
 /// A release with its track listing.
@@ -170,6 +191,10 @@ pub struct MBReleaseDetail {
     pub catalog_number: Option<String>,
     pub disc_count: u32,
     pub tracks: Vec<MBTrack>,
+    /// Les artistes crédités sur le pressage, avec leur MBID (#4805, étape B).
+    /// Même raison que [`MBTrack::artist_credits`] pour le `#[serde(skip)]`.
+    #[serde(skip)]
+    pub artist_credits: Vec<CreditArtiste>,
 }
 
 /// Casse, ponctuation et espaces neutralisés. Partagée avec la passe AcoustID
@@ -221,6 +246,27 @@ fn artist_credit(v: &Value) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Les entrées d'un tableau `artist-credit` qui portent un MBID (#4805,
+/// étape B). Une entrée sans `artist.id` ne rattache rien et n'est pas rendue.
+pub fn credits_d_artiste(v: &Value) -> Vec<CreditArtiste> {
+    let Some(credits) = v.get("artist-credit").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    credits
+        .iter()
+        .filter_map(|credit| {
+            let artiste = credit.get("artist")?;
+            let mbid = str_field(artiste, "id")?;
+            Some(CreditArtiste {
+                mbid,
+                nom: str_field(artiste, "name").unwrap_or_default(),
+                nom_credite: str_field(credit, "name").unwrap_or_default(),
+                nom_de_tri: str_field(artiste, "sort-name").unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Does this search hit plausibly refer to what we asked for?
@@ -397,6 +443,14 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
                         .and_then(|l| l.as_u64())
                 });
                 let credited = artist_credit(track);
+                // Le crédit de la PISTE d'abord ; celui de l'enregistrement à
+                // défaut, que certaines réponses sont seules à porter.
+                let mut artist_credits = credits_d_artiste(track);
+                if artist_credits.is_empty() {
+                    if let Some(r) = recording {
+                        artist_credits = credits_d_artiste(r);
+                    }
+                }
 
                 tracks.push(MBTrack {
                     position: track
@@ -414,6 +468,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
                     } else {
                         Some(credited)
                     },
+                    artist_credits,
                 });
             }
         }
@@ -430,6 +485,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
         catalog_number,
         disc_count: media.map(|m| m.len() as u32).unwrap_or(0),
         tracks,
+        artist_credits: credits_d_artiste(data),
     })
 }
 

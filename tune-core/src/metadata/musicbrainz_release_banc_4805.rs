@@ -570,3 +570,421 @@ async fn enregistrer() {
     )
     .expect("écriture de la fixture");
 }
+
+// ---- Étape B : le MBID des artistes, tiré du pressage identifié ----------
+//
+// Sur les MÊMES albums et les MÊMES réponses de recherche : pour chaque album
+// identifié par la chaîne d'après, le pressage retenu (le premier candidat,
+// celui que garde `identifier_album`) est relu dans une seconde fixture, qui
+// porte la réponse `/release/{id}?inc=recordings+artist-credits+labels` —
+// exactement la requête que `identifier_album` fait déjà. Aucune requête de
+// plus en service : la fixture ne fait que figer cette réponse.
+//
+// Pour la réenregistrer (une requête par album identifié, 1 / 1,1 s) :
+//
+// ```text
+// TUNE_BANC_4805B_ENREGISTRER=1 cargo test -p tune-core --lib \
+//     banc_4805::enregistrer_les_pressages -- --ignored --nocapture
+// ```
+
+fn chemin_fixture_pressages() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/musicbrainz/banc_artistes_4805.json")
+}
+
+/// Réduit un `artist-credit` aux champs que lit le rattachement.
+fn reduire_credit(v: &Value) -> Option<Value> {
+    let ac = v.get("artist-credit")?.as_array()?;
+    Some(Value::Array(
+        ac.iter()
+            .map(|c| {
+                let a = c.get("artist").cloned().unwrap_or(Value::Null);
+                json!({
+                    "name": c.get("name").cloned().unwrap_or(Value::Null),
+                    "joinphrase": c.get("joinphrase").cloned().unwrap_or(json!("")),
+                    "artist": {
+                        "id": a.get("id").cloned().unwrap_or(Value::Null),
+                        "name": a.get("name").cloned().unwrap_or(Value::Null),
+                        "sort-name": a.get("sort-name").cloned().unwrap_or(Value::Null),
+                    },
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// Réduit une réponse `/release/{id}` aux champs que lisent
+/// [`super::parse_release_detail`] et le rattachement des artistes.
+fn reduire_detail(data: &Value) -> Value {
+    let mut o = serde_json::Map::new();
+    for k in ["id", "title", "date", "country"] {
+        if let Some(v) = data.get(k) {
+            o.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(ac) = reduire_credit(data) {
+        o.insert("artist-credit".into(), ac);
+    }
+    let media: Vec<Value> = data
+        .get("media")
+        .and_then(|m| m.as_array())
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    let pistes: Vec<Value> = m
+                        .get("tracks")
+                        .and_then(|t| t.as_array())
+                        .map(|ts| {
+                            ts.iter()
+                                .map(|t| {
+                                    let mut p = serde_json::Map::new();
+                                    for k in ["position", "number", "title"] {
+                                        if let Some(v) = t.get(k) {
+                                            p.insert(k.into(), v.clone());
+                                        }
+                                    }
+                                    if let Some(ac) = reduire_credit(t) {
+                                        p.insert("artist-credit".into(), ac);
+                                    }
+                                    if let Some(r) = t.get("recording") {
+                                        p.insert(
+                                            "recording".into(),
+                                            json!({ "id": r.get("id"), "title": r.get("title") }),
+                                        );
+                                    }
+                                    Value::Object(p)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({ "position": m.get("position"), "tracks": pistes })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    o.insert("media".into(), Value::Array(media));
+    Value::Object(o)
+}
+
+/// Le pressage retenu pour chaque album identifié par la chaîne d'après,
+/// rejouée sur la fixture de recherche : `(index dans ALBUMS, release_id)`.
+async fn pressages_retenus(reponses: &BTreeMap<String, Value>) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, &(_, titre, album, pistes, n)) in ALBUMS.iter().enumerate() {
+        let artiste = artiste_de_requete(Some(album), pistes);
+        let r =
+            recherche_de_pressages(titre, &artiste, Some(n), CANDIDATS, rejouer(reponses)).await;
+        if let Some(m) = r.meilleur() {
+            out.push((i, m.release_id));
+        }
+    }
+    out
+}
+
+fn reponses_de_recherche() -> BTreeMap<String, Value> {
+    let brut = std::fs::read_to_string(chemin_fixture()).expect("fixture du banc #4805");
+    let fixture: Value = serde_json::from_str(&brut).expect("fixture JSON");
+    serde_json::from_value(fixture["reponses"].clone()).expect("reponses")
+}
+
+/// MBID connus, relevés À LA MAIN sur musicbrainz.org et non tirés de la
+/// fixture : ils vérifient que le rattachement pose le BON identifiant, et
+/// pas seulement un identifiant.
+const MBID_ATTENDUS: &[(&str, &str)] = &[
+    ("Miles Davis", "561d854a-6a28-4aa7-8c99-323e6ce46c2a"),
+    ("John Coltrane", "b625448e-bf4a-41c3-a421-72ad46cdb831"),
+    ("Pink Floyd", "83d91898-7763-47d7-b03b-b92132375c47"),
+    ("The Beatles", "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"),
+    ("Radiohead", "a74b1b7f-71a5-4011-9441-d0b5e4122711"),
+    ("Nirvana", "5b11f4ce-a62d-471e-81fc-a69a8278c7da"),
+];
+
+/// 🔴 Le banc de l'étape B. Une bibliothèque synthétique — une fiche par
+/// artiste distinct (au sens de `cle_artiste`), un album par ligne de
+/// `ALBUMS`, ses pistes calquées sur le pressage (titres et rangs) — puis, pour
+/// chaque album identifié, le rattachement tel que l'appelle
+/// `identifier_album`. Mesure : la part des fiches munies d'un MBID, avant et
+/// après.
+/// La bibliothèque synthétique du banc de l'étape B, AVANT rattachement :
+/// une fiche par artiste distinct (au sens de `cle_artiste`), un album par
+/// ligne de `ALBUMS`, et pour chaque album identifié ses pistes calquées sur
+/// le pressage retenu. Rend la base et, par album identifié, de quoi
+/// rejouer le rattachement : `(album_id, pressage, pistes locales)`.
+/// Partagée avec le banc de l'étape C.
+pub(super) async fn bibliotheque_du_banc_b() -> (
+    std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    Vec<(
+        i64,
+        super::MBReleaseDetail,
+        Vec<crate::metadata::reidentify::LocalTrack>,
+    )>,
+) {
+    use std::sync::Arc;
+
+    use crate::db::artist_repo::cle_artiste;
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::metadata::reidentify::LocalTrack;
+
+    let brut = std::fs::read_to_string(chemin_fixture_pressages()).expect("fixture des pressages");
+    let fixture: Value = serde_json::from_str(&brut).expect("fixture JSON");
+    let pressages: BTreeMap<String, Value> =
+        serde_json::from_value(fixture["pressages"].clone()).expect("pressages");
+    let retenus = pressages_retenus(&reponses_de_recherche()).await;
+
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+    // Une fiche par artiste distinct, comme le scan les dédoublonne.
+    let mut fiches: BTreeMap<String, i64> = BTreeMap::new();
+    let mut fiche = |nom: &str| -> i64 {
+        let n = fiches.len() as i64 + 1;
+        let id = *fiches.entry(cle_artiste(nom)).or_insert(n);
+        if id == n {
+            backend
+                .execute(
+                    "INSERT INTO artists (id, name) VALUES (?, ?)",
+                    &[&id as &dyn ToSqlValue, &nom.to_string() as &dyn ToSqlValue],
+                )
+                .unwrap();
+        }
+        id
+    };
+
+    // Les albums, et pour les identifiés leurs pistes calquées sur le pressage.
+    let mut details = Vec::new();
+    let mut piste_id = 1000i64;
+    for (i, &(_, titre, album, pistes, n)) in ALBUMS.iter().enumerate() {
+        let album_id = i as i64 + 1;
+        let aid = fiche(album);
+        let pid = pistes.map(&mut fiche).unwrap_or(aid);
+        backend
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (?, ?, ?)",
+                &[
+                    &album_id as &dyn ToSqlValue,
+                    &titre.to_string() as &dyn ToSqlValue,
+                    &aid as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        let Some((_, rid)) = retenus.iter().find(|(j, _)| *j == i) else {
+            continue;
+        };
+        let data = pressages
+            .get(rid)
+            .unwrap_or_else(|| panic!("pressage {rid} non enregistré : réenregistrer"));
+        let detail = super::parse_release_detail(data).expect("détail");
+        let mut locales = Vec::new();
+        for t in detail.tracks.iter().take(n as usize) {
+            piste_id += 1;
+            backend
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    &[
+                        &piste_id as &dyn ToSqlValue,
+                        &t.title as &dyn ToSqlValue,
+                        &album_id as &dyn ToSqlValue,
+                        &pid as &dyn ToSqlValue,
+                        &(t.disc as i64) as &dyn ToSqlValue,
+                        &(t.position as i64) as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+            locales.push(LocalTrack {
+                id: piste_id,
+                disc: t.disc as i32,
+                position: t.position as i32,
+                title: t.title.clone(),
+            });
+        }
+        details.push((album_id, detail, locales));
+    }
+    (backend, details)
+}
+
+#[tokio::test(start_paused = true)]
+async fn banc_artistes_4805_avant_apres() {
+    use std::sync::Arc;
+
+    use crate::db::artist_repo::cle_artiste;
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::metadata::artistes_du_pressage::rattacher_les_artistes_de_l_album;
+    use crate::metadata::reidentify::map_recording_ids;
+
+    let (backend, details) = bibliotheque_du_banc_b().await;
+
+    let compter = |backend: &Arc<dyn DbBackend>| -> (i64, i64) {
+        let l = backend
+            .query_one(
+                "SELECT COUNT(*), SUM(CASE WHEN TRIM(COALESCE(musicbrainz_id, '')) <> '' \
+                 THEN 1 ELSE 0 END) FROM artists",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        (
+            l[0].as_i64().unwrap_or(0),
+            l.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+        )
+    };
+    let (total, avant) = compter(&backend);
+
+    // « Avant » : la chaîne d'avant identifie l'album et ne touche à aucune
+    // fiche d'artiste. « Après » : le rattachement, album par album.
+    let (mut ambigus, mut desaccords, mut deja, mut sans, mut ecartes, mut refuses) =
+        (0, 0, 0, 0, 0, 0);
+    for (album_id, detail, locales) in &details {
+        let recordings = map_recording_ids(locales, &detail.tracks);
+        let b = rattacher_les_artistes_de_l_album(&backend, *album_id, detail, &recordings)
+            .expect("rattachement");
+        let titre = ALBUMS[*album_id as usize - 1].1;
+        println!(
+            "{titre:<58} écrits={} déjà={} désaccords={} ambigus={} sans={} écartés={} refusés={}",
+            b.ecrits,
+            b.deja_poses,
+            b.desaccords,
+            b.ambigus,
+            b.sans_correspondance,
+            b.ecartes,
+            b.refuses_par_la_base
+        );
+        ambigus += b.ambigus;
+        desaccords += b.desaccords;
+        deja += b.deja_poses;
+        sans += b.sans_correspondance;
+        ecartes += b.ecartes;
+        refuses += b.refuses_par_la_base;
+    }
+    let (_, apres) = compter(&backend);
+
+    let taux = |n: i64| 100.0 * n as f64 / total.max(1) as f64;
+    println!(
+        "\nalbums identifiés : {}/{}\nfiches d'artiste munies d'un MBID : avant {avant}/{total} \
+         ({:.1} %), après {apres}/{total} ({:.1} %)\nconfirmations (album suivant du même \
+         artiste) : {deja} · désaccords : {desaccords} · ambigus : {ambigus} · sans \
+         correspondance : {sans} · écartés : {ecartes} · refusés par la base : {refuses}",
+        details.len(),
+        ALBUMS.len(),
+        taux(avant),
+        taux(apres),
+    );
+
+    // Les fiches restées sans MBID, nommément : c'est le reliquat de l'étape C.
+    let restes = backend
+        .query_many(
+            "SELECT name FROM artists WHERE TRIM(COALESCE(musicbrainz_id, '')) = '' ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    let restes: Vec<String> = restes
+        .iter()
+        .filter_map(|l| l.first().and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    println!("restées sans MBID : {restes:?}");
+
+    assert_eq!(avant, 0, "la bibliothèque synthétique part sans aucun MBID");
+    assert!(
+        apres > avant,
+        "le taux d'artistes munis d'un MBID n'a pas monté : avant {avant}/{total}, après \
+         {apres}/{total}"
+    );
+    for (nom, attendu) in MBID_ATTENDUS {
+        let l = backend
+            .query_one(
+                "SELECT musicbrainz_id FROM artists WHERE name = ?",
+                &[&nom.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("fiche {nom} absente du banc"));
+        assert_eq!(
+            l.first().and_then(|v| v.as_str()),
+            Some(*attendu),
+            "{nom} : mauvais MBID, ou aucun"
+        );
+    }
+    // Les fiches fictives et les alias de compilation ne reçoivent rien.
+    let munies = backend
+        .query_many(
+            "SELECT name FROM artists WHERE TRIM(COALESCE(musicbrainz_id, '')) <> ''",
+            &[],
+        )
+        .unwrap();
+    for l in &munies {
+        let nom = l.first().and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(
+            !super::est_un_artiste_fictif(nom)
+                && !["va", "artistes divers", "various artists"]
+                    .contains(&cle_artiste(nom).as_str()),
+            "{nom} a reçu un MBID"
+        );
+    }
+}
+
+/// Enregistre le détail du pressage retenu pour chaque album identifié — À LA
+/// MAIN seulement, `TUNE_BANC_4805B_ENREGISTRER=1`. Une requête / 1,1 s,
+/// User-Agent Tune, la requête même d'`identifier_album`.
+#[tokio::test]
+#[ignore = "réseau : réenregistre la fixture des pressages du banc #4805"]
+async fn enregistrer_les_pressages() {
+    if std::env::var("TUNE_BANC_4805B_ENREGISTRER").as_deref() != Ok("1") {
+        eprintln!("TUNE_BANC_4805B_ENREGISTRER=1 absent : rien n'est enregistré");
+        return;
+    }
+    let retenus = pressages_retenus(&reponses_de_recherche()).await;
+    let mut pressages: BTreeMap<String, Value> = BTreeMap::new();
+    for (_, rid) in retenus {
+        if pressages.contains_key(&rid) {
+            continue;
+        }
+        let mut v = json!({ "refus": 503 });
+        for essai in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            match super::mb_get(
+                &format!("release/{rid}"),
+                &[
+                    ("inc", "recordings+artist-credits+labels".to_string()),
+                    ("fmt", "json".to_string()),
+                ],
+            )
+            .await
+            {
+                Ok(data) => {
+                    v = reduire_detail(&data);
+                    break;
+                }
+                Err(RefusMusicBrainz::Statut(503)) if essai < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Err(e) => {
+                    v = json!({ "refus": e.to_string() });
+                    break;
+                }
+            }
+        }
+        eprintln!("enregistré : release/{rid}");
+        pressages.insert(rid, v);
+    }
+    let fixture = json!({
+        "methode": "Banc #4805, étape B : pour chaque album identifié par la chaîne d'après \
+                    (fixture banc_identification_4805.json), le pressage retenu lu par \
+                    /release/{id}?inc=recordings+artist-credits+labels, la requête même \
+                    d'identifier_album. 1 requête / 1,1 s, User-Agent TuneServer. Réponses \
+                    réduites aux champs lus par parse_release_detail.",
+        "enregistre_le": "2026-10-05",
+        "pressages": pressages,
+    });
+    std::fs::write(
+        chemin_fixture_pressages(),
+        serde_json::to_string_pretty(&fixture).expect("JSON") + "\n",
+    )
+    .expect("écriture de la fixture");
+}
+
+// #4805, étape C : la passe artistes par le réseau, sur cette bibliothèque.
+#[path = "musicbrainz_release_banc_4805_c.rs"]
+mod banc_c;

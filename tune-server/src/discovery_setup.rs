@@ -59,6 +59,24 @@ pub(crate) fn urls_evenements_dlna(
         .collect()
 }
 
+/// #5793 — l'URL absolue du SCPD de `RenderingControl` d'un appareil
+/// découvert, si son descriptif l'annonce (capacité `scpd_urls`, posée par
+/// `ssdp::build_renderer_device`).
+pub(crate) fn scpd_rendering_control(
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<String> {
+    let urls = dev
+        .capabilities
+        .get("scpd_urls")
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
+        .unwrap_or_default();
+    urls.get("renderingcontrol")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
@@ -840,7 +858,8 @@ async fn handle_ssdp_discovered(
                 oh_listener.clone(),
                 urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
             )
-            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id));
+            .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id))
+            .with_rendering_control_scpd(scpd_rendering_control(dev));
             let mut reg = outputs.lock().await;
             register_discovered_output(
                 &mut reg,

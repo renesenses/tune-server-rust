@@ -591,6 +591,30 @@ pub async fn handle_stream(
 
     let finite_range_start = range_demande.filter(|s| longueur.is_none_or(|len| *s < len));
     let use_partial = finite_range_start.is_some() && longueur.is_some();
+    // ── La borne de fin d'un `Range: bytes=N-M` ──
+    //
+    // Elle était lue nulle part : `bytes=2000044-2001043` (curl sur le .18,
+    // 05/10) recevait un 206 `bytes 2000044-<fin>/<taille>` et TOUT le reste
+    // du flux, au lieu des 1 000 octets demandés. RFC 9110 §14.2 : la réponse
+    // 206 porte les octets qui « correspondent » à la tranche demandée. Le
+    // `Content-Range` disait vrai sur ce qui partait, mais ce n'était pas ce
+    // qui était demandé — et un client qui lit sa tranche puis ferme laissait
+    // dans la connexion des octets tirés du tuyau pour rien.
+    //
+    // La tranche est bornée À LA FIN DU CORPS, pas dans la boucle : ce que la
+    // boucle a tiré du canal au-delà de M est déjà dans la retenue, et la
+    // tranche suivante (`bytes=M+1-…`) y est servie à l'octet (#5426) — là
+    // où la retenue existe ; ailleurs, la reprise suit déjà le tuyau.
+    // `M` au-delà du dernier octet revient à `bytes=N-` ; `M < N` rend la
+    // spec invalide (§14.1.2) et on garde l'ancien comportement.
+    let fin_de_tranche: Option<u64> = match (finite_range_start, longueur) {
+        (Some(debut), Some(len)) => req_headers
+            .get("Range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_range_end)
+            .filter(|fin| *fin >= debut && *fin < len - 1),
+        _ => None,
+    };
 
     // Pas d'`Accept-Ranges` sur une conversion : ce serait inviter le renderer
     // à seeker un tuyau. Le contrat annoncé est celui de la DIDL et du HEAD :
@@ -606,10 +630,11 @@ pub async fn handle_stream(
         );
         match finite_range_start {
             Some(start) => {
-                headers.insert("Content-Length", HeaderValue::from(len - start));
+                let fin = fin_de_tranche.unwrap_or(len - 1);
+                headers.insert("Content-Length", HeaderValue::from(fin - start + 1));
                 headers.insert(
                     "Content-Range",
-                    HeaderValue::from_str(&format!("bytes {start}-{}/{}", len - 1, len)).unwrap(),
+                    HeaderValue::from_str(&format!("bytes {start}-{fin}/{len}")).unwrap(),
                 );
             }
             None => {
@@ -1334,6 +1359,12 @@ pub async fn handle_stream(
             }
         }
     };
+    let flux = borner_le_corps(
+        flux,
+        fin_de_tranche
+            .zip(finite_range_start)
+            .map(|(fin, debut)| fin - debut + 1),
+    );
     let flux = futures_util::StreamExt::map(flux, move |morceau| {
         if let (Ok(o), Some(b)) = (&morceau, bilan.as_mut()) {
             b.octets_envoyes += o.len() as u64;
@@ -2204,6 +2235,57 @@ fn build_file_body(
     })
 }
 
+/// Borne de fin INCLUSE d'un `Range: bytes=N-M` : `M`. `None` pour
+/// `bytes=N-`, un suffixe `bytes=-N` ou une valeur mal formée. Seule la
+/// première tranche compte, comme pour [`parse_range_start`].
+fn parse_range_end(range: &str) -> Option<u64> {
+    let spec = range.strip_prefix("bytes=")?.split(',').next()?;
+    let (debut, fin) = spec.split_once('-')?;
+    if debut.trim().is_empty() {
+        return None;
+    }
+    fin.trim().parse::<u64>().ok()
+}
+
+/// Arrête le corps après `limite` octets — le dernier morceau est coupé à
+/// l'octet. `None` : le corps passe tel quel. Le flux amont est lâché dès la
+/// limite atteinte : il rend le canal, et sa sentinelle part avec lui.
+///
+/// hyper coupe déjà l'écriture au `Content-Length` annoncé : sur le fil, le
+/// client reçoit ses octets avec ou sans cette borne. Elle sert à ce que
+/// mesurent `bytes_sent` (le poller y lit si le renderer tire encore) et
+/// `stream_connexion_terminee octets_envoyes` : sans elle, ils comptaient le
+/// bloc de 64 Kio entier pour une tranche de 1 000 octets.
+fn borner_le_corps<S>(
+    flux: S,
+    limite: Option<u64>,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        let mut flux = Box::pin(flux);
+        let mut reste = limite;
+        while let Some(morceau) = futures_util::StreamExt::next(&mut flux).await {
+            match (morceau, reste) {
+                (Ok(octets), Some(r)) if octets.len() as u64 >= r => {
+                    yield Ok(octets.slice(..r as usize));
+                    break;
+                }
+                (Ok(octets), Some(r)) => {
+                    reste = Some(r - octets.len() as u64);
+                    yield Ok(octets);
+                }
+                (morceau, None) => yield morceau,
+                (Err(e), Some(_)) => {
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Parse the start byte of an HTTP `Range` header value like `bytes=N-` or
 /// `bytes=N-M`. Returns `None` for an open `bytes=-N` (suffix) range or a
 /// malformed value.
@@ -2883,7 +2965,7 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 mod tests {
     use super::{
         ICY_METAINT, accepts_chunked_live_stream, corps_compte, decalage_de_trame, decoupe_icy,
-        parse_range_start,
+        parse_range_end, parse_range_start,
     };
 
     /// #4455 — la grille des trames d'un WAV 24 bits stéréo (6 octets) après
@@ -3867,6 +3949,54 @@ mod tests {
         assert_eq!(parse_range_start("bytes=-500"), None);
         assert_eq!(parse_range_start("bytes=abc-"), None);
         assert_eq!(parse_range_start("chunks=0-"), None);
+    }
+
+    #[tokio::test]
+    async fn le_corps_borne_s_arrete_a_l_octet_et_lache_l_amont() {
+        use super::borner_le_corps;
+        use futures_util::StreamExt;
+        let morceaux = |tailles: &[usize]| {
+            tailles
+                .iter()
+                .map(|&n| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; n])))
+                .collect::<Vec<_>>()
+        };
+        let longueurs = |v: Vec<Result<bytes::Bytes, std::io::Error>>| {
+            v.into_iter().map(|m| m.unwrap().len()).collect::<Vec<_>>()
+        };
+        // Coupé dans le deuxième morceau ; l'amont n'est plus tiré ensuite
+        // (le troisième élément paniquerait s'il l'était).
+        let amont =
+            futures_util::stream::iter(morceaux(&[3, 4])).chain(futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+                    panic!("l'amont ne doit plus être tiré une fois la borne atteinte")
+                },
+            ));
+        let v: Vec<_> = borner_le_corps(amont, Some(5)).collect().await;
+        assert_eq!(longueurs(v), vec![3, 2]);
+        // Borne pile sur une frontière de morceau.
+        let v: Vec<_> = borner_le_corps(futures_util::stream::iter(morceaux(&[3, 4, 5])), Some(7))
+            .collect()
+            .await;
+        assert_eq!(longueurs(v), vec![3, 4]);
+        // Sans borne : tout passe.
+        let v: Vec<_> = borner_le_corps(futures_util::stream::iter(morceaux(&[3, 4, 5])), None)
+            .collect()
+            .await;
+        assert_eq!(longueurs(v), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn parse_range_end_cases() {
+        // La tranche fermée du .18 (curl, 05/10) : 1 000 octets.
+        assert_eq!(parse_range_end("bytes=2000044-2001043"), Some(2_001_043));
+        assert_eq!(parse_range_end("bytes=0-1"), Some(1));
+        assert_eq!(parse_range_end("bytes=100-200, 300-400"), Some(200));
+        // Ouverte, suffixe, mal formée : pas de borne de fin.
+        assert_eq!(parse_range_end("bytes=0-"), None);
+        assert_eq!(parse_range_end("bytes=-500"), None);
+        assert_eq!(parse_range_end("bytes=10-abc"), None);
+        assert_eq!(parse_range_end("chunks=0-9"), None);
     }
 
     // ───────────────────────── #2161 — le titre d'une radio ─────────────────

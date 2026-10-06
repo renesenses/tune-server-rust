@@ -2,6 +2,7 @@
 pub mod acoustid_picard;
 pub mod artist_enrichment;
 pub mod artist_split;
+pub mod artistes_du_pressage;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
@@ -9,6 +10,7 @@ pub mod coffrets;
 pub mod credits_mb;
 pub mod credits_release;
 pub mod disques_abimes;
+pub mod ecriture_fichiers;
 pub mod empreinte_audio;
 pub mod enrich_scope;
 pub mod enrichment;
@@ -23,6 +25,8 @@ pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
 pub mod suggestions;
+// Le MBID des artistes par une recherche MusicBrainz confirmée (#4805, étape C).
+pub mod artistes_par_le_reseau;
 pub mod tag_writer;
 
 use serde::{Deserialize, Serialize};
@@ -121,6 +125,12 @@ pub struct TrackMetadata {
     /// [`crate::metadata::release_type::depuis_valeurs_de_tag`].
     #[serde(default)]
     pub release_type: Option<String>,
+    /// Section « Live » (05/10/2026) — les types SECONDAIRES MusicBrainz de la
+    /// même balise (`live`, `compilation`, `soundtrack`, `remix`…), séparés
+    /// par `;`, dans le vocabulaire de `albums.release_secondary_types`. Voir
+    /// [`crate::metadata::release_type::colonne_des_secondaires`].
+    #[serde(default)]
+    pub release_secondary_types: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
     /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
@@ -2031,11 +2041,15 @@ fn dsf_dff_fallback_complete(
         (None, None, None, None, None, None)
     };
     // #5616 — `TXXX:MusicBrainz Album Type` (Picard), même vocabulaire.
-    let mb_release_type = id3_tags
+    let mb_type_brut = id3_tags
         .as_ref()
-        .and_then(|tags| tags.get_txxx("MusicBrainz Album Type"))
+        .and_then(|tags| tags.get_txxx("MusicBrainz Album Type"));
+    let mb_release_type = mb_type_brut
         .and_then(|v| release_type::depuis_valeurs_de_tag([v]))
         .map(|t| t.primaire.as_str().to_string());
+    // Section « Live » — les types secondaires de la même trame.
+    let mb_release_secondary_types =
+        mb_type_brut.and_then(|v| release_type::colonne_des_secondaires([v]));
 
     Some(TrackMetadata {
         title,
@@ -2074,6 +2088,7 @@ fn dsf_dff_fallback_complete(
         musicbrainz_album_artist_id: mb_album_artist_id,
         musicbrainz_release_group_id: mb_release_group_id,
         release_type: mb_release_type,
+        release_secondary_types: mb_release_secondary_types,
         isrc,
         has_cover,
         cover_art: None,
@@ -2150,6 +2165,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
         release_type: None,
+        release_secondary_types: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2302,6 +2318,14 @@ fn type_de_sortie_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
         tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
     )
     .map(|t| t.primaire.as_str().to_string())
+}
+
+/// Section « Live » (05/10/2026) — les types SECONDAIRES que porte la même
+/// balise, prêts pour `albums.release_secondary_types` (`live;remix`).
+fn types_secondaires_de_la_balise(tag: &lofty::tag::Tag) -> Option<String> {
+    release_type::colonne_des_secondaires(
+        tag.get_strings(lofty::tag::ItemKey::MusicBrainzReleaseType),
+    )
 }
 
 /// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
@@ -2573,6 +2597,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
         release_type: None,
+        release_secondary_types: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2680,6 +2705,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
         release_type: None,
+        release_secondary_types: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -2755,6 +2781,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_album_artist_id: None,
         musicbrainz_release_group_id: None,
         release_type: None,
+        release_secondary_types: None,
         isrc: None,
         has_cover: false,
         cover_art: None,
@@ -3902,6 +3929,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_album_artist_id: get(ItemKey::MusicBrainzReleaseArtistId),
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
         release_type: type_de_sortie_de_la_balise(tag),
+        release_secondary_types: types_secondaires_de_la_balise(tag),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         // Capture the embedded cover from this same lofty pass so the scanner

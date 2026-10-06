@@ -78,7 +78,9 @@ fn piles_armees() -> bool {
     PILES_ARMEES.load(Ordering::Relaxed)
 }
 
-fn armer_les_piles() {
+/// Armer la capture des piles du détenteur : aussi appelé par le relevé d'un
+/// gel de l'exécuteur, pour que le gel SUIVANT porte la pile (#5677).
+pub fn armer_les_piles() {
     if !PILES_ARMEES.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "ecriture_sqlite_piles_armees — les prochaines prises du verrou d'écriture \

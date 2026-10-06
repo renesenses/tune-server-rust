@@ -333,6 +333,7 @@ fn l_empreinte_complete_l_appariement_sans_le_contredire() {
         length_ms: None,
         recording_id: Some(rid.into()),
         artist: None,
+        artist_credits: Vec::new(),
     };
     let release = [piste(1, "r1"), piste(2, "r2"), piste(3, "r3")];
     let par_place = vec![(10, "r1".to_string())];

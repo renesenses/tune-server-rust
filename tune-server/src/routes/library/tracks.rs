@@ -1606,9 +1606,13 @@ pub(super) async fn track_metadata_put(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    // Write tags to file (best-effort, don't fail the request)
+    // Write tags to file (best-effort, don't fail the request) — seulement si
+    // « Écrire les modifications dans les fichiers audio » est coché
+    // (désactivé par défaut) : sinon la base seule est modifiée.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path
+    if ecrire_fichier
+        && let Some(ref path) = file_path
         && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
     {
         tracing::warn!(
@@ -1620,7 +1624,11 @@ pub(super) async fn track_metadata_put(
         file_write_error = Some(e);
     }
 
-    let mut resp = json!({"status": "ok", "fields": body.len()});
+    let mut resp = json!({
+        "status": "ok",
+        "fields": body.len(),
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+    });
     if let Some(err) = file_write_error {
         resp["file_write_warning"] = json!(err);
     }

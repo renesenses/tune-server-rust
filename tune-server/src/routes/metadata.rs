@@ -551,7 +551,12 @@ pub(crate) async fn edit_track(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if let Some(ref file_path) = track.file_path {
+    // Réglage « Écrire les modifications dans les fichiers audio » —
+    // désactivé par défaut (Bertrand, 05/10/2026) : la piste n'est alors
+    // modifiée qu'en base, le fichier n'est pas ouvert.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
+    let mut fichier_ecrit = false;
+    if ecrire_fichier && let Some(ref file_path) = track.file_path {
         let update = MetadataUpdate {
             title: body.title.clone(),
             artist: body.artist.clone(),
@@ -573,6 +578,7 @@ pub(crate) async fn edit_track(
             )
                 .into_response();
         }
+        fichier_ecrit = true;
     }
 
     if let Some(ref v) = body.title {
@@ -646,7 +652,13 @@ pub(crate) async fn edit_track(
             .into_response();
     }
 
-    Json(json!({ "status": "ok", "track_id": id })).into_response()
+    Json(json!({
+        "status": "ok",
+        "track_id": id,
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+        "file_written": fichier_ecrit,
+    }))
+    .into_response()
 }
 
 async fn write_all_tags_compat(state: State<AppState>) -> impl IntoResponse {

@@ -274,6 +274,136 @@ fn etage_e(fichiers: &[String]) {
     );
 }
 
+/// La pause que la boucle de `replaygain::spawn` marque entre deux tours qui
+/// ont travaillé.
+fn pause_entre_deux_tours(b: &Arc<dyn DbBackend>) -> std::time::Duration {
+    tune_core::audio::replaygain::pause_entre_deux_tours(b)
+}
+
+/// F — LA BOUCLE RÉELLE sur une GRANDE base (#5519, mesure du 05/10).
+///
+/// Ni l'étage B (base de 40 pistes, `analyze_track_batch` seul) ni l'étage C
+/// (requêtes sans fichier) ne disent ce que voit Tades : 528 352 pistes, dont
+/// la plupart déjà analysées, et la boucle de `spawn` qui enchaîne un tour de
+/// cascade, la passe d'albums et sa pause. Ici : `pistes_synth` pistes déjà
+/// analysées (gains de piste et d'album, plage dynamique, empreinte), puis les
+/// vrais fichiers EN QUEUE d'identifiants — c'est l'ordre d'un scan, et le
+/// pire cas de la sélection, qui relit tout ce qui est déjà fait.
+fn etage_f(
+    rt: &tokio::runtime::Runtime,
+    fichiers: &[String],
+    dossier: &std::path::Path,
+    pistes_synth: i64,
+) {
+    use tune_core::audio::replaygain::{TourDeCascade, passe_d_albums_du_tour, un_tour_de_cascade};
+    let vitesses: Vec<String> = std::env::var("BANC_VITESSES")
+        .unwrap_or_else(|_| "normal,fast".into())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    for vitesse in vitesses {
+        let (db, b) = base_sur_disque(dossier, &format!("boucle-{vitesse}.db"));
+        b.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            &[
+                &tune_core::taches_de_fond::vitesse::CLE_REGLAGE as &dyn ToSqlValue,
+                &vitesse.as_str() as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        let albums_synth = pistes_synth / 12 + 1;
+        let marque = format!("{}:-", tune_core::audio::empreinte::VERSION);
+        let t = Instant::now();
+        db.execute_batch(&format!(
+            "BEGIN;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {albums_synth})
+               INSERT INTO albums (id, title) SELECT i, 'a' FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {pistes_synth})
+               INSERT INTO tracks (id, title, album_id, file_path, duration_ms, sample_rate, channels, format, audio_fingerprint)
+               SELECT i, 't', i / 12 + 1, '/nulle/part/' || i || '.flac', 240000, 44100, 2, 'flac', '{marque}' FROM n;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_analyzed', '1' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_track_gain', '-3.00 dB' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_album_gain', '-3.00 dB' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'dr_track', '12' FROM tracks;
+             COMMIT;"
+        ))
+        .expect("base synthetique");
+        let premier_album = albums_synth + 1;
+        for (i, f) in fichiers.iter().enumerate() {
+            let id = pistes_synth + 1 + i as i64;
+            let album = premier_album + i as i64 / 12;
+            b.execute(
+                "INSERT OR IGNORE INTO albums (id, title) VALUES (?, 'r')",
+                &[&album as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.execute(
+                "INSERT INTO tracks (id, title, album_id, file_path, duration_ms, sample_rate, channels, format) \
+                 VALUES (?, 't', ?, ?, 240000, 44100, 2, 'flac')",
+                &[&id as &dyn ToSqlValue, &album as &dyn ToSqlValue, f as &dyn ToSqlValue],
+            )
+            .unwrap();
+        }
+        let _ = db.execute_batch("ANALYZE;");
+        println!(
+            "F — {vitesse:<8} base de {pistes_synth} pistes analysees + {} a faire (remplissage {:.1} s, hors mesure)",
+            fichiers.len(),
+            t.elapsed().as_secs_f64()
+        );
+        let largeur = tune_core::taches_de_fond::vitesse::largeur_courante(&b);
+        let (mut t_cascade, mut t_album, mut t_pause) = (0.0, 0.0, 0.0);
+        let (mut tours, mut total) = (0usize, 0usize);
+        let debut = Instant::now();
+        loop {
+            let t0 = Instant::now();
+            let tour = rt.block_on(un_tour_de_cascade(&b));
+            t_cascade += t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let albums = rt.block_on(passe_d_albums_du_tour(&b, false));
+            t_album += t1.elapsed().as_secs_f64();
+            let n = match tour {
+                TourDeCascade::Travail(n) => n,
+                _ => 0,
+            };
+            println!(
+                "    tour {:>2} : {n:>2} pistes, {albums} album(s), cascade {:>6.2} s, albums {:>5.2} s",
+                tours + 1,
+                t1.duration_since(t0).as_secs_f64(),
+                t1.elapsed().as_secs_f64()
+            );
+            if n == 0 && albums == 0 {
+                break;
+            }
+            total += n;
+            tours += 1;
+            let t2 = Instant::now();
+            let pause = pause_entre_deux_tours(&b);
+            rt.block_on(async { tokio::time::sleep(pause).await });
+            t_pause += t2.elapsed().as_secs_f64();
+        }
+        let mur = debut.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let restant = tune_core::audio::replaygain::compter_les_candidats_replaygain(&b);
+        let t_compte = t.elapsed().as_secs_f64();
+        println!(
+            "  largeur {largeur} : {total} pistes en {mur:.1} s = {:.0} pistes/h ; {tours} tours",
+            total as f64 * 3600.0 / mur
+        );
+        println!(
+            "  cascade {t_cascade:.1} s ({:.0} %), passe d'albums {t_album:.1} s ({:.0} %), pauses {t_pause:.1} s ({:.0} %)",
+            100.0 * t_cascade / mur,
+            100.0 * t_album / mur,
+            100.0 * t_pause / mur
+        );
+        println!(
+            "  candidats restants {restant} (compte complet : {:.0} ms)",
+            t_compte * 1e3
+        );
+        drop(b);
+        drop(db);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dossier = std::path::PathBuf::from(args.get(1).expect("dossier"));
@@ -286,6 +416,10 @@ fn main() {
     let fichiers = lister(&dossier, max);
     println!("fichiers: {}", fichiers.len());
     let tmp = tempfile::TempDir::new().unwrap();
+    if std::env::var("BANC_SEUL_F").is_ok() {
+        etage_f(&rt, &fichiers, tmp.path(), pistes_synth);
+        return;
+    }
     if !fichiers.is_empty() {
         etage_a(&rt, &fichiers);
         etage_e(&fichiers);

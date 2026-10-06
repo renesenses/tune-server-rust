@@ -170,3 +170,31 @@ fn le_bras_de_reprise_passe_par_le_saut_differe_et_constate_2125() {
         "une seule reprise par piste doit être appliquée à la décision"
     );
 }
+
+/// Décision du 05/10 : dans le bras de reprise, l'échec du SAUT passe par
+/// `conclure_saut_de_reprise_echoue` (un refus de l'appareil laisse la piste
+/// jouer depuis son début), plus par un `stop` direct.
+#[test]
+fn l_echec_du_saut_de_reprise_passe_par_la_conclusion_de_l_orchestrateur() {
+    const SOURCE: &str = include_str!("tick.rs");
+    let debut = SOURCE
+        .find("\"renderer_cale_reprise_saut_echoue\"")
+        .expect("la ligne d'échec du saut a disparu de tick.rs");
+    let fin = SOURCE[debut..]
+        .find("\"renderer_cale_reprise_echouee\"")
+        .expect("la ligne d'échec de la relance a disparu de tick.rs");
+    let bras = &SOURCE[debut..debut + fin];
+    assert!(
+        bras.contains(".conclure_saut_de_reprise_echoue("),
+        "le refus du saut doit laisser la zone jouer (décision du 05/10)"
+    );
+    assert!(
+        bras.contains("r.generation = generation;"),
+        "une seule tentative : la reprise compte pour la lecture relancée"
+    );
+    let avant_relance = &bras[..bras.find("Err(e) => {").unwrap_or(bras.len())];
+    assert!(
+        !avant_relance.contains(".stop(zone_id"),
+        "plus de Stop direct sur l'échec du saut"
+    );
+}
