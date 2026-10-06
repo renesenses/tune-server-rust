@@ -2,6 +2,9 @@
 #[path = "playback/album_ref_bandcamp_2121_tests.rs"]
 mod album_ref_bandcamp_2121_tests;
 #[cfg(test)]
+#[path = "playback/journal_pause_reprise_tests.rs"]
+mod journal_pause_reprise_tests;
+#[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
@@ -3089,6 +3092,9 @@ async fn playpause(
 }
 
 async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    // Une ligne par ordre, comme `api_next_requested` : sans elle, une pause
+    // n’apparaissait dans le journal qu’en sortie Windows exclusive.
+    info!(zone_id = zone_id, origine = "api", "pause_requested");
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
@@ -3105,6 +3111,7 @@ async fn resume(
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    info!(zone_id = zone_id, origine = "api", "resume_requested");
     let lang = crate::i18n::lang_from_header(&headers);
     let current = state.playback.get_state(zone_id).await;
 
@@ -5535,10 +5542,15 @@ async fn do_transfer(
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
-                if source_paused
-                    && let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await
-                {
-                    return output_command_error_response(error);
+                if source_paused {
+                    info!(
+                        zone_id = target_zone,
+                        origine = "transfert",
+                        "pause_requested"
+                    );
+                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
+                        return output_command_error_response(error);
+                    }
                 }
             }
             Err(e) => {
