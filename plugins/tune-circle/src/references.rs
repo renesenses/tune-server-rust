@@ -166,6 +166,40 @@ pub fn depuis_le_service(service: &str, piste: &StreamTrack) -> Option<Value> {
     restreindre(&r)
 }
 
+/// La référence d'un titre de SERVICE décrit par le client de l'ajout groupé
+/// (`{ source, source_id, title, artist, album, duration_ms, isrc }`), sans
+/// appel au service : une playlist Qobuz de 2 000 titres ne part pas en
+/// 2 000 `get_track`.
+///
+/// Rien de plus n'est cru que ce qu'un `items` brut du client porterait
+/// déjà : la même liste blanche ([`CLES_DE_REFERENCE`]), les mêmes formats.
+/// `None` : service hors de [`SERVICES_DE_REFERENCE`], identifiant ou titre
+/// absent — l'entrée n'est pas référençable.
+pub fn depuis_une_description(service: &str, description: &Value) -> Option<Value> {
+    if !SERVICES_DE_REFERENCE.contains(&service) {
+        return None;
+    }
+    let id = description.get("source_id").and_then(chaine)?;
+    let premier = |cles: &[&str]| {
+        cles.iter()
+            .find_map(|c| description.get(*c).filter(|v| !v.is_null()).cloned())
+            .unwrap_or(Value::Null)
+    };
+    let mut r = serde_json::json!({
+        "title": premier(&["title"]),
+        "artist_name": premier(&["artist_name", "artist"]),
+        "album_title": premier(&["album_title", "album"]),
+        "duration_ms": premier(&["duration_ms"]),
+        "isrc": premier(&["isrc"]),
+    });
+    r[cle_du_service(service)] = Value::String(id);
+    let restreinte = restreindre(&r)?;
+    // Un identifiant hors format a été écarté : sans lui, ce n'est plus la
+    // référence d'un titre de CE service.
+    restreinte.get(cle_du_service(service))?;
+    Some(restreinte)
+}
+
 /// Ce qu'une référence lue du cloud dit d'elle-même, pour la résolution.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reference {
@@ -256,6 +290,46 @@ mod tests {
         );
         assert!(restreindre(&serde_json::json!({ "title": "   " })).is_none());
         assert_eq!(isrc_valide("FRUM7160012"), None, "11 caractères");
+    }
+
+    /// L'ajout groupé : la description du client passe par la même liste
+    /// blanche ; un chemin, une pochette ou un service inconnu ne passent pas.
+    #[test]
+    fn une_description_de_service_devient_une_reference_en_liste_blanche() {
+        let r = depuis_une_description(
+            "qobuz",
+            &serde_json::json!({
+                "source_id": 12345, "title": "So What", "artist": "Miles Davis",
+                "album_title": "Kind of Blue", "duration_ms": 562000, "isrc": "us-sm1-59-00113",
+                "cover_path": "/Users/x/c.jpg", "file_path": "/Users/x/a.flac",
+            }),
+        );
+        assert_eq!(
+            r,
+            Some(serde_json::json!({
+                "title": "So What", "artist_name": "Miles Davis", "album_title": "Kind of Blue",
+                "duration_ms": 562000, "isrc": "USSM15900113", "qobuz_id": "12345",
+            }))
+        );
+        assert!(
+            depuis_une_description(
+                "bandcamp",
+                &serde_json::json!({ "source_id": "1", "title": "X" })
+            )
+            .is_none()
+        );
+        assert!(
+            depuis_une_description("tidal", &serde_json::json!({ "source_id": "1" })).is_none(),
+            "sans titre"
+        );
+        assert!(
+            depuis_une_description(
+                "tidal",
+                &serde_json::json!({ "source_id": "https://x/1", "title": "X" })
+            )
+            .is_none(),
+            "un identifiant hors format n'est pas une référence de ce service"
+        );
     }
 
     #[test]
