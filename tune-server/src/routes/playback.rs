@@ -961,6 +961,11 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// Web#1923, web#1924 : la page de l'album d'un titre Bandcamp lancé SEUL
+    /// (`source` + `source_id`), quand le client la connaît (recherche, page
+    /// d'artiste, genres). Rangée avec la ligne de file si elle est sûre
+    /// (`zones::page_d_album_bandcamp_sure`), ignorée pour toute autre source.
+    album_ref: Option<String>,
 }
 
 /// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
@@ -1306,6 +1311,9 @@ struct QueueAddRequest {
     // Batch streaming tracks: [{source, source_id, title?, artist_name?, ...}]
     #[serde(default)]
     tracks: Vec<StreamingTrackItem>,
+    /// Web#1923, web#1924 : la page de l'album du titre Bandcamp seul
+    /// (`source` + `source_id`). Même règle que `PlayRequest.album_ref`.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1319,6 +1327,8 @@ struct StreamingTrackItem {
     duration_ms: Option<i64>,
     track_number: Option<i64>,
     disc_number: Option<i64>,
+    /// La page de l'album de cette ligne, pour une piste Bandcamp.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2550,6 +2560,15 @@ async fn play(
                 .flatten()
                 .and_then(|z| z.output_device_id)
         });
+        // Web#1923, web#1924 : la page d'album envoyée par le client, sinon
+        // celle que Tune a rangée (#5922). Elle part aussi à l'orchestrateur,
+        // qui l'écrit dans l'historique et s'en sert pour resigner le flux.
+        let album_ref_val = crate::routes::zones::reference_d_album_de_la_demande(
+            &state,
+            source_for_q.as_deref().unwrap_or(""),
+            &source_id_val,
+            body.album_ref.as_deref(),
+        );
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -2568,7 +2587,7 @@ async fn play(
             media_format: body.media_format,
             track_number: None,
             disc_number: None,
-            album_ref: None,
+            album_ref: album_ref_val.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2615,13 +2634,9 @@ async fn play(
                             &[QueueInput::Streaming {
                                 source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
                                 // Web#1926 : un titre Bandcamp seul garde la
-                                // page de son album si Tune la connaît déjà,
-                                // pour « Aller à l'album » dans la file.
-                                album_ref: crate::routes::zones::reference_rangee_bandcamp(
-                                    &state,
-                                    source_for_q.as_deref().unwrap_or(""),
-                                    &source_id_val,
-                                ),
+                                // page de son album, envoyée par le client ou
+                                // déjà connue de Tune, pour « Aller à l'album ».
+                                album_ref: album_ref_val,
                                 source_id: source_id_val,
                                 title: title_val,
                                 artist: artist_val,
@@ -4394,7 +4409,12 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
-            album_ref: crate::routes::zones::reference_rangee_bandcamp(&state, source, source_id),
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+                &state,
+                source,
+                source_id,
+                body.album_ref.as_deref(),
+            ),
             source: source.clone(),
             source_id: source_id.clone(),
             title: meta.title,
@@ -4430,10 +4450,11 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
-            album_ref: crate::routes::zones::reference_rangee_bandcamp(
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
                 &state,
                 &item.source,
                 &item.source_id,
+                item.album_ref.as_deref(),
             ),
             source: item.source.clone(),
             source_id: item.source_id.clone(),
