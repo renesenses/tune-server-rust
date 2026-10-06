@@ -251,6 +251,13 @@ path = "tests/titres_bannis_4806.rs"
 name = "suivants_en_rafale_134"
 path = "tests/suivants_en_rafale_134.rs"
 
+# 05/10/2026 — l'écriture des paroles dans les fichiers : `.lrc` voisin sous le
+# consentement des paroles ET « Écrire les modifications dans les fichiers
+# audio ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "paroles_ecriture_fichiers"
+path = "tests/paroles_ecriture_fichiers.rs"
+
 # #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
 # réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
 [[test]]
@@ -1291,6 +1298,13 @@ path = "tests/identification_lot_4805.rs"
 name = "labels_par_le_pilote_4836"
 path = "tests/labels_par_le_pilote_4836.rs"
 
+# #4805 (idée 4) — la passe par empreinte AcoustID, par la route montée, sur
+# des réponses enregistrées et un faux `fpcalc`. `autotests = false` en tête de
+# ce manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "acoustid_par_le_pilote_4805"
+path = "tests/acoustid_par_le_pilote_4805.rs"
+
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
 # le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne
@@ -1473,3 +1487,9 @@ path = "tests/config_export_zones.rs"
 [[test]]
 name = "pg_compilation_reprise_5837"
 path = "tests/pg_compilation_reprise_5837.rs"
+
+# #5530 — le marquage « généré par IA » envoyé avec un favori de service est
+# rangé et rendu. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "favori_marquage_ia_5530"
+path = "tests/favori_marquage_ia_5530.rs"

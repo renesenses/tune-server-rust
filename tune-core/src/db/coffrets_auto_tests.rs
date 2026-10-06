@@ -670,8 +670,9 @@ pub(crate) fn scenario_cue_deux_disques(db: &Arc<dyn DbBackend>) {
         "le coffret CUE doit figurer dans l'onglet"
     );
 
-    // RESCAN : l'écrivain CUE réécrit chaque feuille et rend le disque 2 à
-    // un album de son dossier ; la passe qui suit le scan le réunit de nouveau.
+    // RESCAN : l'écrivain CUE réécrit chaque feuille. Les tranches du disque 2
+    // restent dans le coffret (tenue du marqueur `coffret`, fil 2094), et le
+    // titre du coffret n'est pas rendu à la feuille du disque 1.
     scanner();
     passe(db).unwrap();
     let apres_rescan = albums_avec_pistes(db);
@@ -1521,4 +1522,173 @@ pub(crate) fn scenario_rattrapage_par_les_balises_2094(db: &Arc<dyn DbBackend>) 
 #[test]
 fn rattrapage_par_les_balises_2094_sur_sqlite() {
     scenario_rattrapage_par_les_balises_2094(&sqlite());
+}
+
+/// Fil 2094, suite de #5812 — la RELECTURE des fichiers d'un coffret
+/// automatique (scan forcé, surveillant, « Relire les balises ») reconstruit
+/// chaque ligne piste depuis ses balises : chaque disque au disque 1, sans
+/// nom, dans l'album de son dossier. Les tenues ([`Tenues`]) rendent à chaque
+/// piste ce que la réunion a composé, d'après le marqueur `coffret` — et plus
+/// rien une fois le coffret DÉFAIT.
+///
+/// La relecture est jouée comme la jouent le scan et la route de relecture :
+/// une ligne refaite depuis les balises, puis `Tenues::appliquer`.
+pub(crate) fn scenario_relecture_coffret_auto_2094(db: &Arc<dyn DbBackend>) {
+    use super::super::edition_album::{CLE_EDITION_PISTES, EditionPistes, PisteTenue, Tenues};
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let g = artiste(db, "Laurent Garnier");
+    let r = "/m/ELECTRO/Laurent Garnier - Early Works";
+    // Le numéro n'est QUE dans le titre d'album : les balises disent disque 1
+    // partout, les dossiers ne disent rien.
+    let d1 = disque(
+        db,
+        "Early Works, Disc 1",
+        g,
+        &format!("{r}/Premiere partie"),
+        2,
+        1,
+    );
+    disque(
+        db,
+        "Early Works, Disc 2",
+        g,
+        &format!("{r}/Seconde partie"),
+        2,
+        1,
+    );
+    // Le disque 3 porte son nom dans ses balises (DISCSUBTITLE).
+    let d3 = disque(
+        db,
+        "Early Works, Disc 3",
+        g,
+        &format!("{r}/Troisieme partie"),
+        2,
+        1,
+    );
+    let (p1, p2) = placeholders(db);
+    db.execute(
+        &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2}"),
+        &[&"Les remixes" as &dyn ToSqlValue, &d3],
+    )
+    .unwrap();
+    assert_eq!(passe(db).unwrap().reunis, 1);
+    let attendu = vec![
+        (1, Some("Early Works, Disc 1".to_string())),
+        (2, Some("Early Works, Disc 2".to_string())),
+        (3, Some("Les remixes".to_string())),
+    ];
+    assert_eq!(sous_titres_de(db, d1), attendu, "montage");
+    assert_eq!(marqueurs(db).unwrap()[&d1].sous_titres, vec![1, 2]);
+
+    // Une piste RENOMMÉE à la main (tenue sans disposition) : son titre est
+    // tenu, son disque l'est par le coffret.
+    let pistes = TrackRepo::with_backend(db.clone());
+    let premiere = pistes
+        .list_by_album(d1)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.file_path.as_deref() == Some(&format!("{r}/Seconde partie/01.flac")))
+        .expect("la piste 1 du disque 2");
+    let renommage = EditionPistes {
+        disposition: false,
+        pistes: vec![PisteTenue {
+            id: premiere.id.unwrap(),
+            chemin: premiere.file_path.clone(),
+            disque: 2,
+            numero: 1,
+            titre: Some("Renommée à la main".into()),
+            ..Default::default()
+        }],
+    };
+    AlbumMetadataRepo::with_backend(db.clone())
+        .set(
+            d1,
+            CLE_EDITION_PISTES,
+            &serde_json::to_string(&renommage).unwrap(),
+        )
+        .unwrap();
+
+    // La relecture : chaque ligne refaite depuis ses balises.
+    let relire = |t: &Track| {
+        let mut relue = t.clone();
+        relue.album_id = None;
+        relue.disc_number = 1;
+        relue.title = format!("piste {}", t.track_number);
+        relue.disc_subtitle = t
+            .file_path
+            .as_deref()
+            .filter(|c| c.contains("/Troisieme partie/"))
+            .map(|_| "Les remixes".to_string());
+        relue
+    };
+    let tenues = Tenues::charger(db);
+    let mut relues = Vec::new();
+    for t in pistes.list_by_album(d1).unwrap() {
+        let mut relue = relire(&t);
+        assert!(tenues.appliquer(&mut relue), "{:?} : tenue", t.file_path);
+        assert_eq!(
+            (
+                relue.album_id,
+                relue.disc_number,
+                relue.disc_subtitle.clone()
+            ),
+            (Some(d1), t.disc_number, t.disc_subtitle.clone()),
+            "{:?} : la relecture rend la piste à son coffret, son disque, son nom",
+            t.file_path
+        );
+        relues.push(relue);
+    }
+    assert_eq!(relues.len(), 6);
+    let renommee = relues.iter().find(|t| t.id == premiere.id).unwrap();
+    assert_eq!(
+        renommee.title, "Renommée à la main",
+        "le renommage reste tenu"
+    );
+    // La relecture ÉCRITE : rien n'a bougé.
+    for t in &relues {
+        pistes.update(t).unwrap();
+    }
+    assert_eq!(sous_titres_de(db, d1), attendu, "après la relecture écrite");
+
+    // DÉFAIRE : le marqueur part, la tenue avec lui. La relecture suivante
+    // rend à chaque piste ce que disent ses balises.
+    let recrees = defaire(db, d1).unwrap();
+    assert_eq!(recrees.len(), 2);
+    let tenues = Tenues::charger(db);
+    for id in std::iter::once(d1).chain(recrees.iter().copied()) {
+        for t in pistes.list_by_album(id).unwrap() {
+            let mut relue = relire(&t);
+            let tenue = tenues.appliquer(&mut relue);
+            assert_eq!(
+                tenue,
+                t.id == premiere.id,
+                "{:?} : seul le renommage reste tenu",
+                t.file_path
+            );
+            assert_eq!(
+                (relue.disc_number, relue.disc_subtitle.as_deref()),
+                (
+                    1,
+                    t.file_path
+                        .as_deref()
+                        .filter(|c| c.contains("/Troisieme partie/"))
+                        .map(|_| "Les remixes")
+                ),
+                "{:?} : plus aucun disque de coffret",
+                t.file_path
+            );
+            assert_eq!(
+                relue.album_id, None,
+                "{:?} : la piste n'est ramenée à aucun album, ni au coffret défait",
+                t.file_path
+            );
+        }
+    }
+}
+
+#[test]
+fn relecture_coffret_auto_2094_sur_sqlite() {
+    scenario_relecture_coffret_auto_2094(&sqlite());
 }

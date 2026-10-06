@@ -1,3 +1,5 @@
+/// AcoustID « à la Picard » : filtres, marge et vote par album (#4805).
+pub mod acoustid_picard;
 pub mod artist_enrichment;
 pub mod artist_split;
 pub mod artistes_du_pressage;
@@ -19,6 +21,8 @@ pub mod lastfm;
 pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
+// Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
+pub mod musicbrainz_release_cache;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;

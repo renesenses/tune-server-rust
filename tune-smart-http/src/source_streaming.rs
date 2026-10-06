@@ -175,6 +175,12 @@ fn condition(rule: &Value, objet: Objet) -> String {
     if let Some(col) = colonne {
         return comparaison_texte(col, &op, &vals);
     }
+    if champ == "ai_generated" {
+        // #5530 — le marquage « généré par IA » rangé avec le favori (celui
+        // de l'album, pour une piste). Inconnu n'est pas marqué.
+        return crate::regles_sql::condition_marquage_ia_colonne("sf.ai_generated", &op)
+            .unwrap_or_else(|| "1=0".into());
+    }
     if champ == "favorite" {
         // Ce sont des favoris : « est favori de ce type » est vrai, sa
         // négation fausse. Un autre type (un album pour une playlist) : faux.
@@ -420,6 +426,101 @@ mod tests {
             sql.ends_with("ORDER BY LOWER(sf.artist) DESC LIMIT 50"),
             "{sql}"
         );
+    }
+
+    /// #5530 — de bout en bout sur une base MIGRÉE : la fiche d'un album
+    /// marqué range le marquage (`marquer_album_ia`), puis la règle
+    /// « Source = Qobuz ET Généré par IA : non » écarte cet album-là et garde
+    /// celui dont le marquage est inconnu.
+    #[test]
+    fn la_regle_ecarte_l_album_marque_sur_une_vraie_base_5530() {
+        use std::sync::Arc;
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo;
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let b: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = StreamingFavoritesRepo::with_backend(b.clone());
+        let ia = "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album";
+        repo.add(
+            1,
+            "album",
+            "qobuz",
+            "tj9je5zd70wsc",
+            Some(ia),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        repo.add(
+            1,
+            "album",
+            "qobuz",
+            "5099749522428",
+            Some("Kind of Blue"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            repo.marquer_album_ia("qobuz", "tj9je5zd70wsc", true)
+                .unwrap(),
+            1
+        );
+        let titres = |regles: &str| -> Vec<String> {
+            let sql = requete(regles, "all", Objet::Album, 1, "title", "asc", None).unwrap();
+            b.query_many(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+                .iter()
+                .map(|r| r[2].as_string().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(
+            titres(
+                r#"[{"field":"source","op":"eq","value":"qobuz"},
+                       {"field":"ai_generated","op":"is_false"}]"#
+            ),
+            vec!["Kind of Blue"]
+        );
+        assert_eq!(
+            titres(
+                r#"[{"field":"source","op":"eq","value":"qobuz"},
+                       {"field":"ai_generated","op":"is_true"}]"#
+            ),
+            vec![ia]
+        );
+        // Et la liste des favoris le rend au client.
+        let liste = repo.list(1, Some("album")).unwrap();
+        let marque = liste
+            .iter()
+            .find(|f| f.service_id == "tj9je5zd70wsc")
+            .unwrap();
+        assert_eq!(marque.ai_generated, Some(true));
+        let temoin = liste
+            .iter()
+            .find(|f| f.service_id == "5099749522428")
+            .unwrap();
+        assert_eq!(temoin.ai_generated, None);
+    }
+
+    /// #5530 — « Généré par IA : non » écarte le favori Qobuz marqué, et lui
+    /// seul : un favori dont le marquage est inconnu reste.
+    #[test]
+    fn le_marquage_ia_filtre_les_favoris_de_service_5530() {
+        let r = r#"[{"field":"source","op":"eq","value":"qobuz"},
+                    {"field":"ai_generated","op":"is_false"}]"#;
+        let sql = requete(r, "all", Objet::Album, 1, "title", "asc", None).unwrap();
+        assert!(
+            sql.contains("(sf.ai_generated IS NULL OR sf.ai_generated != '1')"),
+            "{sql}"
+        );
+        let r = r#"[{"field":"source","op":"eq","value":"qobuz"},
+                    {"field":"ai_generated","op":"is_true"}]"#;
+        let sql = requete(r, "all", Objet::Piste, 1, "title", "asc", None).unwrap();
+        assert!(sql.contains("sf.ai_generated = '1'"), "{sql}");
     }
 
     #[test]

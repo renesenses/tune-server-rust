@@ -104,7 +104,9 @@ pub(super) enum EchecIdentification {
 
 /// La chaîne complète pour UN album : recherche, détail, appariement, écriture.
 ///
-/// Deux requêtes MusicBrainz, séparées par [`musicbrainz_release::rate_limit_delay`].
+/// Deux requêtes MusicBrainz au plus, séparées par
+/// [`musicbrainz_release::rate_limit_delay`] ; une seule quand la base garde
+/// déjà le pressage retenu (`musicbrainz_release_cache`).
 /// L'appelant qui enchaîne des albums doit ajouter SON propre délai entre deux
 /// appels — celui d'ici ne couvre que l'intervalle interne.
 pub(super) async fn identifier_album(
@@ -205,8 +207,12 @@ pub(super) async fn identifier_album(
         });
     };
 
-    musicbrainz_release::rate_limit_delay().await;
-    let detail = musicbrainz_release::lookup_release_detail(&meilleur.release_id).await;
+    // #4805 (idée 3 de MetaRust) — le détail est demandé avec les `inc` des
+    // crédits et GARDÉ en base : la passe des crédits le relira sans requête.
+    // Le créneau MusicBrainz n'est réservé que si la base ne l'a pas déjà.
+    let detail =
+        musicbrainz_release::lookup_release_detail_gardee(&state.backend, &meilleur.release_id)
+            .await;
 
     // 3. Associer les pistes du pressage aux pistes locales.
     let locales: Vec<LocalTrack> = tracks
