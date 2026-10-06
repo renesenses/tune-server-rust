@@ -282,8 +282,8 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // lot (PG 080). Ici AUSSI : une base de bascule ne rejoue pas la 080, et
     // la sélection de `identify-all` nomme la colonne. NULL = jamais tenté.
     "ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT",
-    // #5594 — clé du signal PCM des FLAC et son témoin de lecture (PG 085).
-    // Ici AUSSI : une base de bascule ne rejoue pas la 085, et la passe
+    // #5594 — clé du signal PCM des FLAC et son témoin de lecture (PG 083).
+    // Ici AUSSI : une base de bascule ne rejoue pas la 083, et la passe
     // `taches_de_fond::cle_pcm` nomme les deux colonnes. TEXT des deux côtés,
     // NULL pour l'existant. L'index JUSTE APRÈS les colonnes.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT",

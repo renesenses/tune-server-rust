@@ -2308,39 +2308,39 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
     //
     // NUL pour toutes les lignes existantes : la passe les rattrape.
     //
-    // Numérotée 121 / PG 085, PAS 118 : vérifié le 06/10, la 117 (PG 081)
-    // est sur `batch/feat-rc3-20261002` (#5822), la 118 (PG 082) est prise
-    // par #5827, en PR ; la 119 et la 120 (PG 083, 084) sont réservées. Le
-    // lanceur ne joue que `version > MAX` : une 121 appliquée AVANT elles les
-    // ferait sauter en silence sur toute base déjà montée. Cette migration
-    // EXIGE donc la 118, la 119 et la 120 avant elle — sinon, elle se
-    // renumérote à la promotion. Les gardes de contiguïté (`migration_count_matches`,
+    // Numérotée 119 / PG 083, PAS 118 : vérifié le 06/10, la 117 (PG 081)
+    // est sur `batch/feat-rc3-20261002` (#5822) et la 118 (PG 082) est prise
+    // par #5827, en PR. Le lanceur ne joue que `version > MAX` : une 119
+    // appliquée AVANT la 118 la ferait sauter en silence sur toute base déjà
+    // montée. Cette migration EXIGE donc #5827 fusionnée avant elle — sinon,
+    // elle se renumérote à la promotion. Les gardes de contiguïté
+    // (`migration_count_matches`,
     // `les_deux_migrations_104_renumerotees_s_appliquent_dans_l_ordre`, et
     // côté PG `pg_migrations_are_contiguous_and_include_numeric_heals`) le
-    // signalent tant qu'elles manquent.
+    // signalent tant qu'elle manque.
     //
     // Colonnes et index posés dans le bloc de version et dans la passe
-    // finale, PAS dans `up` : même règle qu'à la 115. Jumelle PG : 085.
+    // finale, PAS dans `up` : même règle qu'à la 115. Jumelle PG : 083.
     Migration {
-        version: 121,
+        version: 119,
         name: "tracks_audio_pcm_key",
         up: "",
     },
 ];
 
-/// L'index de la migration 121 (#5594). `IF NOT EXISTS` : rejouable, et posé
+/// L'index de la migration 119 (#5594). `IF NOT EXISTS` : rejouable, et posé
 /// par la migration ET par la passe finale de `run_migrations`.
 const SQL_INDEX_CLE_PCM: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)";
 
-/// Garantit les deux colonnes puis pose l'index de la 121. Un échec de
+/// Garantit les deux colonnes puis pose l'index de la 119. Un échec de
 /// l'index est JOURNALISÉ, jamais rendu : sans lui, la recherche par clé est
 /// lente, pas fausse.
 fn cle_pcm_des_pistes(db: &SqliteDb) {
     add_column_if_missing(db, "tracks", "audio_pcm_key", "TEXT");
     add_column_if_missing(db, "tracks", "audio_pcm_key_seen", "TEXT");
     if let Err(e) = db.execute_batch(SQL_INDEX_CLE_PCM) {
-        warn!(erreur = %e, "migration_121_index_tracks_audio_pcm_key");
+        warn!(erreur = %e, "migration_119_index_tracks_audio_pcm_key");
     }
 }
 
@@ -3390,7 +3390,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // relit ses fichiers les pose depuis la balise.
             add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
         }
-        if migration.version == 121 {
+        if migration.version == 119 {
             // Clé du signal PCM et son témoin (#5594). Sans défaut : NULL =
             // pas de clé, jamais lu.
             cle_pcm_des_pistes(db);
@@ -3922,9 +3922,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : la sélection de `identify-all` la NOMME, et une base arrivée
     // sans elle ne pourrait plus lancer la passe. PG : migration 080.
     add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
-    // Clé du signal PCM et son témoin (migration 121, #5594) — posés ICI
+    // Clé du signal PCM et son témoin (migration 119, #5594) — posés ICI
     // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
-    // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 085.
+    // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.
     cle_pcm_des_pistes(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
@@ -4676,12 +4676,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "albums_types_secondaires",
         include_str!("../../migrations/postgres/081_albums_types_secondaires.sql"),
     ),
-    // Jumelle de la SQLite 121 (#5594) : `tracks.audio_pcm_key`, son témoin
-    // `audio_pcm_key_seen` et l'index de la clé. EXIGE les 82 à 84 avant elle.
+    // Jumelle de la SQLite 119 (#5594) : `tracks.audio_pcm_key`, son témoin
+    // `audio_pcm_key_seen` et l'index de la clé. EXIGE la 82 (#5827) avant elle.
     (
-        85,
+        83,
         "tracks_audio_pcm_key",
-        include_str!("../../migrations/postgres/085_tracks_audio_pcm_key.sql"),
+        include_str!("../../migrations/postgres/083_tracks_audio_pcm_key.sql"),
     ),
 ];
 
@@ -7500,11 +7500,10 @@ mod tests {
         // 81 : `albums_types_secondaires` (section « Live »), jumelle de la
         // SQLite 117. Pose `albums.release_secondary_types`, que la fiche
         // artiste NOMME.
-        // 85 : `tracks_audio_pcm_key` (#5594), jumelle de la SQLite 121. Les
-        // 82 à 84 sont prises ou réservées par d'autres PR : tant qu'elles ne
-        // sont pas fusionnées, la garde de contiguïté ci-dessus rougit, et
-        // c'est voulu.
-        assert_eq!(pg_latest_version(), 85, "latest PG migration must be 85");
+        // 83 : `tracks_audio_pcm_key` (#5594), jumelle de la SQLite 119. La
+        // 82 est celle de #5827 : tant qu'elle n'est pas fusionnée, la garde
+        // de contiguïté ci-dessus rougit, et c'est voulu.
+        assert_eq!(pg_latest_version(), 83, "latest PG migration must be 83");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
