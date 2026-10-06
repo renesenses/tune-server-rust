@@ -292,6 +292,13 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
     // des favoris de service nomment la colonne. NULL = inconnu.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
+    // #5594 — clé du signal PCM des FLAC et son témoin de lecture (PG 083).
+    // Ici AUSSI : une base de bascule ne rejoue pas la 083, et la passe
+    // `taches_de_fond::cle_pcm` nomme les deux colonnes. TEXT des deux côtés,
+    // NULL pour l'existant. L'index JUSTE APRÈS les colonnes.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT",
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

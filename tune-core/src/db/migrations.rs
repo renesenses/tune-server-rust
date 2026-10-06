@@ -2315,7 +2315,56 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "streaming_favorites_ai_generated",
         up: "",
     },
+    // #5594 (lot 1) — la clé du signal PCM d'une piste FLAC,
+    // `tracks.audio_pcm_key` (`flac-md5-v1:<md5>:<total_samples>:
+    // <sample_rate>:<channels>:<bits>`), et son témoin de lecture
+    // `tracks.audio_pcm_key_seen`.
+    //
+    // La clé vient du MD5 des échantillons que STREAMINFO porte : deux pistes
+    // qui la partagent contiennent le même signal, donc la même sonie et le
+    // même pic. NUL pour un MD5 nul, une piste CUE, tout ce qui n'est pas du
+    // FLAC — jamais une clé inventée. Le témoin garde l'`audio_hash` de l'état
+    // du fichier lu (NUL = jamais lu) ; la passe
+    // `taches_de_fond::cle_pcm` remplit les deux, en fond, par l'en-tête
+    // seulement.
+    //
+    // NUL pour toutes les lignes existantes : la passe les rattrape.
+    //
+    // Numérotée 119 / PG 083, PAS 118 : vérifié le 06/10, la 117 (PG 081)
+    // est sur `batch/feat-rc3-20261002` (#5822) et la 118 (PG 082) est prise
+    // par #5827, en PR. Le lanceur ne joue que `version > MAX` : une 119
+    // appliquée AVANT la 118 la ferait sauter en silence sur toute base déjà
+    // montée. Cette migration EXIGE donc #5827 fusionnée avant elle — sinon,
+    // elle se renumérote à la promotion. Les gardes de contiguïté
+    // (`migration_count_matches`,
+    // `les_deux_migrations_104_renumerotees_s_appliquent_dans_l_ordre`, et
+    // côté PG `pg_migrations_are_contiguous_and_include_numeric_heals`) le
+    // signalent tant qu'elle manque.
+    //
+    // Colonnes et index posés dans le bloc de version et dans la passe
+    // finale, PAS dans `up` : même règle qu'à la 115. Jumelle PG : 083.
+    Migration {
+        version: 119,
+        name: "tracks_audio_pcm_key",
+        up: "",
+    },
 ];
+
+/// L'index de la migration 119 (#5594). `IF NOT EXISTS` : rejouable, et posé
+/// par la migration ET par la passe finale de `run_migrations`.
+const SQL_INDEX_CLE_PCM: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)";
+
+/// Garantit les deux colonnes puis pose l'index de la 119. Un échec de
+/// l'index est JOURNALISÉ, jamais rendu : sans lui, la recherche par clé est
+/// lente, pas fausse.
+fn cle_pcm_des_pistes(db: &SqliteDb) {
+    add_column_if_missing(db, "tracks", "audio_pcm_key", "TEXT");
+    add_column_if_missing(db, "tracks", "audio_pcm_key_seen", "TEXT");
+    if let Err(e) = db.execute_batch(SQL_INDEX_CLE_PCM) {
+        warn!(erreur = %e, "migration_119_index_tracks_audio_pcm_key");
+    }
+}
 
 /// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
 /// posé par la migration ET par la passe finale de `run_migrations`.
@@ -3368,6 +3417,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // INCONNU pour toute ligne existante.
             add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
         }
+        if migration.version == 119 {
+            // Clé du signal PCM et son témoin (#5594). Sans défaut : NULL =
+            // pas de clé, jamais lu.
+            cle_pcm_des_pistes(db);
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3899,6 +3953,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : l'écriture et la lecture des favoris de service la NOMMENT.
     // PG : migration 082.
     add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
+    // Clé du signal PCM et son témoin (migration 119, #5594) — posés ICI
+    // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
+    // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.
+    cle_pcm_des_pistes(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4655,6 +4713,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         82,
         "streaming_favorites_ai_generated",
         include_str!("../../migrations/postgres/082_streaming_favorites_ai_generated.sql"),
+    ),
+    // Jumelle de la SQLite 119 (#5594) : `tracks.audio_pcm_key`, son témoin
+    // `audio_pcm_key_seen` et l'index de la clé. EXIGE la 82 (#5827) avant elle.
+    (
+        83,
+        "tracks_audio_pcm_key",
+        include_str!("../../migrations/postgres/083_tracks_audio_pcm_key.sql"),
     ),
 ];
 
@@ -7552,9 +7617,10 @@ mod tests {
         // 81 : `albums_types_secondaires` (section « Live »), jumelle de la
         // SQLite 117. Pose `albums.release_secondary_types`, que la fiche
         // artiste NOMME.
-        // 82 : `streaming_favorites_ai_generated` (#5530), jumelle de la
-        // SQLite 118. Le marquage « généré par IA » d'un favori de service.
-        assert_eq!(pg_latest_version(), 82, "latest PG migration must be 82");
+        // 83 : `tracks_audio_pcm_key` (#5594), jumelle de la SQLite 119. La
+        // 82 est celle de #5827 : tant qu'elle n'est pas fusionnée, la garde
+        // de contiguïté ci-dessus rougit, et c'est voulu.
+        assert_eq!(pg_latest_version(), 83, "latest PG migration must be 83");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
