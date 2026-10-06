@@ -152,7 +152,16 @@ jobs:
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
             scripts/verifier-fermeture.sh \
-            scripts/verifier-refs-issues.sh
+            scripts/verifier-refs-issues.sh \
+            scripts/docker-install.sh \
+            packaging/docker/entrypoint.sh \
+            packaging/docker/test-entrypoint.sh
+
+      # Entrypoint de l'image (PUID/PGID) : simulation, puis vrais
+      # setpriv/usermod/chown en root dans debian:bookworm-slim, la base de
+      # Dockerfile.dist.
+      - name: Entrypoint de l image Docker
+        run: bash packaging/docker/test-entrypoint.sh --conteneur
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
