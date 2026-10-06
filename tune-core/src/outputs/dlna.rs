@@ -596,6 +596,10 @@ pub struct DlnaOutput {
     /// #5575 — la relecture `GetVolume` d'après le premier `SetVolume`
     /// acquitté est faite : une seule par session de zone.
     volume_relu: AtomicBool,
+    /// #5575 — dernier niveau acquitté, dans l'unité de l'appareil : c'est
+    /// lui que la relecture détachée compare à `GetVolume`, pas le premier —
+    /// le curseur a pu bouger pendant la pause qui précède la relecture.
+    niveau_acquitte: Arc<std::sync::atomic::AtomicU32>,
     /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
     /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
     dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
@@ -735,6 +739,7 @@ impl DlnaOutput {
             profil_volume: tokio::sync::OnceCell::new(),
             journal_volume: Arc::default(),
             volume_relu: AtomicBool::new(false),
+            niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
@@ -1232,36 +1237,49 @@ impl DlnaOutput {
     /// `SetVolume` acquitté et dit si l'appareil l'a VRAIMENT appliqué. C'est
     /// la seule preuve qu'un journal de testeur peut porter d'un renderer qui
     /// acquitte sans rien faire (darTZeel de Sevy, #5793).
-    async fn relire_volume_applique(&self, attendu: u32, canal: &str) {
+    ///
+    /// Tâche DÉTACHÉE : l'ordre de volume et le curseur n'attendent ni la
+    /// pause [`RELECTURE_VOLUME_APRES`] ni la réponse de l'appareil — la
+    /// ligne INFO arrive simplement un peu après. Rend la poignée de la tâche
+    /// (pour les tests), `None` si la relecture de la session est déjà faite.
+    fn relire_volume_applique(
+        &self,
+        niveau: u32,
+        canal: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.niveau_acquitte.store(niveau, Ordering::Relaxed);
         if self.volume_relu.swap(true, Ordering::Relaxed) {
-            return;
+            return None;
         }
-        tokio::time::sleep(RELECTURE_VOLUME_APRES).await;
-        let reponse = self
-            .rc_action(
-                "GetVolume",
-                &format!("<InstanceID>0</InstanceID><Channel>{canal}</Channel>"),
-            )
-            .await;
-        let lu = reponse
-            .as_ref()
-            .ok()
-            .and_then(|r| extract_tag(r, "CurrentVolume"))
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        let lecture = match &reponse {
-            Ok(r) => super::dlna_journal_volume::reponse_soap(r),
-            Err(e) => format!("injoignable ({e})"),
-        };
-        info!(
-            zone = %self.name,
-            canal = %canal,
-            instance = 0,
-            attendu,
-            lu = %lu.map_or_else(|| "-".to_string(), |v| v.to_string()),
-            applique = %super::dlna_journal_volume::verdict_relecture(attendu, lu),
-            reponse = %lecture,
-            "dlna_volume_relu"
-        );
+        let client = self.client.clone();
+        let url = self.url_de(VoieSoap::RenderingControl);
+        let zone = self.name.clone();
+        let canal = canal.to_string();
+        let niveau_acquitte = self.niveau_acquitte.clone();
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(RELECTURE_VOLUME_APRES).await;
+            let attendu = niveau_acquitte.load(Ordering::Relaxed);
+            let reponse = relire_volume_soap(&client, &url, &canal).await;
+            let lu = reponse
+                .as_ref()
+                .ok()
+                .and_then(|r| extract_tag(r, "CurrentVolume"))
+                .and_then(|v| v.trim().parse::<u32>().ok());
+            let lecture = match &reponse {
+                Ok(r) => super::dlna_journal_volume::reponse_soap(r),
+                Err(e) => format!("injoignable ({e})"),
+            };
+            info!(
+                zone = %zone,
+                canal = %canal,
+                instance = 0,
+                attendu,
+                lu = %lu.map_or_else(|| "-".to_string(), |v| v.to_string()),
+                applique = %super::dlna_journal_volume::verdict_relecture(attendu, lu),
+                reponse = %lecture,
+                "dlna_volume_relu"
+            );
+        }))
     }
 
     /// Lit le volume du renderer, sur la voie qu'il faut.
@@ -2722,8 +2740,8 @@ impl OutputTarget for DlnaOutput {
             reponse: "OK".into(),
         });
         self.memoriser_volume(level as u64, niveau).await;
-        self.relire_volume_applique(niveau, profil.canal_de_lecture())
-            .await;
+        // Détachée : la réponse à l'ordre part sans attendre la relecture.
+        let _ = self.relire_volume_applique(niveau, profil.canal_de_lecture());
         Ok(())
     }
 
@@ -3516,6 +3534,34 @@ fn fallback_mime_from_sink(sink: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// #5575 — `GetVolume` en un seul envoi, hors de `soap_action` : la relecture
+/// tourne dans une tâche détachée qui ne tient pas la sortie. Diagnostic
+/// seulement — ni réessai ni redécouverte, un échec se dit au journal.
+async fn relire_volume_soap(client: &Client, url: &str, canal: &str) -> Result<String, String> {
+    let soap = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:GetVolume xmlns:u="{RENDERING_CONTROL_URN}">
+      <InstanceID>0</InstanceID><Channel>{canal}</Channel>
+    </u:GetVolume>
+  </s:Body>
+</s:Envelope>"#
+    );
+    let reponse = client
+        .post(url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "SOAPAction",
+            format!("\"{RENDERING_CONTROL_URN}#GetVolume\""),
+        )
+        .body(soap)
+        .send()
+        .await
+        .map_err(|e| http_error::chain(&e))?;
+    reponse.text().await.map_err(|e| http_error::chain(&e))
 }
 
 /// #5575 — la ligne INFO d'un acquittement de `SetVolume`.

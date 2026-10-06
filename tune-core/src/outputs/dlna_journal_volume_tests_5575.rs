@@ -46,6 +46,18 @@ impl Capture {
                 .finish(),
         )
     }
+    /// Attend (borné) qu'au moins `n` lignes `evenement` soient écrites : la
+    /// relecture est une tâche détachée, sa ligne arrive après la réponse.
+    async fn attendre(&self, evenement: &str, n: usize, budget: Duration) -> Vec<String> {
+        let debut = std::time::Instant::now();
+        loop {
+            let l = self.lignes(evenement);
+            if l.len() >= n || debut.elapsed() >= budget {
+                return l;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     fn lignes(&self, evenement: &str) -> Vec<String> {
         self.text()
             .lines()
@@ -88,6 +100,15 @@ impl Drop for FauxRenderer {
 
 /// `applique` : le faux appareil retient-il ce qu'il acquitte ?
 async fn faux_renderer(applique: bool, volume_initial: u32) -> FauxRenderer {
+    faux_renderer_lent(applique, volume_initial, Duration::ZERO).await
+}
+
+/// Variante dont `GetVolume` met `lenteur` à répondre.
+async fn faux_renderer_lent(
+    applique: bool,
+    volume_initial: u32,
+    lenteur: Duration,
+) -> FauxRenderer {
     let etat = Arc::new(Mutex::new(Etat {
         volume: volume_initial,
         ..Etat::default()
@@ -105,6 +126,9 @@ async fn faux_renderer(applique: bool, volume_initial: u32) -> FauxRenderer {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default()
                         .to_string();
+                    if action.contains("#GetVolume") {
+                        tokio::time::sleep(lenteur).await;
+                    }
                     let mut e = etat.lock().unwrap();
                     if action.contains("#SetVolume") {
                         e.ordres += 1;
@@ -201,7 +225,9 @@ async fn cent_ordres_en_rafale_donnent_au_plus_deux_lignes_info() {
     );
 }
 
-/// L'appareil applique : la relecture le dit, une fois.
+/// L'appareil applique : la relecture le dit, une fois, contre le DERNIER
+/// niveau acquitté (0,6 → 153) et non le premier — le curseur a bougé
+/// pendant la pause qui précède la relecture.
 #[tokio::test]
 async fn la_relecture_dit_que_l_appareil_a_applique() {
     crate::journal_de_test::fiabiliser_la_capture();
@@ -213,7 +239,16 @@ async fn la_relecture_dit_que_l_appareil_a_applique() {
     out.set_volume(0.5).await.unwrap();
     out.set_volume(0.6).await.unwrap();
 
-    let relues = journal.lignes("dlna_volume_relu");
+    let relues = journal
+        .attendre("dlna_volume_relu", 1, Duration::from_secs(3))
+        .await;
+    // Une seconde ligne aurait le temps de venir : la relecture est unique.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let relues = if relues.len() == 1 {
+        journal.lignes("dlna_volume_relu")
+    } else {
+        relues
+    };
     assert_eq!(
         relues.len(),
         1,
@@ -224,8 +259,8 @@ async fn la_relecture_dit_que_l_appareil_a_applique() {
     for attendu in [
         "zone=Salon LHC",
         "canal=LF ",
-        "attendu=128",
-        "lu=128",
+        "attendu=153",
+        "lu=153",
         "applique=oui",
     ] {
         assert!(l.contains(attendu), "« {attendu} » absent : {l}");
@@ -244,7 +279,16 @@ async fn la_relecture_denonce_un_acquittement_sans_effet() {
 
     out.set_volume(0.5).await.unwrap();
 
-    let relues = journal.lignes("dlna_volume_relu");
+    let relues = journal
+        .attendre("dlna_volume_relu", 1, Duration::from_secs(3))
+        .await;
+    // Une seconde ligne aurait le temps de venir : la relecture est unique.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let relues = if relues.len() == 1 {
+        journal.lignes("dlna_volume_relu")
+    } else {
+        relues
+    };
     assert_eq!(relues.len(), 1, "{}", journal.text());
     let l = &relues[0];
     for attendu in ["attendu=128", "lu=40", "applique=non"] {
@@ -254,5 +298,46 @@ async fn la_relecture_denonce_un_acquittement_sans_effet() {
         journal.lignes("dlna_set_volume_ok").len() == 1,
         "l'acquittement reste porté en INFO : {}",
         journal.text()
+    );
+}
+
+/// La réponse au `SetVolume` n'attend PAS la relecture : un appareil dont
+/// `GetVolume` met 2 s à répondre ne retarde pas l'ordre (ni le curseur), et
+/// la ligne `dlna_volume_relu` arrive après coup.
+#[tokio::test]
+async fn la_reponse_au_set_volume_n_attend_pas_la_relecture() {
+    crate::journal_de_test::fiabiliser_la_capture();
+    let journal = Capture::default();
+    let _garde = journal.subscribe();
+    let lenteur = Duration::from_secs(2);
+    let r = faux_renderer_lent(true, 40, lenteur).await;
+    let out = sortie(&r);
+
+    let debut = std::time::Instant::now();
+    out.set_volume(0.5).await.unwrap();
+    let duree = debut.elapsed();
+    // Relecture en ligne : au moins 300 ms + 2 s. Détachée : deux POST locaux.
+    assert!(
+        duree < Duration::from_secs(1),
+        "le premier SetVolume a attendu la relecture : {duree:?}"
+    );
+    assert!(
+        journal.lignes("dlna_volume_relu").is_empty(),
+        "la relecture ne peut pas être déjà écrite"
+    );
+
+    let relues = journal
+        .attendre("dlna_volume_relu", 1, Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        relues.len(),
+        1,
+        "la relecture arrive après coup :\n{}",
+        journal.text()
+    );
+    assert!(
+        relues[0].contains("attendu=128") && relues[0].contains("lu=128"),
+        "{}",
+        relues[0]
     );
 }
