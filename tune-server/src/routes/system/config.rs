@@ -1739,6 +1739,10 @@ mod intervalle_reseau_tests_2148 {
 #[cfg(test)]
 #[path = "replaygain_a_chaud_tests_4384.rs"]
 mod replaygain_a_chaud_tests_4384;
+
+#[cfg(test)]
+#[path = "estimation_dossier_tests_2171.rs"]
+mod estimation_dossier_tests_2171;
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
