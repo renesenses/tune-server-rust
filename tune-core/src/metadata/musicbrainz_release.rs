@@ -1363,6 +1363,11 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
 #[path = "musicbrainz_release_banc_release_en_base.rs"]
 mod banc_release_en_base;
 
+// Banc « couverture des crédits des albums identifiés » (#4805, étape E).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_credits_4805.rs"]
+mod banc_credits_4805;
+
 #[cfg(test)]
 mod tests {
     use super::*;

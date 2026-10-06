@@ -48,13 +48,21 @@ pub struct LigneCredit {
 /// La liste est délibérément GÉNÉREUSE côté musique : mieux vaut une ligne de
 /// trop qu'un sideman perdu. Elle ne coupe que ce qui n'a rien à faire sur une
 /// pochette.
+///
+/// #4805, étape E — le banc des crédits (`banc_credits_4805`, 36 pressages
+/// réels) mesurait 3,1 % des crédits portés par les réponses et perdus ici,
+/// tous au niveau de l'enregistrement : `balance` (127 relations) et `editor`
+/// (79), deux métiers d'ingénieur du son, et `chorus master` (23), le chef de
+/// chœur des enregistrements d'opéra. `sound` est le dernier type d'ingénieur
+/// de MusicBrainz qui manquait. Idée : MetaRust (`credits.rs`), qui range
+/// lui aussi `chorus master` parmi les chefs.
 fn role_canonique(rel_type: &str) -> Option<&'static str> {
     Some(match rel_type {
         "instrument" | "performer" | "performing orchestra" => "performer",
         "vocal" => "vocal",
-        "conductor" => "conductor",
+        "conductor" | "chorus master" => "conductor",
         "producer" => "producer",
-        "engineer" | "recording" | "audio" => "engineer",
+        "engineer" | "recording" | "audio" | "sound" | "balance" | "editor" => "engineer",
         "mastering" => "mastering",
         "mix" | "mix-DJ" => "mixer",
         "remixer" => "remixer",
@@ -94,7 +102,7 @@ const ATTRIBUTS_NON_INSTRUMENT: &[&str] = &[
 // peut pas dependre de `tune-server`. Une copie ici et les deux cotes
 // divergeraient au premier ajout de famille.
 /// Vrai si l'attribut qualifie le crédit au lieu de nommer un instrument.
-fn est_qualificatif(attr: &str) -> bool {
+pub(crate) fn est_qualificatif(attr: &str) -> bool {
     let n = normaliser(attr);
     ATTRIBUTS_NON_INSTRUMENT.contains(&n.as_str())
 }
@@ -531,6 +539,23 @@ mod tests {
             .map(|l| l.role.clone())
             .collect();
         assert_eq!(roles, ["mixer", "engineer", "conductor", "performer"]);
+    }
+
+    /// #4805, étape E : les métiers d'ingénieur et le chef de chœur que la
+    /// table perdait, relevés sur les réponses réelles du banc des crédits.
+    #[test]
+    fn ingenieurs_et_chef_de_choeur_ne_sont_plus_perdus() {
+        let data = json!({"relations": [
+            {"type": "balance", "artist": {"name": "B"}},
+            {"type": "editor", "artist": {"name": "Ed"}},
+            {"type": "sound", "artist": {"name": "S"}},
+            {"type": "chorus master", "artist": {"name": "René Duclos"}},
+        ]});
+        let roles: Vec<String> = lignes_relations(&data)
+            .iter()
+            .map(|l| l.role.clone())
+            .collect();
+        assert_eq!(roles, ["engineer", "engineer", "engineer", "conductor"]);
     }
 
     #[test]
