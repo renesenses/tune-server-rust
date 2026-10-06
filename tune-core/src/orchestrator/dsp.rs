@@ -1575,6 +1575,7 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_egaliseur");
         let profile = self.load_eq_profile(zone_id)?;
         let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
         if eq.is_enabled() { Some(eq) } else { None }
@@ -1599,17 +1600,23 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> StreamingDsp {
-        let replaygain = match track_id {
-            Some(tid) if !self.zone_audiophile(zone_id) => {
-                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
-                if (f - 1.0).abs() > 1e-6 {
-                    Some(f)
-                } else {
-                    None
+        let _tout = EtapeDePreparation::debut(zone_id, "dsp_flux_reseau");
+        let replaygain = {
+            let _e = EtapeDePreparation::debut(zone_id, "dsp_replaygain");
+            match track_id {
+                Some(tid) if !self.zone_audiophile(zone_id) => {
+                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                    if (f - 1.0).abs() > 1e-6 {
+                        Some(f)
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             }
-            _ => None,
         };
+        // L'égaliseur, la convolution et le crossfeed se chronomètrent dans
+        // leur chargeur (`EtapeDePreparation`, #5871).
         let mut dsp = StreamingDsp {
             replaygain,
             eq: self.load_eq_processor(zone_id, sample_rate, channels),
@@ -1628,11 +1635,14 @@ impl PlaybackOrchestrator {
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
-        dsp.compensation = self.compensation_du_flux_reseau(
-            zone_id,
-            dsp.eq.as_ref(),
-            dsp.crossfeed.as_ref().filter(|_| channels == 2),
-        );
+        dsp.compensation = {
+            let _e = EtapeDePreparation::debut(zone_id, "dsp_compensation");
+            self.compensation_du_flux_reseau(
+                zone_id,
+                dsp.eq.as_ref(),
+                dsp.crossfeed.as_ref().filter(|_| channels == 2),
+            )
+        };
         dsp
     }
 
@@ -1841,6 +1851,7 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_convolution");
         let path = self.chemin_ir(zone_id)?;
         match crate::audio::convolver::Convolver::from_wav_for(
             &path,
@@ -1871,6 +1882,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         sample_rate: u32,
     ) -> Option<crate::audio::crossfeed::CrossfeedProcessor> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_crossfeed");
         // PURE mode: no crossfeed, keep the signal path bit-perfect.
         if self.zone_audiophile(zone_id) {
             return None;
@@ -2425,5 +2437,50 @@ impl PlaybackOrchestrator {
             }
         }
         true
+    }
+}
+
+/// Au-delà, une étape de la préparation d'une lecture est dite en INFO
+/// (#5871).
+pub(super) const SEUIL_ETAPE_LENTE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Une étape de la préparation d'une lecture, chronométrée de sa création à
+/// son abandon (#5871).
+///
+/// Le rapport de Tades montrait trois tranches de 7 à 15 s entre des jalons
+/// éloignés, sans dire laquelle des étapes intermédiaires les prenait. Chaque
+/// étape dit désormais sa durée quand elle dépasse [`SEUIL_ETAPE_LENTE`] :
+/// le prochain journal nommera l'étape, au lieu de la faire déduire. Rien
+/// n'est écrit sous le seuil — une préparation normale reste muette.
+///
+/// Mesurée à l'abandon : un retour anticipé (`?`, erreur) la mesure aussi, et
+/// elle vaut pour un bloc `async` comme pour un bloc synchrone.
+pub(super) struct EtapeDePreparation {
+    zone_id: i64,
+    etape: &'static str,
+    debut: std::time::Instant,
+}
+
+impl EtapeDePreparation {
+    pub(super) fn debut(zone_id: i64, etape: &'static str) -> Self {
+        Self {
+            zone_id,
+            etape,
+            debut: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for EtapeDePreparation {
+    fn drop(&mut self) {
+        let duree = self.debut.elapsed();
+        if duree >= SEUIL_ETAPE_LENTE {
+            info!(
+                zone_id = self.zone_id,
+                etape = self.etape,
+                ms = duree.as_millis() as u64,
+                "preparation_etape_lente"
+            );
+        }
     }
 }

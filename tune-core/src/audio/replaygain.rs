@@ -36,7 +36,7 @@ pub mod plage_dynamique;
 pub mod bibliotheque;
 
 use crate::audio::ecretage::CompteurDEcretage;
-use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::library::local_path::{
@@ -138,47 +138,224 @@ fn ecrire_le_dr_mesure(repo: &TrackMetadataRepo, track_id: i64, dr: u32) {
     }
 }
 
-/// Écrire la mesure d'une piste : gains, pics, provenance, et la plage
-/// dynamique qui voyage avec ce décodage-ci.
+/// Ce que la passe nominale doit écrire pour UNE piste, calculé pendant le
+/// tour et écrit à sa fin, avec celles des autres pistes du tour (#5519).
 ///
-/// Synchrone, et appelée HORS du fil async (#4681) : cinq à sept écritures
-/// SQLite qui prennent le verrou d'écriture unique de la base.
-fn ecrire_la_mesure_de_piste(
-    backend: &Arc<dyn DbBackend>,
-    track_id: i64,
-    lufs: f64,
-    peak: f64,
-    true_peak: f64,
-    plage: Option<u32>,
-) {
-    let repo = TrackMetadataRepo::with_backend(backend.clone());
-    let gain = track_gain_db(lufs);
-    let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
-    let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
-    // True peak inter-échantillons 4× (#1694). Clé à part : `rg_track_peak`
-    // garde sa sémantique sample-peak (compat tags, #1382) ;
-    // `prevent_clipping` PRÉFÈRE celle-ci quand elle existe. Peut dépasser
-    // 1.0 — c'est l'information.
-    let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
-    // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en base un
-    // gain MESURÉ ici d'un gain lu dans les tags du fichier : les deux
-    // s'écrivent sous `rg_track_gain`, et c'est voulu (interchangeables à la
-    // lecture). Mais le chemin du signal doit pouvoir dire d'où vient le gain
-    // qu'il applique, et « tags du fichier » affiché sur une mesure Tune
-    // serait un affichage inventé.
-    let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
-    // #5594 — la version de l'algorithme qui a produit ces trois valeurs,
-    // écrite avec elles. Une mesure d'avant cette clé reste sans version.
-    let _ = repo.set(track_id, RG_ALGO_KEY, RG_ALGO);
+/// Les champs suivent l'ordre des écritures d'avant, qui partaient une à une
+/// au fil de la piste : report effacé ou posé, mesure, empreinte, témoin.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EcrituresDePiste {
+    pub track_id: i64,
+    /// Le fichier répond : un report (#1865) qui traînait est effacé.
+    pub effacer_le_report: bool,
+    /// Le fichier ne répond pas : report daté (#1865), et rien d'autre.
+    pub report: Option<String>,
+    /// `(lufs, crête, crête vraie, plage dynamique)`, quand la mesure a abouti.
+    pub mesure: Option<(f64, f64, f64, Option<u32>)>,
+    /// L'empreinte du contenu, ou sa marque « pas d'empreinte possible ».
+    pub empreinte: Option<String>,
+    /// Le témoin `rg_analyzed` (heure unix) : la piste quitte le balayage.
+    pub temoin: Option<String>,
+}
 
-    // ── PLAGE DYNAMIQUE ──────────────────────────────────────────────────
-    //
-    // Elle voyage avec ce décodage-ci : `mesurer_intensite_et_plage` la
-    // calcule sur les mêmes échantillons, donc elle ne coûte que son
-    // arithmétique. Un balayage séparé relirait chaque fichier une seconde
-    // fois — 46 877 pistes sur le .18, mesuré le 09/09/2026.
-    if let Some(dr) = plage {
-        ecrire_le_dr_mesure(&repo, track_id, dr);
+impl EcrituresDePiste {
+    fn pour(track_id: i64) -> Self {
+        Self {
+            track_id,
+            ..Self::default()
+        }
+    }
+
+    fn est_vide(&self) -> bool {
+        !self.effacer_le_report
+            && self.report.is_none()
+            && self.mesure.is_none()
+            && self.empreinte.is_none()
+            && self.temoin.is_none()
+    }
+}
+
+/// Les mêmes écritures qu'avant, dans le même ordre, à travers `tx`.
+///
+/// La première erreur est rendue : dans la transaction du tour, elle l'annule
+/// tout entière et le tour repasse par l'écriture piste à piste
+/// ([`ecrire_le_tour`]).
+fn appliquer_les_ecritures(tx: &dyn DbTxHandle, e: &EcrituresDePiste) -> Result<(), String> {
+    const UPSERT: &str = "INSERT INTO track_metadata (track_id, key, value) VALUES (?, ?, ?) \
+                          ON CONFLICT (track_id, key) DO UPDATE SET value = excluded.value";
+    let id = e.track_id;
+    let poser = |cle: &str, valeur: &str| -> Result<(), String> {
+        tx.execute(
+            UPSERT,
+            &[
+                &id as &dyn ToSqlValue,
+                &cle as &dyn ToSqlValue,
+                &valeur as &dyn ToSqlValue,
+            ],
+        )
+        .map(|_| ())
+    };
+    if e.effacer_le_report {
+        tx.execute(
+            "DELETE FROM track_metadata WHERE track_id = ? AND key = ?",
+            &[
+                &id as &dyn ToSqlValue,
+                &PATH_UNRESOLVED_KEY as &dyn ToSqlValue,
+            ],
+        )?;
+    }
+    if let Some(report) = &e.report {
+        poser(PATH_UNRESOLVED_KEY, report)?;
+    }
+    if let Some((lufs, peak, true_peak, plage)) = e.mesure {
+        poser("rg_track_gain", &format_gain(track_gain_db(lufs)))?;
+        poser("rg_track_peak", &format_peak(peak))?;
+        // True peak inter-échantillons 4× (#1694). Clé à part : `rg_track_peak`
+        // garde sa sémantique sample-peak (compat tags, #1382) ;
+        // `prevent_clipping` PRÉFÈRE celle-ci quand elle existe. Peut dépasser
+        // 1.0 — c'est l'information.
+        poser("rg_track_true_peak", &format_peak(true_peak))?;
+        // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en base un
+        // gain MESURÉ ici d'un gain lu dans les tags du fichier : les deux
+        // s'écrivent sous `rg_track_gain`, et c'est voulu (interchangeables à
+        // la lecture). Mais le chemin du signal doit pouvoir dire d'où vient
+        // le gain qu'il applique, et « tags du fichier » affiché sur une
+        // mesure Tune serait un affichage inventé.
+        poser(TRACK_SOURCE_KEY, SOURCE_ANALYSIS)?;
+        // #5594 — la version de l'algorithme qui a produit ces trois
+        // valeurs, écrite avec elles. Une mesure d'avant cette clé reste sans
+        // version.
+        poser(RG_ALGO_KEY, RG_ALGO)?;
+        // ── PLAGE DYNAMIQUE ──────────────────────────────────────────────
+        //
+        // Elle voyage avec ce décodage-ci : la mesure la calcule sur les
+        // mêmes échantillons. Le tag du fichier fait foi
+        // ([`peut_ecrire_le_dr`]) : relu ICI, dans la transaction, juste
+        // avant d'écrire — un scan a pu en poser un pendant le décodage.
+        if let Some(dr) = plage {
+            let existant = tx
+                .query_one(
+                    "SELECT value FROM track_metadata WHERE track_id = ? AND key = 'dr_track'",
+                    &[&id as &dyn ToSqlValue],
+                )?
+                .and_then(|r| r.first().and_then(|v| v.as_string()));
+            if peut_ecrire_le_dr(existant.as_deref()) {
+                poser("dr_track", &dr.to_string())?;
+                poser("dr_source", DR_SOURCE_ANALYSIS)?;
+                // #5594 — la version de l'algorithme, écrite avec la mesure.
+                poser(DR_ALGO_KEY, DR_ALGO)?;
+            }
+        }
+    }
+    if let Some(empreinte) = &e.empreinte {
+        tx.execute(
+            "UPDATE tracks SET audio_fingerprint = ? WHERE id = ?",
+            &[
+                &empreinte.as_str() as &dyn ToSqlValue,
+                &id as &dyn ToSqlValue,
+            ],
+        )?;
+    }
+    if let Some(temoin) = &e.temoin {
+        poser("rg_analyzed", temoin)?;
+    }
+    Ok(())
+}
+
+/// Les écritures d'un tour, hors transaction : chaque instruction part seule
+/// et une erreur n'arrête pas les suivantes — exactement l'écriture d'avant
+/// le regroupement (`let _ = repo.set(…)`).
+struct SansTransaction<'a>(&'a dyn DbBackend);
+
+impl DbTxHandle for SansTransaction<'_> {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        // Erreur avalée, comme avant : la suite de la piste s'écrit quand même.
+        Ok(self.0.execute(sql, params).unwrap_or(0))
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+        Ok(self.0.query_one(sql, params).ok().flatten())
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+        Ok(self.0.query_many(sql, params).unwrap_or_default())
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.0.last_insert_rowid()
+    }
+}
+
+/// Comment se sont écrites les pistes d'un tour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcritureDuTour {
+    /// Rien à écrire.
+    Rien,
+    /// Une seule transaction pour tout le tour.
+    Groupee,
+    /// La transaction a échoué : chaque écriture est partie seule, comme
+    /// avant le regroupement.
+    PisteAPiste,
+}
+
+/// Écrire en UNE transaction tout ce que les pistes d'un tour ont produit
+/// (#5519).
+///
+/// Avant, chaque piste écrivait au fil de l'eau : cinq à neuf instructions,
+/// chacune sa propre transaction implicite, son `COMMIT` et sa prise du
+/// verrou d'écriture — environ 200 par tour de 25 pistes. Ici, tout le calcul
+/// est déjà fait : la transaction n'enchaîne que des écritures de clés,
+/// quelques millisecondes pour un tour entier (mesure dans la PR).
+///
+/// **Le verrou d'écriture n'est pas tenu longtemps**, et c'est voulu :
+/// - la transaction ne s'ouvre qu'après le dernier décodage du tour, jamais
+///   pendant ; elle ne traverse aucun `await` ;
+/// - sur SQLite, `write_tx` prend la connexion comme toute écriture : si un
+///   lot de scan a sa transaction ouverte, elle attend sa prochaine cession
+///   (#5202, #5798), puis passe en une fois au lieu de deux cents ;
+/// - le `COMMIT` ne replie plus le WAL sur la connexion d'écriture : le
+///   replieur s'en charge sur la sienne (#5804). Un `COMMIT` par tour au lieu
+///   de deux cents, c'est aussi deux cents fois moins de pages de WAL
+///   validées une à une.
+///
+/// Si la transaction échoue (une transaction orpheline restée ouverte sur la
+/// connexion, par exemple), le tour repasse par l'écriture d'avant, piste à
+/// piste, erreurs avalées : un échec du regroupement ne perd aucune mesure.
+///
+/// Synchrone : à appeler HORS du fil async (#4681).
+pub fn ecrire_le_tour(
+    backend: &Arc<dyn DbBackend>,
+    ecritures: &[EcrituresDePiste],
+) -> EcritureDuTour {
+    let a_ecrire: Vec<&EcrituresDePiste> = ecritures.iter().filter(|e| !e.est_vide()).collect();
+    if a_ecrire.is_empty() {
+        return EcritureDuTour::Rien;
+    }
+    let groupee = backend.write_tx(&mut |tx| {
+        for e in &a_ecrire {
+            appliquer_les_ecritures(tx, e)?;
+        }
+        Ok(())
+    });
+    match groupee {
+        Ok(()) => EcritureDuTour::Groupee,
+        Err(erreur) => {
+            warn!(
+                error = %erreur,
+                pistes = a_ecrire.len(),
+                "replaygain_ecriture_groupee_echouee — repli piste a piste"
+            );
+            let seule = SansTransaction(backend.as_ref());
+            for e in &a_ecrire {
+                let _ = appliquer_les_ecritures(&seule, e);
+            }
+            EcritureDuTour::PisteAPiste
+        }
     }
 }
 
@@ -1132,6 +1309,81 @@ pub fn compter_les_reportees_par_chemin(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Les `n` premières pistes candidates d'identifiant strictement supérieur à
+/// `apres`, dans l'ordre des identifiants (#5519).
+///
+/// C'est la sélection de [`analyze_track_batch`], bornée par un CURSEUR. Sans
+/// lui, chaque tour relisait la bibliothèque depuis la première piste : sur
+/// 500 000 pistes déjà faites et des nouvelles en queue (l'ordre d'un scan),
+/// deux sondes de `track_metadata` par piste déjà faite, environ 0,4 s par
+/// tour sur Shrek. Avec lui, un tour ne relit que ce qui suit le dernier
+/// identifiant traité.
+///
+/// L'index est la clé primaire de `tracks` (`t.id > ? ORDER BY t.id`), et
+/// chaque `NOT EXISTS` est une sonde de la clé primaire `(track_id, key)` de
+/// `track_metadata` — sur SQLite comme sur PostgreSQL. Aucune migration : les
+/// plans sont relevés dans la PR.
+///
+/// Rendue `pub` pour le banc (`examples/banc_replaygain_5519.rs`).
+pub fn selectionner_les_candidats_replaygain(
+    backend: &Arc<dyn DbBackend>,
+    apres: i64,
+    n: usize,
+) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    // #5593 — le PÉRIMÈTRE : les racines exclues sortent de la sélection.
+    let predicat = candidats_rg_where(backend);
+    backend.query_many(
+        &format!(
+            "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
+             WHERE {predicat} AND t.id > ? ORDER BY t.id LIMIT ?"
+        ),
+        &[
+            &seuil_report as &dyn ToSqlValue,
+            &apres as &dyn ToSqlValue,
+            &(n as i64) as &dyn ToSqlValue,
+        ],
+    )
+}
+
+/// Le curseur de la sélection ReplayGain, PAR BASE : le dernier identifiant
+/// que la passe a laissé derrière elle (#5519).
+///
+/// En mémoire, et c'est assez : au redémarrage il repart de 0, et le premier
+/// tour paie une fois la relecture complète d'avant. Rangé à côté d'un `Weak`
+/// de la base qu'il suit : tant qu'il existe, l'allocation de cette base ne
+/// peut pas être réemployée par une autre, si bien que deux bases (deux
+/// tests, par exemple) n'héritent jamais du curseur l'une de l'autre.
+///
+/// Le curseur n'est jamais une raison de manquer une piste : quand plus rien
+/// ne le suit, [`analyze_track_batch`] repart de 0 avant de conclure au repos.
+static CURSEURS_RG: std::sync::Mutex<Vec<(std::sync::Weak<dyn DbBackend>, i64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn curseur_rg(backend: &Arc<dyn DbBackend>) -> i64 {
+    let cible = Arc::downgrade(backend);
+    let curseurs = CURSEURS_RG.lock().unwrap_or_else(|e| e.into_inner());
+    curseurs
+        .iter()
+        .find(|(base, _)| std::sync::Weak::ptr_eq(base, &cible))
+        .map(|(_, c)| *c)
+        .unwrap_or(0)
+}
+
+fn poser_curseur_rg(backend: &Arc<dyn DbBackend>, valeur: i64) {
+    let cible = Arc::downgrade(backend);
+    let mut curseurs = CURSEURS_RG.lock().unwrap_or_else(|e| e.into_inner());
+    // Les bases disparues libèrent leur place.
+    curseurs.retain(|(base, _)| base.strong_count() > 0);
+    match curseurs
+        .iter_mut()
+        .find(|(base, _)| std::sync::Weak::ptr_eq(base, &cible))
+    {
+        Some((_, c)) => *c = valeur,
+        None => curseurs.push((cible, valeur)),
+    }
+}
+
 /// Analyse up to `TRACK_BATCH` local tracks that have no ReplayGain yet. Returns
 /// how many were processed (0 ⇒ nothing left, caller idles).
 pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
@@ -1169,18 +1421,18 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // `CANDIDATS_DR_WHERE`) sont EN AVAL de celle-ci : elles exigent le témoin
     // `rg_analyzed`, que seule cette passe pose. Les élargir sans elle ne
     // sélectionnerait rien.
-    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
-    let predicat = candidats_rg_where(backend);
-    let rows = match backend.query_many(
-        &format!(
-            "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
-             WHERE {predicat} LIMIT ?"
-        ),
-        &[
-            &seuil_report as &dyn ToSqlValue,
-            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
-        ],
-    ) {
+    let depuis = curseur_rg(backend);
+    let rows = match selectionner_les_candidats_replaygain(backend, depuis, TRACK_BATCH) {
+        // Rien après le curseur : un tour complet depuis le début, une fois,
+        // avant de conclure. Les pistes redevenues candidates DERRIÈRE lui
+        // (report expiré, rattrapage, re-scan) sont reprises ici.
+        Ok(r) if r.is_empty() && depuis > 0 => {
+            poser_curseur_rg(backend, 0);
+            selectionner_les_candidats_replaygain(backend, 0, TRACK_BATCH)
+        }
+        autre => autre,
+    };
+    let rows = match rows {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "replaygain_candidate_query_failed");
@@ -1198,10 +1450,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // une seule fois : voir `progression::ouvrir_si_besoin`.
     progression::ouvrir_si_besoin(|| compter_les_candidats_replaygain(backend));
 
-    let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     let mut deferred = 0usize;
     let mut cedees = 0usize;
+    // #5519 — ce que les pistes du tour écriront ensemble, à sa fin.
+    let mut tour: Vec<EcrituresDePiste> = Vec::with_capacity(rows.len());
+    let mut passees: std::collections::HashSet<i64> = std::collections::HashSet::new();
     // #5519 — plusieurs fichiers à la fois, selon la vitesse réglée. Les
     // gardes (réglage, pause, lecture) restent relues avant CHAQUE fichier
     // lancé : la frontière propre est toujours « entre deux fichiers ».
@@ -1236,23 +1490,68 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             }
             true
         },
-        |r| analyser_une_piste(backend, &repo, r),
-        |suite| match suite {
-            SuitePiste::Ignoree => true,
-            SuitePiste::Avancee { reportee } => {
-                done += 1;
-                if reportee {
-                    deferred += 1;
-                }
-                true
+        |r| {
+            let id = r.first().and_then(|v| v.as_i64());
+            let piste = analyser_une_piste(backend, r);
+            async move { (id, piste.await) }
+        },
+        |(id, (suite, ecritures))| {
+            if let Some(e) = ecritures {
+                tour.push(e);
             }
-            SuitePiste::Cedee => {
-                cedees += 1;
-                false
+            match suite {
+                SuitePiste::Ignoree => {
+                    passees.extend(id);
+                    true
+                }
+                SuitePiste::Avancee { reportee } => {
+                    passees.extend(id);
+                    done += 1;
+                    if reportee {
+                        deferred += 1;
+                    }
+                    true
+                }
+                SuitePiste::Cedee => {
+                    cedees += 1;
+                    false
+                }
             }
         },
     )
     .await;
+
+    // #5519 — UNE transaction pour tout le tour, hors du fil async (#4681).
+    let ecriture = if tour.is_empty() {
+        EcritureDuTour::Rien
+    } else {
+        let b = backend.clone();
+        crate::taches_de_fond::priorite::hors_du_fil_async(
+            crate::taches_de_fond::Tache::ReplayGain.id(),
+            move || ecrire_le_tour(&b, &tour),
+        )
+        .await
+        .unwrap_or(EcritureDuTour::Rien)
+    };
+    // #4144 — l'avancement suit ce qui est ÉCRIT : la jauge ne devance pas la
+    // base.
+    for _ in 0..done {
+        progression::avancer();
+    }
+
+    // Le curseur s'arrête AVANT la première piste du lot qui n'a pas quitté le
+    // balayage — cédée à la lecture, ou jamais lancée (réglage coupé, pause,
+    // lecture) : le tour suivant la reprend. Les pistes passées derrière elle
+    // ne sont plus candidates, les relire ne coûte qu'une sonde chacune.
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect();
+    let suivant = match ids.iter().find(|id| !passees.contains(id)) {
+        Some(&id) => id - 1,
+        None => ids.last().copied().unwrap_or(depuis),
+    };
+    poser_curseur_rg(backend, suivant);
 
     // `deferred` est porté par la ligne de journal : sans lui, un lot où tout
     // est introuvable ressemblerait à un lot analysé (#1865). `cedees` dit la
@@ -1260,7 +1559,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // un lot rendu à zéro serait indistinguable d'une bibliothèque finie.
     info!(
         analyzed = done - deferred,
-        deferred, cedees, largeur, "replaygain_track_batch"
+        deferred,
+        cedees,
+        largeur,
+        ecriture = ?ecriture,
+        curseur = suivant,
+        "replaygain_track_batch"
     );
     done
 }
@@ -1325,25 +1629,27 @@ async fn en_parallele_borne<I, R, Fut>(
 }
 
 /// Mesurer UNE piste de la passe nominale : gain, pics, plage dynamique et
-/// empreinte, puis poser le témoin `rg_analyzed`.
+/// empreinte, puis le témoin `rg_analyzed`.
 ///
-/// Le corps de l'ancienne boucle de [`analyze_track_batch`], inchangé, à deux
+/// Le corps de l'ancienne boucle de [`analyze_track_batch`], inchangé, à trois
 /// différences près (#5519) : l'empreinte est tirée du décodage de la mesure
 /// quand le format le permet (`mesurer_intensite_plage_et_empreinte`, au bit
-/// près), et il n'y a plus de pause fixe de 400 ms après la piste.
+/// près), il n'y a plus de pause fixe de 400 ms après la piste, et rien n'est
+/// écrit ici : la piste REND ses écritures, que [`ecrire_le_tour`] pose avec
+/// celles des autres pistes du tour, en une transaction.
 async fn analyser_une_piste(
     backend: &Arc<dyn DbBackend>,
-    repo: &TrackMetadataRepo,
     r: &[crate::db::backend::SqlValue],
-) -> SuitePiste {
+) -> (SuitePiste, Option<EcrituresDePiste>) {
     let track_id = match r.first().and_then(|v| v.as_i64()) {
         Some(id) => id,
-        None => return SuitePiste::Ignoree,
+        None => return (SuitePiste::Ignoree, None),
     };
     let path = match r.get(1).and_then(|v| v.as_string()) {
         Some(p) if !p.is_empty() => p,
-        _ => return SuitePiste::Ignoree,
+        _ => return (SuitePiste::Ignoree, None),
     };
+    let mut ecritures = EcrituresDePiste::pour(track_id);
 
     // Le chemin de la base est en NFC ; le fichier, lui, peut être écrit
     // en NFD sur le disque (macOS, SMB/CIFS). On résout AVANT de décider
@@ -1361,21 +1667,17 @@ async fn analyser_une_piste(
                 "replaygain_path_unresolved — aucune graphie (stockee, NFD, NFC) \
                  ne repond ; piste REPORTEE, pas marquee analysee (#1865)"
             );
-            let _ = repo.set(
-                track_id,
-                PATH_UNRESOLVED_KEY,
-                &deferral_stamp(now_epoch_secs() as i64),
-            );
+            ecritures.report = Some(deferral_stamp(now_epoch_secs() as i64));
             // Comptée comme AVANCÉE : la ligne ne ressortira pas de la
             // prochaine requête. Sans cela, un lot entièrement introuvable
             // rendrait 0 et endormirait la passe 15 minutes à chaque paquet de
-            // 25 lignes. #4144 — la jauge avance pour la même raison.
-            progression::avancer();
-            return SuitePiste::Avancee { reportee: true };
+            // 25 lignes. #4144 — la jauge avance pour la même raison (après
+            // l'écriture du tour).
+            return (SuitePiste::Avancee { reportee: true }, Some(ecritures));
         }
     };
     // Un report qui traînait n'a plus lieu d'être : le fichier répond.
-    let _ = repo.delete(track_id, PATH_UNRESOLVED_KEY);
+    ecritures.effacer_le_report = true;
 
     let delai = delai_d_analyse(r.get(2).and_then(|v| v.as_i64()));
 
@@ -1405,7 +1707,8 @@ async fn analyser_une_piste(
                  abandonne SANS temoin (il sera repris) ; le segment deja parti \
                  finit dans le vide, il n'est pas annulable (#2495)"
             );
-            return SuitePiste::Cedee;
+            // L'effacement du report, lui, reste dû : le fichier a répondu.
+            return (SuitePiste::Cedee, Some(ecritures));
         }
     };
     let (mesure, empreinte) = match measured {
@@ -1413,25 +1716,10 @@ async fn analyser_une_piste(
         Err(elapsed) => (Err(elapsed), None),
     };
     match mesure {
-        Ok(Some((lufs, peak, true_peak, plage))) => {
-            // #4681 — les cinq à sept écritures de la mesure partent HORS
-            // des fils de l'exécuteur : la lecture a pu démarrer pendant
-            // le décodage, et ces fils la servent.
-            let backend_ecriture = backend.clone();
-            crate::taches_de_fond::priorite::hors_du_fil_async(
-                crate::taches_de_fond::Tache::ReplayGain.id(),
-                move || {
-                    ecrire_la_mesure_de_piste(
-                        &backend_ecriture,
-                        track_id,
-                        lufs,
-                        peak,
-                        true_peak,
-                        plage,
-                    )
-                },
-            )
-            .await;
+        Ok(Some(m)) => {
+            // Écrite à la fin du tour (`ecrire_le_tour`), hors des fils de
+            // l'exécuteur (#4681).
+            ecritures.mesure = Some(m);
         }
         // Le fichier a disparu ENTRE la résolution et le décodage — un
         // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -1443,13 +1731,9 @@ async fn analyser_une_piste(
                 path = %path,
                 "replaygain_path_disparu_pendant_analyse — REPORTEE, pas marquee analysee (#1865)"
             );
-            let _ = repo.set(
-                track_id,
-                PATH_UNRESOLVED_KEY,
-                &deferral_stamp(now_epoch_secs() as i64),
-            );
-            progression::avancer(); // #4144
-            return SuitePiste::Avancee { reportee: true };
+            ecritures.effacer_le_report = false;
+            ecritures.report = Some(deferral_stamp(now_epoch_secs() as i64));
+            return (SuitePiste::Avancee { reportee: true }, Some(ecritures)); // #4144
         }
         Ok(None) => {
             // Le fichier est bien là et reste illisible ou silencieux :
@@ -1471,29 +1755,16 @@ async fn analyser_une_piste(
     // BIB-B2 : l'empreinte du contenu, dans la même passe. #5519 — tirée du
     // décodage de la mesure quand il l'a permis ; sinon, décodée à part comme
     // avant.
-    match empreinte {
-        Some(calcul) => {
-            ecrire_l_empreinte(backend, track_id, &sur_disque, calcul).await;
-        }
-        None => {
-            empreinter_la_piste(backend, track_id, &sur_disque).await;
-        }
-    }
+    ecritures.empreinte = match empreinte {
+        Some(calcul) => Some(valeur_d_empreinte(track_id, &sur_disque, calcul)),
+        None => calculer_l_empreinte(track_id, &sur_disque).await,
+    };
     // Sentinel = unix seconds, so an album pass can tell a track has been
-    // handled even when it produced no gain. Hors du fil async (#4681).
-    {
-        let repo_temoin = TrackMetadataRepo::with_backend(backend.clone());
-        crate::taches_de_fond::priorite::hors_du_fil_async(
-            crate::taches_de_fond::Tache::ReplayGain.id(),
-            move || {
-                let _ = repo_temoin.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
-            },
-        )
-        .await;
-    }
-    // #4144 — LE point d'avancement nominal, par piste.
-    progression::avancer();
-    SuitePiste::Avancee { reportee: false }
+    // handled even when it produced no gain.
+    ecritures.temoin = Some(now_epoch_secs().to_string());
+    // #4144 — LE point d'avancement nominal, par piste (compté par le lot,
+    // après l'écriture du tour).
+    (SuitePiste::Avancee { reportee: false }, Some(ecritures))
 }
 
 /// BIB-B2 : la marque « pas d'empreinte possible » (silence, fichier
@@ -1507,29 +1778,37 @@ fn marque_sans_empreinte() -> String {
 /// (90 s au plus, mono 11 kHz) part en tache bloquante. Rend `true` si une
 /// valeur a ete ecrite (empreinte ou marque).
 async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin: &str) -> bool {
+    match calculer_l_empreinte(track_id, chemin).await {
+        Some(valeur) => ecrire_l_empreinte(backend, track_id, valeur).await,
+        None => false,
+    }
+}
+
+/// Décoder et calculer l'empreinte d'une piste (tâche bloquante), sans
+/// l'écrire. `None` si la tâche a été interrompue : rien à poser.
+async fn calculer_l_empreinte(track_id: i64, chemin: &str) -> Option<String> {
     let chemin_owned = chemin.to_string();
     let calcul = tokio::task::spawn_blocking(move || {
         crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
     })
     .await;
     match calcul {
-        Ok(calcul) => ecrire_l_empreinte(backend, track_id, chemin, calcul).await,
+        Ok(calcul) => Some(valeur_d_empreinte(track_id, chemin, calcul)),
         Err(e) => {
             warn!(track_id, path = %chemin, error = %e, "empreinte_tache_interrompue");
-            false
+            None
         }
     }
 }
 
-/// Poser l'empreinte calculée — ou la marque « pas d'empreinte possible » —
-/// d'une piste. Rend `true` si une valeur a été écrite.
-async fn ecrire_l_empreinte(
-    backend: &Arc<dyn DbBackend>,
+/// La valeur à poser pour un calcul d'empreinte : l'empreinte sérialisée, ou
+/// la marque « pas d'empreinte possible ».
+fn valeur_d_empreinte(
     track_id: i64,
     chemin: &str,
     calcul: Result<Option<crate::audio::empreinte::Empreinte>, String>,
-) -> bool {
-    let valeur = match calcul {
+) -> String {
+    match calcul {
         Ok(Some(e)) => e.serialiser(),
         Ok(None) => {
             debug!(track_id, path = %chemin, "empreinte_silence — marque posee");
@@ -1539,7 +1818,12 @@ async fn ecrire_l_empreinte(
             warn!(track_id, path = %chemin, error = %e, "empreinte_decodage_echoue — marque posee");
             marque_sans_empreinte()
         }
-    };
+    }
+}
+
+/// Poser l'empreinte calculée — ou la marque « pas d'empreinte possible » —
+/// d'une piste. Rend `true` si une valeur a été écrite.
+async fn ecrire_l_empreinte(backend: &Arc<dyn DbBackend>, track_id: i64, valeur: String) -> bool {
     // Hors du fil async (#4681) : c'est une écriture SQLite.
     let depot = crate::db::track_repo::TrackRepo::with_backend(backend.clone());
     let ecriture = crate::taches_de_fond::priorite::hors_du_fil_async(
@@ -5054,10 +5338,12 @@ mod tests {
             .unwrap();
 
         // #5519 — la pause fixe de 400 ms, qui laissait le temps à un fil de
-        // basculer le réglage, n'existe plus. On bascule donc AU MOMENT MÊME où
-        // la première piste est estampillée, dans l'écriture : plus aucune
-        // course, le test dit la même chose à chaque passage.
-        let backend = CoupeAuPremierTemoin::poser(interne.clone());
+        // basculer le réglage, n'existe plus, et les témoins ne s'écrivent
+        // plus qu'à la fin du tour. On bascule donc AU MOMENT MÊME où la
+        // garde relit le réglage pour la DEUXIÈME fois, c'est-à-dire après le
+        // premier fichier : plus aucune course, le test dit la même chose à
+        // chaque passage.
+        let backend = CoupeALaGarde::poser(interne.clone(), 1);
         let done = analyze_track_batch(&backend).await;
         assert!(
             SettingsRepo::with_backend(interne.clone())
@@ -5099,8 +5385,18 @@ mod tests {
             largeur >= 2 && largeur < 6,
             "le test parle de plusieurs fichiers en vol sur un lot plus large : largeur={largeur}"
         );
-        let backend = CoupeAuPremierTemoin::poser(interne.clone());
+        // La garde qui suit les `largeur` premiers lancements est la première
+        // relue APRÈS qu'un fichier a fini : c'est là que tombe la coupure.
+        let backend = CoupeALaGarde::poser(interne.clone(), largeur);
         let done = analyze_track_batch(&backend).await;
+        assert!(
+            SettingsRepo::with_backend(interne.clone())
+                .get(MODE_KEY)
+                .unwrap()
+                .as_deref()
+                == Some("off"),
+            "le test n'a jamais réussi à couper le réglage — il ne prouve rien"
+        );
         assert!(
             done >= 1 && done <= largeur,
             "au plus les fichiers déjà en vol à la coupure : done={done}, largeur={largeur}"
@@ -5109,59 +5405,151 @@ mod tests {
         assert!(!meta.get_all(6).unwrap().contains_key("rg_analyzed"));
     }
 
-    /// Une base qui passe le mode ReplayGain à « off » dans l'écriture même du
-    /// PREMIER témoin `rg_analyzed` posé, quelle que soit la piste.
+    /// Une base qui passe le mode ReplayGain à « off » quand la garde de
+    /// lancement le relit pour la `(apres + 1)`-ième fois (#2496, #5519).
     ///
-    /// La coupure est ATOMIQUE pour les autres écrivains : le verrou est tenu
-    /// du constat jusqu'à l'écriture de « off ». Avec un simple drapeau levé
-    /// avant l'écriture, une autre piste pouvait poser son témoin, voir le
-    /// drapeau, rendre la main et libérer une place pendant que le fil qui
-    /// coupait n'avait pas encore écrit « off » : la garde lisait alors un
-    /// réglage encore armé et lançait — légitimement — un fichier de plus.
-    /// Ici, aucun fichier ne peut rendre la main avant que « off » soit lisible.
-    struct CoupeAuPremierTemoin {
+    /// La garde (`analysis_enabled`, dans `peut_lancer`) relit le mode avant
+    /// CHAQUE fichier lancé, et rien d'autre ne le relit pendant un lot. Les
+    /// `apres` premières lectures lancent les fichiers du premier créneau ; la
+    /// suivante n'a lieu qu'après la fin d'un fichier. Couper là, c'est couper
+    /// « en plein lot », entre deux fichiers.
+    ///
+    /// Avant #5519, la coupure tombait dans l'écriture du premier témoin
+    /// `rg_analyzed`. Les témoins s'écrivent maintenant ensemble, à la fin du
+    /// tour : une coupure accrochée à eux tomberait après le lot, et le test
+    /// ne prouverait plus rien.
+    ///
+    /// La coupure est ATOMIQUE : « off » est écrit sous le verrou du compteur,
+    /// AVANT que la lecture qui le déclenche ne soit servie. La garde qui la
+    /// déclenche lit donc déjà « off ».
+    struct CoupeALaGarde {
         interne: Arc<dyn DbBackend>,
-        coupe: std::sync::Mutex<bool>,
+        apres: usize,
+        lectures: std::sync::Mutex<usize>,
     }
 
-    impl CoupeAuPremierTemoin {
-        fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
+    impl CoupeALaGarde {
+        fn poser(interne: Arc<dyn DbBackend>, apres: usize) -> Arc<dyn DbBackend> {
             Arc::new(Self {
                 interne,
-                coupe: std::sync::Mutex::new(false),
+                apres,
+                lectures: std::sync::Mutex::new(0),
             })
         }
-        fn apres_ecriture(&self) {
-            let mut coupe = self.coupe.lock().unwrap();
-            if *coupe {
+        fn avant_lecture(&self, p: &[&dyn ToSqlValue]) {
+            let lit_le_mode = p.first().is_some_and(|v| {
+                matches!(v.to_sql_value(), crate::db::backend::SqlValue::Text(ref k) if k == MODE_KEY)
+            });
+            if !lit_le_mode {
                 return;
             }
-            let estampillee = matches!(
-                self.interne.query_one(
-                    "SELECT 1 FROM track_metadata WHERE key = 'rg_analyzed' LIMIT 1",
-                    &[],
-                ),
-                Ok(Some(_))
-            );
-            if estampillee {
+            let mut n = self.lectures.lock().unwrap();
+            *n += 1;
+            if *n == self.apres + 1 {
                 SettingsRepo::with_backend(self.interne.clone())
                     .set(MODE_KEY, "off")
                     .unwrap();
-                *coupe = true;
             }
         }
     }
 
-    impl DbBackend for CoupeAuPremierTemoin {
+    impl DbBackend for CoupeALaGarde {
         fn engine(&self) -> crate::db::engine::Engine {
             self.interne.engine()
         }
         fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
-            let r = self.interne.execute(sql, p);
-            if sql.contains("track_metadata") {
-                self.apres_ecriture();
+            self.interne.execute(sql, p)
+        }
+        fn last_insert_rowid(&self) -> i64 {
+            self.interne.last_insert_rowid()
+        }
+        fn query_one(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            self.avant_lecture(p);
+            self.interne.query_one(sql, p)
+        }
+        fn query_many(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many(sql, p)
+        }
+        fn write_tx(
+            &self,
+            f: &mut dyn FnMut(&dyn crate::db::backend::DbTxHandle) -> Result<(), String>,
+        ) -> Result<(), String> {
+            self.interne.write_tx(f)
+        }
+        fn execute_batch(&self, sql: &str) -> Result<(), String> {
+            self.interne.execute_batch(sql)
+        }
+        fn query_one_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Option<Vec<crate::db::backend::SqlValue>>, String> {
+            self.avant_lecture(p);
+            self.interne.query_one_strong(sql, p)
+        }
+        fn query_many_strong(
+            &self,
+            sql: &str,
+            p: &[&dyn ToSqlValue],
+        ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            self.interne.query_many_strong(sql, p)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // #5519, suite — le curseur de la sélection et l'écriture groupée du tour.
+    // ---------------------------------------------------------------------
+
+    /// Une base qui note ce que la passe lui demande : le curseur de chaque
+    /// sélection de candidats, et chaque écriture, groupée ou non.
+    struct BaseQuiNote {
+        interne: Arc<dyn DbBackend>,
+        curseurs: std::sync::Mutex<Vec<i64>>,
+        transactions: std::sync::atomic::AtomicUsize,
+        ecritures_seules: std::sync::atomic::AtomicUsize,
+        refuser_les_transactions: bool,
+    }
+
+    impl BaseQuiNote {
+        fn poser(interne: Arc<dyn DbBackend>, refuser_les_transactions: bool) -> Arc<Self> {
+            Arc::new(Self {
+                interne,
+                curseurs: std::sync::Mutex::new(Vec::new()),
+                transactions: std::sync::atomic::AtomicUsize::new(0),
+                ecritures_seules: std::sync::atomic::AtomicUsize::new(0),
+                refuser_les_transactions,
+            })
+        }
+        fn curseurs(&self) -> Vec<i64> {
+            self.curseurs.lock().unwrap().clone()
+        }
+        fn transactions(&self) -> usize {
+            self.transactions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn ecritures_seules(&self) -> usize {
+            self.ecritures_seules
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DbBackend for BaseQuiNote {
+        fn engine(&self) -> crate::db::engine::Engine {
+            self.interne.engine()
+        }
+        fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+            if sql.contains("track_metadata") || sql.contains("UPDATE tracks") {
+                self.ecritures_seules
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            r
+            self.interne.execute(sql, p)
         }
         fn last_insert_rowid(&self) -> i64 {
             self.interne.last_insert_rowid()
@@ -5178,15 +5566,24 @@ mod tests {
             sql: &str,
             p: &[&dyn ToSqlValue],
         ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
+            if sql.contains("AND t.id > ? ORDER BY t.id LIMIT ?") {
+                // Paramètres : seuil de report, curseur, borne.
+                if let Some(c) = p.get(1).and_then(|v| v.to_sql_value().as_i64()) {
+                    self.curseurs.lock().unwrap().push(c);
+                }
+            }
             self.interne.query_many(sql, p)
         }
         fn write_tx(
             &self,
             f: &mut dyn FnMut(&dyn crate::db::backend::DbTxHandle) -> Result<(), String>,
         ) -> Result<(), String> {
-            let r = self.interne.write_tx(f);
-            self.apres_ecriture();
-            r
+            if self.refuser_les_transactions {
+                return Err("begin tx: cannot start a transaction within a transaction".into());
+            }
+            self.transactions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.interne.write_tx(f)
         }
         fn execute_batch(&self, sql: &str) -> Result<(), String> {
             self.interne.execute_batch(sql)
@@ -5205,6 +5602,385 @@ mod tests {
         ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
             self.interne.query_many_strong(sql, p)
         }
+    }
+
+    /// #5519 — un tour ne relit plus la bibliothèque depuis la première piste :
+    /// il reprend APRÈS la dernière piste que le tour précédent a laissée
+    /// derrière lui, et ne repart de 0 qu'une fois, quand plus rien ne suit.
+    #[tokio::test]
+    async fn le_tour_suivant_reprend_apres_le_curseur() {
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(30);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let note = BaseQuiNote::poser(interne.clone(), false);
+        let backend: Arc<dyn DbBackend> = note.clone();
+        assert_eq!(analyze_track_batch(&backend).await, 25);
+        assert_eq!(analyze_track_batch(&backend).await, 5);
+        assert_eq!(analyze_track_batch(&backend).await, 0);
+        assert_eq!(
+            note.curseurs(),
+            vec![0, 25, 30, 0],
+            "premier tour depuis 0 ; le deuxième reprend après la 25e piste, pas \
+             depuis le début ; le troisième ne trouve rien après la 30e et repart \
+             UNE fois de 0 avant de conclure"
+        );
+    }
+
+    /// Le curseur n'est jamais une raison de manquer une piste : celle qui
+    /// redevient candidate DERRIÈRE lui (report expiré, re-scan, rattrapage)
+    /// est reprise au tour qui ne trouve plus rien devant lui.
+    #[tokio::test]
+    async fn une_piste_redevenue_candidate_derriere_le_curseur_est_reprise() {
+        let (_tmp, _db, backend) = sweep_db_fichiers_presents(3);
+        SettingsRepo::with_backend(backend.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        assert_eq!(analyze_track_batch(&backend).await, 3);
+        TrackMetadataRepo::with_backend(backend.clone())
+            .delete(1, "rg_analyzed")
+            .unwrap();
+        assert_eq!(
+            analyze_track_batch(&backend).await,
+            1,
+            "la piste 1, redevenue candidate derrière le curseur (posé sur 3), \
+             devait être reprise"
+        );
+        assert!(
+            TrackMetadataRepo::with_backend(backend.clone())
+                .get_all(1)
+                .unwrap()
+                .contains_key("rg_analyzed")
+        );
+    }
+
+    /// Une piste qui n'a pas quitté le balayage (lot arrêté par le réglage,
+    /// la pause ou la lecture) reste DEVANT le curseur : le tour suivant la
+    /// reprend en premier, sans attendre la reprise depuis 0.
+    #[tokio::test]
+    async fn le_curseur_s_arrete_avant_la_premiere_piste_non_traitee() {
+        let (_tmp, _db, interne) = sweep_db_fichiers_presents(4);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        SettingsRepo::with_backend(interne.clone())
+            .set(crate::taches_de_fond::vitesse::CLE_REGLAGE, "discreet")
+            .unwrap();
+        let note = BaseQuiNote::poser(CoupeALaGarde::poser(interne.clone(), 1), false);
+        let backend: Arc<dyn DbBackend> = note.clone();
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        assert_eq!(analyze_track_batch(&backend).await, 3);
+        assert_eq!(
+            note.curseurs(),
+            vec![0, 1],
+            "coupé après la piste 1, le lot laisse le curseur sur 1 : les pistes \
+             2 à 4 sont reprises au tour suivant"
+        );
+    }
+
+    /// #5519 — les écritures d'un tour partent ENSEMBLE, en une transaction,
+    /// et plus une à une : avant, chaque piste en enchaînait cinq à neuf,
+    /// chacune avec son `COMMIT` et sa prise du verrou d'écriture.
+    #[tokio::test]
+    async fn un_tour_s_ecrit_en_une_seule_transaction() {
+        let (_tmp, db, interne) = sweep_db_fichiers_presents(6);
+        db.execute("ALTER TABLE tracks ADD COLUMN audio_fingerprint TEXT", &[])
+            .unwrap();
+        SettingsRepo::with_backend(interne.clone())
+            .set(MODE_KEY, "track")
+            .unwrap();
+        let note = BaseQuiNote::poser(interne.clone(), false);
+        let backend: Arc<dyn DbBackend> = note.clone();
+        assert_eq!(analyze_track_batch(&backend).await, 6);
+        assert_eq!(
+            (note.transactions(), note.ecritures_seules()),
+            (1, 0),
+            "six pistes : une transaction pour le tour, aucune écriture isolée"
+        );
+        for id in 1..=6 {
+            let t = TrackMetadataRepo::with_backend(interne.clone())
+                .get_all(id)
+                .unwrap();
+            assert!(t.contains_key("rg_analyzed"), "piste {id} : {t:?}");
+        }
+    }
+
+    /// Les écritures d'une piste, pour les deux épreuves ci-dessous : toutes
+    /// les branches (report effacé ou posé, mesure avec ou sans plage, plage
+    /// du fichier présente, vide, absente, empreinte, témoin).
+    fn ecritures_variees() -> Vec<EcrituresDePiste> {
+        vec![
+            EcrituresDePiste {
+                track_id: 1,
+                effacer_le_report: true,
+                mesure: Some((-14.25, 0.9876, 1.0123, Some(9))),
+                empreinte: Some("env100ms-v1:abc".into()),
+                temoin: Some("1790000001".into()),
+                ..Default::default()
+            },
+            EcrituresDePiste {
+                track_id: 2,
+                effacer_le_report: true,
+                mesure: Some((-9.5, 0.5, 0.51, Some(7))),
+                empreinte: Some("env100ms-v1:-".into()),
+                temoin: Some("1790000002".into()),
+                ..Default::default()
+            },
+            EcrituresDePiste {
+                track_id: 3,
+                effacer_le_report: true,
+                mesure: Some((-20.0, 0.25, 0.26, Some(12))),
+                temoin: Some("1790000003".into()),
+                ..Default::default()
+            },
+            EcrituresDePiste {
+                track_id: 4,
+                report: Some("00000001790000004".into()),
+                ..Default::default()
+            },
+            EcrituresDePiste {
+                track_id: 5,
+                effacer_le_report: true,
+                mesure: Some((-30.0, 0.1, 0.1, None)),
+                temoin: Some("1790000005".into()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// L'état de départ des deux épreuves : un report à effacer, un DR du
+    /// fichier qui fait foi, un DR vide qui ne bloque pas.
+    fn base_ecritures() -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+        let (db, backend) = sweep_db(5);
+        db.execute("ALTER TABLE tracks ADD COLUMN audio_fingerprint TEXT", &[])
+            .unwrap();
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        meta.set(1, PATH_UNRESOLVED_KEY, "00000001700000000")
+            .unwrap();
+        meta.set(2, "dr_track", "14").unwrap();
+        meta.set(3, "dr_track", "  ").unwrap();
+        (db, backend)
+    }
+
+    fn tout_lire(db: &crate::db::sqlite::SqliteDb) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .query_many(
+                "SELECT track_id || ' ' || key || '=' || value FROM track_metadata \
+                 UNION ALL SELECT id || ' empreinte=' || COALESCE(audio_fingerprint, '∅') FROM tracks",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r[0].as_string().unwrap_or_default())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Le regroupement ne change RIEN à ce qui est écrit : mêmes clés, mêmes
+    /// valeurs que l'écriture piste à piste — qui est aussi le repli quand la
+    /// transaction échoue. Le tag du fichier fait toujours foi (piste 2), un
+    /// tag vide ne bloque pas (piste 3).
+    #[test]
+    fn l_ecriture_groupee_pose_les_memes_lignes_que_piste_a_piste() {
+        let (db_groupee, groupee) = base_ecritures();
+        let (db_seule, seule) = base_ecritures();
+        let refus = BaseQuiNote::poser(seule.clone(), true);
+        let refus_dyn: Arc<dyn DbBackend> = refus.clone();
+        let lot = ecritures_variees();
+        assert_eq!(ecrire_le_tour(&groupee, &lot), EcritureDuTour::Groupee);
+        assert_eq!(
+            ecrire_le_tour(&refus_dyn, &lot),
+            EcritureDuTour::PisteAPiste,
+            "transaction refusée : le tour repasse par l'écriture piste à piste"
+        );
+        assert!(refus.ecritures_seules() > 0);
+        let attendu = tout_lire(&db_seule);
+        assert_eq!(tout_lire(&db_groupee), attendu);
+        // Et ce qui est écrit est bien ce qu'on attend, pas seulement égal.
+        for ligne in [
+            "1 rg_track_gain=-3.75 dB",
+            "1 dr_track=9",
+            "1 dr_source=analysis",
+            "1 rg_analyzed=1790000001",
+            "1 empreinte=env100ms-v1:abc",
+            "2 dr_track=14",
+            "3 dr_track=12",
+            "4 rg_path_unresolved=00000001790000004",
+        ] {
+            assert!(
+                attendu.iter().any(|l| l == ligne),
+                "{ligne} absent de {attendu:?}"
+            );
+        }
+        for absente in [
+            "1 rg_path_unresolved=",
+            "2 dr_source=",
+            "4 rg_analyzed=",
+            "5 dr_track=",
+        ] {
+            assert!(
+                !attendu.iter().any(|l| l.starts_with(absente)),
+                "{absente} ne devait pas être écrit : {attendu:?}"
+            );
+        }
+    }
+
+    /// #5798 / #5202 — l'écriture du tour respecte un lot de scan qui tient sa
+    /// transaction : elle attend sa CESSION, passe en une fois, et ne s'écrit
+    /// pas dans la transaction du lot (le `ROLLBACK` du lot ne l'emporte pas).
+    #[test]
+    fn l_ecriture_du_tour_passe_a_la_cession_d_un_lot_de_scan() {
+        use crate::db::sqlite::SqliteDb;
+        let dossier = crate::test_scratch::scratch_dir("rg-ecriture-du-tour-pendant-un-lot");
+        let chemin = dossier.join("tune.db");
+        let db = SqliteDb::open(&chemin.to_string_lossy()).unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        for id in 1..=5i64 {
+            db.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, file_path) VALUES ({id}, 't', '/x/{id}.flac')"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+        const LOT: std::time::Duration = std::time::Duration::from_secs(3);
+        let (ouvert, lot_ouvert) = std::sync::mpsc::channel::<()>();
+        let b_lot = backend.clone();
+        let lot = std::thread::spawn(move || {
+            b_lot.execute_batch("BEGIN IMMEDIATE").unwrap();
+            b_lot
+                .execute(
+                    "INSERT INTO tracks (title, file_path) VALUES ('du lot', '/lot.flac')",
+                    &[],
+                )
+                .unwrap();
+            ouvert.send(()).unwrap();
+            let debut = std::time::Instant::now();
+            while debut.elapsed() < LOT {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                // Le point de cession du scan, entre deux fichiers.
+                b_lot.ceder_aux_ecrivains();
+            }
+            b_lot.execute_batch("ROLLBACK").unwrap();
+        });
+        lot_ouvert.recv().unwrap();
+        let debut = std::time::Instant::now();
+        let issue = ecrire_le_tour(&backend, &ecritures_variees());
+        let attente = debut.elapsed();
+        lot.join().unwrap();
+        assert_eq!(issue, EcritureDuTour::Groupee);
+        assert!(
+            attente < std::time::Duration::from_secs(1),
+            "l'écriture du tour a attendu {attente:?} : elle devait passer à la \
+             première cession du lot, pas à sa fin ({LOT:?})"
+        );
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        assert_eq!(
+            meta.get_all(1)
+                .unwrap()
+                .get("rg_analyzed")
+                .map(String::as_str),
+            Some("1790000001"),
+            "le ROLLBACK du lot a emporté l'écriture du tour"
+        );
+    }
+
+    /// La même sélection et la même écriture sur PostgreSQL : le curseur, son
+    /// ordre, l'écriture groupée et le tag du fichier qui fait foi.
+    /// `TUNE_TEST_PG_URL` absent : sauté. Tables temporaires sur une seule
+    /// connexion, comme `i3924_album_provenance_postgres`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_5519_curseur_et_ecriture_groupee() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let pg: Arc<dyn DbBackend> =
+            Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
+        pg.execute_batch(
+            "CREATE TEMP TABLE tracks (id BIGINT PRIMARY KEY, file_path TEXT, duration_ms BIGINT,
+                sample_rate BIGINT, channels BIGINT, audio_fingerprint TEXT);
+             CREATE TEMP TABLE track_metadata (track_id BIGINT NOT NULL, key TEXT NOT NULL,
+                value TEXT NOT NULL, PRIMARY KEY (track_id, key));",
+        )
+        .unwrap();
+        // Insérées dans le désordre : l'ordre rendu doit venir de `ORDER BY`.
+        for id in (1..=30i64).rev() {
+            pg.execute(
+                "INSERT INTO tracks (id, file_path, duration_ms, sample_rate, channels) \
+                 VALUES (?, ?, 240000, 44100, 2)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &format!("/p/{id}.flac") as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            if id <= 20 {
+                pg.execute(
+                    "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_analyzed', '1')",
+                    &[&id as &dyn ToSqlValue],
+                )
+                .unwrap();
+            }
+        }
+        let ids = |apres: i64| -> Vec<i64> {
+            selectionner_les_candidats_replaygain(&pg, apres, 25)
+                .unwrap()
+                .iter()
+                .map(|r| r[0].as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(ids(0), (21..=30).collect::<Vec<_>>());
+        assert_eq!(ids(25), (26..=30).collect::<Vec<_>>());
+        assert!(ids(30).is_empty());
+
+        pg.execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (22, 'dr_track', '14')",
+            &[],
+        )
+        .unwrap();
+        let lot: Vec<EcrituresDePiste> = (21..=23)
+            .map(|id| EcrituresDePiste {
+                track_id: id,
+                effacer_le_report: true,
+                mesure: Some((-14.25, 0.9876, 1.0123, Some(9))),
+                empreinte: Some(format!("env100ms-v1:{id}")),
+                temoin: Some("1790000000".into()),
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(ecrire_le_tour(&pg, &lot), EcritureDuTour::Groupee);
+        let cle = |id: i64, k: &str| -> Option<String> {
+            pg.query_one(
+                "SELECT value FROM track_metadata WHERE track_id = ? AND key = ?",
+                &[&id as &dyn ToSqlValue, &k as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r[0].as_string())
+        };
+        assert_eq!(cle(21, "rg_track_gain").as_deref(), Some("-3.75 dB"));
+        assert_eq!(cle(21, "dr_track").as_deref(), Some("9"));
+        assert_eq!(
+            cle(22, "dr_track").as_deref(),
+            Some("14"),
+            "le tag du fichier fait foi"
+        );
+        assert_eq!(cle(22, "dr_source"), None);
+        assert_eq!(ids(0), (24..=30).collect::<Vec<_>>());
+        pool.close().await;
     }
 
     /// #5519 — plus de pause fixe entre deux fichiers. Dix fichiers présents

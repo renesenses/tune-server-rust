@@ -3214,6 +3214,38 @@ mod restore_zone_volumes_tests {
         assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
     }
 
+    /// #5695 — la graine d'une sortie locale sous PURE forcé : 100 %, SANS
+    /// trim, comme `Orchestrator::set_volume` et `arm_fixed_volume`. Un trim
+    /// de −1,6 dB faisait naître la sortie à 83 % alors que la zone promet le
+    /// plein volume.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn sous_pure_force_la_graine_locale_ignore_le_trim_5695() {
+        use std::sync::atomic::Ordering;
+        let (state, id) = state_with_zone(100.0, false);
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages
+            .set(&format!("zone_{id}_gain_trim_db"), "-1.6")
+            .unwrap();
+        reglages
+            .set(
+                &format!("zone_{id}_audiophile"),
+                r#"{"enabled":true,"lock_volume":true}"#,
+            )
+            .unwrap();
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get_by_device_id("local:Test")
+            .unwrap()
+            .unwrap();
+        let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
+        ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
+        assert_eq!(
+            gain, 1000,
+            "gain de rendu {gain}/1000 sous PURE forcé : le trim a été composé"
+        );
+    }
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
     ///
     /// `restore_zone_volumes` est le pont entre la colonne et le son après un

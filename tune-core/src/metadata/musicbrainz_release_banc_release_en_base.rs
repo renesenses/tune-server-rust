@@ -238,3 +238,57 @@ async fn banc_release_en_base_identification_plus_credits() {
         INC_CREDITS_RELEASE
     ));
 }
+
+/// #4805 D + idée 3 — la lecture du choix d'édition passe par la release
+/// gardée : la première lecture part sur le réseau avec les `inc` complets
+/// ET ceux du choix (`release-groups`), la seconde est servie par la base, et
+/// la réponse gardée couvre aussi la passe des crédits. Un `recording/{id}`
+/// n'est jamais gardé.
+#[tokio::test]
+async fn la_lecture_du_choix_d_edition_est_gardee_en_base() {
+    use super::super::choix_de_pressage::INC_DETAIL;
+    use super::super::musicbrainz_release_cache::inc_couvre;
+    use super::lire_sur_musicbrainz_gardee_par;
+    let b = base();
+    let demandes: RefCell<Vec<(String, String)>> = RefCell::default();
+    let transport = |chemin: String, inc: String| {
+        demandes.borrow_mut().push((chemin.clone(), inc));
+        std::future::ready(Ok(Some(json!({ "id": chemin, "media": [] }))))
+    };
+    let mbid = "11111111-2222-3333-4444-555555555555";
+    let chemin = format!("release/{mbid}");
+    let un = lire_sur_musicbrainz_gardee_par(&b, chemin.clone(), INC_DETAIL, transport)
+        .await
+        .unwrap();
+    assert!(un.is_some());
+    assert_eq!(demandes.borrow().len(), 1);
+    let inc_reseau = demandes.borrow()[0].1.clone();
+    assert!(inc_couvre(&inc_reseau, INC_DETAIL), "{inc_reseau}");
+    assert!(inc_couvre(&inc_reseau, INC_RELEASE_COMPLET), "{inc_reseau}");
+    let deux = lire_sur_musicbrainz_gardee_par(&b, chemin, INC_DETAIL, transport)
+        .await
+        .unwrap();
+    assert_eq!(deux, un);
+    assert_eq!(
+        demandes.borrow().len(),
+        1,
+        "la seconde lecture vient de la base"
+    );
+    let (credits, provenance) =
+        lire_release_gardee_par(&b, mbid, INC_CREDITS_RELEASE, |_, _| async {
+            LectureRelease::Panne("ne doit pas partir".into())
+        })
+        .await;
+    assert!(matches!(credits, LectureRelease::Lue(_)));
+    assert_eq!(provenance, Provenance::Base);
+    for _ in 0..2 {
+        lire_sur_musicbrainz_gardee_par(&b, "recording/abc".into(), "releases", transport)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        demandes.borrow().len(),
+        3,
+        "un enregistrement n'est pas gardé"
+    );
+}

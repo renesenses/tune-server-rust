@@ -82,4 +82,48 @@ impl PositionPoller {
         }
         true
     }
+
+    /// Rattrape, UNE fois par épisode de verrou, une zone PURE verrouillée
+    /// dont le volume n'est pas à 100 % sans qu'aucun front ne l'ait signalé.
+    ///
+    /// [`Self::volume_pure_reimpose`] ne se déclenche que sur un mouvement de
+    /// l'appareil. Or deux états arrivent sans mouvement : une base héritée
+    /// où la zone est déjà à 83 % (trim composé à tort avant ce correctif,
+    /// volume adopté par l'ancien sondeur) et le verrou GLOBAL armé sur une
+    /// zone déjà en PURE, que la route de configuration ne commande pas. Le
+    /// chemin du signal affichait alors `Volume 83%` indéfiniment.
+    ///
+    /// Une seule tentative par épisode : un appareil qui refuse le 100 % n'est
+    /// pas recommandé à chaque tour. L'épisode se referme quand la zone est
+    /// vue hors verrou.
+    pub(super) async fn volume_pure_concilie(&self, zone_id: i64, volume_zone: f64, rapporte: f64) {
+        let verrouille = crate::audio::audiophile::zone_enabled(&self.db, zone_id)
+            && crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id);
+        let a_rattraper = {
+            let Ok(mut faits) = self.volumes_pure_concilies.lock() else {
+                return;
+            };
+            if verrouille {
+                faits.insert(zone_id)
+            } else {
+                faits.remove(&zone_id);
+                false
+            }
+        };
+        let ecart = volume_zone < 0.999 || (rapporte > 0.001 && rapporte < 0.999);
+        if !a_rattraper || !ecart {
+            return;
+        }
+        let device_id = self.get_zone_device_id(zone_id);
+        match self
+            .orchestrator
+            .set_volume(zone_id, 1.0, device_id.as_deref())
+            .await
+        {
+            Ok(()) => info!(zone_id, volume_zone, rapporte, "pure_volume_concilie"),
+            Err(e) => {
+                warn!(zone_id, volume_zone, rapporte, error = %e, "pure_volume_concilie_echec")
+            }
+        }
+    }
 }
