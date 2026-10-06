@@ -1689,6 +1689,107 @@ pub(crate) fn local_zone_action(
     }
 }
 
+/// Une sortie locale telle que la règle de la zone automatique la voit :
+/// son nom d'affichage, son endpoint (`alsa:hw:CARD=…`, `alsa:default`…) et
+/// la marque « sortie système » du backend.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SortieCandidate<'a> {
+    pub nom: &'a str,
+    pub endpoint_id: &'a str,
+    pub est_le_defaut: bool,
+}
+
+/// La sortie système est-elle un PCM ALSA logiciel (`default`, `sysdefault`,
+/// `pipewire`, `pulse`, `plughw`, `dmix`…) plutôt que le matériel ?
+///
+/// Sur ALSA, cpal rend toujours `default` comme sortie système (« Default
+/// Audio Device ») : un greffon `plug` → `dmix` ou PipeWire, à cadence fixe.
+/// Sur CoreAudio et WASAPI, la sortie système est un vrai périphérique : la
+/// question ne s'y pose pas, et la règle ne s'y applique pas.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
+    use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa};
+    let Some((hote, _)) = endpoint_id.split_once(':') else {
+        return false;
+    };
+    hote.eq_ignore_ascii_case("alsa")
+        && !greffon_alsa(pcm_alsa(endpoint_id)).eq_ignore_ascii_case("hw")
+}
+
+/// Rang d'un PCM matériel ALSA pour la zone automatique : plus petit = préféré.
+///
+/// 1. Une carte USB : un DAC branché exprès pour écouter.
+/// 2. Une sortie interne analogique.
+/// 3. Une sortie numérique (HDMI, DisplayPort, S/PDIF) : souvent reliée à un
+///    écran sans haut-parleurs, donc muette.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn rang_materiel(nom: &str) -> u8 {
+    let nom = nom.to_lowercase();
+    if nom.contains("usb") {
+        0
+    } else if [
+        "hdmi",
+        "displayport",
+        "iec958",
+        "s/pdif",
+        "spdif",
+        "digital",
+    ]
+    .iter()
+    .any(|motif| nom.contains(motif))
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// #5870 — le NOM de la sortie qui reçoit la zone locale automatique.
+///
+/// Avant, c'était toujours la sortie système du backend
+/// ([`first_system_default_name`]). Sur Linux, c'est le PCM ALSA `default` :
+/// un greffon (`dmix`, PipeWire) qui rééchantillonne tout à 48 kHz. Une
+/// installation neuve jouait donc sur un convertisseur alors qu'un DAC USB
+/// était branché, et le DAC restait bloqué à 48 kHz.
+///
+/// Règle :
+/// - sortie système absente : `None`, comme avant (aucun repli silencieux) ;
+/// - sortie système matérielle (CoreAudio, WASAPI, ASIO, ou un `hw:`) : elle ;
+/// - sortie système ALSA logicielle qui a DÉJÀ une zone (visible ou
+///   supprimée) : elle — une installation existante ne voit rien changer ;
+/// - sinon, le meilleur PCM `hw:` présent ([`rang_materiel`], puis l'endpoint
+///   le plus petit pour un ordre total) ; à défaut de `hw:`, la sortie système.
+///
+/// La sortie `default` reste enregistrée et proposée à la création manuelle :
+/// elle n'est seulement plus choisie d'office.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn sortie_de_la_zone_automatique<'a>(
+    sorties: &[SortieCandidate<'a>],
+    a_deja_une_zone: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    use tune_core::outputs::pseudo_peripherique_alsa::est_un_puits;
+    let defaut = sorties.iter().find(|s| s.est_le_defaut)?;
+    if !defaut_alsa_logiciel(defaut.endpoint_id) || a_deja_une_zone(defaut.nom) {
+        return Some(defaut.nom);
+    }
+    let materiel = sorties
+        .iter()
+        .filter(|s| {
+            s.endpoint_id
+                .split_once(':')
+                .is_some_and(|(hote, _)| hote.eq_ignore_ascii_case("alsa"))
+                && !defaut_alsa_logiciel(s.endpoint_id)
+                && !est_un_puits(s.endpoint_id, s.nom)
+        })
+        .min_by(|a, b| {
+            rang_materiel(a.nom)
+                .cmp(&rang_materiel(b.nom))
+                .then_with(|| a.endpoint_id.cmp(b.endpoint_id))
+        });
+    Some(materiel.map_or(defaut.nom, |s| s.nom))
+}
+
 // Enumerate output devices OFF the async runtime and under a hard timeout.
 //
 // Enumerating ASIO opens each driver to read its formats, and an ASIO driver
@@ -1918,12 +2019,39 @@ pub(crate) async fn enregistrer_les_sorties_locales(
     let auto_create = zone_repo.zone_auto_create_autorise();
     // Un backend est censé marquer une seule sortie par défaut. `find`
     // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
-    let system_default_device_id = first_system_default_name(
+    // #5870 — sur ALSA, la sortie système est le greffon `default` : la zone
+    // automatique vise plutôt le PCM matériel présent, sauf si `default` a
+    // déjà une zone (installation existante, rien ne change).
+    let sorties: Vec<SortieCandidate<'_>> = devices
+        .iter()
+        .map(|dev| SortieCandidate {
+            nom: dev.name.as_str(),
+            endpoint_id: dev.endpoint_id.as_str(),
+            est_le_defaut: dev.is_default,
+        })
+        .collect();
+    let defaut_systeme = first_system_default_name(
         devices
             .iter()
             .map(|dev| (dev.name.as_str(), dev.is_default)),
-    )
-    .map(|name| format!("local:{name}"));
+    );
+    let cible = sortie_de_la_zone_automatique(&sorties, |nom| {
+        zone_repo
+            .get_by_device_id(&format!("local:{nom}"))
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    if let (Some(defaut), Some(cible)) = (defaut_systeme, cible)
+        && defaut != cible
+    {
+        info!(
+            sortie_systeme = %defaut,
+            cible = %cible,
+            "local_audio_zone_auto_vise_le_materiel"
+        );
+    }
+    let system_default_device_id = cible.map(|name| format!("local:{name}"));
 
     for dev in devices {
         let device_id = format!("local:{}", dev.name);
@@ -3375,6 +3503,150 @@ mod local_zone_creation_policy_tests {
     fn no_backend_default_means_no_automatic_candidate() {
         let devices = [("DAC A", false), ("DAC B", false)];
         assert_eq!(first_system_default_name(devices), None);
+    }
+
+    fn sortie<'a>(nom: &'a str, endpoint_id: &'a str, est_le_defaut: bool) -> SortieCandidate<'a> {
+        SortieCandidate {
+            nom,
+            endpoint_id,
+            est_le_defaut,
+        }
+    }
+
+    /// Le parc d'une installation Linux neuve avec un DAC USB, tel que
+    /// l'énumère ALSA : `default` (greffon), la carte interne et le DAC.
+    fn parc_linux_avec_dac_usb() -> Vec<SortieCandidate<'static>> {
+        vec![
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie(
+                "HDA Intel PCH, ALC897 Analog",
+                "alsa:hw:CARD=PCH,DEV=0",
+                false,
+            ),
+            sortie("HDA Intel PCH, HDMI 0", "alsa:hw:CARD=PCH,DEV=3", false),
+            sortie("USB DAC, USB Audio", "alsa:hw:CARD=DAC,DEV=0", false),
+            sortie(
+                "Discard all samples (playback) or generate zero samples (capture)",
+                "alsa:null",
+                false,
+            ),
+        ]
+    }
+
+    /// #5870 — installation neuve : la zone automatique vise le DAC USB, pas
+    /// le greffon `default` qui rééchantillonne à 48 kHz.
+    #[test]
+    fn installation_neuve_linux_vise_le_dac_usb_et_non_default() {
+        let parc = parc_linux_avec_dac_usb();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+    }
+
+    /// Sans DAC USB : la sortie analogique interne, jamais le HDMI.
+    #[test]
+    fn sans_usb_la_sortie_interne_passe_avant_le_hdmi() {
+        let parc: Vec<_> = parc_linux_avec_dac_usb()
+            .into_iter()
+            .filter(|s| !s.nom.contains("USB"))
+            .collect();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("HDA Intel PCH, ALC897 Analog")
+        );
+        let hdmi_seul = [
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie("HDA Intel PCH, HDMI 0", "alsa:hw:CARD=PCH,DEV=3", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&hdmi_seul, |_| false),
+            Some("HDA Intel PCH, HDMI 0"),
+            "un HDMI matériel reste préférable au greffon"
+        );
+    }
+
+    /// L'ordre d'énumération ne change pas le choix.
+    #[test]
+    fn le_choix_ne_depend_pas_de_l_ordre_d_enumeration() {
+        let mut parc = parc_linux_avec_dac_usb();
+        parc.reverse();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+    }
+
+    /// Installation existante : `default` a déjà sa zone (visible ou
+    /// supprimée). Rien ne change, aucune zone nouvelle sur le DAC.
+    #[test]
+    fn installation_existante_garde_la_zone_de_default() {
+        let parc = parc_linux_avec_dac_usb();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |nom| nom == "Default Audio Device"),
+            Some("Default Audio Device")
+        );
+    }
+
+    /// Aucun PCM matériel (PipeWire seul, ou rien que le puits) : `default`
+    /// reste le secours.
+    #[test]
+    fn sans_materiel_default_reste_le_secours() {
+        let parc = [
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie("PipeWire Sound Server", "alsa:pipewire", false),
+            sortie("Discard all samples", "alsa:null", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("Default Audio Device")
+        );
+    }
+
+    /// CoreAudio, WASAPI : la sortie système est un vrai périphérique, elle
+    /// garde la zone automatique comme avant.
+    #[test]
+    fn coreaudio_et_wasapi_gardent_la_sortie_systeme() {
+        let mac = [
+            sortie(
+                "MacBook Pro Speakers",
+                "coreaudio:BuiltInSpeakerDevice",
+                true,
+            ),
+            sortie("USB DAC", "coreaudio:AppleUSBAudioEngine:DAC", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&mac, |_| false),
+            Some("MacBook Pro Speakers")
+        );
+        let windows = [
+            sortie("Speakers", "wasapi:{0.0.0.00000000}.{a}", true),
+            sortie("Speakers (2)", "wasapi:{0.0.0.00000000}.{b}", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&windows, |_| false),
+            Some("Speakers")
+        );
+    }
+
+    /// Une sortie système ALSA déjà matérielle n'est pas déplacée, et
+    /// l'absence de sortie système ne fabrique pas de candidate.
+    #[test]
+    fn default_materiel_ou_absent_inchanges() {
+        let parc = [
+            sortie("USB DAC, USB Audio", "alsa:hw:CARD=DAC,DEV=0", true),
+            sortie("Autre DAC, USB Audio", "alsa:hw:CARD=AAA,DEV=0", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+        let sans_defaut = [sortie(
+            "USB DAC, USB Audio",
+            "alsa:hw:CARD=DAC,DEV=0",
+            false,
+        )];
+        assert_eq!(sortie_de_la_zone_automatique(&sans_defaut, |_| false), None);
     }
 }
 
