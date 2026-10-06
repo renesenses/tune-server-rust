@@ -417,6 +417,7 @@ impl HostContext for AppStateHost {
     }
 
     fn pause(&self, zone: i64) -> Result<Value, String> {
+        info!(zone_id = zone, origine = "greffon", "pause_requested");
         let device_id = self.zone_device_id(zone);
         block_on(self.orchestrator.pause(zone, device_id.as_deref()))
             .map_err(|error| error.to_string())?;
