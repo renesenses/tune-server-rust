@@ -317,6 +317,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5464 -- --nocapture --test-threads=1
 
+      # #5519 — la sélection ReplayGain par curseur et l'écriture groupée par
+      # tour (`rg_analyzed`), sur PostgreSQL : ordre du curseur, écriture
+      # groupée, tag du fichier qui fait foi. Le témoin travaille sur des
+      # tables temporaires d'une seule connexion.
+      - name: ReplayGain par curseur et écriture groupée sur PostgreSQL (#5519)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5519 -- --nocapture
+
       # #5594 — la passe de la clé PCM des FLAC (`tracks.audio_pcm_key`) sur
       # PostgreSQL : placeholders, `LIMIT` lié, comparaison texte du témoin et
       # NUL typé TEXT. Elle vide `tracks` : un fil à la fois.
