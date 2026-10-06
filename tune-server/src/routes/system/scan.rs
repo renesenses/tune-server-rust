@@ -5628,9 +5628,10 @@ mod scan_scheduler_cablage_tests {
             "témoin : le fichier lu doit être celui qui câble les passes de fond"
         );
         assert!(
-            background.contains("scan::spawn_scan_scheduler(state.clone(), config.auto_scan)"),
+            background.contains("scan::spawn_scan_scheduler(\n        state.clone(),\n        crate::auto_scan::scan_au_demarrage_voulu(config.auto_scan, &state.backend),"),
             "spawn_scan_scheduler doit être appelé depuis background.rs, en lui \
-             passant `config.auto_scan` — sans cet appel, la bascule « scan \
+             passant le scan de démarrage VOULU (réglage utilisateur, puis \
+             `config.auto_scan`) — sans cet appel, la bascule « scan \
              planifié » est sans effet (#2469)"
         );
     }

@@ -2637,7 +2637,9 @@ async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
         host = %partage.host, share = %partage.share, path = %partage.path, essai,
         "network_share_mounted_late (#5682)"
     );
-    if !state.config.auto_scan {
+    // Ce scan remplace celui du démarrage pour ce partage : il suit le même
+    // ordre de précédence (réglage utilisateur, puis `auto_scan`).
+    if !crate::auto_scan::scan_au_demarrage_voulu(state.config.auto_scan, &state.backend) {
         return;
     }
     // Le scan de démarrage peut encore tenir le droit de scanner : on attend
