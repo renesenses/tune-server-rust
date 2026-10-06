@@ -37,6 +37,9 @@ use crate::state::AppState;
 ///   un redémarrage, contrairement à `processed` / `total` qui repartent de
 ///   zéro à chaque campagne. Comptés au plus une fois par minute (cache de
 ///   l'état), `null` quand l'analyse est coupée ou que la requête échoue.
+/// - `library_total` / `library_processed` (décision du 06/10) : la jauge
+///   « traitées sur total » ; `library_without_file`, `library_out_of_scope`
+///   et `library_failed` disent pourquoi une piste traitée n'a pas de gain.
 pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<Value> {
     let avancement = tune_core::audio::replaygain::progression::releve();
     let enabled = tune_core::audio::replaygain::analysis_enabled(&state.backend);
@@ -94,6 +97,16 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         "enabled": enabled,
         "library_analyzed": bibliotheque.map(|b| b.analysees),
         "library_eligible": bibliotheque.map(|b| b.eligibles),
+        // Décision du 06/10 — la jauge vaut `library_processed` sur
+        // `library_total` (toute la bibliothèque) : une piste est traitée
+        // quand elle a un témoin ou qu'elle est déclarée non gérable. Les
+        // causes des non gérées sont nommées à part ; `library_failed` est
+        // déjà parmi les traitées. Une piste reportée n'est pas traitée.
+        "library_total": bibliotheque.map(|b| b.total),
+        "library_processed": bibliotheque.map(|b| b.traitees),
+        "library_without_file": bibliotheque.map(|b| b.sans_fichier),
+        "library_out_of_scope": bibliotheque.map(|b| b.hors_perimetre),
+        "library_failed": bibliotheque.map(|b| b.echecs),
         // #5519 / tune-web-client#1828 — la passe DÉCODE-t-elle en ce moment ?
         // `active` dit seulement qu'une campagne est ouverte : elle le reste
         // quand la plage dynamique « En premier » passe devant, et la carte

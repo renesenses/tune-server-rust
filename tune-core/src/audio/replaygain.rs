@@ -2134,6 +2134,88 @@ pub fn compter_les_sans_dr_hors_perimetre(backend: &Arc<dyn DbBackend>) -> i64 {
     }
 }
 
+/// Les pistes TRAITÉES par la plage dynamique — décision du 06/10 : la jauge
+/// de l'écran Santé vaut `traitees / total`, et le total est TOUTE la
+/// bibliothèque. Plus rien n'est retiré du dénominateur.
+///
+/// Une piste est traitée quand elle a un DR (mesuré, lu dans ses tags ou
+/// dans un `foo_dr.txt`), ou qu'elle est déclarée NON GÉRABLE :
+/// * sans fichier propre (`file_path` vide, images CUE) ;
+/// * mesure impossible pour de bon (`dr_indisponible` : format illisible,
+///   silence, délai dépassé) ;
+/// * trop longue pour l'analyse (`rg_skipped_oversized`, sans DR) ;
+/// * dans une racine exclue des analyses (#5593).
+///
+/// 🔴 Une piste REPORTÉE (fichier qui ne répond pas, `rg_path_unresolved`,
+/// #1865) n'est PAS traitée : elle sera reprise à l'expiration du report, et
+/// ne devient traitée que mesurée ou déclarée indisponible. Le report ne
+/// pose jamais `dr_indisponible`, à dessein : un partage démonté revient.
+///
+/// Compté sur `tracks`, une seule passe : `traitees` ne dépasse jamais le
+/// total, et une piste n'est comptée qu'une fois quelle que soit la somme de
+/// ses marques.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PistesTraiteesDr {
+    /// Pistes avec un DR, ou déclarées non gérables.
+    pub traitees: i64,
+    /// Pistes de la table `tracks` qui ont un DR.
+    pub avec_dr: i64,
+    /// Pistes avec un fichier, sans DR, marquées `dr_indisponible`, dans le
+    /// périmètre ou hors de lui : la version dédupliquée de
+    /// `dynamic_range_unavailable`, qui compte aussi celles qui ont un DR.
+    pub non_mesurables: i64,
+}
+
+impl PistesTraiteesDr {
+    /// Les pistes non gérables : traitées, mais sans DR.
+    pub fn non_gerables(&self) -> i64 {
+        (self.traitees - self.avec_dr).max(0)
+    }
+}
+
+/// Voir [`PistesTraiteesDr`]. `None` sur erreur de requête : la route publie
+/// alors les anciens champs seuls, et le client garde son calcul d'avant.
+pub fn compter_les_pistes_traitees_dr(backend: &Arc<dyn DbBackend>) -> Option<PistesTraiteesDr> {
+    let hors = crate::taches_de_fond::perimetre::clause_hors_perimetre_decodage(backend);
+    // Sans racine exclue, rien n'est hors périmètre : un terme toujours faux.
+    let hors = if hors.is_empty() {
+        " AND 1 = 0".to_string()
+    } else {
+        hors
+    };
+    let fichier = "(t.file_path IS NOT NULL AND t.file_path != '')";
+    let avec_dr = "EXISTS (SELECT 1 FROM track_metadata d \
+                   WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != '')";
+    let indisponible = "EXISTS (SELECT 1 FROM track_metadata i \
+                        WHERE i.track_id = t.id AND i.key = 'dr_indisponible')";
+    let sql = format!(
+        "SELECT \
+           COUNT(CASE WHEN {avec_dr} \
+                   OR NOT {fichier} \
+                   OR EXISTS (SELECT 1 FROM track_metadata x WHERE x.track_id = t.id \
+                        AND x.key IN ('dr_indisponible', '{OVERSIZED_KEY}')) \
+                   OR ({fichier}{hors}) THEN 1 END), \
+           COUNT(CASE WHEN {avec_dr} THEN 1 END), \
+           COUNT(CASE WHEN {fichier} AND NOT {avec_dr} AND {indisponible} THEN 1 END) \
+         FROM tracks t"
+    );
+    match backend.query_one(&sql, &[]) {
+        Ok(Some(row)) => {
+            let get = |i: usize| row.get(i).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+            Some(PistesTraiteesDr {
+                traitees: get(0),
+                avec_dr: get(1),
+                non_mesurables: get(2),
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "dr_traitees_count_failed");
+            None
+        }
+    }
+}
+
 /// Calcule la plage dynamique d'un lot de pistes que la passe nominale a
 /// laissées derrière elle. Rend combien de lignes ont AVANCÉ (0 ⇒ plus rien).
 ///

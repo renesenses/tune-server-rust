@@ -1186,5 +1186,93 @@ async fn la_completude_nomme_les_pistes_sans_dr_hors_du_perimetre_2157() {
     );
 }
 
+/// Décision du 06/10 — la jauge de la plage dynamique vaut les pistes
+/// TRAITÉES sur le TOTAL : avec un DR, ou déclarées non gérables (sans
+/// fichier, mesure impossible, trop longue, racine exclue). Elle n'atteint
+/// 100 % que lorsque chaque piste est l'un ou l'autre. Une piste REPORTÉE
+/// (fichier qui ne répond pas) n'est pas traitée.
+#[tokio::test]
+async fn la_completude_compte_les_pistes_traitees_sur_le_total() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+    let poser = |chemin: Option<&str>, nom: &str| -> i64 {
+        let mut t = tune_core::db::models::Track::new(nom.into());
+        t.file_path = chemin.map(str::to_string);
+        pistes.create(&t).expect("piste temoin")
+    };
+
+    let mesuree = poser(Some("/music/mesuree.flac"), "mesuree");
+    meta.set(mesuree, "dr_track", "12").expect("dr");
+    // DR lu dans les tags ET marque d'échec : comptée une fois, avec un DR.
+    let taguee = poser(Some("/music/taguee.flac"), "taguee");
+    meta.set(taguee, "dr_track", "9").expect("dr");
+    meta.set(taguee, "dr_indisponible", "1").expect("marque");
+    let illisible = poser(Some("/music/illisible.ape"), "illisible");
+    meta.set(illisible, "dr_indisponible", "1").expect("marque");
+    let longue = poser(Some("/music/longue.dsf"), "longue");
+    meta.set(longue, "rg_analyzed", "1700000000")
+        .expect("temoin");
+    meta.set(longue, "rg_skipped_oversized", "1")
+        .expect("trop longue");
+    let _cue = poser(None, "cue");
+    let _exclue = poser(Some("/nas/exclue.flac"), "exclue");
+    let reportee = poser(Some("/music/reportee.flac"), "reportee");
+    meta.set(
+        reportee,
+        "rg_path_unresolved",
+        &tune_core::library::local_path::deferral_stamp(4_000_000_000),
+    )
+    .expect("report frais");
+    let vierge = poser(Some("/music/vierge.flac"), "vierge");
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            r#"["/nas"]"#,
+        )
+        .expect("reglage");
+
+    let app = tune_server::routes::router(etat.clone());
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(p["total_tracks"], 8, "payload={p}");
+    assert_eq!(
+        p["dynamic_range_processed"], 6,
+        "2 avec DR + 4 non gérables ; la reportée et la vierge restent à faire. payload={p}"
+    );
+    assert_eq!(p["dynamic_range_unmanageable"], 4, "payload={p}");
+    assert_eq!(
+        p["dynamic_range_unmeasurable"], 1,
+        "la piste taguée a un DR : elle n'est pas « mesure impossible ». payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_unavailable"], 2,
+        "l'ancien champ ne change pas. payload={p}"
+    );
+    let somme = p["dynamic_range_unmeasurable"].as_i64().unwrap()
+        + p["dynamic_range_oversized"].as_i64().unwrap()
+        + p["dynamic_range_without_file"].as_i64().unwrap()
+        + p["dynamic_range_out_of_scope"].as_i64().unwrap();
+    assert_eq!(
+        somme, 4,
+        "les quatre causes partitionnent les non gérables. payload={p}"
+    );
+
+    // La reportée finit indisponible, la vierge est mesurée : 100 %.
+    meta.set(reportee, "dr_indisponible", "1").expect("marque");
+    meta.set(vierge, "dr_track", "10").expect("dr");
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+    assert_eq!(
+        p["dynamic_range_processed"], p["total_tracks"],
+        "payload={p}"
+    );
+    assert_eq!(p["dynamic_range_unmanageable"], 5, "payload={p}");
+}
+
 #[path = "web_contracts/album_tracks_1897.rs"]
 mod album_tracks_1897;
