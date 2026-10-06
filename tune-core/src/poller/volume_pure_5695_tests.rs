@@ -104,7 +104,12 @@ impl Banc {
             position_ms: 10_000,
             recu,
         };
-        banc.appareil_a(0.5).await;
+        // Sous PURE verrouillé, l'appareil part conforme (100 %) : un écart
+        // dès la première observation serait rattrapé par
+        // `volume_pure_concilie`, et sa grâce de volume masquerait le front
+        // que ces tests provoquent ensuite.
+        banc.appareil_a(if pure_verrouille { 1.0 } else { 0.5 })
+            .await;
         banc
     }
 
@@ -146,6 +151,17 @@ impl Banc {
             .await;
     }
 
+    /// La zone à `pour_cent` en base ET en mémoire, sans grâce de volume.
+    async fn zone_a(&self, pour_cent: f64) {
+        ZoneRepo::with_backend(self.db.clone())
+            .update_volume(self.zone_id, pour_cent)
+            .unwrap();
+        self.poller
+            .playback
+            .set_volume(self.zone_id, pour_cent / 100.0)
+            .await;
+    }
+
     fn volume_en_base(&self) -> f64 {
         ZoneRepo::with_backend(self.db.clone())
             .get(self.zone_id)
@@ -172,7 +188,7 @@ impl Banc {
 #[tokio::test]
 async fn sous_pure_force_le_sondeur_reimpose_100_au_lieu_d_adopter_5695() {
     let mut banc = Banc::monter(true).await;
-    banc.tic().await; // première observation : 50 %, jamais adoptée.
+    banc.tic().await; // première observation, appareil conforme.
     let deja = banc.appareil_a(0.83).await;
     banc.tic().await;
 
@@ -240,4 +256,60 @@ async fn hors_verrou_l_aiguillage_laisse_adopter() {
 fn le_bandeau_dit_l_echec_de_la_reimposition() {
     let m = volume_pure_5695::message_de_volume_reimpose(0.83, Some("timeout"));
     assert!(m.contains("83 %") && m.contains("n'a pas pu") && m.contains("timeout"));
+}
+
+/// L'état hérité : la zone était DÉJÀ à 83 % en base et sur l'appareil quand
+/// le verrou s'est mis à valoir 100 % (montée de version depuis une base où le
+/// trim avait été composé, ou verrou global armé sur une zone déjà en PURE).
+/// Aucun front de volume ne survient alors : l'adoption n'est jamais tentée,
+/// donc la réimposition non plus, et « Volume 83 % » restait affiché à vie.
+/// Le sondeur doit rattraper l'écart à sa première observation.
+#[tokio::test]
+async fn sous_pure_force_un_volume_herite_est_rattrape_sans_front_5695() {
+    let mut banc = Banc::monter(true).await;
+    banc.zone_a(83.0).await;
+    let deja = banc.appareil_a(0.83).await;
+    banc.tic().await;
+    banc.tic().await;
+
+    assert_eq!(
+        banc.volume_en_base(),
+        100.0,
+        "PURE forcé : un 83 % hérité doit être ramené à 100 %"
+    );
+    assert_eq!(
+        banc.commandes_depuis(deja).await,
+        vec![1.0],
+        "le 100 % est commandé UNE fois, sans trim, pas à chaque tour"
+    );
+}
+
+/// Le verrou GLOBAL armé sur une zone déjà en PURE (sans surcharge par zone) :
+/// la route de configuration ne commande rien, c'est le sondeur qui rattrape.
+/// Avant l'armement, la zone n'est pas touchée (témoin).
+#[tokio::test]
+async fn le_verrou_global_arme_apres_coup_ramene_la_zone_a_100_5695() {
+    let mut banc = Banc::monter(false).await;
+    SettingsRepo::with_backend(banc.db.clone())
+        .set(
+            &format!("zone_{}_audiophile", banc.zone_id),
+            r#"{"enabled":true}"#,
+        )
+        .unwrap();
+    banc.zone_a(83.0).await;
+    let deja = banc.appareil_a(0.83).await;
+    banc.tic().await;
+    assert!(
+        (banc.volume_en_base() - 83.0).abs() < 1e-6,
+        "verrou global éteint : la zone garde son volume"
+    );
+    assert!(banc.commandes_depuis(deja).await.is_empty());
+
+    SettingsRepo::with_backend(banc.db.clone())
+        .set(crate::audio::audiophile::SETTING_LOCK_VOLUME, "true")
+        .unwrap();
+    banc.tic().await;
+    banc.tic().await;
+    assert_eq!(banc.volume_en_base(), 100.0);
+    assert_eq!(banc.commandes_depuis(deja).await, vec![1.0]);
 }

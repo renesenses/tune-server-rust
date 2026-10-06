@@ -144,6 +144,10 @@ impl PositionPoller {
                 .await
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            if !zone.fixed_volume {
+                self.volume_pure_concilie(zone_id, zone.volume / 100.0, status.volume)
+                    .await;
+            }
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -1120,6 +1124,10 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    if !zone_fixed_volume {
+                        self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
+                            .await;
+                    }
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
@@ -1461,6 +1469,10 @@ impl PositionPoller {
             let in_vol_grace2 = zone_state
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            if !zone_fixed_volume {
+                self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
+                    .await;
+            }
             if !zone_fixed_volume
                 && !in_vol_grace2
                 && status.volume > 0.001

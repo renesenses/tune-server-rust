@@ -566,6 +566,10 @@ pub struct PositionPoller {
     /// #5695 — zones PURE verrouillées dont le volume a déjà été réimposé et
     /// DIT : l'avertissement part une fois par zone, pas à chaque écart.
     volumes_pure_reimposes: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5695 — zones dont l'épisode « PURE verrouillé » a déjà été rattrapé
+    /// une fois (voir `volume_pure_concilie`). Une zone en sort dès qu'elle
+    /// est vue hors verrou, pour que le prochain armement soit rattrapé.
+    volumes_pure_concilies: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 /// Une reprise automatique après décrochage du renderer (#4645), telle que
@@ -608,6 +612,7 @@ impl PositionPoller {
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_pure_reimposes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volumes_pure_concilies: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
