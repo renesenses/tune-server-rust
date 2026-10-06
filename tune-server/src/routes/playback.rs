@@ -2617,6 +2617,14 @@ async fn play(
                             zone_id,
                             &[QueueInput::Streaming {
                                 source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                                // Web#1926 : un titre Bandcamp seul garde la
+                                // page de son album si Tune la connaît déjà,
+                                // pour « Aller à l'album » dans la file.
+                                album_ref: crate::routes::zones::reference_rangee_bandcamp(
+                                    &state,
+                                    source_for_q.as_deref().unwrap_or(""),
+                                    &source_id_val,
+                                ),
                                 source_id: source_id_val,
                                 title: title_val,
                                 artist: artist_val,
@@ -2625,7 +2633,6 @@ async fn play(
                                 duration_ms: duration_val,
                                 track_number: meta.track_number,
                                 disc_number: meta.disc_number,
-                                album_ref: None,
                             }],
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -4394,6 +4401,7 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_rangee_bandcamp(&state, source, source_id),
             source: source.clone(),
             source_id: source_id.clone(),
             title: meta.title,
@@ -4403,7 +4411,6 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
-            album_ref: None,
         });
     }
 
@@ -4430,6 +4437,11 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_rangee_bandcamp(
+                &state,
+                &item.source,
+                &item.source_id,
+            ),
             source: item.source.clone(),
             source_id: item.source_id.clone(),
             title: meta.title,
@@ -4439,7 +4451,6 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
-            album_ref: None,
         });
     }
 
