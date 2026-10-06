@@ -3008,3 +3008,43 @@ async fn pg_2094_relecture_d_un_coffret_automatique() {
     reset_schema(&db);
     crate::db::coffrets_auto::tests::scenario_relecture_coffret_auto_2094(&db);
 }
+
+/// Une bio réécrite à la main perd sa provenance, sur PostgreSQL aussi : la
+/// requête de `effacer_provenance_bio` porte un `$1`, pas le `?` de SQLite.
+/// Un texte inchangé garde la sienne.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_bio_reecrite_a_la_main_oublie_sa_provenance() {
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::models::Artist;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let repo = ArtistRepo::with_backend(db);
+    let id = repo.create(&Artist::new("Miles Davis".into())).unwrap();
+    repo.update_bio_full(
+        id,
+        "Trompettiste de jazz.",
+        "wikipedia",
+        Some("https://fr.wikipedia.org/wiki/Miles_Davis".into()),
+        "CC BY-SA 4.0",
+        "fr",
+    )
+    .unwrap();
+
+    let meme = Some("Trompettiste de jazz.");
+    assert!(
+        !repo
+            .oublier_provenance_si_bio_reecrite(id, meme, meme)
+            .unwrap()
+    );
+    assert_eq!(
+        repo.bio_provenance(id).unwrap().expect("gardée")["source_url"],
+        "https://fr.wikipedia.org/wiki/Miles_Davis"
+    );
+
+    assert!(
+        repo.oublier_provenance_si_bio_reecrite(id, meme, Some("Mon texte."))
+            .unwrap()
+    );
+    assert_eq!(repo.bio_provenance(id).unwrap(), None);
+}
