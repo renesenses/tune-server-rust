@@ -917,6 +917,22 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
         if n > 0 {
             return TourDeCascade::Travail(n);
         }
+        // #5469 — un lot qui rend 0 n'est pas forcément au repos : la pause a
+        // pu tomber APRÈS la garde ci-dessus et AVANT le premier fichier (le
+        // lot a trouvé ses candidats, puis sa garde de lancement a vu la
+        // pause). Lu comme un repos, ce 0 faisait descendre la cascade au rang
+        // suivant — un ReplayGain suspendu lançait la plage dynamique — ou,
+        // au dernier rang, endormait la boucle pour `IDLE_SLEEP_SECS` (15 min)
+        // : « Reprendre » ne relançait alors rien avant un quart d'heure.
+        if est_en_pause(tache) {
+            if rang == Rang::PlageDynamique {
+                noter_travail_dr(false);
+                dr_suspendue = true;
+                continue;
+            }
+            noter_rang_au_travail(None);
+            return TourDeCascade::Suspendue(tache);
+        }
     }
     noter_rang_au_travail(None);
     // Une plage dynamique suspendue n'est pas au repos : le travail est
