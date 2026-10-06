@@ -22,6 +22,7 @@ pub mod didl;
 pub mod dlna;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
+pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
 #[cfg(test)]
 mod dlna_test;

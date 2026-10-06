@@ -38,6 +38,15 @@ pub(crate) mod pause_701_tests_5050;
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
 
+#[cfg(test)]
+#[path = "dlna_journal_volume_tests_5575.rs"]
+mod journal_volume_tests_5575;
+
+/// #5575 — pause entre le premier `SetVolume` acquitté et sa relecture
+/// `GetVolume` : un appareil qui applique en différé ne doit pas être déclaré
+/// sourd pour quelques millisecondes d'avance.
+const RELECTURE_VOLUME_APRES: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
 /// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
 fn faute_commande_soap(response: &str) -> bool {
@@ -580,6 +589,13 @@ pub struct DlnaOutput {
     /// abouti : un échec réseau ne fige pas le profil standard pour la vie
     /// du processus.
     profil_volume: tokio::sync::OnceCell<super::dlna_profil_volume::ProfilVolume>,
+    /// #5575 — débit des lignes INFO d'acquittement de `SetVolume` (voir
+    /// [`super::dlna_journal_volume`]). Partagé avec la tâche de rattrapage
+    /// qui écrit la dernière valeur d'un glissement.
+    journal_volume: Arc<std::sync::Mutex<super::dlna_journal_volume::JournalVolume>>,
+    /// #5575 — la relecture `GetVolume` d'après le premier `SetVolume`
+    /// acquitté est faite : une seule par session de zone.
+    volume_relu: AtomicBool,
     /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
     /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
     dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
@@ -717,6 +733,8 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
+            journal_volume: Arc::default(),
+            volume_relu: AtomicBool::new(false),
             dernier_diag_701: std::sync::Mutex::new(None),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
@@ -1176,6 +1194,74 @@ impl DlnaOutput {
         let niveau_pct = niveau_pct.min(100);
         self.dernier_volume_pct.store(niveau_pct, Ordering::Relaxed);
         self.event_state.lock().await.volume = Some(niveau_appareil);
+    }
+
+    /// #5575 — porte un acquittement de `SetVolume` au journal INFO, à débit
+    /// borné : une ligne au plus par [`super::dlna_journal_volume::INTERVALLE`],
+    /// et la dernière valeur d'un glissement écrite par un rattrapage.
+    fn journaliser_acquit_volume(&self, acquit: super::dlna_journal_volume::AcquitVolume) {
+        use super::dlna_journal_volume::Decision;
+        let decision = self
+            .journal_volume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .noter(std::time::Instant::now(), acquit.clone());
+        match decision {
+            Decision::Ecrire { regroupes } => ecrire_acquit_volume(&self.name, &acquit, regroupes),
+            Decision::Taire {
+                rattrapage_dans: Some(delai),
+            } => {
+                let journal = self.journal_volume.clone();
+                let zone = self.name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delai).await;
+                    let rattrape = journal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .rattraper(std::time::Instant::now());
+                    if let Some((acquit, regroupes)) = rattrape {
+                        ecrire_acquit_volume(&zone, &acquit, regroupes);
+                    }
+                });
+            }
+            Decision::Taire { .. } => {}
+        }
+    }
+
+    /// #5575 — une fois par session de zone, relit le volume après le premier
+    /// `SetVolume` acquitté et dit si l'appareil l'a VRAIMENT appliqué. C'est
+    /// la seule preuve qu'un journal de testeur peut porter d'un renderer qui
+    /// acquitte sans rien faire (darTZeel de Sevy, #5793).
+    async fn relire_volume_applique(&self, attendu: u32, canal: &str) {
+        if self.volume_relu.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(RELECTURE_VOLUME_APRES).await;
+        let reponse = self
+            .rc_action(
+                "GetVolume",
+                &format!("<InstanceID>0</InstanceID><Channel>{canal}</Channel>"),
+            )
+            .await;
+        let lu = reponse
+            .as_ref()
+            .ok()
+            .and_then(|r| extract_tag(r, "CurrentVolume"))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let lecture = match &reponse {
+            Ok(r) => super::dlna_journal_volume::reponse_soap(r),
+            Err(e) => format!("injoignable ({e})"),
+        };
+        info!(
+            zone = %self.name,
+            canal = %canal,
+            instance = 0,
+            attendu,
+            lu = %lu.map_or_else(|| "-".to_string(), |v| v.to_string()),
+            applique = %super::dlna_journal_volume::verdict_relecture(attendu, lu),
+            reponse = %lecture,
+            "dlna_volume_relu"
+        );
     }
 
     /// Lit le volume du renderer, sur la voie qu'il faut.
@@ -2589,6 +2675,14 @@ impl OutputTarget for DlnaOutput {
                         ),
                     )
                     .await?;
+                let acquit = super::dlna_journal_volume::AcquitVolume {
+                    volume_pct: level,
+                    niveau: level,
+                    canal: "GroupRenderingControl".into(),
+                    instance: 0,
+                    reponse: super::dlna_journal_volume::reponse_soap(&grc_resp),
+                };
+                self.journaliser_acquit_volume(acquit);
                 if grc_resp.contains("UPnPError") || grc_resp.contains("<errorCode>") {
                     warn!(device = %self.name, level, response = %grc_resp, "sonos_group_volume_rejected");
                     return Err(format!(
@@ -2605,14 +2699,31 @@ impl OutputTarget for DlnaOutput {
             // out of the speakers any louder: three layers agreeing on a change
             // that never happened (Eric, forum, renderer Diretta + PC vu comme
             // zone DLNA). Say it instead.
+            self.journaliser_acquit_volume(super::dlna_journal_volume::AcquitVolume {
+                volume_pct: level,
+                niveau,
+                canal: profil.canaux_de_commande().join(","),
+                instance: 0,
+                reponse: super::dlna_journal_volume::reponse_soap(&resp),
+            });
             warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
             return Err(format!(
                 "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
                 self.name
             ));
         }
-        debug!(device = %self.name, level, niveau, "dlna_set_volume_ok");
+        // #5575 — au journal INFO, à débit borné : la seule trace, dans les
+        // journaux des testeurs, de ce que le renderer acquitte.
+        self.journaliser_acquit_volume(super::dlna_journal_volume::AcquitVolume {
+            volume_pct: level,
+            niveau,
+            canal: profil.canaux_de_commande().join(","),
+            instance: 0,
+            reponse: "OK".into(),
+        });
         self.memoriser_volume(level as u64, niveau).await;
+        self.relire_volume_applique(niveau, profil.canal_de_lecture())
+            .await;
         Ok(())
     }
 
@@ -3407,7 +3518,38 @@ fn fallback_mime_from_sink(sink: &[String]) -> Option<String> {
     None
 }
 
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+/// #5575 — la ligne INFO d'un acquittement de `SetVolume`.
+fn ecrire_acquit_volume(
+    zone: &str,
+    acquit: &super::dlna_journal_volume::AcquitVolume,
+    regroupes: u32,
+) {
+    if acquit.reponse == "OK" {
+        info!(
+            zone = %zone,
+            volume_pct = acquit.volume_pct,
+            niveau = acquit.niveau,
+            canal = %acquit.canal,
+            instance = acquit.instance,
+            reponse = %acquit.reponse,
+            regroupes,
+            "dlna_set_volume_ok"
+        );
+    } else {
+        info!(
+            zone = %zone,
+            volume_pct = acquit.volume_pct,
+            niveau = acquit.niveau,
+            canal = %acquit.canal,
+            instance = acquit.instance,
+            reponse = %acquit.reponse,
+            regroupes,
+            "dlna_set_volume_refuse"
+        );
+    }
+}
+
+pub(crate) fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
