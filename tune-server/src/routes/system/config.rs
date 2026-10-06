@@ -342,6 +342,15 @@ pub(super) async fn get_config(
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
+        // « Écrire les modifications dans les fichiers audio » (Bertrand,
+        // 05/10/2026 : inactif par défaut). Publié même absent de la base,
+        // pour que l'interface affiche la case DÉCOCHÉE plutôt que « je ne
+        // sais pas » : une clé absente vaut désactivé, côté serveur aussi
+        // (`tune_core::metadata::ecriture_fichiers`).
+        (
+            tune_core::metadata::ecriture_fichiers::CLE,
+            json!(tune_core::metadata::ecriture_fichiers::DEFAUT),
+        ),
         // Default on (unchanged behaviour); scan.rs treats unset as enabled.
         // The web toggle writes "false" to opt out (JF Paquet).
         ("enrich_on_scan", json!(true)),
@@ -387,6 +396,11 @@ pub(super) async fn get_config(
             json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT),
         ),
         ("quality_split", json!(true)),
+        // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
+        (
+            tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY,
+            json!(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_DEFAULT),
+        ),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
@@ -414,6 +428,13 @@ pub(super) async fn get_config(
         (
             tune_core::taches_de_fond::vitesse::CLE_REGLAGE,
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
+        ),
+        // #5593 — le périmètre des passes de fond qui décodent : les racines
+        // de bibliothèque exclues (ReplayGain, plage dynamique, empreintes,
+        // CLAP). Vide par défaut : rien d'exclu, le comportement d'avant.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
         ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
         // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
@@ -499,6 +520,32 @@ pub(super) async fn get_config(
         "shuffle_max_tracks_max".to_string(),
         json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
     );
+    // Fil 2148 (#5792) — le délai des partages réseau tel qu'il s'applique,
+    // et ses bornes, sur le modèle du plafond aléatoire juste au-dessus.
+    {
+        use tune_core::scanner::watcher::{
+            NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_FLOOR, NETWORK_POLL_INTERVAL_KEY,
+            resolve_network_poll_interval,
+        };
+        let effectif = resolve_network_poll_interval(
+            config
+                .get(NETWORK_POLL_INTERVAL_KEY)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(NETWORK_POLL_INTERVAL_KEY.to_string(), json!(effectif));
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_min"),
+            json!(NETWORK_POLL_INTERVAL_FLOOR),
+        );
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_max"),
+            json!(NETWORK_POLL_INTERVAL_CEILING),
+        );
+    }
     // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
     // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
     // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
@@ -1103,6 +1150,28 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// #5593 — le périmètre des analyses de fond : un tableau de chaînes (les
+/// racines exclues), rognées, sans vide ni doublon. `null` vaut le tableau
+/// vide. Toute autre forme est REFUSÉE (400) en nommant la clé : une chaîne
+/// seule ou un nombre, gardés tels quels en base, se reliraient « rien
+/// d'exclu » sans un mot.
+///
+/// Rend `true` quand la clé est dans la requête : l'appelant
+/// referme alors la campagne ReplayGain en cours, dont le total a été compté
+/// sur l'ANCIEN périmètre.
+fn normaliser_perimetre_des_analyses(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<bool, AppError> {
+    use tune_core::taches_de_fond::perimetre::{CLE_RACINES_EXCLUES, normaliser};
+    let Some(brut) = values.get(CLE_RACINES_EXCLUES) else {
+        return Ok(false);
+    };
+    let liste = normaliser(brut)
+        .map_err(|e| AppError::bad_request(format!("{CLE_RACINES_EXCLUES} : {e}")))?;
+    values.insert(CLE_RACINES_EXCLUES.to_string(), json!(liste));
+    Ok(true)
+}
+
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1121,6 +1190,27 @@ fn normaliser_plafond_aleatoire(
     // autres (`"\"800\""`), pour les lignes déjà écrites.
     values.insert(cle.to_string(), Value::String(borne.to_string()));
     Ok(())
+}
+
+/// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
+/// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
+/// après l'écriture.
+fn normaliser_intervalle_reseau(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<u64>, AppError> {
+    let cle = tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY;
+    let Some(brut) = values.get(cle) else {
+        return Ok(None);
+    };
+    let texte = match brut {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    };
+    let secs = tune_core::scanner::watcher::valider_network_poll_interval(&texte)
+        .map_err(AppError::bad_request)?;
+    values.insert(cle.to_string(), Value::String(secs.to_string()));
+    Ok(Some(secs))
 }
 
 pub(super) async fn update_config(
@@ -1170,6 +1260,8 @@ pub(super) async fn update_config(
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
+    let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1306,6 +1398,13 @@ pub(super) async fn update_config(
         }
         cles_posees.push(key);
     }
+    // #5593 — le total de la jauge ReplayGain est compté UNE fois, à
+    // l'ouverture de la campagne. Un périmètre changé en cours de route le
+    // laisserait annoncer les pistes d'une racine qu'on vient d'exclure : on
+    // referme la campagne, le lot suivant la rouvre sur le nouveau compte.
+    if perimetre_touche {
+        tune_core::audio::replaygain::progression::au_repos();
+    }
     if !cles_posees.is_empty() {
         tracing::info!(
             reglages = %cles_posees.join(","),
@@ -1315,6 +1414,12 @@ pub(super) async fn update_config(
     }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+    // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
+    // cours des sondes, sans redémarrage.
+    if let Some(secs) = intervalle_reseau_demande {
+        let applique = tune_core::scanner::watcher::regler_intervalle_reseau(secs);
+        tracing::info!(secs = applique, "network_poll_interval_applied");
+    }
 
     let mut reponse = json!({"ok": true});
     if exclusif_desarme_avec_asio {
@@ -1452,6 +1557,90 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
 }
 
 /// #3809 — l'interrupteur doit agir MAINTENANT.
+#[cfg(test)]
+mod intervalle_reseau_tests_2148 {
+    use crate::state::AppState;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::scanner::watcher::{
+        NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_DEFAULT, NETWORK_POLL_INTERVAL_FLOOR,
+        NETWORK_POLL_INTERVAL_KEY, intervalle_reseau,
+    };
+
+    async fn requete(state: &AppState, methode: &str, corps: Option<Value>) -> (StatusCode, Value) {
+        let corps = corps.map(|c| c.to_string()).unwrap_or_default();
+        let response = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri("/api/v1/system/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// Fil 2148 (#5792) — le délai des partages réseau est un réglage serveur :
+    /// publié avec ses bornes (défaut 300 s), écrit par `PATCH`, appliqué aux
+    /// sondes sans redémarrage, et refusé hors bornes.
+    #[tokio::test]
+    async fn le_delai_des_partages_reseau_se_regle_et_s_applique_a_chaud_2148() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (status, config) = requete(&state, "GET", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            config[NETWORK_POLL_INTERVAL_KEY],
+            json!(NETWORK_POLL_INTERVAL_DEFAULT)
+        );
+        assert_eq!(NETWORK_POLL_INTERVAL_DEFAULT, 300);
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_min")],
+            json!(NETWORK_POLL_INTERVAL_FLOOR)
+        );
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_max")],
+            json!(NETWORK_POLL_INTERVAL_CEILING)
+        );
+
+        let (status, _) = requete(
+            &state,
+            "PATCH",
+            Some(json!({ NETWORK_POLL_INTERVAL_KEY: 120 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            intervalle_reseau(),
+            120,
+            "🔴 #5792 — le délai est écrit mais pas appliqué aux sondes"
+        );
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+
+        for hors_bornes in [json!(59), json!(3601), json!("souvent")] {
+            let (status, _) = requete(
+                &state,
+                "PATCH",
+                Some(json!({ NETWORK_POLL_INTERVAL_KEY: hors_bornes })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{hors_bornes}");
+        }
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+        assert_eq!(intervalle_reseau(), 120);
+    }
+}
+
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
@@ -2180,7 +2369,18 @@ pub(super) async fn remove_music_dir(
     State(state): State<AppState>,
     Json(body): Json<RemoveMusicDir>,
 ) -> Result<Json<Value>, AppError> {
-    let normalized = tune_core::scanner::walker::normalize_path(&body.path);
+    retirer_un_dossier(&state, &body.path, body.confirm_purge).map(Json)
+}
+
+/// Le corps de `POST /system/music-dirs/remove`, réutilisé tel quel par
+/// « Oublier ce partage » (fil 2145) : un seul chemin de retrait de dossier,
+/// donc une seule purge, sous le même plafond (#1943).
+pub(crate) fn retirer_un_dossier(
+    state: &AppState,
+    path: &str,
+    confirm_purge: Option<u64>,
+) -> Result<Value, AppError> {
+    let normalized = tune_core::scanner::walker::normalize_path(path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
@@ -2210,7 +2410,7 @@ pub(super) async fn remove_music_dir(
 
     // Sans confirmation : on DIT, on ne touche à rien. Comportement de tout
     // client existant, inchangé.
-    let Some(confirmee) = body.confirm_purge else {
+    let Some(confirmee) = confirm_purge else {
         if plan.tracks > 0 {
             tracing::info!(
                 dossier = %normalized,
@@ -2221,22 +2421,22 @@ pub(super) async fn remove_music_dir(
                  confirm_purge=N, ou /music-dirs/purge-orphans — peut les retirer."
             );
         }
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "impact": impact_json(&plan),
             "confirm_purge_required": plan.tracks,
-        })));
+        }));
     };
 
     if orphelines.is_empty() {
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": 0,
             "purged": 0,
             "purge_refused": false,
             "impact": impact_json(&plan),
-        })));
+        }));
     }
 
     // Le plafond de #1943 s'applique à ce geste comme aux autres, par la
@@ -2251,7 +2451,7 @@ pub(super) async fn remove_music_dir(
             "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
              constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
         );
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "purged": 0,
@@ -2265,7 +2465,7 @@ pub(super) async fn remove_music_dir(
                  Confirmez ce nombre exact pour les retirer aussi.",
                 plan.tracks
             ),
-        })));
+        }));
     }
 
     let r = executer_purge(&state, &orphelines);
@@ -2284,7 +2484,7 @@ pub(super) async fn remove_music_dir(
          explicitement confirmée par l'utilisateur (#2149)."
     );
 
-    Ok(Json(json!({
+    Ok(json!({
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
@@ -2298,7 +2498,24 @@ pub(super) async fn remove_music_dir(
         "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
         "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
-    })))
+    }))
+}
+
+/// Combien de pistes partiraient avec ces racines : sous l'une d'elles, et
+/// sous aucune des racines qui resteraient. Le compte que « Oublier ce
+/// partage » montre avant de proposer la purge (fil 2145).
+pub(crate) fn pistes_qui_partiraient(state: &AppState, racines: &[String]) -> u64 {
+    use tune_core::scanner::walker::normalize_path;
+    let retirees: Vec<String> = racines.iter().map(|r| normalize_path(r)).collect();
+    let restantes: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .into_iter()
+        .filter(|d| !retirees.contains(&normalize_path(d)))
+        .collect();
+    let mut ids = std::collections::BTreeSet::new();
+    for r in &retirees {
+        ids.extend(pistes_orphelines_sous(state, r, &restantes));
+    }
+    ids.len() as u64
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -5003,6 +5220,102 @@ mod vitesse_des_analyses_5519_tests {
         // Absent : rien à dire.
         let mut vide = serde_json::Map::new();
         assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
+        assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod perimetre_des_analyses_5593_tests {
+    use super::{get_config, normaliser_perimetre_des_analyses};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES;
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0
+    }
+
+    /// #5593 — le réglage est publié, vide par défaut (rien d'exclu), puis tel
+    /// qu'écrit : un TABLEAU, pas sa chaîne JSON.
+    #[tokio::test]
+    async fn le_perimetre_est_publie_vide_puis_tel_qu_ecrit() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = config(&state).await;
+        assert_eq!(c[CLE_RACINES_EXCLUES], json!([]), "{c}");
+
+        // Ce que la boucle d'écriture de `PATCH /config` pose pour un tableau.
+        let mut v: serde_json::Map<String, Value> = json!({
+            CLE_RACINES_EXCLUES: [" \\\\192.168.0.126\\musique ", "", "\\\\192.168.0.126\\musique"],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut v),
+            Ok(true)
+        ));
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        let c = config(&state).await;
+        assert_eq!(
+            c[CLE_RACINES_EXCLUES],
+            json!(["\\\\192.168.0.126\\musique"]),
+            "rognée, sans vide ni doublon : {c}"
+        );
+        // Et le moteur relit la même chose que la route publie.
+        assert_eq!(
+            tune_core::taches_de_fond::perimetre::racines_exclues(&state.backend),
+            vec!["\\\\192.168.0.126\\musique".to_string()]
+        );
+    }
+
+    /// Une forme qui se relirait « rien d'exclu » en silence est REFUSÉE.
+    #[test]
+    fn une_forme_illisible_est_refusee() {
+        for mauvais in [
+            json!("/mnt/nas"),
+            json!(4),
+            json!(true),
+            json!([1, 2]),
+            json!({}),
+        ] {
+            let mut v: serde_json::Map<String, Value> =
+                json!({ CLE_RACINES_EXCLUES: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(
+                normaliser_perimetre_des_analyses(&mut v).is_err(),
+                "{CLE_RACINES_EXCLUES} = {mauvais}"
+            );
+        }
+        // `null` vaut la liste vide ; absent, rien n'est touché.
+        let mut nul: serde_json::Map<String, Value> = json!({ CLE_RACINES_EXCLUES: null })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut nul),
+            Ok(true)
+        ));
+        assert_eq!(nul[CLE_RACINES_EXCLUES], json!([]));
+        let mut vide = serde_json::Map::new();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut vide),
+            Ok(false)
+        ));
         assert!(vide.is_empty());
     }
 }

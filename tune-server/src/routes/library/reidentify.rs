@@ -90,6 +90,9 @@ pub(super) struct Identification {
     /// les refus. Douze albums introuvables d'affilée ne sont pas une panne ;
     /// douze refus, si.
     pub refus_musicbrainz: bool,
+    /// Le rattachement des artistes au pressage (#4805, étape B). `None` quand
+    /// rien n'a été identifié, ou quand le détail du pressage n'est pas venu.
+    pub artistes: Option<tune_core::metadata::artistes_du_pressage::BilanArtistes>,
 }
 
 /// Pourquoi une identification n'a même pas pu être tentée. À distinguer d'un
@@ -101,7 +104,9 @@ pub(super) enum EchecIdentification {
 
 /// La chaîne complète pour UN album : recherche, détail, appariement, écriture.
 ///
-/// Deux requêtes MusicBrainz, séparées par [`musicbrainz_release::rate_limit_delay`].
+/// Deux requêtes MusicBrainz au plus, séparées par
+/// [`musicbrainz_release::rate_limit_delay`] ; une seule quand la base garde
+/// déjà le pressage retenu (`musicbrainz_release_cache`).
 /// L'appelant qui enchaîne des albums doit ajouter SON propre délai entre deux
 /// appels — celui d'ici ne couvre que l'intervalle interne.
 pub(super) async fn identifier_album(
@@ -131,17 +136,24 @@ pub(super) async fn identifier_album(
             // MusicBrainz n'a même pas été interrogé : cet album n'apprend
             // rien sur sa santé.
             refus_musicbrainz: false,
+            artistes: None,
         });
     }
 
     // L'artiste à interroger : celui de l'album quand il est connu, sinon
     // celui de la première piste. Une compilation sans artiste d'album ne doit
     // pas partir avec une chaîne vide, qui rendrait la recherche inexploitable.
-    let artist = album
-        .artist_name
-        .clone()
-        .or_else(|| tracks.iter().find_map(|t| t.artist_name.clone()))
-        .unwrap_or_default();
+    // #4805 — `Unknown Artist` cède la place à l'artiste des pistes quand
+    // elles en portent un vrai, et `VA` / `Artistes divers` deviennent
+    // `Various Artists`, le nom sous lequel MusicBrainz crédite les
+    // compilations : sous leur nom brut, ces albums ne rendaient rien.
+    let artiste_des_pistes = tracks
+        .iter()
+        .filter_map(|t| t.artist_name.as_deref())
+        .find(|nom| !musicbrainz_release::est_un_artiste_fictif(nom))
+        .or_else(|| tracks.iter().find_map(|t| t.artist_name.as_deref()));
+    let artist =
+        musicbrainz_release::artiste_de_requete(album.artist_name.as_deref(), artiste_des_pistes);
 
     // 1. Effacer, en gardant le calque de ce qu'on efface.
     let cleared = match clear_album_identification(&state.backend, album_id) {
@@ -191,11 +203,16 @@ pub(super) async fn identifier_album(
             meilleur: None,
             applied: None,
             refus_musicbrainz,
+            artistes: None,
         });
     };
 
-    musicbrainz_release::rate_limit_delay().await;
-    let detail = musicbrainz_release::lookup_release_detail(&meilleur.release_id).await;
+    // #4805 (idée 3 de MetaRust) — le détail est demandé avec les `inc` des
+    // crédits et GARDÉ en base : la passe des crédits le relira sans requête.
+    // Le créneau MusicBrainz n'est réservé que si la base ne l'a pas déjà.
+    let detail =
+        musicbrainz_release::lookup_release_detail_gardee(&state.backend, &meilleur.release_id)
+            .await;
 
     // 3. Associer les pistes du pressage aux pistes locales.
     let locales: Vec<LocalTrack> = tracks
@@ -235,6 +252,38 @@ pub(super) async fn identifier_album(
         }
     };
 
+    // 4 bis. #4805, étape B — le MBID des artistes, tiré des crédits du
+    //    pressage que l'on vient de recevoir : aucune requête de plus. Jamais
+    //    d'écrasement, rien sur une ambiguïté. Un échec ici ne défait pas
+    //    l'identification de l'album, qui est posée : il se dit et c'est tout.
+    let artistes = detail.as_ref().and_then(|d| {
+        match tune_core::metadata::artistes_du_pressage::rattacher_les_artistes_de_l_album(
+            &state.backend,
+            album_id,
+            d,
+            &recordings,
+        ) {
+            Ok(b) => {
+                info!(
+                    album_id,
+                    ecrits = b.ecrits,
+                    deja_poses = b.deja_poses,
+                    desaccords = b.desaccords,
+                    ambigus = b.ambigus,
+                    sans_correspondance = b.sans_correspondance,
+                    ecartes = b.ecartes,
+                    refuses_par_la_base = b.refuses_par_la_base,
+                    "reidentify_artistes"
+                );
+                Some(b)
+            }
+            Err(e) => {
+                warn!(album_id, error = %e, "reidentify_artistes_failed");
+                None
+            }
+        }
+    });
+
     // 5. Le verdict. « Le même pressage qu'avant » n'est pas un échec, mais ce
     //    n'est pas non plus une correction : il faut le distinguer.
     let meme_pressage = cleared.release_id.as_deref() == Some(meilleur.release_id.as_str());
@@ -263,6 +312,7 @@ pub(super) async fn identifier_album(
         applied: Some(applied),
         // MusicBrainz a répondu, et son pressage est posé.
         refus_musicbrainz: false,
+        artistes,
     })
 }
 

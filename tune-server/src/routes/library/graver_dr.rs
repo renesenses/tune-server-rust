@@ -218,6 +218,8 @@ pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
     v["a_graver"] = json!(inv.a_graver);
     v["hors_format"] = json!(inv.hors_format);
     v["dans_les_fichiers"] = json!(deja_dans_les_fichiers(&state));
+    v[crate::routes::ecriture_fichiers::CHAMP_REPONSE] =
+        json!(crate::routes::ecriture_fichiers::autorisee(&state));
     Json(v)
 }
 
@@ -245,12 +247,18 @@ fn remettre_la_ligne_en_phase(pistes: &tune_core::db::track_repo::TrackRepo, che
 ///
 /// Lance la passe en tâche de fond. 202 avec l'inventaire ; 409 si elle tourne
 /// déjà — deux passes concurrentes réécriraient les mêmes fichiers.
-pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Response {
+    // La gravure n'a pas d'autre effet que d'écrire dans les fichiers :
+    // désactivée (le défaut), elle refuse — le DR reste en base.
+    if !crate::routes::ecriture_fichiers::autorisee(&state) {
+        return crate::routes::ecriture_fichiers::refus("graver_dr");
+    }
     if en_cours(&state) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"status": "running", "error": "already running"})),
-        );
+        )
+            .into_response();
     }
     let (inv, candidates) = inventaire(&state);
     let total = candidates.len();
@@ -343,6 +351,7 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::ACCEPTED,
         Json(json!({"status": "accepted", "total": total, "hors_format": inv.hors_format})),
     )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -351,7 +360,9 @@ mod tests {
     use tune_core::db::backend::ToSqlValue;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        s
     }
 
     fn piste(state: &AppState, id: i64, chemin: &str, dr: Option<(&str, &str)>) {
@@ -395,6 +406,17 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(deja_dans_les_fichiers(&s), 1);
+    }
+
+    /// Réglage « Écrire les modifications dans les fichiers audio » jamais
+    /// touché : 409, rien au registre, aucun fichier ouvert.
+    #[tokio::test]
+    async fn reglage_absent_la_gravure_refuse() {
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        piste(&s, 1, "/m/a.flac", Some(("12", "analysis")));
+        let r = lancer(State(s.clone())).await.into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(!en_cours(&s));
     }
 
     /// La passe s'inscrit au registre (#2129) et ne se laisse pas doubler.
@@ -476,7 +498,9 @@ mod tests_passe_interrompue_2137 {
     use super::*;
 
     fn etat() -> AppState {
-        AppState::new(":memory:", 0, Default::default()).unwrap()
+        let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
+        s
     }
 
     /// La photo qu'une passe tuée laisse en base : le jalon des 50 pistes.
@@ -562,6 +586,7 @@ mod tests_ligne_en_phase_2134 {
         .unwrap();
         let chemin = cible.to_string_lossy().into_owned();
         let s = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&s.backend);
         let (taille, mtime) = tune_core::audio::iso9660::taille_et_mtime(&cible).unwrap();
         let mtime = if en_phase { mtime } else { mtime - 3600.0 };
         let taille = taille as i64;

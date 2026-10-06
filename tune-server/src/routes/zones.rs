@@ -859,28 +859,81 @@ pub(super) async fn album_en_cours(
     if source.is_empty() || source == "local" || source == "radio" || source == "upnp" {
         return rien(id, "source_sans_fiche_album");
     }
+
+    // La référence d'album enregistrée avec la ligne qui joue (#5706,
+    // migration 114) — lue AVANT l'appel au service, servie APRÈS lui.
+    let album_de_la_file =
+        album_de_la_ligne_qui_joue(&state, id, ps.queue_position, source, source_id);
+
     let registre = state.services.lock().await;
     let Some(svc) = registre.get(source) else {
         return rien(id, "service_inconnu");
     };
     let svc = svc.read().await;
-    match svc.get_track(source_id).await {
+    let raison = match svc.get_track(source_id).await {
         Ok(t) => match t.album_id.as_deref().filter(|a| !a.trim().is_empty()) {
-            Some(album) => Json(reponse(
-                id,
-                source,
-                album,
-                t.artist_id.as_deref(),
-                "service_lookup",
-            ))
-            .into_response(),
-            None => rien(id, "le_service_ne_nomme_pas_d_album"),
+            Some(album) => {
+                return Json(reponse(
+                    id,
+                    source,
+                    album,
+                    t.artist_id.as_deref(),
+                    "service_lookup",
+                ))
+                .into_response();
+            }
+            None => "le_service_ne_nomme_pas_d_album",
         },
         Err(e) => {
-            warn!(zone_id = id, service = source, error = %e, "album_en_cours_service_injoignable");
-            rien(id, "service_injoignable")
+            if album_de_la_file.is_none() {
+                warn!(zone_id = id, service = source, error = %e, "album_en_cours_service_injoignable");
+            }
+            "service_injoignable"
         }
+    };
+
+    // 4. La file. Fil forum 2143, points 5 et 6 (FabienM) : Bandcamp refuse
+    //    TOUJOURS la fiche d'une piste seule (`get_track`, « passer par son
+    //    album »). Un titre lancé hors de la page de son album (historique,
+    //    file, favori) rendait donc 404, et le client ouvrait la Recherche — ou
+    //    l'écran Lecture en cours avec le réglage « Lecture en cours ouvre
+    //    l'album ». La ligne de file qui joue, elle, sait son album depuis
+    //    l'enfilage. Le service passe d'abord, parce qu'il nomme aussi
+    //    l'artiste ; la file ne sert que quand il n'a rien dit.
+    match album_de_la_file {
+        Some(album) => Json(reponse(id, source, &album, None, "queue_entry")).into_response(),
+        None => rien(id, raison),
     }
+}
+
+/// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
+///
+/// La ligne doit porter la même source et le même identifiant que la piste en
+/// cours : une file réordonnée ou rechargée ne doit pas prêter l'album d'une
+/// voisine. La ligne au rang de l'état de zone d'abord, puis la ligne marquée
+/// courante — l'état de zone peut avoir un temps de retard sur la base.
+fn album_de_la_ligne_qui_joue(
+    state: &AppState,
+    zone_id: i64,
+    position: i64,
+    source: &str,
+    source_id: &str,
+) -> Option<String> {
+    let repo = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let est_elle = |e: &tune_core::db::play_queue_repo::QueueEntry| {
+        e.source.as_deref() == Some(source) && e.source_id.as_deref() == Some(source_id)
+    };
+    if let Some(e) = repo.get_at(zone_id, position).ok().flatten()
+        && est_elle(&e)
+        && let Some(album) = e.album_id_service()
+    {
+        return Some(album.to_string());
+    }
+    repo.get_ordered(zone_id)
+        .ok()?
+        .into_iter()
+        .find(|e| e.is_current && est_elle(e))
+        .and_then(|e| e.album_id_service().map(str::to_string))
 }
 
 /// Qui a le droit de recevoir l'adresse du flux interne — la règle, UNE fois.
@@ -1339,6 +1392,10 @@ mod signal_path_tests;
 // #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
+
+// #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
+#[cfg(test)]
+mod signal_path_pure_replaygain_5633_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

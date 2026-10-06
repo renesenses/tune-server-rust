@@ -481,7 +481,38 @@ pub(super) async fn artist_albums(
     // La fiche artiste trie ses albums par date d'ajout (Bertrand,
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
-    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    // #5616 — le type DÉDUIT des disques sans type explicite (règle pistes et
+    // durée de `release_type`), publié À CÔTÉ de `release_type`, jamais à sa
+    // place. Clé absente quand rien n'est déduit. Champ additif : le tableau
+    // nu des clients natifs le porte aussi, sans changer de forme.
+    let deduits = repo.types_deduits(&items);
+    // Section « Live » (05/10/2026) — les types SECONDAIRES MusicBrainz
+    // (`albums.release_secondary_types`), publiés en tableau sous
+    // `release_secondary_types`. Clé absente quand rien n'est connu.
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    let secondaires = repo.types_secondaires_par_album(&ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "types_secondaires_par_album a échoué — fiche sans section Live");
+        Default::default()
+    });
+    let items: Vec<(bool, Value)> = items
+        .iter()
+        .map(|a| {
+            let mut v = a.to_json();
+            let types = a.id.and_then(|id| secondaires.get(&id));
+            if let Some(o) = v.as_object_mut() {
+                if let Some(t) = a.id.and_then(|id| deduits.get(&id)) {
+                    o.insert("inferred_release_type".into(), json!(t.as_str()));
+                }
+                if let Some(types) = types {
+                    o.insert("release_secondary_types".into(), json!(types));
+                }
+            }
+            (
+                types.is_some_and(|t| tune_core::metadata::release_type::est_live(t)),
+                v,
+            )
+        })
+        .collect();
 
     // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
     if !q
@@ -489,14 +520,28 @@ pub(super) async fn artist_albums(
         .as_deref()
         .is_some_and(|v| v == "true" || v == "1")
     {
+        // Le tableau nu garde TOUS les albums, lives compris : sa forme et son
+        // contenu ne changent pas pour les clients natifs.
+        let items: Vec<Value> = items.into_iter().map(|(_, v)| v).collect();
         return Json(json!(items));
     }
+
+    // Section « Live » : un disque dont les types secondaires portent `live`
+    // quitte « albums » pour « live », QUEL QUE SOIT son type primaire (un EP
+    // live est un live). Clé absente quand la section est vide, comme les
+    // autres.
+    let (live, items): (Vec<_>, Vec<_>) = items.into_iter().partition(|(live, _)| *live);
+    let items: Vec<Value> = items.into_iter().map(|(_, v)| v).collect();
+    let live: Vec<Value> = live.into_iter().map(|(_, v)| v).collect();
 
     // #4767 — deux sections de plus, à partir de l'artiste de CHAQUE piste.
     // Une section vide est ABSENTE de la réponse : le client ne doit jamais
     // avoir à décider s'il affiche un titre au-dessus de rien.
     let mut reponse = json!({ "albums": items });
     let obj = reponse.as_object_mut().expect("objet");
+    if !live.is_empty() {
+        obj.insert("live".into(), json!(live));
+    }
     for (cle, albums) in [
         (
             "compilations",

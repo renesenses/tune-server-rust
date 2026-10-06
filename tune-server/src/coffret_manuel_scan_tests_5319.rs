@@ -30,14 +30,14 @@ use tower::ServiceExt;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 
-struct Bibliotheque {
+pub(super) struct Bibliotheque {
     _base: tune_core::test_scratch::ScratchDir,
-    racine: tune_core::test_scratch::ScratchDir,
-    etat: AppState,
-    db: Arc<dyn DbBackend>,
+    pub(super) racine: tune_core::test_scratch::ScratchDir,
+    pub(super) etat: AppState,
+    pub(super) db: Arc<dyn DbBackend>,
 }
 
-fn bibliotheque(epreuve: &str) -> Bibliotheque {
+pub(super) fn bibliotheque(epreuve: &str) -> Bibliotheque {
     let base = tune_core::test_scratch::scratch_dir(&format!("coffret-5319-base-{epreuve}"));
     // Sous le dossier courant : `is_tune_temp_file` écarte le dossier
     // temporaire du système.
@@ -71,7 +71,7 @@ fn bibliotheque(epreuve: &str) -> Bibliotheque {
 /// à travers les `.await` à dessein : le droit de scanner est global au
 /// processus (même motif que `scan_realigne_tests_4896::scan_manuel`).
 #[allow(clippy::await_holding_lock)]
-async fn scan_force(etat: &AppState) {
+pub(super) async fn scan_force(etat: &AppState) {
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let mut rx = etat.event_bus.subscribe();
     let debut = Instant::now();
@@ -99,7 +99,12 @@ async fn scan_force(etat: &AppState) {
 }
 
 /// Un appel au routeur de production, avec un corps JSON.
-async fn appel(etat: &AppState, methode: &str, chemin: &str, corps: Value) -> (StatusCode, Value) {
+pub(super) async fn appel(
+    etat: &AppState,
+    methode: &str,
+    chemin: &str,
+    corps: Value,
+) -> (StatusCode, Value) {
     let requete = Request::builder()
         .method(methode)
         .uri(chemin)
@@ -196,7 +201,7 @@ fn disposition(db: &Arc<dyn DbBackend>) -> Vec<(String, i64, i64)> {
 }
 
 /// `(id, titre)` des albums, triés par id.
-fn albums(db: &Arc<dyn DbBackend>) -> Vec<(i64, String)> {
+pub(super) fn albums(db: &Arc<dyn DbBackend>) -> Vec<(i64, String)> {
     db.query_many("SELECT id, title FROM albums ORDER BY id", &[])
         .unwrap()
         .iter()

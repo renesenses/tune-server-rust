@@ -97,6 +97,15 @@ pub async fn run_with(opts: RunOptions) {
         std::process::exit(0);
     }
 
+    // #5617 — mode ponctuel « premier accès » de Tune OS : appelé en root par
+    // une unité de l'image, HORS du bac à sable de tune.service, il applique la
+    // politique du mot de passe du compte `tune` puis sort. Même place que
+    // `--version` : avant tout journal, port ou base.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::premier_acces_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_premier_acces());
+    }
+
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
     #[cfg(windows)]
@@ -374,6 +383,12 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("attente du disque de données");
     crate::routes::appliance_storage::wait_for_data_volume(&config.db_path).await;
 
+    // Dossier de données non inscriptible (image Docker sous `tune`, `/data`
+    // monté depuis un dossier de l'hôte appartenant à root) : un rapport
+    // lisible et une sortie `EX_CONFIG`, au lieu d'une panique dans
+    // `AppState::new` et d'une boucle de redémarrage muette.
+    crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
+
     crate::boot_status::set_phase("base de données");
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
@@ -600,14 +615,13 @@ pub async fn run_with(opts: RunOptions) {
         });
     }
 
-    if let Err(e) = axum::serve(
-        listener,
-        // ConnectInfo<SocketAddr> lets handlers see the client IP (used to
-        // disambiguate browser zones created by different machines — Bertrand).
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown_state))
-    .await
+    // #4645 — le transport HTTP tourne sur son propre moteur, et les flux
+    // audio (`/stream/…`) y sont servis sur place : un gel de l'exécuteur
+    // principal ne tait plus le renderer. Le reste des requêtes est traité ici
+    // comme avant. `ConnectInfo<SocketAddr>` reste posé sur chaque requête
+    // (zones navigateur distinguées par l'adresse du client — Bertrand).
+    if let Err(e) =
+        crate::aiguillage_des_flux::servir(listener, app, shutdown_signal(shutdown_state)).await
     {
         tracing::error!(error = %e, "server_fatal_error");
         #[cfg(windows)]

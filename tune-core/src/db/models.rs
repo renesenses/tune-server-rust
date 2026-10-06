@@ -80,9 +80,10 @@ pub struct Album {
     ///
     /// 🔴 `None` veut dire INCONNU, et l'inconnu est l'état NORMAL : la
     /// couverture MBID mesurée est de 0,9 % sur le .18 et 88,4 % sur le .15.
-    /// Rien ne le devine — ni le nombre de titres, ni la durée. Un client qui
-    /// lit `null` doit le dire ou s'abstenir, jamais classer d'office : un tri
-    /// faux est pire qu'une section absente (#4767).
+    /// Cette colonne ne porte QUE le type explicite : la règle de repli par
+    /// pistes et durée (#5616, [`crate::metadata::release_type::type_deduit`])
+    /// n'y écrit jamais ; la fiche artiste publie son résultat à part, sous
+    /// `inferred_release_type`.
     ///
     /// Les `secondary-types` (Live, Compilation, Soundtrack, Remix…) ne
     /// changent JAMAIS cette valeur — un album live reste un `album`. Pour

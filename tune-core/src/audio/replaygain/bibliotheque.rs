@@ -58,13 +58,19 @@ pub struct BibliothequeReplayGain {
 pub fn compter_la_bibliotheque_replaygain(
     backend: &Arc<dyn DbBackend>,
 ) -> Option<BibliothequeReplayGain> {
+    // #5593 — dans le PÉRIMÈTRE réglé : une racine exclue sort des éligibles
+    // comme des candidats, sinon `eligibles - analysees` annoncerait pour
+    // toujours un reste que la passe ne fera jamais.
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
     let ligne = backend
         .query_one(
-            "SELECT COUNT(*), \
-               COUNT(CASE WHEN EXISTS (SELECT 1 FROM track_metadata m \
-                     WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
-                   THEN 1 END) \
-             FROM tracks t WHERE t.file_path IS NOT NULL AND t.file_path != ''",
+            &format!(
+                "SELECT COUNT(*), \
+                   COUNT(CASE WHEN EXISTS (SELECT 1 FROM track_metadata m \
+                         WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
+                       THEN 1 END) \
+                 FROM tracks t WHERE t.file_path IS NOT NULL AND t.file_path != ''{perimetre}"
+            ),
             &[],
         )
         .ok()
@@ -205,6 +211,38 @@ mod tests_5597 {
             b.eligibles,
             "analysées + candidats doit retomber sur les éligibles (aucun report ici)"
         );
+    }
+
+    /// #5593 — une racine exclue des analyses sort du couple, des analysées
+    /// comme des éligibles ; la somme analysées + candidats retombe toujours
+    /// sur les éligibles.
+    #[test]
+    fn le_couple_suit_le_perimetre_regle() {
+        let backend = base();
+        poser(&backend, 1, "rg_analyzed");
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = '/mnt/nas/' || id || '.flac' WHERE id IN (1, 2)",
+                &[],
+            )
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                crate::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+                r#"["/mnt/nas"]"#,
+            )
+            .unwrap();
+        let b = compter_la_bibliotheque_replaygain(&backend).unwrap();
+        assert_eq!(
+            b,
+            BibliothequeReplayGain {
+                analysees: 0,
+                eligibles: 3
+            },
+            "les pistes 1 et 2 sont sous la racine exclue"
+        );
+        let candidats = super::super::compter_les_candidats_replaygain(&backend);
+        assert_eq!(b.analysees + candidats, b.eligibles);
     }
 
     #[test]

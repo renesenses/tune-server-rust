@@ -68,6 +68,63 @@ pub struct EnteteFlac {
     pub vendeur: Option<String>,
     /// Le MD5 des échantillons de STREAMINFO vaut-il zéro (non calculé) ?
     pub md5_nul: bool,
+    /// #5594 — le MD5 des échantillons décodés, tel que STREAMINFO le porte
+    /// (16 octets ; tous nuls quand l'encodeur ne l'a pas calculé).
+    pub md5: [u8; 16],
+    /// #5594 — le nombre d'échantillons PAR CANAL (36 bits ; 0 = inconnu).
+    pub total_samples: u64,
+    /// La cadence (20 bits ; 0 = gabarit jamais rempli).
+    pub sample_rate: u32,
+    /// Le nombre de canaux (1 à 8).
+    pub channels: u8,
+    /// La profondeur, en bits par échantillon (4 à 32).
+    pub bits: u8,
+}
+
+impl EnteteFlac {
+    /// #5594 — la clé du signal PCM exact, `flac-md5-v1:<md5>:<total_samples>:
+    /// <sample_rate>:<channels>:<bits>`.
+    ///
+    /// Le MD5 de STREAMINFO est celui des échantillons DÉCODÉS : deux fichiers
+    /// qui portent la même clé contiennent le même signal, quels que soient
+    /// leurs tags, leur pochette ou leur niveau de compression. La durée et le
+    /// format, inclus dans la clé, écartent la plupart des MD5 faux qu'un
+    /// encodeur fautif aurait écrits.
+    ///
+    /// `None` — jamais une clé inventée — quand le MD5 est nul (ffmpeg, ou un
+    /// encodage en flux qui ne l'a pas calculé), quand le nombre
+    /// d'échantillons est inconnu (0), ou quand la cadence vaut zéro.
+    pub fn cle_pcm(&self) -> Option<String> {
+        if self.md5_nul || self.total_samples == 0 || self.sample_rate == 0 {
+            return None;
+        }
+        let md5: String = self.md5.iter().map(|o| format!("{o:02x}")).collect();
+        Some(format!(
+            "{PREFIXE_CLE_PCM}{md5}:{}:{}:{}:{}",
+            self.total_samples, self.sample_rate, self.channels, self.bits
+        ))
+    }
+}
+
+/// #5594 — préfixe (et version) de la clé PCM des FLAC. Une autre famille de
+/// clés (WAV, AIFF, formats avec perte) prendra un autre préfixe.
+pub const PREFIXE_CLE_PCM: &str = "flac-md5-v1:";
+
+/// Les champs de STREAMINFO qui décrivent le signal (cadence, canaux,
+/// profondeur, nombre d'échantillons, MD5), lus sur ses 34 octets.
+fn champs_streaminfo(si: &[u8; 34]) -> (u32, u8, u8, u64, [u8; 16]) {
+    // Octets 10..18 : 20 bits de cadence, 3 bits de canaux − 1, 5 bits de
+    // profondeur − 1, 36 bits de nombre d'échantillons.
+    let mot = u64::from_be_bytes([
+        si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
+    ]);
+    let cadence = (mot >> 44) as u32;
+    let canaux = ((mot >> 41) & 0x07) as u8 + 1;
+    let bits = ((mot >> 36) & 0x1f) as u8 + 1;
+    let total = mot & 0x0f_ffff_ffff;
+    let mut md5 = [0u8; 16];
+    md5.copy_from_slice(&si[18..34]);
+    (cadence, canaux, bits, total, md5)
 }
 
 /// L'en-tête d'un flux FLAC : MD5 de STREAMINFO (toujours le premier bloc) et
@@ -87,12 +144,74 @@ pub fn entete_flac<R: Read + Seek>(lecteur: &mut R) -> Option<EnteteFlac> {
     let mut streaminfo = [0u8; 34];
     lecteur.read_exact(&mut streaminfo).ok()?;
     let md5_nul = streaminfo[18..34].iter().all(|&o| o == 0);
+    let (sample_rate, channels, bits, total_samples, md5) = champs_streaminfo(&streaminfo);
     let vendeur = if entete[0] & 0x80 != 0 {
         None
     } else {
         vendeur_apres_streaminfo(lecteur)
     };
-    Some(EnteteFlac { vendeur, md5_nul })
+    Some(EnteteFlac {
+        vendeur,
+        md5_nul,
+        md5,
+        total_samples,
+        sample_rate,
+        channels,
+        bits,
+    })
+}
+
+/// #5594 — la clé PCM d'un fichier FLAC du disque ([`EnteteFlac::cle_pcm`]).
+///
+/// Seul l'en-tête est lu : un éventuel en-tête ID3v2 placé devant `fLaC` est
+/// sauté (certains tagueurs l'y mettent), puis les 42 octets de STREAMINFO.
+/// Le fichier n'est jamais écrit.
+///
+/// `Err` quand le fichier ne s'ouvre pas (partage démonté, droits) : rien
+/// n'est appris, l'appelant réessaiera. `Ok(None)` quand il s'ouvre mais ne
+/// porte pas de clé : pas un FLAC, STREAMINFO illisible, MD5 nul.
+pub fn cle_pcm_du_fichier(chemin: &Path) -> std::io::Result<Option<String>> {
+    let f = std::fs::File::open(chemin)?;
+    let mut lecteur = std::io::BufReader::new(f);
+    if sauter_id3v2(&mut lecteur).is_none() {
+        return Ok(None);
+    }
+    Ok(entete_flac(&mut lecteur).and_then(|e| e.cle_pcm()))
+}
+
+/// Saute un en-tête ID3v2 en tête de flux, s'il y en a un, et laisse le
+/// lecteur sur l'octet qui le suit (ou au début du flux). `None` si la lecture
+/// échoue.
+fn sauter_id3v2<R: Read + Seek>(lecteur: &mut R) -> Option<()> {
+    let mut tete = [0u8; 10];
+    let lus = lire_au_plus(lecteur, &mut tete)?;
+    if lus == 10 && &tete[0..3] == b"ID3" && tete[6..10].iter().all(|&o| o & 0x80 == 0) {
+        // Taille « synchsafe » sur 4 × 7 bits, sans l'en-tête de 10 octets ;
+        // un pied de page (drapeau 0x10) en ajoute 10.
+        let taille = tete[6..10]
+            .iter()
+            .fold(0u64, |acc, &o| (acc << 7) | u64::from(o));
+        let pied = if tete[5] & 0x10 != 0 { 10 } else { 0 };
+        lecteur.seek(SeekFrom::Start(10 + taille + pied)).ok()?;
+    } else {
+        lecteur.seek(SeekFrom::Start(0)).ok()?;
+    }
+    Some(())
+}
+
+/// Lit jusqu'à remplir `tampon` ou atteindre la fin du flux ; rend le nombre
+/// d'octets lus.
+fn lire_au_plus<R: Read>(lecteur: &mut R, tampon: &mut [u8]) -> Option<usize> {
+    let mut lus = 0;
+    while lus < tampon.len() {
+        match lecteur.read(&mut tampon[lus..]) {
+            Ok(0) => break,
+            Ok(n) => lus += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(lus)
 }
 
 /// La chaîne vendeur d'un flux FLAC, lue sur n'importe quel lecteur
@@ -412,6 +531,91 @@ mod tests {
         assert!(vendeur_est_ffmpeg(" Lavf58.76.100"));
         assert!(!vendeur_est_ffmpeg("libFLAC"));
         assert!(!vendeur_est_ffmpeg(""));
+    }
+
+    // ── #5594 — la clé du signal PCM ──────────────────────────────────────
+
+    /// Les champs du signal se lisent aux bons rangs de STREAMINFO : le
+    /// fichier du .18 (96 kHz, 2 canaux, 24 bits, 10 369 280 échantillons,
+    /// MD5 nul) — cf. `streaminfo_du_18` plus bas.
+    #[test]
+    fn streaminfo_du_18_rend_cadence_canaux_profondeur_et_duree_5594() {
+        let mut f = b"fLaC".to_vec();
+        f.extend(bloc(true, 0, &streaminfo_du_18()));
+        let e = entete_flac(&mut Cursor::new(f)).unwrap();
+        assert_eq!(e.sample_rate, 96_000);
+        assert_eq!(e.channels, 2);
+        assert_eq!(e.bits, 24);
+        assert_eq!(e.total_samples, 10_369_280);
+        assert!(e.md5_nul);
+        assert_eq!(e.cle_pcm(), None, "un MD5 nul ne fait jamais de clé");
+    }
+
+    /// Le même STREAMINFO avec un MD5 réel : la clé, au caractère près.
+    #[test]
+    fn la_cle_porte_md5_duree_et_format_5594() {
+        let mut si = streaminfo_du_18();
+        si[18..34].copy_from_slice(&[
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let mut f = b"fLaC".to_vec();
+        f.extend(bloc(false, 0, &si));
+        f.extend(bloc(true, 4, &vorbis("reference libFLAC 1.4.3")));
+        let e = entete_flac(&mut Cursor::new(f)).unwrap();
+        assert_eq!(
+            e.cle_pcm().as_deref(),
+            Some("flac-md5-v1:000102030405060708090abbccddeeff:10369280:96000:2:24")
+        );
+        // Durée inconnue (0) : pas de clé, plutôt qu'une clé qui ne filtre rien.
+        let sans_duree = EnteteFlac {
+            total_samples: 0,
+            ..e
+        };
+        assert_eq!(sans_duree.cle_pcm(), None);
+    }
+
+    /// Le FLAC de référence du dépôt, lu sur le disque : la clé de son
+    /// STREAMINFO (relevé à la main le 05/10/2026 : MD5 e3d5…10bf, 44 100
+    /// échantillons, 44,1 kHz, stéréo, 16 bits).
+    #[test]
+    fn le_flac_de_reference_a_sa_cle_5594() {
+        let chemin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        assert_eq!(
+            cle_pcm_du_fichier(&chemin).unwrap().as_deref(),
+            Some("flac-md5-v1:e3d5a52400c85f978eebd475ec8a10bf:44100:44100:2:16")
+        );
+    }
+
+    /// Un en-tête ID3v2 devant `fLaC` est sauté ; un MP3, un fichier absent,
+    /// un FLAC au MD5 nul ne donnent pas de clé — et l'absent se distingue
+    /// (`Err`) de « lu, sans clé » (`Ok(None)`).
+    #[test]
+    fn id3_saute_et_absences_de_cle_5594() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let flac = std::fs::read(dir.join("test.flac")).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // ID3v2.4 de 20 octets de charge utile (taille synchsafe), puis le FLAC.
+        let mut id3 = b"ID3\x04\x00\x00\x00\x00\x00\x14".to_vec();
+        id3.extend_from_slice(&[0u8; 20]);
+        id3.extend_from_slice(&flac);
+        let avec_id3 = tmp.path().join("id3.flac");
+        std::fs::write(&avec_id3, &id3).unwrap();
+        assert_eq!(
+            cle_pcm_du_fichier(&avec_id3).unwrap(),
+            cle_pcm_du_fichier(&dir.join("test.flac")).unwrap()
+        );
+
+        // Le même fichier, MD5 mis à zéro (ce qu'écrit ffmpeg).
+        let mut nul = flac.clone();
+        nul[26..42].fill(0);
+        let md5_nul = tmp.path().join("nul.flac");
+        std::fs::write(&md5_nul, &nul).unwrap();
+        assert_eq!(cle_pcm_du_fichier(&md5_nul).unwrap(), None);
+
+        assert_eq!(cle_pcm_du_fichier(&dir.join("test.mp3")).unwrap(), None);
+        assert!(cle_pcm_du_fichier(Path::new("/nexiste/pas.flac")).is_err());
     }
 
     // ── #4800 — le conteneur neuf ─────────────────────────────────────────

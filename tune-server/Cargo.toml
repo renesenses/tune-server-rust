@@ -72,8 +72,8 @@ cd = ["dep:tune-cd"]
 circle = ["dep:tune-circle"]
 # Entrée audio en direct (#5051) : capter une entrée USB (platine, S/PDIF,
 # optique) et la diffuser vers une zone. Dans `default` comme `cd` : opt-in à
-# l'exécution (`default_enabled = false`), hors catalogue tant qu'aucun écran
-# ne le consomme.
+# l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
+# rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
 
 [dependencies]
@@ -109,6 +109,9 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { workspace = true }
+# #4645 — le trait `Service` que `axum::serve` attend du service d'aiguillage
+# (`src/aiguillage_des_flux.rs`). Déjà dans l'arbre, par axum.
+tower-service = "0.3"
 toml = { workspace = true }
 reqwest = { workspace = true }
 async-stream = { workspace = true }
@@ -183,6 +186,12 @@ tune-core = { path = "../tune-core", default-features = false, features = [
     "isolement-disque-de-test",
 ] }
 
+# Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
+# RSS mesure tout le processus.
+[[test]]
+name = "memoire_a_froid"
+path = "tests/memoire_a_froid.rs"
+
 # `autotests = false` en tête de ce manifeste (#3326, S2-a) : le témoin du
 # point d'accès Sendspin doit être une cible déclarée pour être compilé.
 [[test]]
@@ -237,6 +246,18 @@ path = "tests/isolement_disque_integration_5512.rs"
 name = "titres_bannis_4806"
 path = "tests/titres_bannis_4806.rs"
 
+# Ticket 134 — trois « suivant » en rafale visent trois pistes distinctes.
+[[test]]
+name = "suivants_en_rafale_134"
+path = "tests/suivants_en_rafale_134.rs"
+
+# 05/10/2026 — l'écriture des paroles dans les fichiers : `.lrc` voisin sous le
+# consentement des paroles ET « Écrire les modifications dans les fichiers
+# audio ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "paroles_ecriture_fichiers"
+path = "tests/paroles_ecriture_fichiers.rs"
+
 # #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
 # réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
 [[test]]
@@ -262,6 +283,14 @@ path = "tests/collection_intelligente_sans_micro_coupure_5438.rs"
 [[test]]
 name = "lecture_sans_famine_collection_intelligente"
 path = "tests/lecture_sans_famine_collection_intelligente.rs"
+
+# #5677 — banc de mesure des blocages de Tune OS (un processeur, 100 000
+# pistes, lecture + navigation + lots d'écriture + analyse). `#[ignore]` :
+# lancé à la main sous `taskset -c 0`. `autotests = false` : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "blocages_tuneos_5677"
+path = "tests/blocages_tuneos_5677.rs"
 
 # #5455 — l'onglet Doublons de Métadonnées : les trois routes qu'il attend,
 # sur une grande bibliothèque générée. `autotests = false` : sans cette cible,
@@ -830,6 +859,21 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
 
+# Fil forum 2143 (FabienM), points 5, 6 et 8 — l'album d'un titre de la file :
+# `album_id` / `album_id_service` sur `GET /zones/{id}/queue`, et l'album en
+# cours d'un titre Bandcamp lancé hors de sa page. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "album_de_la_file_fil2143"
+path = "tests/album_de_la_file_fil2143.rs"
+
+# Fil forum 2143 (#5758) — l'artiste d'un titre de la file : `artist_id` /
+# `artist_id_service` sur `GET /zones/{id}/queue`. `autotests = false` plus
+# haut : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "artiste_de_la_file_fil2143"
+path = "tests/artiste_de_la_file_fil2143.rs"
+
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
 # des services simulés. `autotests = false` plus haut : sans cette cible, le
@@ -1159,6 +1203,14 @@ path = "tests/crossfeed_ombre_5081.rs"
 name = "pg_scan_converge_4602"
 path = "tests/pg_scan_converge_4602.rs"
 
+# Sur PostgreSQL, la règle de pochette d'album du scan par lots paniquait dans
+# le fil de lecture bornée (« there is no reactor running ») : pochette ni
+# posée ni suivie. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "pg_pochette_lecture_bornee"
+path = "tests/pg_pochette_lecture_bornee.rs"
+
 # #4907 — la même musique dans plusieurs répertoires : exemplaires, vues sans
 # doublon, identifiants conservés, sur SQLite et sur PostgreSQL
 # (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
@@ -1188,6 +1240,16 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
+
+# #5616 — EP et singles déduits (pistes et durée) sur la fiche artiste.
+[[test]]
+name = "page_artiste_ep_singles_5616"
+path = "tests/page_artiste_ep_singles_5616.rs"
+
+# Section « Live » de la fiche artiste (types secondaires, suite de #5616).
+[[test]]
+name = "page_artiste_section_live"
+path = "tests/page_artiste_section_live.rs"
 
 # #1572 — crédits d’un album (GET /library/albums/{id}/credits), fil 1921.
 [[test]]
@@ -1235,6 +1297,13 @@ path = "tests/identification_lot_4805.rs"
 [[test]]
 name = "labels_par_le_pilote_4836"
 path = "tests/labels_par_le_pilote_4836.rs"
+
+# #4805 (idée 4) — la passe par empreinte AcoustID, par la route montée, sur
+# des réponses enregistrées et un faux `fpcalc`. `autotests = false` en tête de
+# ce manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "acoustid_par_le_pilote_4805"
+path = "tests/acoustid_par_le_pilote_4805.rs"
 
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
@@ -1410,3 +1479,17 @@ path = "tests/sso_reconnexion_apres_attente.rs"
 [[test]]
 name = "config_export_zones"
 path = "tests/config_export_zones.rs"
+
+# #5837 — une compilation dont l'artiste d'album change de résolution entre
+# deux scans garde sa ligne album, sur SQLite et sur PostgreSQL
+# (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "pg_compilation_reprise_5837"
+path = "tests/pg_compilation_reprise_5837.rs"
+
+# #5530 — le marquage « généré par IA » envoyé avec un favori de service est
+# rangé et rendu. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "favori_marquage_ia_5530"
+path = "tests/favori_marquage_ia_5530.rs"

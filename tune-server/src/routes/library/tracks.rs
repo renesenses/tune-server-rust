@@ -920,6 +920,32 @@ pub(super) async fn rescan_track(
     }
 }
 
+/// `GET /library/tracks/{id}/tenues` — les champs de la piste corrigés à la
+/// main, que les analyses ne défont pas (`tune_core::db::champs_tenus`).
+pub(super) async fn champs_tenus_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let t = tune_core::db::champs_tenus::de_la_piste(&state.backend, id);
+    Json(json!({
+        "track_id": id,
+        "fields": t.as_ref().map(|t| t.noms()).unwrap_or_default(),
+    }))
+}
+
+/// `DELETE /library/tracks/{id}/tenues` — « Rétablir depuis le fichier » : la
+/// piste oublie ses champs tenus et relit tout de suite les balises de son
+/// fichier (même relecture que `POST …/rescan`).
+pub(super) async fn champs_tenus_retablir(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if let Err(e) = tune_core::db::champs_tenus::retablir(&state.backend, id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    rescan_track(State(state), Path(id)).await.into_response()
+}
+
 pub(super) async fn quick_fav_track(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
@@ -1185,9 +1211,11 @@ pub(super) async fn identify_track(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    let api_key = match state.config.acoustid_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
+    // La même clé que la passe de lot (#4805) : le réglage en base, sinon la
+    // configuration.
+    let api_key = match super::identification_lot::acoustid::cle_acoustid(&state) {
+        Some(k) => k,
+        None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"})),
@@ -1575,7 +1603,12 @@ pub(super) async fn track_metadata_get(
 
     let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     match repo.get_all(id) {
-        Ok(meta) => Json(json!(meta)).into_response(),
+        Ok(mut meta) => {
+            // Mémoire interne des champs tenus, pas une balise : elle a sa
+            // route (`…/tenues`).
+            meta.remove(tune_core::db::champs_tenus::CLE);
+            Json(json!(meta)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1604,9 +1637,13 @@ pub(super) async fn track_metadata_put(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    // Write tags to file (best-effort, don't fail the request)
+    // Write tags to file (best-effort, don't fail the request) — seulement si
+    // « Écrire les modifications dans les fichiers audio » est coché
+    // (désactivé par défaut) : sinon la base seule est modifiée.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path
+    if ecrire_fichier
+        && let Some(ref path) = file_path
         && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
     {
         tracing::warn!(
@@ -1618,7 +1655,11 @@ pub(super) async fn track_metadata_put(
         file_write_error = Some(e);
     }
 
-    let mut resp = json!({"status": "ok", "fields": body.len()});
+    let mut resp = json!({
+        "status": "ok",
+        "fields": body.len(),
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+    });
     if let Some(err) = file_write_error {
         resp["file_write_warning"] = json!(err);
     }

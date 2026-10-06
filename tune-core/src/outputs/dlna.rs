@@ -34,6 +34,19 @@ mod contact_tests_4971;
 #[path = "dlna_pause_701_tests_5050.rs"]
 pub(crate) mod pause_701_tests_5050;
 
+#[cfg(test)]
+#[path = "dlna_volume_scpd_tests_5793.rs"]
+mod volume_scpd_tests_5793;
+
+#[cfg(test)]
+#[path = "dlna_journal_volume_tests_5575.rs"]
+mod journal_volume_tests_5575;
+
+/// #5575 — pause entre le premier `SetVolume` acquitté et sa relecture
+/// `GetVolume` : un appareil qui applique en différé ne doit pas être déclaré
+/// sourd pour quelques millisecondes d'avance.
+const RELECTURE_VOLUME_APRES: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
 /// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
 fn faute_commande_soap(response: &str) -> bool {
@@ -146,6 +159,32 @@ pub const URI_RESTEE_VIDE_PREFIX: &str =
 /// acquittement, et la zone « jouait » une piste que le renderer n'avait
 /// jamais reçue.
 pub(crate) const SOAP_HTTP_SANS_CORPS_PREFIX: &str = "soap http sans corps:";
+
+/// Tête des erreurs « le renderer a REFUSÉ le `Seek` » : une faute SOAP
+/// (701 « Transition not available », 710 « Seek mode not supported »,
+/// 711 « Illegal seek target »…) en réponse au `Seek`.
+///
+/// La commande a été reçue et rejetée : la position de l'appareil n'a pas
+/// bougé. L'orchestrateur ne déplace donc pas la position publique, et
+/// `PlaybackOrchestrator::dire_deplacement_refuse` reconnaît cette tête pour
+/// le dire à l'interface.
+pub const SEEK_REFUSE_PREFIX: &str = "seek refusé par le renderer:";
+
+/// L'erreur rendue par `DlnaOutput::seek` pour une faute SOAP : la tête
+/// [`SEEK_REFUSE_PREFIX`], puis le code UPnP et son sens.
+pub(crate) fn refus_de_seek(response: &str) -> String {
+    let code = extract_tag(response, "errorCode");
+    let motif = match code.as_deref().map(str::trim) {
+        Some("701") => "transition impossible pour l'instant",
+        Some("710") => "mode de déplacement non pris en charge",
+        Some("711") => "position hors de portée",
+        _ => "commande refusée",
+    };
+    format!(
+        "{SEEK_REFUSE_PREFIX} code UPnP {} ({motif})",
+        code.as_deref().unwrap_or("inconnu")
+    )
+}
 /// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
 /// Kept short (2s) because we don't need the response — SetAVTransportURI
 /// implicitly stops the current track on compliant renderers.
@@ -541,6 +580,26 @@ pub struct DlnaOutput {
     /// Seule valeur disponible en mode silence si le renderer n'a jamais
     /// poussé de `Volume`.
     dernier_volume_pct: AtomicU64,
+    /// #5793 — URL du SCPD de `RenderingControl`, telle que le descriptif de
+    /// l'appareil l'annonce. `None` : sortie construite sans descriptif, le
+    /// profil standard s'applique.
+    scpd_rendering_control: std::sync::RwLock<Option<String>>,
+    /// #5793 — plage de `Volume` et canaux permis, lus UNE fois dans le SCPD
+    /// (voir [`super::dlna_profil_volume`]). Vide tant que la lecture n'a pas
+    /// abouti : un échec réseau ne fige pas le profil standard pour la vie
+    /// du processus.
+    profil_volume: tokio::sync::OnceCell<super::dlna_profil_volume::ProfilVolume>,
+    /// #5575 — débit des lignes INFO d'acquittement de `SetVolume` (voir
+    /// [`super::dlna_journal_volume`]). Partagé avec la tâche de rattrapage
+    /// qui écrit la dernière valeur d'un glissement.
+    journal_volume: Arc<std::sync::Mutex<super::dlna_journal_volume::JournalVolume>>,
+    /// #5575 — la relecture `GetVolume` d'après le premier `SetVolume`
+    /// acquitté est faite : une seule par session de zone.
+    volume_relu: AtomicBool,
+    /// #5575 — dernier niveau acquitté, dans l'unité de l'appareil : c'est
+    /// lui que la relecture détachée compare à `GetVolume`, pas le premier —
+    /// le curseur a pu bouger pendant la pause qui précède la relecture.
+    niveau_acquitte: Arc<std::sync::atomic::AtomicU32>,
     /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
     /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
     dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
@@ -676,6 +735,11 @@ impl DlnaOutput {
             incoherence_depuis: tokio::sync::Mutex::new(None),
             derniere_position_ms: AtomicU64::new(u64::MAX),
             dernier_volume_pct: AtomicU64::new(u64::MAX),
+            scpd_rendering_control: std::sync::RwLock::new(None),
+            profil_volume: tokio::sync::OnceCell::new(),
+            journal_volume: Arc::default(),
+            volume_relu: AtomicBool::new(false),
+            niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
@@ -871,6 +935,86 @@ impl DlnaOutput {
     /// Arme le « silence UPnP » à la construction (opt-in de zone relu au
     /// moment où la sortie est enregistrée). Même forme que
     /// [`DlnaOutput::with_play_delay`].
+    /// #5793 — l'URL du SCPD de `RenderingControl`, absolue. Sans elle, le
+    /// volume part en 0–100 sur `Master`, comme avant.
+    pub fn with_rendering_control_scpd(self, url: Option<String>) -> Self {
+        *self
+            .scpd_rendering_control
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
+        self
+    }
+
+    /// #5793 — le profil de volume de l'appareil, lu dans son SCPD à la
+    /// première commande puis retenu.
+    ///
+    /// Un SCPD injoignable rend le profil standard SANS le retenir : la
+    /// commande suivante retentera. Un SCPD lu, même sans plage, est retenu.
+    async fn profil_volume(&self) -> super::dlna_profil_volume::ProfilVolume {
+        use super::dlna_profil_volume::ProfilVolume;
+        if let Some(p) = self.profil_volume.get() {
+            return p.clone();
+        }
+        let url = self
+            .scpd_rendering_control
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(url) = url else {
+            return ProfilVolume::default();
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            resp.text().await.map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("délai dépassé".to_string()));
+        match lu {
+            Ok(xml) => {
+                let profil = ProfilVolume::depuis_scpd(&xml);
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    min = profil.min,
+                    max = profil.max,
+                    canaux = ?profil.canaux,
+                    commande = ?profil.canaux_de_commande(),
+                    standard = profil.est_standard(),
+                    "dlna_profil_volume_lu"
+                );
+                let _ = self.profil_volume.set(profil.clone());
+                profil
+            }
+            Err(raison) => {
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    url = %url,
+                    raison = %raison,
+                    "dlna_profil_volume_illisible — volume en 0–100 sur Master"
+                );
+                ProfilVolume::default()
+            }
+        }
+    }
+
+    /// Un niveau d'appareil ramené à 0,0–1,0 par le profil déjà connu
+    /// (standard s'il n'a pas encore été lu). Synchrone : ne fait aucun appel.
+    fn fraction_du_niveau(&self, niveau: u32) -> f64 {
+        match self.profil_volume.get() {
+            Some(p) => p.fraction(f64::from(niveau)),
+            None => f64::from(niveau.min(100)) / 100.0,
+        }
+    }
+
     pub fn with_upnp_silence(self, silence: bool) -> Self {
         self.upnp_silence.store(silence, Ordering::Relaxed);
         self
@@ -1047,10 +1191,95 @@ impl DlnaOutput {
     /// Sert deux choses : ne pas laisser l'état poussé en retard d'un
     /// évènement, et donner au mode silence une valeur honnête quand le
     /// renderer n'émet pas de `Volume`.
-    async fn memoriser_volume(&self, niveau_pct: u64) {
+    ///
+    /// #5793 — l'état poussé porte le niveau dans l'UNITÉ DE L'APPAREIL (c'est
+    /// ce que ses évènements `Volume` y écrivent), le dernier volume posé
+    /// reste en pour-cent.
+    async fn memoriser_volume(&self, niveau_pct: u64, niveau_appareil: u32) {
         let niveau_pct = niveau_pct.min(100);
         self.dernier_volume_pct.store(niveau_pct, Ordering::Relaxed);
-        self.event_state.lock().await.volume = Some(niveau_pct as u32);
+        self.event_state.lock().await.volume = Some(niveau_appareil);
+    }
+
+    /// #5575 — porte un acquittement de `SetVolume` au journal INFO, à débit
+    /// borné : une ligne au plus par [`super::dlna_journal_volume::INTERVALLE`],
+    /// et la dernière valeur d'un glissement écrite par un rattrapage.
+    fn journaliser_acquit_volume(&self, acquit: super::dlna_journal_volume::AcquitVolume) {
+        use super::dlna_journal_volume::Decision;
+        let decision = self
+            .journal_volume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .noter(std::time::Instant::now(), acquit.clone());
+        match decision {
+            Decision::Ecrire { regroupes } => ecrire_acquit_volume(&self.name, &acquit, regroupes),
+            Decision::Taire {
+                rattrapage_dans: Some(delai),
+            } => {
+                let journal = self.journal_volume.clone();
+                let zone = self.name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delai).await;
+                    let rattrape = journal
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .rattraper(std::time::Instant::now());
+                    if let Some((acquit, regroupes)) = rattrape {
+                        ecrire_acquit_volume(&zone, &acquit, regroupes);
+                    }
+                });
+            }
+            Decision::Taire { .. } => {}
+        }
+    }
+
+    /// #5575 — une fois par session de zone, relit le volume après le premier
+    /// `SetVolume` acquitté et dit si l'appareil l'a VRAIMENT appliqué. C'est
+    /// la seule preuve qu'un journal de testeur peut porter d'un renderer qui
+    /// acquitte sans rien faire (darTZeel de Sevy, #5793).
+    ///
+    /// Tâche DÉTACHÉE : l'ordre de volume et le curseur n'attendent ni la
+    /// pause [`RELECTURE_VOLUME_APRES`] ni la réponse de l'appareil — la
+    /// ligne INFO arrive simplement un peu après. Rend la poignée de la tâche
+    /// (pour les tests), `None` si la relecture de la session est déjà faite.
+    fn relire_volume_applique(
+        &self,
+        niveau: u32,
+        canal: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.niveau_acquitte.store(niveau, Ordering::Relaxed);
+        if self.volume_relu.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let client = self.client.clone();
+        let url = self.url_de(VoieSoap::RenderingControl);
+        let zone = self.name.clone();
+        let canal = canal.to_string();
+        let niveau_acquitte = self.niveau_acquitte.clone();
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(RELECTURE_VOLUME_APRES).await;
+            let attendu = niveau_acquitte.load(Ordering::Relaxed);
+            let reponse = relire_volume_soap(&client, &url, &canal).await;
+            let lu = reponse
+                .as_ref()
+                .ok()
+                .and_then(|r| extract_tag(r, "CurrentVolume"))
+                .and_then(|v| v.trim().parse::<u32>().ok());
+            let lecture = match &reponse {
+                Ok(r) => super::dlna_journal_volume::reponse_soap(r),
+                Err(e) => format!("injoignable ({e})"),
+            };
+            info!(
+                zone = %zone,
+                canal = %canal,
+                instance = 0,
+                attendu,
+                lu = %lu.map_or_else(|| "-".to_string(), |v| v.to_string()),
+                applique = %super::dlna_journal_volume::verdict_relecture(attendu, lu),
+                reponse = %lecture,
+                "dlna_volume_relu"
+            );
+        }))
     }
 
     /// Lit le volume du renderer, sur la voie qu'il faut.
@@ -1060,7 +1289,8 @@ impl DlnaOutput {
     /// dans `get_status`, elle est ici pour que les DEUX régimes de lecture
     /// l'appliquent, pas seulement celui qui sonde.
     async fn lire_volume(&self) -> Result<f64, String> {
-        let volume_resp = if self.device_id.contains("RINCON") {
+        let sonos = self.device_id.contains("RINCON");
+        let volume_resp = if sonos {
             self.soap_action(
                 VoieSoap::GroupRenderingControl,
                 "urn:schemas-upnp-org:service:GroupRenderingControl:1",
@@ -1070,16 +1300,27 @@ impl DlnaOutput {
             .await
             .unwrap_or_default()
         } else {
+            let profil = self.profil_volume().await;
             self.rc_action(
                 "GetVolume",
-                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+                &format!(
+                    "<InstanceID>0</InstanceID><Channel>{}</Channel>",
+                    profil.canal_de_lecture()
+                ),
             )
             .await?
         };
-        Ok(extract_tag(&volume_resp, "CurrentVolume")
-            .and_then(|v| v.parse::<f64>().ok())
-            .map(|v| v / 100.0)
-            .unwrap_or(0.5))
+        let niveau =
+            extract_tag(&volume_resp, "CurrentVolume").and_then(|v| v.trim().parse::<f64>().ok());
+        Ok(match niveau {
+            // Sonos : `GroupVolume` est toujours 0–100.
+            Some(v) if sonos => v / 100.0,
+            Some(v) => match self.profil_volume.get() {
+                Some(p) => p.fraction(v),
+                None => v / 100.0,
+            },
+            None => 0.5,
+        })
     }
 
     /// #5050 — un 701 sur `Pause` nomme un état, comme sur `Play` (#2581) :
@@ -2364,11 +2605,28 @@ impl OutputTarget for DlnaOutput {
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         let target = Self::format_time(position_ms);
-        self.av_action(
-            "Seek",
-            &format!("<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"),
-        )
-        .await?;
+        let response = self
+            .av_action(
+                "Seek",
+                &format!(
+                    "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"
+                ),
+            )
+            .await?;
+        // Même modèle que pause/resume (#4258) : une faute SOAP est un REFUS,
+        // pas un acquittement. Avant, un 701/710/711 passait pour un succès,
+        // l'ancre bougeait et l'interface affichait une position que
+        // l'appareil n'avait jamais prise.
+        if faute_commande_soap(&response) {
+            let refus = refus_de_seek(&response);
+            warn!(
+                device = %self.name,
+                position_ms,
+                upnp_code = extract_tag(&response, "errorCode").as_deref().unwrap_or("unknown"),
+                "dlna_seek_refuse"
+            );
+            return Err(refus);
+        }
         // Seul déplacement que le mode silence voit tout de suite : celui qui
         // passe par Tune. Celui fait sur la façade de l'appareil attendra le
         // prochain évènement — c'est le prix annoncé de l'option.
@@ -2390,7 +2648,8 @@ impl OutputTarget for DlnaOutput {
                     let _ = stream.write_all(msg.as_bytes()).await;
                     let _ = stream.shutdown().await;
                     debug!(device = %self.name, volume = target_vol, "micromega_volume_set");
-                    self.memoriser_volume(target_vol.round() as u64).await;
+                    let pct = target_vol.round() as u64;
+                    self.memoriser_volume(pct, pct.min(100) as u32).await;
                 }
                 Ok(Err(e)) => {
                     warn!(device = %self.name, volume = target_vol, error = %e, "micromega_volume_error");
@@ -2402,9 +2661,24 @@ impl OutputTarget for DlnaOutput {
             return Ok(());
         }
         let level = (volume * 100.0).round() as u32;
-        let resp = self.rc_action("SetVolume", &format!(
-            "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>"
-        )).await?;
+        // #5793 — la plage et le canal sont ceux que l'appareil annonce dans
+        // son SCPD, plus une supposition 0–100 sur `Master`.
+        let profil = self.profil_volume().await;
+        let niveau = profil.niveau(volume);
+        let mut resp = String::new();
+        for canal in profil.canaux_de_commande() {
+            resp = self
+                .rc_action(
+                    "SetVolume",
+                    &format!(
+                        "<InstanceID>0</InstanceID><Channel>{canal}</Channel><DesiredVolume>{niveau}</DesiredVolume>"
+                    ),
+                )
+                .await?;
+            if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+                break;
+            }
+        }
         if resp.contains("UPnPError") || resp.contains("<errorCode>") {
             // Sonos rejects RenderingControl SetVolume with 401.
             // Try GroupRenderingControl on the same host instead.
@@ -2419,6 +2693,14 @@ impl OutputTarget for DlnaOutput {
                         ),
                     )
                     .await?;
+                let acquit = super::dlna_journal_volume::AcquitVolume {
+                    volume_pct: level,
+                    niveau: level,
+                    canal: "GroupRenderingControl".into(),
+                    instance: 0,
+                    reponse: super::dlna_journal_volume::reponse_soap(&grc_resp),
+                };
+                self.journaliser_acquit_volume(acquit);
                 if grc_resp.contains("UPnPError") || grc_resp.contains("<errorCode>") {
                     warn!(device = %self.name, level, response = %grc_resp, "sonos_group_volume_rejected");
                     return Err(format!(
@@ -2427,7 +2709,7 @@ impl OutputTarget for DlnaOutput {
                     ));
                 }
                 debug!(device = %self.name, level, "sonos_group_volume_ok");
-                self.memoriser_volume(level as u64).await;
+                self.memoriser_volume(level as u64, level).await;
                 return Ok(());
             }
             // The renderer answered, and said no. Reporting Ok() here — as this
@@ -2435,14 +2717,31 @@ impl OutputTarget for DlnaOutput {
             // out of the speakers any louder: three layers agreeing on a change
             // that never happened (Eric, forum, renderer Diretta + PC vu comme
             // zone DLNA). Say it instead.
+            self.journaliser_acquit_volume(super::dlna_journal_volume::AcquitVolume {
+                volume_pct: level,
+                niveau,
+                canal: profil.canaux_de_commande().join(","),
+                instance: 0,
+                reponse: super::dlna_journal_volume::reponse_soap(&resp),
+            });
             warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
             return Err(format!(
                 "« {} » a refusé le réglage de volume. Réglez-le sur l'appareil lui-même.",
                 self.name
             ));
         }
-        debug!(device = %self.name, level, "dlna_set_volume_ok");
-        self.memoriser_volume(level as u64).await;
+        // #5575 — au journal INFO, à débit borné : la seule trace, dans les
+        // journaux des testeurs, de ce que le renderer acquitte.
+        self.journaliser_acquit_volume(super::dlna_journal_volume::AcquitVolume {
+            volume_pct: level,
+            niveau,
+            canal: profil.canaux_de_commande().join(","),
+            instance: 0,
+            reponse: "OK".into(),
+        });
+        self.memoriser_volume(level as u64, niveau).await;
+        // Détachée : la réponse à l'ordre part sans attendre la relecture.
+        let _ = self.relire_volume_applique(niveau, profil.canal_de_lecture());
         Ok(())
     }
 
@@ -2519,7 +2818,7 @@ impl OutputTarget for DlnaOutput {
                 .await;
             self.position_extrapolee.store(true, Ordering::Relaxed);
             let volume = match evt_volume {
-                Some(v) => v as f64 / 100.0,
+                Some(v) => self.fraction_du_niveau(v),
                 // Le renderer n'a jamais poussé de volume (RenderingControl
                 // absent ou muet). On rend le dernier que Tune a posé — et à
                 // défaut la même valeur de repli que le chemin de sondage quand
@@ -2605,7 +2904,7 @@ impl OutputTarget for DlnaOutput {
             self.position_extrapolee.store(false, Ordering::Relaxed);
 
             let volume = match evt_volume {
-                Some(v) => v as f64 / 100.0,
+                Some(v) => self.fraction_du_niveau(v),
                 // Le RenderingControl n'a rien poussé : on ne devine pas, on
                 // demande — comme avant. Un abonnement AVTransport tenu ne
                 // dispense pas d'avoir un volume juste.
@@ -3237,7 +3536,66 @@ fn fallback_mime_from_sink(sink: &[String]) -> Option<String> {
     None
 }
 
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+/// #5575 — `GetVolume` en un seul envoi, hors de `soap_action` : la relecture
+/// tourne dans une tâche détachée qui ne tient pas la sortie. Diagnostic
+/// seulement — ni réessai ni redécouverte, un échec se dit au journal.
+async fn relire_volume_soap(client: &Client, url: &str, canal: &str) -> Result<String, String> {
+    let soap = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:GetVolume xmlns:u="{RENDERING_CONTROL_URN}">
+      <InstanceID>0</InstanceID><Channel>{canal}</Channel>
+    </u:GetVolume>
+  </s:Body>
+</s:Envelope>"#
+    );
+    let reponse = client
+        .post(url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "SOAPAction",
+            format!("\"{RENDERING_CONTROL_URN}#GetVolume\""),
+        )
+        .body(soap)
+        .send()
+        .await
+        .map_err(|e| http_error::chain(&e))?;
+    reponse.text().await.map_err(|e| http_error::chain(&e))
+}
+
+/// #5575 — la ligne INFO d'un acquittement de `SetVolume`.
+fn ecrire_acquit_volume(
+    zone: &str,
+    acquit: &super::dlna_journal_volume::AcquitVolume,
+    regroupes: u32,
+) {
+    if acquit.reponse == "OK" {
+        info!(
+            zone = %zone,
+            volume_pct = acquit.volume_pct,
+            niveau = acquit.niveau,
+            canal = %acquit.canal,
+            instance = acquit.instance,
+            reponse = %acquit.reponse,
+            regroupes,
+            "dlna_set_volume_ok"
+        );
+    } else {
+        info!(
+            zone = %zone,
+            volume_pct = acquit.volume_pct,
+            niveau = acquit.niveau,
+            canal = %acquit.canal,
+            instance = acquit.instance,
+            reponse = %acquit.reponse,
+            regroupes,
+            "dlna_set_volume_refuse"
+        );
+    }
+}
+
+pub(crate) fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();

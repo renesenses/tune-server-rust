@@ -633,16 +633,16 @@ fn la_surveillance_pure() {
     use decisions::{SuiteAdoption, suite_de_l_adoption};
     let flux = "3f3eb421";
     assert_eq!(
-        suite_de_l_adoption(237_000, 237_000, None, flux, false, 3, 8),
+        suite_de_l_adoption(237_000, 237_000, None, flux, false, false, 3, 8),
         SuiteAdoption::EnAttente
     );
     assert_eq!(
-        suite_de_l_adoption(237_400, 237_000, None, flux, false, 3, 8),
+        suite_de_l_adoption(237_400, 237_000, None, flux, false, false, 3, 8),
         SuiteAdoption::EnAttente,
         "un tremblement de quelques centaines de ms n'est pas un signe de vie"
     );
     assert_eq!(
-        suite_de_l_adoption(2_000, 237_000, None, flux, false, 1, 8),
+        suite_de_l_adoption(2_000, 237_000, None, flux, false, false, 1, 8),
         SuiteAdoption::Confirmee,
         "la position qui repart confirme"
     );
@@ -653,6 +653,7 @@ fn la_surveillance_pure() {
             Some("http://h/stream/3f3eb421.wav"),
             flux,
             false,
+            false,
             1,
             8
         ),
@@ -660,18 +661,18 @@ fn la_surveillance_pure() {
         "l'URI qui nomme le flux adopté confirme, position gelée ou pas"
     );
     assert_eq!(
-        suite_de_l_adoption(237_000, 237_000, None, flux, false, 8, 8),
+        suite_de_l_adoption(237_000, 237_000, None, flux, false, false, 8, 8),
         SuiteAdoption::Infirmee
     );
     // Fils 1926/1931 — un renderer ARRÊTÉ, position remise à 0 : l'écart
     // avec la position gelée n'est pas un signe de vie.
     assert_eq!(
-        suite_de_l_adoption(0, 237_000, None, flux, true, 1, 3),
+        suite_de_l_adoption(0, 237_000, None, flux, false, true, 1, 3),
         SuiteAdoption::EnAttente,
         "arrêté à 0 dans le délai : on attend, on ne confirme pas"
     );
     assert_eq!(
-        suite_de_l_adoption(0, 237_000, None, flux, true, 3, 3),
+        suite_de_l_adoption(0, 237_000, None, flux, false, true, 3, 3),
         SuiteAdoption::Infirmee,
         "arrêté à 0, délai écoulé : le repli relance la piste adoptée"
     );
@@ -681,6 +682,7 @@ fn la_surveillance_pure() {
             237_000,
             Some("http://h/stream/3f3eb421.wav"),
             flux,
+            false,
             true,
             1,
             3
@@ -695,6 +697,11 @@ fn la_surveillance_pure() {
 #[cfg(test)]
 mod eversolo_epingle_4382;
 
+/// #4382 (rc2, 05/10) — le blanc du DMP-A6 mesuré sondage par sondage : le
+/// `Next` ignoré se constate au premier sondage, puis n'est plus demandé.
+#[cfg(test)]
+mod blanc_du_dmp_a6_rc2_4382;
+
 /// #3967 — l'enchaînement VÉRIFIÉ : ce même banc, mais l'appareil a prouvé
 /// qu'il TIENT la suivante, et on la lui demande au lieu de tout relancer.
 #[cfg(test)]
@@ -705,3 +712,9 @@ mod bascule_sur_la_suivante_3967;
 /// déplacement près de la fin, et un recul après l'armement.
 #[cfg(test)]
 mod deplacement_et_enchainement_4682;
+
+/// #5411 (fil 2031) — le renderer qui REJOUE la piste finie : ce même banc,
+/// une retombée de position, un départ après un arrêt dans la garde et un
+/// `Next` acquitté, chaque fois avec l'URI de la piste finie.
+#[cfg(test)]
+mod rejeu_de_la_piste_finie_5411;

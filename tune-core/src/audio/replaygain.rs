@@ -63,6 +63,34 @@ const TRACK_BATCH: usize = 25;
 /// valeur non marquée ne se distinguait pas d'une valeur d'avant la clef.
 const DR_SOURCE_ANALYSIS: &str = "analysis";
 
+/// #5594 (lot 2) — la clé de `track_metadata` qui dit QUEL algorithme a
+/// produit la mesure ReplayGain de piste (`rg_track_gain`, `rg_track_peak`,
+/// `rg_track_true_peak`).
+///
+/// Posée par la passe d'analyse, au moment de la mesure, et par elle seule.
+/// Une mesure faite avant cette clé reste SANS version : rien ne permet de
+/// dire après coup quel code l'a produite, et on n'invente pas. La clé ne se
+/// lit qu'avec `rg_track_source = analysis` : un gain venu des tags du
+/// fichier n'a pas de version Tune.
+pub const RG_ALGO_KEY: &str = "rg_algo";
+
+/// La version de la mesure ReplayGain de Tune : sonie intégrée EBU R128 /
+/// ITU-R BS.1770 (pondération K, double porte), pic d'échantillon, et true
+/// peak par suréchantillonnage 4× (#1694). À changer dès qu'une valeur
+/// rendue pour le même signal change — c'est ce qui permettra de ne comparer
+/// que des mesures comparables entre deux instances.
+pub const RG_ALGO: &str = "bs1770-tp4x-v1";
+
+/// #5594 (lot 2) — la clé de `track_metadata` qui dit quel algorithme a
+/// produit `dr_track`. Même règle que [`RG_ALGO_KEY`] : posée à la mesure,
+/// jamais rétroactivement, et lue seulement avec `dr_source = analysis`.
+pub const DR_ALGO_KEY: &str = "dr_algo";
+
+/// La version de la plage dynamique de Tune : la méthode du TT DR Meter
+/// (blocs de 3 s, 20 % des blocs les plus forts, deuxième pic), arrondie à
+/// l'entier.
+pub const DR_ALGO: &str = "tt-dr-v1";
+
 /// La plage calculée a-t-elle le droit de s'écrire ?
 ///
 /// 🔴 LE TAG DU FICHIER FAIT FOI. `dr_track` a DEUX producteurs : le scan, qui
@@ -105,6 +133,8 @@ fn ecrire_le_dr_mesure(repo: &TrackMetadataRepo, track_id: i64, dr: u32) {
     if peut_ecrire_le_dr(existant.as_deref()) {
         let _ = repo.set(track_id, "dr_track", &dr.to_string());
         let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+        // #5594 — la version de l'algorithme, écrite avec la mesure.
+        let _ = repo.set(track_id, DR_ALGO_KEY, DR_ALGO);
     }
 }
 
@@ -192,6 +222,10 @@ fn appliquer_les_ecritures(tx: &dyn DbTxHandle, e: &EcrituresDePiste) -> Result<
         // le gain qu'il applique, et « tags du fichier » affiché sur une
         // mesure Tune serait un affichage inventé.
         poser(TRACK_SOURCE_KEY, SOURCE_ANALYSIS)?;
+        // #5594 — la version de l'algorithme qui a produit ces trois
+        // valeurs, écrite avec elles. Une mesure d'avant cette clé reste sans
+        // version.
+        poser(RG_ALGO_KEY, RG_ALGO)?;
         // ── PLAGE DYNAMIQUE ──────────────────────────────────────────────
         //
         // Elle voyage avec ce décodage-ci : la mesure la calcule sur les
@@ -208,6 +242,8 @@ fn appliquer_les_ecritures(tx: &dyn DbTxHandle, e: &EcrituresDePiste) -> Result<
             if peut_ecrire_le_dr(existant.as_deref()) {
                 poser("dr_track", &dr.to_string())?;
                 poser("dr_source", DR_SOURCE_ANALYSIS)?;
+                // #5594 — la version de l'algorithme, écrite avec la mesure.
+                poser(DR_ALGO_KEY, DR_ALGO)?;
             }
         }
     }
@@ -1080,9 +1116,20 @@ pub const ALBUMS_PAR_TOUR: usize = 4;
 /// La passe d'albums d'UN tour : jusqu'à [`ALBUMS_PAR_TOUR`] albums, tant
 /// qu'il y en a. Mêmes gardes que [`passe_d_album`], relues à chaque album.
 pub async fn passe_d_albums_du_tour(backend: &Arc<dyn DbBackend>, en_lecture: bool) -> usize {
+    albums_jusqu_a_la_borne(|| passe_d_album(backend, en_lecture)).await
+}
+
+/// La boucle de [`passe_d_albums_du_tour`], sans la base ni les gardes
+/// globales (pause, lecture) : elle se garde seule, sans dépendre de l'état
+/// que d'autres tests du processus posent.
+async fn albums_jusqu_a_la_borne<F, Fut>(mut un_album: F) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
     let mut faits = 0;
     for _ in 0..ALBUMS_PAR_TOUR {
-        let n = passe_d_album(backend, en_lecture).await;
+        let n = un_album().await;
         if n == 0 {
             break;
         }
@@ -1197,6 +1244,16 @@ const CANDIDATS_RG_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
 
+/// Le prédicat de la passe ReplayGain, PÉRIMÈTRE compris (#5593) : les racines
+/// exclues par l'utilisateur sortent de la sélection ET du compteur, par le
+/// même texte. Sans paramètre ajouté : la clause porte des littéraux, les `?`
+/// de [`CANDIDATS_RG_WHERE`] ne bougent pas. Voir
+/// [`crate::taches_de_fond::perimetre`].
+fn candidats_rg_where(backend: &Arc<dyn DbBackend>) -> String {
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_RG_WHERE}{perimetre}")
+}
+
 /// Combien de pistes le balayage ReplayGain a encore devant lui (#4144).
 ///
 /// Le dénominateur de la jauge, et rien d'autre : la MÊME sélection que
@@ -1205,9 +1262,10 @@ const CANDIDATS_RG_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
 /// se rend comme « total inconnu » plutôt que comme une fausse certitude.
 pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    let predicat = candidats_rg_where(backend);
     backend
         .query_one(
-            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_RG_WHERE}"),
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {predicat}"),
             &[&seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -1227,10 +1285,22 @@ pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
 /// cartes de la page Santé le montrent à côté de la jauge, avec sa cause.
 pub fn compter_les_reportees_par_chemin(backend: &Arc<dyn DbBackend>) -> i64 {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    // #5593 — une piste d'une racine EXCLUE n'attend plus son disque : elle
+    // n'est plus du travail du tout. La compter ici ferait dire à la carte
+    // « en attente d'un disque » pour un partage que l'utilisateur a retiré
+    // des analyses — précisément le NAS démonté de l'exemple.
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    let dans_le_perimetre = if perimetre.is_empty() {
+        String::new()
+    } else {
+        format!(" AND EXISTS (SELECT 1 FROM tracks t WHERE t.id = m.track_id{perimetre})")
+    };
     backend
         .query_one(
-            "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
-             WHERE m.key = 'rg_path_unresolved' AND m.value > ?",
+            &format!(
+                "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
+                 WHERE m.key = 'rg_path_unresolved' AND m.value > ?{dans_le_perimetre}"
+            ),
             &[&seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -1261,10 +1331,12 @@ pub fn selectionner_les_candidats_replaygain(
     n: usize,
 ) -> Result<Vec<Vec<crate::db::backend::SqlValue>>, String> {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    // #5593 — le PÉRIMÈTRE : les racines exclues sortent de la sélection.
+    let predicat = candidats_rg_where(backend);
     backend.query_many(
         &format!(
             "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
-             WHERE {CANDIDATS_RG_WHERE} AND t.id > ? ORDER BY t.id LIMIT ?"
+             WHERE {predicat} AND t.id > ? ORDER BY t.id LIMIT ?"
         ),
         &[
             &seuil_report as &dyn ToSqlValue,
@@ -1812,13 +1884,18 @@ const TEMOIN_RG_EMPREINTE: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
 /// (#5246). Décision de Bertrand du 27/09/2026 : les empreintes et la plage
 /// dynamique se calculent MÊME ReplayGain coupé ; seuls le calcul et
 /// l'application du gain restent désactivés.
+///
+/// #5593 — et le PÉRIMÈTRE : les racines exclues sortent de la sélection et du
+/// compteur. Indispensable même ReplayGain armé : le témoin seul ne suffit pas,
+/// une piste analysée AVANT l'exclusion porte déjà `rg_analyzed`.
 fn candidats_empreinte_where(backend: &Arc<dyn DbBackend>) -> String {
     let temoin = if analysis_enabled(backend) {
         TEMOIN_RG_EMPREINTE
     } else {
         ""
     };
-    format!("{CANDIDATS_EMPREINTE_WHERE}{temoin}")
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_EMPREINTE_WHERE}{temoin}{perimetre}")
 }
 
 /// Combien de pistes le rattrapage traiterait encore. `None` : base
@@ -1982,13 +2059,17 @@ const TEMOIN_RG_DR: &str = " AND EXISTS (SELECT 1 FROM track_metadata m \
 
 /// Le prédicat du rattrapage de la plage dynamique, selon l'état du
 /// ReplayGain (#5246) — même règle que [`candidats_empreinte_where`].
+///
+/// #5593 — et le PÉRIMÈTRE, pour la même raison que
+/// [`candidats_empreinte_where`].
 fn candidats_dr_where(backend: &Arc<dyn DbBackend>) -> String {
     let temoin = if analysis_enabled(backend) {
         TEMOIN_RG_DR
     } else {
         ""
     };
-    format!("{CANDIDATS_DR_WHERE}{temoin}")
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    format!("{CANDIDATS_DR_WHERE}{temoin}{perimetre}")
 }
 
 /// Combien de pistes le rattrapage de la plage dynamique prendrait MAINTENANT.
@@ -3640,6 +3721,97 @@ mod tests {
         assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
     }
 
+    // ---------------------------------------------------------------------
+    // #5594 (lot 2) — la VERSION de l'algorithme, écrite avec la mesure.
+    // ---------------------------------------------------------------------
+
+    /// La passe nominale mesure le gain ET la plage : les deux versions
+    /// s'écrivent avec les valeurs, sous leurs libellés exacts — ce sont eux
+    /// que deux instances compareront.
+    #[tokio::test]
+    async fn la_mesure_ecrit_la_version_de_ses_algorithmes_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+
+        assert_eq!(analyze_track_batch(&backend).await, 1);
+        let t = temoins(&db);
+        assert!(t.contains_key("rg_track_gain"), "{t:?}");
+        assert_eq!(
+            t.get(TRACK_SOURCE_KEY).map(String::as_str),
+            Some("analysis")
+        );
+        assert_eq!(
+            t.get("rg_algo").map(String::as_str),
+            Some("bs1770-tp4x-v1"),
+            "la mesure ReplayGain doit porter la version de son algorithme : {t:?}"
+        );
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));
+        assert_eq!(
+            t.get("dr_algo").map(String::as_str),
+            Some("tt-dr-v1"),
+            "la plage dynamique mesurée doit porter la version de son algorithme : {t:?}"
+        );
+    }
+
+    /// Le rattrapage de la plage dynamique écrit `dr_algo` avec la plage — et
+    /// JAMAIS `rg_algo` : le gain en place vient des tags, pas de Tune.
+    #[tokio::test]
+    async fn le_rattrapage_dr_ecrit_dr_algo_sans_inventer_rg_algo_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, "rg_track_gain", "-6.50 dB").unwrap();
+
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 1);
+        let t = temoins(&db);
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
+        assert_eq!(t.get(DR_ALGO_KEY).map(String::as_str), Some(DR_ALGO));
+        assert!(
+            !t.contains_key(RG_ALGO_KEY),
+            "un gain lu dans les tags n'a pas de version Tune : {t:?}"
+        );
+    }
+
+    /// Les mesures déjà en base, faites sans version, RESTENT sans version :
+    /// aucune passe ne la pose après coup, et une valeur venue du disque n'en
+    /// reçoit jamais.
+    #[tokio::test]
+    async fn une_mesure_d_avant_la_version_reste_sans_version_5594() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("plage.wav");
+        wav_de_plage_connue(&f);
+        let (db, backend) = base_avec_piste(f.to_string_lossy().as_ref());
+        let repo = TrackMetadataRepo::new(db.clone());
+        // L'état d'une base d'avant #5594 : gain et plage mesurés par Tune,
+        // provenance posée, mais aucune version.
+        repo.set(42, "rg_analyzed", "1700000000").unwrap();
+        repo.set(42, "rg_track_gain", "-6.12 dB").unwrap();
+        repo.set(42, "rg_track_peak", "0.912345").unwrap();
+        repo.set(42, TRACK_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
+        repo.set(42, "dr_track", "11").unwrap();
+        repo.set(42, "dr_source", "analysis").unwrap();
+
+        assert_eq!(analyze_track_batch(&backend).await, 0);
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+        let t = temoins(&db);
+        assert!(!t.contains_key(RG_ALGO_KEY), "{t:?}");
+        assert!(!t.contains_key(DR_ALGO_KEY), "{t:?}");
+        assert_eq!(t.get("rg_track_gain").map(String::as_str), Some("-6.12 dB"));
+        assert_eq!(t.get("dr_track").map(String::as_str), Some("11"));
+
+        // Une plage lue dans les tags du fichier : ni écrasée, ni versionnée.
+        repo.set(42, "dr_track", "14").unwrap();
+        repo.set(42, "dr_source", "tag").unwrap();
+        assert_eq!(rattraper_un_lot_de_dr(&backend).await, 0);
+        assert!(!temoins(&db).contains_key(DR_ALGO_KEY));
+    }
+
     /// Un fichier introuvable se REPORTE, un fichier illisible se MARQUE. Sans
     /// la marque, le rattrapage reprendrait éternellement les mêmes pistes.
     #[tokio::test]
@@ -4928,36 +5100,35 @@ mod tests {
     /// [`ALBUMS_PAR_TOUR`]. À un album par tour, la passe d'albums prenait du
     /// retard sur la passe de pistes (deux albums complets par lot de 25) et
     /// le rattrapait seule, à près de 4 s l'album sur une grande base.
+    ///
+    /// La BOUCLE est éprouvée sans `passe_d_album` : celle-ci lit des états
+    /// globaux du processus (pause de la tâche, zones qui jouent) que d'autres
+    /// tests de la suite posent, et rendait 0 dans la suite complète.
     #[tokio::test]
     async fn un_tour_fait_plusieurs_albums_jusqu_a_sa_borne() {
-        let (db, backend) = base_albums();
-        let meta = TrackMetadataRepo::with_backend(backend.clone());
-        // Six albums complets de deux pistes, toutes mesurées.
-        for album in 1..=6i64 {
-            for k in 0..2i64 {
-                let id = album * 10 + k;
-                piste(&db, id, album);
-                meta.set(id, "rg_track_gain", "-6.00 dB").unwrap();
-                meta.set(id, "rg_track_peak", "0.900000").unwrap();
-            }
-        }
         assert_eq!(ALBUMS_PAR_TOUR, 4);
+        // Six albums en attente : un tour en fait quatre, le suivant deux.
+        let mut restants = 6usize;
+        let mut un = || {
+            let n = usize::from(restants > 0);
+            restants -= n;
+            std::future::ready(n)
+        };
         assert_eq!(
-            passe_d_albums_du_tour(&backend, false).await,
+            albums_jusqu_a_la_borne(&mut un).await,
             4,
             "premier tour : quatre albums, pas un seul"
         );
-        assert_eq!(passe_d_albums_du_tour(&backend, false).await, 2);
-        assert_eq!(passe_d_albums_du_tour(&backend, false).await, 0);
-        for album in 1..=6i64 {
-            assert!(gain_album(&meta, album * 10).is_some(), "album {album}");
-        }
-        // Pendant la lecture, rien : la garde de `passe_d_album` tient.
-        let (db2, backend2) = base_albums();
-        let meta2 = TrackMetadataRepo::with_backend(backend2.clone());
-        piste(&db2, 1, 1);
-        meta2.set(1, "rg_track_gain", "-6.00 dB").unwrap();
-        assert_eq!(passe_d_albums_du_tour(&backend2, true).await, 0);
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 2);
+        assert_eq!(albums_jusqu_a_la_borne(&mut un).await, 0);
+        // Et elle s'arrête au premier « rien » (pause, lecture, plus d'album).
+        let mut appels = 0usize;
+        let rien = || {
+            appels += 1;
+            std::future::ready(0usize)
+        };
+        assert_eq!(albums_jusqu_a_la_borne(rien).await, 0);
+        assert_eq!(appels, 1, "un seul essai quand il n'y a rien");
     }
 
     /// #5519 — la pause entre deux tours suit la vitesse réglée : « Discret »

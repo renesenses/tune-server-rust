@@ -298,7 +298,7 @@ impl PrefetchEngine {
         // Resolve the stream URL from the service
         let stream_data = {
             let registry = services.lock().await;
-            let svc = match registry.get(&source) {
+            let svc = match registry.get_actif(&source).await {
                 Some(s) => s,
                 None => {
                     warn!(source = %source, "prefetch_unknown_service");
@@ -355,7 +355,7 @@ impl PrefetchEngine {
                 )
             } else {
                 let registry = services.lock().await;
-                if let Some(svc) = registry.get(&source) {
+                if let Some(svc) = registry.get_actif(&source).await {
                     let svc = svc.read().await;
                     match svc.get_track(&source_id).await {
                         Ok(track) => (

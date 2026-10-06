@@ -63,6 +63,9 @@ pub struct MockOutput {
     /// #3967 — le `Next` fait-il VRAIMENT avancer l'appareil ? Un renderer qui
     /// acquitte `Next` sans bouger est le cas que le repli doit rattraper.
     bascule_honoree: Arc<AtomicBool>,
+    /// #4382 — `media_du_transport` rend `None` (transport qui ne publie
+    /// pas `GetMediaInfo`) : la lecture est comptée, sans contenu.
+    transport_muet: Arc<AtomicBool>,
     /// Fil 1915 — le constat que la sortie remet au sondeur par
     /// `take_output_failure` (une seule fois, comme les vraies sorties).
     echec: Arc<std::sync::Mutex<Option<String>>>,
@@ -102,6 +105,7 @@ impl MockOutput {
             bascule_calls: Arc::new(AtomicU64::new(0)),
             media_du_transport_calls: Arc::new(AtomicU64::new(0)),
             bascule_honoree: Arc::new(AtomicBool::new(true)),
+            transport_muet: Arc::new(AtomicBool::new(false)),
             echec: Arc::new(std::sync::Mutex::new(None)),
             refus_de_lecture: Arc::new(std::sync::Mutex::new(None)),
             seek_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -283,6 +287,11 @@ impl MockOutput {
     /// acquitté (il reste figé, et le repli doit rattraper) ?
     pub fn bascule_honoree(&self, honoree: bool) {
         self.bascule_honoree.store(honoree, Ordering::Relaxed);
+    }
+
+    /// #4382 — le transport cesse de dire ce qu'il joue et ce qu'il tient.
+    pub fn transport_muet(&self, muet: bool) {
+        self.transport_muet.store(muet, Ordering::Relaxed);
     }
 
     /// Fil 1915 — poser un constat sur le canal `take_output_failure`.
@@ -477,6 +486,9 @@ impl OutputTarget for MockOutput {
     async fn media_du_transport(&self) -> Option<MediaDuTransport> {
         self.media_du_transport_calls
             .fetch_add(1, Ordering::Relaxed);
+        if self.transport_muet.load(Ordering::Relaxed) {
+            return None;
+        }
         Some(MediaDuTransport {
             courante: self.current_uri.lock().await.clone(),
             suivante: self.next_uri.lock().await.clone(),

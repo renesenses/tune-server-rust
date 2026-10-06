@@ -33,6 +33,10 @@ pub struct SqliteDb {
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
+    /// Le repli du WAL tourne hors de la connexion d'écriture tant que ce
+    /// jeton vit ; `None` en mémoire, hors WAL, ou si le replieur n'a pas pu
+    /// s'ouvrir (voir [`crate::db::replieur_wal`]).
+    _replieur_wal: Option<crate::db::replieur_wal::Vigie>,
 }
 
 /// Une connexion de lecture EMPRUNTÉE au pool (#4800).
@@ -231,6 +235,15 @@ impl SqliteDb {
         // git reset, crash recovery, or external DB modifications).
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 
+        // Le repli du WAL, ensuite, quitte la connexion d'écriture : il la
+        // tenait le temps de copier et de synchroniser (5,4 s sur un disque
+        // lent). Hors WAL (`reliable_fs` faux), il n'y a rien à replier.
+        let replieur_wal = if reliable_fs {
+            crate::db::replieur_wal::armer(&conn, path)
+        } else {
+            None
+        };
+
         // Open a pool of read-only connections for concurrent read access
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
@@ -281,6 +294,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: replieur_wal,
         })
     }
 
@@ -300,6 +314,7 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            _replieur_wal: None,
         })
     }
 
@@ -469,6 +484,7 @@ impl Clone for SqliteDb {
             read_pool: self.read_pool.clone(),
             read_counter: self.read_counter.clone(),
             liberation: self.liberation.clone(),
+            _replieur_wal: self._replieur_wal.clone(),
         }
     }
 }
@@ -537,6 +553,12 @@ CREATE TABLE IF NOT EXISTS albums (
     -- nombre de titres, ni la duree : un tri faux est pire qu'une section
     -- absente. TEXT sur les deux moteurs, sans defaut.
     release_type TEXT,
+    -- Types SECONDAIRES MusicBrainz du disque, separes par `;` : `live`,
+    -- `compilation`, `soundtrack`, `remix`… (migration 117, section « Live »).
+    -- NUL = INCONNU. Poses au scan depuis la balise `RELEASETYPE`, jamais
+    -- par-dessus une valeur connue. `live` range le disque dans la section
+    -- « Live » de la fiche artiste. TEXT sur les deux moteurs, sans defaut.
+    release_secondary_types TEXT,
     -- Dernier passage de la passe des credits MusicBrainz sur ce disque
     -- (migration 107, #4767). NUL = jamais interroge : c'est le curseur de
     -- reprise de `POST /system/enrich-credits`.
@@ -838,6 +860,19 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
     PRIMARY KEY (profile_id, item_type, source, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+
+-- Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
+-- de MetaRust) : l'identification les demande avec les `inc` des crédits, la
+-- passe des crédits les relit sans requête. `corps` = JSON compressé (zlib),
+-- `inc` triés, `fetched_at` ISO-8601 UTC (validité : 90 jours). Sans
+-- migration numérotée, comme `streaming_hidden_items` : présente AUSSI dans
+-- le rattrapage de `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
+    mbid TEXT PRIMARY KEY,
+    inc TEXT NOT NULL,
+    corps BLOB NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
 -- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums
