@@ -355,7 +355,10 @@ CREATE TABLE IF NOT EXISTS albums (
     -- NUL = inconnue. TEXT des deux côtés.
     cover_source TEXT,
     cover_source_path TEXT,
-    cover_source_stamp TEXT
+    cover_source_stamp TEXT,
+    -- Types secondaires MusicBrainz (`live;remix`, section « Live », SQLite
+    -- 117 / PG 081). NUL = inconnu. TEXT des deux côtés.
+    release_secondary_types TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -1154,6 +1157,12 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_path TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_stamp TEXT;
+
+-- Types secondaires MusicBrainz du disque (SQLite migration v117, section
+-- « Live »). Sans cette colonne, la copie de `albums` échoue dès que la base
+-- SQLite la porte — et toutes les tables qui pointent vers un album (dont
+-- `album_preferred_roots`) heurtent leur clé étrangère.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_secondary_types TEXT;
 
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;

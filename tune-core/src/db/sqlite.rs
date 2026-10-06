@@ -553,6 +553,12 @@ CREATE TABLE IF NOT EXISTS albums (
     -- nombre de titres, ni la duree : un tri faux est pire qu'une section
     -- absente. TEXT sur les deux moteurs, sans defaut.
     release_type TEXT,
+    -- Types SECONDAIRES MusicBrainz du disque, separes par `;` : `live`,
+    -- `compilation`, `soundtrack`, `remix`… (migration 117, section « Live »).
+    -- NUL = INCONNU. Poses au scan depuis la balise `RELEASETYPE`, jamais
+    -- par-dessus une valeur connue. `live` range le disque dans la section
+    -- « Live » de la fiche artiste. TEXT sur les deux moteurs, sans defaut.
+    release_secondary_types TEXT,
     -- Dernier passage de la passe des credits MusicBrainz sur ce disque
     -- (migration 107, #4767). NUL = jamais interroge : c'est le curseur de
     -- reprise de `POST /system/enrich-credits`.

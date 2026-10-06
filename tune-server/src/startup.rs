@@ -412,6 +412,17 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // d'autre : un motif inconnu (masquage d'avant la migration 112) ou une
     // suppression par l'utilisateur n'est jamais touché.
     reparer_les_masquages_de_zones(state);
+    // Fil 2138 — une seule fois (marqueur dans `settings`) : une base dont le
+    // premier scan, avant #5748, a daté toutes les pistes à l'heure du scan
+    // est redatée par les fichiers. Hors du chemin du démarrage : la passe
+    // fait un `stat` par piste du premier scan, et un partage lent ne doit
+    // pas retenir le serveur. Une erreur se journalise, le démarrage continue.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
+        });
+    }
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     recalculer_les_compilations(state);
