@@ -1493,3 +1493,9 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# #5770 — une insertion avant la piste en cours fait suivre le curseur.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "insertion_avant_la_piste_en_cours_5770"
+path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
