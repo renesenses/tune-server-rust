@@ -4655,9 +4655,13 @@ mod replaygain_source_tests {
         AppState::new(":memory:", 0, Default::default()).unwrap()
     }
 
+    /// Les libellés attendus ci-dessous sont les français : la requête le dit,
+    /// sans quoi le serveur répondrait dans son repli, l'anglais.
     async fn config_de(state: &AppState) -> serde_json::Value {
+        let mut entetes = HeaderMap::new();
+        entetes.insert(axum::http::header::ACCEPT_LANGUAGE, "fr".parse().unwrap());
         get_config(
-            HeaderMap::new(),
+            entetes,
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
         )
