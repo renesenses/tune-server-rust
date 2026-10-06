@@ -3,6 +3,7 @@
 //! Uses the same subprocess pattern as librespot for Spotify Connect.
 //! The daemon binary reads JSON commands on stdin and emits JSON events on stdout.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -37,6 +38,9 @@ pub struct Airplay2Output {
     pairing: Arc<Mutex<PairingPhase>>,
     transport_command: Mutex<()>,
     pending_transport: Arc<Mutex<Option<PendingTransport>>>,
+    /// Copie locale du flux en cours de lecture, que le daemon lit (#2169).
+    /// Retiree a la piste suivante et a l'arret.
+    copie_du_flux: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// Pairing progress for an AirPlay 2 receiver, updated by the daemon stdout
@@ -111,6 +115,7 @@ impl Airplay2Output {
             pairing: Arc::new(Mutex::new(PairingPhase::Idle)),
             transport_command: Mutex::new(()),
             pending_transport: Arc::new(Mutex::new(None)),
+            copie_du_flux: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -398,7 +403,13 @@ impl OutputTarget for Airplay2Output {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        self.ensure_connected().await?;
+        // Le daemon n'ouvre qu'un FICHIER : il faut le lui fournir AVANT de
+        // le lancer, et refuser tot ce qu'il ne saura pas lire (#2169).
+        let lisible = chemin_lisible_par_le_daemon(media, &self.device_id).await?;
+        if let Err(error) = self.ensure_connected().await {
+            lisible.oublier().await;
+            return Err(error);
+        }
 
         let title = media.title.unwrap_or("Unknown");
         let artist = media.artist.unwrap_or("Unknown");
@@ -442,12 +453,33 @@ impl OutputTarget for Airplay2Output {
         // toutes que `media.url`. Seul OAAT lit encore le fichier lui-meme,
         // et c'est assume : il le fait derriere ses propres gardes
         // (`prefers_local_file_gapless`, en-tete WAV ou `.dsf` natif).
-        let path = media.url;
-        self.send(&serde_json::json!({
-            "cmd": "play",
-            "path": path,
-        }))
-        .await?;
+        //
+        // ... sauf que le daemon ne sait PAS lire une adresse HTTP (#2169).
+        // Sa commande `play` passe `path` tel quel a `AudioDecoder::open`, qui
+        // fait un `File::open` : une adresse y devient un nom de fichier
+        // introuvable, d'ou « decode error: ... Failed to open file: No such
+        // file or directory (os error 2) » sur TOUTE piste, locale comme
+        // Tidal. Le flux est donc d'abord recopie dans un fichier local, et
+        // c'est ce fichier que le daemon ouvre : le traitement serveur de
+        // #1216 est conserve, puisque c'est bien le flux servi qui est copie.
+        let path = lisible.chemin.to_string_lossy().into_owned();
+        if let Err(error) = self
+            .send(&serde_json::json!({
+                "cmd": "play",
+                "path": path,
+            }))
+            .await
+        {
+            lisible.oublier().await;
+            return Err(error);
+        }
+        let precedente = std::mem::replace(
+            &mut *self.copie_du_flux.lock().await,
+            lisible.copie.then_some(lisible.chemin),
+        );
+        if let Some(ancienne) = precedente {
+            tokio::fs::remove_file(&ancienne).await.ok();
+        }
 
         self.playing.store(true, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
@@ -483,6 +515,10 @@ impl OutputTarget for Airplay2Output {
             && let Some(child) = daemon.child.as_mut()
         {
             child.kill().await.ok();
+        }
+        drop(proc);
+        if let Some(copie) = self.copie_du_flux.lock().await.take() {
+            tokio::fs::remove_file(&copie).await.ok();
         }
         info!(device = %self.name, "airplay2: stop");
         Ok(())
@@ -552,6 +588,190 @@ impl OutputTarget for Airplay2Output {
         tokio::net::TcpStream::connect(format!("{}:{}", self.host, self.port))
             .await
             .is_ok()
+    }
+}
+
+/// Taille au-dela de laquelle la copie locale du flux est abandonnee.
+///
+/// Une piste DSD512 de vingt minutes transcodee en PCM tient largement
+/// dessous ; un flux qui la depasse n'a pas de fin et remplirait le disque.
+const COPIE_DU_FLUX_MAX_OCTETS: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Ce que le daemon recevra dans `path`.
+struct CheminLisible {
+    chemin: PathBuf,
+    /// `true` quand Tune a fabrique ce fichier et doit le retirer ensuite.
+    copie: bool,
+}
+
+impl CheminLisible {
+    /// Retire la copie si la lecture n'a finalement pas ete lancee.
+    async fn oublier(self) {
+        if self.copie {
+            tokio::fs::remove_file(&self.chemin).await.ok();
+        }
+    }
+}
+
+fn est_une_adresse_http(url: &str) -> bool {
+    let debut = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    debut.starts_with("http://") || debut.starts_with("https://")
+}
+
+/// Dossier des copies locales de flux, sous le dossier temporaire du systeme.
+fn dossier_des_copies() -> PathBuf {
+    std::env::temp_dir().join("tune-airplay2")
+}
+
+/// Extension qui sert d'indice de format au daemon (`Hint::with_extension`).
+fn extension_du_flux(mime_type: &str, url: &str) -> &'static str {
+    let mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "audio/flac" | "audio/x-flac" => return "flac",
+        "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave" => return "wav",
+        "audio/mpeg" | "audio/mp3" => return "mp3",
+        "audio/aac" | "audio/aacp" => return "aac",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => return "m4a",
+        "audio/ogg" | "audio/vorbis" | "audio/opus" => return "ogg",
+        "audio/aiff" | "audio/x-aiff" => return "aiff",
+        _ => {}
+    }
+    let chemin = url.split(['?', '#']).next().unwrap_or("");
+    let ext = Path::new(chemin)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("flac") => "flac",
+        Some("wav") => "wav",
+        Some("mp3") => "mp3",
+        Some("aac") => "aac",
+        Some("m4a" | "mp4" | "alac") => "m4a",
+        Some("ogg" | "oga" | "opus") => "ogg",
+        Some("aif" | "aiff") => "aiff",
+        _ => "bin",
+    }
+}
+
+/// Rend un chemin que `airplay-daemon` sait ouvrir (#2169).
+///
+/// Le daemon (`crates/airplay-daemon`, commande `play`) ne lit que des
+/// fichiers locaux : `AudioDecoder::open(path)` fait un `File::open`. Une
+/// adresse HTTP est donc recopiee dans un fichier local au prealable ; un
+/// chemin local passe tel quel.
+async fn chemin_lisible_par_le_daemon(
+    media: &PlayMedia<'_>,
+    device_id: &str,
+) -> Result<CheminLisible, String> {
+    if !est_une_adresse_http(media.url) {
+        return Ok(CheminLisible {
+            chemin: PathBuf::from(media.url),
+            copie: false,
+        });
+    }
+    if media.live_stream {
+        return Err("airplay2: live streams (internet radio) cannot be played \
+                    through the AirPlay 2 sender, which only reads complete \
+                    files; use the AirPlay (1) output of this speaker instead"
+            .into());
+    }
+    let dossier = dossier_des_copies();
+    copier_le_flux(
+        media.url,
+        &dossier,
+        device_id,
+        extension_du_flux(media.mime_type, media.url),
+    )
+    .await
+    .map(|chemin| CheminLisible {
+        chemin,
+        copie: true,
+    })
+}
+
+/// Recopie le flux `url` dans `dossier`, morceau par morceau, et rend le
+/// chemin du fichier obtenu.
+async fn copier_le_flux(
+    url: &str,
+    dossier: &Path,
+    device_id: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    use std::sync::atomic::AtomicU64;
+    static NUMERO: AtomicU64 = AtomicU64::new(0);
+
+    tokio::fs::create_dir_all(dossier).await.map_err(|e| {
+        format!(
+            "airplay2: cannot create the folder for the local copy of the stream ({}): {e}",
+            dossier.display()
+        )
+    })?;
+    let appareil: String = device_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let chemin = dossier.join(format!(
+        "{appareil}-{}-{}.{extension}",
+        std::process::id(),
+        NUMERO.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let copie = async {
+        let mut reponse = crate::http::client::long_timeout()
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| crate::http::client::decrire_erreur_http(&e))?;
+        let statut = reponse.status();
+        if !statut.is_success() {
+            return Err(format!("HTTP {statut}"));
+        }
+        let mut fichier = tokio::fs::File::create(&chemin)
+            .await
+            .map_err(|e| format!("cannot create {}: {e}", chemin.display()))?;
+        let mut total: u64 = 0;
+        while let Some(morceau) = reponse
+            .chunk()
+            .await
+            .map_err(|e| crate::http::client::decrire_erreur_http(&e))?
+        {
+            total += morceau.len() as u64;
+            if total > COPIE_DU_FLUX_MAX_OCTETS {
+                return Err(format!(
+                    "stream exceeds {} bytes, it looks endless",
+                    COPIE_DU_FLUX_MAX_OCTETS
+                ));
+            }
+            fichier
+                .write_all(&morceau)
+                .await
+                .map_err(|e| format!("cannot write {}: {e}", chemin.display()))?;
+        }
+        fichier
+            .flush()
+            .await
+            .map_err(|e| format!("cannot write {}: {e}", chemin.display()))?;
+        if total == 0 {
+            return Err("the server sent an empty stream".to_string());
+        }
+        debug!(octets = total, chemin = %chemin.display(), "airplay2: stream copied for the daemon");
+        Ok(())
+    }
+    .await;
+
+    match copie {
+        Ok(()) => Ok(chemin),
+        Err(cause) => {
+            tokio::fs::remove_file(&chemin).await.ok();
+            Err(format!(
+                "airplay2: cannot make a local copy of the stream for the AirPlay 2 sender: {cause}"
+            ))
+        }
     }
 }
 
@@ -735,66 +955,191 @@ mod transport_tests {
         charges
     }
 
-    /// AirPlay 2 envoie l'ADRESSE DU FLUX, jamais le fichier d'origine (#1216).
-    ///
-    /// Le defaut : `let path = media.file_path.unwrap_or(media.url)`. Comme
-    /// l'orchestrateur renseigne `file_path` pour toute piste locale, le
-    /// daemon recevait le fichier brut — et le fichier transcode que le
-    /// serveur venait d'egaliser, de convoluer ou de gainer partait a la
-    /// poubelle sans avoir ete lu.
-    ///
-    /// Ce test met les deux valeurs en opposition frontale : `url` est
-    /// l'adresse de la session, `file_path` le fichier d'origine. Si la ligne
-    /// repasse au fichier, l'assertion tombe.
-    #[tokio::test]
-    async fn play_media_envoie_l_adresse_du_flux_et_pas_le_fichier_d_origine() {
-        let output = output_for_test();
-        let charges = daemon_qui_note_les_charges(&output).await;
+    /// Un serveur HTTP local qui sert `contenu` sur `/stream/sess.flac`,
+    /// comme une session de flux du serveur. Rend l'adresse du flux.
+    async fn serveur_de_flux(contenu: &'static [u8]) -> String {
+        let app = axum::Router::new().route(
+            "/stream/sess.flac",
+            axum::routing::get(move || async move { contenu }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(ecoute, app).await.ok();
+        });
+        format!("http://{adresse}/stream/sess.flac")
+    }
 
-        const FLUX: &str = "http://192.0.2.10:8080/stream/sess-airplay-eq.flac";
-        const ORIGINE: &str = "/srv/musique/album/piste-egalisee.flac";
-
-        output
-            .play_media(&PlayMedia {
-                url: FLUX,
-                mime_type: "audio/flac",
-                title: Some("Fixture"),
-                // Renseigne, exactement comme le fait l'orchestrateur pour
-                // toute piste locale.
-                file_path: Some(ORIGINE),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
+    async fn commande_play(
+        charges: &Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> Option<serde_json::Value> {
         // `play_media` n'attend AUCUNE confirmation : il ecrit sur le tube et
-        // rend la main aussitot — contrairement a `pause`/`resume`, qui
-        // passent par `send_transport_command` et bloquent sur un oneshot. La
-        // garde doit donc laisser au faux daemon le temps de noter la ligne,
-        // sans jamais dormir plus longtemps qu'il ne faut.
-        let mut play = None;
+        // rend la main aussitot. On laisse au faux daemon le temps de noter
+        // la ligne, sans dormir plus qu'il ne faut.
         for _ in 0..200 {
-            play = charges
+            let play = charges
                 .lock()
                 .await
                 .iter()
                 .find(|c| c["cmd"] == "play")
                 .cloned();
             if play.is_some() {
-                break;
+                return play;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let play = play.expect("aucune commande play envoyee au daemon");
+        None
+    }
 
-        assert_eq!(
-            play["path"], FLUX,
-            "AirPlay 2 doit jouer l'adresse du flux servi par le serveur"
-        );
+    /// Le daemon recoit un FICHIER qu'il peut ouvrir, qui porte le FLUX servi
+    /// par le serveur, et jamais le fichier d'origine (#2169, #1216).
+    ///
+    /// `airplay-daemon` passe `path` a `AudioDecoder::open`, soit un
+    /// `File::open`. Le `std::fs::read` ci-dessous rejoue exactement ce geste.
+    /// Avant le correctif, `path` valait l'adresse HTTP du flux : ce read
+    /// echouait sur « No such file or directory (os error 2) », l'erreur
+    /// meme que le daemon renvoie pour chaque piste, locale ou Tidal.
+    ///
+    /// `file_path` est renseigne comme le fait l'orchestrateur pour toute
+    /// piste locale : si la sortie repasse au fichier d'origine, le
+    /// traitement serveur (egaliseur, ReplayGain) est jete, et la garde tombe
+    /// aussi.
+    #[tokio::test]
+    async fn play_media_donne_au_daemon_un_fichier_qu_il_sait_ouvrir_et_qui_porte_le_flux() {
+        const CONTENU: &[u8] = b"fLaC-flux-traite-par-le-serveur";
+        const ORIGINE: &str = "/srv/musique/album/piste-egalisee.flac";
+        let flux = serveur_de_flux(CONTENU).await;
+
+        let output = output_for_test();
+        let charges = daemon_qui_note_les_charges(&output).await;
+
+        output
+            .play_media(&PlayMedia {
+                url: &flux,
+                mime_type: "audio/flac",
+                title: Some("Fixture"),
+                file_path: Some(ORIGINE),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let play = commande_play(&charges)
+            .await
+            .expect("aucune commande play envoyee au daemon");
+        let path = play["path"].as_str().expect("path absent").to_string();
+
         assert_ne!(
-            play["path"], ORIGINE,
+            path, ORIGINE,
             "AirPlay 2 a rejoue le fichier d'origine : tout le DSP est jete (#1216)"
         );
+        let lu = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("le daemon ne pourra pas ouvrir `{path}` ({e}) : c'est #2169")
+        });
+        assert_eq!(
+            lu, CONTENU,
+            "le fichier remis au daemon doit porter le flux servi"
+        );
+        assert!(
+            path.ends_with(".flac"),
+            "l'extension guide le daemon : {path}"
+        );
+
+        output.stop().await.unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "la copie du flux doit etre retiree a l'arret"
+        );
+    }
+
+    /// La piste suivante remplace la copie precedente, qui est retiree.
+    #[tokio::test]
+    async fn la_piste_suivante_retire_la_copie_precedente() {
+        let flux = serveur_de_flux(b"piste").await;
+        let output = output_for_test();
+        let charges = daemon_qui_note_les_charges(&output).await;
+        let media = PlayMedia {
+            url: &flux,
+            mime_type: "audio/flac",
+            ..Default::default()
+        };
+
+        output.play_media(&media).await.unwrap();
+        let premiere = commande_play(&charges).await.unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        charges.lock().await.clear();
+        output.play_media(&media).await.unwrap();
+        let seconde = commande_play(&charges).await.unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(premiere, seconde);
+        assert!(!std::path::Path::new(&premiere).exists());
+        assert!(std::path::Path::new(&seconde).exists());
+        output.stop().await.unwrap();
+    }
+
+    /// Un flux sans fin (radio) est refuse avec un message qui dit quoi faire,
+    /// au lieu de partir vers le daemon et d'y echouer en « os error 2 ».
+    #[tokio::test]
+    async fn un_flux_en_direct_est_refuse_clairement() {
+        let output = output_for_test();
+        let charges = daemon_qui_note_les_charges(&output).await;
+
+        let erreur = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:9/radio",
+                mime_type: "audio/mpeg",
+                live_stream: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(erreur.contains("live streams"), "{erreur}");
+        assert!(erreur.contains("AirPlay (1)"), "{erreur}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(charges.lock().await.iter().all(|c| c["cmd"] != "play"));
+    }
+
+    /// Un flux injoignable rend une erreur qui nomme la copie locale, pas
+    /// l'« os error 2 » du daemon.
+    #[tokio::test]
+    async fn un_flux_injoignable_donne_une_erreur_claire() {
+        let output = output_for_test();
+        let _charges = daemon_qui_note_les_charges(&output).await;
+        let erreur = output
+            .play_media(&PlayMedia {
+                url: "http://127.0.0.1:9/stream/absent.flac",
+                mime_type: "audio/flac",
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(erreur.contains("local copy of the stream"), "{erreur}");
+        assert!(
+            !erreur.contains("127.0.0.1"),
+            "pas d'adresse dans l'erreur : {erreur}"
+        );
+    }
+
+    #[test]
+    fn l_extension_suit_le_type_mime_puis_l_adresse() {
+        assert_eq!(extension_du_flux("audio/flac", "http://h/x"), "flac");
+        assert_eq!(
+            extension_du_flux("audio/wav; rate=44100", "http://h/x"),
+            "wav"
+        );
+        assert_eq!(extension_du_flux("", "http://h/s/1.mp3?t=2"), "mp3");
+        assert_eq!(
+            extension_du_flux("application/octet-stream", "http://h/s"),
+            "bin"
+        );
+        assert!(est_une_adresse_http("HTTP://h/x"));
+        assert!(!est_une_adresse_http("/srv/musique/x.flac"));
     }
 
     #[tokio::test]

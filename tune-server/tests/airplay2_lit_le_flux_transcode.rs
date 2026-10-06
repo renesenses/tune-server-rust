@@ -42,7 +42,7 @@
 //! comportement seule ne serait jamais jouee sur une PR vers `batch/*`.
 //!
 //! La garde de COMPORTEMENT, elle, vit dans le module lui-meme :
-//! `play_media_envoie_l_adresse_du_flux_et_pas_le_fichier_d_origine`
+//! `play_media_donne_au_daemon_un_fichier_qu_il_sait_ouvrir_et_qui_porte_le_flux`
 //! (`tune-core/src/outputs/airplay2/mod.rs`, `mod transport_tests`) monte un
 //! faux daemon et lit le `path` reellement envoye sur le fil.
 //!
@@ -100,18 +100,27 @@ fn airplay2_ne_lit_aucun_chemin_de_fichier_du_media() {
     );
 }
 
-/// Et il envoie bien l'adresse du flux au daemon.
+/// Et il envoie bien le flux au daemon.
 ///
 /// L'inverse des deux gardes ci-dessus : supprimer la ligne au lieu de la
 /// corriger les laisserait vertes, alors que plus rien ne partirait.
+///
+/// Le daemon ne lit qu'un fichier local (#2169) : `media.url` n'est plus
+/// passe tel quel, il est recopie dans un fichier par `copier_le_flux`, et
+/// c'est ce fichier qui part dans `path`. La garde suit donc le flux jusqu'a
+/// la copie, puis la copie jusqu'a la commande.
 #[test]
 fn airplay2_envoie_l_adresse_du_flux_au_daemon() {
     let code = code_seul(AIRPLAY2);
     assert_eq!(
-        code.matches("let path = media.url;").count(),
+        code.matches("copier_le_flux(media.url,").count(),
         1,
-        "airplay2/mod.rs ne construit plus le chemin envoye au daemon depuis \
-         `media.url`. Verifier `play_media`."
+        "airplay2/mod.rs ne construit plus le fichier remis au daemon depuis \
+         `media.url`. Verifier `chemin_lisible_par_le_daemon`."
+    );
+    assert!(
+        code.contains("chemin_lisible_par_le_daemon(media, "),
+        "`play_media` ne passe plus par `chemin_lisible_par_le_daemon`."
     );
     assert!(
         code.contains("\"path\": path,"),
@@ -127,8 +136,9 @@ fn airplay2_envoie_l_adresse_du_flux_au_daemon() {
 #[test]
 fn la_garde_de_comportement_du_module_airplay2_est_toujours_la() {
     assert!(
-        code_seul(AIRPLAY2)
-            .contains("play_media_envoie_l_adresse_du_flux_et_pas_le_fichier_d_origine"),
+        code_seul(AIRPLAY2).contains(
+            "play_media_donne_au_daemon_un_fichier_qu_il_sait_ouvrir_et_qui_porte_le_flux"
+        ),
         "le test de comportement a disparu de airplay2/mod.rs : il ne reste \
          qu'une garde de texte, qui ne mesure pas ce qui part sur le fil."
     );
