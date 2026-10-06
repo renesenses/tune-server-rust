@@ -41,9 +41,12 @@
 //! alors en quelques microsecondes, le lot entier se jouait parfois avant que
 //! le guetteur ne se réveille (« 8 pistes traitées sur 8 », 2 échecs sur 6).
 //!
-//! La pause est donc posée DANS l'écriture du premier témoin `rg_analyzed`
-//! ([`PauseAuPremierTemoin`]) : même instant — une piste finie, le lot en
-//! plein travail —, plus aucune course.
+//! La pause était donc posée DANS l'écriture du premier témoin `rg_analyzed`.
+//! Depuis la suite de #5519, les témoins d'un tour s'écrivent ENSEMBLE, à sa
+//! fin : une pause accrochée à eux tomberait après le lot. Elle est posée
+//! maintenant quand la garde de lancement relit le réglage pour la première
+//! fois APRÈS qu'un fichier a fini ([`PauseALaGarde`]) : même instant — une
+//! piste finie, le lot en plein travail —, toujours aucune course.
 
 use std::sync::Arc;
 
@@ -132,47 +135,58 @@ fn comptees(backend: &Arc<dyn DbBackend>, clef: &str) -> i64 {
         .unwrap_or(-1)
 }
 
-/// Une base qui met le ReplayGain en pause dans l'écriture même du premier
-/// témoin `rg_analyzed`. Tout le reste passe tel quel à la base réelle.
-struct PauseAuPremierTemoin {
+/// Une base qui met le ReplayGain en pause quand la garde de lancement relit
+/// le mode pour la `(apres + 1)`-ième fois. Tout le reste passe tel quel à la
+/// base réelle.
+///
+/// La garde de `analyze_track_batch` relit le mode avant CHAQUE fichier lancé,
+/// et rien d'autre ne le relit pendant un lot : les `apres` premières lectures
+/// lancent le premier créneau (autant de fichiers que la largeur), la suivante
+/// n'a lieu qu'après la fin d'un fichier. La pause est posée AVANT que cette
+/// lecture ne soit servie : la garde qui suit la voit déjà.
+struct PauseALaGarde {
     interne: Arc<dyn DbBackend>,
-    posee: std::sync::atomic::AtomicBool,
+    apres: usize,
+    lectures: std::sync::Mutex<usize>,
 }
 
-impl PauseAuPremierTemoin {
+impl PauseALaGarde {
     fn poser(interne: Arc<dyn DbBackend>) -> Arc<dyn DbBackend> {
+        let apres = tune_core::taches_de_fond::vitesse::largeur_courante(&interne);
         Arc::new(Self {
             interne,
-            posee: std::sync::atomic::AtomicBool::new(false),
+            apres,
+            lectures: std::sync::Mutex::new(0),
         })
     }
 
-    fn apres_ecriture(&self) {
-        if self.posee.load(std::sync::atomic::Ordering::SeqCst) {
+    fn avant_lecture(&self, p: &[&dyn ToSqlValue]) {
+        let lit_le_mode = p.first().is_some_and(
+            |v| matches!(v.to_sql_value(), SqlValue::Text(ref k) if k == "replaygain_mode"),
+        );
+        if !lit_le_mode {
             return;
         }
-        if comptees(&self.interne, "rg_analyzed") >= 1 {
-            self.posee.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut n = self.lectures.lock().unwrap();
+        *n += 1;
+        if *n == self.apres + 1 {
             mettre_en_pause(&self.interne, Tache::ReplayGain).expect("poser la pause");
         }
     }
 }
 
-impl DbBackend for PauseAuPremierTemoin {
+impl DbBackend for PauseALaGarde {
     fn engine(&self) -> tune_core::db::engine::Engine {
         self.interne.engine()
     }
     fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
-        let r = self.interne.execute(sql, p);
-        if sql.contains("track_metadata") {
-            self.apres_ecriture();
-        }
-        r
+        self.interne.execute(sql, p)
     }
     fn last_insert_rowid(&self) -> i64 {
         self.interne.last_insert_rowid()
     }
     fn query_one(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.avant_lecture(p);
         self.interne.query_one(sql, p)
     }
     fn query_many(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
@@ -182,9 +196,7 @@ impl DbBackend for PauseAuPremierTemoin {
         &self,
         f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
     ) -> Result<(), String> {
-        let r = self.interne.write_tx(f);
-        self.apres_ecriture();
-        r
+        self.interne.write_tx(f)
     }
     fn execute_batch(&self, sql: &str) -> Result<(), String> {
         self.interne.execute_batch(sql)
@@ -194,6 +206,7 @@ impl DbBackend for PauseAuPremierTemoin {
         sql: &str,
         p: &[&dyn ToSqlValue],
     ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.avant_lecture(p);
         self.interne.query_one_strong(sql, p)
     }
     fn query_many_strong(
@@ -230,10 +243,10 @@ async fn une_pause_en_plein_lot_s_arrete_a_une_frontiere_et_ne_perd_rien() {
     let tmp = tempfile::tempdir().expect("dossier temporaire");
     let backend = bibliotheque(tmp.path());
 
-    // La pause tombe au moment où la PREMIÈRE piste est estampillée : le lot
-    // travaille, d'autres pistes peuvent être en vol (#5519, plusieurs
+    // La pause tombe à la première garde relue APRÈS la fin d'une piste : le
+    // lot travaille, d'autres pistes peuvent être en vol (#5519, plusieurs
     // fichiers à la fois), aucune ne doit plus partir.
-    let guetteur = PauseAuPremierTemoin::poser(backend.clone());
+    let guetteur = PauseALaGarde::poser(backend.clone());
     let pour_le_lot = guetteur.clone();
     let lot = tokio::spawn(async move { analyze_track_batch(&pour_le_lot).await });
     let pendant = lot.await.expect("le lot ne doit pas paniquer") as i64;
