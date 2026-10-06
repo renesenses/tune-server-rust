@@ -3574,3 +3574,7 @@ mod date_arrondie_tests_5552;
 #[cfg(test)]
 #[path = "surveillant_annonces_tests_2134.rs"]
 mod surveillant_annonces_tests_2134;
+
+#[cfg(test)]
+#[path = "coffret_auto_relu_tests_2094.rs"]
+mod coffret_auto_relu_tests_2094;
