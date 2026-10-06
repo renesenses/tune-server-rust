@@ -3146,6 +3146,31 @@ fn recaler_la_qualite_des_albums_sqlite(db: &SqliteDb) {
 /// rejouée à chaque démarrage, comme [`TRACKS_SOURCE_ID_INDEX`], pour ne pas
 /// prendre de numéro de migration.
 pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_cle_de_copie ON tracks(album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), LOWER(TRIM(COALESCE(title, ''))))";
+/// Ticket 190 — les deux index de la table « un album, son DR »
+/// ([`super::facet_filter::dr_album_source`]) : la liste des valeurs du rail
+/// de filtres, la tranche, le tri et la fiche.
+///
+/// Sans eux, la requête lisait chaque ligne `dr_album` / `dr_track` par
+/// `idx_track_metadata_key`, puis la ligne de `track_metadata` et celle de
+/// `tracks` dans les tables : sur un banc de 25 200 pistes, 6 399 pages lues
+/// sur 13 543, presque la moitié de la base, dans le désordre. Sur un disque
+/// lent et pendant un scan, `slow_query` a dit 7,6 s. Avec eux, la requête
+/// ne lit que les deux index : 311 pages.
+///
+/// * `idx_track_metadata_dr` est PARTIEL : il ne porte que les clés de DR, et
+///   la valeur, pour ne pas toucher la table. Sa clause `WHERE` est le texte
+///   de [`super::facet_filter::dr_tag_where`] : SQLite ne prend un index
+///   partiel que si la requête porte le même terme (le plan le vérifie,
+///   `filtre_dr_190_tests`).
+/// * `idx_tracks_id_album` donne l'album d'une piste sans lire sa ligne. Le
+///   planificateur le prend au banc de 25 200 pistes ; sur une petite base,
+///   il lui préfère la clé primaire.
+///
+/// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
+/// [`TRACKS_CLE_DE_COPIE_INDEX`], pour ne pas prendre de numéro de migration.
+pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
+     ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
+     CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
@@ -3911,6 +3936,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Clé de copie (#5138) : même passe, même raison — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_CLE_DE_COPIE_INDEX) {
         warn!(error = %e, "sqlite_tracks_cle_de_copie_index_failed");
+    }
+    // Table « un album, son DR » (ticket 190) : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
+        warn!(error = %e, "sqlite_dr_album_index_failed");
     }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;

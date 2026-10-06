@@ -86,6 +86,8 @@ mod album_dr_provenance_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
+mod filtre_dr_190_tests;
+#[cfg(test)]
 mod lenteur_albums_4800_tests;
 #[cfg(test)]
 mod lenteur_pistes_5138_tests;
