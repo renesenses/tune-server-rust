@@ -216,3 +216,74 @@ async fn un_lien_vers_un_arbre_systeme_est_refuse_par_la_route() {
         "le lien a ouvert /etc : {corps}"
     );
 }
+
+// -------------------------------------------------------------------------
+// Le COMPTAGE avant l'ajout (fil forum 2171). Mêmes gardes que
+// l'explorateur : il ne lit rien que celui-ci ne pourrait lister.
+// -------------------------------------------------------------------------
+
+/// Le comptage refuse les arbres système, comme l'explorateur.
+#[tokio::test]
+async fn le_comptage_refuse_les_arbres_systeme() {
+    let state = new_state();
+    for chemin in ["/etc", "/proc", "/tmp/../etc", "Musique"] {
+        let (statut, corps) = explorer(
+            &state,
+            &format!("/api/v1/system/browse-dirs/estimate?path={chemin}"),
+            None,
+        )
+        .await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "laissé passer : {chemin}");
+        assert!(corps.get("audio_files").is_none(), "{corps}");
+    }
+}
+
+/// Le comptage exige le rôle administrateur, comme l'ajout qu'il précède.
+#[tokio::test]
+async fn le_comptage_exige_l_administrateur() {
+    let state = new_state();
+    active_l_auth(&state);
+    let (statut, _) = explorer(
+        &state,
+        "/api/v1/system/browse-dirs/estimate?path=/tmp",
+        Some(&jeton("user", 2)),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN);
+}
+
+/// Sans chemin, rien n'est compté : la route ne part jamais d'une racine
+/// implicite.
+#[tokio::test]
+async fn le_comptage_sans_chemin_est_refuse() {
+    let state = new_state();
+    let (statut, _) = explorer(&state, "/api/v1/system/browse-dirs/estimate", None).await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST);
+}
+
+/// Le chemin nominal : les fichiers audio du scan sont comptés, le reste non.
+#[cfg(unix)]
+#[tokio::test]
+async fn le_comptage_rend_le_nombre_de_fichiers_audio() {
+    let state = new_state();
+    let base = tune_core::test_scratch::scratch_dir_in("/tmp", "tune-estimation-route-2171");
+    let album = base.join("Album");
+    std::fs::create_dir_all(&album).unwrap();
+    for f in ["01.flac", "02.dsf", "cover.jpg"] {
+        std::fs::write(album.join(f), b"x").unwrap();
+    }
+    let (statut, corps) = explorer(
+        &state,
+        &format!(
+            "/api/v1/system/browse-dirs/estimate?path={}",
+            base.display()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["audio_files"], 2, "{corps}");
+    assert_eq!(corps["folders"], 1, "{corps}");
+    assert_eq!(corps["complete"], true, "{corps}");
+    assert_eq!(corps["drive_root"], false, "{corps}");
+}
