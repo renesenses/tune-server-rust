@@ -133,6 +133,8 @@ futures-util = { workspace = true }
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 time = { workspace = true }
+# #4805 — la fraîcheur de `albums.credits_mb_at` (RFC 3339 écrit par tune-core).
+chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
@@ -1498,3 +1500,16 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# #4805 — les crédits MusicBrainz lus juste après l'identification d'un album
+# (doublure MusicBrainz locale). `autotests = false` : sans cette cible, jamais
+# compilé.
+[[test]]
+name = "credits_apres_identification_4805"
+path = "tests/credits_apres_identification_4805.rs"
+
+# #5770 — une insertion avant la piste en cours fait suivre le curseur.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "insertion_avant_la_piste_en_cours_5770"
+path = "tests/insertion_avant_la_piste_en_cours_5770.rs"

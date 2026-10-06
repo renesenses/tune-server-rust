@@ -3889,6 +3889,35 @@ fn egaliseur_rock(canaux: u16) -> crate::audio::eq::EqProcessor {
     crate::audio::eq::EqProcessor::new(&profil, 44_100, canaux)
 }
 
+/// #4384 — `gain_demande` lit les mêmes atomiques que les rappels de rendu :
+/// préampli +6 dB à volume plein, le rendu est raboté à 1,0 alors que le
+/// produit demandé vaut ×2 ; volume à 25 %, plus de rabot, demandé = rendu.
+#[tokio::test]
+async fn le_gain_demande_avant_rabot_se_lit_sur_la_sortie_4384() {
+    use crate::outputs::traits::OutputTarget;
+
+    let sortie = LocalOutput::new("DAC test".to_string());
+    let mesure = crate::playback::PlaybackManager::new();
+    mesure.brancher_le_gain_de_sortie(9, sortie.gain_de_rendu());
+    mesure.brancher_le_gain_demande(9, sortie.gain_demande());
+
+    sortie.set_volume(1.0).await.expect("set_volume");
+    sortie.set_replaygain_factor(2.0);
+    assert_eq!(mesure.gain_de_rendu_units(9), 1000, "raboté à l'unité");
+    assert_eq!(mesure.gain_demande_units(9), Some(2000), "×2 demandés");
+
+    sortie.set_volume(0.25).await.expect("set_volume");
+    assert_eq!(mesure.gain_de_rendu_units(9), 500);
+    assert_eq!(mesure.gain_demande_units(9), Some(500), "plus de rabot");
+
+    mesure.debrancher_le_gain_de_sortie(9);
+    assert_eq!(
+        mesure.gain_demande_units(9),
+        None,
+        "débranché avec la sortie"
+    );
+}
+
 fn millemes(db: f64) -> i64 {
     (10.0_f64.powf(db / 20.0) * 1000.0).round() as i64
 }

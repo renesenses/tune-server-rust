@@ -548,6 +548,25 @@ impl InsertOutcome {
     pub fn has_loss(&self) -> bool {
         !self.skipped.is_empty()
     }
+
+    /// Où doit pointer le curseur de lecture APRÈS cette insertion (#5770).
+    ///
+    /// `courant` est le curseur d'avant (`queue_position`), `longueur_avant`
+    /// la longueur de la file avant l'insertion. Une insertion qui tombe à
+    /// `courant` ou avant pousse la piste en cours de `inserted()` rangs : le
+    /// curseur doit la suivre, sinon il désigne une des lignes insérées.
+    /// C'est ce qui faisait rejouer la piste en cours au second « Précédent »,
+    /// et réarmer la mauvaise piste suivante pour l'enchaînement sans blanc.
+    ///
+    /// Une file vide n'a pas de piste en cours : rien à décaler.
+    pub fn curseur_apres(&self, courant: i64, longueur_avant: i64) -> i64 {
+        match self.start {
+            Some(debut) if longueur_avant > 0 && debut <= courant => {
+                courant + self.inserted() as i64
+            }
+            _ => courant,
+        }
+    }
 }
 
 pub struct PlayQueueRepo {

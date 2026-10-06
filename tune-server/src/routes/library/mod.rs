@@ -17,6 +17,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+// #4805 — les crédits d'un album lus juste après son identification.
+mod credits_apres_identification;
 mod duplicates;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;

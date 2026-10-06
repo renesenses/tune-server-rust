@@ -835,6 +835,40 @@ impl HorlogeDeSortie {
     }
 }
 
+/// #4384 — de quoi dire ce que la sortie locale DEMANDAIT avant le rabot à
+/// l'unité : volume utilisateur × ReplayGain (préampli et compensation de
+/// niveau compris), et la bascule DoP qui remplace tout par l'unité.
+///
+/// Les mêmes `Arc` que les rappels de rendu (`LocalOutput::gain_demande`),
+/// relus à chaque appel. `effective_volume_units` rabote ce produit à 1,0 :
+/// « +6 dB de préampli à volume plein » ne produit rien, et sans ce nombre
+/// l'écran ne pouvait pas le dire.
+#[derive(Clone)]
+pub struct GainDemande {
+    /// Volume réglé par l'utilisateur, en millièmes.
+    pub volume_utilisateur: Arc<std::sync::atomic::AtomicU32>,
+    /// Facteur ReplayGain × compensation empaqueté par
+    /// `outputs::local::composer_le_facteur_de_rendu` : les 16 bits bas
+    /// portent le facteur, en millièmes.
+    pub facteur_de_rendu: Arc<std::sync::atomic::AtomicU32>,
+    /// Flux DoP en cours : le gain est alors l'unité exacte, rien n'est
+    /// demandé ni raboté.
+    pub dop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GainDemande {
+    /// Le produit demandé AVANT rabot, en millièmes. `None` en DoP.
+    pub fn units(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if self.dop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let volume = u64::from(self.volume_utilisateur.load(Ordering::SeqCst));
+        let facteur = u64::from(self.facteur_de_rendu.load(Ordering::SeqCst) & 0xFFFF);
+        Some(((volume * facteur + 500) / 1000).min(u64::from(u32::MAX)) as u32)
+    }
+}
+
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
@@ -881,6 +915,9 @@ pub struct PlaybackManager {
     /// son estimation.
     cretes_de_sortie:
         std::sync::Mutex<HashMap<i64, Arc<crate::audio::crete_de_sortie::CretesDeSortie>>>,
+    /// #4384 — ce que la sortie locale qui joue la zone demandait avant le
+    /// rabot à l'unité. Voir [`GainDemande`]. Absent = pas de sortie locale.
+    gains_demandes: std::sync::Mutex<HashMap<i64, GainDemande>>,
 }
 
 impl Default for PlaybackManager {
@@ -902,6 +939,7 @@ impl PlaybackManager {
             gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
             cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
+            gains_demandes: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -942,6 +980,12 @@ impl PlaybackManager {
         self.cretes_de_sortie
             .lock()
             .expect("cretes_de_sortie lock")
+            .remove(&zone_id);
+        // Et ce qu'elle demandait avant rabot (#4384) : un rendu réseau cuit
+        // son gain dans le flux, il n'a pas de rabot à dire.
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
             .remove(&zone_id);
     }
 
@@ -1053,6 +1097,30 @@ impl PlaybackManager {
             }
             _ => rendu,
         }
+    }
+
+    /// #4384 — partage ce que la sortie locale qui va jouer cette zone
+    /// demande avant le rabot à l'unité. Voir [`Self::gain_demande_units`].
+    pub fn brancher_le_gain_demande(&self, zone_id: i64, gain: GainDemande) {
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
+            .insert(zone_id, gain);
+    }
+
+    /// #4384 — volume × ReplayGain (préampli et compensation compris) que la
+    /// sortie locale de la zone DEMANDE, en millièmes, AVANT le rabot à
+    /// l'unité de `effective_volume_units`. Au-dessus de `1000`, le rabot
+    /// mord : le gain de rendu reste à l'unité.
+    ///
+    /// `None` : pas de sortie locale branchée (un rendu réseau cuit le gain
+    /// dans le flux), ou flux DoP (gain unité imposé).
+    pub fn gain_demande_units(&self, zone_id: i64) -> Option<u32> {
+        self.gains_demandes
+            .lock()
+            .expect("gains_demandes lock")
+            .get(&zone_id)
+            .and_then(GainDemande::units)
     }
 
     /// La génération de niveaux d'une zone (créée au premier accès).

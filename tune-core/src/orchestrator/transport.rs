@@ -1809,6 +1809,11 @@ impl PlaybackOrchestrator {
                     // crête publiée est celle des échantillons envoyés au DAC.
                     self.playback
                         .brancher_les_cretes_de_sortie(zone_id, local_output.cretes_de_sortie());
+                    // #4384 — et ce qu'elle demande AVANT le rabot à l'unité :
+                    // l'écran peut alors dire « +6 dB demandés, limités à
+                    // 0 dB » au lieu d'un préampli qui ne fait rien.
+                    self.playback
+                        .brancher_le_gain_demande(zone_id, local_output.gain_demande());
                     return;
                 }
             }
