@@ -1071,3 +1071,254 @@ async fn sans_droit_de_recuperation_aucune_copie_n_est_ecrite() {
     assert!(repo.list(1, 100, 0).unwrap().is_empty());
     assert!(b.faux.etat.lock().unwrap().renonciations.is_empty());
 }
+
+// 6. Ajout groupé : un album, une sélection, une playlist ---------------------
+
+/// `n` titres Qobuz décrits par le client, numérotés à partir de `de`.
+fn descriptions(de: usize, n: usize) -> Vec<Value> {
+    (de..de + n)
+        .map(|k| json!({ "source": "qobuz", "source_id": format!("q{k}"), "title": format!("Titre {k}") }))
+        .collect()
+}
+
+fn ajouts_recus(b: &Banc) -> Vec<Value> {
+    b.faux
+        .etat
+        .lock()
+        .unwrap()
+        .ecritures_de_playlist
+        .iter()
+        .filter(|(r, _)| r == "POST /playlists/{id}/items")
+        .map(|(_, c)| c.clone())
+        .collect()
+}
+
+/// Une suite mêlée — piste locale, titre décrit, piste inconnue, Bandcamp,
+/// titre de service à lire chez lui — part DANS L'ORDRE, sans aucun chemin ;
+/// ce qui ne se référence pas est compté, et n'empêche rien.
+#[tokio::test]
+async fn l_ajout_groupe_garde_l_ordre_et_compte_ce_qui_ne_se_reference_pas() {
+    let b = banc(vec![(
+        "tidal",
+        true,
+        vec![piste(
+            "t-77",
+            "All Blues",
+            "Miles Davis",
+            693_000,
+            Some("USSM15900117"),
+        )],
+    )])
+    .await;
+    let tid = semer_une_piste_locale(&b.backend);
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": [
+            { "track_id": tid },
+            { "source": "qobuz", "source_id": "q-ff", "title": "Freddie Freeloader",
+              "artist_name": "Miles Davis", "duration_ms": 586000, "cover_path": CHEMIN },
+            { "track_id": 999 },
+            { "source": "bandcamp", "source_id": "b-1", "title": "Ailleurs" },
+            { "source": "tidal", "source_id": "t-77" },
+            { "source": "qobuz", "source_id": "q-vide", "title": "   " },
+        ] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.json());
+    let j = r.json();
+    assert_eq!(j["requested"], 6);
+    assert_eq!(j["added"], 3);
+    assert_eq!(j["unreferenceable"], 3, "inconnue, Bandcamp, titre vide");
+    assert_eq!(j["over_limit"], 0);
+    assert_eq!(j["interrupted"], Value::Null);
+    let titres: Vec<&str> = j["playlist"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        &titres[3..],
+        ["So What", "Freddie Freeloader", "All Blues"],
+        "en fin de playlist, dans l'ordre des entrées"
+    );
+    let envoyes = ajouts_recus(&b);
+    assert_eq!(envoyes.len(), 1, "trois références : un seul lot");
+    assert_eq!(envoyes[0]["version"], 3, "la version relue au cloud");
+    let brut = envoyes[0].to_string();
+    for interdit in [
+        CHEMIN,
+        "/Users",
+        "secret-5328",
+        "file_path",
+        "source_id",
+        "cover_path",
+    ] {
+        assert!(
+            !brut.contains(interdit),
+            "« {interdit} » est parti : {brut}"
+        );
+    }
+    assert_eq!(
+        envoyes[0]["items"][2]["isrc"], "USSM15900117",
+        "lu chez Tidal"
+    );
+    assert_eq!(
+        *b.lus.lock().unwrap(),
+        vec!["t-77".to_string()],
+        "seul le titre non décrit est lu"
+    );
+    assert_eq!(b.ecritures.load(Ordering::SeqCst), 0);
+}
+
+/// Plus que la place : des lots de 100 au plus, chacun sur la version du
+/// précédent, et l'arrêt au plafond de 2 000 — le reste est compté. Une
+/// playlist pleine refuse ensuite tout, sans rien envoyer.
+#[tokio::test]
+async fn l_ajout_groupe_part_par_lots_de_100_et_s_arrete_au_plafond() {
+    let b = banc(vec![]).await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(0, 2100) })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.json());
+    let j = r.json();
+    assert_eq!(j["added"], 1997, "3 morceaux déjà là, plafond 2 000");
+    assert_eq!(j["over_limit"], 103);
+    assert_eq!(j["max_items"], 2000);
+    assert_eq!(j["playlist"]["items"].as_array().unwrap().len(), 2000);
+    assert_eq!(
+        r.entetes.get("etag").unwrap(),
+        &format!("\"{}\"", j["playlist"]["version"])
+    );
+    let envoyes = ajouts_recus(&b);
+    assert_eq!(envoyes.len(), 20);
+    assert!(
+        envoyes
+            .iter()
+            .all(|e| e["items"].as_array().unwrap().len() <= 100)
+    );
+    let versions: Vec<i64> = envoyes
+        .iter()
+        .map(|e| e["version"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        versions,
+        (3..23).collect::<Vec<_>>(),
+        "chaque lot sur la version rendue"
+    );
+    assert_eq!(
+        envoyes[19]["items"][96]["title"], "Titre 1996",
+        "l'ordre tient d'un lot à l'autre"
+    );
+
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(5000, 1) })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["code"], "circle.playlist_full");
+    assert_eq!(ajouts_recus(&b).len(), 20, "rien de plus n'est parti");
+}
+
+/// Un autre membre écrit pendant l'ajout : le 409 donne la version à jour,
+/// le lot est refait dessus.
+#[tokio::test]
+async fn l_ajout_groupe_reprend_la_version_sur_un_conflit() {
+    let b = banc(vec![]).await;
+    b.faux.etat.lock().unwrap().conflits_a_simuler = 2;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(0, 2) })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.json());
+    assert_eq!(r.json()["added"], 2);
+    let versions: Vec<Value> = ajouts_recus(&b)
+        .iter()
+        .map(|e| e["version"].clone())
+        .collect();
+    assert_eq!(versions, vec![json!(3), json!(4), json!(5)]);
+}
+
+/// Un refus en route arrête l'ajout : ce qui est parti est dit, le reste
+/// aussi. Un refus AVANT tout ajout est relayé tel quel.
+#[tokio::test]
+async fn l_ajout_groupe_interrompu_dit_ce_qui_est_parti() {
+    let b = banc(vec![]).await;
+    b.faux.etat.lock().unwrap().ajouts_avant_refus = Some(1);
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(0, 250) })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::OK, "{}", r.json());
+    let j = r.json();
+    assert_eq!(j["added"], 100);
+    assert_eq!(j["not_sent"], 150);
+    assert_eq!(j["interrupted"]["status"], 429);
+
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(0, 3) })),
+    )
+    .await;
+    assert_eq!(
+        r.statut,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rien n'est parti : le 429 relayé"
+    );
+}
+
+/// Le droit reste au cloud : une playlist qui n'est plus partagée rend 404
+/// avant toute construction de référence ; une suite sans rien de
+/// référençable ne part pas.
+#[tokio::test]
+async fn l_ajout_groupe_relaie_le_404_et_refuse_une_suite_vide() {
+    let b = banc(vec![]).await;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": [] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["code"], "circle.entries_required");
+
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": [{ "track_id": 999 }, { "source": "bandcamp", "source_id": "1", "title": "X" }] })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["code"], "circle.nothing_referenceable");
+    assert_eq!(r.json()["unreferenceable"], 2);
+
+    b.faux.etat.lock().unwrap().playlists_coupees = true;
+    let r = appel(
+        &b.app,
+        "POST",
+        "/playlists/5/bulk-items",
+        Some(json!({ "entries": descriptions(0, 1) })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::NOT_FOUND);
+    assert!(ajouts_recus(&b).is_empty());
+}
