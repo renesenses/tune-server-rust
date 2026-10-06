@@ -144,6 +144,9 @@ async fn avec_consentement_la_route_accepte_et_le_lrc_apparait() {
     let dir = tempfile::TempDir::new().unwrap();
     let audio = piste_avec_paroles_en_cache(&state, &dir);
     reglage(&state, "lyrics_write_files_enabled", "true");
+    // 05/10/2026 : le `.lrc` voisin exige aussi le réglage général « Écrire
+    // les modifications dans les fichiers audio ».
+    reglage(&state, "library_write_files_enabled", "true");
 
     let (status, body) = post(&app, "/api/v1/library/lyrics/write").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -162,6 +165,27 @@ async fn avec_consentement_la_route_accepte_et_le_lrc_apparait() {
         Some("[00:01.00] une ligne\n"),
         "et porter les paroles que Tune connaissait"
     );
+}
+
+/// Décision de Bertrand du 05/10/2026 : consentement des paroles donné, mais
+/// « Écrire les modifications dans les fichiers audio » jamais coché — la
+/// route refuse (409 `file_writes_disabled`) et aucun `.lrc` n'apparaît.
+#[tokio::test]
+async fn consentement_sans_reglage_general_la_route_refuse_et_ne_pose_aucun_lrc() {
+    let (app, state) = make_app_with_state();
+    let dir = tempfile::TempDir::new().unwrap();
+    let audio = piste_avec_paroles_en_cache(&state, &dir);
+    reglage(&state, "lyrics_write_files_enabled", "true");
+    // `library_write_files_enabled` volontairement NON positionné.
+
+    let (status, body) = post(&app, "/api/v1/library/lyrics/write").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "file_writes_disabled");
+    assert_eq!(body["setting"], "library_write_files_enabled");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(tune_core::metadata::lyrics::find_sidecar_lrc(&audio).is_none());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[tokio::test]

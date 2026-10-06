@@ -248,6 +248,13 @@ path = "tests/titres_bannis_4806.rs"
 name = "suivants_en_rafale_134"
 path = "tests/suivants_en_rafale_134.rs"
 
+# 05/10/2026 — l'écriture des paroles dans les fichiers : `.lrc` voisin sous le
+# consentement des paroles ET « Écrire les modifications dans les fichiers
+# audio ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "paroles_ecriture_fichiers"
+path = "tests/paroles_ecriture_fichiers.rs"
+
 # #4806 suite — bannir un titre de SERVICE (Qobuz, Tidal, Bandcamp…), fil 1946
 # réponse 6820. `autotests = false` : sans cette cible, jamais compilé.
 [[test]]
