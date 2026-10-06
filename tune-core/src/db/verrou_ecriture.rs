@@ -412,20 +412,54 @@ impl VerrouEcriture {
                 }
             }
         };
-        let jeton = self.etat.jeton();
-        if let Ok(mut d) = self.etat.detention.lock() {
-            *d = Some(Prise::nouvelle(jeton, lieu, piles_armees()));
-        }
-        let tenue = EcritureTenue {
-            garde: Some(garde),
-            etat: &self.etat,
-            jeton,
-        };
+        let tenue = self.tenir(garde, lieu);
         if empoisonnee {
             Err(PoisonError::new(tenue))
         } else {
             Ok(tenue)
         }
+    }
+
+    /// Inscrire la prise d'une garde obtenue, et la rendre surveillée.
+    fn tenir<'a>(
+        &'a self,
+        garde: MutexGuard<'a, Connection>,
+        lieu: &'static Location<'static>,
+    ) -> EcritureTenue<'a> {
+        let jeton = self.etat.jeton();
+        if let Ok(mut d) = self.etat.detention.lock() {
+            *d = Some(Prise::nouvelle(jeton, lieu, piles_armees()));
+        }
+        EcritureTenue {
+            garde: Some(garde),
+            etat: &self.etat,
+            jeton,
+        }
+    }
+
+    /// Prendre la connexion d'écriture SI ELLE EST LIBRE, sans jamais
+    /// attendre (#5871). `None` quand un autre fil la tient.
+    ///
+    /// Sert aux lectures qui préfèrent la connexion d'écriture — pour voir
+    /// une valeur posée l'instant d'avant — mais qui n'ont aucune raison
+    /// d'attendre un écrivain pour l'obtenir : quand il la tient, la dernière
+    /// valeur commitée, lue par le pool, fait aussi bien (voir
+    /// `DbBackend::query_one_frais`).
+    #[track_caller]
+    pub fn essayer_sans_attendre(&self) -> Option<EcritureTenue<'_>> {
+        let garde = match self.connexion.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(self.tenir(garde, Location::caller()))
+    }
+
+    /// Le fil courant tient-il une transaction de lot ouverte sur cette
+    /// connexion ? Lui seul voit ce qu'il y a écrit sans l'avoir validé :
+    /// une lecture de SA part ne peut pas passer par le pool (#5871).
+    pub fn lot_au_fil_courant(&self) -> bool {
+        self.etat.lot.est_au_fil_courant()
     }
 
     /// Le détenteur courant et les attentes, sans rien bloquer d'autre que

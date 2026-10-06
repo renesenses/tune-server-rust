@@ -1163,7 +1163,11 @@ impl ZoneRepo {
         // get_by_device_id) does NOT help here: the row exists, only the field is
         // stale, so the fallback never triggers. Mirror list()'s unconditional
         // strong read. A single zone by id is a tiny query.
-        let rows = self.db.query_many_strong(&sql, &params)?;
+        //
+        // #5871 — forte quand l'écrivain est libre, par le pool quand un
+        // autre fil le tient : une PATCH validée y est visible, et la
+        // préparation d'une lecture ne fait plus la queue derrière un scan.
+        let rows = self.db.query_many_frais(&sql, &params)?;
         Ok(rows.first().map(row_to_zone))
     }
 

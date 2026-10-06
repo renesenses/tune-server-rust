@@ -579,15 +579,22 @@ impl PlaybackOrchestrator {
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        // #5871 — chaque étape dit sa durée au-delà de 500 ms.
+        let _preparation = super::dsp::EtapeDePreparation::debut(req.zone_id, "preparation_locale");
         let repo = TrackRepo::with_backend(self.db.clone());
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "lecture_de_la_piste");
         let mut track = repo
             .get(track_id)
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
+        drop(etape);
         // #4907 — le fichier À LIRE est choisi parmi les exemplaires de la
         // piste, avant toute décision de format : préférence de l'album,
         // qualité, ordre des répertoires, puis repli sur le suivant joignable.
-        crate::library::exemplaires::appliquer_a_la_lecture(&*self.db, &mut track);
+        {
+            let _e = super::dsp::EtapeDePreparation::debut(req.zone_id, "choix_de_l_exemplaire");
+            crate::library::exemplaires::appliquer_a_la_lecture(&*self.db, &mut track);
+        }
 
         // #3631 — une piste de feuille CUE n'a PAS de `file_path` : `tracks.
         // file_path` est `UNIQUE` et une feuille découpe N pistes dans le même
@@ -695,6 +702,7 @@ impl PlaybackOrchestrator {
             }
         }
 
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "decision_de_lecture");
         let decision = match self
             .decider_la_lecture_locale(
                 req,
@@ -710,6 +718,8 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Resolu(resolu) => return Ok(resolu),
             DecisionOuResolu::Decision(decision) => decision,
         };
+        drop(etape);
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "armement_du_flux");
         let (
             session_id,
             out_mime,
@@ -723,6 +733,7 @@ impl PlaybackOrchestrator {
         } else {
             self.servir_en_passthrough(req, &decision).await?
         };
+        drop(etape);
         let DecisionLocale {
             is_network_output,
             needs_transcode,
