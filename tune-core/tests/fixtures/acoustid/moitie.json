@@ -1,0 +1,145 @@
+{
+ "album": {
+  "titre": "Rivages",
+  "artiste": "Duo des Rivages"
+ },
+ "pistes": [
+  {
+   "track_id": 501,
+   "titre": "Galets",
+   "artiste": "Duo des Rivages",
+   "duree_s": 240,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000042",
+      "score": 0.88,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000040",
+        "title": "Galets",
+        "duration": 241,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000003d",
+          "name": "Duo des Rivages"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000003e",
+          "title": "Rivages",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000003f",
+            "country": "CA",
+            "date": {
+             "year": 2008
+            },
+            "medium_count": 1,
+            "track_count": 4,
+            "title": "Rivages"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-501"
+  },
+  {
+   "track_id": 502,
+   "titre": "Écume",
+   "artiste": "Duo des Rivages",
+   "duree_s": 199,
+   "reponse": {
+    "status": "ok",
+    "results": []
+   },
+   "empreinte": "AQAD-fixture-502"
+  },
+  {
+   "track_id": 503,
+   "titre": "Laisse de mer",
+   "artiste": "Duo des Rivages",
+   "duree_s": 276,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000043",
+      "score": 0.79,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000041",
+        "title": "Laisse de mer",
+        "duration": 275,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000003d",
+          "name": "Duo des Rivages"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000003e",
+          "title": "Rivages",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000003f",
+            "country": "CA",
+            "date": {
+             "year": 2008
+            },
+            "medium_count": 1,
+            "track_count": 4,
+            "title": "Rivages"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-503"
+  },
+  {
+   "track_id": 504,
+   "titre": "Phare",
+   "artiste": "Duo des Rivages",
+   "duree_s": 158,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000044",
+      "score": 0.83
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-504"
+  }
+ ],
+ "attendu": {
+  "release_id": "7e100000-0000-4000-8000-00000000003f",
+  "release_group_id": "96a00000-0000-4000-8000-00000000003e",
+  "enregistrements": {
+   "501": "5ec00000-0000-4000-8000-000000000040",
+   "503": "5ec00000-0000-4000-8000-000000000041"
+  }
+ },
+ "verite": {
+  "501": "5ec00000-0000-4000-8000-000000000040",
+  "502": null,
+  "503": "5ec00000-0000-4000-8000-000000000041",
+  "504": null
+ }
+}

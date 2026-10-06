@@ -123,7 +123,7 @@ impl Marqueur {
         self.origine == ORIGINE_MANUEL
     }
 
-    fn est_auto(&self) -> bool {
+    pub(crate) fn est_auto(&self) -> bool {
         self.origine == ORIGINE_AUTO
     }
 }

@@ -221,6 +221,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2130 -- --nocapture --test-threads=1
 
+      # #4805 (idée 3 de MetaRust) — les réponses MusicBrainz gardées en base
+      # (`musicbrainz_release_cache`) : corps BYTEA, `ON CONFLICT`, purge par
+      # `NOT EXISTS` corrélé. La table n'a pas de script numéroté : le témoin
+      # la pose par l'entrée d'`ENSURE_TABLES` elle-même.
+      - name: Réponses MusicBrainz gardées en base sur PostgreSQL (#4805)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_musicbrainz_release_cache -- --nocapture
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -307,6 +316,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5464 -- --nocapture --test-threads=1
+
+      # #5594 — la passe de la clé PCM des FLAC (`tracks.audio_pcm_key`) sur
+      # PostgreSQL : placeholders, `LIMIT` lié, comparaison texte du témoin et
+      # NUL typé TEXT. Elle vide `tracks` : un fil à la fois.
+      - name: Clé PCM des FLAC sur PostgreSQL (#5594)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5594 -- --nocapture --test-threads=1
 
       # #5263 — une base issue de SQLite garde plusieurs réglages de zones en
       # TEXT ; leur report précède la suppression des doublons au démarrage.

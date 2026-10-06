@@ -267,11 +267,10 @@ pub(super) async fn lyrics_write(State(state): State<AppState>) -> impl IntoResp
             })),
         );
     }
-    // La cible « étiquette » réécrit le fichier AUDIO : elle exige en plus le
-    // réglage général (désactivé par défaut). Le `.lrc` voisin, non.
-    if target == lyrics_pass::WriteTarget::Tag
-        && !crate::routes::ecriture_fichiers::autorisee(&state)
-    {
+    // Les deux cibles exigent en plus le réglage général (désactivé par
+    // défaut) : l'étiquette réécrit le fichier audio, et le `.lrc` voisin
+    // aussi depuis la décision de Bertrand du 05/10/2026.
+    if !crate::routes::ecriture_fichiers::autorisee(&state) {
         return (
             StatusCode::CONFLICT,
             Json(json!({

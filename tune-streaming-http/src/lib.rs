@@ -643,7 +643,35 @@ async fn service_album(
     State(state): State<StreamingHttpState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
+    let backend = state.backend.clone();
+    with_svc!(&state, &service, |svc| svc
+        .get_album(&album_id)
+        .await
+        .inspect(|album| ranger_le_marquage_ia(&backend, &service, album)))
+}
+
+/// #5530 — la fiche d'un album de service est le moment où Tune lit son
+/// marquage « généré par IA » de première main (`album/get` chez Qobuz). On le
+/// range sur les favoris qui désignent cet album — l'album lui-même, et les
+/// pistes dont la référence d'album le nomme —, pour qu'une règle de playlist
+/// intelligente puisse l'écarter sans rappeler le service.
+///
+/// Rien n'est écrit quand le service ne dit rien (`None`). Une erreur de base
+/// est journalisée, jamais rendue : la fiche reste servie.
+fn ranger_le_marquage_ia(
+    backend: &Arc<dyn DbBackend>,
+    service: &str,
+    album: &tune_core::streaming::StreamAlbum,
+) {
+    let Some(ia) = album.ai_generated else {
+        return;
+    };
+    let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+        backend.clone(),
+    );
+    if let Err(e) = repo.marquer_album_ia(service, &album.id, ia) {
+        tracing::warn!(service, erreur = %e, "marquage_ia_favoris_impossible");
+    }
 }
 
 async fn service_album_tracks(
@@ -2068,7 +2096,18 @@ mod tests_cache_utilisateur {
         async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
             Err("hors sujet".into())
         }
-        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+        /// #5530 — un seul album connu, marqué IA comme le rend Qobuz.
+        async fn get_album(&self, a: &str) -> Result<StreamAlbum, TuneError> {
+            if a == "tj9je5zd70wsc" {
+                return Ok(StreamAlbum {
+                    id: a.to_string(),
+                    title:
+                        "Psychedelic Mongolian Trip Hop (\"Painted Yurts, Painted Souls\") AI Album"
+                            .to_string(),
+                    ai_generated: Some(true),
+                    ..Default::default()
+                });
+            }
             Err("hors sujet".into())
         }
         async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
@@ -2283,6 +2322,52 @@ mod tests_cache_utilisateur {
             Arc::new(Mutex::new(registre)),
             Arc::new(EventBus::new()),
         )
+    }
+
+    /// #5530 — servir la fiche d'un album marqué IA range le marquage sur le
+    /// favori qui le désigne, et la fiche le rend au client.
+    #[tokio::test]
+    async fn la_fiche_d_un_album_marque_range_le_marquage_sur_ses_favoris_5530() {
+        let db = SqliteDb::open_in_memory().expect("sqlite en memoire");
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let nom = "essai-ia-5530";
+        let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+            backend.clone(),
+        );
+        repo.add(1, "album", nom, "tj9je5zd70wsc", None, None, None, None)
+            .unwrap();
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceCompteur {
+            nom: nom.to_string(),
+            lectures: Arc::new(AtomicUsize::new(0)),
+            delai: Duration::ZERO,
+            recherches: RecherchesVues::default(),
+            date_brute: None,
+        }));
+        let etat = StreamingHttpState::new(
+            backend.clone(),
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let r = service_album(
+            State(etat),
+            Path((nom.to_string(), "tj9je5zd70wsc".to_string())),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&corps).unwrap();
+        assert_eq!(v["ai_generated"], json!(true), "{v}");
+        let fav = repo.list(1, Some("album")).unwrap();
+        assert_eq!(
+            fav[0].ai_generated,
+            Some(true),
+            "le favori n'a pas reçu le marquage de la fiche"
+        );
     }
 
     /// Aucun tri demandé — le cas de tous les appels d'avant #2001.

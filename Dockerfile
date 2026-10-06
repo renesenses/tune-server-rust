@@ -80,6 +80,10 @@ RUN groupadd -g 1000 tune && \
 
 WORKDIR /app
 
+# Entrypoint: drops root, honours PUID/PGID (see the end of this file).
+COPY packaging/docker/entrypoint.sh /usr/local/bin/tune-entrypoint
+RUN chmod 755 /usr/local/bin/tune-entrypoint
+
 COPY --from=builder /build/target/release/tune-server /app/tune-server
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 COPY --from=builder /usr/local/cargo/bin/airplay-daemon /usr/local/bin/airplay-daemon
@@ -108,6 +112,9 @@ VOLUME ["/data", "/music"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:8888/api/v1/system/stats || exit 1
 
-USER tune
-
-ENTRYPOINT ["/app/tune-server"]
+# No `USER tune`: the entrypoint starts as root only to drop to `tune`
+# (uid/gid 1000) at once — or, when PUID/PGID are given, to re-number `tune`
+# and give it /data first (packaging/docker/entrypoint.sh). The server itself
+# never runs as root. `docker run --user ...` still works: the entrypoint then
+# starts the server directly.
+ENTRYPOINT ["/usr/local/bin/tune-entrypoint"]

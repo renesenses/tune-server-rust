@@ -394,6 +394,7 @@ impl DeezerService {
 
     fn map_gateway_album(item: &serde_json::Value) -> Result<StreamAlbum, TuneError> {
         Ok(StreamAlbum {
+            ai_generated: None,
             id: Self::gateway_id(item, "ALB_ID")?,
             title: item["ALB_TITLE"].as_str().unwrap_or_default().into(),
             artist: item["ART_NAME"].as_str().unwrap_or_default().into(),
@@ -776,6 +777,7 @@ impl DeezerService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),

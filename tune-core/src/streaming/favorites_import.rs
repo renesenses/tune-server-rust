@@ -113,6 +113,10 @@ struct Entree {
     /// La date de mise en favori CHEZ LE SERVICE (ISO 8601), quand il la
     /// donne. `None` = la reprise datera au « maintenant » du moteur.
     created_at: Option<String>,
+    /// Le marquage « généré par IA » de l'album (#5530) : celui de l'album
+    /// pour un favori album, celui de son album pour une piste. `None` : le
+    /// service ne dit rien.
+    ai_generated: Option<bool>,
 }
 
 /// Les entrées DATÉES d'un type, par `get_user_favorites_dated` (#3489) —
@@ -173,6 +177,9 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     album: texte(v, &["album_title", "album"]),
                     cover_url: texte(v, &["cover_path"]),
                     created_at: texte(v, &["created_at"]),
+                    // Greffé par le connecteur depuis l'album imbriqué
+                    // (`QobuzService::favori_date`).
+                    ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
                 },
                 "album" => Entree {
                     item_type,
@@ -182,6 +189,7 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     album: None,
                     cover_url: texte(v, &["cover_path"]),
                     created_at: texte(v, &["created_at"]),
+                    ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
                 },
                 _ => Entree {
                     item_type,
@@ -191,6 +199,7 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     album: None,
                     cover_url: texte(v, &["image_path"]),
                     created_at: texte(v, &["created_at"]),
+                    ai_generated: None,
                 },
             })
             .collect(),
@@ -226,6 +235,7 @@ pub async fn reprendre_les_favoris_du_service(
                     album: t.album,
                     cover_url: t.cover_path,
                     created_at: None,
+                    ai_generated: None,
                 })
                 .collect(),
             Err(e) => {
@@ -254,6 +264,7 @@ pub async fn reprendre_les_favoris_du_service(
                     album: None,
                     cover_url: a.cover_path,
                     created_at: None,
+                    ai_generated: a.ai_generated,
                 })
                 .collect(),
             Err(e) => {
@@ -279,6 +290,7 @@ pub async fn reprendre_les_favoris_du_service(
                     album: None,
                     cover_url: a.image_path,
                     created_at: None,
+                    ai_generated: None,
                 })
                 .collect(),
             Err(e) => {
@@ -352,6 +364,7 @@ fn enregistrer(
                 {
                     stats.redates += 1;
                 }
+                poser_le_marquage_ia(repo, profile_id, service, &entree);
                 continue;
             }
             Ok(false) => {}
@@ -372,7 +385,10 @@ fn enregistrer(
             entree.cover_url.as_deref(),
             entree.created_at.as_deref(),
         ) {
-            Ok(()) => stats.ajoutes += 1,
+            Ok(()) => {
+                stats.ajoutes += 1;
+                poser_le_marquage_ia(repo, profile_id, service, &entree);
+            }
             Err(e) => {
                 warn!(service = %service, erreur = %e, "reprise_favoris_ecriture_impossible");
                 stats.echecs += 1;
@@ -380,6 +396,30 @@ fn enregistrer(
         }
     }
     stats
+}
+
+/// #5530 — range le marquage IA que le service donne avec le favori. Une
+/// absence ne touche à rien : on n'efface pas un marquage connu parce qu'une
+/// réponse ne le répète pas. Un échec est journalisé, jamais compté : le
+/// favori, lui, est écrit.
+fn poser_le_marquage_ia(
+    repo: &StreamingFavoritesRepo,
+    profile_id: i64,
+    service: &str,
+    entree: &Entree,
+) {
+    let Some(ia) = entree.ai_generated else {
+        return;
+    };
+    if let Err(e) = repo.poser_ia(
+        profile_id,
+        entree.item_type,
+        service,
+        &entree.service_id,
+        ia,
+    ) {
+        warn!(service = %service, erreur = %e, "reprise_favoris_marquage_ia_impossible");
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +617,58 @@ mod tests_dates {
     }
 
     /// `(service_id, first_seen_at)` — la date LOCALE, celle que TUNE pose.
+    /// #5530 — la reprise range le marquage IA que le service donne : à
+    /// l'ajout comme sur un favori déjà présent. Une absence ne l'efface pas.
+    #[test]
+    fn la_reprise_range_le_marquage_ia_5530() {
+        let backend = base();
+        let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+        let entree = |id: &str, ia: Option<bool>| Entree {
+            item_type: "album",
+            service_id: id.to_string(),
+            title: None,
+            artist: None,
+            album: None,
+            cover_url: None,
+            created_at: None,
+            ai_generated: ia,
+        };
+        enregistrer(
+            &repo,
+            1,
+            "qobuz",
+            vec![
+                entree("tj9je5zd70wsc", Some(true)),
+                entree("5099749522428", None),
+            ],
+        );
+        let ia = |id: &str| {
+            repo.list(1, Some("album"))
+                .unwrap()
+                .into_iter()
+                .find(|f| f.service_id == id)
+                .unwrap()
+                .ai_generated
+        };
+        assert_eq!(ia("tj9je5zd70wsc"), Some(true), "ajout : marquage perdu");
+        assert_eq!(ia("5099749522428"), None);
+        // Déjà présent : le service le dit maintenant pour le témoin.
+        enregistrer(
+            &repo,
+            1,
+            "qobuz",
+            vec![entree("5099749522428", Some(false))],
+        );
+        assert_eq!(
+            ia("5099749522428"),
+            Some(false),
+            "déjà présent : marquage perdu"
+        );
+        // Une reprise qui ne le répète pas ne l'efface pas.
+        enregistrer(&repo, 1, "qobuz", vec![entree("tj9je5zd70wsc", None)]);
+        assert_eq!(ia("tj9je5zd70wsc"), Some(true));
+    }
+
     fn vues(backend: &Arc<dyn DbBackend>) -> Vec<(String, String)> {
         colonne(backend, "first_seen_at")
     }

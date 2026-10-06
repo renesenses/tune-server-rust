@@ -136,6 +136,9 @@ pub(super) enum EchecIdentification {
 /// Elle est lue et posée telle quelle, sans cascade ni garde.
 ///
 /// Les requêtes MusicBrainz internes sont espacées par le limiteur partagé.
+/// Les lectures de pressage passent par la release gardée en base
+/// (`musicbrainz_release_cache`, #4805 idée 3) : déjà gardée, elle ne coûte
+/// aucune requête, et la passe des crédits relit celle qui vient d'arriver.
 /// L'appelant qui enchaîne des albums doit ajouter SON propre délai entre deux
 /// appels — celui d'ici ne couvre que l'intervalle interne.
 pub(super) async fn identifier_album(
@@ -297,11 +300,9 @@ async fn poser_le_pressage(
     release_choisie: Option<&str>,
 ) -> Result<Identification, EchecIdentification> {
     let issue = match release_choisie {
-        Some(id) => choix_de_pressage::lire_le_pressage_choisi(
-            id,
-            locales,
-            musicbrainz_release::lire_sur_musicbrainz,
-        )
+        Some(id) => choix_de_pressage::lire_le_pressage_choisi(id, locales, |chemin, inc| {
+            musicbrainz_release::lire_sur_musicbrainz_gardee(&state.backend, chemin, inc)
+        })
         .await
         // Un `release_id` qui n'est pas un MBID est refusé par la route avant
         // d'arriver ici ; par prudence, il ne mène à rien.
@@ -318,7 +319,9 @@ async fn poser_le_pressage(
                     compositeurs_des_balises: &balises.compositeurs,
                 },
                 musicbrainz_release::rechercher_sur_musicbrainz,
-                musicbrainz_release::lire_sur_musicbrainz,
+                |chemin, inc| {
+                    musicbrainz_release::lire_sur_musicbrainz_gardee(&state.backend, chemin, inc)
+                },
             )
             .await
         }
@@ -422,6 +425,17 @@ async fn poser_le_pressage(
             return Err(EchecIdentification::Base(e));
         }
     };
+    // #4767 / #4805 E — un AUTRE pressage : les crédits gardés sont ceux de
+    // l'ancien. Le curseur de la passe des crédits repasse à NULL pour qu'elle
+    // les remplace. Un échec ne défait pas l'identification posée.
+    if let Err(e) = tune_core::metadata::reidentify::oublier_les_credits_si_le_pressage_change(
+        &state.backend,
+        album_id,
+        cleared.release_id.as_deref(),
+        &pressage.release_id,
+    ) {
+        warn!(album_id, error = %e, "reidentify_credits_non_remis_a_refaire");
+    }
     // #4805, étape B — le MBID des artistes, tiré des crédits du pressage que
     // l'on vient de recevoir : aucune requête de plus. Jamais d'écrasement,
     // rien sur une ambiguïté. Un échec ici ne défait pas l'identification de

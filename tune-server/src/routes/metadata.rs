@@ -652,6 +652,47 @@ pub(crate) async fn edit_track(
             .into_response();
     }
 
+    // Les champs corrigés à la main sont TENUS : une analyse complète, qui
+    // reconstruit la ligne depuis les balises, ne les défait plus
+    // (`tune_core::db::champs_tenus`, 05/10/2026).
+    {
+        use tune_core::db::champs_tenus::{self, Champ};
+        let mut champs = Vec::new();
+        if body.title.is_some() {
+            champs.push(Champ::Titre);
+        }
+        if body.artist.is_some() || body.artist_id.is_some() {
+            champs.push(Champ::Artiste);
+        }
+        if body.album.is_some() || body.album_id.is_some() {
+            champs.push(Champ::Album);
+        }
+        if body.album_artist.is_some() {
+            champs.push(Champ::ArtisteAlbum);
+        }
+        if body.genre.is_some() {
+            champs.push(Champ::Genre);
+        }
+        if body.track_number.is_some() {
+            champs.push(Champ::NumeroPiste);
+        }
+        if body.disc_number.is_some() {
+            champs.push(Champ::NumeroDisque);
+        }
+        if body.year.is_some() {
+            champs.push(Champ::Annee);
+        }
+        if body.composer.is_some() {
+            champs.push(Champ::Compositeur);
+        }
+        if body.label.is_some() {
+            champs.push(Champ::Label);
+        }
+        if let Err(e) = champs_tenus::tenir(&state.backend, &track, &champs) {
+            tracing::warn!(track_id = id, erreur = %e, "edit_track_champs_non_tenus");
+        }
+    }
+
     Json(json!({
         "status": "ok",
         "track_id": id,
@@ -826,7 +867,14 @@ async fn batch_set_artist(
             .backend
             .execute("UPDATE tracks SET artist_id = ?1 WHERE id = ?2", &params)
         {
-            Ok(n) => updated += n as i64,
+            Ok(n) => {
+                updated += n as i64;
+                tune_core::db::champs_tenus::tenir_par_id(
+                    &state.backend,
+                    *id,
+                    &[tune_core::db::champs_tenus::Champ::Artiste],
+                );
+            }
             Err(e) => {
                 tracing::warn!(track_id = *id, error = %e, "batch_set_artist_echec");
                 echecs += 1;

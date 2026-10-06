@@ -2996,3 +2996,15 @@ async fn pg_2094_rattrapage_des_sous_titres_des_coffrets() {
     reset_schema(&db);
     crate::db::coffrets_auto::tests::scenario_rattrapage_par_les_balises_2094(&db);
 }
+
+/// Fil 2094, suite de #5812 — la relecture des fichiers d'un coffret
+/// automatique garde ses numéros et sous-titres de disque, sur le VRAI
+/// moteur : marqueur `coffret` relu par `Tenues::charger` (`JOIN albums`,
+/// marqueur `$1`), puis « Défaire ». Même scénario que
+/// `relecture_coffret_auto_2094_sur_sqlite`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2094_relecture_d_un_coffret_automatique() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_relecture_coffret_auto_2094(&db);
+}

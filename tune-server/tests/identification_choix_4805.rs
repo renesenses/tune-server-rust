@@ -448,3 +448,65 @@ async fn le_compositeur_des_balises_departage_et_les_titres_gardent_les_enregist
         );
     }
 }
+
+/// #4767 / #4805 E — la ré-identification qui CHANGE de pressage remet
+/// `albums.credits_mb_at` à NULL : la passe des crédits remplacera ceux de
+/// l'ancien pressage. Retomber sur le même pressage n'y touche pas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changer_de_pressage_remet_les_credits_a_refaire() {
+    let _serie = SERIE.lock().await;
+    let _compteur = doublure().await;
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    for requete in [
+        // 1 — identifié comme Ocean, crédits déjà passés ; ses balises disent
+        //     un autre pressage.
+        "INSERT INTO albums (id, title, source, musicbrainz_release_id, credits_mb_at) \
+         VALUES (1, 'Dossier 2003', 'local', '0c2a6c47-6f5e-4a54-9d3e-2d3f0b9a1c11', \
+         '2026-10-01T00:00:00Z')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (10, 'Un', 1, 'local', 1, 1)",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (11, 'Deux', 1, 'local', 2, 1)",
+        // 2 — témoin : déjà sur le pressage de ses balises.
+        "INSERT INTO albums (id, title, source, musicbrainz_release_id, credits_mb_at) \
+         VALUES (2, 'Dossier 2004', 'local', '5b11f4ce-a62d-471e-81fc-a69a8278c7da', \
+         '2026-10-01T00:00:00Z')",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (20, 'Un', 2, 'local', 1, 1)",
+        "INSERT INTO tracks (id, title, album_id, source, track_number, disc_number) \
+         VALUES (21, 'Deux', 2, 'local', 2, 1)",
+    ] {
+        state.backend.execute(requete, &[]).unwrap();
+    }
+    for piste in [10i64, 11, 20, 21] {
+        state
+            .backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'mb_release_id', ?)",
+                &[&piste as &dyn ToSqlValue, &MBID_BALISE as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+    let app = tune_server::routes::router(state.clone());
+    let release = "SELECT musicbrainz_release_id FROM albums WHERE id = ?";
+    let credits = "SELECT credits_mb_at FROM albums WHERE id = ?";
+
+    let (status, corps) = appeler(&app, "POST", "/api/v1/library/albums/1/reidentify").await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["verdict"], "reidentified", "{corps}");
+    assert_eq!(colonne(&state, release, 1).as_deref(), Some(MBID_BALISE));
+    assert_eq!(
+        colonne(&state, credits, 1),
+        None,
+        "un autre pressage : les crédits sont à refaire"
+    );
+
+    let (status, corps) = appeler(&app, "POST", "/api/v1/library/albums/2/reidentify").await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["verdict"], "unchanged", "{corps}");
+    assert_eq!(
+        colonne(&state, credits, 2).as_deref(),
+        Some("2026-10-01T00:00:00Z"),
+        "même pressage : les crédits restent"
+    );
+}

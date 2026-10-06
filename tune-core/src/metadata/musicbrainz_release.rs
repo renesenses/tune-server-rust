@@ -202,6 +202,8 @@ pub struct MBReleaseDetail {
     pub artist_credits: Vec<CreditArtiste>,
 }
 
+/// Casse, ponctuation et espaces neutralisés. Partagée avec la passe AcoustID
+/// (`acoustid_picard`), pour qu'un titre se compare de la même façon partout.
 pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -561,6 +563,7 @@ async fn mb_get(path: &str, params: &[(&str, String)]) -> Result<Value, RefusMus
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
         .map_err(|e| {
             debug!(path = path, error = %e, "mb_request_transport_error");
             RefusMusicBrainz::Transport
@@ -1318,7 +1321,15 @@ where
     RechercheDePressages::repondue(candidates)
 }
 
+/// Les `inc` que lit [`parse_release_detail`] : pistes, artistes crédités,
+/// labels.
+pub const INC_DETAIL_RELEASE: &str = "recordings+artist-credits+labels";
+
 /// Fetch a chosen release with its track listing.
+///
+/// Sans base : une requête à chaque appel. Les appelants qui ont une base
+/// passent par [`lookup_release_detail_gardee`], qui garde la réponse pour la
+/// passe des crédits.
 pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> {
     if release_id.trim().is_empty() {
         return None;
@@ -1326,13 +1337,28 @@ pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> 
     let data = mb_get(
         &format!("release/{release_id}"),
         &[
-            ("inc", "recordings+artist-credits+labels".to_string()),
+            ("inc", INC_DETAIL_RELEASE.to_string()),
             ("fmt", "json".to_string()),
         ],
     )
     .await
     .ok()?;
     parse_release_detail(&data)
+}
+
+/// Le détail d'un pressage, lu dans la base s'il y est, sinon demandé UNE fois
+/// avec [`INC_RELEASE_COMPLET`] et gardé (#4805, idée 3 de MetaRust). La passe
+/// des crédits trouvera ensuite la réponse en base et ne refera pas la
+/// requête. Attend le créneau MusicBrainz lui-même, et seulement s'il part sur
+/// le réseau.
+pub async fn lookup_release_detail_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+) -> Option<MBReleaseDetail> {
+    match lire_release_gardee(backend, release_id, INC_DETAIL_RELEASE).await {
+        LectureRelease::Lue(data) => parse_release_detail(&data),
+        LectureRelease::Inconnue | LectureRelease::Panne(_) => None,
+    }
 }
 
 /// Le TYPE DE SORTIE d'un groupe de sortie MusicBrainz (#4767).
@@ -1385,6 +1411,15 @@ pub async fn rate_limit_delay() {
         .await;
 }
 
+/// Rend compte d'une réponse MusicBrainz au limiteur partagé (#4805, 4 bis) :
+/// un `503`/`429` double l'intervalle de la clé [`CLE_LIMITEUR_MUSICBRAINZ`]
+/// (jusqu'à 5 s) en respectant `Retry-After`, un succès le ramène à 1 s.
+/// S'emploie juste après le `send`, souvent en `.inspect(...)` sur le
+/// `Result`.
+pub fn constater_reponse_musicbrainz(reponse: &reqwest::Response) {
+    crate::http::fetch::MUSICBRAINZ.constater_reponse(CLE_LIMITEUR_MUSICBRAINZ, reponse);
+}
+
 /// Issue d'une lecture de release pour la passe des crédits (#4767).
 ///
 /// Trois cas, parce que l'appelant ne fait pas la même chose : une réponse
@@ -1405,10 +1440,132 @@ pub enum LectureRelease {
 pub const INC_CREDITS_RELEASE: &str =
     "recordings+artist-credits+recording-level-rels+work-rels+work-level-rels+artist-rels";
 
+/// Ce que l'identification demande désormais d'un coup : les crédits ET les
+/// labels (#4805, idée 3 de MetaRust). Couvre [`INC_DETAIL_RELEASE`] comme
+/// [`INC_CREDITS_RELEASE`] : la réponse gardée sert aux deux.
+pub const INC_RELEASE_COMPLET: &str =
+    "recordings+artist-credits+labels+recording-level-rels+work-rels+work-level-rels+artist-rels";
+
 /// Lit une release avec toutes ses relations de crédits (#4767). N'attend PAS
 /// le créneau : l'appelant appelle [`rate_limit_delay`] juste avant.
 pub async fn lookup_release_credits(release_id: &str) -> LectureRelease {
     lire_release(release_id, INC_CREDITS_RELEASE, 30).await
+}
+
+/// Une lecture `/release/{id}` avec les `inc` donnés, sans base. N'attend PAS
+/// le créneau : c'est le transport des coutures `*_par`.
+pub async fn lire_release_brute(release_id: &str, inc: &str) -> LectureRelease {
+    lire_release(release_id, inc, 30).await
+}
+
+/// D'où vient une release lue par [`lire_release_gardee_par`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Réponse gardée en base : aucune requête.
+    Base,
+    /// Demandée à MusicBrainz (et gardée si elle a été lue).
+    Reseau,
+}
+
+/// Une release, lue d'abord dans `musicbrainz_release_cache`, sinon demandée
+/// par `interroger` avec [`INC_RELEASE_COMPLET`] et gardée.
+///
+/// `inc_requis` dit ce que l'appelant LIT : une réponse gardée qui ne le
+/// couvre pas, ou périmée, ne sert pas. `interroger` reçoit l'identifiant et
+/// les `inc` à demander ; il porte le transport ET l'attente du créneau
+/// MusicBrainz — ainsi une lecture en base ne réserve aucun créneau.
+///
+/// La couture existe pour que l'économie se compte sans réseau (banc #4805).
+pub async fn lire_release_gardee_par<F, Fut>(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+    inc_requis: &str,
+    interroger: F,
+) -> (LectureRelease, Provenance)
+where
+    F: FnOnce(String, &'static str) -> Fut,
+    Fut: std::future::Future<Output = LectureRelease>,
+{
+    use super::musicbrainz_release_cache as cache;
+    let id = release_id.trim();
+    if id.is_empty() {
+        return (LectureRelease::Inconnue, Provenance::Base);
+    }
+    if let Some(v) = cache::lire(backend, id, inc_requis, chrono::Utc::now()) {
+        debug!(release_id = id, "mb_release_cache_hit");
+        return (LectureRelease::Lue(v), Provenance::Base);
+    }
+    let lecture = interroger(id.to_string(), INC_RELEASE_COMPLET).await;
+    if let LectureRelease::Lue(v) = &lecture {
+        cache::ecrire(backend, id, INC_RELEASE_COMPLET, v, chrono::Utc::now());
+    }
+    (lecture, Provenance::Reseau)
+}
+
+/// [`lire_release_gardee_par`] sur le vrai transport : créneau MusicBrainz
+/// partagé, puis une requête, seulement si la base n'a pas la réponse.
+pub async fn lire_release_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+    inc_requis: &str,
+) -> LectureRelease {
+    lire_release_gardee_par(backend, release_id, inc_requis, |id, inc| async move {
+        rate_limit_delay().await;
+        lire_release_brute(&id, inc).await
+    })
+    .await
+    .0
+}
+
+/// La LECTURE du choix d'édition (#4805 D), adossée à la release gardée en
+/// base (#4805, idée 3) : une lecture `release/{id}` est d'abord cherchée dans
+/// `musicbrainz_release_cache` ; sinon elle part sur le réseau avec
+/// [`INC_RELEASE_COMPLET`] ET les `inc` demandés, et la réponse est gardée —
+/// la passe des crédits la relira sans requête. Les autres chemins
+/// (`recording/{id}`) passent tels quels par `interroger`.
+///
+/// `interroger(chemin, inc)` est le transport : [`lire_sur_musicbrainz`] en
+/// production. La couture sert aux tests, sans réseau.
+pub async fn lire_sur_musicbrainz_gardee_par<F, Fut>(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    chemin: String,
+    inc: &'static str,
+    interroger: F,
+) -> Result<Option<Value>, RefusMusicBrainz>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>, RefusMusicBrainz>>,
+{
+    use super::musicbrainz_release_cache as cache;
+    let Some(id) = chemin.strip_prefix("release/").map(str::trim) else {
+        return interroger(chemin, inc.to_string()).await;
+    };
+    if let Some(v) = cache::lire(backend, id, inc, chrono::Utc::now()) {
+        debug!(release_id = id, "mb_release_cache_hit_choix");
+        return Ok(Some(v));
+    }
+    let inc_reseau = cache::inc_canonique(&format!("{INC_RELEASE_COMPLET}+{inc}"));
+    let lecture = interroger(chemin.clone(), inc_reseau.clone()).await;
+    if let Ok(Some(v)) = &lecture {
+        cache::ecrire(backend, id, &inc_reseau, v, chrono::Utc::now());
+    }
+    lecture
+}
+
+/// [`lire_sur_musicbrainz_gardee_par`] sur le vrai transport.
+pub async fn lire_sur_musicbrainz_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    chemin: String,
+    inc: &'static str,
+) -> Result<Option<Value>, RefusMusicBrainz> {
+    lire_sur_musicbrainz_gardee_par(backend, chemin, inc, |chemin, inc| async move {
+        match mb_get(&chemin, &[("inc", inc), ("fmt", "json".to_string())]).await {
+            Ok(v) => Ok(Some(v)),
+            Err(RefusMusicBrainz::Statut(404 | 400)) => Ok(None),
+            Err(refus) => Err(refus),
+        }
+    })
+    .await
 }
 
 /// Lit les SEULS labels d'une release connue par son MBID (#4836) : la passe
@@ -1440,6 +1597,7 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
         .timeout(std::time::Duration::from_secs(delai_s))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
     {
         Ok(r) => r,
         Err(e) => return LectureRelease::Panne(e.to_string()),
@@ -1456,6 +1614,16 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
         Err(e) => LectureRelease::Panne(e.to_string()),
     }
 }
+
+// Banc « une seule requête de release par album » (#4805, idée 3 de MetaRust).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_release_en_base.rs"]
+mod banc_release_en_base;
+
+// Banc « couverture des crédits des albums identifiés » (#4805, étape E).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_credits_4805.rs"]
+mod banc_credits_4805;
 
 #[cfg(test)]
 mod tests {
