@@ -861,6 +861,13 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
 
+# Une bio d'artiste réécrite à la main perd la provenance (l'attribution
+# CC BY-SA) de l'ancienne. `autotests = false` : sans cette cible, jamais
+# compilé.
+[[test]]
+name = "bio_reecrite_a_la_main"
+path = "tests/bio_reecrite_a_la_main.rs"
+
 # Fil forum 2143 (FabienM), points 5, 6 et 8 — l'album d'un titre de la file :
 # `album_id` / `album_id_service` sur `GET /zones/{id}/queue`, et l'album en
 # cours d'un titre Bandcamp lancé hors de sa page. `autotests = false` plus
