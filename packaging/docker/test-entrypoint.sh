@@ -50,6 +50,8 @@ EOF
 cat > "$stubs/usermod" <<'EOF'
 #!/bin/sh
 echo "usermod $*" >> "$JOURNAL"
+# Like the real one, it chats on stdout (seen in CI: "usermod: no changes").
+echo "usermod: no changes"
 [ "$1 $2 $4" = "-o -u tune" ] && echo "TUNE_UID=$3" >> "$ETAT"
 exit 0
 EOF
@@ -80,7 +82,8 @@ lancer() {
     sortie=0
     erreur="$(env -i PATH="$stubs:/usr/bin:/bin" HOME=/root ETAT="$ETAT" JOURNAL="$JOURNAL" \
         TUNE_ENTRYPOINT_BIN="$stubs/serveur" TUNE_ENTRYPOINT_DATA_DIR="$travail/data" \
-        "$@" sh "$ENTRYPOINT" --un "deux mots" 2>&1 >/dev/null)" || sortie=$?
+        "$@" sh "$ENTRYPOINT" --un "deux mots" 2>&1 >"$travail/stdout")" || sortie=$?
+    stdout="$(cat "$travail/stdout")"
     journal="$(cat "$JOURNAL")"
 }
 
@@ -110,11 +113,11 @@ $journal"; fi
 # 4. Root, PUID=99 PGID=100 (unRAID): re-number, chown /data only, drop.
 lancer 0 PUID=99 PGID=100
 if [ "$sortie" = 0 ] && a "groupmod -o -g 100 tune" && a "usermod -o -u 99 tune" \
-    && a "usermod -g 100 tune" && a "chown -h 99:100 $travail/data" \
+    && ! a "usermod -g" && a "chown -h 99:100 $travail/data" && [ -z "$stdout" ] \
     && ! a "music" \
     && [ "$(tail -n1 <<<"$journal")" = "setpriv --reuid=tune --regid=tune --init-groups $stubs/serveur --un deux mots HOME=/home/tune" ]; then
     ok "root PUID=99 PGID=100 : compte renuméroté, /data rendu, /music intact, bascule"
-else ko "root PUID=99 PGID=100" "sortie=$sortie err=$erreur
+else ko "root PUID=99 PGID=100" "sortie=$sortie err=$erreur stdout=$stdout
 $journal"; fi
 
 # 5. Root, PUID/PGID = owner of the files already: no chown at all.

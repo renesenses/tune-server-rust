@@ -50,14 +50,17 @@ if [ -n "${PUID:-}${PGID:-}" ]; then
     is_uint "$want_gid" || die "PGID must be a number, got '$want_gid'."
     [ "$want_uid" != 0 ] || die "PUID=0 would run Tune as root; use the uid that owns your data folder."
 
+    # Their chatter ("usermod: no changes"...) goes to stderr, never stdout.
     if [ "$want_gid" != "$cur_gid" ]; then
-        groupmod -o -g "$want_gid" "$TUNE_USER"
+        groupmod -o -g "$want_gid" "$TUNE_USER" >&2
     fi
     if [ "$want_uid" != "$cur_uid" ]; then
-        usermod -o -u "$want_uid" "$TUNE_USER"
+        usermod -o -u "$want_uid" "$TUNE_USER" >&2
     fi
-    # usermod keeps the primary group by name; make sure it is the new gid.
-    usermod -g "$want_gid" "$TUNE_USER"
+    # groupmod normally moves the primary group too; only fix it if not.
+    if [ "$(id -g "$TUNE_USER")" != "$want_gid" ]; then
+        usermod -g "$want_gid" "$TUNE_USER" >&2
+    fi
 
     if [ -d "$DATA_DIR" ]; then
         # Only what is not already ours: a restart costs one walk, no write.
