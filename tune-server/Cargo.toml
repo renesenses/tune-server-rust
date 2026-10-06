@@ -1298,6 +1298,11 @@ path = "tests/identification_lot_4805.rs"
 name = "labels_par_le_pilote_4836"
 path = "tests/labels_par_le_pilote_4836.rs"
 
+# #4805 D — le pilote part des identifiants des balises, et s'abstient quand
+# le pressage est ambigu (doublure MusicBrainz locale).
+[[test]]
+name = "identification_choix_4805"
+path = "tests/identification_choix_4805.rs"
 # #4805 (idée 4) — la passe par empreinte AcoustID, par la route montée, sur
 # des réponses enregistrées et un faux `fpcalc`. `autotests = false` en tête de
 # ce manifeste : sans cette cible, le fichier ne serait jamais compilé.

@@ -193,6 +193,34 @@ pub fn restore_album_identification(
     Ok(())
 }
 
+/// Remet à refaire la passe des crédits (#4767) d'un album qui vient de
+/// CHANGER de pressage : `albums.credits_mb_at` repasse à `NULL`.
+///
+/// Sans cela, le curseur posé pour l'ancien pressage tenait l'album hors de
+/// la passe (`credits_release::albums_candidats` ne prend que les
+/// `credits_mb_at IS NULL`), et les crédits de l'ancien pressage restaient
+/// sur les pistes du nouveau. La passe suivante les remplace
+/// (`DELETE` + `INSERT` par piste).
+///
+/// Rien n'est touché quand le pressage reste le même (`unchanged`) : ses
+/// crédits sont toujours les bons. Renvoie `true` si le curseur a été effacé.
+pub fn oublier_les_credits_si_le_pressage_change(
+    backend: &Arc<dyn DbBackend>,
+    album_id: i64,
+    pressage_d_avant: Option<&str>,
+    pressage_pose: &str,
+) -> Result<bool, String> {
+    if pressage_d_avant.map(str::trim) == Some(pressage_pose.trim()) {
+        return Ok(false);
+    }
+    let null_text = crate::db::backend::SqlValue::NullText;
+    backend.execute(
+        "UPDATE albums SET credits_mb_at = ? WHERE id = ?",
+        &[&null_text as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
+    )?;
+    Ok(true)
+}
+
 /// Une piste locale, réduite à ce qui sert à la faire correspondre.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTrack {
@@ -663,6 +691,36 @@ mod tests {
         assert!(clear_album_identification(&backend, 999).is_err());
         // Et rien n'a bouge.
         assert_eq!(recording_id(&backend, 10), Some("rec-FAUX-1".to_string()));
+    }
+
+    fn credits(backend: &Arc<dyn DbBackend>, id: i64) -> Option<String> {
+        backend
+            .query_one(
+                "SELECT credits_mb_at FROM albums WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
+    }
+
+    #[test]
+    fn changer_de_pressage_remet_les_credits_a_refaire() {
+        let b = setup();
+        b.execute(
+            "UPDATE albums SET credits_mb_at = '2026-10-01T00:00:00Z' WHERE id IN (1, 2)",
+            &[],
+        )
+        .unwrap();
+        // Même pressage : le curseur reste.
+        assert!(!oublier_les_credits_si_le_pressage_change(&b, 1, Some("rel-a"), "rel-a").unwrap());
+        assert!(credits(&b, 1).is_some());
+        // Autre pressage : le curseur repasse à NULL, cet album seul.
+        assert!(oublier_les_credits_si_le_pressage_change(&b, 1, Some("rel-a"), "rel-b").unwrap());
+        assert_eq!(credits(&b, 1), None);
+        assert!(credits(&b, 2).is_some(), "l'album voisin garde son curseur");
+        // Jamais identifié avant : le curseur repasse aussi à NULL.
+        assert!(oublier_les_credits_si_le_pressage_change(&b, 2, None, "rel-c").unwrap());
+        assert_eq!(credits(&b, 2), None);
     }
 
     #[test]
