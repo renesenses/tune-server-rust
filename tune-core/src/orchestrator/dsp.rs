@@ -1951,8 +1951,18 @@ impl PlaybackOrchestrator {
     /// que [`Self::traitement_que_pure_gouverne`] lise la même clé avec les
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
+    ///
+    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed
+    /// traite la zone (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
+    /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
+    /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)
+        let reglage =
+            Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)?;
+        let tiers = self.etages_tiers_configures(zone_id);
+        crate::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&tiers)
+            .is_none()
+            .then_some(reglage)
     }
 
     /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
