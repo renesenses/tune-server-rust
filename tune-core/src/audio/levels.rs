@@ -67,6 +67,107 @@ pub struct AudioLevels {
     /// l'orchestrateur de cadencer l'émission sur l'horloge de lecture
     /// (le décodage va bien plus vite que le temps réel).
     pub window: std::time::Duration,
+    /// #4969 — le niveau de CHAQUE canal, dans l'ordre des canaux du flux.
+    ///
+    /// Vide en mono et en stéréo : `rms_*` / `peak_*` disent déjà tout, et la
+    /// boucle stéréo ne paie rien de plus. Rempli dès trois canaux, où les
+    /// champs gauche/droite ne lisaient que les canaux 0 et 1 : le centre, le
+    /// LFE et les surrounds n'étaient jamais mesurés, et aucun client ne
+    /// pouvait montrer qu'un « 5.1 » a un LFE muet ou un centre vide.
+    ///
+    /// Même échelle et même gain que `rms_*` / `peak_*` (le gain de sortie
+    /// compris, #4384), mesuré sur le PCM qu'analyse le forwarder.
+    pub canaux: Vec<NiveauDeCanal>,
+}
+
+/// #4969 — le niveau d'UN canal d'une fenêtre multicanale.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NiveauDeCanal {
+    /// RMS linéaire (1,0 = pleine échelle).
+    pub rms: f64,
+    /// Crête linéaire (1,0 = pleine échelle).
+    pub peak: f64,
+    /// Plus longue suite d'échantillons consécutifs à pleine échelle, même
+    /// règle que `over_run_left` / `over_run_right` (#4175).
+    pub over_run: u32,
+}
+
+impl NiveauDeCanal {
+    pub fn rms_db(&self) -> f32 {
+        to_db(self.rms)
+    }
+    pub fn peak_db(&self) -> f32 {
+        to_db(self.peak)
+    }
+    pub fn over(&self) -> bool {
+        self.over_run >= OVER_RUN_SAMPLES
+    }
+}
+
+/// #4969 — le nom de chaque canal dans l'ORDRE PAR DÉFAUT des canaux FLAC et
+/// WAV (affectation de canaux de FLAC, masque par défaut de
+/// WAVEFORMATEXTENSIBLE), pour 3 à 8 canaux : les noms de haut-parleurs de ce
+/// masque (FL, FR, FC, LFE, BL, BR, BC, SL, SR).
+///
+/// C'est l'ordre où le décodeur rend les canaux. Ce n'est PAS une disposition
+/// lue dans le fichier : un fichier qui déclare un masque inhabituel aura des
+/// noms faux, d'où `None` au-delà de 8 canaux, où aucun ordre par défaut ne
+/// fait foi. Un client qui n'a pas de nom affiche le numéro du canal.
+pub fn noms_des_canaux_par_defaut(channels: u16) -> Option<&'static [&'static str]> {
+    match channels {
+        3 => Some(&["FL", "FR", "FC"]),
+        4 => Some(&["FL", "FR", "BL", "BR"]),
+        5 => Some(&["FL", "FR", "FC", "BL", "BR"]),
+        6 => Some(&["FL", "FR", "FC", "LFE", "BL", "BR"]),
+        7 => Some(&["FL", "FR", "FC", "LFE", "BC", "SL", "SR"]),
+        8 => Some(&["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]),
+        _ => None,
+    }
+}
+
+/// #4969 — une passe par canal, seulement au-delà de la stéréo : la boucle
+/// stéréo de [`compute_levels_avec_gain`] reste intacte, et son coût aussi.
+fn niveaux_par_canal(
+    pcm: &[u8],
+    bytes_per_sample: usize,
+    channels: usize,
+    bit_depth: u16,
+    gain: f64,
+) -> Vec<NiveauDeCanal> {
+    if channels <= 2 {
+        return Vec::new();
+    }
+    let frame_size = bytes_per_sample * channels;
+    let pleine_echelle = pleine_echelle_normalisee(bit_depth);
+    let mut somme_carres = vec![0.0_f64; channels];
+    let mut crete = vec![0.0_f64; channels];
+    let mut suite = vec![0_u32; channels];
+    let mut over = vec![0_u32; channels];
+    let mut trames = 0_usize;
+    for frame in pcm.chunks_exact(frame_size) {
+        for c in 0..channels {
+            let s = read_sample(frame, c * bytes_per_sample, bytes_per_sample, bit_depth) * gain;
+            somme_carres[c] += s * s;
+            crete[c] = crete[c].max(s.abs());
+            suite[c] = if s.abs() >= pleine_echelle {
+                suite[c] + 1
+            } else {
+                0
+            };
+            over[c] = over[c].max(suite[c]);
+        }
+        trames += 1;
+    }
+    if trames == 0 {
+        return Vec::new();
+    }
+    (0..channels)
+        .map(|c| NiveauDeCanal {
+            rms: (somme_carres[c] / trames as f64).sqrt(),
+            peak: crete[c],
+            over_run: over[c],
+        })
+        .collect()
 }
 
 /// Nombre d'échantillons consécutifs à pleine échelle à partir duquel on
@@ -551,6 +652,7 @@ pub fn compute_levels_avec_gain(
         } else {
             std::time::Duration::ZERO
         },
+        canaux: niveaux_par_canal(pcm, bytes_per_sample, channels as usize, bit_depth, gain),
     }
 }
 
@@ -1556,5 +1658,117 @@ mod tests_over_pleine_echelle_4175 {
         assert!((pleine_echelle_normalisee(16) - 32767.0 / 32768.0).abs() < 1e-12);
         assert!((pleine_echelle_normalisee(24) - 8_388_607.0 / 8_388_608.0).abs() < 1e-12);
         assert!(pleine_echelle_normalisee(8).is_infinite());
+    }
+}
+
+/// #4969 (Gros Bidon, fil 1929) — « savoir si tous les canaux sont réellement
+/// utilisés » : un LFE muet, un centre vide, un « 7.1 » qui n'est qu'un 5.1.
+/// Les niveaux gauche/droite ne lisaient que les canaux 0 et 1.
+#[cfg(test)]
+mod tests_niveaux_par_canal_4969 {
+    use super::*;
+
+    /// 16 bits, `amplitudes.len()` canaux : un sinus 1 kHz d'amplitude
+    /// `amplitudes[c]` sur le canal `c`, 4 800 trames à 48 kHz.
+    fn pcm_multicanal(amplitudes: &[f64]) -> Vec<u8> {
+        let mut pcm = Vec::new();
+        for n in 0..4_800u32 {
+            let phase = 2.0 * std::f64::consts::PI * 1_000.0 * f64::from(n) / 48_000.0;
+            for a in amplitudes {
+                let v = (a * phase.sin() * f64::from(i16::MAX)) as i16;
+                pcm.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        pcm
+    }
+
+    #[test]
+    fn un_5_1_au_lfe_muet_le_dit_canal_par_canal() {
+        // FL FR FC LFE BL BR : LFE (canal 3) muet, centre à −12 dB.
+        let amplitudes = [0.5, 0.5, 0.125, 0.0, 0.25, 0.25];
+        let lvl = compute_levels(&pcm_multicanal(&amplitudes), 16, 6, 48_000);
+        assert_eq!(
+            lvl.canaux.len(),
+            6,
+            "un flux 5.1 doit rendre six niveaux, pas seulement gauche et droite"
+        );
+        assert_eq!(
+            lvl.canaux[3].peak_db(),
+            -96.0,
+            "le LFE muet doit lire le plancher"
+        );
+        assert_eq!(lvl.canaux[3].rms_db(), -96.0);
+        for (c, a) in amplitudes.iter().enumerate().filter(|(_, a)| **a > 0.0) {
+            let attendu = 20.0 * a.log10();
+            assert!(
+                (f64::from(lvl.canaux[c].peak_db()) - attendu).abs() < 0.1,
+                "canal {c} : crête {} dB, attendu {attendu:.2}",
+                lvl.canaux[c].peak_db()
+            );
+            // Sinus : RMS = crête − 3,01 dB.
+            assert!(
+                (f64::from(lvl.canaux[c].rms_db()) - (attendu - 3.0103)).abs() < 0.1,
+                "canal {c} : RMS {} dB",
+                lvl.canaux[c].rms_db()
+            );
+        }
+        // Les deux premiers canaux et les champs historiques disent la même chose.
+        assert_eq!(lvl.canaux[0].peak, lvl.peak_left);
+        assert_eq!(lvl.canaux[1].peak, lvl.peak_right);
+        assert_eq!(lvl.canaux[0].rms, lvl.rms_left);
+    }
+
+    #[test]
+    fn le_gain_de_sortie_s_applique_a_chaque_canal() {
+        let pcm = pcm_multicanal(&[0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
+        let lvl = compute_levels_avec_gain(&pcm, 16, 6, 48_000, 0.5);
+        assert_eq!(lvl.canaux.len(), 6);
+        for (c, canal) in lvl.canaux.iter().enumerate() {
+            assert!(
+                (f64::from(canal.peak_db()) - 20.0 * 0.25_f64.log10()).abs() < 0.1,
+                "canal {c} : le gain ×0,5 doit baisser la crête de 6 dB"
+            );
+        }
+    }
+
+    #[test]
+    fn la_surcharge_se_lit_sur_le_canal_qui_ecrete() {
+        // Trois trames 3 canaux : seul le centre est à pleine échelle.
+        let mut pcm = Vec::new();
+        for _ in 0..3 {
+            for v in [0_i16, 0, i16::MAX] {
+                pcm.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let lvl = compute_levels(&pcm, 16, 3, 48_000);
+        assert!(
+            lvl.canaux[2].over(),
+            "trois pleines échelles d'affilée sur FC"
+        );
+        assert!(!lvl.canaux[0].over() && !lvl.canaux[1].over());
+    }
+
+    #[test]
+    fn la_stereo_ne_change_pas_de_contrat() {
+        let lvl = compute_levels(&pcm_multicanal(&[0.5, 0.5]), 16, 2, 48_000);
+        assert!(
+            lvl.canaux.is_empty(),
+            "stéréo : les champs gauche/droite suffisent"
+        );
+        let lvl = compute_levels(&pcm_multicanal(&[0.5]), 16, 1, 48_000);
+        assert!(lvl.canaux.is_empty());
+    }
+
+    #[test]
+    fn les_noms_suivent_l_ordre_par_defaut_et_s_arretent_a_huit() {
+        assert_eq!(
+            noms_des_canaux_par_defaut(6),
+            Some(&["FL", "FR", "FC", "LFE", "BL", "BR"][..])
+        );
+        assert_eq!(noms_des_canaux_par_defaut(8).map(<[_]>::len), Some(8));
+        assert_eq!(noms_des_canaux_par_defaut(7).map(<[_]>::len), Some(7));
+        for n in [0, 1, 2, 9, 12, 24] {
+            assert_eq!(noms_des_canaux_par_defaut(n), None, "{n} canaux");
+        }
     }
 }
