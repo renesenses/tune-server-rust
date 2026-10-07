@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::home_queries;
+use tune_core::db::home_queries::TriAjouts;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -52,6 +53,23 @@ struct RecentlyAddedParams {
     limit: Option<i64>,
     /// Largeur de la fenetre en jours. Absent ⇒ [`FENETRE_JOURS_DEFAUT`].
     days: Option<i64>,
+    /// `modification` (defaut, le tri historique) ou `creation` (#5402).
+    /// Toute autre valeur : 400.
+    tri: Option<String>,
+}
+
+/// Le tri demande, ou le refus qui dit les valeurs admises (#5402). Absent ⇒
+/// le tri historique : un client deja deploye ne voit rien changer.
+fn tri_demande(tri: Option<&str>) -> Result<TriAjouts, AppError> {
+    match tri {
+        None => Ok(TriAjouts::default()),
+        Some(v) => TriAjouts::depuis_parametre(v).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "tri={v} inconnu : les ajouts recents se trient par `modification` \
+                 (defaut) ou par `creation`"
+            ))
+        }),
+    }
 }
 
 /// La fenetre servie quand le client n'en demande aucune.
@@ -1788,7 +1806,8 @@ async fn recently_added(
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
     let depuis = borne_basse_de_fenetre(p.days)?;
-    let items = fetch_recently_added(&state, limit, depuis)?;
+    let tri = tri_demande(p.tri.as_deref())?;
+    let items = fetch_recently_added_par(&state, limit, depuis, tri)?;
     Ok(Json(json!(items)))
 }
 
@@ -1803,8 +1822,9 @@ async fn recently_added_summary(
     Query(p): Query<RecentlyAddedParams>,
 ) -> Result<Json<Value>, AppError> {
     let depuis = borne_basse_de_fenetre(p.days)?;
+    let tri = tri_demande(p.tri.as_deref())?;
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added_totaux(engine);
+    let sql = home_queries::recently_added_totaux_par(engine, tri);
     let params: [&dyn ToSqlValue; 1] = [&depuis];
     let rows = state
         .backend
@@ -1822,6 +1842,13 @@ async fn recently_added_summary(
         // valeurs que l'ecran affiche telle quelle (« 5 h 55 min »), et la
         // division n'a pas a etre refaite par chaque client.
         "duration_seconds": duree_ms / 1000,
+        // #5402 — le tri servi, et les pistes de la fenetre sans date de
+        // creation (NFS, SMB, Docker, ou scannees avant la colonne). En tri
+        // par creation, celles-la sont rangees par leur date d'ajout : l'ecran
+        // le dit. La presence de `tri` dit aussi au client que le serveur
+        // connait le parametre.
+        "tri": tri.nom(),
+        "tracks_without_creation_date": nombre(3),
     })))
 }
 
@@ -1838,8 +1865,19 @@ async fn recently_added_summary(
 /// de [`borne_basse_de_fenetre`], qui l'a deja bornee. Elle etait auparavant
 /// recalculee ici a 7 jours en dur, hors d'atteinte de tout appelant (#3039).
 fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec<Value>, AppError> {
+    fetch_recently_added_par(state, limit, depuis, TriAjouts::default())
+}
+
+/// [`fetch_recently_added`] pour le tri choisi (#5402). `added_at` porte alors
+/// la date de ce tri.
+fn fetch_recently_added_par(
+    state: &AppState,
+    limit: i64,
+    depuis: f64,
+    tri: TriAjouts,
+) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added(engine);
+    let sql = home_queries::recently_added_par(engine, tri);
     let params: [&dyn ToSqlValue; 2] = [&depuis, &limit];
     let rows = state
         .backend

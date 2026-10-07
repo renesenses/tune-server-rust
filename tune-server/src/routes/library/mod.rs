@@ -43,6 +43,9 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
+// fichiers de CETTE machine.
+mod reveler;
 mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
@@ -335,6 +338,9 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // tune-web-client#1875 — admin, depuis cette machine seulement.
+        .route("/reveal/available", get(reveler::revelation_disponible))
+        .route("/albums/{id}/reveal", post(reveler::reveler_album))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}/editions", get(albums::album_editions))
         // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.

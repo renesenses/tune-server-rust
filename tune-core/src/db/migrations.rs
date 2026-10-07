@@ -2348,7 +2348,38 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "tracks_audio_pcm_key",
         up: "",
     },
+    // #5402 — la date de CRÉATION d'un fichier, `file_first_seen.created_at`,
+    // à côté de sa première vue. `first_seen_at` reste la date d'ajout
+    // (modification d'abord, #4546) ; `created_at` porte le btime que le
+    // système donne, NULL quand il n'en donne pas (NFS, SMB, Docker). Le tri
+    // « par création » des ajouts récents la lit, et retombe sur la date
+    // d'ajout quand elle manque. Aucun rattrapage : seuls les fichiers
+    // nouveaux ou rescannés la reçoivent.
+    //
+    // Numérotée 120 / PG 084 : la 119 / PG 083 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et aucune PR ouverte ne prend la
+    // 120 ni la 084.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version et
+    // dans la passe finale, PAS dans `up` : la table vient aussi de la passe
+    // finale, et un ALTER TABLE rejoué échouerait. Jumelle PG : 084.
+    Migration {
+        version: 120,
+        name: "file_first_seen_created_at",
+        up: "",
+    },
 ];
+
+/// La colonne de la migration 120 (#5402). La table d'abord : elle n'est
+/// garantie que par la passe finale, qui tourne APRÈS les blocs de version.
+fn date_de_creation_des_fichiers(db: &SqliteDb) {
+    if let Err(e) = db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at REAL NOT NULL);",
+    ) {
+        warn!(erreur = %e, "migration_120_table_file_first_seen");
+    }
+    add_column_if_missing(db, "file_first_seen", "created_at", "REAL");
+}
 
 /// L'index de la migration 119 (#5594). `IF NOT EXISTS` : rejouable, et posé
 /// par la migration ET par la passe finale de `run_migrations`.
@@ -3460,6 +3491,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // pas de clé, jamais lu.
             cle_pcm_des_pistes(db);
         }
+        if migration.version == 120 {
+            // Date de création des fichiers (#5402). Sans défaut : NULL =
+            // inconnue, le tri retombe sur la date d'ajout.
+            date_de_creation_des_fichiers(db);
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -4011,6 +4047,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
     // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.
     cle_pcm_des_pistes(db);
+    // Date de création des fichiers (migration 120, #5402) — posée ICI
+    // aussi : le scan l'écrit et le tri « par création » la NOMME. PG :
+    // migration 084.
+    date_de_creation_des_fichiers(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4782,6 +4822,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         83,
         "tracks_audio_pcm_key",
         include_str!("../../migrations/postgres/083_tracks_audio_pcm_key.sql"),
+    ),
+    // Jumelle de la SQLite 120 (#5402) : `file_first_seen.created_at`, la
+    // date de création d'un fichier, NULL quand le système ne la donne pas.
+    (
+        84,
+        "file_first_seen_created_at",
+        include_str!("../../migrations/postgres/084_file_first_seen_created_at.sql"),
     ),
 ];
 
@@ -7119,6 +7166,31 @@ mod tests {
         }
     }
 
+    /// #5402 — la migration 120 pose `file_first_seen.created_at`, sur une
+    /// base neuve comme sur une base arrêtée à la 119.
+    #[test]
+    fn migration_120_pose_la_date_de_creation_des_fichiers() {
+        let a_la_colonne = |db: &SqliteDb| {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(file_first_seen)").unwrap();
+            let colonnes: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            colonnes.iter().any(|c| c == "created_at")
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert!(a_la_colonne(&neuve), "base neuve sans `created_at`");
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 120 && m.name == "file_first_seen_created_at")
+        );
+    }
+
     /// Section « Live » — la migration 117 pose `albums.release_secondary_types`
     /// sur une base ANCIENNE (sans toucher aux lignes, qui naissent INCONNUES)
     /// comme sur une base NEUVE, et sa jumelle PG 081 est enregistrée.
@@ -7686,7 +7758,10 @@ mod tests {
         // 83 : `tracks_audio_pcm_key` (#5594), jumelle de la SQLite 119. La
         // 82 est celle de #5827 : tant qu'elle n'est pas fusionnée, la garde
         // de contiguïté ci-dessus rougit, et c'est voulu.
-        assert_eq!(pg_latest_version(), 83, "latest PG migration must be 83");
+        // 84 : `file_first_seen_created_at` (#5402), jumelle de la SQLite 120.
+        // Pose `file_first_seen.created_at`, que le scan écrit et que le tri
+        // « par création » des ajouts récents NOMME.
+        assert_eq!(pg_latest_version(), 84, "latest PG migration must be 84");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

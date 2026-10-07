@@ -240,6 +240,7 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
         let mut s = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
@@ -306,6 +307,7 @@ mod tests {
             backend: orch.db.clone(),
             orchestrator: orch.clone(),
             playback: orch.playback.clone(),
+            scan: None,
         });
         tune_core::plugin_sdk::TunePlugin::teardown(&mut greffon)
             .await
@@ -338,6 +340,7 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
         publication.publier_sans_lecteur();
@@ -403,6 +406,7 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
         let s = Surveillant::new(lecteur.clone(), hote, routes.zones.clone())
@@ -449,6 +453,7 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            extraction: None,
         };
         PublicationSource::new(registre.clone(), &routes).publier_sans_lecteur();
         let l = registre.lister();

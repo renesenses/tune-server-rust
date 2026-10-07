@@ -24,12 +24,25 @@ pub struct InfosDisque {
     pub pochette: Option<String>,
     /// Titres par numéro de piste (position sur le support).
     pub pistes: HashMap<u8, InfosPiste>,
+    /// #2466 — pour les balises de l'extraction : identifiants MusicBrainz
+    /// des artistes du crédit de la sortie, date de sortie, position du
+    /// support dans la sortie (1 par défaut) et nombre de supports.
+    pub artiste_ids: Vec<String>,
+    pub date: Option<String>,
+    pub disque: u32,
+    pub disques: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InfosPiste {
     pub titre: String,
     pub artiste: Option<String>,
+    /// #2466 — l'enregistrement (`MUSICBRAINZ_TRACKID` en Vorbis), la piste
+    /// de CETTE sortie (`MUSICBRAINZ_RELEASETRACKID`) et les artistes du
+    /// crédit de la piste.
+    pub recording_id: Option<String>,
+    pub piste_id: Option<String>,
+    pub artiste_ids: Vec<String>,
 }
 
 /// La source des métadonnées d'un disque. Un trait pour que les routes se
@@ -54,6 +67,24 @@ fn credit(v: Option<&Value>) -> Option<String> {
         .collect();
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+/// Les identifiants MusicBrainz des artistes d'un crédit, dans l'ordre.
+fn ids_du_credit(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("artist")?.get("id")?.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn texte(v: &Value, cle: &str) -> Option<String> {
+    v.get(cle)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Lit une réponse `/ws/2/discid/<id>?inc=recordings+artist-credits`.
@@ -93,11 +124,15 @@ pub fn lire_reponse(reponse: &Value, disc_id: &str) -> Option<InfosDisque> {
                 continue;
             }
             let artiste_piste = credit(t.get("artist-credit")).filter(|a| *a != artiste);
+            let ids_piste = ids_du_credit(t.get("artist-credit"));
             pistes.insert(
                 pos as u8,
                 InfosPiste {
                     titre,
                     artiste: artiste_piste,
+                    recording_id: t.get("recording").and_then(|r| texte(r, "id")),
+                    piste_id: texte(t, "id"),
+                    artiste_ids: ids_piste,
                 },
             );
         }
@@ -126,6 +161,14 @@ pub fn lire_reponse(reponse: &Value, disc_id: &str) -> Option<InfosDisque> {
             release_id,
             pochette,
             pistes,
+            artiste_ids: ids_du_credit(release.get("artist-credit")),
+            date: texte(release, "date"),
+            disque: support
+                .get("position")
+                .and_then(Value::as_u64)
+                .filter(|p| *p > 0)
+                .unwrap_or(1) as u32,
+            disques: (media.len() as u32).max(1),
         });
     }
     None
@@ -216,6 +259,33 @@ mod tests {
                 .unwrap()
                 .starts_with("https://coverartarchive.org/release/")
         );
+    }
+
+    /// #2466 — les identifiants que l'extraction écrit en balises : ceux de
+    /// la sortie, de l'enregistrement, de la piste et des artistes, plus la
+    /// position du support dans un coffret.
+    #[test]
+    fn les_identifiants_et_la_position_du_support_sont_lus() {
+        let v = serde_json::json!({ "releases": [{
+            "id": "rel-1", "title": "Coffret", "date": "1999-05-01",
+            "artist-credit": [{ "name": "A", "joinphrase": "", "artist": { "id": "art-a" } }],
+            "media": [
+                { "position": 1, "discs": [{ "id": "autre" }], "tracks": [] },
+                { "position": 2, "discs": [{ "id": "ce-disque" }], "tracks": [
+                    { "id": "trk-1", "position": 1, "title": "Un",
+                      "recording": { "id": "rec-1" },
+                      "artist-credit": [{ "name": "B", "artist": { "id": "art-b" } }] }
+                ] }
+            ]
+        }]});
+        let i = lire_reponse(&v, "ce-disque").unwrap();
+        assert_eq!((i.disque, i.disques), (2, 2));
+        assert_eq!(i.date.as_deref(), Some("1999-05-01"));
+        assert_eq!(i.artiste_ids, vec!["art-a".to_string()]);
+        let p = &i.pistes[&1];
+        assert_eq!(p.recording_id.as_deref(), Some("rec-1"));
+        assert_eq!(p.piste_id.as_deref(), Some("trk-1"));
+        assert_eq!(p.artiste_ids, vec!["art-b".to_string()]);
     }
 
     #[test]
