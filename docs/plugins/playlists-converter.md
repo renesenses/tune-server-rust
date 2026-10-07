@@ -39,6 +39,7 @@ qu'un, celui-ci :
 | `POST /playlist-transfer/transfer` et `/preview` (`tune_core::playlist_transfer`) | **Retirés** : aucun client ne les appelait. |
 | `POST /playlist-manager/batch-transfer` — écrivait « started » et ne transférait rien | **Retiré.** Le mode par lot est celui du greffon (`/apercu` avec plusieurs playlists). |
 | `GET /playlist-manager/history` — l'historique du seul premier moteur | Montre les **lots du greffon** (`id` = numéro du lot, `lot_id` = `lot-N`), quel que soit le chemin emprunté, puis les entrées de l'ancien moteur, figées. Détail : `/history/lot-N`. |
+| `/playlist-manager/links*` (liens) et `/playlist-manager/backup(s)*` (sauvegardes) — doublons de `/liens` et des snapshots | **Alias dépréciés** pendant une version : ils répondent comme avant, avec `Deprecation: @1791331200` (RFC 9745) et un `Link` `rel="successor-version"` vers `/liens` ou `/snapshots`. Les clients livrés passent par le greffon. Suppression dans la version suivante (`routes/playlist_manager_deprecie.rs`). |
 
 La route historique appelle le greffon **au nom du profil de l'appelant**
 (`X-Profile-Id`) : une playlist locale lue ou créée l'est sous ce profil.
