@@ -473,7 +473,7 @@ async fn la_regle_se_regle_se_relit_et_refuse_l_illisible() {
         (s, v),
         (
             StatusCode::OK,
-            json!({"rule": "local", "origin": "default"})
+            json!({"rule": "local", "origin": "default", "scope": "global", "profile_id": null})
         )
     );
 
@@ -488,7 +488,7 @@ async fn la_regle_se_regle_se_relit_et_refuse_l_illisible() {
         (s, v),
         (
             StatusCode::OK,
-            json!({"rule": "quality", "origin": "setting"})
+            json!({"rule": "quality", "origin": "setting", "scope": "global", "profile_id": null})
         )
     );
 
@@ -527,7 +527,7 @@ async fn la_regle_se_regle_se_relit_et_refuse_l_illisible() {
         (s, v),
         (
             StatusCode::OK,
-            json!({"rule": "local", "origin": "default"})
+            json!({"rule": "local", "origin": "default", "scope": "global", "profile_id": null})
         )
     );
 
@@ -632,4 +632,121 @@ async fn un_autre_isrc_ferme_le_groupe_et_rend_les_muets_ambigus() {
             "{seul} seul : {g:?}"
         );
     }
+}
+
+// ─── La règle par profil (décision 3 du 07/10/2026) ──────────────────────
+
+async fn appeler_en_tant_que(
+    state: &AppState,
+    profil: i64,
+    methode: &str,
+    url: &str,
+    corps: Option<Value>,
+) -> (StatusCode, Value) {
+    let app = crate::routes::router(state.clone());
+    let mut req = Request::builder()
+        .method(methode)
+        .uri(url)
+        .header("X-Profile-Id", profil.to_string());
+    let body = match corps {
+        Some(c) => {
+            req = req.header("content-type", "application/json");
+            Body::from(c.to_string())
+        }
+        None => Body::empty(),
+    };
+    let reponse = app.oneshot(req.body(body).unwrap()).await.unwrap();
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn la_regle_se_regle_par_profil_avec_repli_sur_le_defaut_global() {
+    let b = banc().await;
+    let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(b.state.backend.clone());
+    let p2 = profils.create("p2-2264", None, None).unwrap();
+    let p3 = profils.create("p3-2264", None, None).unwrap();
+    const ROUTE: &str = "/api/v1/library/versions/rule";
+
+    // Défaut global : quality (sans en-tête, le contrat d'avant).
+    appeler(&b.state, "PUT", ROUTE, Some(json!({"rule": "quality"}))).await;
+
+    // Le profil 2 règle la sienne.
+    let (s, v) = appeler_en_tant_que(
+        &b.state,
+        p2,
+        "PUT",
+        ROUTE,
+        Some(json!({"rule": "service:tidal"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        v,
+        json!({"rule": "service:tidal", "origin": "profile", "scope": "profile", "profile_id": p2})
+    );
+
+    // Contre-épreuves : le profil 3 suit le global, le global n'a pas bougé.
+    let (_, v) = appeler_en_tant_que(&b.state, p3, "GET", ROUTE, None).await;
+    assert_eq!(
+        v,
+        json!({"rule": "quality", "origin": "setting", "scope": "profile", "profile_id": p3})
+    );
+    let (_, v) = appeler(&b.state, "GET", ROUTE, None).await;
+    assert_eq!(v["rule"], json!("quality"));
+    assert_eq!(v["scope"], json!("global"));
+
+    // Les groupes appliquent la règle du profil qui les demande.
+    let groupes = format!("/api/v1/library/tracks/{}/versions/groups", b.reference);
+    let (_, corps) = appeler_en_tant_que(&b.state, p2, "GET", &groupes, None).await;
+    assert_eq!(corps["rule"], json!("service:tidal"));
+    assert_eq!(corps["rule_origin"], json!("profile"));
+
+    // `?scope=global` règle le global même avec l'en-tête.
+    let (_, v) = appeler_en_tant_que(
+        &b.state,
+        p2,
+        "PUT",
+        &format!("{ROUTE}?scope=global"),
+        Some(json!({"rule": "local"})),
+    )
+    .await;
+    assert_eq!(v["scope"], json!("global"));
+    let (_, v) = appeler_en_tant_que(&b.state, p2, "GET", ROUTE, None).await;
+    assert_eq!(
+        v["rule"],
+        json!("service:tidal"),
+        "celle du profil tient toujours"
+    );
+
+    // `null` rend le profil au défaut global.
+    let (_, v) = appeler_en_tant_que(&b.state, p2, "PUT", ROUTE, Some(json!({"rule": null}))).await;
+    assert_eq!(
+        v,
+        json!({"rule": "local", "origin": "setting", "scope": "profile", "profile_id": p2})
+    );
+}
+
+#[tokio::test]
+async fn un_profil_inconnu_ne_regle_rien() {
+    let b = banc().await;
+    const ROUTE: &str = "/api/v1/library/versions/rule";
+    let (s, _) = appeler_en_tant_que(
+        &b.state,
+        999,
+        "PUT",
+        ROUTE,
+        Some(json!({"rule": "quality"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Ni le profil actif (1), ni le global n'ont été écrits.
+    let (_, v) = appeler_en_tant_que(&b.state, 1, "GET", ROUTE, None).await;
+    assert_eq!(v["origin"], json!("default"));
 }

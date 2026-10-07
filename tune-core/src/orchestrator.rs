@@ -1217,6 +1217,9 @@ pub struct PlaybackOrchestrator {
     /// #5065 — le registre commun des sources physiques (CD, entrées…).
     /// Voir `crate::sources_physiques`.
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
+    /// #2264 — la mémoire de la règle de version : choix explicites en
+    /// attente, réponses des services. Voir `version_de_lecture`.
+    pub(crate) versions: version_de_lecture::EtatDesVersions,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1583,6 +1586,7 @@ impl PlaybackOrchestrator {
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
+            versions: Default::default(),
         }
     }
 
@@ -1693,6 +1697,8 @@ mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
 mod resolve_direct;
+/// #2264 — la règle de version appliquée à la lecture.
+mod version_de_lecture;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;
 // #4863 — une source PCM fournie par un greffon (lecture d'un CD).

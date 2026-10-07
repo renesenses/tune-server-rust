@@ -601,14 +601,17 @@ where
     });
 }
 
-/// Les services interroges pour les versions d'un morceau.
-///
-/// Ecrite UNE fois : `/home/other-versions` s'en sert pour savoir s'il vaut la
-/// peine de lire son vivier d'ecoutes avant d'appeler
-/// [`versions_streaming`]. Deux listes qui derivent l'une de l'autre feraient
-/// lire l'historique pour rien, ou pire, le sauteraient alors qu'un service
-/// repond.
-pub(crate) const SERVICES_VERSIONS: [&str; 4] = ["qobuz", "tidal", "deezer", "spotify"];
+// Les services interroges pour les versions d'un morceau.
+//
+// Ecrite UNE fois : `/home/other-versions` s'en sert pour savoir s'il vaut la
+// peine de lire son vivier d'ecoutes avant d'appeler
+// [`versions_streaming`]. Deux listes qui derivent l'une de l'autre feraient
+// lire l'historique pour rien, ou pire, le sauteraient alors qu'un service
+// repond.
+//
+// #2264 — la liste vit dans `tune-core` : la règle de lecture interroge les
+// MÊMES services que l'écran.
+pub(crate) use tune_core::library::groupes_versions::SERVICES_DE_VERSIONS as SERVICES_VERSIONS;
 
 /// Les versions et reprises d'un morceau DISPONIBLES EN STREAMING.
 ///

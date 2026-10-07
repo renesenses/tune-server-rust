@@ -6,8 +6,8 @@
 //! | méthode | chemin | rôle |
 //! |---|---|---|
 //! | `GET` | `/library/tracks/{id}/versions/groups` | les exemplaires de la piste et de ses versions, groupés, avec la version par défaut de chaque groupe |
-//! | `GET` | `/library/versions/rule` | la règle de choix réglée |
-//! | `PUT` | `/library/versions/rule` | la régler (`{"rule": "quality"}`) ou revenir au défaut (`{"rule": null}`) |
+//! | `GET` | `/library/versions/rule` | la règle de choix réglée : celle du profil nommé par `X-Profile-Id`, sinon le défaut global |
+//! | `PUT` | `/library/versions/rule` | la régler (`{"rule": "quality"}`) ou revenir au défaut (`{"rule": null}`) : sur le profil nommé par `X-Profile-Id`, sinon le défaut global |
 //!
 //! # Ce que la route ajoute à `GET /library/tracks/{id}/versions`
 //!
@@ -22,147 +22,103 @@
 //! # Ce que la route ne fait PAS
 //!
 //! Elle n'écrit rien, hors du réglage de la règle : aucun groupe n'est
-//! persisté, et la lecture d'une playlist, d'un favori ou de la file reste
-//! attachée à la piste précise qui y a été mise. Ce sont les décisions 2 et 4
-//! de l'audit du 29/08, que la PR pose en questions plutôt que de les
-//! supposer.
+//! persisté. La LECTURE applique la même règle, au même endroit pour tous les
+//! lancements (`tune-core/src/orchestrator/version_de_lecture.rs`, décisions
+//! du 07/10/2026).
+//!
+//! # Portée de la règle (décision 3)
+//!
+//! Par profil, rangée dans les réglages du profil, avec un repli sur le
+//! défaut global (`tune_core::library::regle_de_version`). Une requête SANS
+//! `X-Profile-Id` garde le contrat d'avant : elle lit et règle le défaut
+//! global. `?scope=global` force le défaut global même avec l'en-tête.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::db::backend::ToSqlValue;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::library::groupes_versions::{Exemplaire, Qualite, RegleDeChoix, choisir, grouper};
+use tune_core::library::regle_de_version::{
+    self as regle_de_version, Origine, regle_effective, regle_globale,
+};
 use tune_core::library::track_matcher::normaliser_isrc;
-use tune_http_types::panne_sql::OuDefautJournalise;
+use tune_core::library::versions_en_base as base;
 
+use crate::routes::active_profile::ActiveProfile;
 use crate::routes::filtre_sources::FiltreSources;
-use crate::routes::versions::marqueur;
 use crate::state::AppState;
 
-/// La clé du réglage dans la table `settings`. Aucune migration : la table
-/// clé/valeur existe sur les deux moteurs.
-pub(crate) const CLE_REGLE: &str = "versions_default_rule";
+/// La clé du réglage : dans `settings` pour le défaut global, dans les
+/// réglages du profil pour la règle d'un profil. Aucune migration.
+pub(crate) const CLE_REGLE: &str = regle_de_version::CLE_REGLE;
 
-/// Plafond des pistes rapprochées par identifiant (ISRC ou MBID).
-const PLAFOND_PAR_IDENTIFIANT: i64 = 200;
-
-/// La règle réglée, et d'où elle vient : `setting` ou `default`.
+/// Le défaut GLOBAL réglé, et d'où il vient : `setting` ou `default`.
 ///
 /// Une valeur illisible en base (écrite à la main) vaut le défaut : la route
 /// `PUT` refuse de l'écrire, et une lecture ne doit pas échouer pour autant.
 pub(crate) fn regle_reglee(state: &AppState) -> (RegleDeChoix, &'static str) {
-    match SettingsRepo::with_backend(state.backend.clone())
-        .get(CLE_REGLE)
-        .ok()
-        .flatten()
-        .and_then(|t| RegleDeChoix::depuis(&t))
-    {
-        Some(r) => (r, "setting"),
-        None => (RegleDeChoix::DEFAUT, "default"),
+    match regle_globale(&state.backend) {
+        Some(r) => (r, Origine::Global.nom()),
+        None => (RegleDeChoix::DEFAUT, Origine::Defaut.nom()),
     }
 }
 
-/// Les colonnes lues pour une piste de la bibliothèque, dans l'ordre de
-/// [`exemplaire_de_ligne`]. Alias imposés : `t`, `al`, `ar`, `ar2`.
-const COLONNES_PISTE: &str = "t.id, t.title, COALESCE(ar2.name, ar.name, ''), \
-     COALESCE(al.title, ''), t.isrc, t.musicbrainz_recording_id, t.duration_ms, \
-     COALESCE(t.source, 'local'), t.source_id, t.format, t.sample_rate, t.bit_depth, \
-     t.album_id, al.cover_path";
-
-const JOINTURES_PISTE: &str = "FROM tracks t \
-     LEFT JOIN albums al ON t.album_id = al.id \
-     LEFT JOIN artists ar ON al.artist_id = ar.id \
-     LEFT JOIN artists ar2 ON t.artist_id = ar2.id";
-
-type Ligne = Vec<tune_core::db::backend::SqlValue>;
-
-fn exemplaire_de_ligne(cols: &Ligne) -> (Exemplaire, Value) {
-    let s = |i: usize| cols.get(i).and_then(|v| v.as_string());
-    let n = |i: usize| cols.get(i).and_then(|v| v.as_i64());
-    let qualite = Qualite {
-        format: s(9),
-        sample_rate: n(10),
-        bit_depth: n(11),
+/// Le profil que NOMME la requête par `X-Profile-Id`.
+///
+/// `Ok(None)` : pas d'en-tête, la portée est le défaut global (le contrat
+/// d'avant). `Err` : l'en-tête nomme un profil inexistant ou que l'appelant
+/// n'a pas le droit de régler — l'extracteur commun se serait alors rabattu
+/// sur le profil actif, et la règle aurait été écrite sur un AUTRE profil que
+/// celui demandé.
+fn profil_nomme(headers: &HeaderMap, profil: &ActiveProfile) -> Result<Option<i64>, Response> {
+    let Some(brut) = headers.get("X-Profile-Id") else {
+        return Ok(None);
     };
-    let e = Exemplaire {
-        source: s(7).unwrap_or_else(|| "local".into()),
-        track_id: n(0),
-        source_id: s(8),
-        titre: s(1).unwrap_or_default(),
-        artiste: s(2).unwrap_or_default(),
-        album: s(3).unwrap_or_default(),
-        isrc: s(4),
-        mbid_enregistrement: s(5),
-        duree_ms: n(6),
-        qualite: Some(qualite),
-        disponible: None,
-    };
-    let fiche = json!({ "album_id": n(12), "cover_path": s(13) });
-    (e, fiche)
+    let demande = brut
+        .to_str()
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    match demande {
+        Some(id) if id > 0 && id == profil.id() => Ok(Some(id)),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "X-Profile-Id: profil introuvable ou non autorisé" })),
+        )
+            .into_response()),
+    }
+}
+
+/// Une piste de la bibliothèque, et sa fiche d'affichage.
+fn exemplaire_de_ligne(cols: &base::Ligne) -> (Exemplaire, Value) {
+    let fiche = json!({
+        "album_id": cols.get(base::COL_ALBUM_ID).and_then(|v| v.as_i64()),
+        "cover_path": cols.get(base::COL_COVER).and_then(|v| v.as_string()),
+    });
+    (base::exemplaire_de_ligne(cols), fiche)
 }
 
 /// La piste de départ. `None` : elle n'existe pas (404).
 fn lire_reference(state: &AppState, id: i64) -> Option<(Exemplaire, Value)> {
-    let e = state.backend.engine();
-    let sql = format!(
-        "SELECT {COLONNES_PISTE} {JOINTURES_PISTE} WHERE t.id = {}",
-        marqueur(e, 1)
-    );
-    state
-        .backend
-        .query_one(&sql, &[&id as &dyn ToSqlValue])
-        .ok()
-        .flatten()
-        .map(|cols| exemplaire_de_ligne(&cols))
+    base::lire_piste(&state.backend, id).map(|(_, cols)| exemplaire_de_ligne(&cols))
 }
 
 /// Les pistes de la bibliothèque qui partagent l'ISRC ou le MBID
-/// d'enregistrement de la référence, quel que soit leur titre.
-///
-/// L'ISRC est comparé sous la forme que rend `normaliser_isrc` pour les deux
-/// séparateurs qu'on rencontre (`-` et l'espace) ; la comparaison exacte est
-/// refaite en Rust par `relation`, ce SQL ne fait que trouver les candidats.
-/// Aucun index ne porte ces colonnes : la requête parcourt `tracks`. Mesure
-/// dans la PR, sur SQLite et PostgreSQL.
+/// d'enregistrement de la référence, quel que soit leur titre. Requête
+/// commune avec la règle de lecture, servie par les index de la migration 122
+/// (PG 086) : voir `tune_core::library::versions_en_base`.
 fn pistes_par_identifiant(state: &AppState, reference: &Exemplaire) -> Vec<(Exemplaire, Value)> {
-    let isrc = reference
-        .isrc
-        .as_deref()
-        .map(normaliser_isrc)
-        .unwrap_or_default();
-    let mbid = reference
-        .mbid_enregistrement
-        .as_deref()
-        .map(|m| m.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    if isrc.is_empty() && mbid.is_empty() {
-        return Vec::new();
-    }
-    let e = state.backend.engine();
-    let sql = format!(
-        "SELECT {COLONNES_PISTE} {JOINTURES_PISTE} \
-         CROSS JOIN (SELECT CAST({} AS TEXT) AS isrc, CAST({} AS TEXT) AS mbid) ref_id \
-         WHERE t.id <> {} AND ( \
-           (ref_id.isrc <> '' AND UPPER(REPLACE(REPLACE(t.isrc, '-', ''), ' ', '')) = ref_id.isrc) \
-           OR (ref_id.mbid <> '' AND LOWER(TRIM(t.musicbrainz_recording_id)) = ref_id.mbid)) \
-         ORDER BY t.id LIMIT {PLAFOND_PAR_IDENTIFIANT}",
-        marqueur(e, 1),
-        marqueur(e, 2),
-        marqueur(e, 3),
-    );
-    let id = reference.track_id.unwrap_or(-1);
-    let params: [&dyn ToSqlValue; 3] = [&isrc, &mbid, &id];
-    state
-        .backend
-        .query_many(&sql, &params)
-        .ou_defaut_journalise()
-        .iter()
-        .map(exemplaire_de_ligne)
-        .collect()
+    base::pistes_par_identifiant(
+        &state.backend,
+        reference,
+        reference.track_id,
+        base::PLAFOND_PAR_IDENTIFIANT,
+    )
+    .iter()
+    .map(|(_, cols)| exemplaire_de_ligne(cols))
+    .collect()
 }
 
 /// Un candidat LOCAL rendu par `versions_locales`.
@@ -338,9 +294,11 @@ pub(super) struct ParamsGroupes {
 }
 
 /// `GET /library/tracks/{id}/versions/groups`. Contrat dans la PR et en tête
-/// de ce module.
+/// de ce module. Sans `rule`, c'est la règle du profil de la requête (celle
+/// que la lecture appliquera), sinon le défaut global.
 pub(super) async fn track_version_groups(
     State(state): State<AppState>,
+    profil: ActiveProfile,
     Path(id): Path<i64>,
     Query(p): Query<ParamsGroupes>,
 ) -> impl IntoResponse {
@@ -355,7 +313,10 @@ pub(super) async fn track_version_groups(
                     .into_response();
             }
         },
-        None => regle_reglee(&state),
+        None => {
+            let (r, o) = regle_effective(&state.backend, Some(profil.id()));
+            (r, o.nom())
+        }
     };
     let limite = p.limit.unwrap_or(50).clamp(1, 200);
     let avec_streaming = p.streaming.unwrap_or(true);
@@ -369,10 +330,50 @@ pub(super) async fn track_version_groups(
     }
 }
 
-/// `GET /library/versions/rule`.
-pub(super) async fn get_version_rule(State(state): State<AppState>) -> Json<Value> {
-    let (regle, origine) = regle_reglee(&state);
-    Json(json!({ "rule": regle.texte(), "origin": origine }))
+#[derive(Deserialize, Default)]
+pub(super) struct ParamsRegle {
+    /// `global` : le défaut global, même avec `X-Profile-Id`.
+    scope: Option<String>,
+}
+
+impl ParamsRegle {
+    fn global(&self) -> bool {
+        self.scope.as_deref() == Some("global")
+    }
+}
+
+/// La réponse commune des deux routes de réglage.
+fn corps_regle(state: &AppState, profil: Option<i64>) -> Value {
+    match profil {
+        Some(id) => {
+            let (regle, origine) = regle_effective(&state.backend, Some(id));
+            json!({ "rule": regle.texte(), "origin": origine.nom(), "scope": "profile", "profile_id": id })
+        }
+        None => {
+            let (regle, origine) = regle_reglee(state);
+            json!({ "rule": regle.texte(), "origin": origine, "scope": "global", "profile_id": null })
+        }
+    }
+}
+
+/// `GET /library/versions/rule` — avec `X-Profile-Id` : la règle qui
+/// s'applique à ce profil (`origin` = `profile`, `setting` ou `default`) ;
+/// sans : le défaut global, comme avant.
+pub(super) async fn get_version_rule(
+    State(state): State<AppState>,
+    profil: ActiveProfile,
+    headers: HeaderMap,
+    Query(q): Query<ParamsRegle>,
+) -> Response {
+    let nomme = if q.global() {
+        None
+    } else {
+        match profil_nomme(&headers, &profil) {
+            Ok(n) => n,
+            Err(r) => return r,
+        }
+    };
+    Json(corps_regle(&state, nomme)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -381,17 +382,28 @@ pub(super) struct CorpsRegle {
 }
 
 /// `PUT /library/versions/rule` — `{"rule": "quality"}` règle,
-/// `{"rule": null}` revient au défaut. Une règle illisible est refusée (400)
-/// et rien n'est écrit.
+/// `{"rule": null}` revient au défaut (pour un profil : au défaut global).
+/// Une règle illisible est refusée (400) et rien n'est écrit. La portée est
+/// celle de `GET`.
 pub(super) async fn put_version_rule(
     State(state): State<AppState>,
+    profil: ActiveProfile,
+    headers: HeaderMap,
+    Query(q): Query<ParamsRegle>,
     Json(corps): Json<CorpsRegle>,
-) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let ecrit = match corps.rule.as_deref() {
-        None => settings.delete(CLE_REGLE),
+) -> Response {
+    let nomme = if q.global() {
+        None
+    } else {
+        match profil_nomme(&headers, &profil) {
+            Ok(n) => n,
+            Err(r) => return r,
+        }
+    };
+    let regle = match corps.rule.as_deref() {
+        None => None,
         Some(texte) => match RegleDeChoix::depuis(texte) {
-            Some(r) => settings.set(CLE_REGLE, &r.texte()),
+            Some(r) => Some(r),
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -401,6 +413,13 @@ pub(super) async fn put_version_rule(
             }
         },
     };
+    let ecrit = match (nomme, &regle) {
+        (Some(id), r) => regle_de_version::poser_regle_du_profil(&state.backend, id, r.as_ref()),
+        (None, None) => SettingsRepo::with_backend(state.backend.clone()).delete(CLE_REGLE),
+        (None, Some(r)) => {
+            SettingsRepo::with_backend(state.backend.clone()).set(CLE_REGLE, &r.texte())
+        }
+    };
     if let Err(e) = ecrit {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -408,8 +427,7 @@ pub(super) async fn put_version_rule(
         )
             .into_response();
     }
-    let (regle, origine) = regle_reglee(&state);
-    Json(json!({ "rule": regle.texte(), "origin": origine })).into_response()
+    Json(corps_regle(&state, nomme)).into_response()
 }
 
 #[cfg(test)]

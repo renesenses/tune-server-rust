@@ -2368,7 +2368,53 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "file_first_seen_created_at",
         up: "",
     },
+    // #2264 — les index des identifiants d'ENREGISTREMENT : l'ISRC et le MBID
+    // d'enregistrement, sous la forme pliée que comparent le regroupement des
+    // versions et la règle de lecture (`library::groupes_versions`). Index
+    // d'EXPRESSION : la requête compare `UPPER(REPLACE(REPLACE(isrc, '-',
+    // ''), ' ', ''))` et `LOWER(TRIM(musicbrainz_recording_id))`, qu'un index
+    // sur la colonne nue ne servirait pas.
+    //
+    // Numérotée 122 / PG 086 : la 120 / PG 084 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et la 121 / PG 085 est prise par
+    // #5959 (crête vraie), en PR. Le lanceur ne joue que `version > MAX` :
+    // cette migration EXIGE #5959 fusionnée avant elle — sinon elle se
+    // renumérote à la promotion. Les gardes de contiguïté
+    // (`migration_count_matches`, et côté PG
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`) le signalent
+    // tant qu'elle manque.
+    //
+    // Posés dans le bloc de version et dans la passe finale, PAS dans `up` :
+    // même règle qu'à la 119. Jumelle PG : 086.
+    Migration {
+        version: 122,
+        name: "tracks_recording_identifier_indexes",
+        up: "",
+    },
 ];
+
+/// Les index de la migration 122 (#2264). L'expression est EXACTEMENT celle
+/// des requêtes par identifiant ([`SQL_ISRC_PLIE`], [`SQL_MBID_PLIE`]) :
+/// SQLite et PostgreSQL ne servent un index d'expression qu'à l'identique.
+pub const SQL_INDEX_IDENTIFIANTS_D_ENREGISTREMENT: &str = "\
+    CREATE INDEX IF NOT EXISTS idx_tracks_isrc_norm \
+        ON tracks((UPPER(REPLACE(REPLACE(isrc, '-', ''), ' ', ''))));\
+    CREATE INDEX IF NOT EXISTS idx_tracks_mbid_recording_norm \
+        ON tracks((LOWER(TRIM(musicbrainz_recording_id))));";
+
+/// L'ISRC plié, tel que les requêtes le comparent (alias `t` imposé).
+pub const SQL_ISRC_PLIE: &str = "UPPER(REPLACE(REPLACE(t.isrc, '-', ''), ' ', ''))";
+
+/// Le MBID d'enregistrement plié, tel que les requêtes le comparent.
+pub const SQL_MBID_PLIE: &str = "LOWER(TRIM(t.musicbrainz_recording_id))";
+
+/// Pose les index de la 122. Un échec est JOURNALISÉ, jamais rendu : sans
+/// eux la recherche par identifiant est lente, pas fausse.
+fn index_des_identifiants_d_enregistrement(db: &SqliteDb) {
+    if let Err(e) = db.execute_batch(SQL_INDEX_IDENTIFIANTS_D_ENREGISTREMENT) {
+        warn!(erreur = %e, "migration_122_index_identifiants_d_enregistrement");
+    }
+}
 
 /// La colonne de la migration 120 (#5402). La table d'abord : elle n'est
 /// garantie que par la passe finale, qui tourne APRÈS les blocs de version.
@@ -3483,6 +3529,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // inconnue, le tri retombe sur la date d'ajout.
             date_de_creation_des_fichiers(db);
         }
+        if migration.version == 122 {
+            // Index des identifiants d'enregistrement (#2264).
+            index_des_identifiants_d_enregistrement(db);
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -4038,6 +4088,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : le scan l'écrit et le tri « par création » la NOMME. PG :
     // migration 084.
     date_de_creation_des_fichiers(db);
+    // Index des identifiants d'enregistrement (migration 122, #2264) — posés
+    // ICI aussi : le regroupement des versions et la règle de lecture les
+    // interrogent à chaque lancement. PG : migration 086.
+    index_des_identifiants_d_enregistrement(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4812,6 +4866,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         84,
         "file_first_seen_created_at",
         include_str!("../../migrations/postgres/084_file_first_seen_created_at.sql"),
+    ),
+    // Jumelle de la SQLite 122 (#2264) : les index d'expression de l'ISRC et
+    // du MBID d'enregistrement pliés. EXIGE la 85 (#5959) avant elle.
+    (
+        86,
+        "tracks_recording_identifier_indexes",
+        include_str!("../../migrations/postgres/086_tracks_recording_identifier_indexes.sql"),
     ),
 ];
 
@@ -7740,7 +7801,10 @@ mod tests {
         // 84 : `file_first_seen_created_at` (#5402), jumelle de la SQLite 120.
         // Pose `file_first_seen.created_at`, que le scan écrit et que le tri
         // « par création » des ajouts récents NOMME.
-        assert_eq!(pg_latest_version(), 84, "latest PG migration must be 84");
+        // 86 : `tracks_recording_identifier_indexes` (#2264), jumelle de la
+        // SQLite 122. La 85 est celle de #5959 : tant qu'elle n'est pas
+        // fusionnée, la garde de contiguïté ci-dessus rougit, et c'est voulu.
+        assert_eq!(pg_latest_version(), 86, "latest PG migration must be 86");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

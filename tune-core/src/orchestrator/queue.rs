@@ -1164,6 +1164,12 @@ impl PlaybackOrchestrator {
         let entry = queue_repo
             .get_at(zone_id, position)?
             .ok_or("no queue item at position (local or streaming)")?;
+        // #2264 — la règle de version ferait jouer un autre exemplaire (ou
+        // signalerait un repli) : on n'arme pas. L'avance normale passera par
+        // `play_inner`, qui applique la règle et le publie.
+        if self.la_version_change(zone_id, &entry).await {
+            return Err("version_rule_declines_gapless".into());
+        }
 
         // Local track.
         if let Some(track_id) = entry.track_id {
@@ -1342,6 +1348,10 @@ impl PlaybackOrchestrator {
         let entry = PlayQueueRepo::with_backend(self.db.clone())
             .get_at(zone_id, position)?
             .ok_or("no queue item at position (local or streaming)")?;
+        // #2264 — même renoncement que `resolve_queue_item_url`.
+        if self.la_version_change(zone_id, &entry).await {
+            return Err("version_rule_declines_gapless".into());
+        }
 
         // A local file is present only for local library tracks; streaming
         // items (track_id None / file_path None) return file_path: None so the

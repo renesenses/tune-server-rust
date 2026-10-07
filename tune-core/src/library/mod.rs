@@ -31,5 +31,9 @@ pub mod pont_roon_import;
 pub mod quality;
 /// LA règle « compilation » (25/09/2026) — un seul endroit, voir le module.
 pub mod regle_compilation;
+/// Où vit la règle de choix des versions : par profil, puis globale (#2264).
+pub mod regle_de_version;
 pub mod smart_collections;
 pub mod track_matcher;
+/// Les exemplaires d'un enregistrement qui sont en base (#2264).
+pub mod versions_en_base;

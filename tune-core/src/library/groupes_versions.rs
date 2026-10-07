@@ -48,6 +48,12 @@
 use crate::library::quality::score_qualite;
 use crate::library::track_matcher::normaliser_isrc;
 
+/// Les services interrogés pour les versions d'un morceau : par
+/// « Autres versions » (`tune-server/src/routes/versions.rs`) et par la règle
+/// de lecture. Une seule liste, pour que la lecture ne cherche pas ailleurs que
+/// l'écran.
+pub const SERVICES_DE_VERSIONS: [&str; 4] = ["qobuz", "tidal", "deezer", "spotify"];
+
 /// Écart de durée toléré par le rapprochement heuristique : ±2 s.
 pub const TOLERANCE_DUREE_MS: u64 = 2_000;
 
@@ -425,11 +431,56 @@ pub fn choisir(
     indices: &[usize],
     regle: &RegleDeChoix,
 ) -> Option<usize> {
+    choisir_parmi(exemplaires, indices, regle, true)
+}
+
+/// Le choix et ce qu'il dit du REPLI (décision 2 du 07/10/2026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Choix {
+    /// L'exemplaire joué.
+    pub indice: usize,
+    /// L'exemplaire que la règle aurait pris si tout était disponible, quand
+    /// ce n'est PAS celui qui est joué : la version préférée est indisponible
+    /// et on est passé à la suivante. `None` : pas de repli.
+    pub prefere_indisponible: Option<usize>,
+}
+
+impl Choix {
+    pub fn repli(&self) -> bool {
+        self.prefere_indisponible.is_some()
+    }
+}
+
+/// [`choisir`], en disant en plus si le choix est un REPLI.
+///
+/// La version préférée est celle que la règle prendrait si aucun exemplaire
+/// n'était indisponible. Quand elle l'est, la règle passe à la suivante
+/// disponible — et le dit, pour que la lecture le signale au lieu de changer
+/// de version en silence.
+pub fn choisir_avec_repli(
+    exemplaires: &[Exemplaire],
+    indices: &[usize],
+    regle: &RegleDeChoix,
+) -> Option<Choix> {
+    let indice = choisir_parmi(exemplaires, indices, regle, true)?;
+    let prefere = choisir_parmi(exemplaires, indices, regle, false);
+    Some(Choix {
+        indice,
+        prefere_indisponible: prefere.filter(|&p| p != indice),
+    })
+}
+
+fn choisir_parmi(
+    exemplaires: &[Exemplaire],
+    indices: &[usize],
+    regle: &RegleDeChoix,
+    respecter_la_disponibilite: bool,
+) -> Option<usize> {
     use std::cmp::Reverse;
     indices
         .iter()
         .copied()
-        .filter(|&i| exemplaires[i].disponible != Some(false))
+        .filter(|&i| !respecter_la_disponibilite || exemplaires[i].disponible != Some(false))
         .min_by_key(|&i| {
             let e = &exemplaires[i];
             // Chaque critère est un couple « plus grand = mieux ». Une qualité

@@ -190,6 +190,74 @@ async fn pg_2264_les_groupes_sont_les_memes_que_sur_sqlite() {
     );
 }
 
+/// Les index de la migration PG 086 (#2264) sont posés, sur les deux
+/// moteurs, sous les noms que nomme la migration SQLite 122.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_2264_les_index_des_identifiants_sont_poses() {
+    let Some(url) = url_pg() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let pg = etat_postgres(&url);
+    let noms: Vec<String> = pg
+        .backend
+        .query_many(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'tracks' \
+             AND indexname IN ('idx_tracks_isrc_norm', 'idx_tracks_mbid_recording_norm') \
+             ORDER BY indexname",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .collect();
+    assert_eq!(
+        noms,
+        vec!["idx_tracks_isrc_norm", "idx_tracks_mbid_recording_norm"]
+    );
+    // L'expression indexée est celle que la requête compare.
+    let definition: String = pg
+        .backend
+        .query_one(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_tracks_isrc_norm'",
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap();
+    assert!(
+        definition.contains("upper(replace(replace(isrc"),
+        "{definition}"
+    );
+}
+
+/// Médiane de 9 appels de la requête par identifiant (celle que la règle de
+/// lecture et le regroupement font à chaque fois).
+fn chrono_par_identifiant(state: &AppState) -> std::time::Duration {
+    use tune_core::library::groupes_versions::Exemplaire;
+    let reference = Exemplaire {
+        track_id: Some(id_de(state, "/2264/ref.flac")),
+        isrc: Some("USSM18200001".into()),
+        mbid_enregistrement: Some("0b1c-mbid".into()),
+        ..Default::default()
+    };
+    let mut durees = Vec::new();
+    for _ in 0..9 {
+        let t = std::time::Instant::now();
+        let n = tune_core::library::versions_en_base::pistes_par_identifiant(
+            &state.backend,
+            &reference,
+            reference.track_id,
+            200,
+        )
+        .len();
+        durees.push(t.elapsed());
+        assert!(n >= 1);
+    }
+    durees.sort();
+    durees[4]
+}
+
 /// Chronomètre la route sur 100 000 pistes sans rapport, sur chaque moteur.
 /// `cargo test … -- --ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread")]
@@ -237,5 +305,28 @@ async fn mesure_requete_par_identifiant() {
             durees.sort();
             eprintln!("{nom} — {N} pistes — {libelle} : médiane {:?}", durees[4]);
         }
+        // #2264 — le gain des index de la migration 122 / PG 086 : la même
+        // requête, avec puis sans eux.
+        if nom == "PostgreSQL" {
+            executer(&etat, "ANALYZE tracks");
+        }
+        let avec = chrono_par_identifiant(&etat);
+        executer(&etat, "DROP INDEX idx_tracks_isrc_norm");
+        executer(&etat, "DROP INDEX idx_tracks_mbid_recording_norm");
+        if nom == "PostgreSQL" {
+            executer(&etat, "ANALYZE tracks");
+        }
+        let sans = chrono_par_identifiant(&etat);
+        // Remis en place : la base de test PG est partagée entre épreuves.
+        for ordre in tune_core::db::migrations::SQL_INDEX_IDENTIFIANTS_D_ENREGISTREMENT
+            .split(';')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
+            executer(&etat, ordre);
+        }
+        eprintln!(
+            "{nom} — {N} pistes — requête par identifiant : avec index {avec:?}, sans index {sans:?}"
+        );
     }
 }

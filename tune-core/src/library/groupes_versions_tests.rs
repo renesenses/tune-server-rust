@@ -483,3 +483,40 @@ fn un_exemplaire_ambigu_reste_seul() {
     // Contre-épreuve : sans le remaster, il rejoint l'original.
     assert_eq!(indices(&grouper(&[original, muet])), vec![vec![0, 1]]);
 }
+
+// ─── Repli (décision 2 du 07/10/2026) ───────────────────────────────────
+
+#[test]
+fn le_prefere_indisponible_est_un_repli_signale() {
+    let mut qobuz = hires(
+        service("qobuz", "q1", "Billie Jean", "Thriller", 294_000),
+        192_000,
+        24,
+    );
+    let biblio = local(1, "Billie Jean", "Thriller", 294_000);
+    let regle = RegleDeChoix::PrefererService("qobuz".into());
+    // Disponible : Qobuz est joué, pas de repli.
+    let tous = vec![biblio.clone(), qobuz.clone()];
+    let c = choisir_avec_repli(&tous, &[0, 1], &regle).unwrap();
+    assert_eq!(c.indice, 1);
+    assert!(!c.repli(), "la version préférée joue : pas de repli");
+    // Indisponible : la bibliothèque joue, ET le repli le dit.
+    qobuz.disponible = Some(false);
+    let tous = vec![biblio, qobuz];
+    let c = choisir_avec_repli(&tous, &[0, 1], &regle).unwrap();
+    assert_eq!(c.indice, 0, "on passe à la suivante disponible");
+    assert_eq!(c.prefere_indisponible, Some(1), "et on nomme la préférée");
+}
+
+#[test]
+fn rien_d_indisponible_aucun_repli_meme_si_la_regle_change_de_source() {
+    // Une version locale choisie par `local` alors qu'un service existe
+    // n'est PAS un repli : c'est la règle elle-même.
+    let tous = vec![
+        service("tidal", "t1", "Billie Jean", "Thriller", 294_000),
+        local(1, "Billie Jean", "Thriller", 294_000),
+    ];
+    let c = choisir_avec_repli(&tous, &[0, 1], &RegleDeChoix::PrefererLocal).unwrap();
+    assert_eq!(c.indice, 1);
+    assert!(!c.repli());
+}
