@@ -522,3 +522,6 @@ mod persistance_3326;
 
 #[path = "sendspin_runtime_3326.rs"]
 mod runtime_3326;
+
+#[path = "sendspin/lecteur_s2c_3326.rs"]
+mod lecteur_s2c_3326;

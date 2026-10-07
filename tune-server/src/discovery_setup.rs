@@ -231,7 +231,12 @@ async fn retirer_serveur_multimedia(
 /// Set a zone's online state and, if it actually changed, broadcast a
 /// `zone.updated` event so controllers see availability flip in real time.
 /// (`set_online_by_device` alone is silent — clients never learned of it.)
-fn set_zone_online(event_bus: &EventBus, db: &Arc<dyn DbBackend>, device_id: &str, online: bool) {
+pub(crate) fn set_zone_online(
+    event_bus: &EventBus,
+    db: &Arc<dyn DbBackend>,
+    device_id: &str,
+    online: bool,
+) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
     let prev = zone_repo
         .get_by_device_id(device_id)
@@ -511,7 +516,7 @@ fn spawn_ssdp_event_handler(
 /// consommateurs lisent cet evenement — plugins abonnes, passerelle
 /// `developer_api` — et n'ont pas a etre migres pour que l'interface se repare.
 /// Un evenement qui satisfait les deux formes ne casse personne.
-fn charge_utile_zone_creee(
+pub(crate) fn charge_utile_zone_creee(
     zone_repo: &tune_core::db::zone_repo::ZoneRepo,
     zone_id: i64,
     mut plat: serde_json::Value,

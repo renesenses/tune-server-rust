@@ -62,6 +62,8 @@ pub(crate) mod reveil_en_retard_4357;
 /// n'exécute WASAPI, cette table de décision-ci est jugée par `cargo test`.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod reveil_rendu_4357;
+/// #3326 — enceinte Sendspin `player@v1` : Tune pousse l'audio horodaté.
+pub mod sendspin;
 pub mod slimproto;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,

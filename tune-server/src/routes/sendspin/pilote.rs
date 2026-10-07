@@ -1,14 +1,21 @@
 //! Connexion chiffree S2-b : commandes operateur et messages du pair serialises.
+//! S2-c : ordres de la sortie `player@v1` (flux, morceaux, commandes) et
+//! `client/state`, sur la meme boucle — un seul ecrivain par connexion.
 use super::ContexteSendspin;
 use super::sessions::{
     Commande, ErreurCommande, Inscription, Soumission, decrire_methodes, methodes,
 };
+use super::zones::GardeDepart;
 use axum::extract::ws::{Message, WebSocket};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tune_core::sendspin::appairage::{ActionAppairage, AppairageServeur, MethodeAppairage};
+use tune_core::sendspin::horloge::maintenant_us;
+use tune_core::sendspin::lecteur::{
+    CLE_SUPPORT_LECTEUR, CoteConnexion, Demande, LiaisonLecteur, OrdreLecteur, RefusOrdre,
+    SessionLecteur, Sortie, TYPE_AUDIO, avance_d_envoi, capacite_tampon, corps_audio, relier,
+};
 use tune_core::sendspin::messages::{ClientHello, Enveloppe, EnveloppeBrute, ServerHello};
 use tune_core::sendspin::poignee::InfosPair;
 use tune_core::sendspin::psk::PskPair;
@@ -24,6 +31,14 @@ struct Pilote {
     appairage: Option<AppairageServeur>,
     methode: Option<MethodeAppairage>,
     compteur: u32,
+    /// Rôle `player@v1` actif sur cette connexion (session appairée).
+    lecteur: Option<SessionLecteur>,
+    /// Côté connexion de la liaison avec la sortie.
+    cote: Option<CoteConnexion>,
+    /// Liaison qui attend le premier `client/state` pour devenir une sortie.
+    a_raccorder: Option<LiaisonLecteur>,
+    /// Sortie enregistrée ; la retirer à la fin de la connexion.
+    garde: Option<GardeDepart>,
 }
 enum Incident {
     Commande(ErreurCommande),
@@ -49,6 +64,7 @@ pub(super) async fn conduire(
     infos: InfosPair,
     hello: ClientHello,
     contexte: ContexteSendspin,
+    lecteur: Option<SessionLecteur>,
 ) -> Result<(), ErreurSendspin> {
     let inscription = contexte
         .sessions()
@@ -65,14 +81,54 @@ pub(super) async fn conduire(
         appairage: None,
         methode: None,
         compteur: 0,
+        lecteur: None,
+        cote: None,
+        a_raccorder: None,
+        garde: None,
     };
+    p.installer_lecteur(lecteur);
     p.boucle().await
+}
+
+/// Chiffre et envoie une sortie de la session `player@v1`. `send_ahead` est
+/// calculé ICI, au dernier moment avant le chiffrement (*Transmit
+/// timestamps*), jamais à la mise en file.
+pub(super) async fn emettre_hors_boucle(
+    socket: &mut WebSocket,
+    transport: &mut TransportNoise,
+    sortie: Sortie,
+) -> Result<(), ErreurSendspin> {
+    match sortie {
+        Sortie::Json {
+            type_message,
+            payload,
+        } => {
+            let texte = serde_json::to_string(&Enveloppe::nouvelle(type_message, payload))
+                .map_err(|_| sequence("serialisation"))?;
+            super::envoyer_json_chiffre(socket, transport, &texte).await
+        }
+        Sortie::Audio {
+            timestamp_us,
+            donnees,
+        } => {
+            let corps = corps_audio(
+                timestamp_us,
+                avance_d_envoi(timestamp_us, maintenant_us()),
+                &donnees,
+            );
+            for b in transport.chiffrer_message(TYPE_AUDIO, &corps)? {
+                super::envoyer_binaire(socket, b).await?;
+            }
+            Ok(())
+        }
+    }
 }
 impl Pilote {
     async fn boucle(&mut self) -> Result<(), ErreurSendspin> {
         enum Evenement {
             Message(Option<Result<Message, axum::Error>>),
             Commande(Option<Soumission>),
+            Ordre(Option<Demande>),
             Delai,
             Revoque,
         }
@@ -82,9 +138,16 @@ impl Pilote {
                 return Ok(());
             }
             let echeance = self.appairage.as_ref().and_then(AppairageServeur::echeance);
+            let ordres = self.cote.as_mut().map(|c| &mut c.ordres);
             let ev = tokio::select! {
                 _=self.inscription.revocation.changed()=>Evenement::Revoque,
                 c=self.inscription.commandes.recv()=>Evenement::Commande(c),
+                d=async {
+                    match ordres {
+                        Some(o) => o.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }=>Evenement::Ordre(d),
                 _=async {
                     if let Some(t)=echeance {tokio::time::sleep_until(t.into()).await;}
                     else {std::future::pending::<()>().await;}
@@ -119,6 +182,25 @@ impl Pilote {
                     }
                 }
                 Evenement::Commande(None) => return Ok(()),
+                Evenement::Ordre(None) => self.cote = None,
+                Evenement::Ordre(Some(d)) => {
+                    let decision = match self.lecteur.as_mut() {
+                        Some(s) => s.executer(d.ordre, maintenant_us()),
+                        None => Err(RefusOrdre::Deconnecte),
+                    };
+                    match decision {
+                        Ok(sorties) => {
+                            for sortie in sorties {
+                                emettre_hors_boucle(&mut self.socket, &mut self.transport, sortie)
+                                    .await?;
+                            }
+                            let _ = d.reponse.send(Ok(()));
+                        }
+                        Err(refus) => {
+                            let _ = d.reponse.send(Err(refus));
+                        }
+                    }
+                }
                 Evenement::Delai => {
                     if let Some(a) = self
                         .appairage
@@ -138,7 +220,7 @@ impl Pilote {
                     let Some(texte) = self.transport.recevoir_json(&b)? else {
                         continue;
                     };
-                    let recu = horloge();
+                    let recu = maintenant_us();
                     let message: EnveloppeBrute = serde_json::from_str(&texte)
                         .map_err(|_| sequence("JSON chiffre illisible"))?;
                     if !message.payload.is_object() {
@@ -152,8 +234,9 @@ impl Pilote {
                                 .get("client_transmitted")
                                 .and_then(Value::as_i64)
                                 .ok_or_else(|| sequence("client/time sans horodatage entier"))?;
-                            self.envoyer("server/time",json!({"client_transmitted":t,"server_received":recu,"server_transmitted":horloge()})).await?;
+                            self.envoyer("server/time",json!({"client_transmitted":t,"server_received":recu,"server_transmitted":maintenant_us()})).await?;
                         }
+                        "client/state" => self.recevoir_etat(&message.payload).await,
                         typ if typ.starts_with("client/pair-") || typ == "pair/abort" => {
                             let a = self
                                 .appairage
@@ -166,7 +249,7 @@ impl Pilote {
                         "noise/handshake" | "client/hello" | "client/init" => {
                             return Err(sequence("handshake non sollicite"));
                         }
-                        _ => {} // aucun role actif, aucune lecture
+                        _ => {} // message inconnu ou role inactif : ignore (messaging.md)
                     }
                 }
             }
@@ -337,6 +420,18 @@ impl Pilote {
     }
 
     async fn reechanger(&mut self, cle: PskPair) -> Result<(), ErreurSendspin> {
+        // Un role de flux retire par l'activation qui suit le re-echange doit
+        // recevoir son `stream/end` AVANT le re-echange (messaging.md,
+        // `server/activate`). Seule une cle longue duree garde le role.
+        let garde_le_role = cle.categorie() == tune_core::sendspin::psk::CategoriePsk::LongueDuree;
+        if !garde_le_role && let Some(mut s) = self.lecteur.take() {
+            if let Ok(sorties) = s.executer(OrdreLecteur::Arreter, maintenant_us()) {
+                for sortie in sorties {
+                    emettre_hors_boucle(&mut self.socket, &mut self.transport, sortie).await?;
+                }
+            }
+            self.installer_lecteur(None);
+        }
         let identite = self.contexte.identite().await?;
         let mut poignee = PoigneeServeur::renouveler(&identite, &self.infos, &cle)?;
         let texte = poignee.message_un()?;
@@ -410,20 +505,69 @@ impl Pilote {
         if *self.inscription.revocation.borrow() {
             return Err(sequence("revocation pendant le hello"));
         }
-        self.envoyer(
-            "server/activate",
-            json!({"activities":[],"active_roles":[]}),
-        )
-        .await?;
+        if let Some(s) = self.lecteur.as_ref() {
+            // Role conserve (cle longue duree des deux cotes) : l'activation
+            // reprend le role et l'activite en cours, le flux persiste.
+            let activation = s.activation_apres_reechange();
+            emettre_hors_boucle(&mut self.socket, &mut self.transport, activation).await?;
+        } else if let Some(mut s) = super::lecteur_admissible(&self.infos, &self.hello) {
+            // Appairage tout juste promu en longue duree : le role s'active.
+            for sortie in s.activation_initiale() {
+                emettre_hors_boucle(&mut self.socket, &mut self.transport, sortie).await?;
+            }
+            self.installer_lecteur(Some(s));
+        } else {
+            self.envoyer(
+                "server/activate",
+                json!({"activities":[],"active_roles":[]}),
+            )
+            .await?;
+        }
         self.inscription.publier("disponible", json!({}));
         Ok(())
     }
-}
-fn horloge() -> u64 {
-    static ORIGINE: OnceLock<Instant> = OnceLock::new();
-    ORIGINE
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_micros()
-        .min(u64::MAX as u128) as u64
+
+    /// Pose (ou retire) la session `player@v1` et sa liaison avec la sortie.
+    /// Retirer la session retire aussi la sortie enregistrée.
+    fn installer_lecteur(&mut self, lecteur: Option<SessionLecteur>) {
+        self.garde = None;
+        self.a_raccorder = None;
+        self.cote = None;
+        if let Some(s) = lecteur.as_ref() {
+            let capacite = self
+                .hello
+                .reste
+                .get(CLE_SUPPORT_LECTEUR)
+                .and_then(capacite_tampon);
+            let (liaison, cote) = relier(s.formats().to_vec(), capacite);
+            self.a_raccorder = Some(liaison);
+            self.cote = Some(cote);
+        }
+        self.lecteur = lecteur;
+    }
+
+    /// `client/state` : met à jour la session, publie l'état à la sortie, et
+    /// enregistre la sortie au premier état complet du rôle `player`. Un état
+    /// mal formé est journalisé et ignoré ; l'état précédent reste en vigueur.
+    async fn recevoir_etat(&mut self, payload: &Value) {
+        let Some(s) = self.lecteur.as_mut() else {
+            return;
+        };
+        let premier = match s.recevoir_etat(payload) {
+            Ok(p) => p,
+            Err(raison) => {
+                tracing::warn!(client_id = %self.infos.client_id, raison, "sendspin_client_state_ignore");
+                return;
+            }
+        };
+        if let Some(c) = self.cote.as_ref() {
+            c.etat.send_replace(s.etat().clone());
+        }
+        if premier
+            && let (Some(zones), Some(liaison)) = (self.contexte.zones(), self.a_raccorder.take())
+        {
+            let nom = self.hello.name.clone().unwrap_or_else(|| "Sendspin".into());
+            self.garde = Some(zones.arrivee(&self.infos.client_id, &nom, liaison).await);
+        }
+    }
 }
