@@ -110,6 +110,17 @@ pub(crate) fn migrate_legacy_password() {
         Ok(output) if output.status.success() => {
             tracing::info!("tune_os_ssh_password_policy_checked");
         }
+        Ok(output)
+            if euid != 0
+                && crate::privilege::est_un_refus_d_elevation(&String::from_utf8_lossy(
+                    &output.stderr,
+                )) =>
+        {
+            // Tune OS sous `tune` (#3206) : sudoers n'ouvre plus que
+            // l'assistant de montage. La politique tourne en root, hors du
+            // service, par tune-os-premier-acces : ce refus est attendu.
+            tracing::info!("tune_os_ssh_password_policy_left_to_image");
+        }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!(
