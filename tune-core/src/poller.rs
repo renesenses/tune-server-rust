@@ -26,8 +26,8 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
-    OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    SuivantePreparee, TransformationsReelles, TransportState,
+    AnnonceSuivante, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus,
+    OutputTarget, SuivantePreparee, TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 

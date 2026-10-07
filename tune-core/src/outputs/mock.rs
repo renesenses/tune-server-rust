@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use super::traits::{
-    MediaDuTransport, OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    PlayMedia, SuivantePreparee, TransportState,
+    AnnonceSuivante, MediaDuTransport, OutputCapabilities, OutputSignalPathStatus, OutputStatus,
+    OutputTarget, PlayMedia, SuivantePreparee, TransportState,
 };
 
 #[derive(Debug, Clone)]
@@ -78,6 +78,12 @@ pub struct MockOutput {
     /// Fil 2095 — armé, `seek` REFUSE avec ce motif (renderer qui répond
     /// 701 « Transition not available ») et la position ne bouge pas.
     refus_de_seek: Arc<std::sync::Mutex<Option<String>>>,
+    /// #3967 — ce que le SCPD de l'appareil dit de `SetNextAVTransportURI`.
+    /// Défaut `Inconnue` : l'armement d'avant, pour tous les témoins écrits.
+    annonce_suivante: Arc<std::sync::Mutex<AnnonceSuivante>>,
+    /// #3967 — armé, `set_next_media` REFUSE avec ce motif (faute SOAP 401
+    /// d'un renderer qui n'implémente pas l'action). L'appel est compté.
+    refus_de_set_next: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOutput {
@@ -110,7 +116,20 @@ impl MockOutput {
             refus_de_lecture: Arc::new(std::sync::Mutex::new(None)),
             seek_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             refus_de_seek: Arc::new(std::sync::Mutex::new(None)),
+            annonce_suivante: Arc::new(std::sync::Mutex::new(AnnonceSuivante::Inconnue)),
+            refus_de_set_next: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// #3967 — ce que l'appareil annoncera de `SetNextAVTransportURI`.
+    pub fn annoncer_la_suivante(&self, annonce: AnnonceSuivante) {
+        *self.annonce_suivante.lock().unwrap() = annonce;
+    }
+
+    /// #3967 — faire refuser (ou de nouveau accepter, `None`) les
+    /// `set_next_media` suivants.
+    pub fn refuser_le_set_next(&self, motif: Option<&str>) {
+        *self.refus_de_set_next.lock().unwrap() = motif.map(str::to_string);
     }
 
     /// Fil 2095 — faire refuser (ou de nouveau accepter, `None`) les `seek`
@@ -444,12 +463,20 @@ impl OutputTarget for MockOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        *self.next_uri.lock().await = Some(media.url.to_string());
         self.set_next_calls.lock().await.push(PlayCall {
             url: media.url.to_string(),
             title: media.title.map(String::from),
         });
+        let refus = self.refus_de_set_next.lock().unwrap().clone();
+        if let Some(motif) = refus {
+            return Err(motif);
+        }
+        *self.next_uri.lock().await = Some(media.url.to_string());
         Ok(())
+    }
+
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        *self.annonce_suivante.lock().unwrap()
     }
 
     async fn suivante_preparee(&self, url: &str) -> SuivantePreparee {
