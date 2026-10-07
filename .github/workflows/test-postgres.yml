@@ -356,6 +356,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i1696_services_artistes_postgres -- --nocapture
 
+      # web#1716 -- l onglet Titres pagine cote serveur : tri, recherche
+      # (`strpos` + `unaccent`), NULL ranges en bout de tri et comptes sur une
+      # VRAIE base. L epreuve vide `tracks`, `albums`, `artists` et
+      # `hidden_items` : seule, en serie.
+      - name: Onglet Titres pagine cote serveur sur PostgreSQL (web#1716)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_1716 -- --nocapture --test-threads=1
+
       # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
       #
       # Les temoins de #3248 existent depuis le 03/09 et sont declares dans
