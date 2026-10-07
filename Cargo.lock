@@ -5261,14 +5261,18 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "libc",
+ "lofty",
  "reqwest",
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
  "tune-core",
+ "tune-http-types",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

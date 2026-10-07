@@ -1,3 +1,4 @@
+mod boucle_locale_5639;
 mod lecture_http;
 use lecture_http::LecteurHttpAnnulable;
 
