@@ -148,6 +148,15 @@ impl PositionPoller {
                 self.volume_pure_concilie(zone_id, zone.volume / 100.0, status.volume)
                     .await;
             }
+            // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
+            // le dire au journal, une fois par épisode.
+            if !zone.fixed_volume
+                && !in_startup_grace
+                && !in_volume_grace
+                && status.state == TransportState::Playing
+            {
+                self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
+            }
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -1128,6 +1137,10 @@ impl PositionPoller {
                         self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                             .await;
                     }
+                    // #5662 — un renderer à 100 % ignoré est dit une fois.
+                    if !zone_fixed_volume && !in_vol_grace {
+                        self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+                    }
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
@@ -1472,6 +1485,10 @@ impl PositionPoller {
             if !zone_fixed_volume {
                 self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                     .await;
+            }
+            // #5662 — un renderer à 100 % ignoré est dit une fois.
+            if !zone_fixed_volume && !in_vol_grace2 {
+                self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
             }
             if !zone_fixed_volume
                 && !in_vol_grace2

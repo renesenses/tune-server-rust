@@ -38,6 +38,9 @@ pub(crate) mod pause_701_tests_5050;
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
 
+#[path = "dlna_volume_illisible_5662.rs"]
+pub(crate) mod volume_illisible_5662;
+
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
 mod journal_volume_tests_5575;
@@ -525,6 +528,9 @@ pub struct DlnaOutput {
     /// Un compteur qui ne revient jamais en arrière n'a pas de période : deux
     /// émissions ne partagent plus jamais d'id sur la vie du processus.
     item_id_seq: AtomicU64,
+    /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
+    /// la ligne `dlna_volume_illisible` a déjà été écrite.
+    volume_illisible: AtomicBool,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -724,6 +730,7 @@ impl DlnaOutput {
             play_delay_ms: AtomicU64::new(0),
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
+            volume_illisible: AtomicBool::new(false),
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -1298,7 +1305,16 @@ impl DlnaOutput {
                 "<InstanceID>0</InstanceID>",
             )
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                // #5662 — l'échec SOAP finit lui aussi au repli : le dire.
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    "soap_echec",
+                    &e,
+                );
+                String::new()
+            })
         } else {
             let profil = self.profil_volume().await;
             self.rc_action(
@@ -1312,15 +1328,27 @@ impl DlnaOutput {
         };
         let niveau =
             extract_tag(&volume_resp, "CurrentVolume").and_then(|v| v.trim().parse::<f64>().ok());
-        Ok(match niveau {
+        let volume = match niveau {
             // Sonos : `GroupVolume` est toujours 0–100.
             Some(v) if sonos => v / 100.0,
             Some(v) => match self.profil_volume.get() {
                 Some(p) => p.fraction(v),
                 None => v / 100.0,
             },
-            None => 0.5,
-        })
+            None => {
+                // #5662 — repli inchangé, mais visible une fois par épisode.
+                // (Sans effet si l'échec SOAP d'un Sonos vient de l'ouvrir.)
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    volume_illisible_5662::raison_illisible(&volume_resp),
+                    &volume_resp,
+                );
+                return Ok(volume_illisible_5662::REPLI_ILLISIBLE);
+            }
+        };
+        volume_illisible_5662::constater_lisible(&self.volume_illisible, &self.name, volume);
+        Ok(volume)
     }
 
     /// #5050 — un 701 sur `Pause` nomme un état, comme sur `Play` (#2581) :
