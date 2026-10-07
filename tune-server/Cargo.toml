@@ -273,6 +273,14 @@ path = "tests/titres_de_service_bannis_4806.rs"
 name = "pistes_bibliotheque_lentes_5138"
 path = "tests/pistes_bibliotheque_lentes_5138.rs"
 
+# tune-web-client#1716 — l'onglet Titres paginé côté serveur : tri, recherche,
+# provenance et comptes par la route montée, et la réponse d'avant intacte
+# sans les nouveaux paramètres. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "titres_pagines_serveur_1716"
+path = "tests/titres_pagines_serveur_1716.rs"
+
 # #5438 — un clic sur une collection intelligente ne coupe pas le flux : le
 # vrai routeur sur une vraie socket, 58 359 pistes, 4 fils d'exécuteur.
 # `autotests = false` : sans cette cible, jamais compilé.

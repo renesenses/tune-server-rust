@@ -583,6 +583,14 @@ mod like_escape_tests {
 /// deduplicate(), random_ids() with RANDOM()) retain SQLite-specific
 /// fragments behind TODO comments; phase 4 swaps them for PG
 /// equivalents via dialect helpers.
+/// La liste des pistes paginée côté serveur, triée et comptée par
+/// provenance (tune-web-client#1716).
+mod page_de_pistes;
+pub use page_de_pistes::{
+    COLONNES_TRIABLES, ColonneDeTri, ComptesParProvenance, DemandeDePistes, PageDePistes,
+    expression_provenance,
+};
+
 pub mod sql {
     use super::{Engine, SqlDialect};
 
@@ -2327,8 +2335,15 @@ impl TrackRepo {
             .iter()
             .filter_map(|r| r.first().and_then(|v| v.as_i64()))
             .collect();
+        Ok((self.hydrater_dans_l_ordre(&ids)?, total))
+    }
+
+    /// Les pistes de `ids`, dans l'ORDRE de `ids` — le second temps de
+    /// [`Self::list_visible_avec_total`] et de [`Self::page_de_pistes`].
+    /// Liste vide : aucune requête.
+    fn hydrater_dans_l_ordre(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
-            return Ok((Vec::new(), total));
+            return Ok(Vec::new());
         }
         // Des entiers lus dans notre propre base : les inscrire en clair est
         // sûr, et évite une liste de marqueurs de longueur variable.
@@ -2342,8 +2357,7 @@ impl TrackRepo {
             .map(row_to_track)
             .filter_map(|t| t.id.map(|id| (id, t)))
             .collect();
-        let pistes = ids.iter().filter_map(|id| par_id.remove(id)).collect();
-        Ok((pistes, total))
+        Ok(ids.iter().filter_map(|id| par_id.remove(id)).collect())
     }
 
     /// Le SQL de la vue pistes par défaut, sous la projection `tete` (qui
@@ -2377,27 +2391,20 @@ impl TrackRepo {
         }
     }
 
-    /// Filtered track listing with optional WHERE clauses.
+    /// Le `WHERE` de [`Self::list_filtered`] : les facettes, puis le SOCLE
+    /// de la vue (albums masqués, doublon distant, copie de moindre qualité).
+    /// Rend les conditions et les valeurs à lier, dans l'ordre des marqueurs
+    /// demandés à `ph`.
     ///
-    /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
-    /// se combinent en **OU** (`format = aiff OU flac`) ; deux facettes
-    /// différentes se combinent en **ET** (`format = flac ET genre = jazz`).
-    /// Une facette dont la liste est vide ne produit AUCUN prédicat — ni
-    /// `IN ()`, ni un `1 = 1` qui rendrait la bibliothèque entière.
-    ///
-    /// Returns (items, total_matching_count).
-    pub fn list_filtered(
+    /// Extrait tel quel de `list_filtered` (#1716) pour que la page triée de
+    /// [`Self::page_de_pistes`] filtre EXACTEMENT comme la liste facettée :
+    /// deux rédactions du même `WHERE` finiraient par diverger.
+    pub(crate) fn conditions_du_filtre(
         &self,
         f: &TrackFilter,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<Track>, i64), TuneError> {
+        ph: &mut Placeholders,
+    ) -> (Vec<String>, Vec<SqlValue>) {
         let engine = self.db.engine();
-        // Un SEUL compteur de marqueurs pour tout le WHERE : en SQLite ils
-        // s'écrivent tous `?` et seul l'ORDRE de liaison compte, donc chaque
-        // valeur doit être empilée exactement quand son marqueur est demandé.
-        let mut ph = Placeholders::new(engine);
-
         let mut conditions: Vec<String> = Vec::new();
         let mut owned_params: Vec<SqlValue> = Vec::new();
 
@@ -2652,7 +2659,7 @@ impl TrackRepo {
             // recherche passe par `/library/search`), ce qui explique que
             // personne ne l'ait signalé.
             // #5192 — la rédaction PARTAGÉE du texte libre d'Oxygen.
-            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(&mut ph, query);
+            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(ph, query);
             conditions.push(c);
             owned_params.extend(valeurs);
         }
@@ -2675,6 +2682,30 @@ impl TrackRepo {
         // facette : le compteur juste en dessous partage `where_clause`, donc
         // la fenêtre suivante part du bon décalage.
         conditions.push(crate::db::facet_filter::copie_de_moindre_qualite_exclue());
+
+        (conditions, owned_params)
+    }
+
+    /// Filtered track listing with optional WHERE clauses.
+    ///
+    /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
+    /// se combinent en **OU** (`format = aiff OU flac`) ; deux facettes
+    /// différentes se combinent en **ET** (`format = flac ET genre = jazz`).
+    /// Une facette dont la liste est vide ne produit AUCUN prédicat — ni
+    /// `IN ()`, ni un `1 = 1` qui rendrait la bibliothèque entière.
+    ///
+    /// Returns (items, total_matching_count).
+    pub fn list_filtered(
+        &self,
+        f: &TrackFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Track>, i64), TuneError> {
+        // Un SEUL compteur de marqueurs pour tout le WHERE : en SQLite ils
+        // s'écrivent tous `?` et seul l'ORDRE de liaison compte, donc chaque
+        // valeur doit être empilée exactement quand son marqueur est demandé.
+        let mut ph = Placeholders::new(self.db.engine());
+        let (conditions, owned_params) = self.conditions_du_filtre(f, &mut ph);
 
         let where_clause = if conditions.is_empty() {
             String::new()
