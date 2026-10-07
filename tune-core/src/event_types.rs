@@ -142,6 +142,12 @@ declarer_evenements! {
     ZoneCreated => "zone.created", Emis;
     ZoneDeleted => "zone.deleted", Emis;
     ZoneUpdated => "zone.updated", Emis;
+    /// #5662 — le renderer annonce de lui-meme 100 % alors que Tune croit la
+    /// zone plus bas. Tune ne l'adopte pas et n'impose rien : il le SIGNALE.
+    /// Une fois a l'ouverture de l'episode (`actif: true`), une fois a sa fin
+    /// (`actif: false`). Charge : `zone_id`, `renderer_volume`, `tune_volume`
+    /// (fractions 0–1), `actif`.
+    ZoneVolumeExterne => "zone.volume_externe", Emis;
     GroupCreated => "group.created", Emis;
     GroupUpdated => "group.updated", Emis;
     GroupDeleted => "group.deleted", Emis;
@@ -367,7 +373,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            39,
+            40,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );
@@ -420,6 +426,9 @@ mod tests {
         );
         assert_eq!(EventType::DeviceLost.as_str(), "device.lost");
         assert_eq!(EventType::VolumeChanged.as_str(), "playback.volume");
+        // Contrat ENTRE DEPOTS (#5662) : les clients web et appli afficheront
+        // un bandeau sur cette chaine exacte.
+        assert_eq!(EventType::ZoneVolumeExterne.as_str(), "zone.volume_externe");
 
         // Contrat ENTRE DEUX DEPOTS (#2870). Ces quatre chaines-la sont ecrites
         // en toutes lettres dans `tune-web-client` — `SettingsView.svelte` pour
