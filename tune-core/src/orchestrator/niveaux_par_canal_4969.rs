@@ -1,4 +1,4 @@
-//! #4969 (Gros Bidon, fil 1929) — « avoir un bargraphe avec une barre par
+//! #4969 (fil 1929) — « avoir un bargraphe avec une barre par
 //! canal quand un album est en multicanal », pour voir un LFE muet, un centre
 //! vide ou un « 7.1 » qui n'est qu'un 5.1.
 //!

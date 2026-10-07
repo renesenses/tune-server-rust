@@ -1661,7 +1661,7 @@ mod tests_over_pleine_echelle_4175 {
     }
 }
 
-/// #4969 (Gros Bidon, fil 1929) — « savoir si tous les canaux sont réellement
+/// #4969 (fil 1929) — « savoir si tous les canaux sont réellement
 /// utilisés » : un LFE muet, un centre vide, un « 7.1 » qui n'est qu'un 5.1.
 /// Les niveaux gauche/droite ne lisaient que les canaux 0 et 1.
 #[cfg(test)]
