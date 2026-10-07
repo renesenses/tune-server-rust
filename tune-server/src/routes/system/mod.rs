@@ -183,6 +183,7 @@ pub fn router() -> Router<AppState> {
             post(config::purge_orphan_tracks),
         )
         .route("/browse-dirs", get(config::browse_dirs))
+        .route("/browse-dirs/estimate", get(config::estimate_dir))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
         .route("/cleanup", post(enrich::cleanup))

@@ -667,6 +667,22 @@ pub(super) async fn stream_track_audio(
         )
             .into_response();
     }
+    // #4378 — cette route sert le fichier TEL QUEL, et c'est l'URL que le
+    // serveur média UPnP publie à tout point de contrôle tiers. Un DSDIFF
+    // compressé DST n'y est pas du DSD : un renderer qui en lirait les trames
+    // comme des bits DSD rendrait du bruit. Refus nommé, comme l'ISO SACD ;
+    // les zones de Tune, elles, le décodent.
+    if !dans_une_image && tune_core::audio::dff::est_un_dff_dst(&file_path) {
+        tracing::info!(track_id = id, "track_audio_dst_jamais_servi_brut");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT,
+            })),
+        )
+            .into_response();
+    }
     let mime = track
         .format
         .as_deref()
@@ -3237,6 +3253,59 @@ mod contrat_dlna_de_la_route_audio_3579 {
             .await
             .expect("corps");
         assert_eq!(&octets[..], b"0123456789");
+    }
+
+    /// Une piste dont le fichier est une copie d'un échantillon DSD du dépôt.
+    fn piste_dff(fixture: &str) -> (AppState, i64, tempfile::TempDir) {
+        let (state, id, dir) = piste("dff", "dff", 2_822_400, 1);
+        std::fs::copy(
+            format!(
+                "{}/../tune-core/tests/fixtures/dsd/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            dir.path().join("piste.dff"),
+        )
+        .expect("copie de l'échantillon DSD");
+        (state, id, dir)
+    }
+
+    /// 🔴 #4378 — un point de contrôle tiers qui pousse l'URL du serveur
+    /// média vers un renderer ne lui fait JAMAIS lire un DSDIFF DST brut.
+    /// Jumeau : le DFF en DSD non compressé, lui, part tel quel.
+    #[tokio::test]
+    async fn un_dff_dst_n_est_jamais_servi_brut() {
+        let (state, id, _dir) = piste_dff("ref_dsd64_stereo.dff");
+        let reponse = par_la_route(&state, id, "GET", &[]).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::OK,
+            "jumeau : un DFF en DSD brut se sert tel quel"
+        );
+
+        let (state, id, _dir) = piste_dff("dst_fate_dsd64_stereo.dff");
+        for methode in ["GET", "HEAD"] {
+            let reponse = par_la_route(&state, id, methode, &[]).await;
+            assert_eq!(
+                reponse.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{methode} : un DSDIFF DST ne doit pas partir brut vers un renderer"
+            );
+            let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .expect("corps");
+            assert!(
+                !octets.starts_with(b"FRM8"),
+                "{methode} : le corps est le fichier DST lui-même"
+            );
+            if methode == "GET" {
+                let corps: serde_json::Value = serde_json::from_slice(&octets).expect("JSON");
+                assert_eq!(corps["error"], "format_not_playable");
+                assert_eq!(
+                    corps["message"],
+                    tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT
+                );
+            }
+        }
     }
 }
 

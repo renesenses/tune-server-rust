@@ -1173,7 +1173,21 @@ impl PlaybackOrchestrator {
         let browser_needs_wav = navigateur_exige_le_wav(is_browser_output, source_format);
 
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
-        let dsd_passthrough = if source_format == Some(AudioFormat::Dsd) && is_network_output {
+        let dsd_passthrough = if source_format == Some(AudioFormat::Dsd)
+            && is_network_output
+            && crate::audio::dff::est_un_dff_dst(file_path)
+        {
+            // #4378 — un DSDIFF compressé DST n'est pas du DSD : le servir
+            // brut ferait lire au renderer des trames DST comme des bits DSD,
+            // donc du bruit. Il passe par le décodeur, quel que soit le mode
+            // DSD de la zone et quoi qu'annonce le renderer.
+            info!(
+                zone_id = req.zone_id,
+                file = %file_path,
+                "dsd_dst_jamais_servi_brut"
+            );
+            false
+        } else if source_format == Some(AudioFormat::Dsd) && is_network_output {
             let did = identifiant_du_renderer(
                 req.output_device_id.as_deref(),
                 zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
