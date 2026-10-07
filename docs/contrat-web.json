@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "f503b7f1df9e5e6c449c3e480cee877ea262b22d",
+    "web_sha": "42576e35ac7af127826cd4c39cbf4195e6328c9c",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -101,7 +101,7 @@
       "route": "/converter/presets",
       "methode": "GET",
       "type": "(retour de fonction)",
-      "liste": false,
+      "liste": true,
       "champs_obligatoires": [
         "id",
         "label",
@@ -376,6 +376,25 @@
         "expert_bands"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/eq/import/autoeq",
+      "methode": "POST",
+      "type": "EqAutoEqImport",
+      "liste": false,
+      "champs_obligatoires": [
+        "preset",
+        "band_count"
+      ],
+      "champs_optionnels": [
+        "ignored_filter_count",
+        "ignored_filters",
+        "preamp_db",
+        "reserved_headroom_db",
+        "preamp_applied",
+        "preamp_covered_by_headroom",
+        "warning"
+      ]
     },
     {
       "route": "/eq/presets",
@@ -784,6 +803,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -822,6 +843,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -860,6 +883,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -894,7 +919,8 @@
         "source"
       ],
       "champs_optionnels": [
-        "release_id"
+        "release_id",
+        "bio_provenance"
       ]
     },
     {
@@ -962,7 +988,7 @@
       "champs_optionnels": []
     },
     {
-      "route": "/library/albums/{}/reidentify",
+      "route": "/library/albums/{}/reidentify{}",
       "methode": "POST",
       "type": "ReidentifyResult",
       "liste": false,
@@ -972,6 +998,9 @@
         "tracks_total"
       ],
       "champs_optionnels": [
+        "reason",
+        "candidates",
+        "source",
         "tracks_matched",
         "tracks_unmatched",
         "was_identified_before",
@@ -1030,6 +1059,18 @@
       ]
     },
     {
+      "route": "/library/albums/{}/reveal",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "path"
+      ]
+    },
+    {
       "route": "/library/albums/{}/similar",
       "methode": "GET",
       "type": "Album",
@@ -1064,6 +1105,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -1081,6 +1124,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -1140,6 +1184,7 @@
         "musicbrainz_id",
         "discogs_id",
         "bio",
+        "bio_provenance",
         "image_path",
         "image_source",
         "source_id",
@@ -1171,6 +1216,7 @@
         "musicbrainz_id",
         "discogs_id",
         "bio",
+        "bio_provenance",
         "image_path",
         "image_source",
         "source_id",
@@ -1191,6 +1237,7 @@
         "musicbrainz_id",
         "discogs_id",
         "bio",
+        "bio_provenance",
         "image_path",
         "image_source",
         "source_id",
@@ -1232,6 +1279,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -1244,7 +1293,8 @@
         "bio"
       ],
       "champs_optionnels": [
-        "source"
+        "source",
+        "bio_provenance"
       ]
     },
     {
@@ -1295,6 +1345,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -1617,6 +1668,23 @@
       "champs_optionnels": []
     },
     {
+      "route": "/library/identify-all/status",
+      "methode": "GET",
+      "type": "EtatLotIdentification",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "status",
+        "mode",
+        "total",
+        "traites",
+        "identifies",
+        "sans_majorite",
+        "raison",
+        "en_pause"
+      ]
+    },
+    {
       "route": "/library/repertoires/ordre",
       "methode": "GET",
       "type": "MusicDirectoryOrder",
@@ -1652,6 +1720,18 @@
         "pushed"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/library/reveal/available",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "available"
+      ],
+      "champs_optionnels": [
+        "reason"
+      ]
     },
     {
       "route": "/library/search",
@@ -1856,6 +1936,12 @@
         "dynamic_range_from_sidecar_file",
         "dynamic_range_unavailable",
         "dynamic_range_deferred",
+        "dynamic_range_oversized",
+        "dynamic_range_without_file",
+        "dynamic_range_out_of_scope",
+        "dynamic_range_processed",
+        "dynamic_range_unmanageable",
+        "dynamic_range_unmeasurable",
         "dynamic_range_pct"
       ]
     },
@@ -1886,6 +1972,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -1930,7 +2017,10 @@
         "status",
         "track_id"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "file_writes_enabled",
+        "file_written"
+      ]
     },
     {
       "route": "/library/tracks/{}/better-quality",
@@ -2215,7 +2305,9 @@
         "mount_path",
         "id"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "deja_monte"
+      ]
     },
     {
       "route": "/network/smb/mounts",
@@ -2235,6 +2327,24 @@
         "smb_version"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/network/smb/mounts/{}",
+      "methode": "DELETE",
+      "type": "OubliPartage",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "oublie",
+        "demonte",
+        "racines",
+        "pistes",
+        "racines_retirees",
+        "pistes_retirees",
+        "purge_refusee",
+        "error",
+        "message"
+      ]
     },
     {
       "route": "/onboarding/status",
@@ -2464,6 +2574,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -2741,7 +2852,8 @@
         "album",
         "cover_url",
         "created_at",
-        "first_seen_at"
+        "first_seen_at",
+        "ai_generated"
       ]
     },
     {
@@ -3170,6 +3282,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -3264,6 +3377,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -3281,6 +3396,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -3330,6 +3446,7 @@
         "musicbrainz_id",
         "discogs_id",
         "bio",
+        "bio_provenance",
         "image_path",
         "image_source",
         "source_id",
@@ -3371,6 +3488,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -3388,6 +3507,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -3564,6 +3684,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -3602,6 +3724,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -3654,6 +3778,8 @@
         "dynamic_range",
         "is_compilation",
         "release_type",
+        "inferred_release_type",
+        "release_secondary_types",
         "dynamic_range_source"
       ]
     },
@@ -3711,6 +3837,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -3803,6 +3930,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -3852,6 +3980,7 @@
         "album_id_service",
         "album_title",
         "artist_id",
+        "artist_id_service",
         "artist_name",
         "album_artist",
         "disc_number",
@@ -4022,7 +4151,8 @@
         "scan_pausable",
         "dynamic_range_priority",
         "dynamic_range_priority_choices",
-        "dynamic_range_sidecar"
+        "dynamic_range_sidecar",
+        "acoustid"
       ]
     },
     {
@@ -4060,6 +4190,36 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/browse-dirs/estimate",
+      "methode": "GET",
+      "type": "EstimationDossier",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "path",
+        "audio_files",
+        "folders",
+        "complete",
+        "drive_root",
+        "error"
+      ]
+    },
+    {
+      "route": "/system/browse-dirs{}",
+      "methode": "GET",
+      "type": "ListeDossiersServeur",
+      "liste": false,
+      "champs_obligatoires": [
+        "dirs",
+        "parent",
+        "current"
+      ],
+      "champs_optionnels": [
+        "drives",
+        "error"
+      ]
+    },
+    {
       "route": "/system/cleanup",
       "methode": "POST",
       "type": "ResultatNettoyage",
@@ -4092,7 +4252,10 @@
       "champs_obligatoires": [
         "imported"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "zones_added",
+        "zones_modified"
+      ]
     },
     {
       "route": "/system/database/migrate",
@@ -4185,6 +4348,17 @@
         "slimproto_udp",
         "lms_cli",
         "devices"
+      ]
+    },
+    {
+      "route": "/system/dynamic-range/analyze",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "status",
+        "total"
       ]
     },
     {
@@ -4428,7 +4602,12 @@
         "waiting_reason",
         "working",
         "library_analyzed",
-        "library_eligible"
+        "library_eligible",
+        "library_total",
+        "library_processed",
+        "library_without_file",
+        "library_out_of_scope",
+        "library_failed"
       ]
     },
     {
@@ -5400,6 +5579,7 @@
         "queue_length"
       ],
       "champs_optionnels": [
+        "queue_position",
         "unresolved"
       ]
     },
@@ -6507,6 +6687,16 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/system/config/import/preview",
+      "type": "unknown",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/library/identify-all",
+      "type": "Record<string, unknown>",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/system/import/status/{}",
       "type": "EtatImport",
       "raison": "type introuvable dans les sources"
@@ -6578,7 +6768,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 324,
-    "appels_non_resolus": 158
+    "routes_cartographiees": 332,
+    "appels_non_resolus": 160
   }
 }
