@@ -495,6 +495,11 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
 
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716) survivent au redémarrage : la mémoire est
+    // branchée sur la base AVANT la découverte, qui les relit.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
+
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
 

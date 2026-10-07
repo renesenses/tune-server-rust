@@ -890,6 +890,13 @@ async fn handle_ssdp_discovered(
             registered = true;
             info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
             drop(reg);
+            // Les profils de commande appris pour cet appareil lors d'une vie
+            // précédente de Tune : relus ici, oubliés si la version logicielle
+            // publiée a changé.
+            tune_core::outputs::dlna_repli_set_uri::charger_pour_appareil(
+                &dev.id,
+                dev.capabilities.get("firmware").and_then(|v| v.as_str()),
+            );
             // Persist LOCATION + UUID so a lazy-SSDP renderer (Cyrus Stream X2)
             // can be re-probed over HTTP after a restart instead of vanishing
             // until it next answers multicast (#1126).
