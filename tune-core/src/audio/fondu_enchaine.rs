@@ -65,7 +65,9 @@
 //! est nommé plutôt que masqué.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::outputs::traits::{AudioSpec, FormatOuvert, PuitsDEchantillons, TransformationsReelles};
 
@@ -110,6 +112,11 @@ impl CourbeDeFondu {
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::Lineaire => (1.0 - t, t),
+            // `cos(π/2)` en f32 vaut −4,4·10⁻⁸, pas zéro : la dernière trame
+            // du recouvrement garderait une trace inversée de la sortante. La
+            // borne d'arrivée est donc posée exacte, comme celle de départ
+            // l'est déjà (`cos 0 = 1`, `sin 0 = 0`).
+            Self::PuissanceConstante if t >= 1.0 => (0.0, 1.0),
             Self::PuissanceConstante => {
                 let angle = t * std::f32::consts::FRAC_PI_2;
                 (angle.cos(), angle.sin())
@@ -453,6 +460,52 @@ impl FonduEnchaine {
         EtatDuFondu::Livre
     }
 
+    /// Trames de la sortante retenues en ce moment — la queue qui serait
+    /// superposée si elle finissait maintenant. Zéro hors de la phase
+    /// [`PhaseDuFondu::Sortante`].
+    #[must_use]
+    pub fn trames_en_reserve(&self) -> usize {
+        if self.sortante_finie {
+            0
+        } else {
+            self.reserve.len() / self.canaux()
+        }
+    }
+
+    /// La crête absolue des `trames` dernières trames retenues (toutes si la
+    /// réserve est plus courte). `0.0` sur une réserve vide.
+    ///
+    /// C'est la mesure de la « jonction sans blanc » (#2211) : une sortante
+    /// qui finit sur de la musique — et non sur un silence — enchaîne sur la
+    /// suivante sans pause, et le gapless doit primer.
+    #[must_use]
+    pub fn crete_de_la_queue(&self, trames: usize) -> f32 {
+        let mots = (trames * self.canaux()).min(self.reserve.len());
+        self.reserve
+            .iter()
+            .skip(self.reserve.len() - mots)
+            .fold(0.0f32, |m, &x| m.max(x.abs()))
+    }
+
+    /// **Renoncer au fondu** sur cette frontière : la réserve part au puits
+    /// telle quelle, mot pour mot, et le moteur redevient neuf — réserve vide,
+    /// toujours en phase [`PhaseDuFondu::Sortante`].
+    ///
+    /// C'est ce qui rend le moteur inoffensif quand le fondu n'a pas lieu
+    /// (album sans blanc, PURE, piste suivante absente ou non enchaînable) :
+    /// le flux livré est exactement celui d'un enchaînement gapless, seulement
+    /// retardé de la réserve. Sans effet hors de la phase sortante.
+    pub fn relacher_la_reserve(
+        &mut self,
+        puits: &mut (dyn PuitsDEchantillons + '_),
+    ) -> EtatDuFondu {
+        if self.sortante_finie || self.reserve.is_empty() {
+            return EtatDuFondu::Livre;
+        }
+        let intacte: Vec<f32> = self.reserve.drain(..).collect();
+        EtatDuFondu::depuis(self.livrer(puits, &intacte))
+    }
+
     /// Fin de la transition : sort tout ce qui reste.
     ///
     /// À appeler quand l'entrante n'a plus rien à donner non plus. Si elle
@@ -636,6 +689,342 @@ impl PuitsDEchantillons for VoieEntrante<'_> {
                 moteur.pousser_entrante(puits.as_mut(), mots).vivant()
             }
             Err(_) => false,
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #2211 — le raccordement à la sortie locale : un puits qui porte le moteur.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Durée maximale d'un fondu enchaîné, en secondes (réglage de zone).
+pub const DUREE_MAX_S: f64 = 12.0;
+
+/// Fenêtre de la queue sortante examinée pour reconnaître une jonction
+/// « sans blanc » : les 200 dernières millisecondes.
+pub const FENETRE_DE_JONCTION: Duration = Duration::from_millis(200);
+
+/// Crête sous laquelle la queue sortante est un blanc : −48 dBFS.
+pub const SEUIL_DE_BLANC: f32 = 0.003_981_07;
+
+/// Pourquoi une frontière ne fond PAS. Chaque motif a son code de journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotifSansFondu {
+    /// Durée de zone à 0 : le fondu est désactivé.
+    Desactive,
+    /// Mode PURE : rien ne touche le signal.
+    Pure,
+    /// Bit-perfect strict : rien ne touche le signal.
+    BitPerfectStrict,
+    /// Porteur DoP : une addition détruirait le marqueur, le DAC se tairait.
+    Dop,
+    /// La sortante n'a rien laissé en réserve (piste plus courte que le
+    /// pré-remplissage, ou fondu armé après son début).
+    ReserveVide,
+    /// L'orchestrateur n'a pas jugé cette frontière : dans le doute, gapless.
+    ConsigneAbsente,
+    /// Deux pistes d'un même album live : le gapless prime.
+    AlbumLive,
+    /// Deux pistes d'un même album dont la sortante finit sur de la musique,
+    /// sans blanc : le gapless prime.
+    JonctionSansBlanc,
+}
+
+impl MotifSansFondu {
+    /// Le code journalisé (`fondu_enchaine_renonce motif=…`).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Desactive => "desactive",
+            Self::Pure => "pure",
+            Self::BitPerfectStrict => "bitperfect_strict",
+            Self::Dop => "dop",
+            Self::ReserveVide => "reserve_vide",
+            Self::ConsigneAbsente => "consigne_absente",
+            Self::AlbumLive => "album_live",
+            Self::JonctionSansBlanc => "jonction_sans_blanc",
+        }
+    }
+}
+
+/// Ce que l'orchestrateur dit d'UNE frontière, au moment où il arme la
+/// piste suivante (`set_next_media`). Il est le seul à connaître les deux
+/// albums ; la sortie, elle, connaît les échantillons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsigneDeJonction {
+    /// Rien n'a été dit : pas de fondu.
+    #[default]
+    Inconnue,
+    /// Fondu interdit par la file, avec son motif.
+    Interdite(MotifSansFondu),
+    /// Deux albums différents : fondu permis.
+    Permise,
+    /// Deux pistes du même album, non live : fondu permis seulement si la
+    /// sortante finit sur un blanc.
+    PermiseSiBlanc,
+}
+
+/// Tout ce que la frontière sait au moment de décider.
+#[derive(Debug, Clone, Copy)]
+pub struct Jonction {
+    /// La zone a une durée de fondu non nulle ET la réserve est armée.
+    pub fondu_arme: bool,
+    pub pure: bool,
+    pub bitperfect_strict: bool,
+    pub dop: bool,
+    pub reserve_vide: bool,
+    pub consigne: ConsigneDeJonction,
+    /// La queue sortante est-elle un blanc ([`SEUIL_DE_BLANC`]) ?
+    pub queue_silencieuse: bool,
+}
+
+/// **La règle du fondu**, fonction pure. `Ok(())` : la frontière fond.
+///
+/// L'ordre est celui des promesses : un réglage absent d'abord, puis ce qui
+/// promet le signal intact (PURE, strict, DoP), puis la matière, puis la
+/// file. Le doute rend toujours le gapless.
+pub fn decider_le_fondu(j: Jonction) -> Result<(), MotifSansFondu> {
+    if !j.fondu_arme {
+        return Err(MotifSansFondu::Desactive);
+    }
+    if j.pure {
+        return Err(MotifSansFondu::Pure);
+    }
+    if j.bitperfect_strict {
+        return Err(MotifSansFondu::BitPerfectStrict);
+    }
+    if j.dop {
+        return Err(MotifSansFondu::Dop);
+    }
+    if j.reserve_vide {
+        return Err(MotifSansFondu::ReserveVide);
+    }
+    match j.consigne {
+        ConsigneDeJonction::Inconnue => Err(MotifSansFondu::ConsigneAbsente),
+        ConsigneDeJonction::Interdite(motif) => Err(motif),
+        ConsigneDeJonction::Permise => Ok(()),
+        ConsigneDeJonction::PermiseSiBlanc if j.queue_silencieuse => Ok(()),
+        ConsigneDeJonction::PermiseSiBlanc => Err(MotifSansFondu::JonctionSansBlanc),
+    }
+}
+
+/// Le puits que la sortie locale donne à son étage quand la zone a une durée
+/// de fondu : il porte un [`FonduEnchaine`] devant le puits réel.
+///
+/// Mono-fil, contrairement à [`AtelierDeFondu`] : la boucle gapless de
+/// `play_url` lit les pistes **l'une après l'autre**, et c'est suffisant.
+/// La sortante a fini de décoder quand l'entrante commence ; ses N dernières
+/// trames attendent dans la réserve, et chaque bloc de l'entrante est
+/// mélangé à mesure qu'il arrive. Le décodeur court devant le DAC de la
+/// durée de la réserve — c'est tout ce que coûte la superposition.
+///
+/// Sans durée (zone à 0, PURE, flux en direct), il est **transparent** : un
+/// seul `ecrire` vers le puits réel, rien d'autre — la promesse bit-perfect
+/// ne dépend pas d'une branche du moteur.
+pub struct PuitsDeFondu<'p> {
+    reel: Box<dyn PuitsDEchantillons + 'p>,
+    format: FormatOuvert,
+    courbe: CourbeDeFondu,
+    /// La durée de la zone, en millisecondes — relue à chaque réarmement, donc
+    /// à chaque frontière : un réglage changé s'applique à la piste suivante.
+    duree_ms: Arc<AtomicU32>,
+    moteur: Option<FonduEnchaine>,
+    /// Durée retenue dans la réserve, en millisecondes : la sortie la
+    /// retranche de la position publiée, qui sinon courrait devant le son.
+    retenue_ms: Arc<AtomicU64>,
+    /// Vrai pendant le recouvrement, et lui seul : c'est ce que le chemin du
+    /// signal affiche (« Fondu enchaîné »).
+    actif: Arc<AtomicBool>,
+    /// Trames superposées par le dernier fondu, gardées après le réarmement :
+    /// le moteur neuf repart de zéro, la mesure ne doit pas se perdre avec lui.
+    dernier_fondu: usize,
+}
+
+impl<'p> PuitsDeFondu<'p> {
+    /// Monte le puits. Le moteur n'existe que si `duree_ms` est non nulle.
+    #[must_use]
+    pub fn nouveau(
+        reel: Box<dyn PuitsDEchantillons + 'p>,
+        format: FormatOuvert,
+        courbe: CourbeDeFondu,
+        duree_ms: Arc<AtomicU32>,
+        retenue_ms: Arc<AtomicU64>,
+        actif: Arc<AtomicBool>,
+    ) -> Self {
+        let mut puits = Self {
+            reel,
+            format,
+            courbe,
+            duree_ms,
+            moteur: None,
+            retenue_ms,
+            actif,
+            dernier_fondu: 0,
+        };
+        puits.rearmer();
+        puits
+    }
+
+    fn moteur_neuf(&self) -> Option<FonduEnchaine> {
+        let ms = self.duree_ms.load(Ordering::Relaxed);
+        if ms == 0 {
+            return None;
+        }
+        FonduEnchaine::pendant(
+            self.format,
+            Duration::from_millis(u64::from(ms)),
+            self.courbe,
+        )
+    }
+
+    fn rearmer(&mut self) {
+        if let Some(melangees) = self
+            .moteur
+            .as_ref()
+            .map(FonduEnchaine::trames_melangees)
+            .filter(|&n| n > 0)
+        {
+            self.dernier_fondu = melangees;
+        }
+        self.moteur = self.moteur_neuf();
+        self.retenue_ms.store(0, Ordering::Relaxed);
+        self.actif.store(false, Ordering::Relaxed);
+    }
+
+    fn publier_la_retenue(&self) {
+        let trames = self
+            .moteur
+            .as_ref()
+            .map_or(0, FonduEnchaine::trames_en_reserve);
+        let ms = if self.format.cadence == 0 {
+            0
+        } else {
+            trames as u64 * 1000 / u64::from(self.format.cadence)
+        };
+        self.retenue_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Une réserve est-elle armée — la piste courante est-elle une sortante
+    /// qui pourrait fondre à sa fin ?
+    #[must_use]
+    pub fn fondu_arme(&self) -> bool {
+        self.moteur
+            .as_ref()
+            .is_some_and(|m| m.phase() == PhaseDuFondu::Sortante)
+    }
+
+    /// La réserve est-elle vide ?
+    #[must_use]
+    pub fn reserve_vide(&self) -> bool {
+        self.moteur
+            .as_ref()
+            .is_none_or(|m| m.trames_en_reserve() == 0)
+    }
+
+    /// La queue retenue est-elle un blanc ? Vrai sans réserve.
+    #[must_use]
+    pub fn queue_silencieuse(&self) -> bool {
+        let Some(moteur) = self.moteur.as_ref() else {
+            return true;
+        };
+        let trames = (FENETRE_DE_JONCTION.as_secs_f64() * f64::from(self.format.cadence)) as usize;
+        moteur.crete_de_la_queue(trames.max(1)) < SEUIL_DE_BLANC
+    }
+
+    /// Le moteur mélange-t-il deux pistes en ce moment ?
+    #[must_use]
+    pub fn recouvrement_en_cours(&self) -> bool {
+        self.moteur
+            .as_ref()
+            .is_some_and(FonduEnchaine::traitement_actif)
+    }
+
+    /// Trames effectivement superposées par le dernier fondu — celui en
+    /// cours s'il y en a un, sinon le dernier achevé. Zéro si rien n'a fondu.
+    #[must_use]
+    pub fn trames_melangees(&self) -> usize {
+        self.moteur
+            .as_ref()
+            .map(FonduEnchaine::trames_melangees)
+            .filter(|&n| n > 0)
+            .unwrap_or(self.dernier_fondu)
+    }
+
+    /// La frontière FOND : la réserve devient la queue à superposer, les mots
+    /// suivants sont ceux de l'entrante. Rend `false` si le puits réel est mort.
+    pub fn commencer_le_fondu(&mut self) -> bool {
+        let Some(moteur) = self.moteur.as_mut() else {
+            return true;
+        };
+        let etat = moteur.fin_de_la_sortante(self.reel.as_mut());
+        let termine = moteur.phase() == PhaseDuFondu::Entrante;
+        self.retenue_ms.store(0, Ordering::Relaxed);
+        if termine {
+            self.rearmer();
+        } else {
+            self.actif.store(true, Ordering::Relaxed);
+        }
+        etat.vivant()
+    }
+
+    /// La frontière NE FOND PAS : la réserve part intacte (enchaînement
+    /// gapless, au mot près) — ou, si un recouvrement était encore en cours
+    /// (entrante plus courte que le fondu), la sortante finit son extinction.
+    /// Puis une réserve neuve s'arme pour la piste qui commence.
+    pub fn renoncer_au_fondu(&mut self) -> bool {
+        let vivant = self.solder();
+        self.rearmer();
+        vivant
+    }
+
+    /// Fin de la chaîne : tout ce qui est retenu part, plus rien ne se retient.
+    pub fn terminer(&mut self) -> bool {
+        let vivant = self.solder();
+        self.moteur = None;
+        self.retenue_ms.store(0, Ordering::Relaxed);
+        self.actif.store(false, Ordering::Relaxed);
+        vivant
+    }
+
+    fn solder(&mut self) -> bool {
+        let Some(moteur) = self.moteur.as_mut() else {
+            return true;
+        };
+        let etat = match moteur.phase() {
+            PhaseDuFondu::Sortante => moteur.relacher_la_reserve(self.reel.as_mut()),
+            PhaseDuFondu::Recouvrement | PhaseDuFondu::Entrante => moteur.vider(self.reel.as_mut()),
+        };
+        etat.vivant()
+    }
+}
+
+impl PuitsDEchantillons for PuitsDeFondu<'_> {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        let Some(moteur) = self.moteur.as_mut() else {
+            return self.reel.ecrire(mots);
+        };
+        match moteur.phase() {
+            PhaseDuFondu::Sortante => {
+                let etat = moteur.pousser_sortante(self.reel.as_mut(), mots);
+                self.publier_la_retenue();
+                etat.vivant()
+            }
+            PhaseDuFondu::Recouvrement => {
+                let etat = moteur.pousser_entrante(self.reel.as_mut(), mots);
+                if moteur.phase() == PhaseDuFondu::Entrante {
+                    // Le recouvrement est fini et l'entrante entièrement
+                    // livrée : elle devient la sortante de la frontière
+                    // suivante, avec une réserve neuve.
+                    self.rearmer();
+                }
+                etat.vivant()
+            }
+            PhaseDuFondu::Entrante => {
+                // Inatteignable : `rearmer` suit toujours la fin d'un
+                // recouvrement. Gardé sûr plutôt que paniquant.
+                self.rearmer();
+                self.ecrire(mots)
+            }
         }
     }
 }

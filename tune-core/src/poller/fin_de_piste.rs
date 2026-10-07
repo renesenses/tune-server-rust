@@ -966,6 +966,17 @@ impl PositionPoller {
             .ok()
             .flatten();
 
+        // #2211 — ce que la frontière permet au fondu enchaîné (même album,
+        // live, DSD), jugé ICI parce que c'est le seul endroit qui tient à la
+        // fois la piste en cours et la ligne qu'on arme. Sans ligne lisible :
+        // `Inconnue`, donc pas de fondu.
+        let consigne_de_fondu = match (zone_state.now_playing.as_ref(), ligne.as_ref()) {
+            (Some(courante), Some(suivante)) => {
+                crate::audio::fondu_de_zone::consigne(&self.db, courante, suivante)
+            }
+            _ => crate::audio::fondu_enchaine::ConsigneDeJonction::Inconnue,
+        };
+
         let arme = ligne.map(|e| ArmedNext {
             row_id: e.id,
             position: next_pos,
@@ -994,7 +1005,7 @@ impl PositionPoller {
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
-        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme)
+        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme, consigne_de_fondu)
             .await
     }
 
@@ -1087,6 +1098,7 @@ impl PositionPoller {
         next_pos: i64,
         device_id: &str,
         arme: Option<ArmedNext>,
+        consigne_de_fondu: crate::audio::fondu_enchaine::ConsigneDeJonction,
     ) -> GaplessPrep {
         let t0 = Instant::now();
         match self.resolve_gapless_next(zone_id, next_pos).await {
@@ -1201,6 +1213,18 @@ impl PositionPoller {
                         track_number: resolved.track_number,
                         disc_number: resolved.disc_number,
                     };
+                    // #2211 — la consigne de la frontière, AVANT la piste :
+                    // `set_next_media` la range avec elle. Seule la sortie
+                    // locale fond ; les autres n'ont rien à en faire.
+                    #[cfg(feature = "local-audio")]
+                    if let Some(local) = output
+                        .as_any()
+                        .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    {
+                        local.consigner_la_jonction_suivante(consigne_de_fondu);
+                    }
+                    #[cfg(not(feature = "local-audio"))]
+                    let _ = consigne_de_fondu;
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         GaplessPrep::NotArmed

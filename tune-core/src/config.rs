@@ -65,11 +65,10 @@ pub struct TuneConfig {
     /// `playback::crossfade::CrossfadeHandler`, lui-même sans appelant, retiré
     /// par #2211.
     ///
-    /// Le fondu enchaîné n'existe sous aucune forme aujourd'hui : la route
-    /// `POST /zones/{id}/crossfade` refuse l'activation par un 501
-    /// `crossfade_unavailable` depuis #2689, et un vrai fondu demandera de
-    /// mélanger deux flux PCM décodés sur la sortie locale — pas une rampe de
-    /// volume.
+    /// Le fondu enchaîné réel (#2211) ne les lit pas non plus : c'est un
+    /// réglage PAR ZONE (`zone_{id}_crossfade_s`, `audio::fondu_de_zone`),
+    /// appliqué par la sortie locale qui mélange deux flux PCM décodés — pas
+    /// une rampe de volume.
     ///
     /// Laissés en place plutôt que retirés : sortir un champ d'une
     /// configuration publique est un arbitrage de Bertrand, pas une retouche

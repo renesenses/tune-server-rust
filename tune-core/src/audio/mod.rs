@@ -56,6 +56,9 @@ pub mod faststart;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
+/// #2211 — le réglage de fondu d'une zone et la consigne de chaque frontière
+/// (même album, live, DSD) que l'orchestrateur remet à la sortie locale.
+pub mod fondu_de_zone;
 /// Le fondu enchaîné qui superpose vraiment deux pistes (#2211) — deux flux
 /// `f32` décodés, une enveloppe par échantillon, un seul puits. Aucun volume
 /// de sortie n'est touché : c'est tout le sujet du ticket.

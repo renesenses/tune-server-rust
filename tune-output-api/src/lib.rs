@@ -1993,6 +1993,9 @@ pub struct TransformationsReelles {
     entree: AudioSpec,
     ouvert: FormatOuvert,
     dsp_actif: bool,
+    /// #2211 — un fondu enchaîné superpose deux pistes en ce moment même.
+    /// Faux hors du recouvrement : le fondu ne touche le signal que là.
+    fondu_enchaine: bool,
 }
 
 impl TransformationsReelles {
@@ -2005,7 +2008,25 @@ impl TransformationsReelles {
             entree,
             ouvert,
             dsp_actif,
+            fondu_enchaine: false,
         }
+    }
+
+    /// #2211 — la même déclaration, en disant si un fondu enchaîné mélange
+    /// deux pistes à cet instant. Additif : `nouvelles` le pose à faux, et
+    /// une sortie qui ne fond pas n'a rien à changer.
+    #[must_use]
+    pub const fn avec_fondu_enchaine(mut self, actif: bool) -> Self {
+        self.fondu_enchaine = actif;
+        self
+    }
+
+    /// Un fondu enchaîné superpose-t-il deux pistes en ce moment ? Il additionne
+    /// deux sources sous enveloppe : plus rien n'est bit-perfect pendant ce
+    /// recouvrement.
+    #[must_use]
+    pub const fn fondu_enchaine(&self) -> bool {
+        self.fondu_enchaine
     }
 
     /// Le format entré dans la sortie.

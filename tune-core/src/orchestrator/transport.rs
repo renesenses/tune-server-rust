@@ -2077,6 +2077,15 @@ impl PlaybackOrchestrator {
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.
                     local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+                    // #2211 — fondu enchaîné, sortie LOCALE uniquement : `0` en
+                    // PURE et en bit-perfect strict (`duree_appliquee_ms`), et
+                    // pour un flux en direct, qui n'a pas de piste suivante et
+                    // dont la réserve retarderait le démarrage.
+                    local_output.set_fondu_enchaine_ms(if media.live_stream {
+                        0
+                    } else {
+                        crate::audio::fondu_de_zone::duree_appliquee_ms(&self.db, zone_id)
+                    });
                 }
                 drop(output);
             }
