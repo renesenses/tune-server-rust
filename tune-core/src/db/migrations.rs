@@ -3270,6 +3270,19 @@ pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS i
 ///
 /// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
 /// [`TRACKS_CLE_DE_COPIE_INDEX`], pour ne pas prendre de numéro de migration.
+/// b209 — les pistes UPnP importées avant que le numéro ne soit lu portent 0
+/// (le défaut du modèle), sur chaque piste. 0 n'est pas un numéro : il passe
+/// à NULL. Le vrai numéro revient à la synchronisation suivante, qui réécrit
+/// chaque piste vue. Une piste LOCALE n'est jamais touchée.
+///
+/// Rejouée à chaque démarrage, sur les deux moteurs, sans numéro de
+/// migration — même raison que [`TRACKS_SOURCE_ID_INDEX`]. Idempotente : au
+/// second passage, plus aucune ligne ne correspond, et
+/// `idx_tracks_source_path (source, …)` borne la lecture aux pistes UPnP.
+pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_number = NULL \
+     WHERE source = 'upnp' AND track_number = 0;
+     UPDATE tracks SET disc_number = NULL WHERE source = 'upnp' AND disc_number = 0;";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4085,6 +4098,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Table « un album, son DR » (ticket 190) : même passe — voir la constante.
     if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
         warn!(error = %e, "sqlite_dr_album_index_failed");
+    }
+    // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
+        warn!(error = %e, "sqlite_upnp_numeros_zero_a_null_failed");
     }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
@@ -5014,6 +5031,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // pas encore quand `ensure_schema` tourne a la connexion.
     if let Err(e) = sqlx::raw_sql(TRACKS_SOURCE_ID_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_source_id_index_failed");
+    }
+    // b209 — même passe que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(UPNP_NUMEROS_ZERO_A_NULL).execute(pool).await {
+        warn!(error = %e, "pg_upnp_numeros_zero_a_null_failed");
     }
 
     // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
