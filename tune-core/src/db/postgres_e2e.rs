@@ -3273,4 +3273,11 @@ async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
         "piste locale intacte"
     );
     assert_eq!(valeur(ids[&2], "track_number"), Some(1));
+
+    // Idempotence de l'indexation : `IS DISTINCT FROM`, pas `=`, pour que
+    // NULL contre NULL ne compte pas comme un changement.
+    crate::db::track_repo::tests_b209_ordre_dans_l_album::regle_d_idempotence_upnp(
+        db.clone(),
+        ids[&3],
+    );
 }

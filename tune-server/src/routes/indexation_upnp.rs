@@ -991,7 +991,11 @@ fn ecrire(
                         .and_then(|t| t.cover_path)
                         .filter(|p| !p.starts_with("http"));
                 }
-                match pistes_repo.update(&ligne) {
+                match pistes_repo.update_distante(
+                    &ligne,
+                    piste.numero_de_disque,
+                    piste.numero_de_piste,
+                ) {
                     Ok(()) => {
                         bilan.mises_a_jour += 1;
                         Some(id)
@@ -1028,27 +1032,20 @@ fn ecrire(
         // 0 : la base recevait 0 sur chaque piste UPnP, et la fiche d'album se
         // triait par titre. Ce que le serveur ne dit pas est rangé NULL, ce
         // qu'il dit est rangé tel quel — à chaque passe, ce qui rattrape aussi
-        // les pistes déjà importées avec 0. Jouée aussi pour une piste NEUVE
-        // (son `cover_path` vient d'être écrit par `create`, à l'identique),
+        // les pistes déjà importées avec 0. Jouée aussi pour une piste NEUVE,
         // puisque `create` y range 0 lui aussi.
-        let sql = match state.backend.engine() {
-            tune_core::db::engine::Engine::Sqlite => {
-                "UPDATE tracks SET cover_path = ?, track_number = ?, disc_number = ? \
-                 WHERE id = ? AND source = 'upnp'"
-            }
-            tune_core::db::engine::Engine::Postgres => {
-                "UPDATE tracks SET cover_path = $1, track_number = $2, disc_number = $3 \
-                 WHERE id = $4 AND source = 'upnp'"
-            }
-        };
-        if let Err(e) = state.backend.execute(
-            sql,
-            &[
-                &ligne.cover_path as &dyn ToSqlValue,
-                &piste.numero_de_piste as &dyn ToSqlValue,
-                &piste.numero_de_disque as &dyn ToSqlValue,
-                &id as &dyn ToSqlValue,
-            ],
+        //
+        // Une piste DÉJÀ indexée passe par `update_distante`, qui écrit
+        // d'emblée NULL : écrire 0 par `update` puis NULL ici faisait DEUX
+        // changements réels par piste et par passe, et le SystemUpdateID
+        // avançait sur une source identique. L'écriture ci-dessous est gardée
+        // (`IS NOT` / `IS DISTINCT FROM`) : elle ne touche la ligne que si une
+        // valeur change vraiment.
+        if let Err(e) = pistes_repo.publier_pochette_et_numeros_upnp(
+            id,
+            ligne.cover_path.as_deref(),
+            piste.numero_de_disque,
+            piste.numero_de_piste,
         ) {
             bilan
                 .erreurs
@@ -1363,6 +1360,69 @@ mod tests {
         assert_eq!(bilan.mises_a_jour, 4);
         assert_eq!(ordre(&repo), attendu);
         assert_eq!(zeros(&state), Some(0));
+    }
+
+    /// b209 — réindexer une source identique ne fait pas avancer le
+    /// SystemUpdateID ; une passe qui APPREND un numéro le fait avancer.
+    #[test]
+    fn b209_reindexation_identique_stable_numero_appris_compte() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let p = |titre: &str, numero: Option<i32>| PisteDistante {
+            object_id: titre.into(),
+            titre: titre.into(),
+            artiste: Some("Artiste".into()),
+            album: Some("Album".into()),
+            url_de_lecture: Some(format!("http://exemple/{titre}.flac")),
+            pochette: None,
+            duree_ms: Some(1000),
+            taille: Some(1000),
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            protocol_info: None,
+            numero_de_piste: numero,
+            numero_de_disque: None,
+        };
+        let revision = |state: &AppState| {
+            state
+                .backend
+                .query_one("SELECT value FROM upnp_catalog_revision WHERE id = 1", &[])
+                .unwrap()
+                .unwrap()[0]
+                .as_i64()
+                .unwrap()
+        };
+        let passe = |pistes: &[PisteDistante]| {
+            let mut bilan = Bilan::default();
+            ecrire(
+                &state,
+                "uuid:test",
+                "NAS",
+                pistes,
+                &mut bilan,
+                &HashMap::new(),
+            );
+            assert!(bilan.erreurs.is_empty(), "{:?}", bilan.erreurs);
+        };
+        let sans = vec![p("Un", None), p("Deux", Some(2))];
+        passe(&sans);
+        let apres_import = revision(&state);
+        passe(&sans);
+        passe(&sans);
+        assert_eq!(
+            revision(&state),
+            apres_import,
+            "sans le correctif : +2 par piste sans numéro et par passe"
+        );
+        let appris = vec![p("Un", Some(1)), p("Deux", Some(2))];
+        passe(&appris);
+        assert_eq!(
+            revision(&state),
+            apres_import + 1,
+            "un numéro appris est UN changement"
+        );
+        passe(&appris);
+        assert_eq!(revision(&state), apres_import + 1);
     }
 
     #[tokio::test]
