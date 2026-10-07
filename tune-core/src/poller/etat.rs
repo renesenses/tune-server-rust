@@ -190,6 +190,10 @@ pub(super) struct ZonePollState {
     /// bascule par `Next` au lieu du repli ; `Inconnue` — le défaut de toute
     /// sortie qui ne sait pas répondre — laisse la conduite d'avant intacte.
     pub(super) suivante_preparee: SuivantePreparee,
+    /// #3967 — la génération de piste pour laquelle « l'appareil n'annonce
+    /// pas `SetNextAVTransportURI` » a déjà été journalisé : une ligne par
+    /// piste, pas une par sondage de la fenêtre d'armement.
+    pub(super) suivante_non_annoncee_signalee: Option<u64>,
     /// Une avance prononcée à l'HORLOGE a adopté l'enchaînement du renderer
     /// au lieu de le relancer (#4173) : ce que l'on surveille jusqu'à ce que
     /// le renderer donne signe de vie sur la piste adoptée, ou que le délai
@@ -301,6 +305,7 @@ impl ZonePollState {
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
             suivante_preparee: SuivantePreparee::Inconnue,
+            suivante_non_annoncee_signalee: None,
             adoption_horloge: None,
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
@@ -403,6 +408,11 @@ pub(super) struct AdoptionHorloge {
     /// flux (≈ le débit de lecture) ou s'il ne fait que le garder en tampon
     /// (≈ rien) — la position gelée ne le dit pas.
     pub(super) octets_a_l_adoption: Option<u64>,
+    /// #5411 — le flux de la piste FINIE, celle que l'écran vient de
+    /// quitter. Un renderer qui le nomme encore pendant la surveillance la
+    /// rejoue : son mouvement ne confirme rien
+    /// ([`decisions::suite_de_l_adoption`]).
+    pub(super) flux_fini: Option<String>,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

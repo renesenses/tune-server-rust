@@ -33,10 +33,12 @@ pub(super) async fn telecharger_pour_session(
         for (nom, valeur) in entetes {
             requete = requete.header(nom, valeur);
         }
-        let mut response = requete
-            .send()
-            .await
-            .map_err(|e| format!("upstream fetch: {e}"))?;
+        let mut response = requete.send().await.map_err(|e| {
+            format!(
+                "upstream fetch: {}",
+                crate::http::client::decrire_erreur_http(&e)
+            )
+        })?;
         if !response.status().is_success() {
             return Err(format!("upstream HTTP {}", response.status()));
         }
@@ -50,11 +52,12 @@ pub(super) async fn telecharger_pour_session(
         let mut file =
             tokio::fs::File::from_std(temporary.reopen().map_err(|e| format!("tmp open: {e}"))?);
         let mut bytes = 0;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| format!("download read: {e}"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            format!(
+                "download read: {}",
+                crate::http::client::decrire_erreur_http(&e)
+            )
+        })? {
             file.write_all(&chunk)
                 .await
                 .map_err(|e| format!("download write: {e}"))?;
@@ -630,6 +633,155 @@ mod tests {
         assert!(
             requetes.len() >= 2 && requetes.iter().all(|&(ok, range)| ok && range),
             "sonde + lecture, toutes en Range et toutes avec les en-têtes : {requetes:?}"
+        );
+    }
+
+    // ── #5553 : la sonde Range réussit, puis le flux se tarit ──────────────
+    //
+    // Fil 2061 : la sonde `bytes=0-0` d'une piste Qobuz rend un 206 valide,
+    // puis la lecture `bytes=0-` s'arrête après un octet, deux fois de suite
+    // (« probe reached EOF at 1 bytes »). Rien n'était tenté d'autre : la
+    // session restait vide et la sortie locale refusait « aucun décodeur ».
+    // Ce faux CDN rejoue ce cas ; un GET sans `Range` y rend le fichier entier.
+    struct CdnTari {
+        url: String,
+        /// `Range` demandé par chaque requête reçue (`None` : GET entier).
+        requetes: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        _task: Task<()>,
+    }
+
+    impl CdnTari {
+        async fn new(corps: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/file.wav", listener.local_addr().unwrap());
+            let requetes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let journal = requetes.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut brut = Vec::new();
+                    while !brut.ends_with(b"\r\n\r\n") {
+                        let mut octet = [0; 1];
+                        if socket.read_exact(&mut octet).await.is_err() {
+                            break;
+                        }
+                        brut.push(octet[0]);
+                    }
+                    let texte = String::from_utf8_lossy(&brut).to_ascii_lowercase();
+                    let range = texte
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .map(|r| r.trim().to_string());
+                    journal.lock().unwrap().push(range.clone());
+                    let total = corps.len();
+                    let reponse = match range.as_deref() {
+                        None => response(200, total, &corps),
+                        // La sonde : un octet, annoncé honnêtement.
+                        Some("0-0") => {
+                            let mut r = format!(
+                                "HTTP/1.1 206 Partial\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{total}\r\nConnection: close\r\n\r\n"
+                            )
+                            .into_bytes();
+                            r.push(corps[0]);
+                            r
+                        }
+                        // La lecture : le corps entier est annoncé, un octet
+                        // au plus arrive, puis la connexion se ferme.
+                        Some(r) => {
+                            let debut: usize = r.trim_end_matches('-').parse().unwrap();
+                            let mut r = format!(
+                                "HTTP/1.1 206 Partial\r\nContent-Length: {}\r\nContent-Range: bytes {debut}-{}/{total}\r\nConnection: close\r\n\r\n",
+                                total - debut,
+                                total - 1
+                            )
+                            .into_bytes();
+                            if debut == 0 {
+                                r.push(corps[0]);
+                            }
+                            r
+                        }
+                    };
+                    let _ = socket.write_all(&reponse).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                url,
+                requetes,
+                _task: Task(task),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn i5553_un_flux_range_tari_avant_le_format_se_rabat_sur_le_telechargement() {
+        let cdn = CdnTari::new(wav()).await;
+        let octets = produire_4366(cdn.url.clone(), Vec::new(), true).await;
+        let requetes = cdn.requetes.lock().unwrap().clone();
+        assert!(
+            octets.starts_with(b"RIFF") && octets.len() >= 44 + 4410 * 4,
+            "un flux Range tari avant tout octet WAV doit laisser place au \
+             téléchargement complet (reçu {} octets ; requêtes {requetes:?})",
+            octets.len()
+        );
+        assert_eq!(
+            requetes.first().cloned().flatten().as_deref(),
+            Some("0-0"),
+            "le chemin Range a bien été choisi d'abord : {requetes:?}"
+        );
+        assert!(
+            requetes.iter().any(Option::is_none),
+            "le repli est un GET sans Range : {requetes:?}"
+        );
+    }
+
+    // ── #5553, #5522 : l'erreur d'envoi dit sa cause, jamais l'URL signée ──
+    //
+    // Fil 2048 : « error sending request for url (https://…akamaized.net/
+    // file?…&hmac=…) », et rien d'autre. L'URL signée finissait dans le
+    // journal ; la cause, elle, n'y était pas.
+    #[tokio::test]
+    async fn i5553_un_envoi_refuse_dit_sa_cause_sans_l_url_signee() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/file?eid=1&hmac=SECRET-5553",
+            listener.local_addr().unwrap()
+        );
+        // Un amont qui lit la requête puis ferme sans répondre.
+        let _amont = Task(tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut brut = Vec::new();
+                while !brut.ends_with(b"\r\n\r\n") {
+                    let mut octet = [0; 1];
+                    if socket.read_exact(&mut octet).await.is_err() {
+                        break;
+                    }
+                    brut.push(octet[0]);
+                }
+                drop(socket);
+            }
+        }));
+        let streamer = AudioStreamer::new(0);
+        let (sid, _tx, _) = streamer
+            .create_session(StreamInfo::default(), false, 8)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let erreur = telecharger_pour_session(&streamer, &sid, &url, &[], "flac", dir.path())
+            .await
+            .unwrap_err();
+        assert!(
+            !erreur.contains("SECRET-5553"),
+            "l'URL signée ne doit pas finir dans le journal : {erreur}"
+        );
+        assert!(
+            erreur.starts_with("upstream fetch: request failed: ")
+                && erreur.contains("connection closed before message completed"),
+            "la cause réelle doit suivre la nature de l'erreur : {erreur}"
         );
     }
 }

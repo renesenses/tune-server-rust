@@ -104,6 +104,10 @@ if [ -z "$EXPECTED_VERSION" ]; then
     echo "ERROR: version illisible dans $PROJECT_ROOT/Cargo.toml" >&2
     exit 1
 fi
+# Posée explicitement : sans TUNE_VERSION, `tune_core::version()` rend
+# désormais `X.Y.Z-dev` (repli des constructions locales). La bibliothèque des
+# applications mobiles garde la version du workspace, comme avant.
+export TUNE_VERSION="$EXPECTED_VERSION"
 echo "Version attendue dans les bibliothèques : $EXPECTED_VERSION"
 
 # Destination jniLibs. L'ancien chemin était relatif à tune-ffi/ et pointait donc

@@ -46,6 +46,20 @@ pub struct BibliothequeReplayGain {
     pub analysees: i64,
     /// Pistes avec un fichier : celles que la passe peut analyser.
     pub eligibles: i64,
+    /// Décision du 06/10 — toutes les pistes de la bibliothèque : le
+    /// dénominateur de la jauge « traitées ».
+    pub total: i64,
+    /// Pistes TRAITÉES : un témoin (`rg_analyzed` ou `rg_track_gain`), ou
+    /// déclarées non gérables (sans fichier propre, racine exclue). Une piste
+    /// reportée (fichier qui ne répond pas, #1865) n'est pas traitée.
+    pub traitees: i64,
+    /// Sans témoin et sans fichier propre (images CUE) : hors de la passe.
+    pub sans_fichier: i64,
+    /// Sans témoin, avec un fichier, dans une racine exclue (#5593).
+    pub hors_perimetre: i64,
+    /// `rg_analyzed` sans `rg_track_gain` : la passe a essayé, la mesure a
+    /// échoué (fichier illisible, silence, délai). Déjà parmi les traitées.
+    pub echecs: i64,
 }
 
 /// Compte la bibliothèque, SANS cache. `None` sur erreur de requête : une
@@ -58,22 +72,52 @@ pub struct BibliothequeReplayGain {
 pub fn compter_la_bibliotheque_replaygain(
     backend: &Arc<dyn DbBackend>,
 ) -> Option<BibliothequeReplayGain> {
+    // #5593 — dans le PÉRIMÈTRE réglé : une racine exclue sort des éligibles
+    // comme des candidats, sinon `eligibles - analysees` annoncerait pour
+    // toujours un reste que la passe ne fera jamais.
+    let perimetre = crate::taches_de_fond::perimetre::clause_decodage(backend);
+    // Le complément : un terme toujours faux sans racine exclue.
+    let hors = crate::taches_de_fond::perimetre::clause_hors_perimetre_decodage(backend);
+    let hors = if hors.is_empty() {
+        " AND 1 = 0".to_string()
+    } else {
+        hors
+    };
+    let fichier = "(t.file_path IS NOT NULL AND t.file_path != '')";
+    let temoin = "EXISTS (SELECT 1 FROM track_metadata m \
+                  WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain'))";
     let ligne = backend
         .query_one(
-            "SELECT COUNT(*), \
-               COUNT(CASE WHEN EXISTS (SELECT 1 FROM track_metadata m \
-                     WHERE m.track_id = t.id AND m.key IN ('rg_analyzed', 'rg_track_gain')) \
-                   THEN 1 END) \
-             FROM tracks t WHERE t.file_path IS NOT NULL AND t.file_path != ''",
+            &format!(
+                "SELECT \
+                   COUNT(CASE WHEN {fichier}{perimetre} THEN 1 END), \
+                   COUNT(CASE WHEN {fichier}{perimetre} AND {temoin} THEN 1 END), \
+                   COUNT(*), \
+                   COUNT(CASE WHEN {temoin} OR NOT {fichier} OR ({fichier}{hors}) THEN 1 END), \
+                   COUNT(CASE WHEN NOT {fichier} AND NOT {temoin} THEN 1 END), \
+                   COUNT(CASE WHEN {fichier}{hors} AND NOT {temoin} THEN 1 END), \
+                   COUNT(CASE WHEN EXISTS (SELECT 1 FROM track_metadata a \
+                         WHERE a.track_id = t.id AND a.key = 'rg_analyzed') \
+                     AND NOT EXISTS (SELECT 1 FROM track_metadata g \
+                         WHERE g.track_id = t.id AND g.key = 'rg_track_gain') THEN 1 END) \
+                 FROM tracks t"
+            ),
             &[],
         )
         .ok()
         .flatten()?;
-    let eligibles = ligne.first().and_then(|v| v.as_i64())?;
-    let analysees = ligne.get(1).and_then(|v| v.as_i64())?;
+    let get = |i: usize| ligne.get(i).and_then(|v| v.as_i64());
+    let eligibles = get(0)?;
+    let analysees = get(1)?;
+    let total = get(2)?.max(0);
     Some(BibliothequeReplayGain {
         analysees: analysees.clamp(0, eligibles.max(0)),
         eligibles: eligibles.max(0),
+        total,
+        traitees: get(3)?.clamp(0, total),
+        sans_fichier: get(4)?.max(0),
+        hors_perimetre: get(5)?.max(0),
+        echecs: get(6)?.max(0),
     })
 }
 
@@ -175,11 +219,8 @@ mod tests_5597 {
     fn compte_les_pistes_deja_analysees_en_base() {
         let backend = base();
         assert_eq!(
-            compter_la_bibliotheque_replaygain(&backend),
-            Some(BibliothequeReplayGain {
-                analysees: 0,
-                eligibles: 5
-            })
+            compter_la_bibliotheque_replaygain(&backend).map(|b| (b.analysees, b.eligibles)),
+            Some((0, 5))
         );
         poser(&backend, 1, "rg_analyzed");
         poser(&backend, 2, "rg_track_gain");
@@ -192,19 +233,93 @@ mod tests_5597 {
         poser(&backend, 6, "rg_track_gain");
 
         let b = compter_la_bibliotheque_replaygain(&backend).unwrap();
-        assert_eq!(
-            b,
-            BibliothequeReplayGain {
-                analysees: 3,
-                eligibles: 5
-            }
-        );
+        assert_eq!((b.analysees, b.eligibles), (3, 5));
         let candidats = super::super::compter_les_candidats_replaygain(&backend);
         assert_eq!(
             b.analysees + candidats,
             b.eligibles,
             "analysées + candidats doit retomber sur les éligibles (aucun report ici)"
         );
+    }
+
+    /// #5593 — une racine exclue des analyses sort du couple, des analysées
+    /// comme des éligibles ; la somme analysées + candidats retombe toujours
+    /// sur les éligibles.
+    #[test]
+    fn le_couple_suit_le_perimetre_regle() {
+        let backend = base();
+        poser(&backend, 1, "rg_analyzed");
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = '/mnt/nas/' || id || '.flac' WHERE id IN (1, 2)",
+                &[],
+            )
+            .unwrap();
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                crate::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+                r#"["/mnt/nas"]"#,
+            )
+            .unwrap();
+        let b = compter_la_bibliotheque_replaygain(&backend).unwrap();
+        assert_eq!(
+            (b.analysees, b.eligibles),
+            (0, 3),
+            "les pistes 1 et 2 sont sous la racine exclue"
+        );
+        let candidats = super::super::compter_les_candidats_replaygain(&backend);
+        assert_eq!(b.analysees + candidats, b.eligibles);
+    }
+
+    /// Décision du 06/10 — la jauge vaut les pistes TRAITÉES sur le TOTAL de
+    /// la bibliothèque : un témoin, ou non gérable (sans fichier propre,
+    /// racine exclue). Une piste REPORTÉE n'est pas traitée. Chaque cause est
+    /// comptée à part, et une piste une seule fois.
+    #[test]
+    fn traitees_sur_le_total_et_causes_des_non_gerees() {
+        let backend = base();
+        // 1 : mesurée. 2 : échec (témoin sans gain). 3 : reportée, sans témoin.
+        // 4 et 5 : sous une racine exclue, la 5 déjà mesurée. 6 : CUE.
+        poser(&backend, 1, "rg_analyzed");
+        poser(&backend, 1, "rg_track_gain");
+        poser(&backend, 2, "rg_analyzed");
+        backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) \
+                 VALUES (3, 'rg_path_unresolved', '099999999999')",
+                &[],
+            )
+            .unwrap();
+        poser(&backend, 5, "rg_analyzed");
+        poser(&backend, 5, "rg_track_gain");
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = '/mnt/nas/' || id || '.flac' WHERE id IN (4, 5)",
+                &[],
+            )
+            .unwrap();
+        let b = compter_la_bibliotheque_replaygain(&backend).unwrap();
+        assert_eq!(b.total, 6);
+        // Sans racine exclue, la piste 4 est simplement à faire.
+        assert_eq!(
+            (b.traitees, b.sans_fichier, b.hors_perimetre, b.echecs),
+            (4, 1, 0, 1)
+        );
+
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                crate::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+                r#"["/mnt/nas"]"#,
+            )
+            .unwrap();
+        let b = compter_la_bibliotheque_replaygain(&backend).unwrap();
+        assert_eq!(
+            (b.traitees, b.sans_fichier, b.hors_perimetre, b.echecs),
+            (5, 1, 1, 1),
+            "1, 2, 5 ont un témoin, 6 est sans fichier, 4 est hors périmètre ; \
+             la 3, reportée, reste à faire"
+        );
+        assert_eq!(b.total - b.traitees, 1, "seule la piste reportée manque");
     }
 
     #[test]

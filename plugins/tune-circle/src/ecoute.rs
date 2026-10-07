@@ -200,6 +200,7 @@ impl HoteLecture for HoteOrchestrateur {
                 media_format: premiere.media_format,
                 track_number: premiere.numero.map(|n| n as u32),
                 disc_number: premiere.disque.map(|n| n as u32),
+                album_ref: None,
             })
             .await?;
         // Réaffirmée APRÈS play(), comme `POST /zones/{id}/play` : sur une zone

@@ -155,12 +155,17 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // Lecture directe d'un CD audio (#4863). L'orchestrateur est passé pour
     // que le greffon y inscrive sa source PCM `cd` et lance la file du disque ;
     // le gestionnaire de lecture, pour la longueur de file et l'état des zones.
+    // #2466 : le scan ciblé du dossier d'un album extrait, le même que
+    // `POST /system/scan?path=`.
     #[cfg(feature = "cd")]
     loader
         .register(Box::new(tune_cd::CdPlugin::new(tune_cd::HostServices {
             backend: state.backend.clone(),
             orchestrator: state.orchestrator.clone(),
             playback: state.playback.clone(),
+            scan: Some(std::sync::Arc::new(ScanDuDisque {
+                state: state.clone(),
+            })),
         })))
         .await;
 
@@ -468,6 +473,23 @@ pub fn maybe_run_wasm_probe() {
 
 #[cfg(not(feature = "plugins-wasm"))]
 pub fn maybe_run_wasm_probe() {}
+
+/// #2466 — le scan ciblé que le greffon `cd` demande après une extraction :
+/// celui de `POST /system/scan?path=` (incrémental, purge bornée au dossier).
+#[cfg(feature = "cd")]
+struct ScanDuDisque {
+    state: AppState,
+}
+
+#[cfg(feature = "cd")]
+#[async_trait::async_trait]
+impl tune_cd::extraction::ScanCible for ScanDuDisque {
+    async fn scanner(&self, dossier: String) -> bool {
+        let cible = tune_core::scanner::walker::normalize_path(&dossier);
+        crate::routes::system::scan::spawn_library_scan(self.state.clone(), false, Some(cible))
+            .await
+    }
+}
 
 /// L'hôte des rayons de Tune Circle (T3, #5326) : ce que le greffon ne peut pas
 /// juger seul, sans copie de la logique du serveur.

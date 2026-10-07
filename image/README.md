@@ -189,6 +189,13 @@ The temporary password is never baked into the downloadable image and is not
 sent in the SSH banner. After the first successful password change, Tune OS
 removes the console notice and its root-only credential copy.
 
+The Fedora-based Tune OS images (`renesenses/tune-os`) run the same policy at
+boot through `tune-server --tune-os-premier-acces`, as root and outside the
+sandbox of `tune.service`. While the temporary password is still due, that
+mode also publishes it in `/run/tune/premier-mot-de-passe` (tmpfs, root only),
+which those images use for their console screen and Cockpit login banner. The
+file disappears once the password has been changed.
+
 ## Mount music storage
 
 ```bash

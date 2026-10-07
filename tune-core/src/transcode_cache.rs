@@ -292,12 +292,34 @@ pub fn touch(path: &str) {
 }
 
 /// Configured cache size cap in bytes (`TUNE_TRANSCODE_CACHE_MAX_MB`).
+///
+/// Fil 2167 — sans réglage explicite, un dossier temporaire en mémoire
+/// (`tmpfs`) abaisse le plafond : voir
+/// [`crate::chemins_de_travail::plafond_de_cache`].
 fn max_bytes() -> u64 {
-    std::env::var("TUNE_TRANSCODE_CACHE_MAX_MB")
+    let reglage = std::env::var("TUNE_TRANSCODE_CACHE_MAX_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_MB)
-        .saturating_mul(1024 * 1024)
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    max_bytes_dans(
+        // tmp-autorise: on LIT le type du système de fichiers, rien n'y est créé.
+        &std::env::temp_dir(),
+        reglage,
+        crate::chemins_de_travail::memoire_vive_totale(),
+    )
+}
+
+/// [`max_bytes`] avec le dossier, le réglage et la RAM PASSÉS : la forme que
+/// la garde du fil 2167 peut jouer sur un vrai `tmpfs` sans toucher à
+/// l'environnement du processus.
+fn max_bytes_dans(dossier: &std::path::Path, reglage: Option<u64>, ram: Option<u64>) -> u64 {
+    crate::chemins_de_travail::plafond_de_cache_pour(
+        dossier,
+        "transcodage",
+        DEFAULT_MAX_MB.saturating_mul(1024 * 1024),
+        reglage,
+        ram,
+    )
 }
 
 /// Evict least-recently-used cache files until the total is under the
@@ -799,5 +821,65 @@ mod tests {
         );
         assert!(recent.exists(), "un rendu récent a été purgé");
         assert!(racine.join(format!("{CACHE_PREFIX}garde.flac")).exists());
+    }
+
+    /// Fil 2167 — TÉMOIN : sur un `tmpfs`, le cache de transcodage ne garde
+    /// pas plus d'un trente-deuxième de la RAM.
+    ///
+    /// Le dossier est un VRAI `tmpfs` (`/dev/shm`), la RAM est passée
+    /// (16 Gio, la machine du signalement). Quarante rendus de 100 Mio,
+    /// creux (`set_len` : rien n'est réellement écrit), vieux de deux heures :
+    /// 4 000 Mio, sous le plafond par défaut de 4 Gio. Avant le correctif,
+    /// l'éviction n'en retirait aucun — 4 000 Mio de RAM tenus. Après, il en
+    /// reste au plus 512 Mio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sur_tmpfs_le_cache_de_transcodage_reste_sous_un_trente_deuxieme_de_la_ram() {
+        let shm = std::path::Path::new("/dev/shm");
+        if !crate::chemins_de_travail::est_en_memoire(shm) {
+            eprintln!("témoin ignoré : /dev/shm n'est pas un tmpfs sur cette machine");
+            return;
+        }
+        const MIO: u64 = 1024 * 1024;
+        let ram = Some(16 * 1024 * MIO);
+        let dossier = crate::test_scratch::scratch_dir_in(shm, "tcache-tmpfs-2167");
+        let plafond = max_bytes_dans(dossier.path(), None, ram);
+        assert_eq!(
+            plafond,
+            512 * MIO,
+            "sur tmpfs, le plafond du cache de transcodage doit suivre la RAM (16 Gio / 32), \
+             pas rester à {DEFAULT_MAX_MB} Mio de mémoire vive"
+        );
+        let vieux = SystemTime::now() - Duration::from_secs(2 * 3600);
+        for i in 0..40 {
+            let f =
+                std::fs::File::create(dossier.path().join(format!("{CACHE_PREFIX}{i:02}.flac")))
+                    .unwrap();
+            f.set_len(100 * MIO).unwrap();
+            f.set_modified(vieux).unwrap();
+        }
+        evict_in(
+            dossier.path(),
+            plafond,
+            crate::chemins_de_travail::uid_courant(),
+        );
+        let reste: u64 = std::fs::read_dir(dossier.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(
+            reste <= 512 * MIO,
+            "le cache de transcodage tient {} Mio sur un tmpfs (16 Gio de RAM) : plus de 512 Mio",
+            reste / MIO
+        );
+        // Contre-partie : sur un disque, le plafond reste celui d'avant.
+        let disque = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !crate::chemins_de_travail::est_en_memoire(disque) {
+            assert_eq!(max_bytes_dans(disque, None, ram), DEFAULT_MAX_MB * MIO);
+        }
+        // Et un réglage explicite l'emporte toujours.
+        assert_eq!(max_bytes_dans(dossier.path(), Some(3 * MIO), ram), 3 * MIO);
     }
 }

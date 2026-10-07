@@ -12,19 +12,30 @@ pub mod bluos;
 pub mod bridge;
 #[cfg(test)]
 mod capabilities_test;
+/// #5643 — les cadences DSD natives déclarées par chaque pilote ASIO, sondées
+/// une fois. Hors `cfg` : l'API les lit partout, la règle se teste sous Linux.
+pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
 pub mod didl;
 pub mod dlna;
+pub mod dlna_annonce_suivante;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
+pub(crate) mod dlna_journal_volume;
+pub mod dlna_profil_volume;
 #[cfg(test)]
 mod dlna_test;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
 pub mod local;
+/// #4357 — le masque de canaux (`dwChannelMask`) de l'ouverture WASAPI
+/// exclusive. Hors FFI comme `negociation_format_exclusif_3837`, dont il
+/// déroule la négociation pour chaque masque : jugé par `cargo test`.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod masque_de_canaux_4357;
 pub mod mock;
 /// #3837 — la négociation de format de la sortie WASAPI exclusive. Sans FFI
 /// ni `cfg` de plateforme dans son corps : aucun job de CI n'exécute WASAPI,

@@ -710,6 +710,93 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
     assert_eq!(rendu_gain_db, 0.0);
 }
 
+/// #4384 — « preamp +6 dB, pas de changement » : à volume plein, le produit
+/// volume × ReplayGain est raboté à l'unité, et le niveau publié ne bougeait
+/// pas sans que rien ne dise pourquoi. `playback.audio_levels` porte
+/// désormais le gain DEMANDÉ avant rabot et un drapeau de rabot, sur une
+/// sortie locale seulement.
+///
+/// Garde de COMPORTEMENT sur la chaîne réelle (forwarder cadencé → bus) :
+///   * +6 dB demandés (volume plein, facteur ×2) ⇒ `output_gain_requested_db`
+///     ≈ +6, `output_gain_limited` vrai ;
+///   * volume 50 %, facteur ×1 ⇒ ≈ −6 dB demandés, pas de rabot ;
+///   * la part de compensation portée par l'égaliseur (16 bits hauts) ne
+///     change pas le produit demandé ;
+///   * DoP ou aucune sortie locale ⇒ champs ABSENTS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    async fn publier(
+        zone_id: i64,
+        demande: Option<crate::playback::GainDemande>,
+    ) -> serde_json::Value {
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        if let Some(d) = demande {
+            playback.brancher_le_gain_demande(zone_id, d);
+        }
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let pcm = vec![0u8; 512 * 4];
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!reste.is_zero(), "aucun playback.audio_levels publié");
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => return ev.data,
+                Ok(Ok(_)) => {}
+                autre => panic!("bus muet : {autre:?}"),
+            }
+        }
+    }
+    let demande = |volume: u32, facteur: u32, dop: bool| crate::playback::GainDemande {
+        volume_utilisateur: Arc::new(AtomicU32::new(volume)),
+        facteur_de_rendu: Arc::new(AtomicU32::new(facteur)),
+        dop: Arc::new(AtomicBool::new(dop)),
+    };
+
+    let rabote = publier(987_670, Some(demande(1000, 2000, false))).await;
+    let db = rabote["output_gain_requested_db"]
+        .as_f64()
+        .expect("output_gain_requested_db sur une sortie locale");
+    assert!((db - 6.02).abs() < 0.05, "+6 dB demandés, lu {db}");
+    assert_eq!(
+        rabote["output_gain_limited"], true,
+        "+6 dB à volume plein : le rabot mord"
+    );
+
+    let bas = publier(987_671, Some(demande(500, 1000, false))).await;
+    let db = bas["output_gain_requested_db"].as_f64().expect("champ");
+    assert!((db + 6.02).abs() < 0.05, "−6 dB demandés, lu {db}");
+    assert_eq!(bas["output_gain_limited"], false);
+
+    // Facteur ×2 dont ×1,5 porté par l'égaliseur : le produit demandé reste ×2.
+    let porte = publier(987_672, Some(demande(1000, (1500 << 16) | 2000, false))).await;
+    let db = porte["output_gain_requested_db"].as_f64().expect("champ");
+    assert!(
+        (db - 6.02).abs() < 0.05,
+        "la part portée ne compte pas, lu {db}"
+    );
+
+    for (zone_id, d) in [(987_673, Some(demande(1000, 2000, true))), (987_674, None)] {
+        let v = publier(zone_id, d).await;
+        assert!(v.get("output_gain_requested_db").is_none(), "{v}");
+        assert!(v.get("output_gain_limited").is_none(), "{v}");
+    }
+}
+
 /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
 /// passe à la suivante, au lieu de publier son PCM sur l'horloge de la
 /// nouvelle. C'est ce que garantit l'épinglage de la génération au moment
@@ -6548,6 +6635,82 @@ async fn test_persist_position_on_stop() {
     assert_eq!(zone.last_track_source.as_deref(), Some("tidal"));
 }
 
+/// Fil 2121 — l'historique garde la référence d'album d'une écoute Bandcamp :
+/// celle de la demande quand elle la porte, sinon celle que la file connaît
+/// (avance gapless, annonce différée : pas de demande sous la main).
+#[tokio::test]
+async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    const PAGE: &str = "https://artiste.bandcamp.com/album/disque";
+    const PISTE: &str = "https://t4.bcbits.com/stream/e4/mp3-128/29192493?ts=1790782809";
+
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Parents", None, None)
+        .unwrap();
+    let ecrire = |album_ref: Option<&str>| {
+        orch.record_listen(
+            "Meet Her",
+            None,
+            None,
+            "bandcamp",
+            Some(PISTE),
+            None,
+            300_000,
+            zone_id,
+            None,
+            None,
+            crate::orchestrator::ContexteEcoute::default(),
+            album_ref,
+        )
+    };
+    let derniere = || {
+        orch.db
+            .query_one(
+                "SELECT album_ref FROM listen_history ORDER BY id DESC LIMIT 1",
+                &[],
+            )
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+    };
+
+    ecrire(None);
+    assert_eq!(derniere(), None, "rien de connu : NULL, rien d'inventé");
+
+    PlayQueueRepo::with_backend(orch.db.clone())
+        .append(
+            zone_id,
+            &[QueueInput::Streaming {
+                source: "bandcamp".into(),
+                source_id: "https://t4.bcbits.com/stream/e4/mp3-128/29192493?ts=1791020000".into(),
+                title: "Meet Her".into(),
+                artist: String::new(),
+                album: None,
+                cover_url: None,
+                duration_ms: 300_000,
+                track_number: None,
+                disc_number: None,
+                album_ref: Some(PAGE.into()),
+            }],
+        )
+        .unwrap();
+    ecrire(None);
+    assert_eq!(
+        derniere().as_deref(),
+        Some(PAGE),
+        "sans page dans la demande, celle que la file connaît pour la même piste"
+    );
+
+    const AUTRE: &str = "https://artiste.bandcamp.com/track/single";
+    ecrire(Some(AUTRE));
+    assert_eq!(
+        derniere().as_deref(),
+        Some(AUTRE),
+        "la page portée par la demande prime sur celle qu'on retrouverait"
+    );
+}
+
 #[tokio::test]
 async fn test_record_listen() {
     use crate::db::history_repo::HistoryRepo;
@@ -6577,6 +6740,7 @@ async fn test_record_listen() {
             titre: Some("Les indispensables"),
             pochette: None,
         },
+        None,
     );
 
     let repo = HistoryRepo::with_backend(orch.db.clone());
@@ -7029,6 +7193,7 @@ fn requete_locale_3234(zone_id: i64, track_id: i64) -> super::PlayRequest {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     }
 }
 
@@ -7466,6 +7631,7 @@ async fn browser_radio_with_eq_is_forced_through_the_wav_session() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
 
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
@@ -7519,6 +7685,7 @@ async fn browser_radio_mp3_is_never_handed_the_station_url() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
 
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
@@ -7558,6 +7725,7 @@ async fn radio_resolve_direct_url_without_output_device() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
@@ -7599,6 +7767,7 @@ async fn radio_reliable_mp3_passes_through_without_output_device() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
@@ -7631,6 +7800,7 @@ async fn podcast_resolve_returns_raw_url() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert!(
@@ -7670,6 +7840,7 @@ async fn bandcamp_resolves_by_the_direct_url_door() {
         media_format: Some("mp3".into()),
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_stream(&req).await.unwrap();
     assert_eq!(resolved.source, "bandcamp");
@@ -7705,6 +7876,7 @@ async fn bandcamp_mime_is_asserted_not_guessed() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert_eq!(resolved.mime_type, "audio/mpeg");
@@ -7734,6 +7906,7 @@ async fn bandcamp_is_proxied_in_clear_http_for_a_network_renderer() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert!(
@@ -7778,6 +7951,7 @@ async fn bandcamp_is_proxied_for_a_browser_zone_without_an_output_device() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
 
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
@@ -7834,6 +8008,7 @@ async fn une_url_tierce_est_relayee_pour_une_zone_navigateur() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     let stream_id = resolved
@@ -7883,6 +8058,7 @@ async fn une_url_tierce_reste_directe_pour_une_sortie_reseau() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert_eq!(resolved.url, AMONT);
@@ -7910,6 +8086,7 @@ async fn bandcamp_is_decoded_to_wav_for_an_oaat_endpoint() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert!(resolved.stream_id.is_some());
@@ -7941,6 +8118,7 @@ async fn bandcamp_goes_straight_to_a_local_dac() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert!(resolved.stream_id.is_none());
@@ -8040,6 +8218,7 @@ async fn bandcamp_carries_its_128_kbps_all_the_way_to_the_zone() {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert_eq!(
@@ -8073,6 +8252,7 @@ async fn a_purchased_bandcamp_file_is_never_labelled_mp3_128() {
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_direct_url(&req).await.unwrap();
     assert_eq!(
@@ -8679,6 +8859,7 @@ async fn bandcamp_en_sortie_locale_emet_des_niveaux() {
         media_format: Some("mp3".into()),
         track_number: None,
         disc_number: None,
+        album_ref: None,
     };
     let resolved = orch.resolve_stream(&req).await.unwrap();
     assert_eq!(
@@ -9063,6 +9244,81 @@ async fn la_portee_de_la_bascule_pure_distingue_la_relance_de_la_piste_suivante_
     assert_eq!(portee, PorteeDuReglage::RienNeJoue);
     assert_eq!(portee.code(), "not_playing");
 }
+/// #5683 — une bascule PURE est ANNONCÉE au client (`zone.updated`), quelle
+/// que soit sa portée. Seul le bras « flux conservé » l'annonçait ; ailleurs,
+/// le panneau « Chemin du signal » gardait l'étape ReplayGain d'avant la
+/// bascule jusqu'au premier geste de volume, dont l'événement relisait
+/// `/zones` — d'où « l'étape suit le curseur, pas PURE » (GgB, fil 1797).
+#[tokio::test]
+async fn toute_bascule_pure_annonce_la_zone_au_client_5683() {
+    use crate::orchestrator::PorteeDuReglage;
+
+    fn annoncee(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        zone_id: i64,
+    ) -> bool {
+        let mut vue = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event_type == "zone.updated" && ev.data["zone_id"] == zone_id {
+                vue = true;
+            }
+        }
+        vue
+    }
+
+    // Relance : zone réseau dont le flux porte un égaliseur.
+    let (mut orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-relance")).await;
+    let bus = Arc::new(EventBus::new());
+    orch.event_bus = Some(bus.clone());
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let mut rx = bus.subscribe();
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::Relance
+    );
+    assert!(
+        annoncee(&mut rx, zone_id),
+        "bascule PURE avec relance du flux : aucune annonce `zone.updated`, le \
+         panneau garde l'état d'avant la bascule"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    // Piste suivante : zone navigateur, position inconnue.
+    let (mut orch2, zone2, _dir2) = zone_qui_joue_un_flac(Some("browser"), None).await;
+    let bus2 = Arc::new(EventBus::new());
+    orch2.event_bus = Some(bus2.clone());
+    let orch2 = Arc::new(orch2);
+    armer_un_egaliseur_audible(&orch2, zone2);
+    let mut rx2 = bus2.subscribe();
+    regler_pure(&orch2, zone2, true);
+    assert_eq!(
+        orch2.apply_audiophile_change_portee(zone2).await,
+        PorteeDuReglage::PisteSuivante
+    );
+    assert!(
+        annoncee(&mut rx2, zone2),
+        "bascule PURE portée à la piste suivante : aucune annonce `zone.updated`"
+    );
+
+    // Flux conservé : l'annonce d'avant reste là.
+    let (mut orch3, zone3, _dir3) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-nu")).await;
+    let bus3 = Arc::new(EventBus::new());
+    orch3.event_bus = Some(bus3.clone());
+    let orch3 = Arc::new(orch3);
+    let mut rx3 = bus3.subscribe();
+    regler_pure(&orch3, zone3, true);
+    assert_eq!(
+        orch3.apply_audiophile_change_portee(zone3).await,
+        PorteeDuReglage::Immediate
+    );
+    assert!(annoncee(&mut rx3, zone3));
+}
+
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision

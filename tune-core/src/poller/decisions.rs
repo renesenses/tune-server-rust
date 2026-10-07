@@ -97,7 +97,9 @@ use super::{
     GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
     MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
     POSITION_PAST_END_TICKS, RENDERER_CALE_REPRISE_COOLDOWN_SECS, RENDERER_CALE_RESTE_MIN_MS,
-    STOPPED_TICKS_THRESHOLD, SuivantePreparee, TICKS_GELE_DLNA_AVEC_SETNEXT,
+    REPRISE_CALE_DELAI_DE_CONSTAT_MS, REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS,
+    REPRISE_CALE_ECART_TOLERE_MS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
+    TICKS_GELE_DLNA_AVEC_SETNEXT, TransportState,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -398,6 +400,52 @@ pub fn tampon_du_renderer_peut_encore_jouer(
         && wall_elapsed_secs.saturating_mul(1000) < track_duration_ms.saturating_add(END_MARGIN_MS)
 }
 
+/// Fil 2125 (#5711) — l'horloge de piste est-elle CONNUE ?
+///
+/// `track_started_at` est remis à `None` par les bras gapless (arrêt dans la
+/// garde, fin naturelle en attente d'enchaînement). Le sondeur lit alors
+/// `wall_elapsed = 0` (`unwrap_or(0)`), et
+/// [`tampon_du_renderer_peut_encore_jouer`] en concluait que la piste
+/// ENTIÈRE restait à jouer : une zone dont le renderer s'était tu restait
+/// « en lecture » jusqu'au plafond `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`.
+///
+/// Mesure qui motive la règle (fil 2125, 1.0.0-rc1, renderer Rygel) : six
+/// `flux_servi_en_entier_zone_non_coupee` neuf minutes après le départ, tous
+/// à `wall_secs=0` et `reste_ms=303573` — la piste entière —, puis
+/// `zone_figee_rattrapee immobile_secs=604`.
+///
+/// Horloge inconnue ⇒ `false` : la patience de #4661 ne s'accorde que sur
+/// une horloge mesurée, exactement comme elle se refuse sur une durée
+/// inconnue. Les autres filets (#4480, borne des 120 s) restent en place.
+pub fn horloge_de_piste_connue(track_started_at: Option<std::time::Instant>) -> bool {
+    track_started_at.is_some()
+}
+
+/// Ticket 190 — un renderer qui sait rapporter sa position, à l'arrêt, sans
+/// avoir jamais quitté 0 sur cette piste, n'a rien joué.
+///
+/// Les deux patiences du bras `Stopped` supposent qu'une musique est encore
+/// en train de sortir du tampon du renderer :
+/// - #4661 attend la fin nominale de la piste (au plus
+///   `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`) quand le fichier a été servi en
+///   entier ;
+/// - #4480 attend l'avance de l'audio livrée sur la position annoncée (au
+///   plus `AVANCE_AUDIO_BORNE_HAUTE_SECS`).
+///
+/// Ce qui motive la règle (ticket 190) : fichier servi en entier, horloge de
+/// piste connue, renderer qui avait rapporté ses positions sur les pistes
+/// d'avant. Sur celle-ci, il est resté à 0, puis s'est dit arrêté. La zone
+/// restait « en lecture » sans un son pendant plusieurs minutes, jusqu'à la
+/// fin nominale de la piste.
+///
+/// `position_prouvee` est la preuve de #5522 (`zones_a_position_prouvee`) :
+/// sortie locale, ou renderer qui a déjà rapporté une position non nulle sur
+/// cette zone. Sans elle, `false` : certains renderers rendent 0 en permanence
+/// tout en jouant, et leur `Stopped` ne prouve rien.
+pub fn renderer_a_l_arret_sans_avoir_joue(peak_position_ms: u64, position_prouvee: bool) -> bool {
+    position_prouvee && peak_position_ms == 0
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must
@@ -490,6 +538,74 @@ pub fn reprise_apres_renderer_cale_autorisee(
     a_joue && flux_incomplet && reste_assez && hors_fenetre
 }
 
+/// Fil 2125 (#5711) — une reprise après décrochage a-t-elle DÉJÀ été tentée
+/// sur cette lecture de piste ?
+///
+/// `generation_de_la_reprise` est la génération de piste relue juste après le
+/// `play_from_queue` de la reprise. Si le décrochage qu'on examine porte la
+/// même génération, c'est la reprise elle-même qui a décroché : en reprendre
+/// une seconde ferait boucler la zone (fil 2125 : reprise, silence, coupure
+/// 38 s plus tard, reprise…). Une relance par l'utilisateur, une piste
+/// suivante, ont une génération neuve : elles gardent leur droit à une reprise.
+pub fn reprise_cale_deja_tentee_sur_cette_piste(
+    generation_de_la_reprise: Option<u64>,
+    generation_courante: u64,
+) -> bool {
+    generation_de_la_reprise == Some(generation_courante)
+}
+
+/// Ce que dit la position MESURÉE du saut d'une reprise après décrochage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstatDeRepriseCale {
+    /// Trop tôt, ou aucun échantillon probant : on attend le tour suivant.
+    Attendre,
+    /// Le renderer joue à la position visée (à l'écart toléré près).
+    Reussie,
+    /// Le renderer joue, mais loin SOUS la position visée : il a acquitté le
+    /// `Seek` puis relu depuis le début (fil 2125).
+    SautIgnore,
+    /// Aucun échantillon probant dans le délai maximal.
+    NonConstatee,
+    /// La lecture a changé (piste suivante, relance) : plus rien à constater.
+    Abandonnee,
+}
+
+/// Fil 2125 (#5711) — juger le saut d'une reprise après décrochage sur la
+/// position MESURÉE, et non sur l'acquittement SOAP.
+///
+/// Le journal du fil 2125 écrivait `renderer_cale_reprise_automatique` dès que
+/// le `Seek` était acquitté — et le renderer relisait depuis l'octet 0. Une
+/// reprise n'est « réussie » qu'au vu d'un échantillon `Playing`, pris au
+/// moins `REPRISE_CALE_DELAI_DE_CONSTAT_MS` après la demande, à une position
+/// non nulle et au plus `REPRISE_CALE_ECART_TOLERE_MS` sous la cible.
+pub fn constat_de_reprise_cale(
+    generation_de_la_reprise: u64,
+    generation_courante: u64,
+    depuis_la_demande_ms: u64,
+    renderer_joue: bool,
+    position_mesuree_ms: u64,
+    cible_ms: u64,
+) -> ConstatDeRepriseCale {
+    if generation_de_la_reprise != generation_courante {
+        return ConstatDeRepriseCale::Abandonnee;
+    }
+    if depuis_la_demande_ms < REPRISE_CALE_DELAI_DE_CONSTAT_MS {
+        return ConstatDeRepriseCale::Attendre;
+    }
+    if renderer_joue && position_mesuree_ms > 0 {
+        return if position_mesuree_ms.saturating_add(REPRISE_CALE_ECART_TOLERE_MS) >= cible_ms {
+            ConstatDeRepriseCale::Reussie
+        } else {
+            ConstatDeRepriseCale::SautIgnore
+        };
+    }
+    if depuis_la_demande_ms >= REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS {
+        ConstatDeRepriseCale::NonConstatee
+    } else {
+        ConstatDeRepriseCale::Attendre
+    }
+}
+
 /// #4645 — la coupure `playback_failure_stopping_zone` (flux à sec) ouvre-t-elle
 /// droit à la reprise à la position atteinte ?
 ///
@@ -528,6 +644,18 @@ pub fn dsd_skip_latched(latch: Option<i64>, next_pos: Option<i64>) -> bool {
 /// armed — a strong signal the renderer auto-advanced to the next track.
 pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
     last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
+}
+
+/// #3967 — une chute de position (`position_reset`) observée alors que le
+/// transport ne JOUE pas doit-elle être différée au sondage suivant ?
+///
+/// Seul `Playing` atteste un passage : `Stopped` à zéro est la signature d'un
+/// renderer qui a acquitté `SetNextAVTransportURI` sans enchaîner, et
+/// `Transitioning` / `Paused` ne disent pas encore ce qui va jouer. Différer
+/// ne perd rien : la position d'avant est gardée, et un `Playing` près de
+/// zéro au sondage suivant conclut au passage.
+pub fn chute_a_differer_hors_lecture(chute_brute: bool, etat: TransportState) -> bool {
+    chute_brute && etat != TransportState::Playing
 }
 
 /// The `position_reset` fallback advances metadata only, assuming the
@@ -863,6 +991,23 @@ pub fn position_confirms_transition(
         && (position_ms < 5000
             || (track_duration_ms > 0
                 && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
+}
+
+/// Fil 2062 / #5550 — la durée que la sortie RAPPORTE doit-elle devenir celle
+/// de la piste en cours ?
+///
+/// Seulement pour une piste de serveur UPnP (`source = "upnp"`) partie SANS
+/// durée (`duree_connue_ms == 0`) : une durée connue n'est jamais contredite,
+/// et une radio n'en a pas. Jamais une fois la suivante armée
+/// (`gapless_sent`) : le renderer peut alors déjà parler de la suivante.
+pub fn duree_rapportee_a_adopter(
+    source: Option<&str>,
+    duree_connue_ms: u64,
+    duree_rapportee_ms: u64,
+    gapless_sent: bool,
+) -> Option<u64> {
+    (source == Some("upnp") && duree_connue_ms == 0 && duree_rapportee_ms > 0 && !gapless_sent)
+        .then_some(duree_rapportee_ms)
 }
 
 /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
@@ -1369,6 +1514,82 @@ pub enum EnchainementArme {
     Bascule,
     /// Rien n'atteste l'enchaînement : le repli reste de mise.
     Aucun,
+    /// #5411 — la position est retombée comme à un enchaînement, mais le
+    /// renderer nomme encore le flux de la piste FINIE : l'avance de l'écran
+    /// est provisoire, surveillée comme une bascule (voir
+    /// [`renderer_rejoue_la_piste_finie`]).
+    RejeuDeLaPisteFinie,
+}
+
+/// #5411 (fil 2031) — la retombée de position que le sondeur s'apprête à
+/// prendre pour un enchaînement est-elle en fait un REJEU de la piste finie ?
+///
+/// Vrai seulement si le renderer le DIT : son URI courante nomme le flux de
+/// la piste qui vient de finir, et pas le flux armé. Un renderer muet sur son
+/// URI, ou qui nomme le flux armé, n'est jamais soupçonné : l'avance d'avant
+/// s'applique, au mot près. En répétition d'une piste, rejouer la piste finie
+/// est précisément ce qu'on attend : jamais soupçonné non plus.
+pub fn renderer_rejoue_la_piste_finie(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_arme: Option<&str>,
+    repetition_d_une_piste: bool,
+) -> bool {
+    !repetition_d_une_piste
+        && uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, flux_arme)
+}
+
+/// #5411 — au-delà de cette position, un renderer n'est plus « reparti du
+/// début » : la surveillance dure trois à huit secondes, un rejeu s'y voit
+/// bien en deçà.
+pub const REJEU_DEPUIS_LE_DEBUT_MAX_MS: u64 = 15_000;
+
+/// #5411 — débit minimal (octets par seconde, depuis le début de la
+/// surveillance) sur le flux ADOPTÉ pour dire que le renderer le consomme :
+/// 16 000 o/s, soit 128 kbit/s, le plus bas des débits de lecture servis
+/// (MP3 128 k). Un renderer qui rejoue la piste finie ne tire rien du flux
+/// adopté ; un renderer qui a vraiment enchaîné le tire au moins au débit de
+/// lecture, même quand sa `TrackURI` est en retard. C'est un DÉBIT, pas un
+/// volume : le compteur cumule toutes les connexions, sondages compris.
+pub const DEBIT_SOUTENU_MIN_OCTETS_S: u64 = 16_000;
+
+/// #5411 — le flux adopté est-il tiré à un débit soutenu depuis le début de
+/// la surveillance ? Moins d'une demi-seconde de recul : on ne sait pas, donc
+/// non (la décision attend de toute façon son délai pour infirmer).
+pub fn debit_soutenu(octets_depuis_adoption: Option<u64>, age_ms: u64) -> bool {
+    age_ms >= 500
+        && octets_depuis_adoption
+            .is_some_and(|o| o.saturating_mul(1000) / age_ms >= DEBIT_SOUTENU_MIN_OCTETS_S)
+}
+
+/// #5411 — le rejeu de la piste finie est-il AVÉRÉ ? Les trois signes
+/// ensemble, aucun seul :
+///
+/// 1. l'URI courante nomme le flux de la piste finie, pas le flux adopté ;
+/// 2. la position a RECULÉ : revenue près de zéro
+///    ([`REJEU_DEPUIS_LE_DEBUT_MAX_MS`]), loin de la position de référence
+///    (la fin de la piste finie). Un renderer figé en fin de piste (le
+///    DMP-A6 de #4382 : URI de N, position gelée à la durée) n'en relève
+///    pas ;
+/// 3. aucun débit soutenu sur le flux adopté ([`debit_soutenu`]). Un
+///    renderer qui a vraiment enchaîné mais rapporte sa `TrackURI` en retard
+///    tire le flux adopté : il n'en relève pas.
+///
+/// Faux dans tout autre cas : la règle d'avant s'applique.
+pub fn rejeu_de_la_piste_finie_avere(
+    current_uri: Option<&str>,
+    flux_fini: Option<&str>,
+    flux_adopte: &str,
+    position_ms: u64,
+    position_de_reference_ms: u64,
+    debit_soutenu_sur_le_flux_adopte: bool,
+) -> bool {
+    uri_nomme_le_flux(current_uri, flux_fini)
+        && !uri_nomme_le_flux(current_uri, Some(flux_adopte))
+        && position_ms <= REJEU_DEPUIS_LE_DEBUT_MAX_MS
+        && position_ms.saturating_add(MOUVEMENT_MINIMAL_MS) <= position_de_reference_ms
+        && !debit_soutenu_sur_le_flux_adopte
 }
 
 /// #3967 — a-t-on le droit de demander au renderer de basculer LUI-MÊME sur
@@ -1477,11 +1698,22 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
 /// surveillance, une position gelée à l'ancienne durée finirait par passer
 /// pour la fin de la piste adoptée et la file sauterait un titre.
+///
+/// 🔴 Fil 2031 (#5411, Sony BD-P2100 en DLNA) : « à la fin du morceau N, le
+/// N+1 est en surbrillance, mais le N est rejoué du début ; à la fin, le N+2
+/// est joué ». Un renderer qui REPART DE ZÉRO SUR LA PISTE FINIE bouge, lui
+/// aussi : sa position quitte la valeur gelée. Quand ce rejeu est AVÉRÉ
+/// (`rejeu_avere`, voir [`rejeu_de_la_piste_finie_avere`] : URI de la piste
+/// finie, position revenue près de zéro, AUCUN débit soutenu sur le flux
+/// adopté), ce mouvement ne vaut pas signe de vie, et le délai écoulé, le
+/// repli joue la piste adoptée. Hors de ce cas, la règle d'avant, au mot près.
+#[allow(clippy::too_many_arguments)]
 pub fn suite_de_l_adoption(
     position_ms: u64,
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
+    rejeu_avere: bool,
     renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
@@ -1490,8 +1722,8 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    let signe_de_vie =
-        uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS;
+    let signe_de_vie = uri_confirme
+        || (!rejeu_avere && position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS);
     if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {

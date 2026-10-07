@@ -312,11 +312,7 @@ pub(super) async fn artist_bio(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            let out = json!({
-                "artist": artist.name,
-                "bio": data.get("bio").cloned().unwrap_or(Value::Null),
-                "source": data.get("source").cloned().unwrap_or(Value::Null),
-            });
+            let out = reponse_du_proxy("artist", &artist.name, &data);
             if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
                 api_cache_set(&state.backend, &cache_key, &out);
             }
@@ -324,6 +320,53 @@ pub(super) async fn artist_bio(
         }
         _ => repli_sur_la_bio_stockee(&artist.name, artist.bio.as_deref(), prov),
     }
+}
+
+/// Le corps rendu par les deux routes `/bio` quand la bio vient du proxy
+/// communautaire (`/api/v1/artists/bio`, `/api/v1/albums/bio` du site).
+///
+/// `cle` vaut `"artist"` ou `"album"`, `nom` le nom ou le titre.
+///
+/// `source` reste à plat, comme avant. S'y ajoute `bio_provenance`, sous la
+/// MÊME forme que celle des bios stockées par `bio_sync`
+/// (`{source, source_url, license, lang, fetched_at}`, cf.
+/// `ArtistRepo::bio_provenance`) : sans elle, un extrait Wikipédia servi par
+/// ce chemin s'affichait sans le lien vers son article, alors que sa licence
+/// (CC BY-SA 4.0) exige l'attribution.
+///
+/// - `source` : la règle de `bio_sync::bio_source`, `"community"` à défaut ;
+/// - `source_url`, `license`, `lang` : relayés tels que le site les donne,
+///   comme `bio_sync` les range en base. La licence n'est pas réécrite : le
+///   site écrit `CC BY-SA 4.0`, l'enrichissement local `CC-BY-SA-4.0`, et le
+///   client lit les deux graphies ;
+/// - `fetched_at` : l'heure de la réponse du site.
+///
+/// Rien n'est écrit en base : seule l'entrée de cache (24 h) garde ce corps,
+/// provenance comprise. Pas de bio, pas de provenance.
+pub(super) fn reponse_du_proxy(cle: &str, nom: &str, data: &Value) -> Value {
+    let bio = data.get("bio").cloned().unwrap_or(Value::Null);
+    let mut out = json!({
+        cle: nom,
+        "bio": bio,
+        "source": data.get("source").cloned().unwrap_or(Value::Null),
+    });
+    if bio.as_str().is_some_and(|b| !b.trim().is_empty()) {
+        let texte = |champ: &str| {
+            data.get(champ)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        out["bio_provenance"] = json!({
+            "source": tune_core::cloud::bio_sync::bio_source(&texte("source")),
+            "source_url": texte("source_url"),
+            "license": texte("license"),
+            "lang": texte("lang"),
+            "fetched_at": now_iso_utc(),
+        });
+    }
+    out
 }
 
 /// Quelle langue la requête demande-t-elle, pour les deux routes « bio » ?
@@ -481,7 +524,38 @@ pub(super) async fn artist_albums(
     // La fiche artiste trie ses albums par date d'ajout (Bertrand,
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
-    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    // #5616 — le type DÉDUIT des disques sans type explicite (règle pistes et
+    // durée de `release_type`), publié À CÔTÉ de `release_type`, jamais à sa
+    // place. Clé absente quand rien n'est déduit. Champ additif : le tableau
+    // nu des clients natifs le porte aussi, sans changer de forme.
+    let deduits = repo.types_deduits(&items);
+    // Section « Live » (05/10/2026) — les types SECONDAIRES MusicBrainz
+    // (`albums.release_secondary_types`), publiés en tableau sous
+    // `release_secondary_types`. Clé absente quand rien n'est connu.
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    let secondaires = repo.types_secondaires_par_album(&ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "types_secondaires_par_album a échoué — fiche sans section Live");
+        Default::default()
+    });
+    let items: Vec<(bool, Value)> = items
+        .iter()
+        .map(|a| {
+            let mut v = a.to_json();
+            let types = a.id.and_then(|id| secondaires.get(&id));
+            if let Some(o) = v.as_object_mut() {
+                if let Some(t) = a.id.and_then(|id| deduits.get(&id)) {
+                    o.insert("inferred_release_type".into(), json!(t.as_str()));
+                }
+                if let Some(types) = types {
+                    o.insert("release_secondary_types".into(), json!(types));
+                }
+            }
+            (
+                types.is_some_and(|t| tune_core::metadata::release_type::est_live(t)),
+                v,
+            )
+        })
+        .collect();
 
     // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
     if !q
@@ -489,14 +563,28 @@ pub(super) async fn artist_albums(
         .as_deref()
         .is_some_and(|v| v == "true" || v == "1")
     {
+        // Le tableau nu garde TOUS les albums, lives compris : sa forme et son
+        // contenu ne changent pas pour les clients natifs.
+        let items: Vec<Value> = items.into_iter().map(|(_, v)| v).collect();
         return Json(json!(items));
     }
+
+    // Section « Live » : un disque dont les types secondaires portent `live`
+    // quitte « albums » pour « live », QUEL QUE SOIT son type primaire (un EP
+    // live est un live). Clé absente quand la section est vide, comme les
+    // autres.
+    let (live, items): (Vec<_>, Vec<_>) = items.into_iter().partition(|(live, _)| *live);
+    let items: Vec<Value> = items.into_iter().map(|(_, v)| v).collect();
+    let live: Vec<Value> = live.into_iter().map(|(_, v)| v).collect();
 
     // #4767 — deux sections de plus, à partir de l'artiste de CHAQUE piste.
     // Une section vide est ABSENTE de la réponse : le client ne doit jamais
     // avoir à décider s'il affiche un titre au-dessus de rien.
     let mut reponse = json!({ "albums": items });
     let obj = reponse.as_object_mut().expect("objet");
+    if !live.is_empty() {
+        obj.insert("live".into(), json!(live));
+    }
     for (cle, albums) in [
         (
             "compilations",
@@ -894,6 +982,7 @@ pub(super) async fn update_artist(
     if let Some(ref v) = body.sort_name {
         artist.sort_name = Some(v.clone());
     }
+    let bio_avant = artist.bio.clone();
     if let Some(ref v) = body.bio {
         artist.bio = if v.is_empty() { None } else { Some(v.clone()) };
     }
@@ -907,6 +996,11 @@ pub(super) async fn update_artist(
             Json(json!({"error": format!("update failed: {e}")})),
         )
             .into_response();
+    }
+    if let Err(e) =
+        repo.oublier_provenance_si_bio_reecrite(id, bio_avant.as_deref(), artist.bio.as_deref())
+    {
+        tracing::warn!(artist_id = id, error = %e, "artist_bio_provenance_clear_failed");
     }
 
     if body.name.is_some() {
@@ -935,6 +1029,97 @@ pub(super) async fn update_artist(
     }
 
     Json(json!(artist)).into_response()
+}
+
+#[cfg(test)]
+mod tests_proxy_bio {
+    use super::reponse_du_proxy;
+    use serde_json::json;
+
+    /// Le cas de site-mozaiklabs#278 : un extrait Wikipédia servi par le
+    /// proxy part avec l'URL de l'article, la licence et la langue.
+    #[test]
+    fn un_extrait_wikipedia_garde_son_attribution() {
+        let data = json!({
+            "bio": "Kind of Blue est un album de Miles Davis.",
+            "source": "wikipedia",
+            "source_url": "https://fr.wikipedia.org/wiki/Kind_of_Blue",
+            "license": "CC BY-SA 4.0",
+            "lang": "fr",
+        });
+        let out = reponse_du_proxy("album", "Kind of Blue", &data);
+
+        assert_eq!(out["album"], "Kind of Blue");
+        assert_eq!(out["bio"], data["bio"]);
+        assert_eq!(out["source"], "wikipedia", "`source` reste à plat");
+        let prov = &out["bio_provenance"];
+        assert_eq!(prov["source"], "wikipedia");
+        assert_eq!(
+            prov["source_url"],
+            "https://fr.wikipedia.org/wiki/Kind_of_Blue"
+        );
+        assert_eq!(
+            prov["license"], "CC BY-SA 4.0",
+            "licence relayée telle quelle"
+        );
+        assert_eq!(prov["lang"], "fr");
+        assert!(prov["fetched_at"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    /// Même forme que `ArtistRepo::bio_provenance` : les cinq clés, toujours.
+    #[test]
+    fn la_provenance_a_la_forme_des_bios_stockees() {
+        let out = reponse_du_proxy("artist", "Miles Davis", &json!({"bio": "Trompettiste."}));
+        let prov = out["bio_provenance"].as_object().expect("provenance");
+        let mut cles: Vec<&str> = prov.keys().map(String::as_str).collect();
+        cles.sort_unstable();
+        assert_eq!(
+            cles,
+            ["fetched_at", "lang", "license", "source", "source_url"]
+        );
+        // Sans source, l'étiquette de `bio_sync` ; champs absents = null.
+        assert_eq!(prov["source"], "community");
+        assert!(prov["source_url"].is_null());
+        assert!(prov["license"].is_null());
+        assert!(prov["lang"].is_null());
+        assert!(out["source"].is_null(), "`source` à plat inchangé : null");
+    }
+
+    #[test]
+    fn une_bio_d_ia_garde_sa_source() {
+        let out = reponse_du_proxy(
+            "artist",
+            "Miles Davis",
+            &json!({"bio": "Bio.", "source": "claude"}),
+        );
+        assert_eq!(out["bio_provenance"]["source"], "claude");
+        assert!(out["bio_provenance"]["license"].is_null());
+    }
+
+    /// Pas de bio, pas de provenance : rien à attribuer.
+    #[test]
+    fn sans_bio_aucune_provenance() {
+        for data in [
+            json!({"bio": null, "source": null}),
+            json!({}),
+            json!({"bio": "  "}),
+        ] {
+            let out = reponse_du_proxy("artist", "Miles Davis", &data);
+            assert!(out.get("bio_provenance").is_none(), "{data}");
+        }
+    }
+
+    /// Des champs vides ou d'un mauvais type ne passent pas pour une valeur.
+    #[test]
+    fn les_champs_vides_sont_nuls() {
+        let data =
+            json!({"bio": "Bio.", "source": "", "source_url": " ", "license": 4, "lang": ""});
+        let prov = &reponse_du_proxy("album", "X", &data)["bio_provenance"];
+        assert_eq!(prov["source"], "community");
+        assert!(prov["source_url"].is_null());
+        assert!(prov["license"].is_null());
+        assert!(prov["lang"].is_null());
+    }
 }
 
 #[cfg(test)]

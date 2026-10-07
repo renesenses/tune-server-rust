@@ -78,7 +78,9 @@ fn piles_armees() -> bool {
     PILES_ARMEES.load(Ordering::Relaxed)
 }
 
-fn armer_les_piles() {
+/// Armer la capture des piles du détenteur : aussi appelé par le relevé d'un
+/// gel de l'exécuteur, pour que le gel SUIVANT porte la pile (#5677).
+pub fn armer_les_piles() {
     if !PILES_ARMEES.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "ecriture_sqlite_piles_armees — les prochaines prises du verrou d'écriture \
@@ -122,7 +124,9 @@ struct Prise {
     fil: std::thread::Thread,
     tid: i64,
     depuis: Instant,
-    pile: Option<Backtrace>,
+    /// Partagée : le relevé l'emporte sous le petit verrou, et ne la met en
+    /// texte qu'APRÈS l'avoir rendu (ticket 190).
+    pile: Option<Arc<Backtrace>>,
     dernier_signalement: Option<Instant>,
 }
 
@@ -134,7 +138,7 @@ impl Prise {
             fil: std::thread::current(),
             tid: tid_courant(),
             depuis: Instant::now(),
-            pile: pile.then(Backtrace::force_capture),
+            pile: pile.then(|| Arc::new(Backtrace::force_capture())),
             dernier_signalement: None,
         }
     }
@@ -143,15 +147,56 @@ impl Prise {
         self.fil.name().unwrap_or("?").to_string()
     }
 
-    fn photo(&self) -> PhotoPrise {
-        PhotoPrise {
-            lieu: self.lieu.to_string(),
+    /// Ce qu'on copie SOUS le verrou de relevé : rien que des copies et un
+    /// `Arc`. La pile n'est pas mise en texte ici.
+    fn cliche(&self) -> Cliche {
+        Cliche {
+            lieu: self.lieu,
             fil: self.nom_du_fil(),
             tid: self.tid,
             depuis: self.depuis.elapsed(),
-            pile: self.pile.as_ref().map(|p| p.to_string()),
+            pile: self.pile.clone(),
         }
     }
+}
+
+/// Une prise copiée sous le verrou de relevé, pas encore mise en texte.
+///
+/// Ticket 190 : la sentinelle mettait la pile en texte (résolution des
+/// symboles) en tenant `detention`. Sur une machine virtuelle lente, cela a
+/// duré plusieurs secondes. Pendant ce temps, le détenteur ne pouvait pas
+/// finir de rendre la connexion, et l'écrivain suivant, qui venait de la
+/// prendre, attendait `detention` en la gardant : le journal disait
+/// `ecriture_sqlite_detention_longue tenue_ms=5414` pour une écriture
+/// d'environ une seconde.
+struct Cliche {
+    lieu: &'static Location<'static>,
+    fil: String,
+    tid: i64,
+    depuis: Duration,
+    pile: Option<Arc<Backtrace>>,
+}
+
+impl Cliche {
+    /// À appeler verrous de relevé RENDUS.
+    fn developper(self) -> PhotoPrise {
+        let pile = self.pile.as_deref().map(|p| formater_la_pile(p, &self.fil));
+        PhotoPrise {
+            lieu: self.lieu.to_string(),
+            fil: self.fil,
+            tid: self.tid,
+            depuis: self.depuis,
+            pile,
+        }
+    }
+}
+
+/// Mettre une pile en texte : résoudre ses symboles, ce qui peut prendre des
+/// secondes la première fois sur une machine lente. Jamais sous un verrou.
+fn formater_la_pile(pile: &Backtrace, _fil_du_detenteur: &str) -> String {
+    #[cfg(test)]
+    tests_190::retard_de_formatage(_fil_du_detenteur);
+    pile.to_string()
 }
 
 /// Instantané d'une prise ou d'une attente, pour le journal et le relevé de gel.
@@ -410,20 +455,54 @@ impl VerrouEcriture {
                 }
             }
         };
-        let jeton = self.etat.jeton();
-        if let Ok(mut d) = self.etat.detention.lock() {
-            *d = Some(Prise::nouvelle(jeton, lieu, piles_armees()));
-        }
-        let tenue = EcritureTenue {
-            garde: Some(garde),
-            etat: &self.etat,
-            jeton,
-        };
+        let tenue = self.tenir(garde, lieu);
         if empoisonnee {
             Err(PoisonError::new(tenue))
         } else {
             Ok(tenue)
         }
+    }
+
+    /// Inscrire la prise d'une garde obtenue, et la rendre surveillée.
+    fn tenir<'a>(
+        &'a self,
+        garde: MutexGuard<'a, Connection>,
+        lieu: &'static Location<'static>,
+    ) -> EcritureTenue<'a> {
+        let jeton = self.etat.jeton();
+        if let Ok(mut d) = self.etat.detention.lock() {
+            *d = Some(Prise::nouvelle(jeton, lieu, piles_armees()));
+        }
+        EcritureTenue {
+            garde: Some(garde),
+            etat: &self.etat,
+            jeton,
+        }
+    }
+
+    /// Prendre la connexion d'écriture SI ELLE EST LIBRE, sans jamais
+    /// attendre (#5871). `None` quand un autre fil la tient.
+    ///
+    /// Sert aux lectures qui préfèrent la connexion d'écriture — pour voir
+    /// une valeur posée l'instant d'avant — mais qui n'ont aucune raison
+    /// d'attendre un écrivain pour l'obtenir : quand il la tient, la dernière
+    /// valeur commitée, lue par le pool, fait aussi bien (voir
+    /// `DbBackend::query_one_frais`).
+    #[track_caller]
+    pub fn essayer_sans_attendre(&self) -> Option<EcritureTenue<'_>> {
+        let garde = match self.connexion.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(self.tenir(garde, Location::caller()))
+    }
+
+    /// Le fil courant tient-il une transaction de lot ouverte sur cette
+    /// connexion ? Lui seul voit ce qu'il y a écrit sans l'avoir validé :
+    /// une lecture de SA part ne peut pas passer par le pool (#5871).
+    pub fn lot_au_fil_courant(&self) -> bool {
+        self.etat.lot.est_au_fil_courant()
     }
 
     /// Le détenteur courant et les attentes, sans rien bloquer d'autre que
@@ -434,17 +513,20 @@ impl VerrouEcriture {
 }
 
 fn releve_de(etat: &Etat) -> ReleveVerrou {
+    // Copier sous les verrous de relevé, mettre en texte après (ticket 190).
+    let detenteur = etat
+        .detention
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(Prise::cliche));
+    let attentes: Vec<Cliche> = etat
+        .attentes
+        .lock()
+        .map(|a| a.iter().map(Prise::cliche).collect())
+        .unwrap_or_default();
     ReleveVerrou {
-        detenteur: etat
-            .detention
-            .lock()
-            .ok()
-            .and_then(|d| d.as_ref().map(Prise::photo)),
-        attentes: etat
-            .attentes
-            .lock()
-            .map(|a| a.iter().map(Prise::photo).collect())
-            .unwrap_or_default(),
+        detenteur: detenteur.map(Cliche::developper),
+        attentes: attentes.into_iter().map(Cliche::developper).collect(),
     }
 }
 
@@ -612,11 +694,11 @@ fn examiner(etat: &Etat) -> Option<Signalement> {
         return None;
     }
     prise.dernier_signalement = Some(Instant::now());
-    let photo = prise.photo();
+    let cliche = prise.cliche();
     drop(d);
     armer_les_piles();
     Some(Signalement {
-        detenteur: photo,
+        detenteur: cliche.developper(),
         attentes,
     })
 }
@@ -624,3 +706,7 @@ fn examiner(etat: &Etat) -> Option<Signalement> {
 #[cfg(test)]
 #[path = "verrou_ecriture_tests_4924.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "verrou_ecriture_tests_190.rs"]
+mod tests_190;

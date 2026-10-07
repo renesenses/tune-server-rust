@@ -24,6 +24,7 @@ async fn paused_browser() -> (AppState, i64, String) {
             duration_ms: 300_000,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         })
         .collect();
     queue.append(zid, &items).unwrap();
@@ -116,15 +117,15 @@ async fn i4193_expired_browser_session_uses_request_language_on_http_and_event()
 }
 
 #[tokio::test]
-async fn i4193_missing_language_keeps_a_french_refusal() {
+async fn i4193_missing_language_falls_back_to_an_english_refusal() {
     let (state, zid, sid) = paused_browser().await;
     state.streamer.remove_session(&sid).await;
     let (status, body) = post_resume(&state, zid, None).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let message = body["message"].as_str().unwrap();
     assert!(
-        message.contains("Relancez la piste.") && message.contains("navigateur"),
-        "{message}"
+        message.contains("Start the track again.") && message.contains("browser"),
+        "without Accept-Language the server answers in English, never French: {message}"
     );
     assert!(!message.contains("0:00"));
 }

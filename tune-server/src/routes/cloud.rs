@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
+use tune_core::cloud::rate_limit::{self, CloudScope};
 use tune_core::cloud::sso::{MozaikAuth, PkceSession, ProfilCloud};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -102,6 +103,75 @@ fn redirect_uri(state: &AppState, headers: Option<&HeaderMap>) -> String {
     format!("http://{host}/api/v1/cloud/sso/callback")
 }
 
+/// La page que le NAVIGATEUR reçoit quand la connexion au compte n'aboutit pas.
+///
+/// `/sso/authorize` et `/sso/callback` sont des navigations complètes : la
+/// personne y arrive par une redirection, pas par un appel de l'interface. Un
+/// corps JSON s'y affichait donc brut, sans explication et sans chemin de
+/// retour. La page dit ce qui s'est passé, que le compte n'est PAS lié, et
+/// ramène à Tune.
+fn page_connexion_compte(
+    headers: &HeaderMap,
+    statut: StatusCode,
+    message: &str,
+    retry_after_seconds: Option<u64>,
+) -> axum::response::Response {
+    let lang = crate::i18n::lang_from_header(headers);
+    let t = |cle: &str| crate::routes::html_escape(&crate::i18n::t(&lang, cle));
+    let html = format!(
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{titre}</title>
+<style>body{{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}}.card{{max-width:480px;padding:2rem}}h1{{font-weight:600}}a{{color:#6ab0ff;text-decoration:none}}a:hover{{text-decoration:underline}}</style>
+</head><body><div class="card">
+<h1>{titre}</h1>
+<p>{message}</p>
+<p>{non_lie}</p>
+<p><a href="/">{retour}</a></p>
+</div></body></html>"#,
+        titre = t("cloud.ssoTitre"),
+        message = crate::routes::html_escape(message),
+        non_lie = t("cloud.ssoNonLie"),
+        retour = t("cloud.ssoRetour"),
+    );
+    let mut reponse = (statut, Html(html)).into_response();
+    if let Some(valeur) = retry_after_seconds.and_then(|s| s.to_string().parse().ok()) {
+        reponse
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, valeur);
+    }
+    reponse
+}
+
+/// La page d'attente : mozaiklabs refuse pour l'instant la relecture du profil,
+/// sans laquelle le compte ne peut pas être lié. Elle donne le temps restant.
+fn page_attente_compte(headers: &HeaderMap, retry_after_seconds: u64) -> axum::response::Response {
+    let message = crate::routes::cloud_error::message_limite(
+        headers,
+        Some(retry_after_seconds),
+        crate::routes::cloud_error::CLE_LIMITE,
+        crate::routes::cloud_error::CLE_LIMITE_DELAI,
+    );
+    page_connexion_compte(
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        &message,
+        Some(retry_after_seconds),
+    )
+}
+
+/// Une page d'échec ordinaire : le motif technique est cité tel quel, après le
+/// message traduit.
+fn page_echec_compte(
+    headers: &HeaderMap,
+    statut: StatusCode,
+    motif: &str,
+) -> axum::response::Response {
+    let lang = crate::i18n::lang_from_header(headers);
+    let message = format!("{} ({motif})", crate::i18n::t(&lang, "cloud.ssoEchec"));
+    page_connexion_compte(headers, statut, &message, None)
+}
+
 async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
@@ -119,6 +189,18 @@ async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> imp
 </div></body></html>"#;
         return (StatusCode::SERVICE_UNAVAILABLE, Html(html)).into_response();
     };
+
+    // Une attente encore active sur la relecture du profil ferait échouer la
+    // connexion APRÈS l'échange du code : mozaiklabs aurait émis un jeton
+    // pour rien. On le dit donc avant de rediriger. Une échéance passée ne
+    // bloque pas (`active` l'efface).
+    if let Some(attente) = rate_limit::active(&settings, CloudScope::UserProfile) {
+        info!(
+            retry_after_seconds = attente.retry_after_seconds,
+            "sso_authorize_attente_active"
+        );
+        return page_attente_compte(&headers, attente.retry_after_seconds);
+    }
 
     // PKCE (RFC 7636): mint a fresh verifier/challenge/state and stash the
     // verifier + state for the browser round-trip (consumed in sso_callback).
@@ -150,29 +232,31 @@ async fn sso_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
+    // Chaque refus de cette route est une PAGE : le navigateur y arrive par la
+    // redirection de mozaiklabs, il n'y a aucune interface pour lire du JSON.
     if let Some(err) = q.error {
-        return (
+        return page_echec_compte(
+            &headers,
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("OAuth error: {err}")})),
-        )
-            .into_response();
+            &format!("OAuth error: {err}"),
+        );
     }
 
     let Some(code) = q.code else {
-        return (
+        return page_echec_compte(
+            &headers,
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "missing authorization code"})),
-        )
-            .into_response();
+            "missing authorization code",
+        );
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
-        return (
+        return page_echec_compte(
+            &headers,
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "SSO not configured"})),
-        )
-            .into_response();
+            "SSO not configured",
+        );
     };
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
@@ -185,19 +269,19 @@ async fn sso_callback(
     settings.set("mozaik_pkce_pending", "").ok();
 
     let Some(pkce) = pending else {
-        return (
+        return page_echec_compte(
+            &headers,
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "no pending SSO session (restart login)"})),
-        )
-            .into_response();
+            "no pending SSO session (restart login)",
+        );
     };
     if q.state.as_deref() != Some(pkce.state.as_str()) {
         warn!("sso_state_mismatch");
-        return (
+        return page_echec_compte(
+            &headers,
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "state mismatch (possible CSRF)"})),
-        )
-            .into_response();
+            "state mismatch (possible CSRF)",
+        );
     }
 
     // Reuse the exact redirect_uri minted at authorize time (must match); fall
@@ -210,11 +294,21 @@ async fn sso_callback(
         .unwrap_or_else(|| redirect_uri(&state, Some(&headers)));
     settings.set("mozaik_redirect_uri_pending", "").ok();
 
+    // Même contrôle qu'à l'autorisation, AVANT l'échange : une attente posée
+    // entre-temps (battement de fond) ferait émettre un jeton aussitôt jeté.
+    if let Some(attente) = rate_limit::active(&settings, CloudScope::UserProfile) {
+        warn!(
+            retry_after_seconds = attente.retry_after_seconds,
+            "sso_callback_attente_active"
+        );
+        return page_attente_compte(&headers, attente.retry_after_seconds);
+    }
+
     let token = match auth.exchange_code(&code, &uri, &pkce.verifier).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "sso_code_exchange_failed");
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+            return page_echec_compte(&headers, StatusCode::BAD_GATEWAY, &e);
         }
     };
 
@@ -237,30 +331,11 @@ async fn sso_callback(
             retry_after_seconds,
         } => {
             warn!(retry_after_seconds, "sso_user_fetch_rate_limited");
-            let mut reponse = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    // Code stable : c'est lui que le client traduit (ce dépôt
-                    // ne porte aucun catalogue de langues, cf. `refusal.code`
-                    // de `discovery_setup`).
-                    "code": "cloud_rate_limited",
-                    "retry_after_seconds": retry_after_seconds,
-                    "error": format!(
-                        "mozaiklabs.fr is rate-limiting this server;                          the account was NOT linked. Retry the login in {retry_after_seconds}s."
-                    ),
-                })),
-            )
-                .into_response();
-            if let Ok(valeur) = retry_after_seconds.to_string().parse() {
-                reponse
-                    .headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, valeur);
-            }
-            return reponse;
+            return page_attente_compte(&headers, retry_after_seconds);
         }
         ProfilCloud::Echec(e) => {
             warn!(error = %e, "sso_user_fetch_failed");
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+            return page_echec_compte(&headers, StatusCode::BAD_GATEWAY, &e);
         }
     };
 
@@ -420,11 +495,11 @@ async fn sso_callback(
     let jwt = match crate::auth::sign_jwt(profile_id, role, &jwt_secret) {
         Ok(t) => t,
         Err(e) => {
-            return (
+            return page_echec_compte(
+                &headers,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("JWT creation failed: {e}")})),
-            )
-                .into_response();
+                &format!("JWT creation failed: {e}"),
+            );
         }
     };
 

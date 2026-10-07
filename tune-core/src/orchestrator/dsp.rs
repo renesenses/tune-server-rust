@@ -367,7 +367,7 @@ impl PlaybackOrchestrator {
         // Playing is never blanked and end detection has a duration.
         if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
-            if let Some(svc) = registry.get(&prefetched.source) {
+            if let Some(svc) = registry.get_actif(&prefetched.source).await {
                 let svc = svc.read().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
                     if title.is_empty() {
@@ -1575,6 +1575,7 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::eq::EqProcessor> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_egaliseur");
         let profile = self.load_eq_profile(zone_id)?;
         let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
         if eq.is_enabled() { Some(eq) } else { None }
@@ -1599,17 +1600,23 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> StreamingDsp {
-        let replaygain = match track_id {
-            Some(tid) if !self.zone_audiophile(zone_id) => {
-                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
-                if (f - 1.0).abs() > 1e-6 {
-                    Some(f)
-                } else {
-                    None
+        let _tout = EtapeDePreparation::debut(zone_id, "dsp_flux_reseau");
+        let replaygain = {
+            let _e = EtapeDePreparation::debut(zone_id, "dsp_replaygain");
+            match track_id {
+                Some(tid) if !self.zone_audiophile(zone_id) => {
+                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+                    if (f - 1.0).abs() > 1e-6 {
+                        Some(f)
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             }
-            _ => None,
         };
+        // L'égaliseur, la convolution et le crossfeed se chronomètrent dans
+        // leur chargeur (`EtapeDePreparation`, #5871).
         let mut dsp = StreamingDsp {
             replaygain,
             eq: self.load_eq_processor(zone_id, sample_rate, channels),
@@ -1628,11 +1635,14 @@ impl PlaybackOrchestrator {
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
-        dsp.compensation = self.compensation_du_flux_reseau(
-            zone_id,
-            dsp.eq.as_ref(),
-            dsp.crossfeed.as_ref().filter(|_| channels == 2),
-        );
+        dsp.compensation = {
+            let _e = EtapeDePreparation::debut(zone_id, "dsp_compensation");
+            self.compensation_du_flux_reseau(
+                zone_id,
+                dsp.eq.as_ref(),
+                dsp.crossfeed.as_ref().filter(|_| channels == 2),
+            )
+        };
         dsp
     }
 
@@ -1841,6 +1851,7 @@ impl PlaybackOrchestrator {
         sample_rate: u32,
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_convolution");
         let path = self.chemin_ir(zone_id)?;
         match crate::audio::convolver::Convolver::from_wav_for(
             &path,
@@ -1871,6 +1882,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         sample_rate: u32,
     ) -> Option<crate::audio::crossfeed::CrossfeedProcessor> {
+        let _e = EtapeDePreparation::debut(zone_id, "dsp_crossfeed");
         // PURE mode: no crossfeed, keep the signal path bit-perfect.
         if self.zone_audiophile(zone_id) {
             return None;
@@ -1939,8 +1951,18 @@ impl PlaybackOrchestrator {
     /// que [`Self::traitement_que_pure_gouverne`] lise la même clé avec les
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
+    ///
+    /// `None` aussi quand un greffon natif tiers de la famille du crossfeed
+    /// traite la zone (`audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed`) :
+    /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
+    /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)
+        let reglage =
+            Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)?;
+        let tiers = self.etages_tiers_configures(zone_id);
+        crate::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&tiers)
+            .is_none()
+            .then_some(reglage)
     }
 
     /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
@@ -2109,6 +2131,91 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #4384 — repousser le facteur ReplayGain (préampli compris) à la sortie
+    /// locale qui joue, sans attendre la piste suivante.
+    ///
+    /// Le facteur n'était posé qu'au lancement d'une piste (`transport.rs`) et
+    /// à la bascule PURE ([`Self::refresh_zone_pure_dsp`]). Un préampli changé
+    /// dans les réglages en cours d'écoute était donc écrit en base, renvoyé
+    /// comme un succès, et n'atteignait ni le son ni le crête-mètre avant la
+    /// piste suivante : à −6 dB, l'aiguille ne bougeait pas, parce que rien
+    /// n'avait bougé (GgB, fil 1797). Le forwarder de niveaux lit le gain de
+    /// rendu à chaque fenêtre : le repousser ici suffit pour que l'aiguille
+    /// suive dans la seconde.
+    ///
+    /// Même expression que le chemin de lecture : 1,0 sous PURE ou sans piste
+    /// identifiée. Aucune garde sur `current_format()` : un scalaire n'a pas
+    /// de filtre à bâtir pour un débit donné (même raison que
+    /// [`Self::refresh_zone_mono_downmix`]). Rend `true` quand une sortie
+    /// locale l'a reçu.
+    pub async fn refresh_zone_replaygain(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            // Lu AVANT le verrou de la sortie, comme dans
+            // `refresh_zone_pure_dsp` : `get_state` prend ses propres verrous.
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let pure = self.zone_audiophile(zone_id);
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let rg = match (pure, track_id) {
+                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+                _ => 1.0,
+            };
+            local_output.set_replaygain_factor(rg);
+            // Idempotent : le même `Arc` que la lecture a déjà branché.
+            self.playback
+                .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
+            info!(zone_id, device_id = %device_id, rg, "zone_replaygain_refreshed_live");
+            true
+        }
+    }
+
+    /// #4384 — un réglage ReplayGain GLOBAL vient de changer (mode, préampli,
+    /// anti-écrêtage…) : le repousser à toutes les sorties locales. Rend le
+    /// nombre de zones servies à chaud. Une zone réseau a son gain cuit dans
+    /// le flux : elle l'entendra à la piste suivante, comme avant.
+    pub async fn refresh_replaygain_toutes_zones(&self) -> usize {
+        let zones = ZoneRepo::with_backend(self.db.clone())
+            .list()
+            .unwrap_or_default();
+        let mut servies = 0;
+        for zone_id in zones.into_iter().filter_map(|z| z.id) {
+            if self.refresh_zone_replaygain(zone_id).await {
+                servies += 1;
+            }
+        }
+        servies
+    }
+
     /// #5071 — l'interrupteur de compensation vient de changer : le faire
     /// entendre, sur une sortie locale comme sur une zone réseau.
     ///
@@ -2241,6 +2348,37 @@ impl PlaybackOrchestrator {
         volume: f64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #5695 — le verrou PURE mord ICI, au point de passage unique : la
+        // route `POST /playback/{id}/volume` l'appliquait seule, et toutes les
+        // autres (`PUT /zones/{id}/volume` du client web, PATCH de zone,
+        // volume de groupe, alarmes…) le contournaient.
+        let pure_force = crate::audio::audiophile::volume_lock_enabled(&self.db, zone_id)
+            && crate::audio::audiophile::zone_enabled(&self.db, zone_id);
+        self.appliquer_volume(zone_id, volume, device_id, pure_force)
+            .await
+    }
+
+    /// #5695 — commande le plein volume d'une zone PURE verrouillée, SANS
+    /// trim de gain, comme [`Self::arm_fixed_volume`].
+    ///
+    /// Pour la route qui arme PURE : elle commande le 100 % AVANT d'écrire le
+    /// réglage (un refus de l'appareil ne doit rien persister), donc
+    /// [`Self::set_volume`] ne peut pas encore lire le verrou en base.
+    pub async fn set_volume_pure_force(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+    ) -> OutputCommandResult<()> {
+        self.appliquer_volume(zone_id, 1.0, device_id, true).await
+    }
+
+    async fn appliquer_volume(
+        &self,
+        zone_id: i64,
+        volume: f64,
+        device_id: Option<&str>,
+        pure_force: bool,
+    ) -> OutputCommandResult<()> {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
         let zone = ZoneRepo::with_backend(self.db.clone())
@@ -2262,7 +2400,17 @@ impl PlaybackOrchestrator {
         // zones fixed_volume ne passent jamais ici (early return ci-dessus).
         // Limite assumée : un trim positif est plafonné quand user_volume est
         // déjà haut (clamp 0..1).
-        let device_volume = volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id));
+        //
+        // #5695 — en PURE verrouillé, ni l'un ni l'autre : la consigne est
+        // 100 % et le trim n'est pas composé, comme dans `arm_fixed_volume`.
+        // Un trim de −1,6 dB faisait partir 0,83 vers le Devialet, que le
+        // sondeur rapatriait ensuite en base : « Volume 83 % » sous PURE.
+        let volume = if pure_force { 1.0 } else { volume };
+        let device_volume = if pure_force {
+            1.0
+        } else {
+            volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id))
+        };
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                 OutputCommandError::failed(
@@ -2274,6 +2422,7 @@ impl PlaybackOrchestrator {
                 zone_id,
                 volume,
                 device_volume,
+                pure_force,
                 device_id = did,
                 "device_set_volume_sending"
             );
@@ -2383,5 +2532,50 @@ impl PlaybackOrchestrator {
             }
         }
         true
+    }
+}
+
+/// Au-delà, une étape de la préparation d'une lecture est dite en INFO
+/// (#5871).
+pub(super) const SEUIL_ETAPE_LENTE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Une étape de la préparation d'une lecture, chronométrée de sa création à
+/// son abandon (#5871).
+///
+/// Le rapport de Tades montrait trois tranches de 7 à 15 s entre des jalons
+/// éloignés, sans dire laquelle des étapes intermédiaires les prenait. Chaque
+/// étape dit désormais sa durée quand elle dépasse [`SEUIL_ETAPE_LENTE`] :
+/// le prochain journal nommera l'étape, au lieu de la faire déduire. Rien
+/// n'est écrit sous le seuil — une préparation normale reste muette.
+///
+/// Mesurée à l'abandon : un retour anticipé (`?`, erreur) la mesure aussi, et
+/// elle vaut pour un bloc `async` comme pour un bloc synchrone.
+pub(super) struct EtapeDePreparation {
+    zone_id: i64,
+    etape: &'static str,
+    debut: std::time::Instant,
+}
+
+impl EtapeDePreparation {
+    pub(super) fn debut(zone_id: i64, etape: &'static str) -> Self {
+        Self {
+            zone_id,
+            etape,
+            debut: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for EtapeDePreparation {
+    fn drop(&mut self) {
+        let duree = self.debut.elapsed();
+        if duree >= SEUIL_ETAPE_LENTE {
+            info!(
+                zone_id = self.zone_id,
+                etape = self.etape,
+                ms = duree.as_millis() as u64,
+                "preparation_etape_lente"
+            );
+        }
     }
 }

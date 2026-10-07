@@ -109,6 +109,19 @@ fn condition(rule: &Value, profile_id: i64) -> String {
                  WHERE f9.profile_id = {profile_id} AND f9.item_type = 'album' \
                  AND f9.service = sit.source AND f9.service_id = sit.source_id"
         )),
+        // #5530 — un album étiqueté ne porte pas le marquage IA lui-même ;
+        // il est connu quand l'album est AUSSI en favori (tous profils : c'est
+        // un fait de catalogue). Inconnu n'est pas marqué.
+        "ai_generated" => {
+            let marque = "SELECT 1 FROM streaming_favorites f8 \
+                 WHERE f8.item_type = 'album' AND f8.service = sit.source \
+                 AND f8.service_id = sit.source_id AND f8.ai_generated = '1'";
+            match op.as_str() {
+                "is_false" => format!("NOT EXISTS ({marque})"),
+                "is_true" => format!("EXISTS ({marque})"),
+                _ => "1=0".into(),
+            }
+        }
         // Une donnée que la ligne n'a pas : FAUX (voir l'en-tête).
         _ => "1=0".into(),
     }
@@ -291,6 +304,34 @@ mod tests {
         assert_eq!(album["title"], "Sevy");
         assert_eq!(album["artist_name"], "Artiste A");
         assert_eq!(album["cover_path"], "https://c/q1.jpg");
+    }
+
+    /// #5530 — l'album étiqueté hérite du marquage IA rangé avec son favori ;
+    /// sans favori, le marquage est inconnu et l'album reste.
+    #[test]
+    fn le_marquage_ia_du_favori_vaut_pour_l_album_etiquete_5530() {
+        let b = base();
+        let repo = tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo::with_backend(
+            b.clone(),
+        );
+        assert_eq!(repo.marquer_album_ia("qobuz", "q1", true).unwrap(), 1);
+        let avec = |autre: &str| format!(r#"[{{"field":"tag","op":"is","value":"12"}},{autre}]"#);
+        assert_eq!(
+            titres(
+                &b,
+                &avec(r#"{"field":"ai_generated","op":"is_false"}"#),
+                "all"
+            ),
+            vec!["Bandcamp"]
+        );
+        assert_eq!(
+            titres(
+                &b,
+                &avec(r#"{"field":"ai_generated","op":"is_true"}"#),
+                "all"
+            ),
+            vec!["Sevy"]
+        );
     }
 
     #[test]

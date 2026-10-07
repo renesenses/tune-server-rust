@@ -16,7 +16,7 @@ const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 /// (`defer_from_headers` n'écrit rien sans en-tête, et cela ne change pas) : ce
 /// repli ne sert qu'à DIRE à l'utilisateur dans combien de temps réessayer,
 /// plutôt que de lui rendre un « 0 » ou un silence.
-pub const FENETRE_THROTTLE_DEFAUT_S: u64 = 60;
+pub const FENETRE_THROTTLE_DEFAUT_S: u64 = rate_limit::FENETRE_PROFIL_COMPTE_S;
 
 /// Baked-in OAuth client id for the public **PKCE** "Tune" client on
 /// mozaiklabs.fr.
@@ -271,7 +271,8 @@ impl MozaikAuth {
                 if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
             {
                 // `appeler` a déjà persisté l'échéance quand l'en-tête la
-                // donne ; on relit la même source pour DIRE le délai, avec la
+                // donne et qu'elle tient dans la fenêtre de la route
+                // (`CloudScope::fenetre_max_s`) ; on relit la même source pour DIRE le délai, avec la
                 // fenêtre mesurée en repli plutôt qu'un zéro trompeur.
                 let retry_after_seconds = rate_limit::retry_after_secs(resp.headers())
                     .unwrap_or(FENETRE_THROTTLE_DEFAUT_S);

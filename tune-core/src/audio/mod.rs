@@ -27,6 +27,11 @@ pub mod dff;
 pub mod dither;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
+/// #5643 — le flux « DSD brut » (DsdU8, MSB-first) de la sortie ASIO native.
+pub mod dsd_brut;
+#[cfg(test)]
+#[path = "dsd_brut_tests_5643.rs"]
+mod dsd_brut_tests_5643;
 #[cfg(test)]
 mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
@@ -36,6 +41,8 @@ pub mod dsf;
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
 mod dsf_http_progressif_tests;
+/// Fil 2062 — la durée d'un flux distant lue dans ses en-têtes.
+pub mod duree_des_entetes;
 pub mod ecretage;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;

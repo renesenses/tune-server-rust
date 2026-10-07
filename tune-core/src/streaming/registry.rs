@@ -47,6 +47,21 @@ impl ServiceRegistry {
         self.services.get(name).cloned()
     }
 
+    /// Le service, s'il est ACTIF ; `None` s'il est inconnu ou désactivé.
+    ///
+    /// Pour tout appel que Tune déclenche de lui-même sur un service déjà
+    /// choisi — lecture, préchargement, enchaînement, radio : la case
+    /// « Actif » des Réglages veut dire « ne plus interroger ce service »,
+    /// d'où que vienne l'appel (retour de terrain : Qobuz désactivé,
+    /// interrogé quand même, 500 puis 502).
+    pub async fn get_actif(&self, name: &str) -> Option<Arc<RwLock<Box<dyn StreamingService>>>> {
+        let svc = self.services.get(name)?;
+        if !svc.read().await.enabled() {
+            return None;
+        }
+        Some(svc.clone())
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.services.keys().cloned().collect()
     }
@@ -189,5 +204,34 @@ impl ServiceRegistry {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod get_actif_tests {
+    use super::ServiceRegistry;
+    use crate::streaming::qobuz::QobuzService;
+
+    /// Retour de terrain : Qobuz désactivé, interrogé quand même.
+    #[tokio::test]
+    async fn un_service_desactive_n_est_pas_rendu() {
+        let mut registre = ServiceRegistry::new();
+        let mut qobuz = QobuzService::new("app".into(), "secret".into());
+        crate::streaming::traits::StreamingService::set_enabled(&mut qobuz, false);
+        registre.register(Box::new(qobuz));
+        assert!(
+            registre.get("qobuz").is_some(),
+            "le service reste enregistré"
+        );
+        assert!(registre.get_actif("qobuz").await.is_none());
+
+        registre
+            .get("qobuz")
+            .unwrap()
+            .write()
+            .await
+            .set_enabled(true);
+        assert!(registre.get_actif("qobuz").await.is_some());
+        assert!(registre.get_actif("inconnu").await.is_none());
     }
 }

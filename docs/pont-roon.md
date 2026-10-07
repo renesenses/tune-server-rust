@@ -195,7 +195,44 @@ aussi, mais il n'apporte alors que les crédits, aucune image.
 ## Ce que fait l'import, et ce qu'il ne fait jamais
 
 L'appariement se fait sur **vos artistes, puis leurs albums, puis leurs
-pistes**, par nom et titre.
+pistes**, en deux niveaux.
+
+1. **Égalité stricte** : même nom d'artiste et même titre d'album, une fois
+   repliés (accents, casse, espaces, article « The »). C'est le premier
+   essai, et il garde la priorité. Un nom **générique** d'artiste ou d'album
+   (« Unknown », « Unknown Artist », « Unknown Album », « Inconnu »,
+   « Artiste inconnu », « Album inconnu », « Various », « Various Artists »,
+   « VA », « Divers », « Artistes divers », « Compilation », « Untitled »,
+   « Sans titre ») ne s'apparie **jamais** à ce niveau : il ne prouve rien,
+   et seul le niveau 2 peut le relier par ses pistes. Un tel artiste n'est
+   pas compté comme apparié, et son image n'est pas posée.
+2. **Par le contenu**, pour ce que le premier niveau n'a pas trouvé. Les
+   candidats sont les albums de toutes les fiches Tune de ce nom, ceux qui
+   portent une piste de l'artiste (une compilation, par exemple) et, en
+   dernier recours, ceux de toute la bibliothèque. Un candidat doit avoir le
+   même titre que l'album Roon, en ignorant la ponctuation et les suffixes de
+   disque (« (CD 1/2) », « [Disc 2] »…). Si ce titre ne donne aucun
+   candidat, une **seconde clé** ignore aussi les crochets et les parenthèses,
+   avec leur contenu : « Black Orpheus [Original Soundtrack] » trouve alors
+   « Black Orpheus ». Ce sont ensuite les **pistes** qui décident :
+   - au moins 80 % des pistes doivent se retrouver des deux côtés, avec le
+     même titre et, quand il est connu, le même numéro et le même disque, et
+     au moins deux pistes ;
+   - les titres **génériques** ne comptent jamais : titre vide, titre fait
+     de chiffres seuls qui ne fait que répéter le numéro de la piste (« 03 »
+     en piste 3 ; « 1999 » ou « 22 » sur une autre piste restent de vrais
+     titres), « Track 01 », « Track01 », « Piste 1 », « Titre 3 »,
+     « Unknown », « Unknown Title », « Untitled », « Sans titre »,
+     « No title », « Inconnu ». Un album « Unknown Album » fait de
+     « Track 01… » ne s'apparie donc pas par le contenu ;
+   - le candidat retenu doit devancer le suivant d'au moins **10 points** de
+     couverture (la plus petite de ses deux parts : pistes Roon retrouvées,
+     pistes Tune retrouvées). Sinon l'album est ambigu.
+
+   Un coffret que Tune range en un album par disque est apparié disque par
+   disque. Si plusieurs candidats conviennent, l'album est classé **ambigu**
+   et rien n'est écrit ; quand ce sont des copies aux pistes identiques, le
+   rapport le dit (« 3 exemplaires identiques »).
 
 Ce qu'il fait :
 
@@ -212,8 +249,22 @@ Ce qu'il ne fait jamais :
 - il ne **remplace aucun crédit** existant ;
 - il ne crée ni artiste, ni album, ni piste : ce que Tune ne connaît pas est
   listé dans le rapport (`artistes_inconnus`, `albums_inconnus`) et ignoré ;
+- il ne choisit jamais entre deux fiches Tune au hasard de leur ordre : un
+  artiste ou un album en double est listé dans `doublons`, et seul le contenu
+  peut trancher ;
 - ce qui vient de Roon **reste local** : la synchronisation cloud de Tune ne
   l'emporte pas.
+
+Chaque album Roon tombe dans une seule catégorie du rapport : apparié strict
+(`albums_apparies_strict`, détail dans `albums_par_strict`), apparié par le
+contenu (`albums_apparies_contenu`, détail dans `albums_par_contenu`), ambigu
+(`albums_ambigus`) ou introuvable (`albums_inconnus`, y compris les albums des
+artistes inconnus). Les détails donnent l'identifiant Tune de chaque album
+(« Artiste — Titre Roon → [12] Titre Tune »). Le champ `classement` reprend
+chaque album à sa place dans l'export (`i`, `j` pour `artistes[i].albums[j]`),
+avec sa catégorie et les identifiants Tune : de quoi comparer deux
+appariements du même export ligne à ligne. L'aperçu établit ce classement
+sans rien écrire.
 
 Le rapport donne, entre autres : artistes, albums et pistes appariés ;
 crédits à écrire, déjà présents, écrits ; images nommées par l'export et

@@ -147,6 +147,7 @@ impl Candidat {
                 duration_ms: piste.duration_ms as i64,
                 track_number: piste.track_number.map(i64::from),
                 disc_number: piste.disc_number.map(i64::from),
+                album_ref: piste.album_id.clone(),
             },
         }
     }

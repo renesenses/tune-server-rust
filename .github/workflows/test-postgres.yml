@@ -210,6 +210,26 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
 
+      # Fil 2130 — « Reprendre l'écoute » tombait en « (delai) » : la jointure
+      # en OR du second rang prenait 25,7 s sur PostgreSQL. Réécrite en deux
+      # branches UNION ALL : mêmes lignes que l'ancienne écriture (recopiée
+      # dans le test), mesure avant / après, et la migration 079 (index de
+      # listen_history.album_id). En série : les épreuves vident les tables
+      # qu'elles peuplent.
+      - name: « Reprendre l'écoute » en UNION ALL sur PostgreSQL (fil 2130)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2130 -- --nocapture --test-threads=1
+
+      # #4805 (idée 3 de MetaRust) — les réponses MusicBrainz gardées en base
+      # (`musicbrainz_release_cache`) : corps BYTEA, `ON CONFLICT`, purge par
+      # `NOT EXISTS` corrélé. La table n'a pas de script numéroté : le témoin
+      # la pose par l'entrée d'`ENSURE_TABLES` elle-même.
+      - name: Réponses MusicBrainz gardées en base sur PostgreSQL (#4805)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_musicbrainz_release_cache -- --nocapture
+
       - name: Provenance du DR album sur PostgreSQL (#3924)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -271,6 +291,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_rejeu_bascule -- --nocapture
 
+      # Fil 2138 — le rattrapage unique des dates d'ajout figees au premier
+      # scan (avant #5748), joue sur la VRAIE base : une base figee a 90 % est
+      # redatee par les fichiers, une base normale n'est pas touchee, la
+      # seconde passe ne refait rien. Bases jetables creees puis supprimees.
+      - name: Rattrapage des dates d'ajout figees au premier scan (fil 2138)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2138 -- --nocapture --test-threads=1
+
       # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
       # chemin qui masque, le démasquage et la réparation sûre, joués sur la
       # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
@@ -288,6 +317,23 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5464 -- --nocapture --test-threads=1
 
+      # #5519 — la sélection ReplayGain par curseur et l'écriture groupée par
+      # tour (`rg_analyzed`), sur PostgreSQL : ordre du curseur, écriture
+      # groupée, tag du fichier qui fait foi. Le témoin travaille sur des
+      # tables temporaires d'une seule connexion.
+      - name: ReplayGain par curseur et écriture groupée sur PostgreSQL (#5519)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5519 -- --nocapture
+
+      # #5594 — la passe de la clé PCM des FLAC (`tracks.audio_pcm_key`) sur
+      # PostgreSQL : placeholders, `LIMIT` lié, comparaison texte du témoin et
+      # NUL typé TEXT. Elle vide `tracks` : un fil à la fois.
+      - name: Clé PCM des FLAC sur PostgreSQL (#5594)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5594 -- --nocapture --test-threads=1
+
       # #5263 — une base issue de SQLite garde plusieurs réglages de zones en
       # TEXT ; leur report précède la suppression des doublons au démarrage.
       - name: Réglages des zones en double sur PostgreSQL (#5263)
@@ -304,6 +350,11 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i4036_context_names_postgres -- --nocapture
+
+      - name: Service des artistes du top sur PostgreSQL (web#1696)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i1696_services_artistes_postgres -- --nocapture
 
       # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
       #
@@ -484,6 +535,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
 
+      # Rc2 -- la regle de pochette d'album du scan par lots tourne dans le fil
+      # de `lecture_bornee`, qui n'avait pas de runtime tokio : sur PostgreSQL
+      # elle paniquait a chaque album (« there is no reactor running ») et la
+      # pochette n'etait ni posee ni suivie. Releve par #5860.
+      - name: Pochette d'album suivie par le scan sur PostgreSQL (lecture bornee)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_pochette_lecture_bornee -- --nocapture --test-threads=1
+
       # #4602 -- le VRAI scan (`POST /system/scan`) d'une bibliotheque de FLAC
       # avec pochettes : toute piste doit avoir un album, et les comptes ne
       # doivent pas bouger d'une passe a l'autre. `GROUP_CONCAT` en dur dans
@@ -494,6 +554,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
+
+      # #5837 -- une compilation dont l'artiste d'album change de resolution
+      # entre deux scans garde SA ligne album (balises changees, puis base
+      # heritee sans folder_path). Avant, une nouvelle ligne etait creee et
+      # l'ancienne restait vide dans la grille jusqu'a la fin du scan.
+      - name: Compilation reclassee, ligne album conservee (#5837)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_compilation_reprise_5837 -- --nocapture --test-threads=1
 
       # Chasse PG du 25/09/2026 -- le PREMIER demarrage d'une installation
       # native. Toutes les autres etapes jouent sur une base dont les scripts

@@ -667,6 +667,22 @@ pub(super) async fn stream_track_audio(
         )
             .into_response();
     }
+    // #4378 — cette route sert le fichier TEL QUEL, et c'est l'URL que le
+    // serveur média UPnP publie à tout point de contrôle tiers. Un DSDIFF
+    // compressé DST n'y est pas du DSD : un renderer qui en lirait les trames
+    // comme des bits DSD rendrait du bruit. Refus nommé, comme l'ISO SACD ;
+    // les zones de Tune, elles, le décodent.
+    if !dans_une_image && tune_core::audio::dff::est_un_dff_dst(&file_path) {
+        tracing::info!(track_id = id, "track_audio_dst_jamais_servi_brut");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT,
+            })),
+        )
+            .into_response();
+    }
     let mime = track
         .format
         .as_deref()
@@ -918,6 +934,32 @@ pub(super) async fn rescan_track(
         }
         None => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read metadata").into_response(),
     }
+}
+
+/// `GET /library/tracks/{id}/tenues` — les champs de la piste corrigés à la
+/// main, que les analyses ne défont pas (`tune_core::db::champs_tenus`).
+pub(super) async fn champs_tenus_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let t = tune_core::db::champs_tenus::de_la_piste(&state.backend, id);
+    Json(json!({
+        "track_id": id,
+        "fields": t.as_ref().map(|t| t.noms()).unwrap_or_default(),
+    }))
+}
+
+/// `DELETE /library/tracks/{id}/tenues` — « Rétablir depuis le fichier » : la
+/// piste oublie ses champs tenus et relit tout de suite les balises de son
+/// fichier (même relecture que `POST …/rescan`).
+pub(super) async fn champs_tenus_retablir(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if let Err(e) = tune_core::db::champs_tenus::retablir(&state.backend, id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    rescan_track(State(state), Path(id)).await.into_response()
 }
 
 pub(super) async fn quick_fav_track(
@@ -1185,9 +1227,11 @@ pub(super) async fn identify_track(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    let api_key = match state.config.acoustid_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
+    // La même clé que la passe de lot (#4805) : le réglage en base, sinon la
+    // configuration.
+    let api_key = match super::identification_lot::acoustid::cle_acoustid(&state) {
+        Some(k) => k,
+        None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"})),
@@ -1575,7 +1619,12 @@ pub(super) async fn track_metadata_get(
 
     let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     match repo.get_all(id) {
-        Ok(meta) => Json(json!(meta)).into_response(),
+        Ok(mut meta) => {
+            // Mémoire interne des champs tenus, pas une balise : elle a sa
+            // route (`…/tenues`).
+            meta.remove(tune_core::db::champs_tenus::CLE);
+            Json(json!(meta)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1604,9 +1653,13 @@ pub(super) async fn track_metadata_put(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    // Write tags to file (best-effort, don't fail the request)
+    // Write tags to file (best-effort, don't fail the request) — seulement si
+    // « Écrire les modifications dans les fichiers audio » est coché
+    // (désactivé par défaut) : sinon la base seule est modifiée.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path
+    if ecrire_fichier
+        && let Some(ref path) = file_path
         && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
     {
         tracing::warn!(
@@ -1618,7 +1671,11 @@ pub(super) async fn track_metadata_put(
         file_write_error = Some(e);
     }
 
-    let mut resp = json!({"status": "ok", "fields": body.len()});
+    let mut resp = json!({
+        "status": "ok",
+        "fields": body.len(),
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+    });
     if let Some(err) = file_write_error {
         resp["file_write_warning"] = json!(err);
     }
@@ -3196,6 +3253,59 @@ mod contrat_dlna_de_la_route_audio_3579 {
             .await
             .expect("corps");
         assert_eq!(&octets[..], b"0123456789");
+    }
+
+    /// Une piste dont le fichier est une copie d'un échantillon DSD du dépôt.
+    fn piste_dff(fixture: &str) -> (AppState, i64, tempfile::TempDir) {
+        let (state, id, dir) = piste("dff", "dff", 2_822_400, 1);
+        std::fs::copy(
+            format!(
+                "{}/../tune-core/tests/fixtures/dsd/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            dir.path().join("piste.dff"),
+        )
+        .expect("copie de l'échantillon DSD");
+        (state, id, dir)
+    }
+
+    /// 🔴 #4378 — un point de contrôle tiers qui pousse l'URL du serveur
+    /// média vers un renderer ne lui fait JAMAIS lire un DSDIFF DST brut.
+    /// Jumeau : le DFF en DSD non compressé, lui, part tel quel.
+    #[tokio::test]
+    async fn un_dff_dst_n_est_jamais_servi_brut() {
+        let (state, id, _dir) = piste_dff("ref_dsd64_stereo.dff");
+        let reponse = par_la_route(&state, id, "GET", &[]).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::OK,
+            "jumeau : un DFF en DSD brut se sert tel quel"
+        );
+
+        let (state, id, _dir) = piste_dff("dst_fate_dsd64_stereo.dff");
+        for methode in ["GET", "HEAD"] {
+            let reponse = par_la_route(&state, id, methode, &[]).await;
+            assert_eq!(
+                reponse.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{methode} : un DSDIFF DST ne doit pas partir brut vers un renderer"
+            );
+            let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .expect("corps");
+            assert!(
+                !octets.starts_with(b"FRM8"),
+                "{methode} : le corps est le fichier DST lui-même"
+            );
+            if methode == "GET" {
+                let corps: serde_json::Value = serde_json::from_slice(&octets).expect("JSON");
+                assert_eq!(corps["error"], "format_not_playable");
+                assert_eq!(
+                    corps["message"],
+                    tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT
+                );
+            }
+        }
     }
 }
 

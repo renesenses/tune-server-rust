@@ -465,7 +465,7 @@ fn chemin_compresse_5439_play_url_branche_le_decodage_continu() {
     );
     let pos_continu = production.find(&branchement).unwrap();
     let pos_ancienne = production
-        .find("decode_compressed_stream(&all_data)")
+        .find("decode_compressed_stream(&all_data,&force_silent)")
         .expect("la branche d'avant reste pour les autres formats");
     assert!(
         pos_continu < pos_ancienne,

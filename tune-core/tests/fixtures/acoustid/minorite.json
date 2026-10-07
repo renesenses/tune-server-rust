@@ -1,0 +1,148 @@
+{
+ "album": {
+  "titre": "Brumes",
+  "artiste": "Les Brumes"
+ },
+ "pistes": [
+  {
+   "track_id": 601,
+   "titre": "Matin",
+   "artiste": "Les Brumes",
+   "duree_s": 200,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000004a",
+      "score": 0.9,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000048",
+        "title": "Matin",
+        "duration": 200,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000045",
+          "name": "Les Brumes"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000046",
+          "title": "Brumes",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000047",
+            "country": "FR",
+            "date": {
+             "year": 2013
+            },
+            "medium_count": 1,
+            "track_count": 5,
+            "title": "Brumes"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-601"
+  },
+  {
+   "track_id": 602,
+   "titre": "Midi",
+   "artiste": "Les Brumes",
+   "duree_s": 210,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000004b",
+      "score": 0.9,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000049",
+        "title": "Midi",
+        "duration": 211,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000045",
+          "name": "Les Brumes"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000046",
+          "title": "Brumes",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000047",
+            "country": "FR",
+            "date": {
+             "year": 2013
+            },
+            "medium_count": 1,
+            "track_count": 5,
+            "title": "Brumes"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-602"
+  },
+  {
+   "track_id": 603,
+   "titre": "Brume 3",
+   "artiste": "Les Brumes",
+   "duree_s": 183,
+   "reponse": {
+    "status": "ok",
+    "results": []
+   },
+   "empreinte": "AQAD-fixture-603"
+  },
+  {
+   "track_id": 604,
+   "titre": "Brume 4",
+   "artiste": "Les Brumes",
+   "duree_s": 184,
+   "reponse": {
+    "status": "ok",
+    "results": []
+   },
+   "empreinte": "AQAD-fixture-604"
+  },
+  {
+   "track_id": 605,
+   "titre": "Brume 5",
+   "artiste": "Les Brumes",
+   "duree_s": 185,
+   "reponse": {
+    "status": "ok",
+    "results": []
+   },
+   "empreinte": "AQAD-fixture-605"
+  }
+ ],
+ "attendu": {
+  "release_id": null,
+  "enregistrements": {}
+ },
+ "verite": {
+  "601": "5ec00000-0000-4000-8000-000000000048",
+  "602": "5ec00000-0000-4000-8000-000000000049",
+  "603": null,
+  "604": null,
+  "605": null
+ }
+}

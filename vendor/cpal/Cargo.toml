@@ -209,6 +209,8 @@ optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies.asio-sys]
 version = "0.2.6"
+# Tune (#5643): vendored copy with the DSD I/O format calls. See TUNE-PATCH.md.
+path = "../asio-sys"
 optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies.audio_thread_priority]

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
+use crate::routes::ecriture_fichiers;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -120,6 +121,9 @@ async fn batch_edit_tags(
     let mut results: Vec<Value> = Vec::new();
     let mut success_count = 0;
     let mut error_count = 0;
+    // « Écrire les modifications dans les fichiers audio » (désactivé par
+    // défaut) : sinon, la base seule est modifiée.
+    let ecrire = ecriture_fichiers::autorisee(&state);
 
     for track_id in &body.track_ids {
         let Some((path, info)) = get_track_path(&state, *track_id)? else {
@@ -127,13 +131,19 @@ async fn batch_edit_tags(
             error_count += 1;
             continue;
         };
-        match apply_tags_to_file(&path, &body.fields) {
+        let fichier = if ecrire {
+            apply_tags_to_file(&path, &body.fields).map(Some)
+        } else {
+            Ok(None)
+        };
+        match fichier {
             Ok(changes) => {
                 update_track_db(&state, *track_id, &body.fields)?;
                 results.push(json!({
                     "track_id": track_id,
                     "path": info["path"],
-                    "changes": changes,
+                    "file_written": changes.is_some(),
+                    "changes": changes.unwrap_or_default(),
                     "success": true,
                 }));
                 success_count += 1;
@@ -149,6 +159,7 @@ async fn batch_edit_tags(
         "total": body.track_ids.len(),
         "success": success_count,
         "errors": error_count,
+        ecriture_fichiers::CHAMP_REPONSE: ecrire,
         "results": results,
     }))
     .into_response())
@@ -199,6 +210,30 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
                 &[year as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
             )
             .ok();
+    }
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    {
+        use tune_core::db::champs_tenus::{Champ, tenir_par_id};
+        let mut champs = Vec::new();
+        if fields.title.is_some() {
+            champs.push(Champ::Titre);
+        }
+        if fields.artist.is_some() {
+            champs.push(Champ::Artiste);
+        }
+        if fields.album.is_some() {
+            champs.push(Champ::Album);
+        }
+        if fields.genre.is_some() {
+            champs.push(Champ::Genre);
+        }
+        if fields.year.is_some() {
+            champs.push(Champ::Annee);
+        }
+        if fields.album_artist.is_some() {
+            champs.push(Champ::ArtisteAlbum);
+        }
+        tenir_par_id(&state.backend, track_id, &champs);
     }
     Ok(())
 }
@@ -276,10 +311,14 @@ async fn auto_number_album(
     }
 
     let mut results: Vec<Value> = Vec::new();
+    let ecrire = ecriture_fichiers::autorisee(&state);
     for (i, (track_id, path, title)) in tracks.iter().enumerate() {
         let track_num = (i + 1) as u32;
-        // Write track number to file
+        // Write track number to file — seulement si le réglage le permet.
         let file_result = (|| -> Result<(), String> {
+            if !ecrire {
+                return Err(ecriture_fichiers::CODE_REFUS.to_string());
+            }
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
 
@@ -298,6 +337,11 @@ async fn auto_number_album(
                 &[&track_num as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
             )
             .map_err(AppError::internal)?;
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::NumeroPiste],
+        );
 
         results.push(json!({
             "track_id": track_id,
@@ -311,6 +355,7 @@ async fn auto_number_album(
     Ok(Json(json!({
         "album_id": album_id,
         "tracks_numbered": results.len(),
+        ecriture_fichiers::CHAMP_REPONSE: ecrire,
         "results": results,
     }))
     .into_response())
@@ -373,8 +418,17 @@ async fn set_album_genre(
         )
         .map_err(AppError::internal)?;
 
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    for (track_id, _) in &paths {
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::Genre],
+        );
+    }
     let mut file_errors: Vec<Value> = Vec::new();
-    for (track_id, path) in &paths {
+    let ecrire = ecriture_fichiers::autorisee(&state);
+    for (track_id, path) in paths.iter().filter(|_| ecrire) {
         let result = (|| -> Result<(), String> {
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
@@ -395,6 +449,7 @@ async fn set_album_genre(
         "album_id": album_id,
         "genre": body.genre,
         "tracks_updated": paths.len(),
+        ecriture_fichiers::CHAMP_REPONSE: ecrire,
         "file_errors": file_errors,
     }))
     .into_response())
@@ -435,8 +490,17 @@ async fn set_album_year(
         .map_err(AppError::internal)?;
 
     let year_num: Option<u16> = body.year.parse().ok();
+    // Corrigé à la main : tenu face aux analyses (`champs_tenus`).
+    for (track_id, _) in &paths {
+        tune_core::db::champs_tenus::tenir_par_id(
+            &state.backend,
+            *track_id,
+            &[tune_core::db::champs_tenus::Champ::Annee],
+        );
+    }
     let mut file_errors: Vec<Value> = Vec::new();
-    for (track_id, path) in &paths {
+    let ecrire = ecriture_fichiers::autorisee(&state);
+    for (track_id, path) in paths.iter().filter(|_| ecrire) {
         let result = (|| -> Result<(), String> {
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
@@ -462,6 +526,7 @@ async fn set_album_year(
         "album_id": album_id,
         "year": body.year,
         "tracks_updated": paths.len(),
+        ecriture_fichiers::CHAMP_REPONSE: ecrire,
         "file_errors": file_errors,
     }))
     .into_response())
@@ -590,6 +655,7 @@ async fn fix_encoding(
     Json(body): Json<FixEncodingBody>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut results: Vec<Value> = Vec::new();
+    let ecrire = ecriture_fichiers::autorisee(&state);
 
     for track_id in &body.track_ids {
         let Some((path, info)) = get_track_path(&state, *track_id)? else {
@@ -640,7 +706,11 @@ async fn fix_encoding(
                 year: None,
                 album_artist: None,
             };
-            let file_result = apply_tags_to_file(&path, &fields);
+            let file_result = if ecrire {
+                apply_tags_to_file(&path, &fields)
+            } else {
+                Err(ecriture_fichiers::CODE_REFUS.to_string())
+            };
             update_track_db(&state, *track_id, &fields)?;
             results.push(json!({
                 "track_id": track_id,
@@ -654,6 +724,7 @@ async fn fix_encoding(
 
     Ok(Json(json!({
         "total": body.track_ids.len(),
+        ecriture_fichiers::CHAMP_REPONSE: ecrire,
         "results": results,
     }))
     .into_response())
@@ -702,6 +773,11 @@ async fn strip_extra_tags(
     State(state): State<AppState>,
     Json(body): Json<StripTagsBody>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Retirer des balises n'a pas d'autre effet que de réécrire les fichiers :
+    // désactivé (le défaut), refus sans rien toucher.
+    if !ecriture_fichiers::autorisee(&state) {
+        return Ok(ecriture_fichiers::refus("strip_extra_tags"));
+    }
     let keep_set: std::collections::HashSet<String> = body
         .keep
         .unwrap_or_else(|| {
@@ -916,9 +992,52 @@ mod genre_consistency_3979 {
             .unwrap();
     }
 
+    /// « Écrire les modifications dans les fichiers audio » jamais coché : la
+    /// base change, le fichier reste octet pour octet ce qu'il était.
+    #[tokio::test]
+    async fn tagger_reglage_absent_base_seule_fichier_intact() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.flac");
+        fixture(&state, &path);
+        let avant = std::fs::read(&path).unwrap();
+        for (action, body) in [
+            ("set-genre", json!({"genre":"Jazz"})),
+            ("set-year", json!({"year":"1997"})),
+            ("auto-number", Value::Null),
+        ] {
+            let (status, result) =
+                request(&state, "POST", &format!("/tagger/album/1/{action}"), body).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["file_writes_enabled"], false, "{result}");
+        }
+        let (status, _) = request(
+            &state,
+            "POST",
+            "/tagger/strip-tags",
+            json!({"track_ids": [1]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            avant,
+            "un fichier a été réécrit"
+        );
+        let row = state
+            .backend
+            .query_one("SELECT genre,year,track_number FROM tracks WHERE id=1", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row[0].as_string().as_deref(), Some("Jazz"));
+        assert_eq!(row[1].as_i64(), Some(1997));
+        assert_eq!(row[2].as_i64(), Some(1));
+    }
+
     #[tokio::test]
     async fn tagger_3979_ecrit_genre_annee_et_numero_dans_le_fichier() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        crate::routes::ecriture_fichiers::activer_pour_test(&state.backend);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("track.flac");
         fixture(&state, &path);

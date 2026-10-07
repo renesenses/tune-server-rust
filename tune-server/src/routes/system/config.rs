@@ -342,6 +342,15 @@ pub(super) async fn get_config(
         ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
+        // « Écrire les modifications dans les fichiers audio » (Bertrand,
+        // 05/10/2026 : inactif par défaut). Publié même absent de la base,
+        // pour que l'interface affiche la case DÉCOCHÉE plutôt que « je ne
+        // sais pas » : une clé absente vaut désactivé, côté serveur aussi
+        // (`tune_core::metadata::ecriture_fichiers`).
+        (
+            tune_core::metadata::ecriture_fichiers::CLE,
+            json!(tune_core::metadata::ecriture_fichiers::DEFAUT),
+        ),
         // Default on (unchanged behaviour); scan.rs treats unset as enabled.
         // The web toggle writes "false" to opt out (JF Paquet).
         ("enrich_on_scan", json!(true)),
@@ -387,6 +396,11 @@ pub(super) async fn get_config(
             json!(tune_core::cloud::consent::CONTRIBUTION_DEFAULT),
         ),
         ("quality_split", json!(true)),
+        // Fil 2148 (#5792) — le délai de la sonde des partages réseau.
+        (
+            tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY,
+            json!(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_DEFAULT),
+        ),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
@@ -415,6 +429,13 @@ pub(super) async fn get_config(
             tune_core::taches_de_fond::vitesse::CLE_REGLAGE,
             json!(tune_core::taches_de_fond::vitesse::Vitesse::default().id()),
         ),
+        // #5593 — le périmètre des passes de fond qui décodent : les racines
+        // de bibliothèque exclues (ReplayGain, plage dynamique, empreintes,
+        // CLAP). Vide par défaut : rien d'exclu, le comportement d'avant.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
+            json!([]),
+        ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
         // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
         // normalise en plus la valeur persistée (`"false"` → `false`). Une
@@ -431,6 +452,36 @@ pub(super) async fn get_config(
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
+    }
+    // « Analyser la bibliothèque au démarrage » (Réglages › Bibliothèque) :
+    // la valeur qui vaudra au PROCHAIN démarrage, selon l'ordre de précédence
+    // de `auto_scan::CLE_SCAN_AU_DEMARRAGE` — le choix de l'utilisateur, sinon
+    // la configuration de déploiement (`TUNE_AUTO_SCAN`, `tune.toml`), sinon
+    // `false`. Toujours publiée : un client y lit que le serveur connaît le
+    // réglage. `_source` dit qui décide : `user` ou `deployment`.
+    {
+        use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+        let choix = choix_utilisateur_scan_au_demarrage(
+            config
+                .get(CLE_SCAN_AU_DEMARRAGE)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(
+            CLE_SCAN_AU_DEMARRAGE.to_string(),
+            json!(choix.unwrap_or(state.config.auto_scan)),
+        );
+        config.insert(
+            format!("{CLE_SCAN_AU_DEMARRAGE}_source"),
+            json!(if choix.is_some() {
+                "user"
+            } else {
+                "deployment"
+            }),
+        );
     }
     // #5519 — combien de fichiers chaque vitesse décode à la fois SUR CETTE
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
@@ -499,6 +550,32 @@ pub(super) async fn get_config(
         "shuffle_max_tracks_max".to_string(),
         json!(tune_core::playback::queue::SHUFFLE_MAX_TRACKS_CEILING),
     );
+    // Fil 2148 (#5792) — le délai des partages réseau tel qu'il s'applique,
+    // et ses bornes, sur le modèle du plafond aléatoire juste au-dessus.
+    {
+        use tune_core::scanner::watcher::{
+            NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_FLOOR, NETWORK_POLL_INTERVAL_KEY,
+            resolve_network_poll_interval,
+        };
+        let effectif = resolve_network_poll_interval(
+            config
+                .get(NETWORK_POLL_INTERVAL_KEY)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(NETWORK_POLL_INTERVAL_KEY.to_string(), json!(effectif));
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_min"),
+            json!(NETWORK_POLL_INTERVAL_FLOOR),
+        );
+        config.insert(
+            format!("{NETWORK_POLL_INTERVAL_KEY}_max"),
+            json!(NETWORK_POLL_INTERVAL_CEILING),
+        );
+    }
     // #1268 — le sélecteur « Backend audio » du client web écrivait ses trois
     // choix en dur (Auto/WASAPI/ASIO) et les proposait tels quels sur Debian
     // et Fedora. On publie ici la liste vraie, filtrée par la plateforme du
@@ -1103,6 +1180,28 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// #5593 — le périmètre des analyses de fond : un tableau de chaînes (les
+/// racines exclues), rognées, sans vide ni doublon. `null` vaut le tableau
+/// vide. Toute autre forme est REFUSÉE (400) en nommant la clé : une chaîne
+/// seule ou un nombre, gardés tels quels en base, se reliraient « rien
+/// d'exclu » sans un mot.
+///
+/// Rend `true` quand la clé est dans la requête : l'appelant
+/// referme alors la campagne ReplayGain en cours, dont le total a été compté
+/// sur l'ANCIEN périmètre.
+fn normaliser_perimetre_des_analyses(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<bool, AppError> {
+    use tune_core::taches_de_fond::perimetre::{CLE_RACINES_EXCLUES, normaliser};
+    let Some(brut) = values.get(CLE_RACINES_EXCLUES) else {
+        return Ok(false);
+    };
+    let liste = normaliser(brut)
+        .map_err(|e| AppError::bad_request(format!("{CLE_RACINES_EXCLUES} : {e}")))?;
+    values.insert(CLE_RACINES_EXCLUES.to_string(), json!(liste));
+    Ok(true)
+}
+
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1121,6 +1220,66 @@ fn normaliser_plafond_aleatoire(
     // autres (`"\"800\""`), pour les lignes déjà écrites.
     values.insert(cle.to_string(), Value::String(borne.to_string()));
     Ok(())
+}
+
+/// « Analyser la bibliothèque au démarrage » : un booléen (ou `"true"` /
+/// `"false"`), écrit normalisé ; `null` efface le choix et rend la décision à
+/// la configuration de déploiement. Toute autre valeur est REFUSÉE. Rend
+/// `Some(())` quand le choix est à effacer.
+fn normaliser_scan_au_demarrage(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<()>, AppError> {
+    use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+    let Some(brut) = values.get(CLE_SCAN_AU_DEMARRAGE) else {
+        return Ok(None);
+    };
+    if brut.is_null() {
+        values.remove(CLE_SCAN_AU_DEMARRAGE);
+        return Ok(Some(()));
+    }
+    let choix = match brut {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => choix_utilisateur_scan_au_demarrage(Some(s)),
+        _ => None,
+    };
+    let Some(choix) = choix else {
+        return Err(AppError::bad_request(format!(
+            "{CLE_SCAN_AU_DEMARRAGE} attend true, false ou null"
+        )));
+    };
+    values.insert(
+        CLE_SCAN_AU_DEMARRAGE.to_string(),
+        Value::String(choix.to_string()),
+    );
+    Ok(None)
+}
+
+/// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
+/// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
+/// après l'écriture.
+fn normaliser_intervalle_reseau(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<u64>, AppError> {
+    let cle = tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY;
+    let Some(brut) = values.get(cle) else {
+        return Ok(None);
+    };
+    let texte = match brut {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    };
+    let secs = tune_core::scanner::watcher::valider_network_poll_interval(&texte)
+        .map_err(AppError::bad_request)?;
+    values.insert(cle.to_string(), Value::String(secs.to_string()));
+    Ok(Some(secs))
+}
+
+/// #4384 — le patch a-t-il touché un réglage dont dépend le facteur
+/// ReplayGain de lecture ? Toutes ces clés partagent le préfixe
+/// `replaygain_` (`audio::replaygain::{MODE_KEY, PREAMP_KEY, …}`).
+fn touche_le_replaygain(cles_posees: &[String]) -> bool {
+    cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
 
 pub(super) async fn update_config(
@@ -1170,6 +1329,9 @@ pub(super) async fn update_config(
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
+    let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
+    let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1306,6 +1468,21 @@ pub(super) async fn update_config(
         }
         cles_posees.push(key);
     }
+    if scan_au_demarrage_efface {
+        let cle = crate::auto_scan::CLE_SCAN_AU_DEMARRAGE;
+        if let Err(e) = settings.delete(cle) {
+            tracing::error!(reglage = %cle, erreur = %e, "reglage_non_efface");
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
+        }
+        cles_posees.push(cle.to_string());
+    }
+    // #5593 — le total de la jauge ReplayGain est compté UNE fois, à
+    // l'ouverture de la campagne. Un périmètre changé en cours de route le
+    // laisserait annoncer les pistes d'une racine qu'on vient d'exclure : on
+    // referme la campagne, le lot suivant la rouvre sur le nouveau compte.
+    if perimetre_touche {
+        tune_core::audio::replaygain::progression::au_repos();
+    }
     if !cles_posees.is_empty() {
         tracing::info!(
             reglages = %cles_posees.join(","),
@@ -1313,10 +1490,33 @@ pub(super) async fn update_config(
             "reglages_ecrits"
         );
     }
+    // #4384 — un réglage ReplayGain (préampli, mode, anti-écrêtage…) vaut
+    // MAINTENANT sur les sorties locales qui jouent, pas à la piste suivante.
+    // Sans cela, le préampli changé en écoutant ne bougeait ni le son ni le
+    // crête-mètre, et l'écran ne disait pas pourquoi (fil 1797).
+    let replaygain_applique_a_chaud = if touche_le_replaygain(&cles_posees) {
+        let servies = state.orchestrator.refresh_replaygain_toutes_zones().await;
+        tracing::info!(zones = servies, "replaygain_reapplique_a_chaud");
+        Some(servies)
+    } else {
+        None
+    };
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
+    // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
+    // cours des sondes, sans redémarrage.
+    if let Some(secs) = intervalle_reseau_demande {
+        let applique = tune_core::scanner::watcher::regler_intervalle_reseau(secs);
+        tracing::info!(secs = applique, "network_poll_interval_applied");
+    }
 
     let mut reponse = json!({"ok": true});
+    // Champ ADDITIF : combien de sorties locales ont reçu le nouveau facteur
+    // ReplayGain tout de suite. `0` = rien ne jouait en local ; une zone
+    // réseau l'entendra à la piste suivante.
+    if let Some(servies) = replaygain_applique_a_chaud {
+        reponse["replaygain_applied_live_zones"] = json!(servies);
+    }
     if exclusif_desarme_avec_asio {
         // Le client a envoyé `local_exclusive_mode: true` (l'écho du forçage
         // ASIO) : il doit apprendre ce qui a été écrit.
@@ -1452,6 +1652,97 @@ fn appliquer_annonce_slimproto(annonce: bool, port_http: u16) -> bool {
 }
 
 /// #3809 — l'interrupteur doit agir MAINTENANT.
+#[cfg(test)]
+mod intervalle_reseau_tests_2148 {
+    use crate::state::AppState;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::scanner::watcher::{
+        NETWORK_POLL_INTERVAL_CEILING, NETWORK_POLL_INTERVAL_DEFAULT, NETWORK_POLL_INTERVAL_FLOOR,
+        NETWORK_POLL_INTERVAL_KEY, intervalle_reseau,
+    };
+
+    async fn requete(state: &AppState, methode: &str, corps: Option<Value>) -> (StatusCode, Value) {
+        let corps = corps.map(|c| c.to_string()).unwrap_or_default();
+        let response = crate::routes::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri("/api/v1/system/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// Fil 2148 (#5792) — le délai des partages réseau est un réglage serveur :
+    /// publié avec ses bornes (défaut 300 s), écrit par `PATCH`, appliqué aux
+    /// sondes sans redémarrage, et refusé hors bornes.
+    #[tokio::test]
+    async fn le_delai_des_partages_reseau_se_regle_et_s_applique_a_chaud_2148() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (status, config) = requete(&state, "GET", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            config[NETWORK_POLL_INTERVAL_KEY],
+            json!(NETWORK_POLL_INTERVAL_DEFAULT)
+        );
+        assert_eq!(NETWORK_POLL_INTERVAL_DEFAULT, 300);
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_min")],
+            json!(NETWORK_POLL_INTERVAL_FLOOR)
+        );
+        assert_eq!(
+            config[format!("{NETWORK_POLL_INTERVAL_KEY}_max")],
+            json!(NETWORK_POLL_INTERVAL_CEILING)
+        );
+
+        let (status, _) = requete(
+            &state,
+            "PATCH",
+            Some(json!({ NETWORK_POLL_INTERVAL_KEY: 120 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            intervalle_reseau(),
+            120,
+            "🔴 #5792 — le délai est écrit mais pas appliqué aux sondes"
+        );
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+
+        for hors_bornes in [json!(59), json!(3601), json!("souvent")] {
+            let (status, _) = requete(
+                &state,
+                "PATCH",
+                Some(json!({ NETWORK_POLL_INTERVAL_KEY: hors_bornes })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{hors_bornes}");
+        }
+        let (_, config) = requete(&state, "GET", None).await;
+        assert_eq!(config[NETWORK_POLL_INTERVAL_KEY], json!(120));
+        assert_eq!(intervalle_reseau(), 120);
+    }
+}
+
+#[cfg(test)]
+#[path = "replaygain_a_chaud_tests_4384.rs"]
+mod replaygain_a_chaud_tests_4384;
+
+#[cfg(test)]
+#[path = "estimation_dossier_tests_2171.rs"]
+mod estimation_dossier_tests_2171;
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
@@ -1751,7 +2042,9 @@ pub(super) struct ExportConfigQuery {
     include_secrets: bool,
 }
 
-/// `GET /system/config/export` — sauvegarde de la table `settings`.
+/// `GET /system/config/export` — sauvegarde de la table `settings` ET des
+/// zones (fil forum 2110), au format versionné de
+/// [`tune_core::config_export`].
 ///
 /// **Réservée à l'administrateur** (#2793). Sans `RequireAdmin`, le
 /// middleware d'authentification se contentait de vérifier qu'un jeton était
@@ -1760,85 +2053,102 @@ pub(super) struct ExportConfigQuery {
 /// compris. `RequireAdmin` laisse passer sans condition quand l'authentification
 /// est désactivée (`auth.rs:502`), donc l'installation mono-utilisateur, qui est
 /// le cas courant, ne voit aucun changement.
+///
+/// Par défaut, les secrets sont RETIRÉS (pas masqués) par
+/// `tune_core::secrets::retirer_les_secrets` : une sauvegarde se ré-importe,
+/// et poser `********` à la place de `jwt_secret` écraserait le vrai secret à
+/// la restauration ; l'absence de la clé, elle, laisse la valeur en place.
+/// `?include_secrets=true` reste le mode « migration vers un serveur neuf »
+/// pour les seuls réglages ; les réglages de zone n'en portent jamais.
 pub(super) async fn export_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
-) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let all = settings.all().unwrap_or_default();
-    let mut config = serde_json::Map::new();
-    for (k, v) in all {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
-            config.insert(k, parsed);
-        } else {
-            config.insert(k, Value::String(v));
-        }
-    }
-    // By default, omit secrets so a shared or leaked backup file carries no
-    // credentials. import_config merges (it only sets keys present in the
-    // payload), so restoring a redacted backup to the SAME server leaves the
-    // existing secrets untouched. Pass ?include_secrets=true for a full backup
-    // when migrating to a fresh server.
-    //
-    // La liste de trois retraits nommés à la main a été remplacée par la même
-    // règle que `get_config` : c'était la seconde des « listes partielles » de
-    // #2793, et elle ne connaissait ni la graine AirPlay ni les clés
-    // développeur.
-    //
-    // On RETIRE, on ne masque pas — c'est la différence avec `get_config`, et
-    // elle est délibérée : une sauvegarde se ré-importe. Poser `********` à la
-    // place de `jwt_secret` écraserait le vrai secret de signature à la
-    // restauration ; l'absence de la clé, elle, est ce que `import_config` sait
-    // déjà ignorer.
-    if !q.include_secrets {
-        tune_core::secrets::retirer_les_secrets(&mut config);
-    }
-    Json(Value::Object(config))
+) -> Result<Json<Value>, AppError> {
+    tune_core::config_export::exporter(&state.backend, q.include_secrets)
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("configuration export failed: {e}")))
 }
 
-/// `POST /system/config/import` — restauration de réglages.
+#[derive(Deserialize)]
+pub(super) struct ImportConfigQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /system/config/import` — restauration de réglages et de zones.
 ///
 /// **Réservée à l'administrateur** (#2793) : la route appelait `settings.set`
 /// sur chaque clé reçue, donc un utilisateur standard pouvait poster
 /// `{"auth_enabled": "false"}` et éteindre l'authentification du serveur.
 ///
-/// L'application est en DEUX TEMPS : tout le corps est validé et converti
-/// d'abord, et rien n'est écrit tant qu'une entrée est refusée. Avant, la
-/// validation vivait dans la boucle d'écriture, donc un corps dont la dixième
-/// entrée était invalide laissait les neuf premières appliquées.
+/// Lit les deux formats : l'ancien export à plat (sans zones) et le format
+/// versionné. Les zones sont rapprochées par identifiant d'appareil ; une zone
+/// dont l'appareil n'a pas de zone ici est créée hors ligne ; aucune zone n'est
+/// supprimée. Voir [`tune_core::config_export`].
 ///
-/// Une écriture qui échoue en cours de route est désormais DITE (`500`) avec
-/// le nombre de clés déjà appliquées, au lieu d'être avalée par un
-/// `if ….is_ok()` qui rendait `200` et un compte silencieusement trop bas :
-/// l'appelant croyait sa restauration complète.
+/// `?dry_run=true` rend l'aperçu — réglages et zones ajoutés, modifiés,
+/// inchangés — sans RIEN écrire. L'aperçu et l'import sont le même plan
+/// (`planifier`), l'import l'exécute (`appliquer`).
+///
+/// L'application est en DEUX TEMPS : tout le corps est validé et le plan
+/// calculé d'abord, et rien n'est écrit tant qu'une entrée est refusée. Une
+/// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
+/// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
+    Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut a_ecrire: Vec<(String, String)> = Vec::with_capacity(body.len());
-    for (key, value) in body {
-        if key.trim().is_empty() {
-            return Err(AppError::bad_request("empty setting key"));
-        }
-        let str_val = match value {
-            Value::String(s) => s,
-            other => other.to_string(),
-        };
-        a_ecrire.push((key, str_val));
+    use tune_core::config_export as ce;
+    let fichier = ce::lire(body).map_err(AppError::bad_request)?;
+    let plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
+    let mut reponse = ce::rapport(&plan);
+    if q.dry_run {
+        reponse["dry_run"] = json!(true);
+        return Ok(Json(reponse));
     }
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut imported = 0;
-    for (key, str_val) in a_ecrire {
-        settings.set(&key, &str_val).map_err(|e| {
-            AppError::internal(format!(
-                "import stopped after {imported} settings: writing '{key}' failed: {e}"
-            ))
-        })?;
-        imported += 1;
+    let bilan = ce::appliquer(&state.backend, &plan).map_err(AppError::internal)?;
+    for id in &bilan.zones_creees {
+        let v = crate::routes::playback::build_zone_json(&state, *id).await;
+        state
+            .event_bus
+            .emit_typed(tune_core::event_types::EventType::ZoneCreated, v);
     }
-    Ok(Json(json!({ "imported": imported })))
+    for id in &bilan.zones_modifiees {
+        let v = crate::routes::playback::build_zone_json(&state, *id).await;
+        state
+            .event_bus
+            .emit_typed(tune_core::event_types::EventType::ZoneUpdated, v);
+    }
+    reponse["dry_run"] = json!(false);
+    reponse["imported"] = json!(bilan.reglages_ecrits);
+    reponse["zones_added"] = json!(bilan.zones_creees.len());
+    reponse["zones_modified"] = json!(bilan.zones_modifiees.len());
+    reponse["warnings"] = json!(bilan.avertissements);
+    Ok(Json(reponse))
+}
+
+/// `POST /system/config/import/preview` — l'aperçu seul, sous un chemin à lui.
+///
+/// Même chose que `POST /system/config/import?dry_run=true`, mais un serveur
+/// ANTÉRIEUR à l'aperçu ne connaît pas ce chemin et répond 404 / 405 : le
+/// client sait alors qu'il n'y a pas d'aperçu. Le même serveur, appelé avec
+/// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
+/// pourquoi l'écran passe par ici.
+pub(super) async fn preview_import_config(
+    admin: crate::auth::RequireAdmin,
+    state: State<AppState>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    import_config(
+        admin,
+        state,
+        Query(ImportConfigQuery { dry_run: true }),
+        Json(body),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,13 +2225,33 @@ pub(super) async fn browse_dirs(
 ) -> (StatusCode, Json<Value>) {
     use super::explorateur;
 
-    let base = q.path.unwrap_or_else(|| {
-        if cfg!(target_os = "windows") {
-            "C:\\".into()
-        } else {
-            "/".into()
+    let base = q
+        .path
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "/".into());
+
+    // Sous Windows, `/` (ou `\`) désigne le poste : la liste des lecteurs.
+    // `C:\` désigne, lui, le CONTENU du lecteur (fil forum 2171) — il rendait
+    // auparavant la liste des lecteurs, et le lecteur système n'était jamais
+    // explorable.
+    #[cfg(target_os = "windows")]
+    if explorateur::liste_des_lecteurs_demandee(&base) {
+        let mut dirs: Vec<Value> = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:\\", letter as char);
+            if std::path::Path::new(&drive).exists() {
+                dirs.push(json!({
+                    "name": format!("{}:", letter as char),
+                    "path": drive,
+                    "has_children": true,
+                }));
+            }
         }
-    });
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": "/", "drives": true })),
+        );
+    }
 
     if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
         tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
@@ -1958,28 +2288,13 @@ pub(super) async fn browse_dirs(
         );
     }
 
-    let parent = base_path.parent().map(|p| p.to_string_lossy().to_string());
+    let parent = explorateur::parent_a_rendre(
+        &base,
+        base_path.parent().map(|p| p.to_string_lossy().to_string()),
+        cfg!(target_os = "windows"),
+    );
 
     let mut dirs: Vec<Value> = Vec::new();
-
-    // On Windows, list drives when at root
-    #[cfg(target_os = "windows")]
-    if base == "C:\\" || base == "\\" || base == "/" {
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            if std::path::Path::new(&drive).exists() {
-                dirs.push(json!({
-                    "name": format!("{} Drive", letter as char),
-                    "path": drive,
-                    "has_children": true,
-                }));
-            }
-        }
-        return (
-            StatusCode::OK,
-            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
-        );
-    }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
         for entry in entries.flatten() {
@@ -2037,6 +2352,83 @@ pub(super) async fn browse_dirs(
             "dirs": dirs,
             "parent": parent,
             "current": base_path.to_string_lossy(),
+        })),
+    )
+}
+
+/// `GET /system/browse-dirs/estimate?path=…` — ce que l'ajout de ce dossier
+/// ferait analyser (fil forum 2171).
+///
+/// Une faute de frappe dans le chemin avait fait entrer un disque entier de
+/// 1 To dans la bibliothèque : l'ajout lance l'analyse sur-le-champ, sans rien
+/// dire de son ampleur. Cette route donne au client de quoi demander une
+/// confirmation chiffrée AVANT l'ajout.
+///
+/// Mêmes gardes que [`browse_dirs`] : `RequireAdmin`, puis le périmètre de
+/// [`super::explorateur`] — elle ne lit rien que l'explorateur ne pourrait
+/// déjà lister. Elle ne rend que des NOMBRES, jamais de noms. Le comptage est
+/// borné en durée et en entrées ; au-delà, il rend un minimum marqué
+/// `complete: false`.
+pub(super) async fn estimate_dir(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
+    let Some(base) = q.path.filter(|p| !p.trim().is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is required" })),
+        );
+    };
+    let base = tune_core::scanner::walker::normalize_path(&base);
+
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "estimate_dir_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "path": base, "error": refus.libelle() })),
+        );
+    }
+    let chemin = std::path::PathBuf::from(&base);
+    if !chemin.is_dir() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "path": base, "error": "not a directory" })),
+        );
+    }
+    if !explorateur::la_cible_reste_dans_le_perimetre(&chemin) {
+        tracing::warn!(path = %base, "estimate_dir_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "path": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
+        );
+    }
+
+    let debut = std::time::Instant::now();
+    let echeance = debut + explorateur::ESTIMATION_DUREE_MAX;
+    let mesure = tokio::task::spawn_blocking(move || {
+        explorateur::estimer_le_contenu(&chemin, echeance, explorateur::ESTIMATION_ENTREES_MAX)
+    })
+    .await;
+    let Ok(e) = mesure else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "path": base, "error": "estimate failed" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "path": base,
+            "audio_files": e.fichiers_audio,
+            "folders": e.dossiers,
+            "complete": e.complete,
+            "drive_root": base == "/" || explorateur::est_une_racine_de_lecteur(&base),
+            "elapsed_ms": debut.elapsed().as_millis() as u64,
         })),
     )
 }
@@ -2161,7 +2553,18 @@ pub(super) async fn remove_music_dir(
     State(state): State<AppState>,
     Json(body): Json<RemoveMusicDir>,
 ) -> Result<Json<Value>, AppError> {
-    let normalized = tune_core::scanner::walker::normalize_path(&body.path);
+    retirer_un_dossier(&state, &body.path, body.confirm_purge).map(Json)
+}
+
+/// Le corps de `POST /system/music-dirs/remove`, réutilisé tel quel par
+/// « Oublier ce partage » (fil 2145) : un seul chemin de retrait de dossier,
+/// donc une seule purge, sous le même plafond (#1943).
+pub(crate) fn retirer_un_dossier(
+    state: &AppState,
+    path: &str,
+    confirm_purge: Option<u64>,
+) -> Result<Value, AppError> {
+    let normalized = tune_core::scanner::walker::normalize_path(path);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
@@ -2191,7 +2594,7 @@ pub(super) async fn remove_music_dir(
 
     // Sans confirmation : on DIT, on ne touche à rien. Comportement de tout
     // client existant, inchangé.
-    let Some(confirmee) = body.confirm_purge else {
+    let Some(confirmee) = confirm_purge else {
         if plan.tracks > 0 {
             tracing::info!(
                 dossier = %normalized,
@@ -2202,22 +2605,22 @@ pub(super) async fn remove_music_dir(
                  confirm_purge=N, ou /music-dirs/purge-orphans — peut les retirer."
             );
         }
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "impact": impact_json(&plan),
             "confirm_purge_required": plan.tracks,
-        })));
+        }));
     };
 
     if orphelines.is_empty() {
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": 0,
             "purged": 0,
             "purge_refused": false,
             "impact": impact_json(&plan),
-        })));
+        }));
     }
 
     // Le plafond de #1943 s'applique à ce geste comme aux autres, par la
@@ -2232,7 +2635,7 @@ pub(super) async fn remove_music_dir(
             "music_dir_removed_purge_refusee — la confirmation ne couvre pas l'ampleur \
              constatée. Le dossier est retiré des réglages ; aucune piste n'a été supprimée."
         );
-        return Ok(Json(json!({
+        return Ok(json!({
             "dirs": dirs,
             "orphan_tracks": plan.tracks,
             "purged": 0,
@@ -2246,7 +2649,7 @@ pub(super) async fn remove_music_dir(
                  Confirmez ce nombre exact pour les retirer aussi.",
                 plan.tracks
             ),
-        })));
+        }));
     }
 
     let r = executer_purge(&state, &orphelines);
@@ -2265,7 +2668,7 @@ pub(super) async fn remove_music_dir(
          explicitement confirmée par l'utilisateur (#2149)."
     );
 
-    Ok(Json(json!({
+    Ok(json!({
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
@@ -2279,7 +2682,24 @@ pub(super) async fn remove_music_dir(
         "distinct_pairs_relinked": r.paires_distinctes_rerattachees,
         "distinct_pairs_unresolved": r.paires_distinctes_non_resolues,
         "impact": impact_json(&plan),
-    })))
+    }))
+}
+
+/// Combien de pistes partiraient avec ces racines : sous l'une d'elles, et
+/// sous aucune des racines qui resteraient. Le compte que « Oublier ce
+/// partage » montre avant de proposer la purge (fil 2145).
+pub(crate) fn pistes_qui_partiraient(state: &AppState, racines: &[String]) -> u64 {
+    use tune_core::scanner::walker::normalize_path;
+    let retirees: Vec<String> = racines.iter().map(|r| normalize_path(r)).collect();
+    let restantes: Vec<String> = super::get_music_dirs_list(&state.backend)
+        .into_iter()
+        .filter(|d| !retirees.contains(&normalize_path(d)))
+        .collect();
+    let mut ids = std::collections::BTreeSet::new();
+    for r in &retirees {
+        ids.extend(pistes_orphelines_sous(state, r, &restantes));
+    }
+    ids.len() as u64
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -4419,9 +4839,13 @@ mod replaygain_source_tests {
         AppState::new(":memory:", 0, Default::default()).unwrap()
     }
 
+    /// Les libellés attendus ci-dessous sont les français : la requête le dit,
+    /// sans quoi le serveur répondrait dans son repli, l'anglais.
     async fn config_de(state: &AppState) -> serde_json::Value {
+        let mut entetes = HeaderMap::new();
+        entetes.insert(axum::http::header::ACCEPT_LANGUAGE, "fr".parse().unwrap());
         get_config(
-            HeaderMap::new(),
+            entetes,
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
         )
@@ -4984,6 +5408,102 @@ mod vitesse_des_analyses_5519_tests {
         // Absent : rien à dire.
         let mut vide = serde_json::Map::new();
         assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
+        assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod perimetre_des_analyses_5593_tests {
+    use super::{get_config, normaliser_perimetre_des_analyses};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES;
+
+    async fn config(state: &AppState) -> Value {
+        get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0
+    }
+
+    /// #5593 — le réglage est publié, vide par défaut (rien d'exclu), puis tel
+    /// qu'écrit : un TABLEAU, pas sa chaîne JSON.
+    #[tokio::test]
+    async fn le_perimetre_est_publie_vide_puis_tel_qu_ecrit() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = config(&state).await;
+        assert_eq!(c[CLE_RACINES_EXCLUES], json!([]), "{c}");
+
+        // Ce que la boucle d'écriture de `PATCH /config` pose pour un tableau.
+        let mut v: serde_json::Map<String, Value> = json!({
+            CLE_RACINES_EXCLUES: [" \\\\192.168.0.126\\musique ", "", "\\\\192.168.0.126\\musique"],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut v),
+            Ok(true)
+        ));
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        let c = config(&state).await;
+        assert_eq!(
+            c[CLE_RACINES_EXCLUES],
+            json!(["\\\\192.168.0.126\\musique"]),
+            "rognée, sans vide ni doublon : {c}"
+        );
+        // Et le moteur relit la même chose que la route publie.
+        assert_eq!(
+            tune_core::taches_de_fond::perimetre::racines_exclues(&state.backend),
+            vec!["\\\\192.168.0.126\\musique".to_string()]
+        );
+    }
+
+    /// Une forme qui se relirait « rien d'exclu » en silence est REFUSÉE.
+    #[test]
+    fn une_forme_illisible_est_refusee() {
+        for mauvais in [
+            json!("/mnt/nas"),
+            json!(4),
+            json!(true),
+            json!([1, 2]),
+            json!({}),
+        ] {
+            let mut v: serde_json::Map<String, Value> =
+                json!({ CLE_RACINES_EXCLUES: mauvais.clone() })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            assert!(
+                normaliser_perimetre_des_analyses(&mut v).is_err(),
+                "{CLE_RACINES_EXCLUES} = {mauvais}"
+            );
+        }
+        // `null` vaut la liste vide ; absent, rien n'est touché.
+        let mut nul: serde_json::Map<String, Value> = json!({ CLE_RACINES_EXCLUES: null })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut nul),
+            Ok(true)
+        ));
+        assert_eq!(nul[CLE_RACINES_EXCLUES], json!([]));
+        let mut vide = serde_json::Map::new();
+        assert!(matches!(
+            normaliser_perimetre_des_analyses(&mut vide),
+            Ok(false)
+        ));
         assert!(vide.is_empty());
     }
 }
