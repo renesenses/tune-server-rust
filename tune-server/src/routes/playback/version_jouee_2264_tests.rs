@@ -82,6 +82,11 @@ async fn banc() -> Banc {
     state.outputs.lock().await.register(Box::new(
         tune_core::outputs::mock::MockOutput::new(SORTIE, "Salon 2264").with_type("dlna"),
     ));
+    // Sans règle réglée, rien n'est remplacé (décision du 07/10/2026) : le
+    // banc choisit `local` en défaut global, comme un utilisateur.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set(tune_core::library::regle_de_version::CLE_REGLE, "local")
+        .unwrap();
     Banc {
         state,
         zone,
@@ -219,10 +224,19 @@ async fn la_regle_est_celle_du_profil_qui_lance() {
     assert_eq!(piste["version"]["fallback"], true, "le repli est SIGNALÉ");
     assert_eq!(piste["version"]["unavailable_source"], "qobuz");
 
-    // Contre-épreuve : le profil 1 n'a rien réglé.
+    // Contre-épreuve : le profil 1 n'a rien réglé, il suit le global `local`.
     lancer(&b, json!({ "track_id": LIVE }), Some(1)).await;
     let piste = lancer(&b, json!({ "track_id": STANDARD }), Some(1)).await;
     assert_eq!(piste["version"]["rule"], "local");
-    assert_eq!(piste["version"]["rule_origin"], "default");
+    assert_eq!(piste["version"]["rule_origin"], "setting");
     assert_eq!(piste["version"]["fallback"], false);
+
+    // Et sans AUCUNE règle réglée : on joue ce qui est lancé.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+        .delete(tune_core::library::regle_de_version::CLE_REGLE)
+        .unwrap();
+    lancer(&b, json!({ "track_id": LIVE }), Some(1)).await;
+    let piste = lancer(&b, json!({ "track_id": STANDARD }), Some(1)).await;
+    assert_eq!(piste["track_id"], STANDARD);
+    assert_eq!(piste["version"], Value::Null);
 }

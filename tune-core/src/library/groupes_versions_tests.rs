@@ -427,7 +427,7 @@ fn le_choix_est_deterministe_a_qualite_egale() {
 
 #[test]
 fn la_regle_se_lit_et_s_ecrit_sans_perte() {
-    for texte in ["local", "quality", "service:qobuz"] {
+    for texte in ["none", "local", "quality", "service:qobuz"] {
         let r = RegleDeChoix::depuis(texte).expect(texte);
         assert_eq!(r.texte(), texte);
     }
@@ -445,7 +445,8 @@ fn la_regle_se_lit_et_s_ecrit_sans_perte() {
     ] {
         assert_eq!(RegleDeChoix::depuis(invalide), None, "{invalide:?}");
     }
-    assert_eq!(RegleDeChoix::DEFAUT, RegleDeChoix::PrefererLocal);
+    // Décision du 07/10/2026 : sans règle réglée, aucune substitution.
+    assert_eq!(RegleDeChoix::DEFAUT, RegleDeChoix::Aucune);
 }
 
 #[test]
@@ -519,4 +520,30 @@ fn rien_d_indisponible_aucun_repli_meme_si_la_regle_change_de_source() {
     let c = choisir_avec_repli(&tous, &[0, 1], &RegleDeChoix::PrefererLocal).unwrap();
     assert_eq!(c.indice, 1);
     assert!(!c.repli());
+}
+
+// ─── Aucune substitution (décision du 07/10/2026) ───────────────────────
+
+#[test]
+fn sans_regle_on_joue_ce_qui_est_lance() {
+    assert_eq!(RegleDeChoix::DEFAUT, RegleDeChoix::Aucune);
+    assert_eq!(RegleDeChoix::depuis("none"), Some(RegleDeChoix::Aucune));
+    assert_eq!(RegleDeChoix::Aucune.texte(), "none");
+    // La référence (indice 0) en MP3, une copie hi-res : sous `none`, la
+    // référence ; sous `local` (contre-épreuve), la copie.
+    let mut mp3 = local(1, "Billie Jean", "Thriller", 294_000);
+    mp3.qualite = Some(Qualite {
+        format: Some("mp3".into()),
+        sample_rate: Some(44_100),
+        bit_depth: None,
+    });
+    let tous = vec![
+        mp3,
+        hires(local(2, "Billie Jean", "Thriller", 294_000), 96_000, 24),
+    ];
+    assert_eq!(choisir(&tous, &[0, 1], &RegleDeChoix::Aucune), Some(0));
+    assert_eq!(
+        choisir(&tous, &[0, 1], &RegleDeChoix::PrefererLocal),
+        Some(1)
+    );
 }

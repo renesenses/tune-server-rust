@@ -308,7 +308,7 @@ pub(super) async fn track_version_groups(
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "rule: attendu local, quality ou service:<nom>" })),
+                    Json(json!({ "error": "rule: attendu none, local, quality ou service:<nom>" })),
                 )
                     .into_response();
             }
@@ -407,7 +407,7 @@ pub(super) async fn put_version_rule(
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "rule: attendu local, quality ou service:<nom>" })),
+                    Json(json!({ "error": "rule: attendu none, local, quality ou service:<nom>" })),
                 )
                     .into_response();
             }

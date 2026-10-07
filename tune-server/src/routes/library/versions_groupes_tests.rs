@@ -419,8 +419,12 @@ async fn la_reference_reunit_ses_exemplaires_et_laisse_live_et_remaster_a_part()
         corps["groups"][0]["identity"],
         json!("title_artist_duration")
     );
-    assert_eq!(corps["rule"], json!("local"));
+    // Sans règle réglée : `none`, et la version jouée par défaut du groupe de
+    // la référence est la référence elle-même (décision du 07/10/2026).
+    assert_eq!(corps["rule"], json!("none"));
     assert_eq!(corps["rule_origin"], json!("default"));
+    let defaut = corps["groups"][0]["default"].as_u64().unwrap() as usize;
+    assert_eq!(membres[defaut]["is_reference"], json!(true));
 }
 
 #[tokio::test]
@@ -473,7 +477,7 @@ async fn la_regle_se_regle_se_relit_et_refuse_l_illisible() {
         (s, v),
         (
             StatusCode::OK,
-            json!({"rule": "local", "origin": "default", "scope": "global", "profile_id": null})
+            json!({"rule": "none", "origin": "default", "scope": "global", "profile_id": null})
         )
     );
 
@@ -527,7 +531,7 @@ async fn la_regle_se_regle_se_relit_et_refuse_l_illisible() {
         (s, v),
         (
             StatusCode::OK,
-            json!({"rule": "local", "origin": "default", "scope": "global", "profile_id": null})
+            json!({"rule": "none", "origin": "default", "scope": "global", "profile_id": null})
         )
     );
 

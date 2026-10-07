@@ -378,6 +378,11 @@ pub fn grouper(exemplaires: &[Exemplaire]) -> Vec<Groupe> {
 /// La règle qui désigne la version jouée par défaut dans un groupe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegleDeChoix {
+    /// Aucune substitution : on joue ce qui est lancé. Dans un groupe, la
+    /// version « jouée par défaut » est alors son premier membre (la piste de
+    /// départ pour le groupe de la référence). Décision du 07/10/2026 : c'est
+    /// le défaut quand rien n'est réglé.
+    Aucune,
     /// La bibliothèque d'abord, puis la meilleure qualité.
     PrefererLocal,
     /// La meilleure qualité connue, puis la bibliothèque.
@@ -387,15 +392,17 @@ pub enum RegleDeChoix {
 }
 
 impl RegleDeChoix {
-    /// La règle quand rien n'est réglé : la bibliothèque d'abord, ce qui ne
-    /// change rien à ce que l'auditeur joue aujourd'hui.
-    pub const DEFAUT: RegleDeChoix = RegleDeChoix::PrefererLocal;
+    /// La règle quand rien n'est réglé : AUCUNE substitution (décision du
+    /// 07/10/2026). `local` ne s'applique que si l'utilisateur ou son profil
+    /// l'a choisie.
+    pub const DEFAUT: RegleDeChoix = RegleDeChoix::Aucune;
 
-    /// Lit `local`, `quality` ou `service:<nom>`. `None` pour toute autre
+    /// Lit `none`, `local`, `quality` ou `service:<nom>`. `None` pour toute autre
     /// forme : une règle mal écrite se refuse, elle ne se devine pas.
     pub fn depuis(texte: &str) -> Option<RegleDeChoix> {
         let t = texte.trim();
         match t {
+            "none" => Some(RegleDeChoix::Aucune),
             "local" => Some(RegleDeChoix::PrefererLocal),
             "quality" => Some(RegleDeChoix::MeilleureQualite),
             _ => {
@@ -413,6 +420,7 @@ impl RegleDeChoix {
     /// La forme écrite, l'inverse exact de [`RegleDeChoix::depuis`].
     pub fn texte(&self) -> String {
         match self {
+            RegleDeChoix::Aucune => "none".to_string(),
             RegleDeChoix::PrefererLocal => "local".to_string(),
             RegleDeChoix::MeilleureQualite => "quality".to_string(),
             RegleDeChoix::PrefererService(s) => format!("service:{s}"),
@@ -491,6 +499,8 @@ fn choisir_parmi(
                 .unwrap_or((0, 0));
             let local = (i64::from(e.est_local()), 0);
             let priorite: Vec<(i64, i64)> = match regle {
+                // Le premier membre du groupe : l'indice le plus petit.
+                RegleDeChoix::Aucune => vec![(-(i as i64), 0)],
                 RegleDeChoix::PrefererLocal => vec![local, qualite],
                 RegleDeChoix::MeilleureQualite => vec![qualite, local],
                 RegleDeChoix::PrefererService(s) => vec![

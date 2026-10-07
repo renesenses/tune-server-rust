@@ -14,11 +14,22 @@
 //!
 //! [`PlaybackOrchestrator::appliquer_la_regle_de_version`] est appelé par
 //! `play_inner`, où passent TOUTES les lectures (`play`, `play_from_queue`,
-//! `play_without_history`). Aucun appelant ne recopie la règle. Le
-//! pré-armement sans coupure de la ligne suivante ne la recopie pas non plus :
-//! il demande seulement [`PlaybackOrchestrator::la_version_change`] et
-//! renonce à armer quand la règle ferait jouer autre chose (ou signalerait un
-//! repli) — la ligne passe alors par l'avance normale, donc par `play_inner`.
+//! `play_without_history`). Aucun appelant ne recopie la règle.
+//!
+//! # L'enchaînement sans blanc est gardé (décision du 07/10/2026)
+//!
+//! La règle ne touche JAMAIS une piste suivante pré-armée : le pré-armement
+//! (`resolve_queue_item_url`, `resolve_gapless_next_local_file`) arme la
+//! ligne de file telle quelle, et l'avance sans blanc ne passe pas par
+//! `play_inner`. Une piste suivante n'est remplacée que si elle démarre par
+//! l'avance NORMALE (sortie qui n'enchaîne pas sans blanc, ou pré-armement
+//! qui n'a pas eu lieu) : elle passe alors par `play_inner`, sans rien casser
+//! du pré-armement puisqu'il n'y en a pas.
+//!
+//! # Sans règle réglée, rien n'est remplacé
+//!
+//! [`RegleDeChoix::Aucune`] est le défaut : on joue ce qui est lancé, et la
+//! piste en cours ne porte aucune décision.
 //!
 //! # Ce qui ne change PAS de version
 //!
@@ -51,7 +62,6 @@
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::db::play_queue_repo::QueueEntry;
 use crate::library::groupes_versions::{
     Exemplaire, Qualite, RegleDeChoix, SERVICES_DE_VERSIONS, choisir_avec_repli, grouper,
 };
@@ -298,6 +308,10 @@ impl PlaybackOrchestrator {
             });
         }
 
+        // Rien de réglé (ou `none` choisi) : on joue ce qui est lancé.
+        if regle == RegleDeChoix::Aucune {
+            return None;
+        }
         let indices = Indices {
             titre: req.title.clone(),
             artiste: req.artist_name.clone(),
@@ -339,42 +353,6 @@ impl PlaybackOrchestrator {
             );
         }
         Some(version)
-    }
-
-    /// La ligne de file `entree` jouerait-elle AUTRE CHOSE qu'elle-même, ou
-    /// un repli à signaler ? Le pré-armement sans coupure renonce alors à
-    /// l'armer : l'avance normale passera par `play_inner`, qui applique la
-    /// règle et le publie.
-    pub(crate) async fn la_version_change(&self, zone_id: i64, entree: &QueueEntry) -> bool {
-        let identite = Identite::depuis(
-            entree.track_id,
-            entree.source.as_deref(),
-            entree.source_id.as_deref(),
-        );
-        if !self.eligible(&identite).await {
-            return false;
-        }
-        let profil = self.playback.get_state(zone_id).await.session_profile_id;
-        let (regle, _) = regle_effective(&self.db, profil);
-        let indices = Indices {
-            titre: entree.title.clone(),
-            artiste: entree.artist_name.clone(),
-            album: entree.album_title.clone(),
-            duree_ms: entree.duration_ms,
-        };
-        match self.decider(&identite, &indices, &regle).await {
-            Some(d) if d.cible.is_some() || d.version.fallback => {
-                info!(
-                    zone_id,
-                    track_id = ?identite.track_id,
-                    source = %identite.source,
-                    repli = d.version.fallback,
-                    "version_regle_renonce_a_l_enchainement_sans_blanc"
-                );
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Seules les pistes de la bibliothèque (ligne locale) et celles des
@@ -475,7 +453,7 @@ impl PlaybackOrchestrator {
 
         // 3. Les services dont la règle a besoin.
         let a_interroger: Vec<String> = match regle {
-            RegleDeChoix::PrefererLocal => Vec::new(),
+            RegleDeChoix::Aucune | RegleDeChoix::PrefererLocal => Vec::new(),
             RegleDeChoix::MeilleureQualite => {
                 SERVICES_DE_VERSIONS.iter().map(|s| s.to_string()).collect()
             }

@@ -137,7 +137,7 @@ mod tests {
         let db = base();
         assert_eq!(
             regle_effective(&db, Some(2)),
-            (RegleDeChoix::PrefererLocal, Origine::Defaut)
+            (RegleDeChoix::Aucune, Origine::Defaut)
         );
         SettingsRepo::with_backend(db.clone())
             .set(CLE_REGLE, "quality")

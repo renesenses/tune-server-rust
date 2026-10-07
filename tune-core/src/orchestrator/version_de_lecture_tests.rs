@@ -109,6 +109,11 @@ async fn banc() -> Banc {
     orch.outputs.lock().await.register(Box::new(
         MockOutput::new(SORTIE, "Salon 2264").with_type("dlna"),
     ));
+    // Sans règle réglée, rien n'est remplacé (décision du 07/10/2026) : le
+    // banc règle `local` en défaut GLOBAL, comme un utilisateur qui l'a choisie.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(crate::library::regle_de_version::CLE_REGLE, "local")
+        .unwrap();
     Banc {
         orch,
         zone_id,
@@ -155,7 +160,7 @@ async fn lancer_une_piste_joue_la_version_de_la_regle() {
     let v = np.version.expect("la décision est publiée");
     assert_eq!(v.origin, "rule");
     assert_eq!(v.rule, "local");
-    assert_eq!(v.rule_origin, "default");
+    assert_eq!(v.rule_origin, "setting");
     assert_eq!(v.requested.and_then(|r| r.track_id), Some(STANDARD));
     assert!(!v.fallback);
 }
@@ -212,27 +217,61 @@ async fn une_reprise_garde_la_version_qui_joue() {
 }
 
 #[tokio::test]
-async fn l_enchainement_sans_blanc_renonce_quand_la_version_change() {
+async fn l_enchainement_sans_blanc_arme_la_ligne_telle_quelle() {
+    // Décision du 07/10/2026 : la règle ne touche jamais une piste suivante
+    // pré-armée. STANDARD jouerait HAUTE si on la LANÇAIT ; pré-armée, elle
+    // part telle quelle.
     let b = banc().await;
     b.orch
         .persist_local_queue(b.zone_id, &[LIVE, STANDARD, HAUTE], 0);
-    let ligne = |pos| {
-        crate::db::play_queue_repo::PlayQueueRepo::with_backend(b.orch.db.clone())
-            .get_at(b.zone_id, pos)
-            .unwrap()
-            .unwrap()
-    };
-    assert!(
-        b.orch.la_version_change(b.zone_id, &ligne(1)).await,
-        "STANDARD jouerait HAUTE : on n'arme pas"
+    let arme = b
+        .orch
+        .resolve_queue_item_url(b.zone_id, 1)
+        .await
+        .expect("le pré-armement ne renonce pas");
+    assert_eq!(
+        arme.source_id.as_deref(),
+        Some(STANDARD.to_string().as_str())
     );
+}
+
+#[tokio::test]
+async fn sans_regle_reglee_rien_n_est_remplace() {
+    let b = banc().await;
+    crate::db::settings_repo::SettingsRepo::with_backend(b.orch.db.clone())
+        .delete(crate::library::regle_de_version::CLE_REGLE)
+        .unwrap();
+    b.orch.play(piste(b.zone_id, STANDARD)).await.unwrap();
+    let np = joue(&b).await;
+    assert_eq!(np.track_id, Some(STANDARD), "on joue ce qui est lancé");
     assert!(
-        !b.orch.la_version_change(b.zone_id, &ligne(2)).await,
-        "HAUTE se joue elle-même : on arme"
+        np.version.is_none(),
+        "et la piste en cours ne porte aucune décision"
     );
-    let refus = b.orch.resolve_queue_item_url(b.zone_id, 1).await.err();
-    assert_eq!(refus.as_deref(), Some("version_rule_declines_gapless"));
-    assert!(b.orch.resolve_queue_item_url(b.zone_id, 2).await.is_ok());
+    // Contre-épreuve : `none` choisi sur le profil, alors que le global dit
+    // `local`.
+    crate::db::settings_repo::SettingsRepo::with_backend(b.orch.db.clone())
+        .set(crate::library::regle_de_version::CLE_REGLE, "local")
+        .unwrap();
+    poser_regle_du_profil(&b.orch.db, 4, Some(&RegleDeChoix::Aucune)).unwrap();
+    b.orch
+        .playback
+        .set_session_profile(b.zone_id, Some(4))
+        .await;
+    b.orch.play(piste(b.zone_id, LIVE)).await.unwrap();
+    b.orch.play(piste(b.zone_id, STANDARD)).await.unwrap();
+    assert_eq!(joue(&b).await.track_id, Some(STANDARD));
+    b.orch
+        .playback
+        .set_session_profile(b.zone_id, Some(5))
+        .await;
+    b.orch.play(piste(b.zone_id, LIVE)).await.unwrap();
+    b.orch.play(piste(b.zone_id, STANDARD)).await.unwrap();
+    assert_eq!(
+        joue(&b).await.track_id,
+        Some(HAUTE),
+        "profil sans règle : le global `local`"
+    );
 }
 
 // ─── Le choix explicite prime ───────────────────────────────────────────
@@ -449,7 +488,7 @@ async fn la_regle_est_celle_du_profil_de_la_zone() {
     assert_eq!(v.rule_origin, "profile");
     assert!(!v.fallback);
 
-    // Contre-épreuve : profil 3, rien de réglé — le défaut `local`.
+    // Contre-épreuve : profil 3, rien de réglé — le défaut global `local`.
     b.orch
         .playback
         .set_session_profile(b.zone_id, Some(3))
@@ -463,7 +502,7 @@ async fn la_regle_est_celle_du_profil_de_la_zone() {
     assert_eq!(req.track_id, Some(HAUTE));
     assert_eq!(req.source, None);
     assert_eq!(v.rule, "local");
-    assert_eq!(v.rule_origin, "default");
+    assert_eq!(v.rule_origin, "setting");
 }
 
 #[tokio::test]
