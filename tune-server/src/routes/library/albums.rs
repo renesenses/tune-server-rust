@@ -940,11 +940,9 @@ pub(super) async fn album_bio(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            let out = json!({
-                "album": album.title,
-                "bio": data.get("bio").cloned().unwrap_or(Value::Null),
-                "source": data.get("source").cloned().unwrap_or(Value::Null),
-            });
+            // Provenance comprise (CC BY-SA des extraits Wikipédia) : cf.
+            // `super::artists::reponse_du_proxy`.
+            let out = super::artists::reponse_du_proxy("album", &album.title, &data);
             if out.get("bio").map(|b| !b.is_null()).unwrap_or(false) {
                 super::api_cache_set(&state.backend, &cache_key, &out);
             }

@@ -115,10 +115,14 @@ hostname = "0.4"
 # Décodeur DST (DSD compressé sans perte des SACD), pur Rust, sans FFmpeg (#4378).
 # Sortie vérifiée bit à bit contre libdstdec (référence ISO/Philips) et, en
 # PCM flottant, contre FFmpeg, sur l'échantillon FATE `dst-64fs44-2ch.dff`.
-# DÉSARMÉ par défaut : son README reproduit l'en-tête ISO/Philips du code de
-# référence (« Copyright is not released for non MPEG-4 Audio conforming
-# products ») — l'armer dans une version livrée est une décision de licence.
-dst-decoder = { version = "0.1.2", optional = true }
+# Licence : Apache-2.0 (Cargo.toml et fichier LICENSE du crate). Son README
+# reproduit l'en-tête ISO/Philips du code de référence (« Copyright is not
+# released for non MPEG-4 Audio conforming products », avertissement brevets)
+# et demande que cette notice accompagne les œuvres dérivées. Licence acceptée
+# par Bertrand le 06/10/2026 : la feature `dst` est livrée. Version FIGÉE : un
+# seul mainteneur, crate jeune — chaque montée se relit (garde
+# tests/dst_armee_4378.rs).
+dst-decoder = { version = "=0.1.2", optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -396,11 +400,9 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:libloading", "dep:tar", "dep:tokenizers"]
-# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
-# de toute ligne de build publiée : la licence de `dst-decoder` n'est pas
-# tranchée (Apache-2.0 déclarée contre l'en-tête ISO/Philips reproduit dans
-# son README). L'allumer demande un arbitrage juridique de Bertrand. Garde :
-# tests/dst_desarmee_4378.rs.
+# #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais LIVRÉE :
+# toutes les lignes de build publiées l'allument depuis l'arbitrage de licence
+# du 06/10/2026. Garde : tests/dst_armee_4378.rs.
 dst = ["dep:dst-decoder"]
 # #5453 : expose `journal_de_test::fiabiliser_la_capture()` aux tests des
 # caisses qui dépendent de tune-core. Allumée SEULEMENT par les
@@ -637,18 +639,17 @@ required-features = ["local-audio"]
 name = "asio_dsd_5643"
 path = "tests/asio_dsd_5643.rs"
 
-# #4378 — la garde qui tient la fonctionnalité `dst` DÉSARMÉE : hors de tout
-# `default`, tirée par aucune autre fonctionnalité, et absente des lignes
-# `--features` de toutes les recettes qui PUBLIENT un artefact (release.yml,
-# docker.yml, Dockerfile), bases `plugin-catalog` comprises. La licence du
-# crate `dst-decoder` n'est pas tranchée (Apache-2.0 déclarée contre en-tête
-# ISO/Philips) : l'allumer est un arbitrage de Bertrand. Sans feature requise :
-# la garde lit des FICHIERS, elle doit tourner dans toutes les configurations.
-# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
-# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+# #4378 — la garde qui tient la fonctionnalité `dst` ARMÉE (licence acceptée le
+# 06/10/2026) : présente dans les lignes `--features` de toutes les recettes
+# qui PUBLIENT un artefact (release.yml, docker.yml, Dockerfile), bases
+# `plugin-catalog` comprises, et `dst-decoder` figé à une version relue. Sans
+# feature requise : la garde lit des FICHIERS, elle doit tourner dans toutes
+# les configurations. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait JAMAIS compilé et la porte rendrait un vert
+# contre rien.
 [[test]]
-name = "dst_desarmee_4378"
-path = "tests/dst_desarmee_4378.rs"
+name = "dst_armee_4378"
+path = "tests/dst_armee_4378.rs"
 
 # #4573 — le témoin du REPLI lui-même : un fichier à six voies, une cible à
 # deux, et ce qui sort mesuré voie par voie contre ITU-R BS.775. La .159

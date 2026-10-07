@@ -11,6 +11,8 @@ pub mod backend;
 pub mod champs_tenus;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+/// Un disque par dossier pour un album sans DISCNUMBER réparti en dossiers frères.
+pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
 pub mod dossiers_des_collections;
 pub mod edition_album;
@@ -86,6 +88,8 @@ pub mod zone_repo;
 mod album_dr_provenance_tests;
 #[cfg(test)]
 mod ecrivains_pendant_un_lot_de_scan_tests;
+#[cfg(test)]
+mod filtre_dr_190_tests;
 #[cfg(test)]
 mod lenteur_albums_4800_tests;
 #[cfg(test)]

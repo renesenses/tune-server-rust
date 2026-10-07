@@ -35,6 +35,10 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
+/// (#5882) : la campagne qui les rend à la passe, par lots.
+pub mod remesure;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -79,7 +83,13 @@ pub const RG_ALGO_KEY: &str = "rg_algo";
 /// peak par suréchantillonnage 4× (#1694). À changer dès qu'une valeur
 /// rendue pour le même signal change — c'est ce qui permettra de ne comparer
 /// que des mesures comparables entre deux instances.
-pub const RG_ALGO: &str = "bs1770-tp4x-v1";
+///
+/// `v2` : le seek de l'analyse rogne au bon échantillon (#5882). Avant, chaque
+/// jonction de segments rejouait la fin du segment précédent, et le true peak
+/// lisait ce saut comme un over (0,507 au lieu de 0,456 sur le même signal).
+/// `v1` a pu être écrite sans ce correctif : la branche de #5594 ne le
+/// contenait pas. Voir [`remesure`].
+pub const RG_ALGO: &str = "bs1770-tp4x-v2";
 
 /// #5594 (lot 2) — la clé de `track_metadata` qui dit quel algorithme a
 /// produit `dr_track`. Même règle que [`RG_ALGO_KEY`] : posée à la mesure,
@@ -916,6 +926,22 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
         };
         if n > 0 {
             return TourDeCascade::Travail(n);
+        }
+        // #5469 — un lot qui rend 0 n'est pas forcément au repos : la pause a
+        // pu tomber APRÈS la garde ci-dessus et AVANT le premier fichier (le
+        // lot a trouvé ses candidats, puis sa garde de lancement a vu la
+        // pause). Lu comme un repos, ce 0 faisait descendre la cascade au rang
+        // suivant — un ReplayGain suspendu lançait la plage dynamique — ou,
+        // au dernier rang, endormait la boucle pour `IDLE_SLEEP_SECS` (15 min)
+        // : « Reprendre » ne relançait alors rien avant un quart d'heure.
+        if est_en_pause(tache) {
+            if rang == Rang::PlageDynamique {
+                noter_travail_dr(false);
+                dr_suspendue = true;
+                continue;
+            }
+            noter_rang_au_travail(None);
+            return TourDeCascade::Suspendue(tache);
         }
     }
     noter_rang_au_travail(None);
@@ -2092,6 +2118,126 @@ pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
         Err(e) => {
             warn!(error = %e, "dr_candidate_count_failed");
             0
+        }
+    }
+}
+
+/// Combien de pistes SANS plage dynamique dorment dans une racine exclue des
+/// analyses (#5593) — fil 2157, « bloquée à 97 % ».
+///
+/// Le périmètre retire ces pistes de toutes les passes qui décodent, ET de
+/// leurs compteurs ([`compter_les_candidats_dr`], [`compter_les_reportees_par_chemin`]).
+/// Elles n'étaient donc comptées nulle part, sauf au total de la
+/// bibliothèque : l'écran Santé les rangeait « en attente » et sa jauge ne
+/// finissait jamais, la passe au repos. Les compter ici, par la clause même
+/// qui les écarte, ferme ce trou.
+///
+/// Jamais deux fois : ni une piste qui a un DR, ni une piste déjà comptée
+/// ailleurs — `dr_indisponible` (`dynamic_range_unavailable`),
+/// `rg_skipped_oversized` (`dynamic_range_oversized`), sans fichier
+/// (`dynamic_range_without_file`). Aucune racine exclue : `0` sans requête.
+pub fn compter_les_sans_dr_hors_perimetre(backend: &Arc<dyn DbBackend>) -> i64 {
+    let hors = crate::taches_de_fond::perimetre::clause_hors_perimetre_decodage(backend);
+    if hors.is_empty() {
+        return 0;
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM tracks t \
+         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'dr_track' AND TRIM(m.value) != '') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key IN ('dr_indisponible', '{OVERSIZED_KEY}')){hors}"
+    );
+    match backend.query_one(&sql, &[]) {
+        Ok(row) => row
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0),
+        Err(e) => {
+            warn!(error = %e, "dr_hors_perimetre_count_failed");
+            0
+        }
+    }
+}
+
+/// Les pistes TRAITÉES par la plage dynamique — décision du 06/10 : la jauge
+/// de l'écran Santé vaut `traitees / total`, et le total est TOUTE la
+/// bibliothèque. Plus rien n'est retiré du dénominateur.
+///
+/// Une piste est traitée quand elle a un DR (mesuré, lu dans ses tags ou
+/// dans un `foo_dr.txt`), ou qu'elle est déclarée NON GÉRABLE :
+/// * sans fichier propre (`file_path` vide, images CUE) ;
+/// * mesure impossible pour de bon (`dr_indisponible` : format illisible,
+///   silence, délai dépassé) ;
+/// * trop longue pour l'analyse (`rg_skipped_oversized`, sans DR) ;
+/// * dans une racine exclue des analyses (#5593).
+///
+/// 🔴 Une piste REPORTÉE (fichier qui ne répond pas, `rg_path_unresolved`,
+/// #1865) n'est PAS traitée : elle sera reprise à l'expiration du report, et
+/// ne devient traitée que mesurée ou déclarée indisponible. Le report ne
+/// pose jamais `dr_indisponible`, à dessein : un partage démonté revient.
+///
+/// Compté sur `tracks`, une seule passe : `traitees` ne dépasse jamais le
+/// total, et une piste n'est comptée qu'une fois quelle que soit la somme de
+/// ses marques.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PistesTraiteesDr {
+    /// Pistes avec un DR, ou déclarées non gérables.
+    pub traitees: i64,
+    /// Pistes de la table `tracks` qui ont un DR.
+    pub avec_dr: i64,
+    /// Pistes avec un fichier, sans DR, marquées `dr_indisponible`, dans le
+    /// périmètre ou hors de lui : la version dédupliquée de
+    /// `dynamic_range_unavailable`, qui compte aussi celles qui ont un DR.
+    pub non_mesurables: i64,
+}
+
+impl PistesTraiteesDr {
+    /// Les pistes non gérables : traitées, mais sans DR.
+    pub fn non_gerables(&self) -> i64 {
+        (self.traitees - self.avec_dr).max(0)
+    }
+}
+
+/// Voir [`PistesTraiteesDr`]. `None` sur erreur de requête : la route publie
+/// alors les anciens champs seuls, et le client garde son calcul d'avant.
+pub fn compter_les_pistes_traitees_dr(backend: &Arc<dyn DbBackend>) -> Option<PistesTraiteesDr> {
+    let hors = crate::taches_de_fond::perimetre::clause_hors_perimetre_decodage(backend);
+    // Sans racine exclue, rien n'est hors périmètre : un terme toujours faux.
+    let hors = if hors.is_empty() {
+        " AND 1 = 0".to_string()
+    } else {
+        hors
+    };
+    let fichier = "(t.file_path IS NOT NULL AND t.file_path != '')";
+    let avec_dr = "EXISTS (SELECT 1 FROM track_metadata d \
+                   WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != '')";
+    let indisponible = "EXISTS (SELECT 1 FROM track_metadata i \
+                        WHERE i.track_id = t.id AND i.key = 'dr_indisponible')";
+    let sql = format!(
+        "SELECT \
+           COUNT(CASE WHEN {avec_dr} \
+                   OR NOT {fichier} \
+                   OR EXISTS (SELECT 1 FROM track_metadata x WHERE x.track_id = t.id \
+                        AND x.key IN ('dr_indisponible', '{OVERSIZED_KEY}')) \
+                   OR ({fichier}{hors}) THEN 1 END), \
+           COUNT(CASE WHEN {avec_dr} THEN 1 END), \
+           COUNT(CASE WHEN {fichier} AND NOT {avec_dr} AND {indisponible} THEN 1 END) \
+         FROM tracks t"
+    );
+    match backend.query_one(&sql, &[]) {
+        Ok(Some(row)) => {
+            let get = |i: usize| row.get(i).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+            Some(PistesTraiteesDr {
+                traitees: get(0),
+                avec_dr: get(1),
+                non_mesurables: get(2),
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "dr_traitees_count_failed");
+            None
         }
     }
 }
@@ -3744,7 +3890,7 @@ mod tests {
         );
         assert_eq!(
             t.get("rg_algo").map(String::as_str),
-            Some("bs1770-tp4x-v1"),
+            Some("bs1770-tp4x-v2"),
             "la mesure ReplayGain doit porter la version de son algorithme : {t:?}"
         );
         assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));

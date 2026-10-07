@@ -281,6 +281,19 @@ pub(super) async fn completeness_stats(
     // derrière ReplayGain » — faux sur un partage démonté (#4254).
     let dr_deferred =
         tune_core::audio::replaygain::compter_les_reportees_par_chemin(&state.backend);
+    // Fil 2157 — et celles d'une racine EXCLUE des analyses (#5593) : le
+    // périmètre les retire de toutes les passes et de tous les compteurs
+    // ci-dessus, mais pas du total. Sans ce chiffre, la carte Santé les
+    // attendait pour toujours, la passe au repos. `0` sans racine exclue.
+    let dr_out_of_scope =
+        tune_core::audio::replaygain::compter_les_sans_dr_hors_perimetre(&state.backend);
+    // Décision du 06/10 — la jauge vaut les pistes TRAITÉES sur le TOTAL :
+    // avec un DR, ou déclarées non gérables (sans fichier, mesure impossible,
+    // trop longues, racine exclue). Une piste reportée n'est pas traitée.
+    // Compté en une passe sur `tracks` : jamais au-dessus du total, chaque
+    // piste une seule fois. Absent sur erreur : le client garde alors son
+    // calcul d'avant, comme face à un serveur plus ancien.
+    let dr_traitees = tune_core::audio::replaygain::compter_les_pistes_traitees_dr(&state.backend);
     // Le client affiche ce nombre dans la pastille « Métadonnées douteuses ».
     // Réutiliser le compteur de la route `/metadata/doubtful` garantit que la
     // pastille et la liste comptent exactement la même population (#1897).
@@ -330,7 +343,7 @@ pub(super) async fn completeness_stats(
         _ => "F",
     };
 
-    Ok(Json(json!({
+    let mut corps = json!({
         "total_tracks": total_tracks,
         "total_albums": total_albums,
         "total_artists": total_artists,
@@ -363,12 +376,24 @@ pub(super) async fn completeness_stats(
         "dynamic_range_deferred": dr_deferred,
         "dynamic_range_oversized": dr_oversized,
         "dynamic_range_without_file": dr_without_file,
+        "dynamic_range_out_of_scope": dr_out_of_scope,
         "dynamic_range_pct": if total_tracks > 0 {
             (with_dr as f64 / total_tracks as f64 * 100.0).round()
         } else {
             0.0
         },
-    })))
+    });
+    if let Some(d) = dr_traitees {
+        // `dynamic_range_processed` est le numérateur de la jauge, le total
+        // des pistes son dénominateur. `dynamic_range_unmanageable` en est la
+        // part sans DR, que détaillent `dynamic_range_unmeasurable` (version
+        // dédupliquée de `dynamic_range_unavailable`), `_oversized`,
+        // `_without_file` et `_out_of_scope`.
+        corps["dynamic_range_processed"] = json!(d.traitees);
+        corps["dynamic_range_unmanageable"] = json!(d.non_gerables());
+        corps["dynamic_range_unmeasurable"] = json!(d.non_mesurables);
+    }
+    Ok(Json(corps))
 }
 
 pub(super) async fn library_activity(

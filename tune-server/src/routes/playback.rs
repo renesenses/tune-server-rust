@@ -2,6 +2,9 @@
 #[path = "playback/album_ref_bandcamp_2121_tests.rs"]
 mod album_ref_bandcamp_2121_tests;
 #[cfg(test)]
+#[path = "playback/journal_pause_reprise_tests.rs"]
+mod journal_pause_reprise_tests;
+#[cfg(test)]
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
@@ -961,6 +964,11 @@ struct PlayRequest {
     // le client l'ENONCER ; ils priment sur toute deduction.
     context_type: Option<String>,
     context_id: Option<String>,
+    /// Web#1923, web#1924 : la page de l'album d'un titre Bandcamp lancé SEUL
+    /// (`source` + `source_id`), quand le client la connaît (recherche, page
+    /// d'artiste, genres). Rangée avec la ligne de file si elle est sûre
+    /// (`zones::page_d_album_bandcamp_sure`), ignorée pour toute autre source.
+    album_ref: Option<String>,
 }
 
 /// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
@@ -1306,6 +1314,9 @@ struct QueueAddRequest {
     // Batch streaming tracks: [{source, source_id, title?, artist_name?, ...}]
     #[serde(default)]
     tracks: Vec<StreamingTrackItem>,
+    /// Web#1923, web#1924 : la page de l'album du titre Bandcamp seul
+    /// (`source` + `source_id`). Même règle que `PlayRequest.album_ref`.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1319,6 +1330,8 @@ struct StreamingTrackItem {
     duration_ms: Option<i64>,
     track_number: Option<i64>,
     disc_number: Option<i64>,
+    /// La page de l'album de cette ligne, pour une piste Bandcamp.
+    album_ref: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2550,6 +2563,15 @@ async fn play(
                 .flatten()
                 .and_then(|z| z.output_device_id)
         });
+        // Web#1923, web#1924 : la page d'album envoyée par le client, sinon
+        // celle que Tune a rangée (#5922). Elle part aussi à l'orchestrateur,
+        // qui l'écrit dans l'historique et s'en sert pour resigner le flux.
+        let album_ref_val = crate::routes::zones::reference_d_album_de_la_demande(
+            &state,
+            source_for_q.as_deref().unwrap_or(""),
+            &source_id_val,
+            body.album_ref.as_deref(),
+        );
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -2568,7 +2590,7 @@ async fn play(
             media_format: body.media_format,
             track_number: None,
             disc_number: None,
-            album_ref: None,
+            album_ref: album_ref_val.clone(),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -2614,6 +2636,10 @@ async fn play(
                             zone_id,
                             &[QueueInput::Streaming {
                                 source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
+                                // Web#1926 : un titre Bandcamp seul garde la
+                                // page de son album, envoyée par le client ou
+                                // déjà connue de Tune, pour « Aller à l'album ».
+                                album_ref: album_ref_val,
                                 source_id: source_id_val,
                                 title: title_val,
                                 artist: artist_val,
@@ -2622,7 +2648,6 @@ async fn play(
                                 duration_ms: duration_val,
                                 track_number: meta.track_number,
                                 disc_number: meta.disc_number,
-                                album_ref: None,
                             }],
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -3089,6 +3114,9 @@ async fn playpause(
 }
 
 async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    // Une ligne par ordre, comme `api_next_requested` : sans elle, une pause
+    // n’apparaissait dans le journal qu’en sortie Windows exclusive.
+    info!(zone_id = zone_id, origine = "api", "pause_requested");
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
@@ -3105,6 +3133,7 @@ async fn resume(
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    info!(zone_id = zone_id, origine = "api", "resume_requested");
     let lang = crate::i18n::lang_from_header(&headers);
     let current = state.playback.get_state(zone_id).await;
 
@@ -4387,6 +4416,12 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+                &state,
+                source,
+                source_id,
+                body.album_ref.as_deref(),
+            ),
             source: source.clone(),
             source_id: source_id.clone(),
             title: meta.title,
@@ -4396,7 +4431,6 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
-            album_ref: None,
         });
     }
 
@@ -4423,6 +4457,12 @@ async fn queue_add(
             }));
         }
         inputs.push(QueueInput::Streaming {
+            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+                &state,
+                &item.source,
+                &item.source_id,
+                item.album_ref.as_deref(),
+            ),
             source: item.source.clone(),
             source_id: item.source_id.clone(),
             title: meta.title,
@@ -4432,7 +4472,6 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
-            album_ref: None,
         });
     }
 
@@ -4499,6 +4538,11 @@ async fn queue_add(
     }
     let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let current_pos = state.playback.get_state(zone_id).await.queue_position;
+    // #5770 — une insertion AVANT la piste en cours (« Lire à partir d'ici »
+    // remet les titres précédents en tête, `position: 0`) la décale : le
+    // curseur la suit. Garder l'ancien curseur le faisait pointer sur une
+    // ligne insérée.
+    let current_pos = bilan.curseur_apres(current_pos, total - count as i64);
     state
         .playback
         .update_queue_info(zone_id, current_pos, total)
@@ -4526,6 +4570,7 @@ async fn queue_add(
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
         }),
     );
     (
@@ -4549,10 +4594,17 @@ async fn queue_add(
         // `unresolved` (#4261) est additif lui aussi : la liste des pistes de
         // service enfilées sous « Unknown » faute de réponse du service, avec
         // le motif. Vide quand tout est résolu.
+        //
+        // `queue_position` (#5770) est additif aussi : le curseur de lecture
+        // APRÈS l'insertion. Sa présence dit au client que ce serveur fait
+        // suivre la piste en cours quand on insère avant elle ; un serveur
+        // plus ancien ne l'envoie pas, et le client s'abstient alors d'insérer
+        // en tête.
         Json(json!({
             "added": count,
             "queue_length": total,
             "position": start,
+            "queue_position": current_pos,
             "items": enfiles,
             "unresolved": non_resolues,
         })),
@@ -5535,10 +5587,15 @@ async fn do_transfer(
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
-                if source_paused
-                    && let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await
-                {
-                    return output_command_error_response(error);
+                if source_paused {
+                    info!(
+                        zone_id = target_zone,
+                        origine = "transfert",
+                        "pause_requested"
+                    );
+                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
+                        return output_command_error_response(error);
+                    }
                 }
             }
             Err(e) => {

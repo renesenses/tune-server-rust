@@ -575,6 +575,8 @@ mod fusion_tests;
 #[cfg(test)]
 mod identite_appareil_tests;
 #[cfg(test)]
+mod page_d_album_bandcamp_tests;
+#[cfg(test)]
 mod sante_reseau_de_zone_tests;
 #[cfg(test)]
 mod zone_masquee_en_lecture_affichee_5077;
@@ -863,7 +865,12 @@ pub(super) async fn album_en_cours(
     // La référence d'album enregistrée avec la ligne qui joue (#5706,
     // migration 114) — lue AVANT l'appel au service, servie APRÈS lui.
     let album_de_la_file =
-        album_de_la_ligne_qui_joue(&state, id, ps.queue_position, source, source_id);
+        album_de_la_ligne_qui_joue(&state, id, ps.queue_position, source, source_id)
+            .map(|album| (album, "queue_entry"))
+            .or_else(|| {
+                reference_rangee_bandcamp(&state, source, source_id)
+                    .map(|album| (album, "stored_reference"))
+            });
 
     let registre = state.services.lock().await;
     let Some(svc) = registre.get(source) else {
@@ -900,10 +907,105 @@ pub(super) async fn album_en_cours(
     //    l'album ». La ligne de file qui joue, elle, sait son album depuis
     //    l'enfilage. Le service passe d'abord, parce qu'il nomme aussi
     //    l'artiste ; la file ne sert que quand il n'a rien dit.
+    //
+    //    Web#1923 et web#1924 : un titre Bandcamp rejoué SEUL (historique,
+    //    favori, « Lire ») entrait en file sans référence d'album, et la ligne
+    //    ne savait donc rien. La référence que Tune a déjà rangée pour cette
+    //    piste (file, favoris, historique : `reference_d_album_bandcamp`, la
+    //    même recherche que la resignature du flux) prend alors le relais.
     match album_de_la_file {
-        Some(album) => Json(reponse(id, source, &album, None, "queue_entry")).into_response(),
+        Some((album, origine)) => Json(reponse(id, source, &album, None, origine)).into_response(),
         None => rien(id, raison),
     }
+}
+
+/// La référence d'album qu'une piste Bandcamp a déjà laissée dans la base
+/// (file, favoris, historique), ou `None` pour toute autre source.
+///
+/// Bandcamp ne donne jamais la fiche d'une piste seule : l'adresse de la page
+/// de l'album est la seule identité d'album qu'on lui connaisse, et elle n'est
+/// connue que si Tune l'a rangée en enfilant, en mettant en favori ou en
+/// écoutant cette piste (migration 114). Web#1923, web#1924, web#1926.
+pub(crate) fn reference_rangee_bandcamp(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+) -> Option<String> {
+    if source != "bandcamp" {
+        return None;
+    }
+    tune_core::db::reference_d_album::reference_d_album_bandcamp(&state.backend, source_id)
+}
+
+/// La plus longue adresse de page d'album acceptée du client. Une page
+/// Bandcamp tient en une centaine de caractères ; au-delà, ce n'en est pas une.
+const LONGUEUR_MAX_PAGE_BANDCAMP: usize = 2048;
+
+/// L'adresse de page d'album Bandcamp que le CLIENT a envoyée, si elle est sûre.
+///
+/// Elle finit en base (`queue_items.album_ref`), puis le serveur l'ouvre lui-même
+/// pour resigner un flux ou servir l'album en cours (`album_depuis_url`). On n'y
+/// laisse donc entrer que ce qu'il aurait accepté d'ouvrir, en plus strict :
+///
+/// - schéma `https://`, seul admis par `album_depuis_url` ;
+/// - hôte `bandcamp.com` ou `*.bandcamp.com`, comparé par COMPOSANT comme
+///   `est_un_flux_bandcamp` : `evilbandcamp.com` et `bandcamp.com.exemple`
+///   n'entrent pas, alors qu'un `contains("bandcamp.com")` les laisserait ;
+/// - ni identifiants (`@`), ni port (`:`), ni blanc ni caractère de contrôle ;
+/// - un chemin après l'hôte (`/album/…` ou `/track/…`).
+///
+/// `None` pour tout le reste : la demande se poursuit alors comme avant, sur la
+/// référence que Tune a rangée s'il en a une. Web#1923, web#1924.
+pub(crate) fn page_d_album_bandcamp_sure(brute: Option<&str>) -> Option<String> {
+    let page = brute?.trim();
+    if page.is_empty()
+        || page.len() > LONGUEUR_MAX_PAGE_BANDCAMP
+        || page.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let reste = page.strip_prefix("https://")?;
+    let fin_hote = reste.find(['/', '?', '#'])?;
+    let (hote, chemin) = reste.split_at(fin_hote);
+    if hote.contains(['@', ':', '\\']) {
+        return None;
+    }
+    let hote = hote.to_ascii_lowercase();
+    let bon_domaine = hote == "bandcamp.com"
+        || hote.strip_suffix(".bandcamp.com").is_some_and(|sous| {
+            !sous.is_empty()
+                && sous.split('.').all(|etiquette| {
+                    !etiquette.is_empty()
+                        && etiquette
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+        });
+    if !bon_domaine || !chemin.starts_with('/') || chemin.len() < 2 {
+        return None;
+    }
+    Some(page.to_string())
+}
+
+/// La référence d'album à ranger avec une piste Bandcamp demandée SEULE
+/// (`POST /zones/{id}/play`, `POST /zones/{id}/queue/add`).
+///
+/// La page envoyée par le client d'abord, si elle est sûre : c'est elle qui
+/// sert un titre que Tune n'a JAMAIS vu (un résultat de recherche lancé seul),
+/// que ni la file, ni les favoris, ni l'historique ne connaissent. Sinon, celle
+/// que Tune a rangée (#5922). `None` pour toute autre source que Bandcamp : le
+/// champ y est ignoré, la ligne de file ne prend pas une page étrangère.
+pub(crate) fn reference_d_album_de_la_demande(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    fournie: Option<&str>,
+) -> Option<String> {
+    if source != "bandcamp" {
+        return None;
+    }
+    page_d_album_bandcamp_sure(fournie)
+        .or_else(|| reference_rangee_bandcamp(state, source, source_id))
 }
 
 /// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
@@ -1396,6 +1498,10 @@ mod signal_path_ombre_5081_tests;
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;
+
+// #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
+#[cfg(test)]
+mod signal_path_gain_sortie_4384_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

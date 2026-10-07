@@ -453,6 +453,36 @@ pub(super) async fn get_config(
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
+    // « Analyser la bibliothèque au démarrage » (Réglages › Bibliothèque) :
+    // la valeur qui vaudra au PROCHAIN démarrage, selon l'ordre de précédence
+    // de `auto_scan::CLE_SCAN_AU_DEMARRAGE` — le choix de l'utilisateur, sinon
+    // la configuration de déploiement (`TUNE_AUTO_SCAN`, `tune.toml`), sinon
+    // `false`. Toujours publiée : un client y lit que le serveur connaît le
+    // réglage. `_source` dit qui décide : `user` ou `deployment`.
+    {
+        use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+        let choix = choix_utilisateur_scan_au_demarrage(
+            config
+                .get(CLE_SCAN_AU_DEMARRAGE)
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .as_deref(),
+        );
+        config.insert(
+            CLE_SCAN_AU_DEMARRAGE.to_string(),
+            json!(choix.unwrap_or(state.config.auto_scan)),
+        );
+        config.insert(
+            format!("{CLE_SCAN_AU_DEMARRAGE}_source"),
+            json!(if choix.is_some() {
+                "user"
+            } else {
+                "deployment"
+            }),
+        );
+    }
     // #5519 — combien de fichiers chaque vitesse décode à la fois SUR CETTE
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
@@ -1192,6 +1222,38 @@ fn normaliser_plafond_aleatoire(
     Ok(())
 }
 
+/// « Analyser la bibliothèque au démarrage » : un booléen (ou `"true"` /
+/// `"false"`), écrit normalisé ; `null` efface le choix et rend la décision à
+/// la configuration de déploiement. Toute autre valeur est REFUSÉE. Rend
+/// `Some(())` quand le choix est à effacer.
+fn normaliser_scan_au_demarrage(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<()>, AppError> {
+    use crate::auto_scan::{CLE_SCAN_AU_DEMARRAGE, choix_utilisateur_scan_au_demarrage};
+    let Some(brut) = values.get(CLE_SCAN_AU_DEMARRAGE) else {
+        return Ok(None);
+    };
+    if brut.is_null() {
+        values.remove(CLE_SCAN_AU_DEMARRAGE);
+        return Ok(Some(()));
+    }
+    let choix = match brut {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => choix_utilisateur_scan_au_demarrage(Some(s)),
+        _ => None,
+    };
+    let Some(choix) = choix else {
+        return Err(AppError::bad_request(format!(
+            "{CLE_SCAN_AU_DEMARRAGE} attend true, false ou null"
+        )));
+    };
+    values.insert(
+        CLE_SCAN_AU_DEMARRAGE.to_string(),
+        Value::String(choix.to_string()),
+    );
+    Ok(None)
+}
+
 /// Fil 2148 (#5792) — le délai de la sonde des partages réseau : un nombre de
 /// secondes dans les bornes, ou 400 qui les nomme. Rend la valeur à appliquer
 /// après l'écriture.
@@ -1211,6 +1273,13 @@ fn normaliser_intervalle_reseau(
         .map_err(AppError::bad_request)?;
     values.insert(cle.to_string(), Value::String(secs.to_string()));
     Ok(Some(secs))
+}
+
+/// #4384 — le patch a-t-il touché un réglage dont dépend le facteur
+/// ReplayGain de lecture ? Toutes ces clés partagent le préfixe
+/// `replaygain_` (`audio::replaygain::{MODE_KEY, PREAMP_KEY, …}`).
+fn touche_le_replaygain(cles_posees: &[String]) -> bool {
+    cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
 
 pub(super) async fn update_config(
@@ -1262,6 +1331,7 @@ pub(super) async fn update_config(
     normaliser_vitesse_des_analyses(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
+    let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
@@ -1398,6 +1468,14 @@ pub(super) async fn update_config(
         }
         cles_posees.push(key);
     }
+    if scan_au_demarrage_efface {
+        let cle = crate::auto_scan::CLE_SCAN_AU_DEMARRAGE;
+        if let Err(e) = settings.delete(cle) {
+            tracing::error!(reglage = %cle, erreur = %e, "reglage_non_efface");
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
+        }
+        cles_posees.push(cle.to_string());
+    }
     // #5593 — le total de la jauge ReplayGain est compté UNE fois, à
     // l'ouverture de la campagne. Un périmètre changé en cours de route le
     // laisserait annoncer les pistes d'une racine qu'on vient d'exclure : on
@@ -1412,6 +1490,17 @@ pub(super) async fn update_config(
             "reglages_ecrits"
         );
     }
+    // #4384 — un réglage ReplayGain (préampli, mode, anti-écrêtage…) vaut
+    // MAINTENANT sur les sorties locales qui jouent, pas à la piste suivante.
+    // Sans cela, le préampli changé en écoutant ne bougeait ni le son ni le
+    // crête-mètre, et l'écran ne disait pas pourquoi (fil 1797).
+    let replaygain_applique_a_chaud = if touche_le_replaygain(&cles_posees) {
+        let servies = state.orchestrator.refresh_replaygain_toutes_zones().await;
+        tracing::info!(zones = servies, "replaygain_reapplique_a_chaud");
+        Some(servies)
+    } else {
+        None
+    };
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
@@ -1422,6 +1511,12 @@ pub(super) async fn update_config(
     }
 
     let mut reponse = json!({"ok": true});
+    // Champ ADDITIF : combien de sorties locales ont reçu le nouveau facteur
+    // ReplayGain tout de suite. `0` = rien ne jouait en local ; une zone
+    // réseau l'entendra à la piste suivante.
+    if let Some(servies) = replaygain_applique_a_chaud {
+        reponse["replaygain_applied_live_zones"] = json!(servies);
+    }
     if exclusif_desarme_avec_asio {
         // Le client a envoyé `local_exclusive_mode: true` (l'écho du forçage
         // ASIO) : il doit apprendre ce qui a été écrit.
@@ -1641,6 +1736,13 @@ mod intervalle_reseau_tests_2148 {
     }
 }
 
+#[cfg(test)]
+#[path = "replaygain_a_chaud_tests_4384.rs"]
+mod replaygain_a_chaud_tests_4384;
+
+#[cfg(test)]
+#[path = "estimation_dossier_tests_2171.rs"]
+mod estimation_dossier_tests_2171;
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
@@ -2123,13 +2225,33 @@ pub(super) async fn browse_dirs(
 ) -> (StatusCode, Json<Value>) {
     use super::explorateur;
 
-    let base = q.path.unwrap_or_else(|| {
-        if cfg!(target_os = "windows") {
-            "C:\\".into()
-        } else {
-            "/".into()
+    let base = q
+        .path
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "/".into());
+
+    // Sous Windows, `/` (ou `\`) désigne le poste : la liste des lecteurs.
+    // `C:\` désigne, lui, le CONTENU du lecteur (fil forum 2171) — il rendait
+    // auparavant la liste des lecteurs, et le lecteur système n'était jamais
+    // explorable.
+    #[cfg(target_os = "windows")]
+    if explorateur::liste_des_lecteurs_demandee(&base) {
+        let mut dirs: Vec<Value> = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:\\", letter as char);
+            if std::path::Path::new(&drive).exists() {
+                dirs.push(json!({
+                    "name": format!("{}:", letter as char),
+                    "path": drive,
+                    "has_children": true,
+                }));
+            }
         }
-    });
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": "/", "drives": true })),
+        );
+    }
 
     if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
         tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
@@ -2166,28 +2288,13 @@ pub(super) async fn browse_dirs(
         );
     }
 
-    let parent = base_path.parent().map(|p| p.to_string_lossy().to_string());
+    let parent = explorateur::parent_a_rendre(
+        &base,
+        base_path.parent().map(|p| p.to_string_lossy().to_string()),
+        cfg!(target_os = "windows"),
+    );
 
     let mut dirs: Vec<Value> = Vec::new();
-
-    // On Windows, list drives when at root
-    #[cfg(target_os = "windows")]
-    if base == "C:\\" || base == "\\" || base == "/" {
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            if std::path::Path::new(&drive).exists() {
-                dirs.push(json!({
-                    "name": format!("{} Drive", letter as char),
-                    "path": drive,
-                    "has_children": true,
-                }));
-            }
-        }
-        return (
-            StatusCode::OK,
-            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
-        );
-    }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
         for entry in entries.flatten() {
@@ -2245,6 +2352,83 @@ pub(super) async fn browse_dirs(
             "dirs": dirs,
             "parent": parent,
             "current": base_path.to_string_lossy(),
+        })),
+    )
+}
+
+/// `GET /system/browse-dirs/estimate?path=…` — ce que l'ajout de ce dossier
+/// ferait analyser (fil forum 2171).
+///
+/// Une faute de frappe dans le chemin avait fait entrer un disque entier de
+/// 1 To dans la bibliothèque : l'ajout lance l'analyse sur-le-champ, sans rien
+/// dire de son ampleur. Cette route donne au client de quoi demander une
+/// confirmation chiffrée AVANT l'ajout.
+///
+/// Mêmes gardes que [`browse_dirs`] : `RequireAdmin`, puis le périmètre de
+/// [`super::explorateur`] — elle ne lit rien que l'explorateur ne pourrait
+/// déjà lister. Elle ne rend que des NOMBRES, jamais de noms. Le comptage est
+/// borné en durée et en entrées ; au-delà, il rend un minimum marqué
+/// `complete: false`.
+pub(super) async fn estimate_dir(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
+    let Some(base) = q.path.filter(|p| !p.trim().is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is required" })),
+        );
+    };
+    let base = tune_core::scanner::walker::normalize_path(&base);
+
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "estimate_dir_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "path": base, "error": refus.libelle() })),
+        );
+    }
+    let chemin = std::path::PathBuf::from(&base);
+    if !chemin.is_dir() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "path": base, "error": "not a directory" })),
+        );
+    }
+    if !explorateur::la_cible_reste_dans_le_perimetre(&chemin) {
+        tracing::warn!(path = %base, "estimate_dir_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "path": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
+        );
+    }
+
+    let debut = std::time::Instant::now();
+    let echeance = debut + explorateur::ESTIMATION_DUREE_MAX;
+    let mesure = tokio::task::spawn_blocking(move || {
+        explorateur::estimer_le_contenu(&chemin, echeance, explorateur::ESTIMATION_ENTREES_MAX)
+    })
+    .await;
+    let Ok(e) = mesure else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "path": base, "error": "estimate failed" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "path": base,
+            "audio_files": e.fichiers_audio,
+            "folders": e.dossiers,
+            "complete": e.complete,
+            "drive_root": base == "/" || explorateur::est_une_racine_de_lecteur(&base),
+            "elapsed_ms": debut.elapsed().as_millis() as u64,
         })),
     )
 }

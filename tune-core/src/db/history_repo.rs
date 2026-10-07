@@ -671,6 +671,64 @@ impl HistoryRepo {
         out
     }
 
+    /// Le service où chaque artiste nommé est le plus écouté — UNE requête
+    /// pour tout le lot (tune-web-client#1696).
+    ///
+    /// Seules les écoutes d'un SERVICE comptent : `local` et `upnp` sont la
+    /// bibliothèque, que le client essaie de toute façon en premier, et une
+    /// radio n'a pas d'artiste à ouvrir. Toute l'histoire est lue, pas la
+    /// seule période du tableau : la question est « où cet artiste se
+    /// trouve-t-il », pas « où l'a-t-on écouté ce mois-ci ». À égalité, le
+    /// premier dans l'ordre alphabétique, pour que la réponse ne dépende pas
+    /// de l'ordre des lignes.
+    fn services_par_artiste(&self, noms: &[String]) -> std::collections::HashMap<String, String> {
+        let mut out: std::collections::HashMap<String, (i64, String)> =
+            std::collections::HashMap::new();
+        if noms.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let bas: Vec<String> = noms.iter().map(|n| n.to_lowercase()).collect();
+        let params: Vec<Box<dyn ToSqlValue>> = bas
+            .iter()
+            .map(|n| Box::new(n.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let dans = Self::lot_in(bas.len());
+        let sql = format!(
+            "SELECT LOWER(artist_name), source, COUNT(*) FROM listen_history \
+             WHERE source IS NOT NULL AND source NOT IN ('local', 'upnp', 'radio') \
+             AND LOWER(artist_name) IN ({dans}) \
+             GROUP BY LOWER(artist_name), source"
+        );
+        match self.db.query_many(&sql, &refs) {
+            Ok(rows) => {
+                for r in rows {
+                    let (Some(n), Some(src)) = (
+                        r.first().and_then(|v| v.as_string()),
+                        r.get(1).and_then(|v| v.as_string()),
+                    ) else {
+                        continue;
+                    };
+                    if src.trim().is_empty() {
+                        continue;
+                    }
+                    let nb = r.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let garde = match out.get(&n) {
+                        None => true,
+                        Some((nb0, src0)) => nb > *nb0 || (nb == *nb0 && src < *src0),
+                    };
+                    if garde {
+                        out.insert(n, (nb, src));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "top_artistes_services_illisibles");
+            }
+        }
+        out.into_iter().map(|(n, (_, src))| (n, src)).collect()
+    }
+
     /// L'album de bibliothèque correspondant à chaque titre d'album nommé —
     /// UNE requête pour tout le lot, au lieu d'une jointure `LOWER() = LOWER()`
     /// qui balaie la table des albums pour chaque ligne d'historique.
@@ -901,16 +959,23 @@ impl HistoryRepo {
             .filter_map(|c| c.first().and_then(|v| v.as_string()))
             .collect();
         let pochettes_artistes = self.pochettes_par_artiste(&noms_artistes);
+        let services_artistes = self.services_par_artiste(&noms_artistes);
         let top_artists: Vec<TopArtistEntry> = artistes_bruts
             .into_iter()
-            .map(|cols| TopArtistEntry {
-                artist_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
-                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
-                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
-                cover_path: cols
+            .map(|cols| {
+                let cle = cols
                     .first()
                     .and_then(|v| v.as_string())
-                    .and_then(|n| pochettes_artistes.get(&n.to_lowercase()).cloned()),
+                    .map(|n| n.to_lowercase());
+                TopArtistEntry {
+                    artist_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                    listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                    cover_path: cle
+                        .as_ref()
+                        .and_then(|n| pochettes_artistes.get(n).cloned()),
+                    source: cle.as_ref().and_then(|n| services_artistes.get(n).cloned()),
+                }
             })
             .collect();
 
@@ -1469,6 +1534,15 @@ pub struct TopArtistEntry {
     pub listening_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// Le service de streaming où cet artiste est le plus écouté — `qobuz`,
+    /// `tidal`… —, ou rien s'il ne l'a jamais été que depuis la bibliothèque.
+    ///
+    /// tune-web-client#1696 : le classement ne portait qu'un NOM. Un artiste
+    /// écouté sur Qobuz seulement n'a pas de fiche locale, et le client, faute
+    /// de savoir où le chercher, rouvrait la Bibliothèque. Avec le service, il
+    /// ouvre la fiche de l'artiste chez ce service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2263,6 +2337,61 @@ mod tests {
         assert_eq!(dash.totals.unique_artists, 1);
     }
 
+    /// tune-web-client#1696 — un artiste écouté sur un service SEULEMENT
+    /// n'a pas de fiche locale : le classement doit dire OÙ le trouver, sinon
+    /// le clic de l'accueil rouvre la Bibliothèque.
+    #[test]
+    fn top_artistes_1696_disent_le_service_de_l_artiste() {
+        let repo = fresh_repo();
+        let ecoute = |artiste: &str, source: &str| {
+            let mut rec = ecoute_locale_nue("piste", None);
+            rec.artist_name = Some(artiste.into());
+            rec.source = source.into();
+            if source != "local" {
+                rec.source_id = Some("1".into());
+            }
+            repo.record(&rec).unwrap();
+        };
+        // Écouté sur Qobuz seulement.
+        ecoute("Jo-Yu Chen", "qobuz");
+        ecoute("Jo-Yu Chen", "qobuz");
+        // Deux services : celui qui l'emporte, même si le nom change de casse.
+        ecoute("Blondshell", "tidal");
+        ecoute("BLONDSHELL", "qobuz");
+        ecoute("Blondshell", "qobuz");
+        // Bibliothèque et upnp seulement : aucun service à proposer.
+        ecoute("Miles Davis", "local");
+        ecoute("Miles Davis", "upnp");
+        // Égalité : l'ordre alphabétique tranche.
+        ecoute("Baba Blues", "tidal");
+        ecoute("Baba Blues", "qobuz");
+
+        let dash = repo.full_dashboard("all", None, None, 10).unwrap();
+        let service = |nom: &str| {
+            dash.top_artists
+                .iter()
+                .find(|a| a.artist_name == nom)
+                .unwrap_or_else(|| panic!("{nom} absent du classement"))
+                .source
+                .clone()
+        };
+        assert_eq!(service("Jo-Yu Chen").as_deref(), Some("qobuz"));
+        assert_eq!(service("Blondshell").as_deref(), Some("qobuz"));
+        assert_eq!(service("Miles Davis"), None);
+        assert_eq!(service("Baba Blues").as_deref(), Some("qobuz"));
+
+        // Sans service, la clé n'est pas écrite : un client ancien ne voit
+        // aucune différence.
+        let json = serde_json::to_value(&dash.top_artists).unwrap();
+        let miles = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["artist_name"] == "Miles Davis")
+            .unwrap();
+        assert!(miles.get("source").is_none(), "{miles}");
+    }
+
     /// Deux pistes du même album, du même interprète : `So What` (id 1) et
     /// `Blue in Green` (id 2).
     fn pose_un_album(repo: &HistoryRepo) {
@@ -2511,6 +2640,85 @@ mod context_names_4036 {
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
     async fn i4036_context_names_postgres() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        verify(Arc::new(super::super::backend::PostgresBackend::new(
+            pool.clone(),
+        )));
+        pool.close().await;
+    }
+}
+
+/// tune-web-client#1696 — la même requête sur les DEUX moteurs : `COUNT(*)`
+/// rend un BIGINT sous PostgreSQL, et le `?` y devient `$n`.
+#[cfg(test)]
+mod services_artistes_1696 {
+    use super::*;
+
+    fn verify(db: Arc<dyn DbBackend>) {
+        db.execute(
+            "CREATE TEMP TABLE listen_history (id BIGINT PRIMARY KEY, artist_name TEXT, source TEXT)",
+            &[],
+        )
+        .unwrap();
+        let lignes = [
+            (1_i64, "Jo-Yu Chen", "qobuz"),
+            (2, "Jo-Yu Chen", "qobuz"),
+            (3, "Blondshell", "tidal"),
+            (4, "BLONDSHELL", "qobuz"),
+            (5, "Blondshell", "qobuz"),
+            (6, "Miles Davis", "local"),
+            (7, "Miles Davis", "upnp"),
+            (8, "Miles Davis", "radio"),
+            (9, "Baba Blues", "tidal"),
+            (10, "Baba Blues", "qobuz"),
+            (11, "Pas classé", "qobuz"),
+        ];
+        for (id, nom, source) in lignes {
+            db.execute(
+                "INSERT INTO listen_history VALUES (?,?,?)",
+                &[&id as &dyn ToSqlValue, &nom, &source],
+            )
+            .unwrap();
+        }
+        let repo = HistoryRepo::with_backend(db);
+        let noms: Vec<String> = ["Jo-Yu Chen", "Blondshell", "Miles Davis", "Baba Blues"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let services = repo.services_par_artiste(&noms);
+        assert_eq!(
+            services.get("jo-yu chen").map(String::as_str),
+            Some("qobuz")
+        );
+        assert_eq!(
+            services.get("blondshell").map(String::as_str),
+            Some("qobuz")
+        );
+        assert_eq!(
+            services.get("baba blues").map(String::as_str),
+            Some("qobuz")
+        );
+        assert!(!services.contains_key("miles davis"), "{services:?}");
+        assert!(!services.contains_key("pas classé"), "{services:?}");
+        assert!(repo.services_par_artiste(&[]).is_empty());
+    }
+
+    #[test]
+    fn i1696_services_artistes_sqlite() {
+        verify(Arc::new(SqliteDb::open_in_memory().unwrap()));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i1696_services_artistes_postgres() {
         let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
             eprintln!("SAUT: TUNE_TEST_PG_URL absent");
             return;

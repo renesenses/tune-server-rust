@@ -535,6 +535,8 @@ pub(super) async fn reidentify_album(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
+    // #4805 — un pressage CHANGÉ fait lire ses crédits, sans retarder la réponse.
+    super::credits_apres_identification::apres_identification(&state, album_id, issue.verdict);
 
     match (issue.verdict, &issue.meilleur, &issue.applied) {
         ("no_tracks", _, _) => Json(json!({

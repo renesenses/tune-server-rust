@@ -268,6 +268,11 @@ impl ToolExecutor {
     }
 
     async fn pause(&self) -> Value {
+        info!(
+            zone_id = self.zone_id,
+            origine = "assistant",
+            "pause_requested"
+        );
         let device_id = self.get_zone_device_id();
         match self
             .orchestrator
@@ -280,6 +285,11 @@ impl ToolExecutor {
     }
 
     async fn resume(&self) -> Value {
+        info!(
+            zone_id = self.zone_id,
+            origine = "assistant",
+            "resume_requested"
+        );
         let device_id = self.get_zone_device_id();
         match self
             .orchestrator

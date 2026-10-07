@@ -11,9 +11,9 @@ default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", 
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
 asio = ["tune-core/asio"]
-# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
-# de toute ligne de build publiée (licence de `dst-decoder` non tranchée,
-# arbitrage de Bertrand). Garde : tune-core/tests/dst_desarmee_4378.rs.
+# #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais livrée par
+# toutes les lignes de build publiées (licence de `dst-decoder` acceptée le
+# 06/10/2026). Garde : tune-core/tests/dst_armee_4378.rs.
 dst = ["tune-core/dst"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
@@ -133,6 +133,8 @@ futures-util = { workspace = true }
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 time = { workspace = true }
+# #4805 — la fraîcheur de `albums.credits_mb_at` (RFC 3339 écrit par tune-core).
+chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
@@ -859,6 +861,13 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
 
+# Une bio d'artiste réécrite à la main perd la provenance (l'attribution
+# CC BY-SA) de l'ancienne. `autotests = false` : sans cette cible, jamais
+# compilé.
+[[test]]
+name = "bio_reecrite_a_la_main"
+path = "tests/bio_reecrite_a_la_main.rs"
+
 # Fil forum 2143 (FabienM), points 5, 6 et 8 — l'album d'un titre de la file :
 # `album_id` / `album_id_service` sur `GET /zones/{id}/queue`, et l'album en
 # cours d'un titre Bandcamp lancé hors de sa page. `autotests = false` plus
@@ -1498,3 +1507,16 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# #4805 — les crédits MusicBrainz lus juste après l'identification d'un album
+# (doublure MusicBrainz locale). `autotests = false` : sans cette cible, jamais
+# compilé.
+[[test]]
+name = "credits_apres_identification_4805"
+path = "tests/credits_apres_identification_4805.rs"
+
+# #5770 — une insertion avant la piste en cours fait suivre le curseur.
+# `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "insertion_avant_la_piste_en_cours_5770"
+path = "tests/insertion_avant_la_piste_en_cours_5770.rs"

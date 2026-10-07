@@ -354,3 +354,267 @@ async fn la_file_ne_prete_pas_l_album_d_une_voisine() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{corps}");
     assert_eq!(corps["reason"], "service_injoignable");
 }
+
+// ─── Web#1923, #1924, #1926 : un titre Bandcamp rejoué SEUL ─────────────────
+//
+// Rejoué depuis l'historique, un favori ou « Lire », un titre Bandcamp entre en
+// file par `source` + `source_id`, sans référence d'album : la ligne ne savait
+// rien, et la route rendait encore 404. Tune avait pourtant rangé la page de
+// l'album à la première écoute (`listen_history.album_ref`, migration 114).
+
+/// La même piste sous une AUTRE signature : l'URL de flux change d'un jour à
+/// l'autre, l'identité de la piste (son chemin) non.
+fn signee(ts: u64) -> String {
+    format!("{PISTE_BC}?p=0&ts={ts}&t=abcd&token={ts}_x")
+}
+
+/// Une écoute passée de la piste Bandcamp, avec la page de son album.
+fn ecoute_passee(state: &AppState, source_id: &str) {
+    tune_core::db::history_repo::HistoryRepo::with_backend(state.backend.clone())
+        .record(&tune_core::db::history_repo::ListenRecord {
+            title: "Meet Her At The Love Parade".into(),
+            source: "bandcamp".into(),
+            source_id: Some(source_id.into()),
+            duration_ms: 300_000,
+            album_ref: Some(PAGE.into()),
+            ..Default::default()
+        })
+        .expect("écoute passée");
+}
+
+#[tokio::test]
+async fn un_titre_bandcamp_rejoue_seul_retrouve_l_album_de_son_historique() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "atelier");
+    ecoute_passee(&state, &signee(1_790_000_000));
+    let piste = signee(1_791_000_000);
+    enfiler(&state, zid, &[de_service("bandcamp", &piste, None)]);
+    jouer(&state, zid, "bandcamp", &piste).await;
+
+    let (status, corps) = lire(&app, &format!("/api/v1/zones/{zid}/album-en-cours")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un titre Bandcamp dont Tune connaît la page d'album doit la rendre : {corps}"
+    );
+    assert_eq!(corps["kind"], "streaming");
+    assert_eq!(corps["service"], "bandcamp");
+    assert_eq!(corps["album_id"], PAGE);
+    assert_eq!(corps["origin"], "stored_reference");
+}
+
+#[tokio::test]
+async fn un_titre_bandcamp_enfile_seul_porte_l_album_connu() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "veranda");
+    ecoute_passee(&state, &signee(1_790_000_000));
+    let piste = signee(1_791_000_000);
+
+    let corps_requete = serde_json::json!({
+        "source": "bandcamp",
+        "source_id": piste,
+        "title": "Meet Her At The Love Parade",
+        "artist_name": "Framewerk",
+        "duration_ms": 300_000,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/zones/{zid}/queue/add"))
+                .header("content-type", "application/json")
+                .body(Body::from(corps_requete.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ajout en file : {}",
+        resp.status()
+    );
+
+    let (status, corps) = lire(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    let lignes = corps["tracks"].as_array().expect("tracks");
+    assert_eq!(lignes.len(), 1, "{corps}");
+    assert_eq!(
+        lignes[0]["album_id_service"], PAGE,
+        "la ligne Bandcamp doit désigner la page de son album : {corps}"
+    );
+}
+
+/// Contre-épreuve : la référence d'une AUTRE piste Bandcamp ne se prête pas.
+#[tokio::test]
+async fn la_reference_d_une_autre_piste_ne_se_prete_pas() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "grenier");
+    ecoute_passee(&state, "https://t4.bcbits.com/stream/abc/mp3-128/999?ts=1");
+    let piste = signee(1_791_000_000);
+    enfiler(&state, zid, &[de_service("bandcamp", &piste, None)]);
+    jouer(&state, zid, "bandcamp", &piste).await;
+
+    let (status, corps) = lire(&app, &format!("/api/v1/zones/{zid}/album-en-cours")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{corps}");
+}
+
+// ─── Un titre Bandcamp que Tune n'a JAMAIS vu (suite de #5922) ──────────────
+//
+// Ni en file, ni en favori, ni dans l'historique : un résultat de recherche
+// lancé seul. Seul le client sait alors la page de son album, et il l'envoie
+// dans `album_ref` (web#1923, web#1924).
+
+/// `POST` d'un corps JSON sur une route de zone. Rend le statut et le corps.
+async fn poster(app: &axum::Router, chemin: &str, corps: &Value) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(chemin)
+                .header("content-type", "application/json")
+                .body(Body::from(corps.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// La référence d'album rangée sur chaque ligne de la file, lue en base.
+fn references_en_file(state: &AppState, zone_id: i64) -> Vec<Option<String>> {
+    PlayQueueRepo::with_backend(state.backend.clone())
+        .get_ordered(zone_id)
+        .expect("lecture de la file")
+        .into_iter()
+        .map(|e| e.album_ref)
+        .collect()
+}
+
+fn titre_seul(source: &str, source_id: &str, album_ref: &str) -> Value {
+    serde_json::json!({
+        "source": source,
+        "source_id": source_id,
+        "title": "Meet Her At The Love Parade",
+        "artist_name": "Framewerk",
+        "duration_ms": 300_000,
+        "album_ref": album_ref,
+    })
+}
+
+#[tokio::test]
+async fn un_titre_bandcamp_jamais_vu_enfile_seul_porte_l_album_du_client() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "cellier");
+    let piste = signee(1_791_000_000);
+
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        &titre_seul("bandcamp", &piste, PAGE),
+    )
+    .await;
+    assert!(status.is_success(), "ajout en file : {status} {corps}");
+
+    let (status, corps) = lire(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(
+        corps["tracks"][0]["album_id_service"], PAGE,
+        "la page envoyée par le client doit désigner l'album : {corps}"
+    );
+
+    jouer(&state, zid, "bandcamp", &piste).await;
+    let (status, corps) = lire(&app, &format!("/api/v1/zones/{zid}/album-en-cours")).await;
+    assert_eq!(status, StatusCode::OK, "{corps}");
+    assert_eq!(corps["album_id"], PAGE);
+    assert_eq!(corps["origin"], "queue_entry");
+}
+
+#[tokio::test]
+async fn un_lot_de_titres_bandcamp_garde_l_album_de_chaque_ligne() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "buanderie");
+    let autre_page = "https://framewerk.bandcamp.com/album/autre-disque";
+    let a = titre_seul("bandcamp", &signee(1_791_000_000), PAGE);
+    let b = titre_seul(
+        "bandcamp",
+        "https://t4.bcbits.com/stream/def/mp3-128/222?ts=1",
+        autre_page,
+    );
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        &serde_json::json!({ "tracks": [a, b] }),
+    )
+    .await;
+    assert!(status.is_success(), "ajout en file : {status} {corps}");
+    assert_eq!(
+        references_en_file(&state, zid),
+        vec![Some(PAGE.to_string()), Some(autre_page.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn un_titre_bandcamp_jamais_vu_lance_seul_porte_l_album_du_client() {
+    let (app, state) = app_et_etat().await;
+    // Une zone navigateur : le flux est relayé tel quel, sans réseau.
+    let zid = ZoneRepo::with_backend(state.backend.clone())
+        .create("Navigateur", Some("browser"), None)
+        .expect("creation de zone");
+    let piste = "http://127.0.0.1:9/stream/abc/mp3-128/333";
+
+    let (status, corps) = poster(
+        &app,
+        &format!("/api/v1/zones/{zid}/play"),
+        &titre_seul("bandcamp", piste, PAGE),
+    )
+    .await;
+    assert!(status.is_success(), "lecture : {status} {corps}");
+    assert_eq!(
+        references_en_file(&state, zid),
+        vec![Some(PAGE.to_string())],
+        "la ligne écrite par `play` doit garder la page envoyée : {corps}"
+    );
+}
+
+/// Contre-épreuve : une adresse qui n'est pas une page Bandcamp sûre n'entre
+/// pas en base, et une page posée sur une autre source n'y entre pas non plus.
+#[tokio::test]
+async fn une_page_douteuse_ou_etrangere_n_est_pas_rangee() {
+    let (app, state) = app_et_etat().await;
+    let zid = zone(&state, "remise");
+    for (source, source_id, page) in [
+        (
+            "bandcamp",
+            signee(1_791_000_000),
+            "https://evilbandcamp.com/album/x",
+        ),
+        (
+            "bandcamp",
+            signee(1_791_000_001),
+            "http://framewerk.bandcamp.com/album/x",
+        ),
+        (
+            "bandcamp",
+            signee(1_791_000_002),
+            "https://moi@framewerk.bandcamp.com/album/x",
+        ),
+        ("qobuz", "q-1".to_string(), PAGE),
+    ] {
+        let (status, corps) = poster(
+            &app,
+            &format!("/api/v1/zones/{zid}/queue/add"),
+            &titre_seul(source, &source_id, page),
+        )
+        .await;
+        assert!(status.is_success(), "ajout en file : {status} {corps}");
+    }
+    assert_eq!(
+        references_en_file(&state, zid),
+        vec![None, None, None, None]
+    );
+}

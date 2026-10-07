@@ -394,6 +394,10 @@ fn spawn_paced_levels_forwarder(
             // sur tous les chemins qui n'en déclarent pas, ce qui laisse leur
             // mesure inchangée.
             let gain_units = playback.gain_de_sortie_units(zone_id);
+            // #4384 — ce que la sortie locale DEMANDAIT avant le rabot à
+            // l'unité (volume × ReplayGain, préampli compris). `None` hors
+            // sortie locale et en DoP : rien n'y est raboté.
+            let gain_demande_units = playback.gain_demande_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
             let mut lvl = crate::audio::levels::compute_levels_avec_gain(
                 &pcm,
@@ -424,96 +428,99 @@ fn spawn_paced_levels_forwarder(
                 peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
             bus.emit(
                 "playback.audio_levels",
-                serde_json::json!({
-                    "zone_id": zone_id,
-                    "play_seq": play_seq,
-                    "generation": gen_at_spawn,
-                    "observation_point": "decoded_source",
-                    "provenance": "source_probe",
-                    "sample_rate": raw.sample_rate,
-                    "channels": raw.channels,
-                    "bit_depth": raw.bit_depth,
+                avec_le_gain_demande(
+                    gain_demande_units,
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "play_seq": play_seq,
+                        "generation": gen_at_spawn,
+                        "observation_point": "decoded_source",
+                        "provenance": "source_probe",
+                        "sample_rate": raw.sample_rate,
+                        "channels": raw.channels,
+                        "bit_depth": raw.bit_depth,
 
-                    // Début de la fenêtre analysée, dans le référentiel de la
-                    // piste — les clients s'alignent sur la position rapportée
-                    // par le renderer pour compenser son tampon de sortie.
-                    "position_ms": position.as_millis() as i64,
-                    "rms_left_db": lvl.rms_left_db(),
-                    "rms_right_db": lvl.rms_right_db(),
-                    "peak_left_db": lvl.peak_left_db(),
-                    "peak_right_db": lvl.peak_right_db(),
-                    // Crête TENUE (max glissant ~300 ms) — champ ADDITIF
-                    // (#1694) : un client ancien l'ignore, un client neuf y
-                    // lit le transitoire même s'il a raté la trame qui le
-                    // portait. Sample peak, sur la même échelle que
-                    // `peak_*_db` : gain de sortie compris (#4384), et sur une
-                    // sortie locale qui les relève, les traitements non
-                    // scalaires d'`apply_local_dsp` aussi.
-                    "peak_hold_left_db": peak_hold_left_db,
-                    "peak_hold_right_db": peak_hold_right_db,
-                    // Gain DÉJÀ compris dans tous les champs ci-dessus, en dB
-                    // (#4384) : ce que la sortie multiplie entre le décodeur
-                    // et le DAC. `0.0` = mesure brute du décodeur. Champ
-                    // ADDITIF — un client ancien l'ignore, un client neuf peut
-                    // dire à l'écran pourquoi l'aiguille est plus basse que le
-                    // fichier, et voir qu'un préampli positif à plein volume
-                    // ne monte pas (clamp à l'unité, voir
-                    // `outputs::local::effective_volume_units`).
-                    "output_gain_db": if gain_units == 1000 {
-                        0.0_f32
-                    } else {
-                        crate::audio::levels::gain_units_en_db(gain_units)
-                    },
-                    // Surcharge = échantillons consécutifs à pleine échelle,
-                    // la seule que du PCM entier sache montrer (#4175).
-                    "over_left": lvl.over_left(),
-                    "over_right": lvl.over_right(),
-                    "over_run_left": lvl.over_run_left,
-                    "over_run_right": lvl.over_run_right,
-                    "rms_left": lvl.rms_left,
-                    "rms_right": lvl.rms_right,
-                    "spectrum": lvl.spectrum,
-                    // Niveau absolu par bande, en dBFS. `spectrum` reste une
-                    // forme normalisée trame par trame (contrat des clients
-                    // déjà déployés) ; ce champ dit le vrai niveau.
-                    "spectrum_db": lvl.spectrum_db,
-                    // Fréquence centrale RÉELLE de chaque bande, en Hz —
-                    // champ ADDITIF (#2081). Jusqu'ici `spectrum` était une
-                    // suite de nombres anonymes : rien ne disait à quelle
-                    // fréquence répondait la barre n° 12, et un client ne
-                    // pouvait graduer son analyseur qu'en recopiant le
-                    // découpage de `levels.rs`, arrondis compris, avec une
-                    // fréquence d'échantillonnage devinée depuis les
-                    // métadonnées de la piste. C'est la même grille que celle
-                    // que l'égaliseur Expert affiche en ISO.
-                    //
-                    // Deux bandes voisines de même valeur lisent les mêmes
-                    // raies FFT : l'analyse ne les distingue pas, et un client
-                    // honnête n'y pose qu'un seul repère.
-                    "spectrum_hz": &*lvl.spectrum_hz,
-                    // De quoi refaire le calcul soi-même si besoin : la
-                    // fréquence d'échantillonnage RÉELLEMENT analysée (celle
-                    // du décodage, pas celle du tag) et la taille de FFT qui a
-                    // servi — elle tombe sous 2048 sur une fenêtre courte.
-                    "sample_rate": raw.sample_rate,
-                    "spectrum_fft_size": lvl.spectrum_fft_size,
-                    // Trames de signal RÉEL analysées, et résolution qui en
-                    // découle — champs ADDITIFS (#2866). `spectrum_fft_size`
-                    // seul MENTAIT sur la finesse : à 44,1 kHz une fenêtre de
-                    // 1764 trames est zéro-paddée à 2048, ce qui resserre les
-                    // raies à 21,5 Hz sans rien apprendre de plus que les
-                    // 25,0 Hz que porte le signal. Un client qui gradue son
-                    // axe doit lire `spectrum_resolution_hz`.
-                    "spectrum_frames": lvl.spectrum_frames,
-                    "spectrum_resolution_hz": lvl.spectrum_resolution_hz,
-                    // Bande par bande : l'analyse la sépare-t-elle de ses
-                    // voisines ? Les bandes du grave sont plus étroites que la
-                    // résolution — 20,0 à 24,8 Hz pour la première, soit 4,8 Hz
-                    // de large contre 25 Hz de résolution. Elles existent, mais
-                    // elles recopient la raie de leur voisine : un client
-                    // honnête ne leur pose pas de repère propre.
-                    "spectrum_resolved": &*lvl.spectrum_resolved,
-                }),
+                        // Début de la fenêtre analysée, dans le référentiel de la
+                        // piste — les clients s'alignent sur la position rapportée
+                        // par le renderer pour compenser son tampon de sortie.
+                        "position_ms": position.as_millis() as i64,
+                        "rms_left_db": lvl.rms_left_db(),
+                        "rms_right_db": lvl.rms_right_db(),
+                        "peak_left_db": lvl.peak_left_db(),
+                        "peak_right_db": lvl.peak_right_db(),
+                        // Crête TENUE (max glissant ~300 ms) — champ ADDITIF
+                        // (#1694) : un client ancien l'ignore, un client neuf y
+                        // lit le transitoire même s'il a raté la trame qui le
+                        // portait. Sample peak, sur la même échelle que
+                        // `peak_*_db` : gain de sortie compris (#4384), et sur une
+                        // sortie locale qui les relève, les traitements non
+                        // scalaires d'`apply_local_dsp` aussi.
+                        "peak_hold_left_db": peak_hold_left_db,
+                        "peak_hold_right_db": peak_hold_right_db,
+                        // Gain DÉJÀ compris dans tous les champs ci-dessus, en dB
+                        // (#4384) : ce que la sortie multiplie entre le décodeur
+                        // et le DAC. `0.0` = mesure brute du décodeur. Champ
+                        // ADDITIF — un client ancien l'ignore, un client neuf peut
+                        // dire à l'écran pourquoi l'aiguille est plus basse que le
+                        // fichier, et voir qu'un préampli positif à plein volume
+                        // ne monte pas (clamp à l'unité, voir
+                        // `outputs::local::effective_volume_units`).
+                        "output_gain_db": if gain_units == 1000 {
+                            0.0_f32
+                        } else {
+                            crate::audio::levels::gain_units_en_db(gain_units)
+                        },
+                        // Surcharge = échantillons consécutifs à pleine échelle,
+                        // la seule que du PCM entier sache montrer (#4175).
+                        "over_left": lvl.over_left(),
+                        "over_right": lvl.over_right(),
+                        "over_run_left": lvl.over_run_left,
+                        "over_run_right": lvl.over_run_right,
+                        "rms_left": lvl.rms_left,
+                        "rms_right": lvl.rms_right,
+                        "spectrum": lvl.spectrum,
+                        // Niveau absolu par bande, en dBFS. `spectrum` reste une
+                        // forme normalisée trame par trame (contrat des clients
+                        // déjà déployés) ; ce champ dit le vrai niveau.
+                        "spectrum_db": lvl.spectrum_db,
+                        // Fréquence centrale RÉELLE de chaque bande, en Hz —
+                        // champ ADDITIF (#2081). Jusqu'ici `spectrum` était une
+                        // suite de nombres anonymes : rien ne disait à quelle
+                        // fréquence répondait la barre n° 12, et un client ne
+                        // pouvait graduer son analyseur qu'en recopiant le
+                        // découpage de `levels.rs`, arrondis compris, avec une
+                        // fréquence d'échantillonnage devinée depuis les
+                        // métadonnées de la piste. C'est la même grille que celle
+                        // que l'égaliseur Expert affiche en ISO.
+                        //
+                        // Deux bandes voisines de même valeur lisent les mêmes
+                        // raies FFT : l'analyse ne les distingue pas, et un client
+                        // honnête n'y pose qu'un seul repère.
+                        "spectrum_hz": &*lvl.spectrum_hz,
+                        // De quoi refaire le calcul soi-même si besoin : la
+                        // fréquence d'échantillonnage RÉELLEMENT analysée (celle
+                        // du décodage, pas celle du tag) et la taille de FFT qui a
+                        // servi — elle tombe sous 2048 sur une fenêtre courte.
+                        "sample_rate": raw.sample_rate,
+                        "spectrum_fft_size": lvl.spectrum_fft_size,
+                        // Trames de signal RÉEL analysées, et résolution qui en
+                        // découle — champs ADDITIFS (#2866). `spectrum_fft_size`
+                        // seul MENTAIT sur la finesse : à 44,1 kHz une fenêtre de
+                        // 1764 trames est zéro-paddée à 2048, ce qui resserre les
+                        // raies à 21,5 Hz sans rien apprendre de plus que les
+                        // 25,0 Hz que porte le signal. Un client qui gradue son
+                        // axe doit lire `spectrum_resolution_hz`.
+                        "spectrum_frames": lvl.spectrum_frames,
+                        "spectrum_resolution_hz": lvl.spectrum_resolution_hz,
+                        // Bande par bande : l'analyse la sépare-t-elle de ses
+                        // voisines ? Les bandes du grave sont plus étroites que la
+                        // résolution — 20,0 à 24,8 Hz pour la première, soit 4,8 Hz
+                        // de large contre 25 Hz de résolution. Elles existent, mais
+                        // elles recopient la raie de leur voisine : un client
+                        // honnête ne leur pose pas de repère propre.
+                        "spectrum_resolved": &*lvl.spectrum_resolved,
+                    }),
+                ),
             );
             trames_publiees += 1;
             next_emit += window;
@@ -530,6 +537,28 @@ fn spawn_paced_levels_forwarder(
         );
     });
     tx
+}
+
+/// #4384 — champs ADDITIFS de `playback.audio_levels`, posés seulement sur
+/// une sortie locale hors DoP : le gain DEMANDÉ avant le rabot à l'unité, en
+/// dB (`output_gain_requested_db`), et si ce rabot a mordu
+/// (`output_gain_limited`).
+///
+/// Un préampli +6 dB à volume plein demande +6 dB et rend 0 dB : avec le seul
+/// `output_gain_db`, l'écran voyait le résultat sans pouvoir dire pourquoi le
+/// réglage ne faisait rien. Absents sur un rendu réseau, qui cuit son gain
+/// dans le flux, et chez un serveur d'avant : un client s'en garde par leur
+/// présence.
+fn avec_le_gain_demande(
+    gain_demande_units: Option<u32>,
+    mut niveaux: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(demande) = gain_demande_units {
+        niveaux["output_gain_requested_db"] =
+            serde_json::json!(crate::audio::levels::gain_units_en_db(demande));
+        niveaux["output_gain_limited"] = serde_json::json!(demande > 1000);
+    }
+    niveaux
 }
 
 /// Fil 1908 — issue de l'attente d'une fenêtre sur l'horloge de la sortie.
@@ -1786,6 +1815,11 @@ mod dsd_upnp_politique_de_zone_tests;
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
+
+/// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
+/// réseau, même en DSD « natif » : il passe par le décodeur.
+#[cfg(test)]
+mod dst_jamais_brut_au_renderer_4378_tests;
 
 #[cfg(test)]
 mod mesure_saut_cd_5079;

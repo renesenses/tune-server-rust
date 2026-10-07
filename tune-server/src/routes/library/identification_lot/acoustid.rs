@@ -558,8 +558,11 @@ async fn traiter_un_album(
         return FinAlbum::Termine;
     };
 
-    musicbrainz_release::rate_limit_delay().await;
-    let Some(detail) = musicbrainz_release::lookup_release_detail(&release.id).await else {
+    // #4805 — lu et GARDÉ en base (créneau MusicBrainz compris) : la lecture
+    // des crédits qui suit la pose le relit sans requête.
+    let Some(detail) =
+        musicbrainz_release::lookup_release_detail_gardee(&state.backend, &release.id).await
+    else {
         // Rien n'est écrit : la release n'a pas pu être lue. Une passe neuve
         // la retentera.
         c.pannes_musicbrainz += 1;
@@ -605,6 +608,12 @@ async fn traiter_un_album(
     match ecrit {
         Ok(Ok(Some(applied))) => {
             c.identifies += 1;
+            // #4805 — l'album n'avait pas de pressage : il vient d'en changer.
+            super::super::credits_apres_identification::apres_identification(
+                state,
+                album_id,
+                "reidentified",
+            );
             c.pistes_identifiees += applied.tracks_matched;
             info!(
                 album_id,
