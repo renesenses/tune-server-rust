@@ -91,7 +91,22 @@ async fn sans_cle_les_routes_annoncent_configuration_requise() {
             "chemin = {chemin}, corps = {corps}"
         );
 
-        // Et un message humain, français par défaut, qui nomme le réglage.
+        // Et un message humain, en anglais sans Accept-Language (repli du
+        // serveur, #5913), qui nomme le réglage.
+        let message = corps["message"].as_str().expect("message absent");
+        assert!(
+            message.contains("radiofrance_api_key"),
+            "message = {message}"
+        );
+        assert!(message.contains("API key"), "message = {message}");
+
+        // La traduction reste servie à qui la demande.
+        let (status, corps) = lire(&app, chemin, Some("fr")).await;
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_FAILED,
+            "chemin = {chemin}, corps = {corps}"
+        );
         let message = corps["message"].as_str().expect("message absent");
         assert!(
             message.contains("radiofrance_api_key"),

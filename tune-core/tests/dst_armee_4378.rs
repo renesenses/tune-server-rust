@@ -1,24 +1,21 @@
-//! 🔴 #4378 — la fonctionnalité `dst` ne doit ENTRER dans aucun binaire publié.
+//! 🔴 #4378 — la fonctionnalité `dst` doit être DANS chaque binaire publié.
 //!
 //! ## Pourquoi cette garde existe
 //!
 //! Le décodeur DST (DSD compressé des SACD) s'appuie sur le crate
-//! `dst-decoder`. Sa licence n'est PAS tranchée : le paquet se déclare
-//! Apache-2.0 (crates.io, GitHub, fichier `LICENSE`) mais son README reproduit
-//! l'en-tête ISO/Philips du code de référence — « Copyright is not released
-//! for non MPEG-4 Audio conforming products » — et un avertissement brevets.
+//! `dst-decoder`, qui se déclare Apache-2.0 (crates.io, GitHub, fichier
+//! `LICENSE`) ; son README reproduit l'en-tête ISO/Philips du code de
+//! référence et un avertissement brevets. Le code est parti DÉSARMÉ le
+//! 20/09/2026 en attendant l'arbitrage. Bertrand a accepté la licence le
+//! 06/10/2026 : la feature `dst` est désormais LIVRÉE.
 //!
-//! Décision de Bertrand du 20/09/2026 : le code part **désarmé**, derrière la
-//! fonctionnalité de compilation `dst`, éteinte. L'allumer — l'ajouter à un
-//! `default` ou à une ligne de build qui produit un artefact — revient à
-//! trancher la question ISO/Philips. Ce n'est pas un geste de code : c'est un
-//! arbitrage juridique, et il appartient à Bertrand.
-//!
-//! Une fonctionnalité éteinte ne reste pas éteinte toute seule. Il suffit d'un
-//! `--features …,dst` ajouté à une cible pour qu'un binaire publié embarque le
-//! crate, sans que rien ne rougisse. C'est exactement le mode de panne de
-//! #3355, en miroir : là-bas une fonctionnalité disparaissait des binaires
-//! livrés en silence, ici elle y entrerait en silence.
+//! Cette garde était le verrou « jamais dans un binaire publié ». Elle est
+//! retournée, avec le même lecteur de fichiers : une fonctionnalité livrée ne
+//! reste pas livrée toute seule. Il suffit qu'une ligne `--features` soit
+//! réécrite sans elle — ou qu'une base `plugin-catalog` la perde, et le
+//! prochain `--write` l'efface de la ligne — pour qu'un binaire publié refuse
+//! de nouveau les DSDIFF DST, sans que rien ne rougisse. C'est le mode de
+//! panne exact de #3355 (`cloud-relay` absent de tous les binaires livrés).
 //!
 //! ## Ce que la garde lit VRAIMENT
 //!
@@ -39,18 +36,17 @@
 //!    base est la source. Une garde qui ne lirait que la ligne serait effacée
 //!    au premier `--write`.
 //!
-//! ## Portée volontairement étroite : ce qui PUBLIE, pas ce qui compile
+//! ## Portée : ce qui PUBLIE
 //!
-//! `ci.yml` est hors portée, et c'est délibéré : il ne produit aucun artefact
-//! livré. C'est même là qu'il faudra allumer `dst` le jour où on voudra le
-//! faire tourner en intégration sans rien publier. `test-postgres.yml`,
-//! `plugin-sdk.yml`, `Dockerfile.bridge` (tune-bridge) n'ont pas non plus de
-//! ligne de build de `tune-server`.
+//! `ci.yml` ne produit aucun artefact livré : il est hors de cette garde (il
+//! compile et teste `dst` de son côté). `test-postgres.yml`, `plugin-sdk.yml`,
+//! `Dockerfile.bridge` (tune-bridge) n'ont pas de ligne de build de
+//! `tune-server`.
 //!
 //! Les images Tune OS (`image/build-*.sh`, `tune-os.yml`) et les scripts de
 //! déploiement .15/.18 ne compilent RIEN : ils déposent une archive déjà
 //! construite par `release.yml`. Ils sont donc couverts par ricochet — et le
-//! balayage ci-dessous rougit si l'un d'eux se met à compiler.
+//! balayage ci-dessous rougit si l'un d'eux se met à compiler sans être classé.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -283,13 +279,13 @@ fn listes(fichier: &str, source: &str) -> Vec<Liste> {
     relevees
 }
 
-/// 🔴 #4378 — aucune ligne de build qui PUBLIE n'allume `dst`.
+/// 🔴 #4378 — toute ligne de build qui PUBLIE allume `dst`.
 ///
-/// ⚠️ Sabotage qui doit le faire tomber : ajouter `,dst` à n'importe quelle
+/// ⚠️ Sabotage qui doit le faire tomber : retirer `dst` de n'importe quelle
 /// ligne `--features` ou `features:` de `release.yml`, `docker.yml` ou du
-/// `Dockerfile`, ou à n'importe quelle `base` de marqueur `plugin-catalog`.
+/// `Dockerfile`, ou de n'importe quelle `base` de marqueur `plugin-catalog`.
 #[test]
-fn dst_n_est_dans_aucune_ligne_de_build_publiee() {
+fn dst_est_dans_toute_ligne_de_build_publiee() {
     let mut toutes: Vec<Liste> = Vec::new();
     for (nom, source) in RECETTES_PUBLIEES {
         let relevees = listes(nom, source);
@@ -358,23 +354,23 @@ fn dst_n_est_dans_aucune_ligne_de_build_publiee() {
         );
     }
 
-    // La garde.
-    let fautives: Vec<&str> = toutes
+    // La garde. Le relais `${{ matrix.features }}` ne porte aucun nom à
+    // lui : ce sont les entrées de matrice qu'il relaie, relevées à part, qui
+    // doivent nommer `dst`.
+    let manquantes: Vec<&str> = toutes
         .iter()
-        .filter(|l| l.features.iter().any(|f| est_dst(f)))
+        .filter(|l| !l.relais && !l.features.iter().any(|f| est_dst(f)))
         .map(|l| l.ancre.as_str())
         .collect();
     assert!(
-        fautives.is_empty(),
-        "🔴 #4378 — la fonctionnalité `dst` est allumée dans une ligne de build \
-         qui PUBLIE : {fautives:?}.\n\
-         Le crate `dst-decoder` se déclare Apache-2.0 mais son README reproduit \
-         l'en-tête ISO/Philips « Copyright is not released for non MPEG-4 Audio \
-         conforming products », plus un avertissement brevets. Livrer un binaire \
-         qui l'embarque, c'est trancher cette question : c'est un arbitrage \
-         JURIDIQUE de Bertrand, pas une ligne de workflow.\n\
-         Pour compiler `dst` sans rien publier, c'est `ci.yml` — hors portée de \
-         cette garde."
+        manquantes.is_empty(),
+        "🔴 #4378 — la fonctionnalité `dst` MANQUE à une ligne de build qui \
+         PUBLIE : {manquantes:?}.\n\
+         Licence de `dst-decoder` acceptée le 06/10/2026 : tout binaire livré \
+         lit les DSDIFF compressés DST. Une ligne sans `dst` publierait un \
+         binaire qui les refuse — le mode de panne de #3355. Ajouter `dst` à la \
+         `base` du marqueur `plugin-catalog` (puis `plugin-catalog.py --write`), \
+         ou à la ligne elle-même quand elle n'a pas de marqueur."
     );
 }
 
@@ -494,7 +490,7 @@ fn aucune_recette_de_publication_n_echappe_a_la_garde() {
         inconnus.is_empty(),
         "🔴 #4378 — {inconnus:?} construi(sen)t tune-server sans être classé(s). \
          Si cette recette produit un artefact LIVRÉ, l'ajouter à \
-         RECETTES_PUBLIEES (elle sera gardée contre `dst`) ; si elle ne publie \
+         RECETTES_PUBLIEES (elle devra alors allumer `dst`) ; si elle ne publie \
          rien, à RECETTES_SANS_PUBLICATION, avec la raison."
     );
 }
@@ -531,84 +527,59 @@ fn table_des_features(nom: &str, manifeste: &str) -> BTreeMap<String, Vec<String
     table
 }
 
-/// Tout ce qu'un `cargo build` sans `--features` activerait : la fermeture
-/// transitive de `default`.
-fn fermeture_du_defaut(table: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
-    let mut vus: BTreeSet<String> = BTreeSet::new();
-    let mut a_voir: Vec<String> = table.get("default").cloned().unwrap_or_default();
-    while let Some(entree) = a_voir.pop() {
-        if !vus.insert(entree.clone()) {
-            continue;
-        }
-        if let Some(suite) = table.get(&entree) {
-            a_voir.extend(suite.iter().cloned());
-        }
-    }
-    vus
+/// La déclaration de `dst-decoder` dans le manifeste de tune-core.
+fn dependance_dst_decoder(manifeste: &str) -> Option<&str> {
+    manifeste
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("dst-decoder ") || l.starts_with("dst-decoder="))
 }
 
-/// 🔴 #4378 — `dst` est hors du `default` et n'est tirée par aucune autre
-/// fonctionnalité.
+/// 🔴 #4378 — `dst` est déclarée dans les deux caisses, tune-server la relaie
+/// vers tune-core, et `dst-decoder` est FIGÉ à la version relue.
 ///
-/// La garde de build ci-dessus lit les lignes `--features`. Elle ne verrait
-/// RIEN si `dst` entrait par la porte de derrière : un `default` qui la
-/// contient, ou une fonctionnalité déjà livrée qui la tire (`bandcamp =
-/// ["dep:tune-bandcamp", "dst"]`). Un `cargo build` sans `--features`
-/// l'embarquerait alors dans tous les artefacts.
+/// Sans le relais, `--features dst` sur tune-server n'allumerait rien dans
+/// tune-core : toutes les lignes ci-dessus seraient vertes et aucun binaire
+/// ne décoderait le DST. Sans la version figée, un `cargo update` ferait
+/// entrer une version que personne n'a relue d'un crate jeune, à un seul
+/// mainteneur, dont la sortie n'a de contrôle que l'empreinte de référence.
 ///
-/// ⚠️ Sabotage qui doit le faire tomber : ajouter `"dst"` au `default` de
-/// tune-core ou de tune-server, ou à n'importe quelle autre fonctionnalité.
+/// ⚠️ Sabotages qui doivent le faire tomber : `dst = []` dans tune-server ;
+/// `version = "0.1.2"` (sans `=`) dans tune-core.
 #[test]
-fn dst_est_hors_du_defaut_et_tiree_par_aucune_autre_feature() {
-    for (nom, manifeste, temoin) in [
-        ("tune-core", MANIFESTE_CORE, "local-audio"),
-        ("tune-server", MANIFESTE_SERVEUR, "oaat"),
+fn dst_est_declaree_relayee_et_figee() {
+    let core = table_des_features("tune-core", MANIFESTE_CORE);
+    let serveur = table_des_features("tune-server", MANIFESTE_SERVEUR);
+    // Contrôle POSITIF : le lecteur voit-il encore une vraie table ?
+    for (nom, table, temoin) in [
+        ("tune-core", &core, "local-audio"),
+        ("tune-server", &serveur, "oaat"),
     ] {
-        let table = table_des_features(nom, manifeste);
-
-        // Contrôle POSITIF : sans la fonctionnalité, la garde ne garde rien.
         assert!(
-            table.contains_key("dst"),
-            "{nom} ne déclare plus de fonctionnalité `dst` : cette garde ne \
-             garde plus rien. Si le décodeur DST a été retiré, retirer aussi \
-             ce fichier ; s'il a été renommé, suivre le nom."
-        );
-        // Contrôle POSITIF : le lecteur voit-il encore une vraie table ?
-        let defauts = table
-            .get("default")
-            .unwrap_or_else(|| panic!("{nom} n'a plus de `default` — lecteur de manifeste cassé"));
-        assert!(
-            !defauts.is_empty() && !defauts.iter().any(|d| d.starts_with('[')),
-            "{nom} : `default` mal lu ({defauts:?}) — lecteur de manifeste cassé"
-        );
-
-        let fermeture = fermeture_du_defaut(&table);
-        assert!(
-            fermeture.iter().any(|f| f.contains(temoin)),
-            "{nom} : la fermeture du `default` ne contient même pas `{temoin}` \
-             ({fermeture:?}) — le parcours transitif est cassé et ne prouverait \
-             rien sur `dst`"
-        );
-        let par_defaut: Vec<&String> = fermeture.iter().filter(|f| est_dst(f)).collect();
-        assert!(
-            par_defaut.is_empty(),
-            "🔴 #4378 — `dst` est atteinte depuis le `default` de {nom} \
-             ({par_defaut:?}) : tout binaire construit sans `--features` \
-             embarquerait `dst-decoder`. La licence n'est pas tranchée \
-             (Apache-2.0 déclarée contre en-tête ISO/Philips) — arbitrage de \
-             Bertrand avant d'allumer."
-        );
-
-        let tireuses: Vec<&String> = table
-            .iter()
-            .filter(|(clef, entrees)| clef.as_str() != "dst" && entrees.iter().any(|e| est_dst(e)))
-            .map(|(clef, _)| clef)
-            .collect();
-        assert!(
-            tireuses.is_empty(),
-            "🔴 #4378 — dans {nom}, {tireuses:?} tire(nt) `dst`. Allumer l'une \
-             d'elles allumerait le décodeur DST sans que la garde des lignes de \
-             build ne voie passer le nom. Seule `dst` doit tirer `dst`."
+            table.contains_key(temoin),
+            "{nom} : `{temoin}` introuvable — lecteur de manifeste cassé ({:?})",
+            table.keys().collect::<Vec<_>>()
         );
     }
+    assert_eq!(
+        core.get("dst").map(Vec::as_slice),
+        Some(&["dep:dst-decoder".to_string()][..]),
+        "tune-core : la feature `dst` doit tirer `dep:dst-decoder`, et lui seul"
+    );
+    assert!(
+        serveur
+            .get("dst")
+            .is_some_and(|e| e.iter().any(|f| f == "tune-core/dst")),
+        "🔴 #4378 — tune-server doit relayer `dst` vers `tune-core/dst` : sans \
+         ce relais, `--features dst` des lignes de build n'allume rien — {:?}",
+        serveur.get("dst")
+    );
+    let declaration = dependance_dst_decoder(MANIFESTE_CORE)
+        .expect("tune-core ne déclare plus `dst-decoder` : la feature `dst` ne tire rien");
+    assert!(
+        declaration.contains("version = \"=0.1.2\"") && declaration.contains("optional = true"),
+        "🔴 #4378 — `dst-decoder` doit rester figé (`=0.1.2`) et optionnel : \
+         une montée se relit (licence, `unsafe`, empreinte de référence) avant \
+         d'entrer dans un binaire livré — `{declaration}`"
+    );
 }
