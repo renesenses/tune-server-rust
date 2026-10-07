@@ -461,6 +461,15 @@ name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
 
+# #2264 : `GET /library/tracks/{id}/versions/groups` ajoute une requete par
+# ISRC plie / MBID d enregistrement. Meme reponse sur PostgreSQL et SQLite,
+# et une mesure ignoree sur 100 000 pistes. `autotests = false` : sans cette
+# entree, le fichier ne serait jamais compile.
+[[test]]
+name = "pg_2264_groupes_versions"
+path = "tests/pg_2264_groupes_versions.rs"
+required-features = ["postgres"]
+
 # SQL propre a SQLite dans des routes jouees sur PostgreSQL (chasse PG du
 # 25/09/2026) : `strftime` du cache d API, `STRING_AGG($1)` de la fusion des
 # doublons. Pas de `required-features` : la contre-epreuve SQLite tourne dans la

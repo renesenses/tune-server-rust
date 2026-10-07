@@ -13,6 +13,9 @@ pub mod export;
 pub mod folder_playlists;
 pub mod full_text_search;
 pub mod genre_tree;
+/// Regrouper les exemplaires d'un même enregistrement entre sources, et
+/// choisir celui qu'on joue (#2264).
+pub mod groupes_versions;
 pub mod importer;
 pub mod ingest;
 pub mod local_path;
