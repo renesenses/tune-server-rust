@@ -25,6 +25,10 @@ const MOTD: &str = "/etc/motd";
 /// Command-line flag of the one-shot first-access mode.
 pub(crate) const PREMIER_ACCES_FLAG: &str = "--tune-os-premier-acces";
 
+/// Command-line flag of the one-shot forgotten-password mode (#3206): called
+/// as root by the image's console-only helper, never by the service.
+pub(crate) const REINITIALISATION_FLAG: &str = "--tune-os-reinitialiser-mot-de-passe";
+
 fn looks_like_tune_os(appliance_marker: &Path, motd: &Path) -> bool {
     appliance_marker.is_file()
         || std::fs::read_to_string(motd)
@@ -83,18 +87,37 @@ pub(crate) fn premier_acces_requested<I: IntoIterator<Item = String>>(args: I) -
 /// sudo, since the caller is a root unit of the image.  The script's stderr
 /// is inherited (it never contains the password); stdout is discarded.
 pub(crate) fn run_premier_acces() -> i32 {
+    run_root_mode(PREMIER_ACCES_FLAG, "--premier-acces")
+}
+
+/// Does the command line ask for the forgotten-password mode?  Exact match.
+pub(crate) fn reinitialisation_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|a| a == REINITIALISATION_FLAG)
+}
+
+/// One-shot forgotten-password mode (#3206); returns the process exit code.
+///
+/// Same rotation as the first access (a fresh temporary password, expired at
+/// once, published in `/run/tune` for the console screens).  Root only, like
+/// [`run_premier_acces`]: the terminal checks belong to the image's helper,
+/// the only caller sudoers allows.
+pub(crate) fn run_reinitialisation() -> i32 {
+    run_root_mode(REINITIALISATION_FLAG, "--reinitialiser")
+}
+
+fn run_root_mode(flag: &str, mode: &str) -> i32 {
     if !looks_like_tune_os(Path::new(APPLIANCE_MARKER), Path::new(MOTD)) {
-        eprintln!("tune-server {PREMIER_ACCES_FLAG}: not a Tune OS appliance, nothing to do");
+        eprintln!("tune-server {flag}: not a Tune OS appliance, nothing to do");
         return 0;
     }
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("tune-server {PREMIER_ACCES_FLAG}: must run as root");
+        eprintln!("tune-server {flag}: must run as root");
         return 1;
     }
-    match run_policy(policy_command(0, "--premier-acces"), Stdio::inherit()) {
+    match run_policy(policy_command(0, mode), Stdio::inherit()) {
         Ok(output) => output.status.code().unwrap_or(1),
         Err(error) => {
-            eprintln!("tune-server {PREMIER_ACCES_FLAG}: {error}");
+            eprintln!("tune-server {flag}: {error}");
             1
         }
     }
@@ -187,6 +210,27 @@ mod tests {
             root.get_args().collect::<Vec<_>>(),
             ["-s", "--", "--premier-acces"]
         );
+    }
+
+    /// #3206 : le mode « mot de passe oublié » est un drapeau exact, et la
+    /// politique embarquée porte le mode qu'il appelle.
+    #[test]
+    fn reinitialisation_flag_is_an_exact_match_and_reaches_the_policy() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(reinitialisation_requested(args(&[
+            "--tune-os-reinitialiser-mot-de-passe"
+        ])));
+        assert!(!reinitialisation_requested(args(&[
+            "--tune-os-premier-acces"
+        ])));
+        assert!(!reinitialisation_requested(args(&[
+            "--tune-os-reinitialiser-mot-de-passe=1"
+        ])));
+        assert!(!premier_acces_requested(args(&[
+            "--tune-os-reinitialiser-mot-de-passe"
+        ])));
+        assert!(PASSWORD_SCRIPT.contains("--reinitialiser) reinitialiser ;;"));
+        assert!(PASSWORD_SCRIPT.contains("rotate_and_expire \"reset-from-console\""));
     }
 
     #[test]
