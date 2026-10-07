@@ -1961,6 +1961,16 @@ pub(crate) fn verdict_suppression_surveillant(
 /// enregistre ? Comparaison exacte (#5223), par un simple `stat`, sans lire le
 /// contenu : c'est la garde « fichier inchangé » du surveillant.
 pub(crate) fn disque_conforme_a_la_ligne(ligne: &Track, chemin: &str) -> bool {
+    // #5299 — une piste DANS une image : sa taille propre et la date de
+    // l'image, comme le scan les enregistre (`iso9660::taille_et_mtime`).
+    if tune_core::audio::iso9660::est_chemin_virtuel(chemin) {
+        let Some((taille, mtime)) =
+            tune_core::audio::iso9660::taille_et_mtime(std::path::Path::new(chemin))
+        else {
+            return false;
+        };
+        return ligne.file_size == Some(taille as i64) && ligne.file_mtime == Some(mtime);
+    }
     let Ok(fs_meta) = std::fs::metadata(chemin) else {
         return false;
     };
@@ -2616,12 +2626,15 @@ pub(crate) fn traiter_le_lot_du_surveillant(
     let (images, changes): (Vec<_>, Vec<_>) = changes
         .into_iter()
         .partition(|c| c.change_type == ChangeType::ImageDePochette);
-    let (dossiers, fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
+    let (dossiers, mut fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
         matches!(
             c.change_type,
             ChangeType::DossierApparu | ChangeType::DossierDisparu
         )
     });
+    // #5299 — une image `.iso` de données se déplie en ses pistes AVANT tout :
+    // ses disparitions comptent dans l'arbitrage des suppressions ci-dessous.
+    deplier_les_images_iso_du_lot(db, &mut fichiers);
     // Racines illisibles À CET INSTANT. Calculée une fois par
     // lot, et seulement s'il porte une suppression : `read_dir`
     // sur un partage réseau tombé peut bloquer plusieurs
@@ -2987,6 +3000,98 @@ fn relire_les_feuilles_cue_du_lot(
         }
     }
     images_decoupees
+}
+
+/// #5299 — une image `.iso` signalée par le surveillant n'était pas relayée :
+/// une image de données ajoutée n'était indexée qu'au scan suivant, et une
+/// image retirée laissait ses pistes en base jusque-là.
+///
+/// Chaque image du lot quitte le lot et y est remplacée par ses pistes, sous
+/// leur chemin virtuel (`image.iso!/dossier/piste.flac`) :
+/// - les fichiers audio que l'image porte À CET INSTANT, en `Added` — la
+///   relecture saute ceux dont la taille et la date n'ont pas bougé ;
+/// - les pistes que la base tient dans l'image et qu'elle ne porte plus (image
+///   retirée, réécrite), en `Deleted` — l'arbitrage des suppressions
+///   (racine illisible, hors périmètre) s'y applique comme à tout fichier.
+///
+/// Le disque tranche, pas le genre de l'événement : une image présente est
+/// lue, une image absente n'a plus de pistes. Une image SACD n'est pas
+/// dépliée ici (sa lecture passe par le découpage du scan) : elle attend le
+/// scan suivant, comme avant. Une image présente mais illisible (partage
+/// réseau qui hoquette) ne retire rien.
+fn deplier_les_images_iso_du_lot(
+    db: &Arc<dyn DbBackend>,
+    fichiers: &mut Vec<tune_core::scanner::watcher::FileChange>,
+) {
+    use tune_core::scanner::watcher::{ChangeType, FileChange, est_une_image_iso};
+    if !fichiers
+        .iter()
+        .any(|c| est_une_image_iso(std::path::Path::new(&c.path)))
+    {
+        return;
+    }
+    let (images, autres): (Vec<_>, Vec<_>) = std::mem::take(fichiers)
+        .into_iter()
+        .partition(|c| est_une_image_iso(std::path::Path::new(&c.path)));
+    *fichiers = autres;
+    let poser =
+        |fichiers: &mut Vec<FileChange>, change_type: ChangeType, path: String| match fichiers
+            .iter_mut()
+            .find(|c| c.path == path)
+        {
+            Some(present) => present.change_type = change_type,
+            None => fichiers.push(FileChange { change_type, path }),
+        };
+    let track_repo = TrackRepo::with_backend(db.clone());
+    for image in images {
+        let chemin = std::path::Path::new(&image.path);
+        let presentes: Vec<String> = if chemin.is_file() {
+            if tune_core::audio::iso_sacd::is_sacd_iso(chemin) {
+                tracing::debug!(image = %image.path, "watcher_iso_sacd_attend_le_scan (#5299)");
+                continue;
+            }
+            match tune_core::audio::iso9660::contenu_audio(chemin) {
+                Ok(contenu) => contenu
+                    .pistes
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(image = %image.path, error = %e, "watcher_iso_illisible (#5299)");
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // Les pistes que la base tient DANS cette image : celles du dossier de
+        // l'image dont le chemin commence par `image.iso!/`.
+        let prefixe = tune_core::audio::iso9660::chemin_virtuel(chemin, "");
+        let indexees: Vec<String> = chemin
+            .parent()
+            .and_then(|d| track_repo.fichiers_sous_dossier(&d.to_string_lossy()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| p.starts_with(&prefixe))
+            .collect();
+        let mut retirees = 0usize;
+        for p in indexees {
+            if !presentes.contains(&p) {
+                retirees += 1;
+                poser(fichiers, ChangeType::Deleted, p);
+            }
+        }
+        info!(
+            image = %image.path,
+            pistes = presentes.len(),
+            retirees,
+            "watcher_image_iso_depliee (#5299)"
+        );
+        for p in presentes {
+            poser(fichiers, ChangeType::Added, p);
+        }
+    }
 }
 
 /// La porte des lots de scan (`sqlite_write_gate`), prise par le surveillant
@@ -3579,6 +3684,10 @@ mod surveillant_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
 #[path = "surveillant_feuille_cue_tests_5073.rs"]
 mod surveillant_feuille_cue_tests_5073;
+
+#[cfg(test)]
+#[path = "surveillant_images_iso_tests_5299.rs"]
+mod surveillant_images_iso_tests_5299;
 
 #[cfg(test)]
 #[path = "scan_feuille_cue_tests_5108.rs"]
