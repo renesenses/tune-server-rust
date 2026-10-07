@@ -29,6 +29,12 @@ fn url_pg() -> Option<String> {
     std::env::var("TUNE_TEST_PG_URL").ok()
 }
 
+/// Les épreuves de ce binaire montent chacune un `AppState` sur la MÊME base
+/// PostgreSQL, en parallèle : deux démarrages simultanés y posent les mêmes
+/// fonctions et se heurtent (« tuple concurrently updated »). Une épreuve à
+/// la fois.
+static UNE_A_LA_FOIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn etat_postgres(url: &str) -> AppState {
     let config = tune_server::config::TuneConfig {
         database_url: Some(url.to_string()),
@@ -150,6 +156,7 @@ fn titres_du_premier_groupe(corps: &Value) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_2264_les_groupes_sont_les_memes_que_sur_sqlite() {
+    let _verrou = UNE_A_LA_FOIS.lock().await;
     let Some(url) = url_pg() else {
         eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
         return;
@@ -194,6 +201,7 @@ async fn pg_2264_les_groupes_sont_les_memes_que_sur_sqlite() {
 /// moteurs, sous les noms que nomme la migration SQLite 122.
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_2264_les_index_des_identifiants_sont_poses() {
+    let _verrou = UNE_A_LA_FOIS.lock().await;
     let Some(url) = url_pg() else {
         eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
         return;
@@ -263,6 +271,7 @@ fn chrono_par_identifiant(state: &AppState) -> std::time::Duration {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "mesure, pas une épreuve"]
 async fn mesure_requete_par_identifiant() {
+    let _verrou = UNE_A_LA_FOIS.lock().await;
     const N: i64 = 100_000;
     let mut etats = vec![("SQLite", etat_sqlite())];
     if let Some(url) = url_pg() {
