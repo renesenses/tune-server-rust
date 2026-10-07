@@ -190,11 +190,12 @@ async fn le_refus_parle_la_langue_de_la_requete() {
             "en {langue}, le refus sert encore la phrase anglaise codee en dur : {message:?}"
         );
     }
-    // Sans en-tête, le défaut de l'application (fr) — pas d'anglais résiduel.
+    // Sans en-tête, le repli du serveur est l'anglais (#5913), comme celui du
+    // client web : la phrase anglaise traduite, pas la phrase codée en dur.
     let (_, nu) = jouer(&app, quatrieme, None).await;
     assert_eq!(
-        nu["message"], mfr,
-        "sans Accept-Language, le refus doit tomber sur le defaut francais"
+        nu["message"], men,
+        "sans Accept-Language, le refus doit tomber sur le repli anglais"
     );
 }
 
