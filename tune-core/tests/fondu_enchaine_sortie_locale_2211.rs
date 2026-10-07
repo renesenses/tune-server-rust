@@ -16,16 +16,15 @@
 //!   échantillons est conservé, la durée du recouvrement est celle demandée ;
 //! * **le gapless respecté** : quand la frontière renonce, le flux livré est
 //!   la concaténation exacte des deux pistes, au bit près ;
-//! * **la règle** : PURE, bit-perfect strict, DoP, album live, jonction sans
-//!   blanc — chacun renonce, avec sa contre-épreuve ;
+//! * **la règle** : PURE, bit-perfect strict, DoP, même album — chacun
+//!   renonce, avec sa contre-épreuve ;
 //! * **la position** : la durée retenue est publiée, puis rendue à zéro.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tune_core::audio::fondu_enchaine::{
-    ConsigneDeJonction, CourbeDeFondu, Jonction, MotifSansFondu, PuitsDeFondu, SEUIL_DE_BLANC,
-    decider_le_fondu,
+    ConsigneDeJonction, CourbeDeFondu, Jonction, MotifSansFondu, PuitsDeFondu, decider_le_fondu,
 };
 use tune_core::outputs::traits::{FormatOuvert, PuitsDEchantillons};
 
@@ -98,7 +97,6 @@ fn jonction_permise() -> Jonction {
         dop: false,
         reserve_vide: false,
         consigne: ConsigneDeJonction::Permise,
-        queue_silencieuse: false,
     }
 }
 
@@ -196,7 +194,7 @@ fn fondu_applique_les_deux_pistes_se_superposent() {
     assert!((mots[milieu] - sortante).abs() > 0.1 && (mots[milieu] - entrante).abs() > 0.1);
 }
 
-/// La frontière renonce (album sans blanc, PURE…) : le flux livré est la
+/// La frontière renonce (même album, PURE…) : le flux livré est la
 /// concaténation EXACTE des deux pistes — l'enchaînement gapless au bit près,
 /// seulement retardé de la réserve.
 #[test]
@@ -314,33 +312,16 @@ fn regle_un_porteur_dop_ne_fond_jamais() {
     assert_eq!(decider_le_fondu(dop), Err(MotifSansFondu::Dop));
 }
 
+/// Décision du 07/10 : deux pistes d'un même album, live ou non, ne fondent
+/// jamais. Contre-épreuve : la même jonction entre deux albums fond.
 #[test]
-fn regle_un_album_sans_blanc_reste_gapless() {
-    let meme_album_musique_continue = Jonction {
-        consigne: ConsigneDeJonction::PermiseSiBlanc,
-        queue_silencieuse: false,
+fn regle_un_meme_album_ne_fond_jamais() {
+    let meme_album = Jonction {
+        consigne: ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum),
         ..jonction_permise()
     };
-    assert_eq!(
-        decider_le_fondu(meme_album_musique_continue),
-        Err(MotifSansFondu::JonctionSansBlanc)
-    );
-    // Contre-épreuve : même album, mais la sortante finit sur un blanc.
-    let meme_album_avec_blanc = Jonction {
-        queue_silencieuse: true,
-        ..meme_album_musique_continue
-    };
-    assert_eq!(decider_le_fondu(meme_album_avec_blanc), Ok(()));
-}
-
-#[test]
-fn regle_un_album_live_ne_fond_jamais() {
-    let live = Jonction {
-        consigne: ConsigneDeJonction::Interdite(MotifSansFondu::AlbumLive),
-        queue_silencieuse: true,
-        ..jonction_permise()
-    };
-    assert_eq!(decider_le_fondu(live), Err(MotifSansFondu::AlbumLive));
+    assert_eq!(decider_le_fondu(meme_album), Err(MotifSansFondu::MemeAlbum));
+    assert_eq!(decider_le_fondu(jonction_permise()), Ok(()));
 }
 
 #[test]
@@ -370,20 +351,4 @@ fn regle_le_doute_rend_le_gapless() {
     ] {
         assert_eq!(decider_le_fondu(j), Err(motif));
     }
-}
-
-/// La mesure de la jonction : une queue à −60 dBFS est un blanc, une queue à
-/// −20 dBFS n'en est pas un.
-#[test]
-fn la_queue_sortante_se_mesure_sur_les_echantillons() {
-    let mut b = banc(500, CourbeDeFondu::PuissanceConstante);
-    pousser(&mut b.puits, 800, |i| if i < 600 { 0.5 } else { 0.001 });
-    assert!(
-        b.puits.queue_silencieuse(),
-        "les 200 dernières ms sont à −60 dBFS"
-    );
-    let mut b = banc(500, CourbeDeFondu::PuissanceConstante);
-    pousser(&mut b.puits, 800, |_| 0.1);
-    assert!(!b.puits.queue_silencieuse(), "contre-épreuve : −20 dBFS");
-    assert!(0.001 < SEUIL_DE_BLANC && SEUIL_DE_BLANC < 0.1);
 }

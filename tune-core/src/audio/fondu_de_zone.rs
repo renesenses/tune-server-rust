@@ -3,19 +3,19 @@
 //! chaque frontière entre deux pistes.
 //!
 //! Le moteur ([`super::fondu_enchaine`]) ne voit que des échantillons ; il ne
-//! sait pas si deux pistes viennent du même album, ni si cet album est un live.
+//! sait pas si deux pistes viennent du même album.
 //! L'orchestrateur, lui, le sait au moment où il arme la piste suivante. Il
-//! le dit par une [`ConsigneDeJonction`], et la sortie tranche le reste sur le
-//! signal (la queue sortante finit-elle sur un blanc ?).
+//! le dit par une [`ConsigneDeJonction`].
 //!
 //! # Les règles
 //!
 //! * durée de 0 à [`DUREE_MAX_S`] secondes, `0` par défaut : sans geste de
 //!   l'utilisateur, rien ne change ;
 //! * jamais en PURE ni en bit-perfect strict : la durée appliquée vaut `0` ;
-//! * jamais entre deux pistes d'un même album live : le gapless prime ;
-//! * entre deux pistes d'un même album non live, seulement si la sortante
-//!   finit sur un blanc — un album « sans blanc » enchaîne en gapless ;
+//! * jamais entre deux pistes consécutives d'un même album, live ou non : le
+//!   gapless prime (décision de Bertrand, 07/10). Le fondu ne sert qu'entre
+//!   albums différents, en aléatoire notamment ;
+//! * jamais sur une zone locale en mode exclusif (refusé par la route) ;
 //! * jamais avec un DSD de part ou d'autre : un porteur DoP additionné perd
 //!   son marqueur et le DAC se tait.
 
@@ -96,32 +96,23 @@ pub fn meme_album(a: PisteDeJonction<'_>, b: PisteDeJonction<'_>) -> bool {
     }
 }
 
-/// **La consigne d'une frontière**, fonction pure. `album_live` répond pour
-/// un identifiant d'album.
+/// **La consigne d'une frontière**, fonction pure.
+#[must_use]
 pub fn consigne_pure(
     courante: PisteDeJonction<'_>,
     suivante: PisteDeJonction<'_>,
-    album_live: impl Fn(i64) -> bool,
 ) -> ConsigneDeJonction {
     if est_dsd(courante.format) || est_dsd(suivante.format) {
         return ConsigneDeJonction::Interdite(MotifSansFondu::Dop);
     }
-    if !meme_album(courante, suivante) {
-        return ConsigneDeJonction::Permise;
+    if meme_album(courante, suivante) {
+        return ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum);
     }
-    let live = courante
-        .album_id
-        .or(suivante.album_id)
-        .is_some_and(album_live);
-    if live {
-        ConsigneDeJonction::Interdite(MotifSansFondu::AlbumLive)
-    } else {
-        ConsigneDeJonction::PermiseSiBlanc
-    }
+    ConsigneDeJonction::Permise
 }
 
 /// La consigne d'une frontière, lue en base : l'album de la suivante vient de
-/// sa piste, le caractère live des types secondaires de l'album.
+/// sa piste.
 pub fn consigne(
     db: &Arc<dyn DbBackend>,
     courante: &crate::playback::NowPlaying,
@@ -144,13 +135,7 @@ pub fn consigne(
         album_titre: suivante.album_title.as_deref(),
         format: suivante.format.as_deref(),
     };
-    consigne_pure(a, b, |album_id| {
-        crate::db::album_repo::AlbumRepo::with_backend(db.clone())
-            .types_secondaires_par_album(&[album_id])
-            .ok()
-            .and_then(|mut table| table.remove(&album_id))
-            .is_some_and(|types| crate::metadata::release_type::est_live(&types))
-    })
+    consigne_pure(a, b)
 }
 
 #[cfg(test)]
@@ -184,36 +169,25 @@ mod tests {
         let c = consigne_pure(
             piste(Some(1), Some("A"), Some("flac")),
             piste(Some(2), Some("B"), Some("flac")),
-            |_| false,
         );
         assert_eq!(c, ConsigneDeJonction::Permise);
     }
 
+    /// Décision du 07/10 : jamais entre deux pistes d'un même album, live ou
+    /// non. Contre-épreuve : le témoin précédent, deux albums, fond.
     #[test]
-    fn un_meme_album_ne_fond_que_sur_un_blanc() {
+    fn un_meme_album_ne_fond_jamais() {
         let c = consigne_pure(
             piste(Some(7), Some("A"), Some("flac")),
             piste(Some(7), Some("A"), Some("flac")),
-            |_| false,
         );
-        assert_eq!(c, ConsigneDeJonction::PermiseSiBlanc);
-    }
-
-    #[test]
-    fn un_album_live_ne_fond_jamais() {
+        assert_eq!(c, ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum));
+        // Par le titre, quand un identifiant manque.
         let c = consigne_pure(
-            piste(Some(7), None, Some("flac")),
-            piste(Some(7), None, Some("flac")),
-            |id| id == 7,
+            piste(None, Some("Kind of Blue"), Some("flac")),
+            piste(Some(7), Some("kind of blue"), Some("flac")),
         );
-        assert_eq!(c, ConsigneDeJonction::Interdite(MotifSansFondu::AlbumLive));
-        // Contre-épreuve : le même album, NON live, fond sous condition.
-        let c = consigne_pure(
-            piste(Some(7), None, Some("flac")),
-            piste(Some(7), None, Some("flac")),
-            |_| false,
-        );
-        assert_eq!(c, ConsigneDeJonction::PermiseSiBlanc);
+        assert_eq!(c, ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum));
     }
 
     #[test]
@@ -236,7 +210,7 @@ mod tests {
     fn un_dsd_de_part_ou_d_autre_ne_fond_jamais() {
         for (a, b) in [(Some("dsf"), Some("flac")), (Some("flac"), Some("DFF"))] {
             assert_eq!(
-                consigne_pure(piste(Some(1), None, a), piste(Some(2), None, b), |_| false),
+                consigne_pure(piste(Some(1), None, a), piste(Some(2), None, b)),
                 ConsigneDeJonction::Interdite(MotifSansFondu::Dop)
             );
         }

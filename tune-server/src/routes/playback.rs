@@ -5331,6 +5331,9 @@ enum RefusDuFondu {
     DureeInvalide,
     /// La zone ne sort pas sur la carte son locale : le fondu n'y existe pas.
     SortieNonLocale(String),
+    /// Zone locale en mode exclusif (WASAPI exclusif, ASIO, CoreAudio
+    /// exclusif) : ces bras enchaînent sans blanc mais ne fondent pas.
+    Exclusif,
 }
 
 impl RefusDuFondu {
@@ -5358,17 +5361,28 @@ impl RefusDuFondu {
                      reste sans blanc (gapless)."
                 ),
             ),
+            Self::Exclusif => (
+                StatusCode::NOT_IMPLEMENTED,
+                "crossfade_unavailable_exclusive",
+                "Le fondu enchaîné est indisponible en mode exclusif (WASAPI exclusif, ASIO, \
+                 CoreAudio exclusif) : cette sortie enchaîne les pistes sans blanc, mais ne les \
+                 superpose pas."
+                    .to_string(),
+            ),
         };
         (statut, Json(json!({"error": code, "message": message}))).into_response()
     }
 }
 
 /// #2211 — la règle de la route, sans base ni réseau. `type_de_sortie` :
-/// celui de la zone, `None` si elle n'existe pas. Désactiver (`0`) est
-/// permis partout ; activer exige une sortie locale.
+/// celui de la zone, `None` si elle n'existe pas. `exclusive` : la sortie
+/// locale vivante joue par un bras exclusif (`None` : pas de sortie vivante,
+/// rien ne s'y oppose). Désactiver (`0`) est permis partout ; activer exige
+/// une sortie locale qui ne soit pas en mode exclusif.
 fn valider_le_reglage_de_fondu(
     body: &CrossfadeSettings,
     type_de_sortie: Option<&str>,
+    exclusive: Option<bool>,
 ) -> Result<f64, RefusDuFondu> {
     let Some(type_de_sortie) = type_de_sortie else {
         return Err(RefusDuFondu::ZoneInconnue);
@@ -5382,6 +5396,9 @@ fn valider_le_reglage_de_fondu(
         .ok_or(RefusDuFondu::DureeInvalide)?;
     if duree > 0.0 && type_de_sortie != "local" {
         return Err(RefusDuFondu::SortieNonLocale(type_de_sortie.to_string()));
+    }
+    if duree > 0.0 && exclusive == Some(true) {
+        return Err(RefusDuFondu::Exclusif);
     }
     Ok(duree)
 }
@@ -5405,7 +5422,13 @@ async fn get_crossfade(
     let Some(type_de_sortie) = type_de_sortie_de_la_zone(&state, zone_id) else {
         return RefusDuFondu::ZoneInconnue.reponse();
     };
-    let disponible = type_de_sortie == "local";
+    let locale = type_de_sortie == "local";
+    let exclusive = if locale {
+        state.orchestrator.zone_locale_exclusive(zone_id).await == Some(true)
+    } else {
+        false
+    };
+    let disponible = locale && !exclusive;
     let duree = if disponible {
         tune_core::audio::fondu_de_zone::duree_reglee_s(&state.backend, zone_id)
     } else {
@@ -5415,6 +5438,8 @@ async fn get_crossfade(
         "zone_id": zone_id,
         "available": disponible,
         "output_type": type_de_sortie,
+        // Zone locale en mode exclusif : le réglage est refusé, l'écran le grise.
+        "exclusive": exclusive,
         "enabled": duree > 0.0,
         "duration": duree,
         "max_duration": tune_core::audio::fondu_enchaine::DUREE_MAX_S,
@@ -5428,7 +5453,8 @@ async fn set_crossfade(
     Json(body): Json<CrossfadeSettings>,
 ) -> impl IntoResponse {
     let type_de_sortie = type_de_sortie_de_la_zone(&state, zone_id);
-    let duree = match valider_le_reglage_de_fondu(&body, type_de_sortie.as_deref()) {
+    let exclusive = state.orchestrator.zone_locale_exclusive(zone_id).await;
+    let duree = match valider_le_reglage_de_fondu(&body, type_de_sortie.as_deref(), exclusive) {
         Ok(duree) => duree,
         Err(refus) => return refus.reponse(),
     };
@@ -5457,8 +5483,7 @@ async fn set_crossfade(
         "crossfade_enabled": duree > 0.0,
         "crossfade_duration": duree,
         // `null` : aucune sortie locale vivante, la prochaine lecture posera
-        // la valeur. `false` : la sortie joue par un bras exclusif (WASAPI,
-        // ASIO, CoreAudio), qui enchaîne sans blanc mais ne fond pas.
+        // la valeur. Un bras exclusif a déjà été refusé plus haut.
         "applies_on_this_output": sortie_vivante,
         "portee": "next_track",
     }))
@@ -7917,15 +7942,15 @@ mod tests_reglage_du_fondu_2211 {
     #[test]
     fn une_zone_locale_accepte_le_fondu() {
         assert_eq!(
-            valider_le_reglage_de_fondu(&duree(5.0), Some("local")),
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), None),
             Ok(5.0)
         );
         assert_eq!(
-            valider_le_reglage_de_fondu(&duree(12.0), Some("local")),
+            valider_le_reglage_de_fondu(&duree(12.0), Some("local"), None),
             Ok(12.0)
         );
         assert_eq!(
-            valider_le_reglage_de_fondu(&duree(0.0), Some("local")),
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), None),
             Ok(0.0)
         );
     }
@@ -7936,13 +7961,13 @@ mod tests_reglage_du_fondu_2211 {
     fn les_autres_sorties_refusent_le_fondu_et_disent_pourquoi() {
         for sortie in ["dlna", "airplay", "chromecast", "oaat", "bluos"] {
             assert_eq!(
-                valider_le_reglage_de_fondu(&duree(5.0), Some(sortie)),
+                valider_le_reglage_de_fondu(&duree(5.0), Some(sortie), None),
                 Err(RefusDuFondu::SortieNonLocale(sortie.to_string())),
                 "{sortie}"
             );
             // Désactiver reste possible partout.
             assert_eq!(
-                valider_le_reglage_de_fondu(&duree(0.0), Some(sortie)),
+                valider_le_reglage_de_fondu(&duree(0.0), Some(sortie), None),
                 Ok(0.0)
             );
         }
@@ -7952,7 +7977,7 @@ mod tests_reglage_du_fondu_2211 {
     fn une_duree_hors_bornes_est_refusee_pas_bornee_en_silence() {
         for d in [-1.0, 12.5, 99.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
-                valider_le_reglage_de_fondu(&duree(d), Some("local")),
+                valider_le_reglage_de_fondu(&duree(d), Some("local"), None),
                 Err(RefusDuFondu::DureeInvalide),
                 "{d}"
             );
@@ -7962,7 +7987,7 @@ mod tests_reglage_du_fondu_2211 {
             enabled: Some(true),
         };
         assert_eq!(
-            valider_le_reglage_de_fondu(&sans_duree, Some("local")),
+            valider_le_reglage_de_fondu(&sans_duree, Some("local"), None),
             Err(RefusDuFondu::DureeInvalide)
         );
     }
@@ -7974,13 +7999,36 @@ mod tests_reglage_du_fondu_2211 {
             duration: Some(5.0),
             enabled: Some(false),
         };
-        assert_eq!(valider_le_reglage_de_fondu(&ancien, Some("dlna")), Ok(0.0));
+        assert_eq!(
+            valider_le_reglage_de_fondu(&ancien, Some("dlna"), None),
+            Ok(0.0)
+        );
+    }
+
+    /// Décision du 07/10 : une zone locale en mode EXCLUSIF (WASAPI exclusif,
+    /// ASIO, CoreAudio exclusif) refuse le fondu, avec son motif. Contre-
+    /// épreuve : la même zone en mode partagé l'accepte.
+    #[test]
+    fn une_zone_locale_exclusive_refuse_le_fondu() {
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(true)),
+            Err(RefusDuFondu::Exclusif)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(false)),
+            Ok(5.0)
+        );
+        // Désactiver reste possible en exclusif.
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), Some(true)),
+            Ok(0.0)
+        );
     }
 
     #[test]
     fn une_zone_inconnue_est_refusee() {
         assert_eq!(
-            valider_le_reglage_de_fondu(&duree(3.0), None),
+            valider_le_reglage_de_fondu(&duree(3.0), None, None),
             Err(RefusDuFondu::ZoneInconnue)
         );
     }

@@ -2355,6 +2355,35 @@ impl PlaybackOrchestrator {
     /// lecture posera la valeur). `Some(sait_fondre)` : la valeur est posée, et
     /// `sait_fondre` dit si ce bras de lecture fond (chemin partagé) ou s'il
     /// enchaîne seulement en gapless (bras exclusifs).
+    /// #2211 — la sortie locale vivante de la zone joue-t-elle par un bras
+    /// EXCLUSIF (WASAPI exclusif, ASIO, CoreAudio exclusif) ? Ces bras
+    /// enchaînent sans blanc mais ne fondent pas : la route refuse alors le
+    /// réglage. `None` : aucune sortie locale vivante pour cette zone.
+    pub async fn zone_locale_exclusive(&self, zone_id: i64) -> Option<bool> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)?;
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            let local_output = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            Some(!local_output.sait_fondre())
+        }
+    }
+
     pub async fn refresh_zone_fondu_enchaine(&self, zone_id: i64) -> Option<bool> {
         #[cfg(not(feature = "local-audio"))]
         {

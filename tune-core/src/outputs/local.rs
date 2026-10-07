@@ -486,7 +486,7 @@ struct PendingNextMedia {
     artist: Option<String>,
     duration_ms: Option<u64>,
     /// #2211 — ce que l'orchestrateur a dit de la frontière qui mène à cette
-    /// piste (même album, live…). `Inconnue` quand rien n'a été dit : pas
+    /// piste (même album, DSD…). `Inconnue` quand rien n'a été dit : pas
     /// de fondu, l'enchaînement reste gapless.
     consigne_de_fondu: crate::audio::fondu_enchaine::ConsigneDeJonction,
 }
@@ -6515,7 +6515,6 @@ impl OutputTarget for LocalOutput {
                     dop: dop_active.load(Ordering::Relaxed),
                     reserve_vide: puits.reserve_vide(),
                     consigne: next.consigne_de_fondu,
-                    queue_silencieuse: puits.queue_silencieuse(),
                 };
                 if !jonction_du_fondu(&mut puits, jonction, &device_name) {
                     break;

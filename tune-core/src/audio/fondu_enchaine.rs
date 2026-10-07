@@ -472,27 +472,12 @@ impl FonduEnchaine {
         }
     }
 
-    /// La crête absolue des `trames` dernières trames retenues (toutes si la
-    /// réserve est plus courte). `0.0` sur une réserve vide.
-    ///
-    /// C'est la mesure de la « jonction sans blanc » (#2211) : une sortante
-    /// qui finit sur de la musique — et non sur un silence — enchaîne sur la
-    /// suivante sans pause, et le gapless doit primer.
-    #[must_use]
-    pub fn crete_de_la_queue(&self, trames: usize) -> f32 {
-        let mots = (trames * self.canaux()).min(self.reserve.len());
-        self.reserve
-            .iter()
-            .skip(self.reserve.len() - mots)
-            .fold(0.0f32, |m, &x| m.max(x.abs()))
-    }
-
     /// **Renoncer au fondu** sur cette frontière : la réserve part au puits
     /// telle quelle, mot pour mot, et le moteur redevient neuf — réserve vide,
     /// toujours en phase [`PhaseDuFondu::Sortante`].
     ///
     /// C'est ce qui rend le moteur inoffensif quand le fondu n'a pas lieu
-    /// (album sans blanc, PURE, piste suivante absente ou non enchaînable) :
+    /// (même album, PURE, piste suivante absente ou non enchaînable) :
     /// le flux livré est exactement celui d'un enchaînement gapless, seulement
     /// retardé de la réserve. Sans effet hors de la phase sortante.
     pub fn relacher_la_reserve(
@@ -700,13 +685,6 @@ impl PuitsDEchantillons for VoieEntrante<'_> {
 /// Durée maximale d'un fondu enchaîné, en secondes (réglage de zone).
 pub const DUREE_MAX_S: f64 = 12.0;
 
-/// Fenêtre de la queue sortante examinée pour reconnaître une jonction
-/// « sans blanc » : les 200 dernières millisecondes.
-pub const FENETRE_DE_JONCTION: Duration = Duration::from_millis(200);
-
-/// Crête sous laquelle la queue sortante est un blanc : −48 dBFS.
-pub const SEUIL_DE_BLANC: f32 = 0.003_981_07;
-
 /// Pourquoi une frontière ne fond PAS. Chaque motif a son code de journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotifSansFondu {
@@ -723,11 +701,10 @@ pub enum MotifSansFondu {
     ReserveVide,
     /// L'orchestrateur n'a pas jugé cette frontière : dans le doute, gapless.
     ConsigneAbsente,
-    /// Deux pistes d'un même album live : le gapless prime.
-    AlbumLive,
-    /// Deux pistes d'un même album dont la sortante finit sur de la musique,
-    /// sans blanc : le gapless prime.
-    JonctionSansBlanc,
+    /// Deux pistes consécutives d'un même album, live ou non : le gapless
+    /// prime, toujours (décision de Bertrand). Le fondu ne sert qu'entre
+    /// albums différents — en aléatoire notamment.
+    MemeAlbum,
 }
 
 impl MotifSansFondu {
@@ -741,8 +718,7 @@ impl MotifSansFondu {
             Self::Dop => "dop",
             Self::ReserveVide => "reserve_vide",
             Self::ConsigneAbsente => "consigne_absente",
-            Self::AlbumLive => "album_live",
-            Self::JonctionSansBlanc => "jonction_sans_blanc",
+            Self::MemeAlbum => "meme_album",
         }
     }
 }
@@ -759,9 +735,6 @@ pub enum ConsigneDeJonction {
     Interdite(MotifSansFondu),
     /// Deux albums différents : fondu permis.
     Permise,
-    /// Deux pistes du même album, non live : fondu permis seulement si la
-    /// sortante finit sur un blanc.
-    PermiseSiBlanc,
 }
 
 /// Tout ce que la frontière sait au moment de décider.
@@ -774,8 +747,6 @@ pub struct Jonction {
     pub dop: bool,
     pub reserve_vide: bool,
     pub consigne: ConsigneDeJonction,
-    /// La queue sortante est-elle un blanc ([`SEUIL_DE_BLANC`]) ?
-    pub queue_silencieuse: bool,
 }
 
 /// **La règle du fondu**, fonction pure. `Ok(())` : la frontière fond.
@@ -803,8 +774,6 @@ pub fn decider_le_fondu(j: Jonction) -> Result<(), MotifSansFondu> {
         ConsigneDeJonction::Inconnue => Err(MotifSansFondu::ConsigneAbsente),
         ConsigneDeJonction::Interdite(motif) => Err(motif),
         ConsigneDeJonction::Permise => Ok(()),
-        ConsigneDeJonction::PermiseSiBlanc if j.queue_silencieuse => Ok(()),
-        ConsigneDeJonction::PermiseSiBlanc => Err(MotifSansFondu::JonctionSansBlanc),
     }
 }
 
@@ -919,16 +888,6 @@ impl<'p> PuitsDeFondu<'p> {
         self.moteur
             .as_ref()
             .is_none_or(|m| m.trames_en_reserve() == 0)
-    }
-
-    /// La queue retenue est-elle un blanc ? Vrai sans réserve.
-    #[must_use]
-    pub fn queue_silencieuse(&self) -> bool {
-        let Some(moteur) = self.moteur.as_ref() else {
-            return true;
-        };
-        let trames = (FENETRE_DE_JONCTION.as_secs_f64() * f64::from(self.format.cadence)) as usize;
-        moteur.crete_de_la_queue(trames.max(1)) < SEUIL_DE_BLANC
     }
 
     /// Le moteur mélange-t-il deux pistes en ce moment ?

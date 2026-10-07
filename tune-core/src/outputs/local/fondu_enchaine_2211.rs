@@ -107,7 +107,6 @@ fn jouer(fondu_ms: u32, pure: bool, consigne: ConsigneDeJonction, cadence_b: u32
         dop: false,
         reserve_vide: puits.reserve_vide(),
         consigne,
-        queue_silencieuse: puits.queue_silencieuse(),
     };
     assert!(jonction_du_fondu(&mut puits, jonction, "banc"));
     let actif_pendant = actif.load(Ordering::Relaxed);
@@ -167,11 +166,18 @@ fn fondu_applique_sur_l_etage_de_la_sortie_locale() {
     );
 }
 
+/// Décision du 07/10 : jamais de fondu entre deux pistes d'un même album —
+/// le gapless prime, au bit près. Contre-épreuve : `fondu_applique_…`, deux
+/// albums, fond.
 #[test]
-fn gapless_respecte_un_album_sans_blanc_rend_le_flux_au_bit_pres() {
+fn gapless_respecte_un_meme_album_rend_le_flux_au_bit_pres() {
     let reference = jouer(0, false, ConsigneDeJonction::Permise, SR);
-    // Même album, et la sortante (un sinus à −6 dBFS) finit sur de la musique.
-    let meme_album = jouer(FONDU_MS, false, ConsigneDeJonction::PermiseSiBlanc, SR);
+    let meme_album = jouer(
+        FONDU_MS,
+        false,
+        ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum),
+        SR,
+    );
     assert!(!meme_album.actif_pendant);
     assert_eq!(meme_album.melangees, 0);
     assert!(
@@ -250,7 +256,7 @@ fn media(url: &str) -> PlayMedia<'_> {
 #[tokio::test]
 async fn sortie_la_consigne_voyage_avec_la_piste_suivante_une_seule_fois() {
     let sortie = LocalOutput::new("Banc".into());
-    sortie.consigner_la_jonction_suivante(ConsigneDeJonction::Interdite(MotifSansFondu::AlbumLive));
+    sortie.consigner_la_jonction_suivante(ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum));
     sortie
         .set_next_media(&media("http://x/a.wav"))
         .await
@@ -258,7 +264,7 @@ async fn sortie_la_consigne_voyage_avec_la_piste_suivante_une_seule_fois() {
     let rangee = sortie.next_media.lock().unwrap().clone().unwrap();
     assert_eq!(
         rangee.consigne_de_fondu,
-        ConsigneDeJonction::Interdite(MotifSansFondu::AlbumLive)
+        ConsigneDeJonction::Interdite(MotifSansFondu::MemeAlbum)
     );
     // Contre-épreuve : la piste armée ensuite sans consigne n'hérite de rien.
     sortie
