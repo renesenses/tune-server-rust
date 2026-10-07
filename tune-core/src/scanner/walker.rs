@@ -405,7 +405,15 @@ fn scan_io_pool() -> Option<&'static rayon::ThreadPool> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(scan_io_concurrency())
             .thread_name(|i| format!("scan-io-{i}"))
-            .start_handler(|_| lower_scan_thread_priority())
+            .start_handler(|_| {
+                lower_scan_thread_priority();
+                // #4681 — ces fils ne servent que le scan : « de fond » pour
+                // toute leur vie (réserve de lecture SQLite, cession de
+                // l'écrivain).
+                std::mem::forget(
+                    crate::taches_de_fond::priorite::politique::marquer_le_fil_de_fond(),
+                );
+            })
             .build()
             .ok()
     })
@@ -1937,6 +1945,43 @@ pub fn scan_files_parallel(
 /// Balances memory usage vs. rayon thread-pool efficiency.
 pub const SCAN_BATCH_SIZE: usize = 500;
 
+/// #4681 — lire les fichiers d'un lot : tout le lot en parallèle au repos ;
+/// pendant qu'une zone joue, par paquets de `scan_width` fichiers
+/// (`taches_de_fond::priorite::politique`), avec une pause entre deux. La
+/// largeur est relue avant CHAQUE paquet : la fin de la lecture rend toute sa
+/// largeur au reste du lot, son début la réduit au paquet suivant.
+pub fn lire_le_lot<'a, F>(
+    lot: &[&'a Path],
+    arret: &(impl Fn() -> bool + Sync),
+    lire_un: &F,
+) -> Vec<ScannedFile>
+where
+    F: Fn(&&'a Path) -> ScannedFile + Sync,
+{
+    use crate::taches_de_fond::priorite::{ID_SCAN, politique};
+    let mut lus = Vec::with_capacity(lot.len());
+    let mut i = 0usize;
+    while i < lot.len() {
+        if arret() {
+            break;
+        }
+        let largeur = politique::largeur_du_scan();
+        let fin = largeur.map_or(lot.len(), |w| (i + w).min(lot.len()));
+        let paquet: Vec<ScannedFile> = lot[i..fin]
+            .par_iter()
+            .filter(|_| !arret())
+            .map(lire_un)
+            .collect();
+        lus.extend(paquet);
+        let n = fin - i;
+        i = fin;
+        if largeur.is_some() && i < lot.len() {
+            politique::ceder_entre_deux_fichiers_bloquant(ID_SCAN, n);
+        }
+    }
+    lus
+}
+
 /// Répartit `files` en lots d'au plus `batch_size` chemins **sans jamais
 /// séparer les fichiers d'un même dossier**.
 ///
@@ -2108,85 +2153,83 @@ pub fn scan_files_batched_avec_arret(
         let batch_timeout_counter = AtomicUsize::new(0);
         let vides = EcartsFichiersVides::default();
 
-        let read_batch = || {
-            chunk
-                .par_iter()
-                .filter(|_| !arret())
-                .map(|path| {
-                    let path: &Path = path;
-                    // NFC-normalize: see comment in scan_files_parallel
-                    let path_str: String = path.to_string_lossy().nfc().collect();
-                    warn_unsafe_path_text(&path_str);
+        let lire_un = |path: &&Path| {
+            let path: &Path = path;
+            // #4681 — priorité d'E/S basse pendant la lecture, là où
+            // elle se défait sans privilège (macOS ; sur Linux, ces
+            // fils sont déjà en best-effort 7 en permanence).
+            let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
+            // NFC-normalize: see comment in scan_files_parallel
+            let path_str: String = path.to_string_lossy().nfc().collect();
+            warn_unsafe_path_text(&path_str);
 
-                    // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
-                    // `metadata()` : sa taille propre, la date de l'image.
-                    let file_meta = crate::audio::iso9660::taille_et_mtime(path);
-                    let stat_ok = file_meta.is_some();
-                    let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
+            // #5299 — un chemin virtuel (`image.iso!/…`) n'a pas de
+            // `metadata()` : sa taille propre, la date de l'image.
+            let file_meta = crate::audio::iso9660::taille_et_mtime(path);
+            let stat_ok = file_meta.is_some();
+            let (file_size, mtime) = file_meta.unwrap_or((0, 0.0));
 
-                    // Zero-byte "audio" files are aborted copies/downloads, not
-                    // tracks: don't index a tagless duration-0 ghost, surface
-                    // them in failed_paths so the report shows what to clean.
-                    if stat_ok && file_size == 0 {
-                        vides.ecarter(&path_str, &failed_files);
-                        return ScannedFile {
-                            path: path_str,
-                            metadata: None,
-                            unsupported: None,
-                            audio_hash: None,
-                            file_size,
-                            mtime,
-                        };
-                    }
+            // Zero-byte "audio" files are aborted copies/downloads, not
+            // tracks: don't index a tagless duration-0 ghost, surface
+            // them in failed_paths so the report shows what to clean.
+            if stat_ok && file_size == 0 {
+                vides.ecarter(&path_str, &failed_files);
+                return ScannedFile {
+                    path: path_str,
+                    metadata: None,
+                    unsupported: None,
+                    audio_hash: None,
+                    file_size,
+                    mtime,
+                };
+            }
 
-                    let (metadata, audio_hash, unsupported) =
-                        match read_file_with_retry(path, with_hash) {
-                        Ok((meta, hash)) => (meta, hash, None),
-                        Err(ReadFileError::Timeout) => {
-                            // Don't drop the file — same fallback as
-                            // scan_files_parallel: index it with filename-based
-                            // metadata so it still appears in the library.
-                            // audio_hash stays None so the next scan re-reads
-                            // full tags once storage is responsive.
-                            warn!(
-                                path = %path_str,
-                                timeout_secs = FILE_TIMEOUT.as_secs(),
-                                "scan_file_timeout — tag read timed out, indexing with filename metadata"
-                            );
-                            batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                            (Some(tagless_fallback_no_props(path)), None, None)
-                        }
-                        Err(ReadFileError::Unsupported(unsupported)) => {
-                            info!(
-                                path = %path_str,
-                                format = %unsupported.report_key,
-                                reason = %unsupported.reason,
-                                "scan_file_unsupported — format reconnu mais non décodable"
-                            );
-                            (None, None, Some(unsupported))
-                        }
-                        Err(ReadFileError::Other(err)) => {
-                            warn!(
-                                path = %path_str,
-                                error = %err,
-                                "scan_file_failed"
-                            );
-                            failed_files.lock().unwrap().push((path_str.clone(), err));
-                            (None, None, None)
-                        }
-                    };
+            let (metadata, audio_hash, unsupported) = match read_file_with_retry(path, with_hash) {
+                Ok((meta, hash)) => (meta, hash, None),
+                Err(ReadFileError::Timeout) => {
+                    // Don't drop the file — same fallback as
+                    // scan_files_parallel: index it with filename-based
+                    // metadata so it still appears in the library.
+                    // audio_hash stays None so the next scan re-reads
+                    // full tags once storage is responsive.
+                    warn!(
+                        path = %path_str,
+                        timeout_secs = FILE_TIMEOUT.as_secs(),
+                        "scan_file_timeout — tag read timed out, indexing with filename metadata"
+                    );
+                    batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
+                    (Some(tagless_fallback_no_props(path)), None, None)
+                }
+                Err(ReadFileError::Unsupported(unsupported)) => {
+                    info!(
+                        path = %path_str,
+                        format = %unsupported.report_key,
+                        reason = %unsupported.reason,
+                        "scan_file_unsupported — format reconnu mais non décodable"
+                    );
+                    (None, None, Some(unsupported))
+                }
+                Err(ReadFileError::Other(err)) => {
+                    warn!(
+                        path = %path_str,
+                        error = %err,
+                        "scan_file_failed"
+                    );
+                    failed_files.lock().unwrap().push((path_str.clone(), err));
+                    (None, None, None)
+                }
+            };
 
-                    ScannedFile {
-                        path: path_str,
-                        metadata,
-                        unsupported,
-                        audio_hash,
-                        file_size,
-                        mtime,
-                    }
-                })
-                .collect()
+            ScannedFile {
+                path: path_str,
+                metadata,
+                unsupported,
+                audio_hash,
+                file_size,
+                mtime,
+            }
         };
+        let read_batch = || lire_le_lot(&chunk, &arret, &lire_un);
         // Run the I/O-bound reads on the dedicated high-concurrency pool so many
         // per-file latencies overlap; fall back to the default pool if the
         // dedicated one couldn't be built.

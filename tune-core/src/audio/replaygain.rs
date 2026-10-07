@@ -1815,6 +1815,8 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
 async fn calculer_l_empreinte(track_id: i64, chemin: &str) -> Option<String> {
     let chemin_owned = chemin.to_string();
     let calcul = tokio::task::spawn_blocking(move || {
+        // #4681 — E/S basses si une zone joue.
+        let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
         crate::audio::empreinte::empreinte_du_fichier(&chemin_owned)
     })
     .await;
