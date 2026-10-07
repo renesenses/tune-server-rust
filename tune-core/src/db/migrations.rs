@@ -2368,7 +2368,42 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "file_first_seen_created_at",
         up: "",
     },
+    // #2713 — la crête vraie a sa version (`rg_true_peak_algo`,
+    // `rg_album_true_peak_algo`). Les crêtes déjà en base viennent de
+    // l'interpolation Catmull-Rom 4× d'avant l'annexe 2 de BS.1770 : elles
+    // sont ÉTIQUETÉES `catmull-rom-4x`, pas effacées. Effacer priverait
+    // `prevent_clipping` de sa crête jusqu'au rattrapage (il retomberait sur
+    // le pic d'échantillon, plus bas) ; étiquetées, elles servent jusqu'à leur
+    // remplacement par le rattrapage de fond
+    // (`audio::replaygain::rattrapage_crete`). Les gains ne sont pas touchés.
+    //
+    // Idempotente : `DO NOTHING` sur une version déjà posée. Une crête sans
+    // version écrite après coup (retour à un ancien binaire) reste
+    // rattrapable : le rattrapage vise toute crête qui n'a pas la version
+    // COURANTE, étiquette ou non.
+    //
+    // Numérotée 121 / PG 085 : la 120 / PG 084 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et aucune PR ouverte ne prend la
+    // 121 ni la 085. Jumelle PG : 085.
+    Migration {
+        version: 121,
+        name: "true_peak_algo_etiquette",
+        up: SQL_ETIQUETTE_CRETES_VRAIES,
+    },
 ];
+
+/// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
+/// même texte que la jumelle PG 085, à la transaction près.
+const SQL_ETIQUETTE_CRETES_VRAIES: &str = "
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_track_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_album_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_album_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+";
 
 /// La colonne de la migration 120 (#5402). La table d'abord : elle n'est
 /// garantie que par la passe finale, qui tourne APRÈS les blocs de version.
@@ -4813,6 +4848,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "file_first_seen_created_at",
         include_str!("../../migrations/postgres/084_file_first_seen_created_at.sql"),
     ),
+    // Jumelle de la SQLite 121 (#2713) : les crêtes vraies d'avant l'annexe 2
+    // de BS.1770 étiquetées `catmull-rom-4x`, rien n'est effacé.
+    (
+        85,
+        "true_peak_algo_etiquette",
+        include_str!("../../migrations/postgres/085_true_peak_algo_etiquette.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -7240,6 +7282,66 @@ mod tests {
     }
 
     #[test]
+    fn migration_121_etiquette_les_cretes_vraies_sans_rien_effacer() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 121 && m.name == "true_peak_algo_etiquette")
+        );
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path)
+                 VALUES (1, 'a', 1, 1, '/a'), (2, 'b', 1, 1, '/b'), (3, 'c', 1, 1, '/c');
+             -- 1 : crête d'avant #2713, crête d'album aussi.
+             INSERT INTO track_metadata (track_id, key, value) VALUES
+                 (1, 'rg_track_true_peak', '0.790000'),
+                 (1, 'rg_album_true_peak', '0.950000'),
+                 (1, 'rg_track_gain', '-6.50 dB'),
+             -- 2 : crête déjà versionnée.
+                 (2, 'rg_track_true_peak', '0.900000'),
+                 (2, 'rg_true_peak_algo', 'bs1770-a2-fir-v1'),
+             -- 3 : pas de crête du tout.
+                 (3, 'rg_track_gain', '-3.00 dB');",
+        )
+        .unwrap();
+        // Jouée deux fois : idempotente.
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let lire = |id: i64, cle: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM track_metadata WHERE track_id = ?1 AND key = ?2",
+                rusqlite::params![id, cle],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(
+            lire(1, "rg_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        assert_eq!(
+            lire(1, "rg_album_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        // Rien n'est effacé : les valeurs restent en service.
+        assert_eq!(lire(1, "rg_track_true_peak").as_deref(), Some("0.790000"));
+        assert_eq!(lire(1, "rg_album_true_peak").as_deref(), Some("0.950000"));
+        assert_eq!(lire(1, "rg_track_gain").as_deref(), Some("-6.50 dB"));
+        // Une version déjà posée ne s'écrase pas.
+        assert_eq!(
+            lire(2, "rg_true_peak_algo").as_deref(),
+            Some("bs1770-a2-fir-v1")
+        );
+        // Pas de crête, pas d'étiquette.
+        assert_eq!(lire(3, "rg_true_peak_algo"), None);
+    }
+
+    #[test]
     fn migration_count_matches() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -7740,7 +7842,9 @@ mod tests {
         // 84 : `file_first_seen_created_at` (#5402), jumelle de la SQLite 120.
         // Pose `file_first_seen.created_at`, que le scan écrit et que le tri
         // « par création » des ajouts récents NOMME.
-        assert_eq!(pg_latest_version(), 84, "latest PG migration must be 84");
+        // 85 : `true_peak_algo_etiquette` (#2713), jumelle de la SQLite 121.
+        // Étiquette les crêtes vraies Catmull-Rom, que le rattrapage NOMME.
+        assert_eq!(pg_latest_version(), 85, "latest PG migration must be 85");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
