@@ -35,7 +35,7 @@ qu'un, celui-ci :
 
 | Avant | Depuis #4741 |
 |---|---|
-| `POST /playlist-manager/transfer` — son propre appariement, sa propre création | **Garde son contrat** (web, appli iPad, appli Flutter) mais n'a plus de moteur : il appelle `/apercu`, puis `/transfert` avec accord (sauf `dry_run`), et rend la forme d'avant, plus `lot_id`, `etat` et le rapport par titre (`tracks[].raison`). Sans greffon chargé : 503 `greffon_requis`. « Bibliothèque → bibliothèque » reste une simple copie (`POST /playlists/{id}/duplicate`). |
+| `POST /playlist-manager/transfer` — son propre appariement, sa propre création | **Garde son contrat** (web, appli iPad, appli Flutter) mais n'a plus de moteur : il appelle `/apercu`, puis `/transfert` avec accord (sauf `dry_run`), et rend la forme d'avant, plus `lot_id`, `etat` et le rapport par titre (`tracks[].raison`). Sans greffon chargé : 503 `greffon_requis`. **Premium** (Bertrand, 07/10/2026) : un compte gratuit reçoit `402 premium_required` (`code: playlist_transfer`, avec une `raison`). « Bibliothèque → bibliothèque » reste une simple copie (`POST /playlists/{id}/duplicate`), **gratuite**. |
 | `POST /playlist-transfer/transfer` et `/preview` (`tune_core::playlist_transfer`) | **Retirés** : aucun client ne les appelait. |
 | `POST /playlist-manager/batch-transfer` — écrivait « started » et ne transférait rien | **Retiré.** Le mode par lot est celui du greffon (`/apercu` avec plusieurs playlists). |
 | `GET /playlist-manager/history` — l'historique du seul premier moteur | Montre les **lots du greffon** (`id` = numéro du lot, `lot_id` = `lot-N`), quel que soit le chemin emprunté, puis les entrées de l'ancien moteur, figées. Détail : `/history/lot-N`. |

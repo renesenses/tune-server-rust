@@ -18,7 +18,10 @@
 //!    greffon, quel que soit le chemin emprunté ;
 //! 5. les deux autres moteurs ont disparu ;
 //! 6. sans le greffon, la route le dit (503 `greffon_requis`) au lieu de
-//!    transférer par un autre chemin.
+//!    transférer par un autre chemin ;
+//! 7. le transfert entre services est Premium (Bertrand, 07/10/2026) : un
+//!    compte gratuit reçoit `402 premium_required` avec sa raison, et rien
+//!    n'est écrit ; la copie « bibliothèque → bibliothèque » reste gratuite.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -238,6 +241,12 @@ struct Banc {
 /// remaster trop long et la bonne édition vient en second. La bibliothèque
 /// porte « La Bohème » (piste 1). Le greffon est chargé si `avec_greffon`.
 async fn banc(avec_greffon: bool) -> Banc {
+    banc_licence(avec_greffon, true).await
+}
+
+/// Comme [`banc`], en choisissant la licence : le transfert entre services est
+/// Premium (Bertrand, 07/10/2026), la copie dans la bibliothèque ne l'est pas.
+async fn banc_licence(avec_greffon: bool, premium: bool) -> Banc {
     let dossier = tempfile::tempdir().unwrap();
     let greffons = dossier.path().join("plugins");
     std::fs::create_dir_all(&greffons).unwrap();
@@ -322,6 +331,7 @@ async fn banc(avec_greffon: bool) -> Banc {
     }
 
     tune_server::plugins_host::load_wasm_plugins(&state).await;
+    state.license.set_account_premium(premium, None).await;
     let app = tune_server::routes::router(state.clone());
     Banc {
         _dossier: dossier,
@@ -401,7 +411,6 @@ async fn le_transfert_historique_passe_par_le_greffon_4741() {
 
     let mut corps = transfert("cible");
     corps["target_name"] = json!("Mon nom");
-    // Aucune licence Premium : la route historique garde son accès d'avant.
     let (st, rendu) = appel(&b.app, "POST", "/api/v1/playlist-manager/transfer", corps).await;
     assert_eq!(st, StatusCode::OK, "{rendu}");
 
@@ -472,8 +481,7 @@ async fn le_transfert_historique_passe_par_le_greffon_4741() {
         "{detail}"
     );
 
-    // Et le même lot, vu par l'onglet Transferts du greffon (Premium).
-    b.state.license.set_account_premium(true, None).await;
+    // Et le même lot, vu par l'onglet Transferts du greffon.
     let (st, lots) = appel(
         &b.app,
         "GET",
@@ -603,4 +611,105 @@ async fn sans_le_greffon_la_route_le_dit_4741() {
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{rendu}");
     assert_eq!(rendu["error"], "greffon_requis", "{rendu}");
     assert!(journal(&b.ecritures_cible).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Premium (Bertrand, 07/10/2026)
+// ---------------------------------------------------------------------------
+
+/// 🔴 Un compte gratuit : refus clair, et RIEN d'écrit — ni chez le service,
+/// ni dans la bibliothèque, ni dans les lots du greffon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_compte_gratuit_est_refuse_avec_sa_raison_4741() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    for cible in ["cible", "local"] {
+        let (st, rendu) = appel(
+            &b.app,
+            "POST",
+            "/api/v1/playlist-manager/transfer",
+            transfert(cible),
+        )
+        .await;
+        assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "vers {cible} : {rendu}");
+        assert_eq!(rendu["error"], "premium_required", "{rendu}");
+        assert_eq!(rendu["code"], "playlist_transfer", "{rendu}");
+        assert!(
+            rendu["raison"]
+                .as_str()
+                .is_some_and(|r| r.contains("gratuit")),
+            "{rendu}"
+        );
+        assert!(rendu["upgrade_url"].is_string(), "{rendu}");
+    }
+    assert!(
+        journal(&b.ecritures_cible).is_empty(),
+        "un refus a écrit chez le service"
+    );
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    assert!(
+        repo.list(1, 100, 0).unwrap().is_empty(),
+        "un refus a créé une playlist locale"
+    );
+    let (_, historique) = appel(
+        &b.app,
+        "GET",
+        "/api/v1/playlist-manager/history",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        historique,
+        json!([]),
+        "un refus a laissé un lot : {historique}"
+    );
+}
+
+/// Témoin : le même compte, passé Premium, transfère.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_compte_premium_transfere_4741() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    b.state.license.set_account_premium(true, None).await;
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        "/api/v1/playlist-manager/transfer",
+        transfert("cible"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    assert_eq!(rendu["matched"], 1, "{rendu}");
+    assert_eq!(journal(&b.ecritures_cible).len(), 2);
+}
+
+/// « Dupliquer » (bibliothèque → bibliothèque) reste gratuit : ce n'est pas un
+/// transfert entre services, et il ne passe pas par le greffon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dupliquer_dans_la_bibliotheque_reste_gratuit_4741() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(false, false).await;
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    let id = repo.create("Ma locale", None, 1).unwrap();
+    repo.add_tracks(id, &[1], None).unwrap();
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        "/api/v1/playlist-manager/transfer",
+        json!({
+            "source_service": "local",
+            "source_playlist_id": id.to_string(),
+            "target_service": "local",
+            "target_name": "Ma locale (copie)",
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    let copie = repo
+        .list(1, 100, 0)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "Ma locale (copie)")
+        .unwrap_or_else(|| panic!("aucune copie : {rendu}"));
+    assert_eq!(repo.get_track_ids(copie.id.unwrap()).unwrap(), vec![1]);
 }

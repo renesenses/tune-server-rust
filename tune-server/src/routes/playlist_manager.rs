@@ -248,6 +248,7 @@ struct TransferRequest {
 async fn transfer_playlist(
     State(state): State<AppState>,
     profile: ActiveProfile,
+    headers: axum::http::HeaderMap,
     Json(body): Json<TransferRequest>,
 ) -> axum::response::Response {
     if body.source_service == "local" {
@@ -273,7 +274,36 @@ async fn transfer_playlist(
             );
         }
     }
+    // Bertrand, 07/10/2026 : le transfert ENTRE services (et l'import d'un
+    // service dans la bibliothèque) est Premium, comme les routes du greffon.
+    // La copie « bibliothèque → bibliothèque » ci-dessus reste gratuite : ce
+    // n'est pas un transfert, aucun service n'est touché.
+    if let Err(refus) = refus_premium_du_transfert(&state, &headers).await {
+        return refus;
+    }
     transferer_par_le_greffon(&state, &body, profile.id()).await
+}
+
+/// `402 premium_required` — le refus commun des routes payantes
+/// (`premium_guard`), dans la langue de l'application, plus la `raison` qui
+/// dit à l'utilisateur ce qui reste gratuit.
+async fn refus_premium_du_transfert(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), axum::response::Response> {
+    let droit = tune_core::license::Feature::PlaylistTransfer;
+    if state.license.check_feature(droit).await {
+        return Ok(());
+    }
+    tracing::info!("playlist_transfer_premium_refuse");
+    let lang = crate::i18n::lang_from_header(headers);
+    let mut corps = crate::premium_guard::corps_du_refus(droit, &lang);
+    corps["raison"] = json!(
+        "Le transfert d'une playlist entre services, ou d'un service vers la \
+         bibliothèque, est réservé à Tune Premium. Dupliquer une playlist de la \
+         bibliothèque reste gratuit."
+    );
+    Err((StatusCode::PAYMENT_REQUIRED, Json(corps)).into_response())
 }
 
 /// « Bibliothèque → bibliothèque » n'est pas un transfert : rien n'est à
