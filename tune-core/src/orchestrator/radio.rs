@@ -214,6 +214,33 @@ pub(crate) fn is_hls_manifest(url: &str, content_type: &str) -> bool {
         .eq_ignore_ascii_case("application/vnd.apple.mpegurl")
 }
 
+/// #5716 — le codec reconnu par la sonde de décodage est retenu dans
+/// `radio_stations`, pour la station d'adresse `station_url` (le `source_id`
+/// d'une lecture radio EST l'adresse de la station). Les stations livrées avec
+/// Tune ont `codec = NULL` : sans cette écriture, aucun écran ne pouvait dire si
+/// une station est en AAC ou en MP3. Un codec déjà connu n'est jamais remplacé.
+pub(crate) fn retenir_le_codec_de_la_station(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    session: &crate::http::streamer::StreamSession,
+    station_url: Option<&str>,
+) {
+    let Some(station_url) = station_url.filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let db = db.clone();
+    let station_url = station_url.to_string();
+    session.au_premier_codec_radio(Box::new(move |codec| {
+        let repo = crate::db::radio_repo::RadioRepo::with_backend(db);
+        match repo.remplir_le_codec_observe(&station_url, codec) {
+            Ok(0) => {}
+            Ok(_) => tracing::info!(url = %station_url, codec, "radio_codec_observe_retenu"),
+            Err(error) => {
+                tracing::warn!(url = %station_url, codec, %error, "radio_codec_observe_non_retenu")
+            }
+        }
+    }));
+}
+
 /// Applique l'EQ au PCM radio déjà décodé, avant sa quantification au format de sortie.
 /// `None` est une identité stricte : les chemins sans EQ conservent exactement
 /// les mêmes échantillons et ne paient aucun traitement supplémentaire.
