@@ -337,6 +337,29 @@ pub enum SuivantePreparee {
     Inconnue,
 }
 
+/// #3967 — l'appareil ANNONCE-t-il `SetNextAVTransportURI` ?
+///
+/// L'action est OPTIONNELLE dans AVTransport:1 : seul le descriptif de
+/// service (SCPD) de l'appareil dit s'il la propose. Un renderer qui ne
+/// l'annonce pas n'enchaîne pas de lui-même ; lui poser une suivante ne
+/// sert qu'à faire attendre une transition qui ne viendra pas.
+///
+/// Seul [`Self::NonAnnoncee`] change une conduite : on n'arme pas, et la fin
+/// de piste enchaîne aussitôt comme pour un renderer qui refuse. Un SCPD
+/// injoignable ou illisible vaut [`Self::Inconnue`], c'est-à-dire
+/// l'armement d'avant, au mot près.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnonceSuivante {
+    /// Le SCPD d'AVTransport liste l'action `SetNextAVTransportURI`.
+    Annoncee,
+    /// Le SCPD a été lu, c'est bien une liste d'actions, et l'action n'y
+    /// figure pas.
+    NonAnnoncee,
+    /// Pas de SCPD connu, injoignable ou illisible : on ne conclut rien.
+    Inconnue,
+}
+
 /// #4382 — ce que le TRANSPORT de l'appareil déclare jouer et tenir en
 /// suivante, lu à la source (UPnP : `GetMediaInfo` → `CurrentURI`,
 /// `NextURI`).
@@ -2250,6 +2273,16 @@ pub trait OutputTarget: Send + Sync {
     /// répondre garde exactement la conduite d'avant, c'est-à-dire le repli.
     async fn suivante_preparee(&self, _url: &str) -> SuivantePreparee {
         SuivantePreparee::Inconnue
+    }
+
+    /// #3967 — l'appareil annonce-t-il `SetNextAVTransportURI` dans son
+    /// descriptif de service ? Lu AVANT de résoudre la suivante : un appareil
+    /// qui ne l'annonce pas n'est pas armé du tout.
+    ///
+    /// Défaut [`AnnonceSuivante::Inconnue`] : toute sortie qui ne sait pas
+    /// répondre est armée exactement comme avant.
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        AnnonceSuivante::Inconnue
     }
 
     /// #3967 — demander à l'appareil de passer LUI-MÊME à la suivante qu'il a

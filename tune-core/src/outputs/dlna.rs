@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{
-    MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee,
-    TransportState,
+    AnnonceSuivante, MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia,
+    SuivantePreparee, TransportState,
 };
 use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
@@ -589,6 +589,14 @@ pub struct DlnaOutput {
     /// abouti : un échec réseau ne fige pas le profil standard pour la vie
     /// du processus.
     profil_volume: tokio::sync::OnceCell<super::dlna_profil_volume::ProfilVolume>,
+    /// #3967 — URL du SCPD d'`AVTransport`, telle que le descriptif de
+    /// l'appareil l'annonce. `None` : sortie construite sans descriptif, la
+    /// suivante est armée comme avant.
+    scpd_av_transport: std::sync::RwLock<Option<String>>,
+    /// #3967 — ce que ce SCPD dit de `SetNextAVTransportURI`, lu UNE fois.
+    /// Vide tant que la lecture n'a pas abouti : un échec réseau ne fige
+    /// rien, l'armement suivant relira.
+    annonce_suivante: tokio::sync::OnceCell<AnnonceSuivante>,
     /// #5575 — débit des lignes INFO d'acquittement de `SetVolume` (voir
     /// [`super::dlna_journal_volume`]). Partagé avec la tâche de rattrapage
     /// qui écrit la dernière valeur d'un glissement.
@@ -737,6 +745,8 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
+            scpd_av_transport: std::sync::RwLock::new(None),
+            annonce_suivante: tokio::sync::OnceCell::new(),
             journal_volume: Arc::default(),
             volume_relu: AtomicBool::new(false),
             niveau_acquitte: Arc::default(),
@@ -943,6 +953,72 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #3967 — l'URL du SCPD d'`AVTransport`, absolue. Sans elle, la
+    /// suivante est armée comme avant (verdict `Inconnue`).
+    pub fn with_av_transport_scpd(self, url: Option<String>) -> Self {
+        *self
+            .scpd_av_transport
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
+        self
+    }
+
+    /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
+    /// lu au premier armement puis retenu. Un SCPD injoignable ou illisible
+    /// rend `Inconnue` SANS le retenir.
+    async fn lire_annonce_suivante(&self) -> AnnonceSuivante {
+        if let Some(a) = self.annonce_suivante.get() {
+            return *a;
+        }
+        let url = self
+            .scpd_av_transport
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(url) = url else {
+            return AnnonceSuivante::Inconnue;
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            resp.text().await.map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("délai dépassé".to_string()));
+        match lu {
+            Ok(xml) => {
+                let annonce = super::dlna_annonce_suivante::depuis_scpd(&xml);
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    annonce = ?annonce,
+                    "dlna_scpd_avtransport_lu"
+                );
+                if annonce != AnnonceSuivante::Inconnue {
+                    let _ = self.annonce_suivante.set(annonce);
+                }
+                annonce
+            }
+            Err(raison) => {
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    url = %url,
+                    raison = %raison,
+                    "dlna_scpd_avtransport_illisible — suivante armée comme avant"
+                );
+                AnnonceSuivante::Inconnue
+            }
+        }
     }
 
     /// #5793 — le profil de volume de l'appareil, lu dans son SCPD à la
@@ -2984,6 +3060,10 @@ impl OutputTarget for DlnaOutput {
             .send()
             .await
             .is_ok()
+    }
+
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        self.lire_annonce_suivante().await
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
