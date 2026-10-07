@@ -313,3 +313,55 @@ async fn le_verrou_global_arme_apres_coup_ramene_la_zone_a_100_5695() {
     assert_eq!(banc.volume_en_base(), 100.0);
     assert_eq!(banc.commandes_depuis(deja).await, vec![1.0]);
 }
+
+/// #5662 — sur le VRAI tick, hors PURE : l'appareil passe de lui-même à
+/// 100 %. Tune ne l'adopte pas (la règle reste), n'envoie aucune commande
+/// (il n'impose rien), et le SIGNALE : un `zone.volume_externe` à
+/// l'ouverture, aucun pendant l'épisode, un à la fin.
+#[tokio::test]
+async fn un_renderer_a_100_est_signale_sans_etre_adopte_ni_corrige_5662() {
+    let mut banc = Banc::monter(false).await;
+    banc.zone_a(42.0).await;
+    banc.appareil_a(0.42).await;
+    banc.tic().await;
+    let deja = banc.appareil_a(1.0).await;
+    for _ in 0..5 {
+        banc.tic().await;
+    }
+    let mut externes = Vec::new();
+    while let Ok(e) = banc.recu.try_recv() {
+        if e.event_type == "zone.volume_externe" {
+            externes.push(e.data);
+        }
+    }
+    assert_eq!(
+        externes.len(),
+        1,
+        "un seul signal pour cinq tours à 100 % : {externes:?}"
+    );
+    assert_eq!(externes[0]["zone_id"], banc.zone_id);
+    assert_eq!(externes[0]["actif"], true);
+    assert_eq!(externes[0]["renderer_volume"], 1.0);
+    assert_eq!(externes[0]["tune_volume"], 0.42);
+    assert_eq!(
+        banc.volume_en_base(),
+        42.0,
+        "le 100 % de l'appareil ne doit pas être adopté"
+    );
+    assert!(
+        banc.commandes_depuis(deja).await.is_empty(),
+        "Tune signale et n'impose rien : aucune commande de volume"
+    );
+
+    banc.appareil_a(0.42).await;
+    banc.tic().await;
+    banc.tic().await;
+    let mut fins = Vec::new();
+    while let Ok(e) = banc.recu.try_recv() {
+        if e.event_type == "zone.volume_externe" {
+            fins.push(e.data);
+        }
+    }
+    assert_eq!(fins.len(), 1, "une seule fin d'épisode : {fins:?}");
+    assert_eq!(fins[0]["actif"], false);
+}
