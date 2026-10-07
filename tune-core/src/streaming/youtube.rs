@@ -33,15 +33,84 @@ const NATIVE_FAILURE_THRESHOLD: u32 = 2;
 const NATIVE_CIRCUIT_COOLDOWN_SECS: u64 = 15 * 60;
 
 // ---------------------------------------------------------------------------
-// Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
+// Google OAuth 2.0 — Device Code Flow
 // ---------------------------------------------------------------------------
 
+/// Client de REPLI : le client « YouTube TV » public, qui n'appartient pas à
+/// Tune. Il ne sert que si aucun client à nous n'est configuré (voir
+/// [`ClientOAuth::resoudre`]).
 const GOOGLE_CLIENT_ID: &str =
     "43212718137-t3p59j0tov6ak6jdsuj9leqpdmmmqpt4.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET: &str = "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";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Portée du client de repli, inchangée : c'est celle que les comptes déjà
+/// connectés ont accordée.
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+/// Portée de NOTRE client : Tune ne fait que LIRE le compte (#5247).
+const GOOGLE_SCOPE_LECTURE: &str = "https://www.googleapis.com/auth/youtube.readonly";
+
+/// Variables d'environnement du client OAuth Google de Tune (#5247). Lues à
+/// l'EXÉCUTION en priorité, sinon figées à la COMPILATION (`option_env!`, pour
+/// les binaires publiés : le secret vient alors d'un secret de CI, jamais du
+/// dépôt).
+pub const ENV_CLIENT_ID: &str = "TUNE_YOUTUBE_CLIENT_ID";
+pub const ENV_CLIENT_SECRET: &str = "TUNE_YOUTUBE_CLIENT_SECRET";
+
+/// Le client OAuth Google employé pour la connexion au compte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientOAuth {
+    pub id: String,
+    pub secret: String,
+    pub scope: &'static str,
+    /// Vrai pour le client de repli (YouTube TV public).
+    pub repli: bool,
+}
+
+impl ClientOAuth {
+    /// Exécution, puis compilation, puis repli. Une paire n'est retenue que
+    /// COMPLÈTE : un identifiant sans son secret (ou l'inverse) ne fabrique
+    /// pas un client à moitié configuré, qui échouerait au premier échange.
+    pub fn resoudre(
+        execution: (Option<&str>, Option<&str>),
+        compilation: (Option<&str>, Option<&str>),
+    ) -> Self {
+        let complet = |(id, secret): (Option<&str>, Option<&str>)| match (
+            id.map(str::trim).filter(|v| !v.is_empty()),
+            secret.map(str::trim).filter(|v| !v.is_empty()),
+        ) {
+            (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
+            _ => None,
+        };
+        match complet(execution).or_else(|| complet(compilation)) {
+            Some((id, secret)) => Self {
+                id,
+                secret,
+                scope: GOOGLE_SCOPE_LECTURE,
+                repli: false,
+            },
+            None => Self {
+                id: GOOGLE_CLIENT_ID.into(),
+                secret: GOOGLE_CLIENT_SECRET.into(),
+                scope: GOOGLE_SCOPE,
+                repli: true,
+            },
+        }
+    }
+
+    /// Le client de ce processus : environnement, puis valeurs de compilation.
+    pub fn depuis_l_environnement() -> Self {
+        let id = std::env::var(ENV_CLIENT_ID).ok();
+        let secret = std::env::var(ENV_CLIENT_SECRET).ok();
+        Self::resoudre(
+            (id.as_deref(), secret.as_deref()),
+            (
+                option_env!("TUNE_YOUTUBE_CLIENT_ID"),
+                option_env!("TUNE_YOUTUBE_CLIENT_SECRET"),
+            ),
+        )
+    }
+}
 /// OAuth 2.0 Device Authorization Grant type (RFC 8628). The URN segment is
 /// `grant-type` with a HYPHEN — an underscore makes Google reject the token
 /// poll with "Invalid grant_type", so device-code login never completes.
@@ -354,6 +423,8 @@ pub struct YouTubeService {
     ytm_base: String,
     /// Racine de l'API YouTube Data v3. `YT_API_BASE` en production.
     data_api_base: String,
+    /// Client OAuth Google de la connexion au compte (#5247).
+    oauth: ClientOAuth,
     enabled_override: Option<bool>,
 
     // -- OAuth state ----------------------------------------------------------
@@ -397,6 +468,11 @@ impl YouTubeService {
             api_key,
             ytm_base: YTM_API_BASE.into(),
             data_api_base: YT_API_BASE.into(),
+            oauth: {
+                let c = ClientOAuth::depuis_l_environnement();
+                info!(repli = c.repli, scope = c.scope, "youtube_client_oauth");
+                c
+            },
             enabled_override: None,
             // OAuth — not authenticated until user completes Device Code flow
             access_token: None,
@@ -929,7 +1005,10 @@ impl YouTubeService {
             .client
             .post(GOOGLE_DEVICE_CODE_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("client_id={GOOGLE_CLIENT_ID}&scope={GOOGLE_SCOPE}"))
+            .body(format!(
+                "client_id={}&scope={}",
+                self.oauth.id, self.oauth.scope
+            ))
             .send()
             .await
             .map_err(|e| {
@@ -1006,10 +1085,11 @@ impl YouTubeService {
             .post(GOOGLE_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
-                "client_id={GOOGLE_CLIENT_ID}\
-                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                "client_id={}\
+                 &client_secret={}\
                  &device_code={device_code}\
-                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}"
+                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}",
+                self.oauth.id, self.oauth.secret
             ))
             .send()
             .await
@@ -1097,10 +1177,11 @@ impl YouTubeService {
             .post(GOOGLE_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
-                "client_id={GOOGLE_CLIENT_ID}\
-                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                "client_id={}\
+                 &client_secret={}\
                  &refresh_token={refresh_token}\
-                 &grant_type=refresh_token"
+                 &grant_type=refresh_token",
+                self.oauth.id, self.oauth.secret
             ))
             .send()
             .await
@@ -3588,6 +3669,42 @@ impl StreamingService for YouTubeService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // #5247 — le client OAuth de Tune remplace le client TV public dès qu'il
+    // est configuré, et seulement s'il l'est entièrement.
+    #[test]
+    fn client_oauth_repli_sans_configuration() {
+        let c = ClientOAuth::resoudre((None, None), (None, None));
+        assert!(c.repli);
+        assert_eq!(c.id, GOOGLE_CLIENT_ID);
+        assert_eq!(c.scope, GOOGLE_SCOPE);
+    }
+
+    #[test]
+    fn client_oauth_de_tune_en_lecture_seule() {
+        let c = ClientOAuth::resoudre((Some(" id-tune "), Some("secret-tune")), (None, None));
+        assert!(!c.repli);
+        assert_eq!(
+            (c.id.as_str(), c.secret.as_str()),
+            ("id-tune", "secret-tune")
+        );
+        assert_eq!(c.scope, "https://www.googleapis.com/auth/youtube.readonly");
+    }
+
+    #[test]
+    fn client_oauth_execution_avant_compilation_et_paire_complete_seulement() {
+        let c = ClientOAuth::resoudre(
+            (Some("id-exec"), Some("secret-exec")),
+            (Some("id-build"), Some("secret-build")),
+        );
+        assert_eq!(c.id, "id-exec");
+        // Un identifiant d'exécution SANS secret ne casse pas le client de
+        // compilation : il est ignoré.
+        let c = ClientOAuth::resoudre((Some("id-exec"), None), (Some("id-build"), Some("s")));
+        assert_eq!(c.id, "id-build");
+        let c = ClientOAuth::resoudre((Some("id-exec"), Some("  ")), (None, None));
+        assert!(c.repli);
+    }
 
     #[test]
     fn youtube_service_name() {

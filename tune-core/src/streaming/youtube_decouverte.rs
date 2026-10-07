@@ -313,6 +313,46 @@ pub fn code_pays(brut: &str) -> Option<String> {
     (c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase())).then_some(c)
 }
 
+/// Réglage serveur du pays des tendances (`PUT /system/config`). Vide ou
+/// absent : automatique.
+pub const CLE_PAYS_TENDANCES: &str = "youtube_charts_country";
+
+/// D'où vient le pays retenu pour les tendances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginePays {
+    /// Le réglage explicite du service YouTube.
+    Reglage,
+    /// Le `?country=` de la requête : la langue du navigateur, côté web.
+    Requete,
+    /// Ni l'un ni l'autre : le classement mondial.
+    Monde,
+}
+
+impl OriginePays {
+    pub fn cle(self) -> &'static str {
+        match self {
+            Self::Reglage => "setting",
+            Self::Requete => "request",
+            Self::Monde => "world",
+        }
+    }
+}
+
+/// Le pays des tendances : le RÉGLAGE explicite l'emporte sur la requête (le
+/// web y envoie la région de la langue du navigateur, un défaut), puis le
+/// monde (`ZZ`). Un réglage illisible est ignoré plutôt que de bloquer
+/// l'écran ; une requête illisible est rendue telle quelle et sera refusée
+/// par [`code_pays`] en aval.
+pub fn choisir_pays(reglage: Option<&str>, requete: Option<&str>) -> (String, OriginePays) {
+    if let Some(p) = reglage.and_then(code_pays) {
+        return (p, OriginePays::Reglage);
+    }
+    match requete.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => (r.to_string(), OriginePays::Requete),
+        None => ("ZZ".into(), OriginePays::Monde),
+    }
+}
+
 #[cfg(test)]
 #[path = "youtube_decouverte_tests.rs"]
 mod tests;

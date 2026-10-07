@@ -1688,19 +1688,33 @@ struct ChartsQuery {
     country: Option<String>,
 }
 
-/// GET /streaming/youtube/charts?country=FR → `{country, sections: Rayon[]}`.
-/// Sans `country`, les tendances mondiales (`ZZ`).
+/// GET /streaming/youtube/charts?country=FR → `{country, country_source,
+/// sections: Rayon[]}`. Pays : réglage `youtube_charts_country`, sinon
+/// `country`, sinon le monde (`ZZ`).
 async fn youtube_charts(
     State(state): State<StreamingHttpState>,
     Query(q): Query<ChartsQuery>,
 ) -> Response {
-    let pays = q.country.unwrap_or_else(|| "ZZ".into());
-    with_youtube!(&state, |yt| svc_response_editorial(
-        yt.tendances(&pays).await.map(|sections| json!({
+    // Le réglage explicite du service l'emporte ; à défaut, le `?country=`
+    // (le web y envoie la région de la langue du navigateur), puis le monde.
+    let reglage = SettingsRepo::with_backend(state.backend.clone())
+        .get(tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES)
+        .ok()
+        .flatten();
+    let (pays, origine) = tune_core::streaming::youtube_decouverte::choisir_pays(
+        reglage.as_deref(),
+        q.country.as_deref(),
+    );
+    // PAS de cache navigateur ici (`svc_response`, pas `_editorial`) : la même
+    // URL change de pays dès que le réglage change, et le serveur garde déjà
+    // les rayons trente minutes.
+    with_youtube!(&state, |yt| svc_response(yt.tendances(&pays).await.map(
+        |sections| json!({
             "country": pays.trim().to_ascii_uppercase(),
+            "country_source": origine.cle(),
             "sections": sections,
-        }))
-    ))
+        })
+    )))
 }
 
 /// GET /streaming/youtube/moods → `CategorieAmbiances[]` (un TABLEAU : c'est

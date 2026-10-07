@@ -122,3 +122,29 @@ fn code_pays_refuse_ce_qui_n_est_pas_deux_lettres() {
         assert_eq!(code_pays(mauvais), None, "{mauvais}");
     }
 }
+
+#[test]
+fn le_reglage_du_pays_l_emporte_sur_la_langue_du_navigateur() {
+    assert_eq!(
+        choisir_pays(Some("de"), Some("FR")),
+        ("DE".to_string(), OriginePays::Reglage)
+    );
+    assert_eq!(
+        choisir_pays(None, Some("FR")),
+        ("FR".to_string(), OriginePays::Requete)
+    );
+    // Réglage vide = automatique.
+    assert_eq!(
+        choisir_pays(Some(""), Some("FR")),
+        ("FR".to_string(), OriginePays::Requete)
+    );
+    assert_eq!(
+        choisir_pays(None, None),
+        ("ZZ".to_string(), OriginePays::Monde)
+    );
+    // Un réglage illisible n'écrase pas la requête.
+    assert_eq!(
+        choisir_pays(Some("xyz"), None),
+        ("ZZ".to_string(), OriginePays::Monde)
+    );
+}

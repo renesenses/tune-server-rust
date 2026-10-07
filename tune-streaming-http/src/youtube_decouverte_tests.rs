@@ -56,7 +56,8 @@ async fn innertube(
     }
     let nom = match corps["browseId"].as_str().unwrap_or("") {
         "FEmusic_home" => "home",
-        "FEmusic_charts" if corps["formData"]["selectedValues"] == json!(["FR"]) => "charts_fr",
+        // Le pays demandé est vérifié par les témoins dans `vus`.
+        "FEmusic_charts" => "charts_fr",
         "FEmusic_moods_and_genres" => "moods",
         "FEmusic_moods_and_genres_category" if corps["params"] == "ggMPOg1uX1JOQWZFeDByc2Jm" => {
             "mood_category"
@@ -146,8 +147,11 @@ async fn etat(
     }
     let mut registre = ServiceRegistry::new();
     registre.register(Box::new(yt));
-    let backend: Arc<dyn DbBackend> =
-        Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+    // Schéma complet : la route des tendances lit le réglage du pays.
+    let db = SqliteDb::open_in_memory().expect("sqlite en memoire");
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
     (
         StreamingHttpState::new(
             backend,
@@ -212,10 +216,37 @@ async fn tendances_du_pays_demande() {
     let (statut, v, texte) = corps(youtube_charts(State(etat), q).await).await;
     assert_eq!(statut, StatusCode::OK, "{texte}");
     assert_eq!(v["country"], "FR");
+    assert_eq!(v["country_source"], "request");
     assert_eq!(titres(&v["sections"]), ["Video charts", "Top artists"]);
     assert_eq!(v["sections"][0]["items"][0]["title"], "Trending 20 France");
     assert_eq!(v["sections"][1]["items"][0]["kind"], "artist");
     assert!(vus.lock().unwrap()[0].contains(r#""selectedValues":["FR"]"#));
+}
+
+/// Le RÉGLAGE explicite du pays l'emporte sur la langue du navigateur que le
+/// web envoie en `?country=`.
+#[tokio::test]
+async fn le_reglage_du_pays_l_emporte_sur_la_requete() {
+    let (etat, vus) = etat(false, ModeData::Normal, false).await;
+    SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES,
+            "DE",
+        )
+        .unwrap();
+    let q = Query(ChartsQuery {
+        country: Some("FR".into()),
+    });
+    let r = youtube_charts(State(etat), q).await;
+    assert!(
+        r.headers().get(axum::http::header::CACHE_CONTROL).is_none(),
+        "pas de cache navigateur : la même URL change de pays avec le réglage"
+    );
+    let (statut, v, texte) = corps(r).await;
+    assert_eq!(statut, StatusCode::OK, "{texte}");
+    assert_eq!(v["country"], "DE");
+    assert_eq!(v["country_source"], "setting");
+    assert!(vus.lock().unwrap()[0].contains(r#""selectedValues":["DE"]"#));
 }
 
 #[tokio::test]

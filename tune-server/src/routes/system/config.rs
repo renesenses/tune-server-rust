@@ -326,6 +326,11 @@ pub(super) async fn get_config(
         ("tidal_enabled", json!(true)),
         ("qobuz_enabled", json!(true)),
         ("youtube_enabled", json!(true)),
+        // #5247 — pays des tendances YouTube Music ; vide = automatique.
+        (
+            tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES,
+            json!(""),
+        ),
         ("spotify_enabled", json!(false)),
         ("deezer_enabled", json!(true)),
         ("amazon_music_enabled", json!(false)),
@@ -1222,6 +1227,72 @@ fn normaliser_plafond_aleatoire(
     Ok(())
 }
 
+/// #5247 — pays des tendances YouTube Music. Vide, `null` ou `auto` :
+/// automatique (la langue du navigateur, sinon le monde), écrit `""`. Sinon un
+/// code à deux lettres, écrit en MAJUSCULES (`ZZ` = monde). Toute autre valeur
+/// est REFUSÉE en le disant, jamais retenue pour être ignorée à la lecture.
+fn normaliser_pays_tendances_youtube(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    let cle = tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES;
+    let Some(brut) = values.get(cle) else {
+        return Ok(());
+    };
+    let texte = match brut {
+        Value::Null => String::new(),
+        Value::String(s) => s.trim().to_string(),
+        autre => autre.to_string(),
+    };
+    let normalise = if texte.is_empty() || texte.eq_ignore_ascii_case("auto") {
+        String::new()
+    } else {
+        tune_core::streaming::youtube_decouverte::code_pays(&texte).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "{cle} : code pays à deux lettres attendu (FR, DE, ZZ pour le monde) ou vide pour automatique, reçu {texte:?}"
+            ))
+        })?
+    };
+    values.insert(cle.to_string(), Value::String(normalise));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests_pays_tendances_youtube_5247 {
+    use super::*;
+
+    /// `AppError` n'est pas `Debug` : le refus devient `Err(())`.
+    fn normalise(v: Value) -> Result<Value, ()> {
+        let mut m = serde_json::Map::new();
+        m.insert("youtube_charts_country".into(), v);
+        normaliser_pays_tendances_youtube(&mut m).map_err(|_| ())?;
+        Ok(m["youtube_charts_country"].clone())
+    }
+
+    #[test]
+    fn code_ecrit_en_majuscules_et_automatique_ecrit_vide() {
+        assert_eq!(normalise(json!(" de ")).unwrap(), json!("DE"));
+        assert_eq!(normalise(json!("zz")).unwrap(), json!("ZZ"));
+        for auto in [json!(""), json!(null), json!("auto"), json!("AUTO")] {
+            assert_eq!(normalise(auto).unwrap(), json!(""));
+        }
+    }
+
+    #[test]
+    fn valeur_illisible_refusee() {
+        for mauvais in [json!("FRA"), json!("F1"), json!(33), json!(true)] {
+            assert!(normalise(mauvais.clone()).is_err(), "{mauvais}");
+        }
+    }
+
+    #[test]
+    fn autres_cles_intactes() {
+        let mut m = serde_json::Map::new();
+        m.insert("zone_auto_create".into(), json!(true));
+        assert!(normaliser_pays_tendances_youtube(&mut m).is_ok());
+        assert_eq!(m.len(), 1);
+    }
+}
+
 /// « Analyser la bibliothèque au démarrage » : un booléen (ou `"true"` /
 /// `"false"`), écrit normalisé ; `null` efface le choix et rend la décision à
 /// la configuration de déploiement. Toute autre valeur est REFUSÉE. Rend
@@ -1328,6 +1399,7 @@ pub(super) async fn update_config(
     // valeur hors bornes ou illisible est REFUSÉE en nommant les bornes, au
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
+    normaliser_pays_tendances_youtube(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
