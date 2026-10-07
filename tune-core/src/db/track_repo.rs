@@ -1014,11 +1014,27 @@ pub mod sql {
         )
     }
 
+    /// L'ordre des pistes d'UN album : disque, puis numéro, les pistes SANS
+    /// numéro en dernier, puis titre (b209).
+    ///
+    /// 0 et NULL disent tous deux « numéro inconnu » : le scan local range 0,
+    /// l'import UPnP range NULL. SQLite place NULL EN TÊTE d'un tri croissant,
+    /// PostgreSQL EN FIN : sans le `CASE`, la même fiche s'ordonnait
+    /// différemment selon le moteur, et une piste sans numéro passait devant
+    /// la piste 1. Le troisième terme rend NULL pour TOUTE piste sans numéro,
+    /// pour que 0 et NULL se départagent par le titre sur les deux moteurs.
+    /// Un disque inconnu (NULL ou 0) est le disque 1.
+    pub const ORDRE_DANS_L_ALBUM: &str = "COALESCE(NULLIF(CAST(t.disc_number AS INTEGER), 0), 1), \
+         CASE WHEN COALESCE(CAST(t.track_number AS INTEGER), 0) > 0 THEN 0 ELSE 1 END, \
+         CASE WHEN CAST(t.track_number AS INTEGER) > 0 THEN CAST(t.track_number AS INTEGER) END, \
+         t.title";
+
     pub fn list_by_album<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.album_id = {} ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+            "{} WHERE t.album_id = {} ORDER BY {}",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            ORDRE_DANS_L_ALBUM
         )
     }
 
@@ -2809,7 +2825,8 @@ impl TrackRepo {
             .join(",");
         let sql = format!(
             "SELECT t.id, t.album_id FROM tracks t WHERE t.album_id IN ({id_list}) \
-             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title, t.id"
+             ORDER BY {}, t.id",
+            sql::ORDRE_DANS_L_ALBUM
         );
         let rows = self.db.query_many(&sql, &[])?;
         Ok(rows
@@ -6278,5 +6295,121 @@ mod tests_doubtful_source_locale_20260927 {
             "le compte doit valoir la liste"
         );
         assert_eq!(liste, 2, "les deux pistes locales, pas la distante");
+    }
+}
+
+/// b209 — l'ordre des pistes d'un album, et le rattrapage des numéros 0 que
+/// l'import UPnP rangeait sur chaque piste.
+#[cfg(test)]
+pub(crate) mod tests_b209_ordre_dans_l_album {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    /// `(id, titre, disque, numéro, source)` — un album où disque et numéro
+    /// sont tantôt dits, tantôt NULL, tantôt 0.
+    pub(crate) const PISTES: [(i64, &str, Option<i64>, Option<i64>, &str); 6] = [
+        (1, "Alive", Some(1), Some(3), "upnp"),
+        (2, "Believer", Some(1), Some(1), "upnp"),
+        (3, "Aaa sans numéro", None, None, "upnp"),
+        (4, "Dreaming", None, Some(2), "upnp"),
+        (5, "Zéro", Some(1), Some(0), "local"),
+        (6, "Disque deux", Some(2), Some(1), "upnp"),
+    ];
+
+    /// Disque (inconnu = 1), numéro, sans numéro en dernier, titre.
+    pub(crate) const ATTENDU: [&str; 6] = [
+        "Believer",
+        "Dreaming",
+        "Alive",
+        "Aaa sans numéro",
+        "Zéro",
+        "Disque deux",
+    ];
+
+    fn banc() -> (Arc<SqliteDb>, Arc<dyn DbBackend>) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let sqlite = Arc::new(db);
+        let db: Arc<dyn DbBackend> = sqlite.clone();
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Album')", &[])
+            .unwrap();
+        for (id, titre, disque, numero, source) in PISTES {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, 1000)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &titre.to_string(),
+                    &disque,
+                    &numero,
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        }
+        (sqlite, db)
+    }
+
+    #[test]
+    fn b209_les_pistes_sans_numero_passent_apres_les_numerotees() {
+        let (_s, db) = banc();
+        let repo = TrackRepo::with_backend(db);
+        let titres: Vec<String> = repo
+            .list_by_album(1)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(
+            titres, ATTENDU,
+            "sans le correctif, SQLite place NULL en tête : la piste sans \
+             numéro et celle sans disque passaient devant la piste 1"
+        );
+        let ids: Vec<i64> = repo
+            .ids_by_album_ids(&[1])
+            .unwrap()
+            .into_iter()
+            .map(|(piste, _)| piste)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 4, 1, 3, 5, 6],
+            "même ordre pour « jouer l'album »"
+        );
+    }
+
+    #[test]
+    fn b209_le_demarrage_remet_a_null_les_zeros_upnp_et_seulement_eux() {
+        let (sqlite, db) = banc();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES (7, 'Ancien import', 1, 0, 0, 'upnp', 1000)",
+            &[],
+        )
+        .unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let valeur = |id: i64, colonne: &str| {
+            db.query_one(
+                &format!("SELECT {colonne} FROM tracks WHERE id = ?1"),
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_i64())
+        };
+        assert_eq!(valeur(7, "track_number"), None, "sans le rattrapage : 0");
+        assert_eq!(valeur(7, "disc_number"), None);
+        assert_eq!(
+            valeur(5, "track_number"),
+            Some(0),
+            "une piste locale n'est pas touchée"
+        );
+        assert_eq!(valeur(2, "track_number"), Some(1), "un vrai numéro reste");
+        assert_eq!(valeur(1, "disc_number"), Some(1));
     }
 }

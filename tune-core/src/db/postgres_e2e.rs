@@ -3060,3 +3060,91 @@ async fn pg_bio_reecrite_a_la_main_oublie_sa_provenance() {
     );
     assert_eq!(repo.bio_provenance(id).unwrap(), None);
 }
+
+/// b209 — l'ordre des pistes d'un album et le rattrapage des numéros 0 UPnP,
+/// sur PostgreSQL. Jumeau de `track_repo::tests_b209_ordre_dans_l_album` :
+/// PostgreSQL place NULL EN FIN d'un tri croissant, SQLite EN TÊTE — la même
+/// fiche doit rendre le même ordre sur les deux moteurs.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::track_repo::TrackRepo;
+    use crate::db::track_repo::tests_b209_ordre_dans_l_album::{ATTENDU, PISTES};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    reset_schema(&db);
+    let album = db
+        .execute_returning_id("INSERT INTO albums (title) VALUES ('Album b209')", &[])
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (id, titre, disque, numero, source) in PISTES {
+        let nouvel = db
+            .execute_returning_id(
+                "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES ($1, $2, $3, $4, $5, 1000)",
+                &[
+                    &titre.to_string() as &dyn ToSqlValue,
+                    &album,
+                    &disque.map(|v| v as i32),
+                    &numero.map(|v| v as i32),
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        ids.insert(id, nouvel);
+    }
+    let repo = TrackRepo::with_backend(db.clone());
+    let titres: Vec<String> = repo
+        .list_by_album(album)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert_eq!(
+        titres, ATTENDU,
+        "sans le correctif, PostgreSQL place la piste à 0 devant la piste 1"
+    );
+
+    // Rattrapage : un ancien import UPnP à 0 passe à NULL au démarrage, une
+    // piste locale à 0 reste à 0.
+    let ancien = db
+        .execute_returning_id(
+            "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES ('Ancien import', $1, 0, 0, 'upnp', 1000)",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations rejouées");
+    let valeur = |id: i64, colonne: &str| {
+        db.query_one(
+            &format!("SELECT {colonne} FROM tracks WHERE id = $1"),
+            &[&id as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_i64())
+    };
+    assert_eq!(
+        valeur(ancien, "track_number"),
+        None,
+        "sans le rattrapage : 0"
+    );
+    assert_eq!(valeur(ancien, "disc_number"), None);
+    assert_eq!(
+        valeur(ids[&5], "track_number"),
+        Some(0),
+        "piste locale intacte"
+    );
+    assert_eq!(valeur(ids[&2], "track_number"), Some(1));
+}

@@ -400,6 +400,11 @@ struct PisteDistante {
     channels: Option<i32>,
     taille: Option<u64>,
     protocol_info: Option<String>,
+    /// `upnp:originalTrackNumber` — `None` quand le serveur ne le dit pas, ou
+    /// dit 0 : rangé NULL en base, jamais 0 (b209).
+    numero_de_piste: Option<i32>,
+    /// `upnp:originalDiscNumber` — même règle.
+    numero_de_disque: Option<i32>,
 }
 
 fn texte(v: &Value, cle: &str) -> Option<String> {
@@ -412,6 +417,13 @@ fn texte(v: &Value, cle: &str) -> Option<String> {
 
 fn entier(v: &Value, cle: &str) -> Option<u64> {
     v.get(cle).and_then(serde_json::Value::as_u64)
+}
+
+/// Un numéro de piste ou de disque : strictement positif, sinon rien.
+fn numero(v: &Value, cle: &str) -> Option<i32> {
+    entier(v, cle)
+        .and_then(|n| i32::try_from(n).ok())
+        .filter(|n| *n > 0)
 }
 
 impl PisteDistante {
@@ -430,6 +442,8 @@ impl PisteDistante {
             channels: entier(item, "channels").map(|v| v as i32),
             taille: entier(item, "size"),
             protocol_info: texte(item, "protocol_info"),
+            numero_de_piste: numero(item, "track_number"),
+            numero_de_disque: numero(item, "disc_number"),
         })
     }
 
@@ -957,6 +971,10 @@ fn ecrire(
             ligne.channels = ch;
         }
         ligne.file_size = piste.taille.map(|t| t as i64);
+        // Le modèle porte des entiers : 0 / 1 y disent « inconnu ». La base,
+        // elle, reçoit NULL — voir l'`UPDATE` explicite plus bas.
+        ligne.track_number = piste.numero_de_piste.unwrap_or(0);
+        ligne.disc_number = piste.numero_de_disque.unwrap_or(1);
         ligne.source = SOURCE_UPNP.to_string();
         ligne.source_id = Some(cle.clone());
         ligne.cover_path = pochette;
@@ -1004,23 +1022,37 @@ fn ecrire(
         bilan.identites.push(cle);
         // L'édition générale de piste ne touche pas cover_path. La mise à jour
         // de l'instantané UPnP doit donc publier explicitement sa nouvelle image.
-        if ligne.id.is_some() {
-            let sql = match state.backend.engine() {
-                tune_core::db::engine::Engine::Sqlite => {
-                    "UPDATE tracks SET cover_path = ? WHERE id = ? AND source = 'upnp'"
-                }
-                tune_core::db::engine::Engine::Postgres => {
-                    "UPDATE tracks SET cover_path = $1 WHERE id = $2 AND source = 'upnp'"
-                }
-            };
-            if let Err(e) = state.backend.execute(
-                sql,
-                &[&ligne.cover_path as &dyn ToSqlValue, &id as &dyn ToSqlValue],
-            ) {
-                bilan
-                    .erreurs
-                    .push(format!("pochette de « {} » : {e}", piste.titre));
+        //
+        // b209 — les numéros de piste et de disque passent par la MÊME
+        // écriture. `TrackRepo` écrit les entiers du modèle, où l'inconnu vaut
+        // 0 : la base recevait 0 sur chaque piste UPnP, et la fiche d'album se
+        // triait par titre. Ce que le serveur ne dit pas est rangé NULL, ce
+        // qu'il dit est rangé tel quel — à chaque passe, ce qui rattrape aussi
+        // les pistes déjà importées avec 0. Jouée aussi pour une piste NEUVE
+        // (son `cover_path` vient d'être écrit par `create`, à l'identique),
+        // puisque `create` y range 0 lui aussi.
+        let sql = match state.backend.engine() {
+            tune_core::db::engine::Engine::Sqlite => {
+                "UPDATE tracks SET cover_path = ?, track_number = ?, disc_number = ? \
+                 WHERE id = ? AND source = 'upnp'"
             }
+            tune_core::db::engine::Engine::Postgres => {
+                "UPDATE tracks SET cover_path = $1, track_number = $2, disc_number = $3 \
+                 WHERE id = $4 AND source = 'upnp'"
+            }
+        };
+        if let Err(e) = state.backend.execute(
+            sql,
+            &[
+                &ligne.cover_path as &dyn ToSqlValue,
+                &piste.numero_de_piste as &dyn ToSqlValue,
+                &piste.numero_de_disque as &dyn ToSqlValue,
+                &id as &dyn ToSqlValue,
+            ],
+        ) {
+            bilan
+                .erreurs
+                .push(format!("pochette et numéro de « {} » : {e}", piste.titre));
         }
         let mut instantane: HashMap<String, String> = HashMap::new();
         if let Some(url) = &piste.url_de_lecture {
@@ -1214,10 +1246,123 @@ mod tests {
             channels: None,
             taille: None,
             protocol_info: Some("http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".into()),
+            numero_de_piste: None,
+            numero_de_disque: None,
         };
         assert_eq!(p.format().as_deref(), Some("flac"));
         p.protocol_info = None;
         assert_eq!(p.format(), None, "rien n'est inventé quand rien n'est dit");
+    }
+
+    /// b209 — l'import rangeait 0 sur chaque piste UPnP : la fiche d'album
+    /// se triait par titre (Alive, Believer, Dreaming…). Le numéro lu est
+    /// rangé, l'absent est rangé NULL, et une passe suivante rattrape une
+    /// piste déjà importée avec 0.
+    #[test]
+    fn b209_le_numero_de_piste_upnp_est_range_et_ordonne_l_album() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let p = |titre: &str, numero: Option<i32>| PisteDistante {
+            object_id: titre.into(),
+            titre: titre.into(),
+            artiste: Some("Artiste".into()),
+            album: Some("Head First".into()),
+            url_de_lecture: Some(format!("http://exemple/{titre}.flac")),
+            pochette: None,
+            duree_ms: Some(1000),
+            taille: Some(1000),
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            protocol_info: None,
+            numero_de_piste: numero,
+            numero_de_disque: numero.map(|_| 1),
+        };
+        let pistes = vec![
+            p("Alive", Some(3)),
+            p("Believer", Some(1)),
+            p("Aaa sans numéro", None),
+            p("Dreaming", Some(2)),
+        ];
+        let mut bilan = Bilan::default();
+        ecrire(
+            &state,
+            "uuid:test",
+            "NAS",
+            &pistes,
+            &mut bilan,
+            &HashMap::new(),
+        );
+        assert!(bilan.erreurs.is_empty(), "{:?}", bilan.erreurs);
+        let album = album_existant(
+            &state,
+            &cle_d_identite_album("uuid:test", "Head First", Some("Artiste")),
+        )
+        .unwrap();
+        let repo = TrackRepo::with_backend(state.backend.clone());
+        let ordre = |repo: &TrackRepo| -> Vec<(String, i32)> {
+            repo.list_by_album(album)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.title, t.track_number))
+                .collect()
+        };
+        let attendu = vec![
+            ("Believer".to_string(), 1),
+            ("Dreaming".to_string(), 2),
+            ("Alive".to_string(), 3),
+            ("Aaa sans numéro".to_string(), 0),
+        ];
+        assert_eq!(
+            ordre(&repo),
+            attendu,
+            "sans le correctif : 0 partout, ordre du titre"
+        );
+        let zeros = |state: &AppState| {
+            state
+                .backend
+                .query_one(
+                    "SELECT COUNT(*) FROM tracks WHERE source = 'upnp' \
+                     AND (track_number = 0 OR disc_number = 0)",
+                    &[],
+                )
+                .unwrap()
+                .unwrap()[0]
+                .as_i64()
+        };
+        let nuls = state
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM tracks WHERE source = 'upnp' \
+                 AND track_number IS NULL AND disc_number IS NULL",
+                &[],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_i64();
+        assert_eq!(zeros(&state), Some(0), "0 n'est jamais rangé");
+        assert_eq!(nuls, Some(1), "l'absent est rangé NULL");
+
+        // Une base importée AVANT le correctif : 0 partout. La passe suivante
+        // relit les numéros.
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET track_number = 0 WHERE source = 'upnp'",
+                &[],
+            )
+            .unwrap();
+        let mut bilan = Bilan::default();
+        ecrire(
+            &state,
+            "uuid:test",
+            "NAS",
+            &pistes,
+            &mut bilan,
+            &HashMap::new(),
+        );
+        assert_eq!(bilan.mises_a_jour, 4);
+        assert_eq!(ordre(&repo), attendu);
+        assert_eq!(zeros(&state), Some(0));
     }
 
     #[tokio::test]
@@ -1265,6 +1410,8 @@ mod tests {
             bit_depth: None,
             channels: None,
             protocol_info: None,
+            numero_de_piste: None,
+            numero_de_disque: None,
         };
         // La première piste n'annonce pas d'image, la suivante oui.
         let pistes = vec![p("A", None), p("B", Some(url.clone())), p("C", Some(url))];
