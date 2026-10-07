@@ -122,6 +122,16 @@ pub mod sql {
     pub fn count() -> &'static str {
         "SELECT COUNT(*) FROM radio_stations"
     }
+
+    /// #5716 — le codec observé ne remplit qu'un champ VIDE : un codec saisi
+    /// à la main ou servi par l'annuaire reste maître.
+    pub fn remplir_le_codec<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET codec = {} WHERE url = {} AND (codec IS NULL OR codec = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,12 +287,30 @@ impl RadioRepo {
         Ok(())
     }
 
+    /// #5716 — retient le codec que la sonde de lecture a reconnu pour la
+    /// station d'adresse `url`, si la station n'en a aucun. Les stations
+    /// livrées avec Tune ont `codec = NULL` par construction (l'annuaire ne
+    /// sert qu'un champ `quality`) : sans cela, aucun écran ne pouvait dire
+    /// « AAC » ou « MP3 ». Rend le nombre de stations complétées.
+    pub fn remplir_le_codec_observe(&self, url: &str, codec: &str) -> Result<usize, String> {
+        let codec = libelle_du_codec(codec);
+        let sql = self.dialect_sql(sql::remplir_le_codec, sql::remplir_le_codec);
+        let params: [&dyn ToSqlValue; 2] = [&codec, &url];
+        self.db.execute(&sql, &params)
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         match self.db.query_one(sql::count(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
     }
+}
+
+/// #5716 — le codec de sonde (`mp3`, `aac`, `ogg`…) dans la forme des
+/// codecs saisis ou servis par l'annuaire (`MP3`, `AAC`, `OGG`).
+fn libelle_du_codec(codec: &str) -> String {
+    codec.trim().to_ascii_uppercase()
 }
 
 fn row_to_radio(cols: &Vec<SqlValue>) -> RadioStation {
@@ -594,5 +622,65 @@ mod tests {
         };
         let id = repo.create(&station).unwrap();
         assert_eq!(repo.get(id).unwrap().unwrap().name, "X");
+    }
+
+    fn station_5716(url: &str, codec: Option<&str>) -> RadioStation {
+        RadioStation {
+            id: None,
+            name: format!("Station {url}"),
+            url: url.into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: codec.map(Into::into),
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        }
+    }
+
+    /// #5716 — le codec observé remplit une station SANS codec, et une seule :
+    /// celle de cette adresse. Il ne remplace jamais un codec déjà connu.
+    #[test]
+    fn le_codec_observe_remplit_la_station_sans_codec_5716() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = RadioRepo::new(db);
+        let vide = repo
+            .create(&station_5716("http://exemple.test/vide", None))
+            .unwrap();
+        let chaine_vide = repo
+            .create(&station_5716("http://exemple.test/chaine-vide", Some("")))
+            .unwrap();
+        let connue = repo
+            .create(&station_5716("http://exemple.test/connue", Some("MP3")))
+            .unwrap();
+        let autre = repo
+            .create(&station_5716("http://exemple.test/autre", None))
+            .unwrap();
+
+        assert_eq!(
+            repo.remplir_le_codec_observe("http://exemple.test/vide", "aac"),
+            Ok(1)
+        );
+        assert_eq!(
+            repo.remplir_le_codec_observe("http://exemple.test/chaine-vide", "flac"),
+            Ok(1)
+        );
+        assert_eq!(
+            repo.remplir_le_codec_observe("http://exemple.test/connue", "aac"),
+            Ok(0),
+            "un codec déjà connu reste maître"
+        );
+
+        let codec = |id| repo.get(id).unwrap().unwrap().codec;
+        assert_eq!(codec(vide).as_deref(), Some("AAC"));
+        assert_eq!(codec(chaine_vide).as_deref(), Some("FLAC"));
+        assert_eq!(codec(connue).as_deref(), Some("MP3"));
+        assert_eq!(codec(autre), None, "une autre station n'est pas touchée");
     }
 }

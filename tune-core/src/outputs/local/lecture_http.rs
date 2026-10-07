@@ -9,6 +9,7 @@ use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tracing::{debug, warn};
 
 pub(super) const PAS_ANNULATION: Duration = Duration::from_millis(25);
 
@@ -90,18 +91,38 @@ impl CorpsHttp {
 
 impl LecteurHttpAnnulable {
     pub(super) fn ouvrir(url: &str, arret: Arc<AtomicBool>) -> io::Result<Self> {
+        // #5639 — le flux interne de Tune se lit par la boucle locale, jamais
+        // par l'adresse LAN qu'un autre programme peut tenir sur le même port.
+        let cible = super::boucle_locale_5639::adresse_de_lecture(url);
+        if cible.url != url {
+            debug!(url_demandee = %url, url_jointe = %cible.url, "local_flux_interne_par_la_boucle");
+        }
         let moteur = Moteur(Some(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?,
         ));
         let response = moteur.0.as_ref().unwrap().block_on(async {
-            let client = crate::http::client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .map_err(io::Error::other)?;
-            attendre(&arret, client.get(url).send()).await
+            let mut builder =
+                crate::http::client::builder().connect_timeout(Duration::from_secs(10));
+            // Un mandataire n'a rien à faire entre la sortie et son serveur.
+            if cible.flux_interne {
+                builder = builder.no_proxy();
+            }
+            let client = builder.build().map_err(io::Error::other)?;
+            attendre(&arret, client.get(&cible.url).send()).await
         })?;
+        if super::boucle_locale_5639::signaler_le_refus(response.status().as_u16(), &cible) {
+            // Le serveur de flux de Tune ne répond jamais 403 : c'est un
+            // autre programme qui a répondu. On nomme l'adresse jointe.
+            warn!(
+                adresse_jointe = %super::boucle_locale_5639::adresse_jointe(&cible.url),
+                url_demandee = %url,
+                url_jointe = %cible.url,
+                "local_flux_interne_refuse_403 — le flux interne de Tune a été refusé (403) : \
+                 un autre programme répond probablement à cette adresse"
+            );
+        }
         Ok(Self {
             corps: Corps::Http(CorpsHttp {
                 response,

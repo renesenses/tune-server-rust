@@ -28,9 +28,9 @@ pub enum ChannelLayout {
     Surround71,
     /// 10 channels (L, R, C, LFE, Ls, Rs, Lb, Rb, Ltf, Rtf) — 5.1.4
     Surround514,
-    /// 12 channels (L, R, C, LFE, Ls, Rs, Lb, Rb, Ltf, Rtf, Ltr, Rtr) — 7.1.4 Atmos
+    /// 12 channels (L, R, C, LFE, Ls, Rs, Lb, Rb, Ltf, Rtf, Ltr, Rtr) — 7.1.4 (Atmos, Auro-3D)
     Surround714,
-    /// 16 channels — 9.1.6 Auro-3D
+    /// 16 channels — 9.1.6 (Atmos, Auro-3D)
     Surround916,
     /// 24 channels — 13.1.10 or custom immersive
     Immersive24,
@@ -135,16 +135,21 @@ impl ChannelLayout {
         }
     }
 
-    /// Human-readable badge string for UI display (e.g. "5.1", "7.1.4 Atmos").
+    /// Human-readable badge string for UI display (e.g. "5.1", "7.1.4 Atmos / Auro-3D").
     /// Returns `None` for mono/stereo (no badge needed).
+    ///
+    /// #5576 — la disposition est déduite du SEUL nombre de canaux : rien ne
+    /// dit quel format immersif le fichier porte. 7.1.4 et 9.1.6 existent en
+    /// Atmos comme en Auro-3D ; le libellé nomme donc les deux, au lieu d'en
+    /// coller un seul (« 7.1.4 Atmos », « 9.1.6 Auro-3D ») à un simple compte.
     pub fn badge(self) -> Option<&'static str> {
         match self {
             Self::Mono | Self::Stereo => None,
             Self::Surround51 => Some("5.1"),
             Self::Surround71 => Some("7.1"),
             Self::Surround514 => Some("5.1.4"),
-            Self::Surround714 => Some("7.1.4 Atmos"),
-            Self::Surround916 => Some("9.1.6 Auro-3D"),
+            Self::Surround714 => Some("7.1.4 Atmos / Auro-3D"),
+            Self::Surround916 => Some("9.1.6 Atmos / Auro-3D"),
             Self::Immersive24 => Some("Immersive 24ch"),
             Self::Immersive32 => Some("Immersive 32ch"),
         }
@@ -614,8 +619,8 @@ mod tests {
         assert_eq!(channel_badge(2), None);
         assert_eq!(channel_badge(6), Some("5.1"));
         assert_eq!(channel_badge(8), Some("7.1"));
-        assert_eq!(channel_badge(12), Some("7.1.4 Atmos"));
-        assert_eq!(channel_badge(16), Some("9.1.6 Auro-3D"));
+        assert_eq!(channel_badge(12), Some("7.1.4 Atmos / Auro-3D"));
+        assert_eq!(channel_badge(16), Some("9.1.6 Atmos / Auro-3D"));
     }
 
     #[test]
