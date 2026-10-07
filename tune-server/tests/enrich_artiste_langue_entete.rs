@@ -125,8 +125,8 @@ async fn en_interface_anglaise_le_serveur_repond_en_anglais() {
     );
 }
 
-/// Interface française : le français, qui est aussi le repli — d'où le cas
-/// suivant, qui montre que ce n'est pas le repli qui répond ici.
+/// Interface française : le français, qui n'est PAS le repli — c'est donc
+/// bien l'en-tête qui répond ici.
 #[tokio::test]
 async fn en_interface_francaise_le_serveur_repond_en_francais() {
     let app = app_sans_cle_lastfm();
@@ -172,23 +172,22 @@ async fn chaque_langue_de_l_interface_a_son_propre_message() {
     }
 }
 
-/// Sans en-tête, le repli reste le français : un client muet garde le
-/// comportement d'avant.
+/// Sans en-tête, le repli est l'anglais, comme le client web — jamais le
+/// français par défaut.
 #[tokio::test]
-async fn sans_entete_le_repli_reste_le_francais() {
+async fn sans_entete_le_repli_est_l_anglais() {
     let app = app_sans_cle_lastfm();
-    assert_eq!(message(&app, None).await, tune_server::i18n::t("fr", CLE));
+    assert_eq!(message(&app, None).await, tune_server::i18n::t("en", CLE));
 }
 
-/// Une locale que l'interface ne parle pas retombe sur le français, comme
-/// partout ailleurs — et non sur la clé brute.
+/// Une locale que l'interface ne parle pas retombe sur l'anglais, comme
+/// partout ailleurs — et non sur le français ni sur la clé brute.
 #[tokio::test]
-async fn une_locale_non_supportee_retombe_sur_le_francais() {
+async fn une_locale_non_supportee_retombe_sur_l_anglais() {
     let app = app_sans_cle_lastfm();
-    assert_eq!(
-        message(&app, Some("pt-BR,pt;q=0.9")).await,
-        tune_server::i18n::t("fr", CLE)
-    );
+    let texte = message(&app, Some("pt-BR,pt;q=0.9")).await;
+    assert_eq!(texte, tune_server::i18n::t("en", CLE));
+    assert_ne!(texte, tune_server::i18n::t("fr", CLE));
 }
 
 /// Un artiste inconnu reste un 404 : la lecture de l'en-tête ne change rien à

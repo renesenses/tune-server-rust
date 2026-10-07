@@ -1739,6 +1739,10 @@ mod intervalle_reseau_tests_2148 {
 #[cfg(test)]
 #[path = "replaygain_a_chaud_tests_4384.rs"]
 mod replaygain_a_chaud_tests_4384;
+
+#[cfg(test)]
+#[path = "estimation_dossier_tests_2171.rs"]
+mod estimation_dossier_tests_2171;
 #[cfg(test)]
 mod annonce_slimproto_a_chaud_tests {
     use super::*;
@@ -2221,13 +2225,33 @@ pub(super) async fn browse_dirs(
 ) -> (StatusCode, Json<Value>) {
     use super::explorateur;
 
-    let base = q.path.unwrap_or_else(|| {
-        if cfg!(target_os = "windows") {
-            "C:\\".into()
-        } else {
-            "/".into()
+    let base = q
+        .path
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "/".into());
+
+    // Sous Windows, `/` (ou `\`) désigne le poste : la liste des lecteurs.
+    // `C:\` désigne, lui, le CONTENU du lecteur (fil forum 2171) — il rendait
+    // auparavant la liste des lecteurs, et le lecteur système n'était jamais
+    // explorable.
+    #[cfg(target_os = "windows")]
+    if explorateur::liste_des_lecteurs_demandee(&base) {
+        let mut dirs: Vec<Value> = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:\\", letter as char);
+            if std::path::Path::new(&drive).exists() {
+                dirs.push(json!({
+                    "name": format!("{}:", letter as char),
+                    "path": drive,
+                    "has_children": true,
+                }));
+            }
         }
-    });
+        return (
+            StatusCode::OK,
+            Json(json!({ "dirs": dirs, "parent": null, "current": "/", "drives": true })),
+        );
+    }
 
     if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
         tracing::warn!(path = %base, motif = ?refus, "browse_dirs_refuse");
@@ -2264,28 +2288,13 @@ pub(super) async fn browse_dirs(
         );
     }
 
-    let parent = base_path.parent().map(|p| p.to_string_lossy().to_string());
+    let parent = explorateur::parent_a_rendre(
+        &base,
+        base_path.parent().map(|p| p.to_string_lossy().to_string()),
+        cfg!(target_os = "windows"),
+    );
 
     let mut dirs: Vec<Value> = Vec::new();
-
-    // On Windows, list drives when at root
-    #[cfg(target_os = "windows")]
-    if base == "C:\\" || base == "\\" || base == "/" {
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            if std::path::Path::new(&drive).exists() {
-                dirs.push(json!({
-                    "name": format!("{} Drive", letter as char),
-                    "path": drive,
-                    "has_children": true,
-                }));
-            }
-        }
-        return (
-            StatusCode::OK,
-            Json(json!({ "dirs": dirs, "parent": null, "current": base })),
-        );
-    }
 
     if let Ok(entries) = std::fs::read_dir(base_path) {
         for entry in entries.flatten() {
@@ -2343,6 +2352,83 @@ pub(super) async fn browse_dirs(
             "dirs": dirs,
             "parent": parent,
             "current": base_path.to_string_lossy(),
+        })),
+    )
+}
+
+/// `GET /system/browse-dirs/estimate?path=…` — ce que l'ajout de ce dossier
+/// ferait analyser (fil forum 2171).
+///
+/// Une faute de frappe dans le chemin avait fait entrer un disque entier de
+/// 1 To dans la bibliothèque : l'ajout lance l'analyse sur-le-champ, sans rien
+/// dire de son ampleur. Cette route donne au client de quoi demander une
+/// confirmation chiffrée AVANT l'ajout.
+///
+/// Mêmes gardes que [`browse_dirs`] : `RequireAdmin`, puis le périmètre de
+/// [`super::explorateur`] — elle ne lit rien que l'explorateur ne pourrait
+/// déjà lister. Elle ne rend que des NOMBRES, jamais de noms. Le comptage est
+/// borné en durée et en entrées ; au-delà, il rend un minimum marqué
+/// `complete: false`.
+pub(super) async fn estimate_dir(
+    _admin: crate::auth::RequireAdmin,
+    Query(q): Query<BrowseDirsQuery>,
+) -> (StatusCode, Json<Value>) {
+    use super::explorateur;
+
+    let Some(base) = q.path.filter(|p| !p.trim().is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is required" })),
+        );
+    };
+    let base = tune_core::scanner::walker::normalize_path(&base);
+
+    if let Err(refus) = explorateur::verifier_le_chemin_demande(&base) {
+        tracing::warn!(path = %base, motif = ?refus, "estimate_dir_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "path": base, "error": refus.libelle() })),
+        );
+    }
+    let chemin = std::path::PathBuf::from(&base);
+    if !chemin.is_dir() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "path": base, "error": "not a directory" })),
+        );
+    }
+    if !explorateur::la_cible_reste_dans_le_perimetre(&chemin) {
+        tracing::warn!(path = %base, "estimate_dir_refuse_cible_hors_perimetre");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "path": base,
+                "error": explorateur::Refus::ArbreSysteme.libelle(),
+            })),
+        );
+    }
+
+    let debut = std::time::Instant::now();
+    let echeance = debut + explorateur::ESTIMATION_DUREE_MAX;
+    let mesure = tokio::task::spawn_blocking(move || {
+        explorateur::estimer_le_contenu(&chemin, echeance, explorateur::ESTIMATION_ENTREES_MAX)
+    })
+    .await;
+    let Ok(e) = mesure else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "path": base, "error": "estimate failed" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "path": base,
+            "audio_files": e.fichiers_audio,
+            "folders": e.dossiers,
+            "complete": e.complete,
+            "drive_root": base == "/" || explorateur::est_une_racine_de_lecteur(&base),
+            "elapsed_ms": debut.elapsed().as_millis() as u64,
         })),
     )
 }
@@ -4753,9 +4839,13 @@ mod replaygain_source_tests {
         AppState::new(":memory:", 0, Default::default()).unwrap()
     }
 
+    /// Les libellés attendus ci-dessous sont les français : la requête le dit,
+    /// sans quoi le serveur répondrait dans son repli, l'anglais.
     async fn config_de(state: &AppState) -> serde_json::Value {
+        let mut entetes = HeaderMap::new();
+        entetes.insert(axum::http::header::ACCEPT_LANGUAGE, "fr".parse().unwrap());
         get_config(
-            HeaderMap::new(),
+            entetes,
             ActiveProfile(DEFAULT_PROFILE_ID),
             State(state.clone()),
         )

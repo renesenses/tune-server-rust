@@ -1857,6 +1857,11 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
 
+/// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
+/// réseau, même en DSD « natif » : il passe par le décodeur.
+#[cfg(test)]
+mod dst_jamais_brut_au_renderer_4378_tests;
+
 #[cfg(test)]
 mod mesure_saut_cd_5079;
 
