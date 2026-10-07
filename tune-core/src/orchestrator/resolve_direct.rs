@@ -1005,6 +1005,7 @@ impl PlaybackOrchestrator {
 
         let (session_id, tx, data_ready, session) =
             self.streamer.create_radio_session(wav_info, 256).await;
+        retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
         // #4407 — OAAT consomme le WAV égalisé par Tune : un changement
         // d'égaliseur s'y relève en vol. La sortie locale égalise elle-même.
         let en_vol = (!is_local_output).then(|| {
@@ -1804,6 +1805,7 @@ impl PlaybackOrchestrator {
             };
             let (session_id, tx, data_ready, session) =
                 self.streamer.create_radio_session(wav_info, 256).await;
+            retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
             info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.

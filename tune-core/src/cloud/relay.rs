@@ -9,6 +9,8 @@ use tracing::{info, warn};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
+use super::ENTETE_RELAIS;
+
 pub struct RelayClient {
     pub server_id: String,
     pub bridge_token: String,
@@ -223,6 +225,8 @@ impl RelayClient {
                         }
                     }
                 }
+                // APRÈS les en-têtes du distant : voir `ENTETE_RELAIS`.
+                req = req.header(ENTETE_RELAIS, "1");
                 if let Some(b) = body {
                     req = req.body(b);
                 }

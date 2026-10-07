@@ -298,13 +298,13 @@ async fn album_un_parametre_vide_laisse_parler_l_entete() {
     assert_eq!(body["bio"].as_str(), Some(BIO_EN));
 }
 
-// === 3. Ni parametre ni en-tete -> repli sur `fr` ==========================
+// === 3. Ni parametre ni en-tete -> repli sur `en` ==========================
 
-/// Non-regression : un appel nu (script, `curl`, ancien client) garde le
-/// comportement d'avant. Le cache anglais est seme pour que le test ait quelque
-/// chose d'autre a rendre s'il derivait vers l'anglais.
+/// Un appel nu (script, `curl`, ancien client) est servi en anglais, le repli
+/// du serveur comme du client web. La bio francaise est semee pour que le test
+/// ait quelque chose d'autre a rendre s'il retombait sur le francais.
 #[tokio::test]
-async fn artiste_sans_parametre_ni_entete_le_repli_reste_le_francais() {
+async fn artiste_sans_parametre_ni_entete_le_repli_est_l_anglais() {
     let (app, state) = app_et_etat();
     artiste_avec_bio(&state, 1, "fr", BIO_FR);
     cache_artiste(&state, "en", BIO_EN);
@@ -312,12 +312,15 @@ async fn artiste_sans_parametre_ni_entete_le_repli_reste_le_francais() {
     let (status, body) = bio_artiste(&app, "", None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["bio"].as_str(), Some(BIO_FR));
-    assert_eq!(body["bio_provenance"]["lang"].as_str(), Some("fr"));
+    assert_eq!(
+        body["bio"].as_str(),
+        Some(BIO_EN),
+        "sans en-tete, la bio francaise stockee ne doit pas etre servie"
+    );
 }
 
 #[tokio::test]
-async fn album_sans_parametre_ni_entete_le_repli_reste_le_francais() {
+async fn album_sans_parametre_ni_entete_le_repli_est_l_anglais() {
     let (app, state) = app_et_etat();
     album_avec_bio(&state, 1, "fr", BIO_FR);
     cache_album(&state, "en", BIO_EN);
@@ -325,31 +328,34 @@ async fn album_sans_parametre_ni_entete_le_repli_reste_le_francais() {
     let (status, body) = bio_album(&app, "", None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["bio"].as_str(), Some(BIO_FR));
-    assert_eq!(body["bio_provenance"]["lang"].as_str(), Some("fr"));
+    assert_eq!(
+        body["bio"].as_str(),
+        Some(BIO_EN),
+        "sans en-tete, la bio francaise stockee ne doit pas etre servie"
+    );
 }
 
 /// Une locale que l'interface ne parle pas (`lang_from_header` la refuse) doit
-/// retomber sur `fr`, pas produire un code inconnu qui ne conviendrait a
+/// retomber sur `en`, pas produire un code inconnu qui ne conviendrait a
 /// aucune bio et declencherait un appel reseau.
 #[tokio::test]
-async fn artiste_une_locale_non_supportee_retombe_sur_le_francais() {
+async fn artiste_une_locale_non_supportee_retombe_sur_l_anglais() {
     let (app, state) = app_et_etat();
     artiste_avec_bio(&state, 1, "fr", BIO_FR);
     cache_artiste(&state, "en", BIO_EN);
 
     let (_, body) = bio_artiste(&app, "", Some("pt-BR")).await;
 
-    assert_eq!(body["bio"].as_str(), Some(BIO_FR));
+    assert_eq!(body["bio"].as_str(), Some(BIO_EN));
 }
 
 #[tokio::test]
-async fn album_une_locale_non_supportee_retombe_sur_le_francais() {
+async fn album_une_locale_non_supportee_retombe_sur_l_anglais() {
     let (app, state) = app_et_etat();
     album_avec_bio(&state, 1, "fr", BIO_FR);
     cache_album(&state, "en", BIO_EN);
 
     let (_, body) = bio_album(&app, "", Some("pt-BR")).await;
 
-    assert_eq!(body["bio"].as_str(), Some(BIO_FR));
+    assert_eq!(body["bio"].as_str(), Some(BIO_EN));
 }

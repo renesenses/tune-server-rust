@@ -721,6 +721,12 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                 desc.scpd_urls().get("renderingcontrol").map(|p| {
                                     crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
                                 }),
+                            )
+                            // #3967 — l'annonce de `SetNextAVTransportURI`.
+                            .with_av_transport_scpd(
+                                desc.scpd_urls().get("avtransport").map(|p| {
+                                    crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
+                                }),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;

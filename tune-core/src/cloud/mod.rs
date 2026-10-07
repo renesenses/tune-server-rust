@@ -18,3 +18,14 @@ pub mod sso;
 pub mod support;
 pub mod telemetry;
 pub mod tune_tested;
+
+/// Posé par le relais (`relay`) sur CHAQUE requête qu'il rejoue en local,
+/// après les en-têtes venus du distant : un appelant distant peut ajouter des
+/// en-têtes, jamais retirer celui-ci. Une route qui ne doit servir que le
+/// navigateur de CETTE machine (ouvrir un dossier dans le gestionnaire de
+/// fichiers, tune-web-client#1875) le lit pour refuser : vue du serveur, une
+/// requête relayée arrive de 127.0.0.1 comme le navigateur local.
+///
+/// Hors du module `relay`, qui n'existe qu'avec la fonction `cloud-relay` : la
+/// route qui refuse doit le connaître dans TOUTES les compositions.
+pub const ENTETE_RELAIS: &str = "x-tune-relais";

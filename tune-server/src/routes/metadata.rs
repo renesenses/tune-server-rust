@@ -1201,8 +1201,8 @@ async fn auto_apply_suggestions(
 /// La lecture est celle de tout le reste du serveur
 /// ([`crate::i18n::lang_from_header`]) : la MÊME que `library/artists.rs`,
 /// `library/browse.rs` et `system/enrich.rs`, pas une seconde façon de lire la
-/// langue. Elle replie déjà sur `fr` quand l'en-tête est absent ou nomme une
-/// locale que l'interface ne parle pas.
+/// langue. Elle replie déjà sur l'anglais quand l'en-tête est absent ou ne
+/// nomme aucune locale que l'interface parle.
 ///
 /// Le défaut réparé ici (#1849, même famille que #2874) : cette route
 /// n'extrayait AUCUN en-tête. Elle demandait `("lang", "fr")` à Last.fm,
@@ -3220,23 +3220,23 @@ mod langue_des_bios {
         assert_eq!(wikis, vec!["de".to_string(), "en".to_string()]);
     }
 
-    /// Aucun en-tête : le repli reste `fr`, celui que porte déjà
-    /// `lang_from_header` — le comportement d'avant pour un client muet.
+    /// Aucun en-tête : le repli est l'anglais, celui que porte
+    /// `lang_from_header` — comme le client web, jamais le français par défaut.
     #[test]
-    fn sans_entete_le_repli_reste_le_francais() {
+    fn sans_entete_le_repli_est_l_anglais() {
         let (lang, wikis) = langue_et_encyclopedies(&entetes(None));
-        assert_eq!(lang, "fr");
-        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+        assert_eq!(lang, "en");
+        assert_eq!(wikis, vec!["en".to_string()]);
     }
 
-    /// Une locale que l'interface ne parle pas retombe sur `fr`, comme
+    /// Une locale que l'interface ne parle pas retombe sur l'anglais, comme
     /// partout ailleurs : la liste des encyclopédies suit ce repli, elle n'est
     /// jamais construite sur la locale refusée.
     #[test]
     fn une_locale_non_supportee_retombe_sur_le_repli() {
         let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("pt-BR,pt;q=0.9")));
-        assert_eq!(lang, "fr");
-        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+        assert_eq!(lang, "en");
+        assert_eq!(wikis, vec!["en".to_string()]);
         assert!(
             !wikis.iter().any(|w| w == "pt"),
             "aucune Wikipédia « pt » ne doit être interrogée : la locale est refusée en amont"
