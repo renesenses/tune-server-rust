@@ -15,6 +15,7 @@ mod database;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
 // pour épuiser le quota comme le serveur le compte.
@@ -364,6 +365,29 @@ pub fn router() -> Router<AppState> {
         .route(
             "/config-backup/cloud-status",
             get(config_backup::cloud_status),
+        )
+        // Sauvegarde cloud AUTOMATIQUE et tournante des personnalisations,
+        // chiffrée avant l'envoi, restaurable sur une machine neuve (#5654).
+        .route("/config-backup/cloud/status", get(sauvegarde_cloud::status))
+        .route(
+            "/config-backup/cloud/enable",
+            post(sauvegarde_cloud::enable),
+        )
+        .route(
+            "/config-backup/cloud/disable",
+            post(sauvegarde_cloud::disable),
+        )
+        .route(
+            "/config-backup/cloud/backup-now",
+            post(sauvegarde_cloud::backup_now),
+        )
+        .route(
+            "/config-backup/cloud/snapshots",
+            get(sauvegarde_cloud::snapshots),
+        )
+        .route(
+            "/config-backup/cloud/restore",
+            post(sauvegarde_cloud::restore),
         )
         // Weekly digest — new releases from library artists
         .route("/new-releases", get(new_releases_handler))
