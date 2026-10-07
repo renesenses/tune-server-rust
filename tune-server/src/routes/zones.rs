@@ -1495,6 +1495,10 @@ mod signal_path_tests;
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
 
+// L'étape crossfeed porte le nom du greffon de crossfeed qui traite.
+#[cfg(test)]
+mod signal_path_crossfeed_greffon_tests;
+
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;

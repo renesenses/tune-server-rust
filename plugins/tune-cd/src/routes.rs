@@ -8,6 +8,10 @@
 //!   lecteur courant (fil 2135). Si une zone le joue (ou le tient en pause),
 //!   refus `409 lecture_en_cours` qui nomme les zones ; avec `forcer`, ces
 //!   zones sont d'abord arrêtées, puis le disque est éjecté.
+//!
+//! Pendant une extraction (#2466, `extraction/routes.rs`), `/jouer` et
+//! `/ejecter` refusent par `409 extraction_en_cours`, même avec `forcer` :
+//! on annule d'abord l'extraction.
 
 use std::sync::Arc;
 
@@ -22,6 +26,7 @@ use tokio::sync::Notify;
 
 use crate::discid::disc_id;
 use crate::ejection::ZonesDuDisque;
+use crate::extraction::Extractions;
 use crate::fournisseur::{SOURCE, source_id};
 use crate::hote::{ElementFile, HoteLecture};
 use crate::lecteur::{
@@ -40,18 +45,32 @@ pub struct EtatRoutes {
     /// éjection commandée, la source `cd` passe à `vide` et
     /// `sources.changed` part tout de suite, sans attendre le tour suivant.
     pub reveil: Arc<Notify>,
+    /// #2466 — les extractions. `None` : routes d'extraction absentes.
+    pub extraction: Option<Arc<Extractions>>,
 }
 
 pub fn router(etat: EtatRoutes) -> Router<()> {
-    Router::new()
+    let base = Router::new()
         .route("/etat", get(etat_du_lecteur))
         .route("/disque", get(disque))
         .route("/jouer", post(jouer))
         .route("/ejecter", post(ejecter))
-        .with_state(etat)
+        .with_state(etat.clone());
+    match etat.extraction.clone() {
+        Some(ex) => base.merge(crate::extraction::routes::router(etat, ex)),
+        None => base,
+    }
 }
 
-fn refus(code: StatusCode, motif: &str, message: String) -> Response {
+/// L'extraction en cours, s'il y en a une (#2466).
+fn extraction_en_cours(etat: &EtatRoutes) -> Option<String> {
+    etat.extraction
+        .as_ref()
+        .and_then(|e| e.en_cours())
+        .map(|t| t.id.clone())
+}
+
+pub(crate) fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
 }
 
@@ -67,7 +86,7 @@ fn aucun_lecteur() -> Refus {
 }
 
 /// La TOC du disque inséré, ou le refus qui dit pourquoi il n'y en a pas.
-async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
+pub(crate) async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
     let Some(lecteur) = etat.lecteur.clone() else {
         return Err(aucun_lecteur());
     };
@@ -195,6 +214,13 @@ pub(crate) async fn jouer_disque(
     zone_id: i64,
     piste: Option<u8>,
 ) -> Result<Value, Refus> {
+    if extraction_en_cours(etat).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "extraction_en_cours",
+            "Le disque est en cours d'extraction : annulez-la pour le jouer.".into(),
+        ));
+    }
     let toc = toc_ou_refus(etat).await?;
     let disc = disc_id(&toc);
     let infos = etat.consultation.consulter(&disc).await;
@@ -231,7 +257,7 @@ struct DemandeEjecter {
 }
 
 /// Les zones qui jouent ce disque ou le tiennent en pause, triées.
-async fn zones_qui_jouent_le_disque(etat: &EtatRoutes) -> Vec<i64> {
+pub(crate) async fn zones_qui_jouent_le_disque(etat: &EtatRoutes) -> Vec<i64> {
     let candidates: Vec<i64> = etat.zones.lock().await.iter().copied().collect();
     let mut v = Vec::new();
     for z in candidates {
@@ -243,10 +269,13 @@ async fn zones_qui_jouent_le_disque(etat: &EtatRoutes) -> Vec<i64> {
     v
 }
 
-/// Fil 2135 — éjecter le disque. Pas d'extraction à protéger : ce serveur
-/// n'en lance aucune (`/cd-rip`, #2466) ; seule la LECTURE tient le disque.
+/// Fil 2135 — éjecter le disque. La lecture et l'extraction (#2466) tiennent
+/// le disque : la première s'arrête sur confirmation, la seconde s'annule.
 async fn ejecter(State(etat): State<EtatRoutes>, corps: Option<Json<DemandeEjecter>>) -> Response {
     let forcer = corps.map(|Json(d)| d.forcer).unwrap_or(false);
+    if let Some(id) = extraction_en_cours(&etat) {
+        return crate::extraction::routes::conflit_extraction(&id);
+    }
     let Some(lecteur) = etat.lecteur.clone() else {
         let (code, motif, message) = aucun_lecteur();
         return refus(code, motif, message);
@@ -377,6 +406,7 @@ mod tests {
                 consultation: c,
                 zones: Arc::default(),
                 reveil: Arc::default(),
+                extraction: None,
             },
             hote,
         )
