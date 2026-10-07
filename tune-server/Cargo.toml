@@ -206,6 +206,11 @@ path = "tests/sendspin_point_d_acces_s2a.rs"
 [[test]]
 name = "sendspin_mode_transition"
 path = "tests/sendspin_mode_transition.rs"
+# #4626 — rôle maître / agent : deux serveurs Tune réels, appairage, zone,
+# flux, pause, volume. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "agent_tune_4626"
+path = "tests/agent_tune_4626.rs"
 
 [[test]]
 name = "server_contracts"

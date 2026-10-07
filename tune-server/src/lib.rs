@@ -7,6 +7,8 @@
 #![allow(clippy::result_large_err)]
 
 mod adresse_d_accueil;
+/// #4626 — rôle maître / agent entre deux serveurs Tune du réseau local.
+pub mod agent_tune;
 pub mod aiguillage_des_flux;
 #[cfg(test)]
 mod aiguillage_des_flux_tests_4645;
