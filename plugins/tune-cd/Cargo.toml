@@ -29,6 +29,13 @@ reqwest = { workspace = true }
 # 0.22 aussi (tune-core).
 sha1 = "0.10"
 base64 = "0.22"
+# #2466 — l'extraction : balises écrites par `lofty`, la bibliothèque que le
+# scan emploie pour les relire (déjà dans le graphe par tune-core) ; le rôle
+# de l'appelant (`AuthUser`) que pose le middleware d'authentification ;
+# l'identifiant des extractions.
+lofty = { workspace = true }
+tune-http-types = { path = "../../tune-http-types" }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -42,3 +49,5 @@ windows-sys = { version = "0.61", features = ["Win32_Devices_Cdrom", "Win32_Foun
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# #2466 — une bibliothèque jetable pour les fichiers extraits.
+tempfile = "3"

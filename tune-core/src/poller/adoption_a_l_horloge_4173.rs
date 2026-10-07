@@ -718,3 +718,8 @@ mod deplacement_et_enchainement_4682;
 /// `Next` acquitté, chaque fois avec l'URI de la piste finie.
 #[cfg(test)]
 mod rejeu_de_la_piste_finie_5411;
+
+/// #3967 — l'enchaînement vérifié renderer par renderer : annoncé, refusé,
+/// ignoré, passage vu en retard, chacun avec sa contre-épreuve.
+#[cfg(test)]
+mod gapless_verifie_3967;

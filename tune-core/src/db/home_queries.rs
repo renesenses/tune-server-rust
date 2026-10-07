@@ -350,6 +350,56 @@ pub const DUREE_MS: &str = "CAST(NULLIF(CAST(t.duration_ms AS TEXT), '') AS DOUB
 pub const DATE_D_AJOUT: &str = "COALESCE(ffs.first_seen_at, \
      CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION))";
 
+/// La date de CREATION d'une piste pour le tri « par creation » (#5402) :
+/// le btime du fichier quand le systeme l'a donne au scan, sinon la date
+/// d'ajout ([`DATE_D_AJOUT`]).
+///
+/// Le repli n'est pas une approximation cachee : NFS, SMB et bien des
+/// montages Docker ne donnent aucun btime, et les fichiers scannes avant la
+/// colonne n'en ont pas non plus (aucun rattrapage). [`recently_added_totaux_par`]
+/// compte ces pistes pour que l'ecran le dise.
+pub const DATE_DE_CREATION: &str = "COALESCE(ffs.created_at, COALESCE(ffs.first_seen_at, \
+     CAST(NULLIF(CAST(t.file_mtime AS TEXT), '') AS DOUBLE PRECISION)))";
+
+/// Le tri d'« Ajoutes recemment » (#5402). [`TriAjouts::Modification`] est le
+/// tri historique et le defaut : un client qui ne demande rien voit ce qu'il
+/// voyait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriAjouts {
+    /// La date d'ajout, modification d'abord (#4546) — `DATE_D_AJOUT`.
+    #[default]
+    Modification,
+    /// La date de creation du fichier, repli sur la date d'ajout.
+    Creation,
+}
+
+impl TriAjouts {
+    /// `modification` ou `creation` ; toute autre valeur est refusee par
+    /// l'appelant, jamais servie en silence comme un autre tri.
+    pub fn depuis_parametre(valeur: &str) -> Option<Self> {
+        match valeur {
+            "modification" => Some(Self::Modification),
+            "creation" => Some(Self::Creation),
+            _ => None,
+        }
+    }
+
+    pub fn nom(self) -> &'static str {
+        match self {
+            Self::Modification => "modification",
+            Self::Creation => "creation",
+        }
+    }
+
+    /// L'expression de date que filtre et trie la requete.
+    pub fn expression(self) -> &'static str {
+        match self {
+            Self::Modification => DATE_D_AJOUT,
+            Self::Creation => DATE_DE_CREATION,
+        }
+    }
+}
+
 /// Second rang de « Continuer l'ecoute » : les albums DEDUITS de l'historique,
 /// pour les lignes anterieures a la migration 84 qui ne disent rien de leur
 /// contexte.
@@ -562,17 +612,24 @@ pub fn progression_pourcent(ecoutees: Option<i64>, total: Option<i64>) -> Option
 /// Colonnes rendues, dans l'ordre : `id, title, artist_name, year, cover_path,
 /// genre, format, sample_rate, bit_depth, track_count, added_at`.
 pub fn recently_added(engine: Engine) -> String {
+    recently_added_par(engine, TriAjouts::Modification)
+}
+
+/// [`recently_added`] pour le tri choisi (#5402) : la meme requete, la date
+/// de creation a la place de la date d'ajout dans le filtre ET dans le tri.
+pub fn recently_added_par(engine: Engine, tri: TriAjouts) -> String {
     let p1 = ph(engine, 1);
     let p2 = ph(engine, 2);
+    let date = tri.expression();
     format!(
         "SELECT {COLONNES_ALBUM}, \
                a.format, a.sample_rate, a.bit_depth, a.track_count, \
-               MAX({DATE_D_AJOUT}) as added_at \
+               MAX({date}) as added_at \
         FROM tracks t \
         JOIN albums a ON t.album_id = a.id \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
         {JOINTURE_PREMIERE_VUE} \
-        WHERE {DATE_D_AJOUT} > {p1} \
+        WHERE {date} > {p1} \
         GROUP BY {COLONNES_ALBUM}, a.format, a.sample_rate, a.bit_depth, a.track_count \
         ORDER BY added_at DESC \
         LIMIT {p2}"
@@ -629,15 +686,32 @@ pub fn nouveautes(engine: Engine) -> String {
 /// `$1` : la meme borne basse. Colonnes rendues : `albums, tracks,
 /// duration_ms`.
 pub fn recently_added_totaux(engine: Engine) -> String {
+    recently_added_totaux_par(engine, TriAjouts::Modification)
+}
+
+/// [`recently_added_totaux`] pour le tri choisi (#5402), plus une quatrieme
+/// colonne : `sans_creation`, les pistes de la fenetre sans date de creation,
+/// que le tri « par creation » a donc rangees par leur date d'ajout. Elle ne
+/// se compte qu'en tri par creation : le tri par defaut garde la requete
+/// d'avant, sans nommer la colonne (`0` constant).
+pub fn recently_added_totaux_par(engine: Engine, tri: TriAjouts) -> String {
     let p1 = ph(engine, 1);
+    let date = tri.expression();
+    let sans_creation = match tri {
+        TriAjouts::Modification => "0",
+        TriAjouts::Creation => {
+            "COALESCE(SUM(CASE WHEN ffs.created_at IS NULL THEN 1 ELSE 0 END), 0)"
+        }
+    };
     format!(
         "SELECT COUNT(DISTINCT a.id) AS albums, \
                 COUNT(*) AS tracks, \
-                CAST(COALESCE(SUM({DUREE_MS}), 0) AS BIGINT) AS duration_ms \
+                CAST(COALESCE(SUM({DUREE_MS}), 0) AS BIGINT) AS duration_ms, \
+                CAST({sans_creation} AS BIGINT) AS sans_creation \
          FROM tracks t \
          JOIN albums a ON t.album_id = a.id \
          {JOINTURE_PREMIERE_VUE} \
-         WHERE {DATE_D_AJOUT} > {p1}"
+         WHERE {date} > {p1}"
     )
 }
 

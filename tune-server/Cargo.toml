@@ -513,6 +513,12 @@ path = "tests/pg_group_by_strict_historique.rs"
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #5402 — le tri des ajouts recents par date de creation. `autotests = false` :
+# sans cette cible, jamais compile.
+[[test]]
+name = "ajouts_recents_tri_creation_5402"
+path = "tests/ajouts_recents_tri_creation_5402.rs"
+
 # #2901 (suite) — le plafond de la file d'attente est un reglage, et ses bornes
 # se ferment a l'ECRITURE : `PATCH /system/config` refuse une valeur hors
 # bornes au lieu de l'accepter puis de la ramener en silence a la lecture. La

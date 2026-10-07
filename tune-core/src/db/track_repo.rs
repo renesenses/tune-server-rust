@@ -1707,14 +1707,25 @@ fn sql_figer_toutes_les_premieres_vues(engine: Engine) -> String {
     }
 }
 
-/// Première vue d'un chemin qui entre dans la bibliothèque ([`premiere_vue_du_fichier`]).
+/// Première vue d'un chemin qui entre dans la bibliothèque, et sa date de
+/// création ([`dates_du_fichier`]).
+///
+/// La première vue n'est écrite QU'UNE fois (#4546) : un conflit ne la touche
+/// pas. La date de création, elle, suit le disque à chaque passage du scan
+/// (#5402) — c'est ainsi qu'un fichier rescanné la reçoit sans rattrapage —
+/// mais une lecture qui n'en rend aucune (NFS, SMB) n'efface pas celle qu'on
+/// avait.
 fn sql_premiere_vue(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => {
-            "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
+            "INSERT INTO file_first_seen (file_path, first_seen_at, created_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (file_path) DO UPDATE \
+             SET created_at = COALESCE(EXCLUDED.created_at, file_first_seen.created_at)"
         }
         Engine::Sqlite => {
-            "INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) VALUES (?, ?)"
+            "INSERT INTO file_first_seen (file_path, first_seen_at, created_at) VALUES (?, ?, ?) \
+             ON CONFLICT (file_path) DO UPDATE \
+             SET created_at = COALESCE(excluded.created_at, file_first_seen.created_at)"
         }
     }
 }
@@ -1754,6 +1765,22 @@ fn maintenant_epoch() -> f64 {
 /// #4546 tient : la ligne n'est écrite QU'UNE fois (`INSERT OR IGNORE` /
 /// `ON CONFLICT DO NOTHING`), une retouche ultérieure ne la change plus.
 fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant: f64) -> f64 {
+    dates_du_fichier(chemin, mtime_du_scan, maintenant).0
+}
+
+/// La première vue ([`premiere_vue_du_fichier`]) et la date de CRÉATION d'un
+/// fichier, d'une seule lecture du disque (#5402).
+///
+/// La création est le btime tel quel, borné à `maintenant` ; `None` quand le
+/// système ne le donne pas (NFS, SMB, certains montages Docker, vieux noyaux
+/// sans `statx`) ou qu'il n'est pas valable. Jamais de repli sur le `mtime`
+/// ICI : c'est la requête de tri qui retombe sur la date d'ajout, et elle
+/// seule sait le compter pour le dire à l'écran.
+fn dates_du_fichier(
+    chemin: &str,
+    mtime_du_scan: Option<f64>,
+    maintenant: f64,
+) -> (f64, Option<f64>) {
     let meta = std::fs::metadata(chemin).ok();
     let en_epoch = |t: std::time::SystemTime| {
         t.duration_since(std::time::UNIX_EPOCH)
@@ -1769,7 +1796,17 @@ fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant:
         .and_then(|m| m.modified().ok())
         .and_then(en_epoch)
         .or(mtime_du_scan);
-    choisir_premiere_vue(creation, modification, maintenant)
+    (
+        choisir_premiere_vue(creation, modification, maintenant),
+        creation_valable(creation, maintenant),
+    )
+}
+
+/// Une date de création retenue : finie, positive, bornée à `maintenant`.
+fn creation_valable(creation: Option<f64>, maintenant: f64) -> Option<f64> {
+    creation
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|d| d.min(maintenant))
 }
 
 /// Le choix seul, sans disque : modification, sinon création, bornée à
@@ -2140,8 +2177,8 @@ impl TrackRepo {
         // tracks/albums but not file_first_seen). Best-effort: never fail track
         // creation over this. Streaming tracks (http URLs / no path) are skipped.
         if let Some(path) = chemin_local(track.file_path.as_deref()) {
-            let now = premiere_vue_du_fichier(path, track.file_mtime, maintenant_epoch());
-            let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
+            let (now, creation) = dates_du_fichier(path, track.file_mtime, maintenant_epoch());
+            let fs_params: [&dyn ToSqlValue; 3] = [&path, &now, &creation];
             let _ = self
                 .db
                 .execute(sql_premiere_vue(self.db.engine()), &fs_params);
@@ -3372,8 +3409,13 @@ impl TrackRepo {
                 Ok(_) => {
                     count += 1;
                     if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
-                        let date = premiere_vue_du_fichier(chemin, track.file_mtime, maintenant);
-                        premieres_vues.push(vec![chemin.to_sql_value(), date.to_sql_value()]);
+                        let (date, creation) =
+                            dates_du_fichier(chemin, track.file_mtime, maintenant);
+                        premieres_vues.push(vec![
+                            chemin.to_sql_value(),
+                            date.to_sql_value(),
+                            creation.to_sql_value(),
+                        ]);
                     }
                 }
                 // Previously this failure was swallowed silently: the scanner
@@ -3550,6 +3592,28 @@ impl TrackRepo {
                 pistes = tracks.len(),
                 "track_update_failures_truncated"
             );
+        }
+        // #5402 : un fichier RESCANNÉ reçoit sa date de création, sans
+        // rattrapage des autres. Après le gel ci-dessus : la première vue est
+        // déjà posée, le conflit ne touche que `created_at`.
+        if !figer_params.is_empty() {
+            let maintenant = maintenant_epoch();
+            let dates: Vec<Vec<SqlValue>> = tracks
+                .iter()
+                .filter(|t| t.id.is_some())
+                .filter_map(|t| {
+                    let chemin = chemin_local(t.file_path.as_deref())?;
+                    let (date, creation) = dates_du_fichier(chemin, t.file_mtime, maintenant);
+                    Some(vec![
+                        chemin.to_sql_value(),
+                        date.to_sql_value(),
+                        creation.to_sql_value(),
+                    ])
+                })
+                .collect();
+            let _ = self
+                .db
+                .execute_many(sql_premiere_vue(self.db.engine()), &dates);
         }
         if !deplacements.is_empty()
             && let Err(e) =
@@ -5504,6 +5568,155 @@ mod tests {
         );
         assert_eq!(choisir_premiere_vue(Some(9e9), None, 100.0), 100.0);
         assert_eq!(choisir_premiere_vue(None, None, 100.0), 100.0);
+    }
+
+    // ── #5402 : la date de création, à côté de la première vue ──────────
+
+    /// `file_first_seen.created_at` d'un chemin.
+    fn creation_en_base(repo: &TrackRepo, chemin: &str) -> Option<f64> {
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        repo.backend()
+            .query_one(
+                "SELECT created_at FROM file_first_seen WHERE file_path = ?",
+                &p,
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()))
+    }
+
+    /// Le btime du fichier tel que le système le donne, ou `None`.
+    fn btime(chemin: &str) -> Option<f64> {
+        std::fs::metadata(chemin)
+            .ok()?
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64())
+    }
+
+    /// La piste relue avec son identifiant, prête pour `update_batch`.
+    fn avec_id(repo: &TrackRepo, mut t: Track) -> Track {
+        let chemin = t.file_path.clone().unwrap();
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        t.id = repo
+            .backend()
+            .query_one("SELECT id FROM tracks WHERE file_path = ?", &p)
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()));
+        assert!(t.id.is_some(), "piste introuvable : {chemin}");
+        t
+    }
+
+    /// Le scan garde la date de CRÉATION à part, sans toucher à la date
+    /// d'ajout (modification d'abord, #4546).
+    ///
+    /// Le fichier porte un `mtime` de 2017 et vient d'être créé : sur un
+    /// système qui donne le btime, les deux dates diffèrent de plusieurs
+    /// années, et chacune doit rester dans sa colonne. Sans btime, la colonne
+    /// reste NULL — jamais remplie par le `mtime`.
+    #[test]
+    fn le_scan_garde_la_date_de_creation_du_fichier_5402() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fichier_date(dir.path(), "x.flac", 1_500_000_000);
+        let attendue = btime(&f);
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (album, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        assert_eq!(repo.create_batch(&[t]).unwrap(), 1);
+
+        assert_eq!(
+            creation_en_base(&repo, &f),
+            attendue,
+            "la date de création en base doit être le btime du fichier"
+        );
+        assert_eq!(
+            date_d_ajout(&repo, album),
+            Some(1_500_000_000.0),
+            "la date d'ajout reste le mtime"
+        );
+        match attendue {
+            Some(c) => assert!(c > 1_500_000_000.0 + 86_400.0, "btime {c}"),
+            None => eprintln!("#5402 : pas de btime sur ce système de fichiers"),
+        }
+
+        // `create`, l'autre porte d'entrée, l'écrit aussi.
+        let g = fichier_date(dir.path(), "y.flac", 1_500_000_000);
+        let (_, t) = album_avec_piste(&db, "Y", &g, 1_500_000_000.0);
+        repo.create(&t).unwrap();
+        assert_eq!(creation_en_base(&repo, &g), btime(&g));
+    }
+
+    /// Un fichier RESCANNÉ reçoit sa date de création, sans que sa date
+    /// d'ajout bouge. C'est la seule voie des fichiers déjà en base : il n'y
+    /// a pas de rattrapage.
+    #[test]
+    fn un_fichier_rescanne_recoit_sa_date_de_creation_5402() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fichier_date(dir.path(), "x.flac", 1_500_000_000);
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (_, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        repo.create_batch(std::slice::from_ref(&t)).unwrap();
+        // Une ligne d'avant la colonne : première vue posée, création NULL.
+        let p: [&dyn ToSqlValue; 1] = [&f];
+        repo.backend()
+            .execute(
+                "UPDATE file_first_seen SET first_seen_at = 500.0, created_at = NULL \
+                 WHERE file_path = ?",
+                &p,
+            )
+            .unwrap();
+        assert_eq!(creation_en_base(&repo, &f), None);
+
+        let t = avec_id(&repo, t);
+        assert_eq!(repo.update_batch(&[t]).unwrap(), 1);
+        assert_eq!(creation_en_base(&repo, &f), btime(&f));
+        let p: [&dyn ToSqlValue; 1] = [&f];
+        let premiere = repo
+            .backend()
+            .query_one(
+                "SELECT first_seen_at FROM file_first_seen WHERE file_path = ?",
+                &p,
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()));
+        assert_eq!(premiere, Some(500.0), "la date d'ajout ne bouge pas");
+    }
+
+    /// Un passage qui ne lit AUCUN btime (NFS, SMB, fichier absent) n'efface
+    /// pas celui qu'on avait.
+    #[test]
+    fn une_lecture_sans_btime_n_efface_pas_la_date_de_creation_5402() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let chemin = "/nulle-part/5402/x.flac";
+        let (_, t) = album_avec_piste(&db, "X", chemin, 1_500_000_000.0);
+        repo.create_batch(std::slice::from_ref(&t)).unwrap();
+        assert_eq!(creation_en_base(&repo, chemin), None);
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        repo.backend()
+            .execute(
+                "UPDATE file_first_seen SET created_at = 42.0 WHERE file_path = ?",
+                &p,
+            )
+            .unwrap();
+        let t = avec_id(&repo, t);
+        repo.update_batch(std::slice::from_ref(&t)).unwrap();
+        repo.delete_all().unwrap();
+        repo.create_batch(&[t]).unwrap();
+        assert_eq!(creation_en_base(&repo, chemin), Some(42.0));
+    }
+
+    /// Le choix seul : finie, positive, bornée à maintenant ; jamais le mtime.
+    #[test]
+    fn la_date_de_creation_retenue_5402() {
+        assert_eq!(creation_valable(Some(10.0), 100.0), Some(10.0));
+        assert_eq!(creation_valable(Some(9e9), 100.0), Some(100.0));
+        assert_eq!(creation_valable(Some(0.0), 100.0), None);
+        assert_eq!(creation_valable(Some(-1.0), 100.0), None);
+        assert_eq!(creation_valable(Some(f64::NAN), 100.0), None);
+        assert_eq!(creation_valable(None, 100.0), None);
     }
 
     /// Le cas de Jean Valjean, sur les TROIS chemins qui récrivent le
