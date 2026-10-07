@@ -20,7 +20,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/services", get(list_services))
         .route("/transfer", post(transfer_playlist))
-        .route("/batch-transfer", post(batch_transfer))
         .route("/history", get(transfer_history))
         .route("/history/{id}", get(transfer_history_detail))
         .route("/links", get(list_links).post(create_link))
@@ -59,6 +58,10 @@ fn save_json_setting(settings: &SettingsRepo, key: &str, data: &[Value]) {
             &serde_json::to_string(data).unwrap_or_else(|_| "[]".into()),
         )
         .ok();
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn next_id(items: &[Value]) -> i64 {
@@ -204,397 +207,309 @@ async fn delete_service_playlist(
 }
 
 // ---------------------------------------------------------------------------
-// Transfer
+// Transfer — #4741 : UN seul moteur, celui du greffon « Playlists converter »
 // ---------------------------------------------------------------------------
+//
+// Trois moteurs transféraient une playlist d'un service à l'autre : cette
+// route (son propre appariement, sa propre création), `POST /playlist-transfer/*`
+// (`tune_core::playlist_transfer`, sans aucun appelant) et
+// `POST /playlist-manager/batch-transfer` (une coquille qui écrivait « started »
+// dans l'historique et ne transférait rien). Les deux derniers sont retirés.
+// Celle-ci GARDE son contrat — le web, l'appli iPad et l'appli Flutter
+// l'appellent — mais n'a plus de moteur : elle passe la demande au greffon
+// (`/apercu`, puis `/transfert` avec accord) et rend sa réponse sous la forme
+// d'avant, enrichie du rapport par titre.
+//
+// Le geste de l'utilisateur sur cette route EST l'accord : elle écrivait déjà
+// sans aperçu. L'aperçu sans écriture reste `dry_run: true`.
 
+/// L'identifiant de manifeste du greffon — le seul moteur de transfert.
+const GREFFON_CONVERTISSEUR: &str = "playlists-converter";
+
+/// Le corps historique. Les champs que le moteur unique ne connaît plus —
+/// `match_threshold`, `include_approximate`, `create_on_target` — sont
+/// acceptés et ignorés (serde ignore les champs inconnus) : la règle
+/// d'appariement est celle du greffon, ISRC puis titre + artiste + durée à
+/// ±3 s, sans seuil réglable ni appariement approximatif.
 #[derive(Deserialize)]
 struct TransferRequest {
     source_service: String,
     source_playlist_id: String,
     target_service: String,
-    #[serde(rename = "name")]
+    /// `target_name` est ce que TOUS les clients envoient ; l'ancienne route
+    /// ne lisait que `name` (`#[serde(rename)]`) et ignorait donc le nom choisi
+    /// dans la fenêtre d'import. Les deux sont lus.
+    #[serde(default, alias = "name")]
     target_name: Option<String>,
-    match_threshold: Option<f64>,
-    #[serde(default)]
-    include_approximate: bool,
     #[serde(default)]
     dry_run: bool,
-    #[serde(default = "default_true")]
-    create_on_target: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 async fn transfer_playlist(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Json(body): Json<TransferRequest>,
-) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
-    let track_repo = TrackRepo::with_backend(state.backend.clone());
-
-    // Resolve source tracks
-    let (source_tracks, source_name) = if body.source_service == "local" {
+) -> axum::response::Response {
+    if body.source_service == "local" {
         // La source locale se désigne par son id, et les ids de playlists sont
         // de petits entiers séquentiels : sans ce refus, n'importe quel profil
         // recopiait la playlist du voisin chez lui, ou la déversait sur son
-        // propre compte de service (#2794, #3073).
+        // propre compte de service (#2794, #3073). Le refus se joue ICI, avant
+        // le greffon, et ne laisse aucune trace.
+        let repo = PlaylistRepo::with_backend(state.backend.clone());
         let playlist_id: i64 = body.source_playlist_id.parse().unwrap_or(0);
-        let source = match owned_or_404_response(&playlist_repo, playlist_id, profile.id()) {
+        let source = match owned_or_404_response(&repo, playlist_id, profile.id()) {
             Ok(pl) => pl,
             Err(r) => return r,
         };
-        let track_ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
-        let tracks = track_repo.get_multiple(&track_ids).unwrap_or_default();
-        let source_tracks: Vec<Value> = tracks
-            .iter()
-            .map(|t| {
-                json!({
-                    "title": t.title,
-                    "artist_name": t.artist_name,
-                    "album_title": t.album_title,
-                    "duration_ms": t.duration_ms,
-                })
-            })
-            .collect();
-        (source_tracks, source.name)
-    } else {
-        // Streaming service source — fetch playlist tracks via the service
-        let registry = state.services.lock().await;
-        let svc_arc = match registry.get(&body.source_service) {
-            Some(arc) => arc,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"detail": format!("Source service '{}' not found", body.source_service)})),
-                )
-                    .into_response()
-            }
-        };
-        drop(registry);
+        if body.target_service == "local" {
+            return copier_dans_la_bibliotheque(
+                &repo,
+                playlist_id,
+                &source.name,
+                body.target_name.as_deref(),
+                body.dry_run,
+                profile.id(),
+            );
+        }
+    }
+    transferer_par_le_greffon(&state, &body, profile.id()).await
+}
 
-        let svc = svc_arc.read().await;
-        let playlist_tracks = match svc.get_playlist_tracks(&body.source_playlist_id).await {
-            Ok(tracks) => tracks,
+/// « Bibliothèque → bibliothèque » n'est pas un transfert : rien n'est à
+/// apparier, c'est une copie (le « Dupliquer » de l'appli iPad passe par ici).
+/// Elle reprend `POST /playlists/{id}/duplicate`, titres de service compris.
+fn copier_dans_la_bibliotheque(
+    repo: &PlaylistRepo,
+    source_id: i64,
+    source_nom: &str,
+    nom: Option<&str>,
+    dry_run: bool,
+    profil: i64,
+) -> axum::response::Response {
+    let nom = nom
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{source_nom} (copy)"));
+    let total = repo.get_entries(source_id).map(|e| e.len()).unwrap_or(0);
+    let (cible, copiees) = if dry_run {
+        (None, total)
+    } else {
+        match crate::routes::playlists::copier_playlist_locale(repo, source_id, &nom, profil) {
+            Ok((id, n)) => (Some(id), n),
             Err(e) => {
+                tracing::warn!(source_playlist = source_id, error = %e, "playlist_copy_failed");
                 return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"detail": format!("Failed to load source playlist: {e}")})),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "detail": e, "error": "copie_impossible" })),
                 )
                     .into_response();
             }
-        };
-
-        let source_tracks: Vec<Value> = playlist_tracks
-            .iter()
-            .map(|t| {
-                json!({
-                    "title": t.title,
-                    "artist_name": t.artist,
-                    "album_title": t.album.as_deref().unwrap_or(""),
-                    "duration_ms": t.duration_ms,
-                    "source_id": t.id,
-                    "isrc": "",
-                })
-            })
-            .collect();
-
-        // Get source playlist name
-        let source_name = match svc.get_user_playlists().await {
-            Ok(playlists) => playlists
-                .iter()
-                .find(|p| p.id == body.source_playlist_id)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| body.source_playlist_id.clone()),
-            Err(_) => body.source_playlist_id.clone(),
-        };
-
-        (source_tracks, source_name)
+        }
     };
-
-    let total = source_tracks.len();
-    let target_name = body
-        .target_name
-        .unwrap_or_else(|| format!("{source_name} (transferred)"));
-    let _threshold = body.match_threshold.unwrap_or(0.8);
-
-    // Match tracks on target
-    let mut matched = 0usize;
-    let approximate = 0usize;
-    let mut not_found = 0usize;
-    let mut matched_track_ids: Vec<i64> = Vec::new();
-    let mut track_details: Vec<Value> = Vec::new();
-
-    for track in &source_tracks {
-        let title = track.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let artist = track
-            .get("artist_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if body.target_service == "local" {
-            let query = if artist.is_empty() {
-                title.to_string()
-            } else {
-                format!("{title} {artist}")
-            };
-            let results = track_repo.search(&query, 5).unwrap_or_default();
-            if let Some(best) = results.first()
-                && let Some(id) = best.id
-            {
-                matched_track_ids.push(id);
-                matched += 1;
-                track_details.push(json!({
-                    "source_title": title,
-                    "source_artist": artist,
-                    "matched_title": best.title,
-                    "matched_artist": best.artist_name,
-                    "status": "matched",
-                }));
-                continue;
-            }
-            not_found += 1;
-            track_details.push(json!({
-                "source_title": title,
-                "source_artist": artist,
-                "status": "not_found",
-            }));
-        } else {
-            // Search on target streaming service
-            let registry = state.services.lock().await;
-            let svc_arc = match registry.get(&body.target_service) {
-                Some(arc) => arc,
-                None => {
-                    not_found += 1;
-                    continue;
-                }
-            };
-            drop(registry);
-
-            let svc = svc_arc.read().await;
-            // #4716 — la recherche PUIS l'appariement vivent désormais dans
-            // `matching::apparier_chez_le_service`, que la capacité WASM
-            // `host_streaming_match_track` appelle aussi : un seul verdict pour
-            // l'écran et pour le greffon. Le seuil reste celui d'avant
-            // (`best_stream_match` = score au-dessus de `MATCH_ACCEPT_SCORE`).
-            match tune_core::streaming::matching::apparier_chez_le_service(
-                &**svc, title, artist, "", 0,
-            )
-            .await
-            {
-                Ok(candidat) => {
-                    if let Some(best) = candidat
-                        .filter(|(_, score)| {
-                            *score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE
-                        })
-                        .map(|(t, _)| t)
-                    {
-                        matched += 1;
-                        track_details.push(json!({
-                            "source_title": title,
-                            "source_artist": artist,
-                            "matched_title": best.title,
-                            "matched_artist": best.artist,
-                            "matched_id": best.id,
-                            "status": "matched",
-                        }));
-                    } else {
-                        not_found += 1;
-                        track_details.push(json!({
-                            "source_title": title,
-                            "source_artist": artist,
-                            "status": "not_found",
-                        }));
-                    }
-                }
-                Err(_) => {
-                    not_found += 1;
-                    track_details.push(json!({
-                        "source_title": title,
-                        "source_artist": artist,
-                        "status": "not_found",
-                    }));
-                }
-            }
-        }
-    }
-
-    // Create playlist on target
-    let mut target_playlist_id: Option<i64> = None;
-    let mut remote_playlist_id: Option<String> = None;
-    if !body.dry_run && matched > 0 {
-        if body.target_service == "local" {
-            if let Ok(id) =
-                playlist_repo.create(&target_name, Some("Transferred playlist"), profile.id())
-            {
-                playlist_repo.add_tracks(id, &matched_track_ids, None).ok();
-                target_playlist_id = Some(id);
-            }
-        } else {
-            // Create playlist on streaming service target
-            let matched_ids: Vec<String> = track_details
-                .iter()
-                .filter(|t| t["status"].as_str() == Some("matched"))
-                .filter_map(|t| t["matched_id"].as_str().map(|s| s.to_string()))
-                .collect();
-            if !matched_ids.is_empty() {
-                let registry = state.services.lock().await;
-                if let Some(svc_arc) = registry.get(&body.target_service) {
-                    drop(registry);
-                    let svc = svc_arc.read().await;
-                    match svc
-                        .create_playlist(&target_name, Some("Created by Tune"))
-                        .await
-                    {
-                        Ok(pid) => match svc.add_tracks_to_playlist(&pid, &matched_ids).await {
-                            Ok(added) => {
-                                tracing::info!(
-                                    service = %body.target_service,
-                                    playlist_id = %pid,
-                                    added,
-                                    "playlist_created_on_service"
-                                );
-                                remote_playlist_id = Some(pid);
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "add_tracks_to_service_playlist_failed");
-                                remote_playlist_id = Some(pid);
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                service = %body.target_service,
-                                error = %e,
-                                "create_playlist_on_service_failed (service may not support write)"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Record in transfer history
-    let mut history = load_json_setting(&settings, "playlist_transfer_history");
-    let history_id = next_id(&history);
-    let entry = json!({
-        "id": history_id,
-        "operation": "transfer",
-        "source_service": body.source_service,
-        "source_playlist_name": source_name,
-        "target_service": body.target_service,
-        "target_playlist_name": target_name,
-        "total_tracks": total,
-        "matched": matched,
-        "approximate": approximate,
-        "not_found": not_found,
-        "status": if body.dry_run { "dry_run" } else { "completed" },
-        "started_at": now_iso(),
-        "completed_at": now_iso(),
-        "details": track_details,
-    });
-    history.push(entry);
-    save_json_setting(&settings, "playlist_transfer_history", &history);
-
     Json(json!({
-        "transfer_id": history_id,
-        "source_service": body.source_service,
-        "source_playlist_name": source_name,
-        "target_service": body.target_service,
-        "target_playlist_name": target_name,
-        "target_playlist_id": target_playlist_id,
-        "remote_playlist_id": remote_playlist_id,
+        "transfer_id": Value::Null,
+        "source_service": "local",
+        "source_playlist_name": source_nom,
+        "target_service": "local",
+        "target_playlist_name": nom,
+        "target_playlist_id": cible,
+        "local_playlist_id": cible,
+        "remote_playlist_id": Value::Null,
         "total_tracks": total,
-        "matched": matched,
-        "approximate": approximate,
-        "not_found": not_found,
-        "match_rate": if total > 0 { matched as f64 / total as f64 } else { 0.0 },
-        "dry_run": body.dry_run,
-        "status": if body.dry_run { "dry_run" } else { "completed" },
-    }))
-    .into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Batch Transfer
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct BatchTransferRequest {
-    source_service: String,
-    target_service: String,
-    playlist_ids: Option<Vec<String>>,
-    match_threshold: Option<f64>,
-}
-
-async fn batch_transfer(
-    State(state): State<AppState>,
-    Json(body): Json<BatchTransferRequest>,
-) -> impl IntoResponse {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    // Get source playlists
-    let registry = state.services.lock().await;
-    let svc_arc = match registry.get(&body.source_service) {
-        Some(arc) => arc,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"detail": format!("Source '{}' not found", body.source_service)})),
-            )
-                .into_response();
-        }
-    };
-    drop(registry);
-
-    let svc = svc_arc.read().await;
-    let all_playlists = svc.get_user_playlists().await.unwrap_or_default();
-    drop(svc);
-
-    let playlists_to_transfer: Vec<_> = if let Some(ref ids) = body.playlist_ids {
-        all_playlists
-            .iter()
-            .filter(|p| ids.contains(&p.id))
-            .collect()
-    } else {
-        all_playlists.iter().collect()
-    };
-
-    let total = playlists_to_transfer.len();
-
-    // Record batch in history
-    let mut history = load_json_setting(&settings, "playlist_transfer_history");
-    let batch_id = next_id(&history);
-    history.push(json!({
-        "id": batch_id,
-        "operation": "batch_transfer",
-        "source_service": body.source_service,
-        "source_playlist_name": format!("{} playlists", total),
-        "target_service": body.target_service,
-        "target_playlist_name": "",
-        "total_tracks": 0,
-        "matched": 0,
+        "matched": copiees,
         "approximate": 0,
-        "not_found": 0,
-        "status": "started",
-        "started_at": now_iso(),
-    }));
-    save_json_setting(&settings, "playlist_transfer_history", &history);
-
-    Json(json!({
-        "batch_id": batch_id,
-        "total_playlists": total,
-        "status": "started",
+        "not_found": total.saturating_sub(copiees),
+        "match_rate": if total > 0 { copiees as f64 / total as f64 } else { 0.0 },
+        "dry_run": dry_run,
+        "status": if dry_run { "dry_run" } else { "completed" },
+        "tracks": [],
     }))
     .into_response()
 }
 
+#[cfg(not(feature = "plugins-wasm"))]
+async fn transferer_par_le_greffon(
+    _state: &AppState,
+    _body: &TransferRequest,
+    _profil: i64,
+) -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "greffon_requis",
+            "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
+                       et ce serveur est compilé sans greffons WASM (`plugins-wasm`).",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn transferer_par_le_greffon(
+    state: &AppState,
+    body: &TransferRequest,
+    profil: i64,
+) -> axum::response::Response {
+    use crate::routes::plugins::appeler_greffon_wasm;
+
+    let appeler = |chemin: &'static str, corps: Value| {
+        appeler_greffon_wasm(
+            state,
+            GREFFON_CONVERTISSEUR,
+            "POST",
+            chemin,
+            "",
+            corps,
+            Some(profil),
+        )
+    };
+
+    let demande = json!({
+        "source_service": body.source_service,
+        "cible_service": body.target_service,
+        "playlists": [body.source_playlist_id],
+        "nom_cible": body.target_name,
+    });
+    let mut reponse = match appeler("/apercu", demande).await {
+        Ok((st, corps)) if st.is_success() => corps,
+        Ok((st, corps)) | Err((st, corps)) => return refus_du_greffon(st, corps),
+    };
+
+    if !body.dry_run {
+        let lot_id = reponse["lot"]["lot_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        reponse = match appeler("/transfert", json!({ "lot_id": lot_id, "accord": true })).await {
+            Ok((st, corps)) if st.is_success() => corps,
+            Ok((st, corps)) | Err((st, corps)) => return refus_du_greffon(st, corps),
+        };
+    }
+
+    Json(reponse_historique(&reponse["lot"], body.dry_run)).into_response()
+}
+
+/// Un refus du greffon, ou son absence, rendu avec `detail` en plus de
+/// `error` : les clients d'avant lisaient `detail`.
+#[cfg(feature = "plugins-wasm")]
+fn refus_du_greffon(statut: StatusCode, corps: Value) -> axum::response::Response {
+    if corps["error"] == "plugin not found" {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "greffon_requis",
+                "detail": "Le transfert de playlists passe par le greffon « Playlists converter », \
+                           qui n'est pas chargé sur ce serveur (désactivé, ou absent du dossier \
+                           des greffons).",
+            })),
+        )
+            .into_response();
+    }
+    let detail = corps["error"]
+        .as_str()
+        .or_else(|| corps["message"].as_str())
+        .unwrap_or("le greffon a refusé la demande")
+        .to_string();
+    let mut corps = if corps.is_object() { corps } else { json!({}) };
+    corps["detail"] = json!(detail);
+    (statut, Json(corps)).into_response()
+}
+
+/// Le lot d'UNE playlist, sous la forme que rendait l'ancienne route — plus
+/// `lot_id`, `etat` et le rapport titre par titre (`tracks`), raison comprise.
+fn reponse_historique(lot: &Value, dry_run: bool) -> Value {
+    let pl = &lot["playlists"][0];
+    let liste = |cle: &str| pl[cle].as_array().cloned().unwrap_or_default();
+    let appariees = liste("appariees");
+    let introuvables = liste("introuvables");
+    let total = pl["total"].as_u64().unwrap_or(0);
+    let cible = lot["cible_service"].as_str().unwrap_or_default();
+    let cible_id = pl["cible_playlist_id"].as_str();
+    let locale = cible == "local";
+    let id_local = if locale {
+        cible_id.and_then(|s| s.parse::<i64>().ok())
+    } else {
+        None
+    };
+
+    let mut pistes: Vec<Value> = appariees
+        .iter()
+        .map(|a| {
+            json!({
+                "title": a["source_titre"],
+                "artist_name": a["source_artiste"],
+                "status": "matched",
+                "target_id": a["cible_id"],
+                "target_title": a["cible_titre"],
+                "target_artist": a["cible_artiste"],
+                "score": a["score"],
+                "match_method": "greffon",
+            })
+        })
+        .collect();
+    pistes.extend(introuvables.iter().map(|i| {
+        json!({
+            "title": i["source_titre"],
+            "artist_name": i["source_artiste"],
+            "status": "not_found",
+            "raison": i["raison"],
+        })
+    }));
+
+    let etat = lot["etat"].as_str().unwrap_or_default();
+    json!({
+        "transfer_id": lot["lot_id"],
+        "lot_id": lot["lot_id"],
+        "source_service": lot["source_service"],
+        "source_playlist_name": pl["source_nom"],
+        "target_service": cible,
+        "target_playlist_name": pl["cible_nom"],
+        "target_playlist_id": id_local.map(Value::from).unwrap_or_else(|| json!(cible_id)),
+        "local_playlist_id": id_local,
+        "remote_playlist_id": if locale { Value::Null } else { json!(cible_id) },
+        "total_tracks": total,
+        "matched": appariees.len(),
+        "approximate": 0,
+        "not_found": introuvables.len(),
+        "match_rate": if total > 0 { appariees.len() as f64 / total as f64 } else { 0.0 },
+        "dry_run": dry_run,
+        "status": if dry_run { "dry_run" } else { statut_historique(etat) },
+        "etat": etat,
+        "snapshot_avant": pl["snapshot_avant"],
+        "erreur": pl["erreur"],
+        "tracks": pistes,
+    })
+}
+
+/// L'état d'un lot du greffon, dans le vocabulaire de l'ancien historique.
+fn statut_historique(etat: &str) -> &'static str {
+    match etat {
+        "termine" | "rien_a_transferer" => "completed",
+        "interrompu" => "interrupted",
+        "en_cours" => "running",
+        "apercu" => "dry_run",
+        _ => "unknown",
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Transfer History
+// Transfer History — #4741 : l'historique ne dépend plus du chemin emprunté
 // ---------------------------------------------------------------------------
+//
+// Les lots du greffon SONT l'historique des transferts, qu'ils viennent de
+// l'onglet Transferts du web (`/plugins/playlists-converter/…`) ou de
+// `POST /playlist-manager/transfer`. Les entrées écrites par l'ancien moteur
+// dans le réglage `playlist_transfer_history` restent lisibles, après eux ;
+// plus rien n'y est ajouté.
+//
+// Identifiants : un lot rend `id` = son numéro (`lot-12` → 12, un entier, ce
+// que l'appli iPad décode) et `lot_id` = `"lot-12"` ; une entrée ancienne rend
+// son `id` d'origine et `lot_id: null`. Le détail se demande par `lot-12` pour
+// un lot, par l'entier pour une entrée ancienne.
+
+const HISTORIQUE_ANCIEN: &str = "playlist_transfer_history";
 
 #[derive(Deserialize)]
 struct HistoryQuery {
@@ -603,59 +518,164 @@ struct HistoryQuery {
     operation: Option<String>,
 }
 
+/// Une entrée d'historique tirée d'un lot complet (`{resume, lot}`).
+fn entree_de_lot(reponse: &Value) -> Value {
+    let lot = &reponse["lot"];
+    let resume = &reponse["resume"];
+    let playlists = lot["playlists"].as_array().cloned().unwrap_or_default();
+    let lot_id = lot["lot_id"].as_str().unwrap_or_default();
+    let numero = lot_id
+        .strip_prefix("lot-")
+        .and_then(|n| n.parse::<i64>().ok());
+    let (source_nom, cible_nom) = match playlists.as_slice() {
+        [une] => (une["source_nom"].clone(), une["cible_nom"].clone()),
+        _ => (json!(format!("{} playlists", playlists.len())), json!("")),
+    };
+    json!({
+        "id": numero,
+        "lot_id": lot_id,
+        "operation": if playlists.len() > 1 { "batch_transfer" } else { "transfer" },
+        "source_service": lot["source_service"],
+        "source_playlist_name": source_nom,
+        "target_service": lot["cible_service"],
+        "target_playlist_name": cible_nom,
+        "total_tracks": resume["titres"],
+        "matched": resume["appariees"],
+        "approximate": 0,
+        "not_found": resume["introuvables"],
+        "status": statut_historique(lot["etat"].as_str().unwrap_or_default()),
+        "etat": lot["etat"],
+        "started_at": Value::Null,
+    })
+}
+
+/// Les en-têtes de lots du greffon, du plus récent au plus ancien. Vide si le
+/// greffon n'est pas chargé : l'historique ancien reste alors seul.
+#[cfg(feature = "plugins-wasm")]
+async fn en_tetes_de_lots(state: &AppState) -> Vec<Value> {
+    match crate::routes::plugins::appeler_greffon_wasm(
+        state,
+        GREFFON_CONVERTISSEUR,
+        "GET",
+        "/lots",
+        "",
+        Value::Null,
+        None,
+    )
+    .await
+    {
+        Ok((st, corps)) if st.is_success() => corps["lots"].as_array().cloned().unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+async fn en_tetes_de_lots(_state: &AppState) -> Vec<Value> {
+    Vec::new()
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn lot_complet(state: &AppState, lot_id: &str) -> Option<Value> {
+    match crate::routes::plugins::appeler_greffon_wasm(
+        state,
+        GREFFON_CONVERTISSEUR,
+        "GET",
+        "/lot",
+        &format!("id={lot_id}"),
+        Value::Null,
+        None,
+    )
+    .await
+    {
+        Ok((st, corps)) if st.is_success() => Some(corps),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+async fn lot_complet(_state: &AppState, _lot_id: &str) -> Option<Value> {
+    None
+}
+
 async fn transfer_history(
     State(state): State<AppState>,
     Query(q): Query<HistoryQuery>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let history = load_json_setting(&settings, "playlist_transfer_history");
-
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
+    let garder = |operation: &str| q.operation.as_deref().is_none_or(|op| op == operation);
 
-    let filtered: Vec<&Value> = history
-        .iter()
-        .rev()
-        .filter(|entry| {
-            if let Some(ref op) = q.operation {
-                entry
-                    .get("operation")
-                    .and_then(|v| v.as_str())
-                    .map(|o| o == op)
-                    .unwrap_or(false)
-            } else {
-                true
-            }
+    // Les lots d'abord. L'opération se lit sur l'en-tête (`rangs` = une
+    // playlist par rang) : seuls les lots de la fenêtre demandée sont relus en
+    // entier.
+    let lots: Vec<String> = en_tetes_de_lots(&state)
+        .await
+        .into_iter()
+        .filter(|e| {
+            let n = e["rangs"].as_array().map_or(0, Vec::len);
+            garder(if n > 1 { "batch_transfer" } else { "transfer" })
         })
-        .skip(offset)
-        .take(limit)
+        .filter_map(|e| e["lot_id"].as_str().map(str::to_string))
         .collect();
 
-    // Strip details from summary view
-    let summary: Vec<Value> = filtered
-        .iter()
-        .map(|e| {
-            let mut v = (*e).clone();
-            if let Some(obj) = v.as_object_mut() {
-                obj.remove("details");
-            }
-            v
-        })
-        .collect();
+    let mut sortie: Vec<Value> = Vec::new();
+    for lot_id in lots.iter().skip(offset).take(limit) {
+        if let Some(complet) = lot_complet(&state, lot_id).await {
+            sortie.push(entree_de_lot(&complet));
+        }
+    }
 
-    Json(json!(summary))
+    // Puis l'ancien historique, figé, sans ses détails.
+    let reste = limit.saturating_sub(sortie.len());
+    let saut = offset.saturating_sub(lots.len());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let anciennes = load_json_setting(&settings, HISTORIQUE_ANCIEN);
+    sortie.extend(
+        anciennes
+            .iter()
+            .rev()
+            .filter(|e| garder(e["operation"].as_str().unwrap_or_default()))
+            .skip(saut)
+            .take(reste)
+            .map(|e| {
+                let mut v = e.clone();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("details");
+                    obj.insert("lot_id".into(), Value::Null);
+                }
+                v
+            }),
+    );
+
+    Json(json!(sortie))
 }
 
 async fn transfer_history_detail(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if id.starts_with("lot-") {
+        return match lot_complet(&state, &id).await {
+            Some(complet) => {
+                let mut entree = entree_de_lot(&complet);
+                entree["details"] = reponse_historique(&complet["lot"], false)["tracks"].clone();
+                if complet["lot"]["playlists"].as_array().map_or(0, Vec::len) > 1 {
+                    entree["playlists"] = complet["lot"]["playlists"].clone();
+                }
+                Json(entree).into_response()
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    let Ok(numero) = id.parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let history = load_json_setting(&settings, "playlist_transfer_history");
-    let entry = history
+    let anciennes = load_json_setting(&settings, HISTORIQUE_ANCIEN);
+    match anciennes
         .iter()
-        .find(|e| e.get("id").and_then(|v| v.as_i64()) == Some(id));
-    match entry {
+        .find(|e| e.get("id").and_then(Value::as_i64) == Some(numero))
+    {
         Some(e) => Json(e.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }

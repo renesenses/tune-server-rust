@@ -28,6 +28,25 @@ la boutique de mozaiklabs.fr, dès que sa fiche y est publiée (payante : un
 | **Rapport par playlist** | chaque playlist porte ses `appariees` et ses `introuvables`, chaque introuvable portant sa `raison` (un code + le détail mesuré). |
 | **Reprise sans doublon** | l'identifiant de la playlist créée et les identifiants déjà versés sont écrits dans le stockage clé/valeur **avant** l'étape suivante. Une reprise ne recrée rien et ne reverse rien. |
 
+## Le seul moteur de transfert du serveur (#4741)
+
+Trois moteurs transféraient une playlist d'un service à l'autre. Il n'en reste
+qu'un, celui-ci :
+
+| Avant | Depuis #4741 |
+|---|---|
+| `POST /playlist-manager/transfer` — son propre appariement, sa propre création | **Garde son contrat** (web, appli iPad, appli Flutter) mais n'a plus de moteur : il appelle `/apercu`, puis `/transfert` avec accord (sauf `dry_run`), et rend la forme d'avant, plus `lot_id`, `etat` et le rapport par titre (`tracks[].raison`). Sans greffon chargé : 503 `greffon_requis`. « Bibliothèque → bibliothèque » reste une simple copie (`POST /playlists/{id}/duplicate`). |
+| `POST /playlist-transfer/transfer` et `/preview` (`tune_core::playlist_transfer`) | **Retirés** : aucun client ne les appelait. |
+| `POST /playlist-manager/batch-transfer` — écrivait « started » et ne transférait rien | **Retiré.** Le mode par lot est celui du greffon (`/apercu` avec plusieurs playlists). |
+| `GET /playlist-manager/history` — l'historique du seul premier moteur | Montre les **lots du greffon** (`id` = numéro du lot, `lot_id` = `lot-N`), quel que soit le chemin emprunté, puis les entrées de l'ancien moteur, figées. Détail : `/history/lot-N`. |
+
+La route historique appelle le greffon **au nom du profil de l'appelant**
+(`X-Profile-Id`) : une playlist locale lue ou créée l'est sous ce profil.
+
+La **bibliothèque locale** vaut comme source **et** comme cible : appariement
+par `host_library_match_track`, création par `host_playlist_create`, ajout par
+`host_playlist_add_tracks`.
+
 ## La règle d'appariement (Bertrand, 22/09/2026)
 
 Quand l'identifiant de service ne correspond pas : **titre + artiste + durée à
@@ -38,6 +57,12 @@ Quand l'identifiant de service ne correspond pas : **titre + artiste + durée à
   hôte `host_streaming_match_track` qui rend `score` et `approximate`.
 * La **durée** est le critère que le greffon ajoute. Tolérance inclusive de
   3 000 ms ; au-delà, introuvable, avec l'écart mesuré.
+* **L'ISRC d'abord** (#4741) : un candidat dont l'ISRC (normalisé : sans
+  tirets, en capitales) est celui de la source est pris même si le flou du
+  titre le juge approximatif — la durée reste exigée. Puis **tout le
+  classement** de l'hôte (`candidates`) est parcouru : le premier candidat qui
+  tient les trois critères l'emporte, et pas seulement le verdict de tête. Sinon
+  la raison rapportée est celle de la tête.
 * Une **durée absente** d'un côté ou de l'autre vaut introuvable : le troisième
   critère n'a pas pu être vérifié, donc il n'est pas tenu.
 
@@ -181,12 +206,6 @@ pause, la cadence repart pleine : pas de rattrapage en rafale.
   connecteur, derrière `add_tracks_to_playlist` / `get_playlist_tracks`. Le
   greffon verse par paquets de 100 — la taille d'un lot TIDAL, et le grain de
   la reprise.
-* **Transférer (tranche 2) VERS la bibliothèque locale.** Le transfert refuse
-  toujours cette cible (`cible_locale_non_supportee`) : il a été écrit avant
-  que `host_library_match_track` n'arrive. Un **lien** (#4719), lui, sait
-  écrire dans une playlist locale existante — il apparie par
-  `host_library_match_track` et ajoute par `host_playlist_add_tracks`.
-  Lever le refus du transfert est hors de cette tranche.
 
 ## Stockage
 
