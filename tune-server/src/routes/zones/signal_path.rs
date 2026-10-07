@@ -202,6 +202,25 @@ pub(super) fn annoter_l_ombre_du_crossfeed(
     }
 }
 
+/// L'étape « Crossfeed » (`code: "crossfeed"`) prend le nom du greffon natif
+/// tiers de la famille du crossfeed quand c'est lui qui traite (`greffon`) :
+/// le crossfeed intégré est alors éteint, l'appeler « Crossfeed » désignerait
+/// l'autre. Le `code` reste `crossfeed` pour les clients qui le lisent ;
+/// `plugin` porte l'identifiant du greffon. Sans greffon, rien ne change.
+pub(super) fn nommer_le_crossfeed_du_greffon(steps: &mut [Value], greffon: Option<&str>) {
+    let Some(id) = greffon else {
+        return;
+    };
+    let nom = tune_core::audio::natifs_tiers::nom_affichable(id);
+    for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
+        etape["name"] = json!(nom);
+        etape["description"] = json!(format!(
+            "{nom} dans le flux (greffon, voies gauche et droite croisées)"
+        ));
+        etape["plugin"] = json!(id);
+    }
+}
+
 /// #5171 — la réserve de l'égaliseur de la zone, pour l'écran : le mode, le
 /// pré-gain réellement appliqué par canal (au débit de référence) et, en mode
 /// réaliste, le compteur du limiteur. `None` quand l'égaliseur ne modifie pas
@@ -774,11 +793,19 @@ pub(super) fn build_signal_path(
         runtime_signal_path,
         analyse,
     );
+    // Un greffon natif tiers de la famille du crossfeed remplace le crossfeed
+    // intégré : l'étape porte SON nom, et l'ombre de la tête du crossfeed
+    // intégré, éteint, n'a rien à y annoncer.
+    let greffon_de_crossfeed = tune_core::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),
+        zone_id_courant,
+    );
+    nommer_le_crossfeed_du_greffon(&mut etapes.steps, greffon_de_crossfeed.as_deref());
     // #5081 — la coupure et la pente de l'ombre de la tête, sur l'étape
     // crossfeed quand elle existe.
     annoter_l_ombre_du_crossfeed(
         &mut etapes.steps,
-        zone_crossfeed_ombre(backend, zone_id_courant),
+        zone_crossfeed_ombre(backend, zone_id_courant).filter(|_| greffon_de_crossfeed.is_none()),
     );
     if let Some((etape, _)) = capture {
         let apres_la_source = etapes.steps.len().min(1);
