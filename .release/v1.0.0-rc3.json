@@ -15,7 +15,7 @@
     },
     "os": {
       "repository": "renesenses/tune-os",
-      "sha": "edd3930d273a0bdf1b71fd4127c9d6a801ac7475",
+      "sha": "4db2775a10a82ba0183e474e177c35a74ad500b0",
       "tag": "tune-os-rpi-v1.0.0-rc3"
     },
     "universal": {
