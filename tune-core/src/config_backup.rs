@@ -8,22 +8,21 @@
 //! # Streaming tokens
 //!
 //! Streaming credentials are OAuth refresh tokens for paid accounts, and a
-//! snapshot leaves the machine: `cloud-push` PUTs it to mozaiklabs.fr. They
+//! snapshot leaves the machine as a downloaded file. They
 //! used to be XOR'd with a fixed key compiled into every binary, which is not
 //! encryption — anyone holding a Tune build could read every token in every
 //! snapshot they could reach (audit item 7).
 //!
 //! They are now sealed in a [`Envelope`]: a random data key encrypts them, and
 //! that data key is wrapped under both the user's passphrase and a recovery key
-//! shown once. Without one of those two secrets the tokens are unreadable, so
-//! the cloud store holds an opaque blob.
+//! shown once. Without one of those two secrets the tokens are unreadable.
 //!
 //! Two consequences worth knowing:
 //!
 //! - [`export_config`] produces a snapshot with **no tokens at all**. Sealing
 //!   requires the passphrase, so it is [`export_config_sealed`] that carries
 //!   them. Everything else — zones, playlists, favourites — restores without
-//!   any secret, so an unattended `cloud-pull` onto a fresh machine still
+//!   any secret, so a restore onto a fresh machine still
 //!   rebuilds the install and only asks for a passphrase to re-attach the
 //!   streaming services.
 //! - Snapshots written before this change are still readable on import
@@ -34,7 +33,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
@@ -1315,23 +1313,6 @@ fn import_legacy_tokens(
     Ok(count)
 }
 
-// ── Snapshot fingerprint ────────────────────────────────────────────
-
-impl ConfigSnapshot {
-    /// SHA-256 digest of the snapshot content (for cloud deduplication).
-    pub fn fingerprint(&self) -> String {
-        let json = serde_json::to_vec(self).unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(&json);
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Approximate size in bytes when serialised as JSON.
-    pub fn size_bytes(&self) -> usize {
-        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,28 +1350,6 @@ mod tests {
         assert!(is_room_profile_key("room_profile_1"));
         assert!(is_room_profile_key("room_profile_index"));
         assert!(!is_room_profile_key("theme"));
-    }
-
-    #[test]
-    fn snapshot_fingerprint_deterministic() {
-        let snap = ConfigSnapshot {
-            version: "0.8.0".into(),
-            created_at: "2026-06-25T00:00:00Z".into(),
-            zones: vec![],
-            settings: vec![],
-            playlists: vec![],
-            favorites: vec![],
-            radio_stations: vec![],
-            alarms: vec![],
-            eq_presets: vec![],
-            room_profiles: vec![],
-            streaming_tokens: vec![],
-            sealed_tokens: None,
-        };
-        let fp1 = snap.fingerprint();
-        let fp2 = snap.fingerprint();
-        assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 64);
     }
 
     #[test]
@@ -1598,8 +1557,8 @@ mod tests {
     }
 
     /// The heart of audit item 7: a snapshot that leaves the machine must not
-    /// carry a recoverable token. Previously `cloud-push` PUT them to
-    /// mozaiklabs.fr XOR'd with a key compiled into every binary.
+    /// carry a recoverable token. Previously they left XOR'd with a key
+    /// compiled into every binary.
     #[test]
     fn a_sealed_snapshot_leaks_no_token() {
         let backend = seeded_backend();
@@ -1614,8 +1573,8 @@ mod tests {
         assert!(snapshot.streaming_tokens.is_empty());
     }
 
-    /// The plain export must never carry tokens: it is what an unattended
-    /// cloud-push sends, with no passphrase to seal them.
+    /// The plain export must never carry tokens: nothing seals them without
+    /// a passphrase.
     #[test]
     fn the_plain_export_carries_no_tokens() {
         let backend = seeded_backend();
@@ -1662,7 +1621,7 @@ mod tests {
     }
 
     /// Everything except the tokens must restore with no secret at all —
-    /// otherwise a cloud-pull onto a new machine is useless without a
+    /// otherwise a restore onto a new machine is useless without a
     /// passphrase.
     #[test]
     fn a_restore_without_the_secret_still_rebuilds_the_install() {

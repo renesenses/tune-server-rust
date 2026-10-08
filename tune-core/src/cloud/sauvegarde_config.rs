@@ -1,8 +1,13 @@
 //! Sauvegarde cloud des personnalisations, automatique et tournante (#5654,
 //! tune-web-client#902).
 //!
+//! Réservée au Premium, toutes ses routes comprises (seul l'état se lit sans,
+//! pour que l'écran dise « Premium requis »).
+//!
 //! Le serveur range dans le compte mozaiklabs relié au plus
-//! [`MAX_INSTANTANES`] instantanés CHIFFRÉS de ce qui fait « son » Tune :
+//! [`MAX_INSTANTANES`] instantanés CHIFFRÉS par machine, et le compte garde
+//! au plus [`MAX_MACHINES`] machines (le site élague les plus anciennes), de
+//! ce qui fait « son » Tune :
 //! réglages, zones et leurs réglages, profils et leurs préférences
 //! d'interface (`ui_preferences`, thème…), préréglages d'égaliseur et profils
 //! de pièce, favoris, playlists, radios. Sur un appareil neuf relié au même
@@ -18,7 +23,9 @@
 //!   restauration, puis une seconde passe sur l'objet entier ;
 //! - l'identité de la machine et sa liaison au compte (`server_id`, jetons
 //!   du compte, licence, propriétaire), et l'état de la sauvegarde elle-même ;
-//! - le hash de mot de passe des profils, et leur droit d'administration.
+//! - le hash de mot de passe des profils, et leur droit d'administration :
+//!   un profil restauré revient SANS mot de passe
+//!   ([`Rapport::profiles_without_password`]), et l'écran l'annonce.
 //!
 //! # Chiffrement
 //!
@@ -83,8 +90,11 @@ pub const FORMAT_BLOB: &str = "tune-config-cloud";
 /// Version de l'enveloppe.
 pub const FORMAT_BLOB_VERSION: u64 = 1;
 
-/// Instantanés gardés par compte (la rotation est faite par le site).
+/// Instantanés gardés par MACHINE (la rotation est faite par le site).
 pub const MAX_INSTANTANES: usize = 3;
+/// Machines qui sauvegardent dans un même compte ; au-delà, le site élague
+/// la machine dont la dernière sauvegarde est la plus ancienne.
+pub const MAX_MACHINES: usize = 5;
 /// Cadence de la passe de fond.
 pub const CADENCE_MINUTES: i64 = 5;
 /// Délai d'attente : un changement n'est envoyé qu'une fois la configuration
@@ -542,6 +552,9 @@ pub struct Rapport {
     pub zones_created: usize,
     pub zones_updated: usize,
     pub profiles_created: usize,
+    /// Profils créés par la restauration, donc SANS mot de passe : le hash
+    /// ne voyage jamais. L'écran le dit et invite à en poser un.
+    pub profiles_without_password: Vec<String>,
     pub playlists_restored: usize,
     pub playlists_replaced: usize,
     pub favorites_restored: usize,
@@ -619,6 +632,7 @@ pub fn restaurer(
                 // voyagent pas (voir l'en-tête).
                 let id = repo.create(nom, affiche, None)?;
                 rapport.profiles_created += 1;
+                rapport.profiles_without_password.push(nom.to_string());
                 id
             }
         };
@@ -939,6 +953,7 @@ pub fn statut(settings: &SettingsRepo) -> Value {
         "pending_since": txt(CLE_ATTENTE_PREMIERE),
         "debounce_minutes": DELAI_D_ATTENTE_MINUTES,
         "max_snapshots": MAX_INSTANTANES,
+        "max_machines": MAX_MACHINES,
     })
 }
 

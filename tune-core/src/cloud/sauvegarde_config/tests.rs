@@ -419,6 +419,11 @@ fn une_machine_neuve_reprend_ses_personnalisations() {
         &source,
         "INSERT INTO profiles (username, display_name) VALUES ('ana', 'Ana')",
     );
+    exec(
+        &source,
+        "UPDATE profiles SET password_hash = 'hash-ana', password_hash_v2 = 'hash2-ana' \
+         WHERE username = 'ana'",
+    );
     let pid = un_entier(&source, "SELECT id FROM profiles WHERE username = 'ana'");
     reglages(&source)
         .set(&format!("ui_preferences:{pid}"), r#"{"accent":"vert"}"#)
@@ -443,6 +448,7 @@ fn une_machine_neuve_reprend_ses_personnalisations() {
         1
     );
     assert_eq!(r.profiles_created, 1);
+    assert_eq!(r.profiles_without_password, vec!["ana".to_string()]);
     let pid_ici = un_entier(&cible, "SELECT id FROM profiles WHERE username = 'ana'");
     assert_ne!(
         pid_ici, pid,
@@ -461,6 +467,15 @@ fn une_machine_neuve_reprend_ses_personnalisations() {
         ),
         0,
         "un profil restauré ne doit jamais être administrateur"
+    );
+    assert_eq!(
+        un_entier(
+            &cible,
+            "SELECT COUNT(*) FROM profiles WHERE username = 'ana' \
+             AND (COALESCE(password_hash, '') <> '' OR COALESCE(password_hash_v2, '') <> '')"
+        ),
+        0,
+        "un profil restauré revient sans mot de passe"
     );
     assert_eq!(r.playlists_restored, 1);
     assert_eq!(

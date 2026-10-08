@@ -4,8 +4,8 @@
 //! et la forme des réponses.
 //!
 //! Toutes sont réservées à l'administrateur : elles lisent ou réécrivent la
-//! configuration entière. `status` n'a pas de garde Premium, pour que l'écran
-//! puisse dire « Premium requis » au lieu d'une erreur.
+//! configuration entière. Toutes exigent le Premium, sauf `status`, pour que
+//! l'écran puisse dire « Premium requis » au lieu d'une erreur.
 
 use axum::Json;
 use axum::extract::State;
@@ -130,6 +130,9 @@ fn issue_json(i: &sc::Issue) -> Value {
 // ── POST /system/config-backup/cloud/disable ────────────────────────
 
 pub(super) async fn disable(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+    if let Err(r) = garde_premium(&state).await {
+        return r;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     match sc::activer(&settings, false) {
         Ok(()) => Json(json!({ "success": true })).into_response(),
@@ -193,7 +196,13 @@ pub(super) async fn snapshots(_admin: RequireAdmin, State(state): State<AppState
                     v
                 })
                 .collect();
-            Json(json!({ "backups": backups, "max": sc::MAX_INSTANTANES })).into_response()
+            Json(json!({
+                "backups": backups,
+                "max": sc::MAX_INSTANTANES,
+                "max_per_server": sc::MAX_INSTANTANES,
+                "max_machines": sc::MAX_MACHINES,
+            }))
+            .into_response()
         }
         Err(e) => erreur_site(e),
     }
@@ -277,6 +286,8 @@ pub(super) async fn restore(
     Json(json!({
         "success": true,
         "key_adopted": adoptee,
+        // Les mots de passe des profils ne voyagent jamais.
+        "passwords_restored": false,
         "report": rapport,
     }))
     .into_response()
