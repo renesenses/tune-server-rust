@@ -1925,6 +1925,132 @@ async fn pg_3039_fenetre_et_decompte_des_ajouts_recents() {
     let _ = db.execute(&format!("DELETE FROM artists WHERE id = {artiste}"), &[]);
 }
 
+/// #5402 — le tri « par creation » s'execute sur PostgreSQL, filtre et trie
+/// sur `file_first_seen.created_at`, et compte les pistes sans date.
+///
+/// La colonne vient de la migration 084 et d'`ENSURE_COLUMNS` ; le test la
+/// pose lui-meme (`IF NOT EXISTS`) pour ne dependre d'aucun millesime du banc.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_5402_tri_des_ajouts_recents_par_creation() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::engine::Engine;
+    use crate::db::home_queries::{TriAjouts, recently_added_par, recently_added_totaux_par};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL absente — epreuve PostgreSQL sautee");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("TUNE_TEST_PG_URL posee : la connexion doit aboutir");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool));
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS file_first_seen \
+         (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
+        "ALTER TABLE file_first_seen ADD COLUMN IF NOT EXISTS created_at DOUBLE PRECISION",
+    ] {
+        db.execute(sql, &[]).expect(sql);
+    }
+
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let il_y_a = |jours: f64| maintenant - jours * 24.0 * 3600.0;
+    let marque = format!("i5402-{}", maintenant as i64);
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}\n{e}"))
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    // (album, date d'ajout, creation)
+    let cas: [(&str, f64, Option<f64>); 4] = [
+        ("Alpha", 1.0, Some(5.0)),
+        ("Bravo", 3.0, Some(1.0)),
+        ("Charlie", 2.0, None),
+        ("Delta", 4.0, Some(30.0)),
+    ];
+    let mut ids = Vec::new();
+    for (nom, ajout, creation) in cas {
+        let titre = format!("{marque} {nom}");
+        let album = id_de(&format!(
+            "INSERT INTO albums (title, track_count) VALUES ('{titre}', 1) RETURNING id"
+        ));
+        let chemin = format!("/{marque}/{nom}.flac");
+        db.execute(
+            &format!(
+                "INSERT INTO tracks (title, album_id, file_path, file_mtime, duration_ms) \
+                 VALUES ('{titre}', {album}, '{chemin}', {}, 60000)",
+                il_y_a(900.0)
+            ),
+            &[],
+        )
+        .expect("piste");
+        let creation = creation.map_or("NULL".to_string(), |j| il_y_a(j).to_string());
+        db.execute(
+            &format!(
+                "INSERT INTO file_first_seen (file_path, first_seen_at, created_at) \
+                 VALUES ('{chemin}', {}, {creation})",
+                il_y_a(ajout)
+            ),
+            &[],
+        )
+        .expect("premiere vue");
+        ids.push(album);
+    }
+
+    let depuis = il_y_a(7.0);
+    let limite: i64 = 5000;
+    let ordre = |tri: TriAjouts| -> Vec<String> {
+        db.query_many(
+            &recently_added_par(Engine::Postgres, tri),
+            &[&depuis as &dyn ToSqlValue, &limite as &dyn ToSqlValue],
+        )
+        .unwrap_or_else(|e| panic!("tri {tri:?} sur PostgreSQL : {e}"))
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_string()))
+        .filter_map(|t| t.strip_prefix(&format!("{marque} ")).map(str::to_string))
+        .collect()
+    };
+    assert_eq!(
+        ordre(TriAjouts::Modification),
+        vec!["Alpha", "Charlie", "Bravo", "Delta"]
+    );
+    assert_eq!(
+        ordre(TriAjouts::Creation),
+        vec!["Bravo", "Charlie", "Alpha"]
+    );
+
+    // Le decompte : un entier, sur la fenetre de la creation. Le banc partage
+    // sa base : on ne conclut que sur un ecart d'au moins une piste.
+    let sans = |tri: TriAjouts| -> i64 {
+        db.query_many(
+            &recently_added_totaux_par(Engine::Postgres, tri),
+            &[&depuis as &dyn ToSqlValue],
+        )
+        .unwrap_or_else(|e| panic!("decompte {tri:?} sur PostgreSQL : {e}"))
+        .first()
+        .and_then(|l| l.get(3).and_then(|v| v.as_i64()))
+        .expect("sans_creation est un entier — CAST … AS BIGINT")
+    };
+    assert_eq!(sans(TriAjouts::Modification), 0);
+    assert!(
+        sans(TriAjouts::Creation) >= 1,
+        "Charlie n'a pas de creation"
+    );
+
+    for album in &ids {
+        let _ = db.execute(&format!("DELETE FROM tracks WHERE album_id = {album}"), &[]);
+        let _ = db.execute(&format!("DELETE FROM albums WHERE id = {album}"), &[]);
+    }
+    let _ = db.execute(
+        &format!("DELETE FROM file_first_seen WHERE file_path LIKE '/{marque}/%'"),
+        &[],
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_genres_manquants_3979() {
     let db = pg_or_skip!();
@@ -3059,4 +3185,99 @@ async fn pg_bio_reecrite_a_la_main_oublie_sa_provenance() {
             .unwrap()
     );
     assert_eq!(repo.bio_provenance(id).unwrap(), None);
+}
+
+/// b209 — l'ordre des pistes d'un album et le rattrapage des numéros 0 UPnP,
+/// sur PostgreSQL. Jumeau de `track_repo::tests_b209_ordre_dans_l_album` :
+/// PostgreSQL place NULL EN FIN d'un tri croissant, SQLite EN TÊTE — la même
+/// fiche doit rendre le même ordre sur les deux moteurs.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::track_repo::TrackRepo;
+    use crate::db::track_repo::tests_b209_ordre_dans_l_album::{ATTENDU, PISTES};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    reset_schema(&db);
+    let album = db
+        .execute_returning_id("INSERT INTO albums (title) VALUES ('Album b209')", &[])
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (id, titre, disque, numero, source) in PISTES {
+        let nouvel = db
+            .execute_returning_id(
+                "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES ($1, $2, $3, $4, $5, 1000)",
+                &[
+                    &titre.to_string() as &dyn ToSqlValue,
+                    &album,
+                    &disque.map(|v| v as i32),
+                    &numero.map(|v| v as i32),
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        ids.insert(id, nouvel);
+    }
+    let repo = TrackRepo::with_backend(db.clone());
+    let titres: Vec<String> = repo
+        .list_by_album(album)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert_eq!(
+        titres, ATTENDU,
+        "sans le correctif, PostgreSQL place la piste à 0 devant la piste 1"
+    );
+
+    // Rattrapage : un ancien import UPnP à 0 passe à NULL au démarrage, une
+    // piste locale à 0 reste à 0.
+    let ancien = db
+        .execute_returning_id(
+            "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES ('Ancien import', $1, 0, 0, 'upnp', 1000)",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations rejouées");
+    let valeur = |id: i64, colonne: &str| {
+        db.query_one(
+            &format!("SELECT {colonne} FROM tracks WHERE id = $1"),
+            &[&id as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_i64())
+    };
+    assert_eq!(
+        valeur(ancien, "track_number"),
+        None,
+        "sans le rattrapage : 0"
+    );
+    assert_eq!(valeur(ancien, "disc_number"), None);
+    assert_eq!(
+        valeur(ids[&5], "track_number"),
+        Some(0),
+        "piste locale intacte"
+    );
+    assert_eq!(valeur(ids[&2], "track_number"), Some(1));
+
+    // Idempotence de l'indexation : `IS DISTINCT FROM`, pas `=`, pour que
+    // NULL contre NULL ne compte pas comme un changement.
+    crate::db::track_repo::tests_b209_ordre_dans_l_album::regle_d_idempotence_upnp(
+        db.clone(),
+        ids[&3],
+    );
 }

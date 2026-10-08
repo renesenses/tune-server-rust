@@ -99,7 +99,7 @@ use super::{
     POSITION_PAST_END_TICKS, RENDERER_CALE_REPRISE_COOLDOWN_SECS, RENDERER_CALE_RESTE_MIN_MS,
     REPRISE_CALE_DELAI_DE_CONSTAT_MS, REPRISE_CALE_DELAI_MAX_DE_CONSTAT_MS,
     REPRISE_CALE_ECART_TOLERE_MS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
-    TICKS_GELE_DLNA_AVEC_SETNEXT,
+    TICKS_GELE_DLNA_AVEC_SETNEXT, TransportState,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -644,6 +644,18 @@ pub fn dsd_skip_latched(latch: Option<i64>, next_pos: Option<i64>) -> bool {
 /// armed — a strong signal the renderer auto-advanced to the next track.
 pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
     last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
+}
+
+/// #3967 — une chute de position (`position_reset`) observée alors que le
+/// transport ne JOUE pas doit-elle être différée au sondage suivant ?
+///
+/// Seul `Playing` atteste un passage : `Stopped` à zéro est la signature d'un
+/// renderer qui a acquitté `SetNextAVTransportURI` sans enchaîner, et
+/// `Transitioning` / `Paused` ne disent pas encore ce qui va jouer. Différer
+/// ne perd rien : la position d'avant est gardée, et un `Playing` près de
+/// zéro au sondage suivant conclut au passage.
+pub fn chute_a_differer_hors_lecture(chute_brute: bool, etat: TransportState) -> bool {
+    chute_brute && etat != TransportState::Playing
 }
 
 /// The `position_reset` fallback advances metadata only, assuming the

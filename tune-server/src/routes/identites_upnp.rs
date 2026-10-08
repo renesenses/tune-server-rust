@@ -279,6 +279,8 @@ mod tests {
             channels: Some(2),
             taille: Some(123456),
             protocol_info: Some("http-get:*:audio/flac:*".into()),
+            numero_de_piste: None,
+            numero_de_disque: None,
         }
     }
 

@@ -1014,11 +1014,27 @@ pub mod sql {
         )
     }
 
+    /// L'ordre des pistes d'UN album : disque, puis numéro, les pistes SANS
+    /// numéro en dernier, puis titre (b209).
+    ///
+    /// 0 et NULL disent tous deux « numéro inconnu » : le scan local range 0,
+    /// l'import UPnP range NULL. SQLite place NULL EN TÊTE d'un tri croissant,
+    /// PostgreSQL EN FIN : sans le `CASE`, la même fiche s'ordonnait
+    /// différemment selon le moteur, et une piste sans numéro passait devant
+    /// la piste 1. Le troisième terme rend NULL pour TOUTE piste sans numéro,
+    /// pour que 0 et NULL se départagent par le titre sur les deux moteurs.
+    /// Un disque inconnu (NULL ou 0) est le disque 1.
+    pub const ORDRE_DANS_L_ALBUM: &str = "COALESCE(NULLIF(CAST(t.disc_number AS INTEGER), 0), 1), \
+         CASE WHEN COALESCE(CAST(t.track_number AS INTEGER), 0) > 0 THEN 0 ELSE 1 END, \
+         CASE WHEN CAST(t.track_number AS INTEGER) > 0 THEN CAST(t.track_number AS INTEGER) END, \
+         t.title";
+
     pub fn list_by_album<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.album_id = {} ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+            "{} WHERE t.album_id = {} ORDER BY {}",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            ORDRE_DANS_L_ALBUM
         )
     }
 
@@ -1699,14 +1715,25 @@ fn sql_figer_toutes_les_premieres_vues(engine: Engine) -> String {
     }
 }
 
-/// Première vue d'un chemin qui entre dans la bibliothèque ([`premiere_vue_du_fichier`]).
+/// Première vue d'un chemin qui entre dans la bibliothèque, et sa date de
+/// création ([`dates_du_fichier`]).
+///
+/// La première vue n'est écrite QU'UNE fois (#4546) : un conflit ne la touche
+/// pas. La date de création, elle, suit le disque à chaque passage du scan
+/// (#5402) — c'est ainsi qu'un fichier rescanné la reçoit sans rattrapage —
+/// mais une lecture qui n'en rend aucune (NFS, SMB) n'efface pas celle qu'on
+/// avait.
 fn sql_premiere_vue(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => {
-            "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
+            "INSERT INTO file_first_seen (file_path, first_seen_at, created_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (file_path) DO UPDATE \
+             SET created_at = COALESCE(EXCLUDED.created_at, file_first_seen.created_at)"
         }
         Engine::Sqlite => {
-            "INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) VALUES (?, ?)"
+            "INSERT INTO file_first_seen (file_path, first_seen_at, created_at) VALUES (?, ?, ?) \
+             ON CONFLICT (file_path) DO UPDATE \
+             SET created_at = COALESCE(excluded.created_at, file_first_seen.created_at)"
         }
     }
 }
@@ -1746,6 +1773,22 @@ fn maintenant_epoch() -> f64 {
 /// #4546 tient : la ligne n'est écrite QU'UNE fois (`INSERT OR IGNORE` /
 /// `ON CONFLICT DO NOTHING`), une retouche ultérieure ne la change plus.
 fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant: f64) -> f64 {
+    dates_du_fichier(chemin, mtime_du_scan, maintenant).0
+}
+
+/// La première vue ([`premiere_vue_du_fichier`]) et la date de CRÉATION d'un
+/// fichier, d'une seule lecture du disque (#5402).
+///
+/// La création est le btime tel quel, borné à `maintenant` ; `None` quand le
+/// système ne le donne pas (NFS, SMB, certains montages Docker, vieux noyaux
+/// sans `statx`) ou qu'il n'est pas valable. Jamais de repli sur le `mtime`
+/// ICI : c'est la requête de tri qui retombe sur la date d'ajout, et elle
+/// seule sait le compter pour le dire à l'écran.
+fn dates_du_fichier(
+    chemin: &str,
+    mtime_du_scan: Option<f64>,
+    maintenant: f64,
+) -> (f64, Option<f64>) {
     let meta = std::fs::metadata(chemin).ok();
     let en_epoch = |t: std::time::SystemTime| {
         t.duration_since(std::time::UNIX_EPOCH)
@@ -1761,7 +1804,17 @@ fn premiere_vue_du_fichier(chemin: &str, mtime_du_scan: Option<f64>, maintenant:
         .and_then(|m| m.modified().ok())
         .and_then(en_epoch)
         .or(mtime_du_scan);
-    choisir_premiere_vue(creation, modification, maintenant)
+    (
+        choisir_premiere_vue(creation, modification, maintenant),
+        creation_valable(creation, maintenant),
+    )
+}
+
+/// Une date de création retenue : finie, positive, bornée à `maintenant`.
+fn creation_valable(creation: Option<f64>, maintenant: f64) -> Option<f64> {
+    creation
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|d| d.min(maintenant))
 }
 
 /// Le choix seul, sans disque : modification, sinon création, bornée à
@@ -2132,8 +2185,8 @@ impl TrackRepo {
         // tracks/albums but not file_first_seen). Best-effort: never fail track
         // creation over this. Streaming tracks (http URLs / no path) are skipped.
         if let Some(path) = chemin_local(track.file_path.as_deref()) {
-            let now = premiere_vue_du_fichier(path, track.file_mtime, maintenant_epoch());
-            let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
+            let (now, creation) = dates_du_fichier(path, track.file_mtime, maintenant_epoch());
+            let fs_params: [&dyn ToSqlValue; 3] = [&path, &now, &creation];
             let _ = self
                 .db
                 .execute(sql_premiere_vue(self.db.engine()), &fs_params);
@@ -2147,6 +2200,18 @@ impl TrackRepo {
     }
 
     fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
+        self.update_inner_numeros(track, &track.disc_number, &track.track_number)
+    }
+
+    /// [`Self::update_inner`], les numéros de disque et de piste pris à part :
+    /// le modèle les porte en entiers (0 = inconnu), une source distante les
+    /// range NULL quand elle ne les connaît pas (b209).
+    fn update_inner_numeros(
+        &self,
+        track: &Track,
+        disque: &dyn ToSqlValue,
+        piste: &dyn ToSqlValue,
+    ) -> Result<(), TuneError> {
         let id = track
             .id
             .ok_or_else(|| TuneError::NotFound("track has no id".into()))?;
@@ -2156,9 +2221,9 @@ impl TrackRepo {
             &track.album_id,
             &track.artist_id,
             &track.album_artist,
-            &track.disc_number,
+            disque,
             &track.disc_subtitle,
-            &track.track_number,
+            piste,
             &track.duration_ms,
             &track.file_path,
             &track.format,
@@ -2192,6 +2257,59 @@ impl TrackRepo {
 
     pub fn update(&self, track: &Track) -> Result<(), TuneError> {
         self.update_inner(track).map_err(TuneError::from)
+    }
+
+    /// [`Self::update`] d'une piste DISTANTE (b209) : les numéros de disque et
+    /// de piste sont écrits tels que la source les dit, `None` rangé NULL —
+    /// jamais le 0 / 1 du modèle.
+    ///
+    /// Sans elle, l'indexation UPnP écrivait d'abord 0 par [`Self::update`],
+    /// puis NULL par son `UPDATE` explicite : deux changements réels par
+    /// piste, à chaque passe, même sur une source identique — et le
+    /// `SystemUpdateID` (`upnp_catalog_revision`) avançait de deux par piste.
+    /// Ici la ligne reçoit d'emblée la valeur finale : une passe identique ne
+    /// change rien, et les déclencheurs de révision (`IS NOT` en SQLite,
+    /// `IS DISTINCT FROM` en PostgreSQL) restent muets.
+    pub fn update_distante(
+        &self,
+        track: &Track,
+        disque: Option<i32>,
+        piste: Option<i32>,
+    ) -> Result<(), TuneError> {
+        self.update_inner_numeros(track, &disque, &piste)
+    }
+
+    /// Pochette et numéros d'une piste UPnP, écrits SEULEMENT s'ils changent
+    /// (b209).
+    ///
+    /// `create` range les entiers du modèle (0 = inconnu) et `update` ne
+    /// touche pas `cover_path` : l'indexation publie donc ces trois colonnes
+    /// à part. La garde `IS NOT` (SQLite) / `IS DISTINCT FROM` (PostgreSQL)
+    /// compare aussi NULL à NULL — `=` ne le ferait pas : une passe identique
+    /// ne touche aucune ligne. Rend le nombre de lignes écrites.
+    pub fn publier_pochette_et_numeros_upnp(
+        &self,
+        id: i64,
+        pochette: Option<&str>,
+        disque: Option<i32>,
+        piste: Option<i32>,
+    ) -> Result<u64, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "UPDATE tracks SET cover_path = ?1, track_number = ?2, disc_number = ?3 \
+                 WHERE id = ?4 AND source = 'upnp' \
+                 AND (cover_path IS NOT ?1 OR track_number IS NOT ?2 OR disc_number IS NOT ?3)"
+            }
+            Engine::Postgres => {
+                "UPDATE tracks SET cover_path = $1, track_number = $2, disc_number = $3 \
+                 WHERE id = $4 AND source = 'upnp' \
+                 AND (cover_path IS DISTINCT FROM $1 OR track_number IS DISTINCT FROM $2 \
+                 OR disc_number IS DISTINCT FROM $3)"
+            }
+        };
+        let params: [&dyn ToSqlValue; 4] = [&pochette, &piste, &disque, &id];
+        let n = self.db.execute(sql, &params).map_err(TuneError::Db)?;
+        Ok(n as u64)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), TuneError> {
@@ -2809,7 +2927,8 @@ impl TrackRepo {
             .join(",");
         let sql = format!(
             "SELECT t.id, t.album_id FROM tracks t WHERE t.album_id IN ({id_list}) \
-             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title, t.id"
+             ORDER BY {}, t.id",
+            sql::ORDRE_DANS_L_ALBUM
         );
         let rows = self.db.query_many(&sql, &[])?;
         Ok(rows
@@ -3341,8 +3460,13 @@ impl TrackRepo {
                 Ok(_) => {
                     count += 1;
                     if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
-                        let date = premiere_vue_du_fichier(chemin, track.file_mtime, maintenant);
-                        premieres_vues.push(vec![chemin.to_sql_value(), date.to_sql_value()]);
+                        let (date, creation) =
+                            dates_du_fichier(chemin, track.file_mtime, maintenant);
+                        premieres_vues.push(vec![
+                            chemin.to_sql_value(),
+                            date.to_sql_value(),
+                            creation.to_sql_value(),
+                        ]);
                     }
                 }
                 // Previously this failure was swallowed silently: the scanner
@@ -3519,6 +3643,28 @@ impl TrackRepo {
                 pistes = tracks.len(),
                 "track_update_failures_truncated"
             );
+        }
+        // #5402 : un fichier RESCANNÉ reçoit sa date de création, sans
+        // rattrapage des autres. Après le gel ci-dessus : la première vue est
+        // déjà posée, le conflit ne touche que `created_at`.
+        if !figer_params.is_empty() {
+            let maintenant = maintenant_epoch();
+            let dates: Vec<Vec<SqlValue>> = tracks
+                .iter()
+                .filter(|t| t.id.is_some())
+                .filter_map(|t| {
+                    let chemin = chemin_local(t.file_path.as_deref())?;
+                    let (date, creation) = dates_du_fichier(chemin, t.file_mtime, maintenant);
+                    Some(vec![
+                        chemin.to_sql_value(),
+                        date.to_sql_value(),
+                        creation.to_sql_value(),
+                    ])
+                })
+                .collect();
+            let _ = self
+                .db
+                .execute_many(sql_premiere_vue(self.db.engine()), &dates);
         }
         if !deplacements.is_empty()
             && let Err(e) =
@@ -5475,6 +5621,155 @@ mod tests {
         assert_eq!(choisir_premiere_vue(None, None, 100.0), 100.0);
     }
 
+    // ── #5402 : la date de création, à côté de la première vue ──────────
+
+    /// `file_first_seen.created_at` d'un chemin.
+    fn creation_en_base(repo: &TrackRepo, chemin: &str) -> Option<f64> {
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        repo.backend()
+            .query_one(
+                "SELECT created_at FROM file_first_seen WHERE file_path = ?",
+                &p,
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()))
+    }
+
+    /// Le btime du fichier tel que le système le donne, ou `None`.
+    fn btime(chemin: &str) -> Option<f64> {
+        std::fs::metadata(chemin)
+            .ok()?
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64())
+    }
+
+    /// La piste relue avec son identifiant, prête pour `update_batch`.
+    fn avec_id(repo: &TrackRepo, mut t: Track) -> Track {
+        let chemin = t.file_path.clone().unwrap();
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        t.id = repo
+            .backend()
+            .query_one("SELECT id FROM tracks WHERE file_path = ?", &p)
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()));
+        assert!(t.id.is_some(), "piste introuvable : {chemin}");
+        t
+    }
+
+    /// Le scan garde la date de CRÉATION à part, sans toucher à la date
+    /// d'ajout (modification d'abord, #4546).
+    ///
+    /// Le fichier porte un `mtime` de 2017 et vient d'être créé : sur un
+    /// système qui donne le btime, les deux dates diffèrent de plusieurs
+    /// années, et chacune doit rester dans sa colonne. Sans btime, la colonne
+    /// reste NULL — jamais remplie par le `mtime`.
+    #[test]
+    fn le_scan_garde_la_date_de_creation_du_fichier_5402() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fichier_date(dir.path(), "x.flac", 1_500_000_000);
+        let attendue = btime(&f);
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (album, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        assert_eq!(repo.create_batch(&[t]).unwrap(), 1);
+
+        assert_eq!(
+            creation_en_base(&repo, &f),
+            attendue,
+            "la date de création en base doit être le btime du fichier"
+        );
+        assert_eq!(
+            date_d_ajout(&repo, album),
+            Some(1_500_000_000.0),
+            "la date d'ajout reste le mtime"
+        );
+        match attendue {
+            Some(c) => assert!(c > 1_500_000_000.0 + 86_400.0, "btime {c}"),
+            None => eprintln!("#5402 : pas de btime sur ce système de fichiers"),
+        }
+
+        // `create`, l'autre porte d'entrée, l'écrit aussi.
+        let g = fichier_date(dir.path(), "y.flac", 1_500_000_000);
+        let (_, t) = album_avec_piste(&db, "Y", &g, 1_500_000_000.0);
+        repo.create(&t).unwrap();
+        assert_eq!(creation_en_base(&repo, &g), btime(&g));
+    }
+
+    /// Un fichier RESCANNÉ reçoit sa date de création, sans que sa date
+    /// d'ajout bouge. C'est la seule voie des fichiers déjà en base : il n'y
+    /// a pas de rattrapage.
+    #[test]
+    fn un_fichier_rescanne_recoit_sa_date_de_creation_5402() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fichier_date(dir.path(), "x.flac", 1_500_000_000);
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let (_, t) = album_avec_piste(&db, "X", &f, 1_500_000_000.0);
+        repo.create_batch(std::slice::from_ref(&t)).unwrap();
+        // Une ligne d'avant la colonne : première vue posée, création NULL.
+        let p: [&dyn ToSqlValue; 1] = [&f];
+        repo.backend()
+            .execute(
+                "UPDATE file_first_seen SET first_seen_at = 500.0, created_at = NULL \
+                 WHERE file_path = ?",
+                &p,
+            )
+            .unwrap();
+        assert_eq!(creation_en_base(&repo, &f), None);
+
+        let t = avec_id(&repo, t);
+        assert_eq!(repo.update_batch(&[t]).unwrap(), 1);
+        assert_eq!(creation_en_base(&repo, &f), btime(&f));
+        let p: [&dyn ToSqlValue; 1] = [&f];
+        let premiere = repo
+            .backend()
+            .query_one(
+                "SELECT first_seen_at FROM file_first_seen WHERE file_path = ?",
+                &p,
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()));
+        assert_eq!(premiere, Some(500.0), "la date d'ajout ne bouge pas");
+    }
+
+    /// Un passage qui ne lit AUCUN btime (NFS, SMB, fichier absent) n'efface
+    /// pas celui qu'on avait.
+    #[test]
+    fn une_lecture_sans_btime_n_efface_pas_la_date_de_creation_5402() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let chemin = "/nulle-part/5402/x.flac";
+        let (_, t) = album_avec_piste(&db, "X", chemin, 1_500_000_000.0);
+        repo.create_batch(std::slice::from_ref(&t)).unwrap();
+        assert_eq!(creation_en_base(&repo, chemin), None);
+        let p: [&dyn ToSqlValue; 1] = [&chemin];
+        repo.backend()
+            .execute(
+                "UPDATE file_first_seen SET created_at = 42.0 WHERE file_path = ?",
+                &p,
+            )
+            .unwrap();
+        let t = avec_id(&repo, t);
+        repo.update_batch(std::slice::from_ref(&t)).unwrap();
+        repo.delete_all().unwrap();
+        repo.create_batch(&[t]).unwrap();
+        assert_eq!(creation_en_base(&repo, chemin), Some(42.0));
+    }
+
+    /// Le choix seul : finie, positive, bornée à maintenant ; jamais le mtime.
+    #[test]
+    fn la_date_de_creation_retenue_5402() {
+        assert_eq!(creation_valable(Some(10.0), 100.0), Some(10.0));
+        assert_eq!(creation_valable(Some(9e9), 100.0), Some(100.0));
+        assert_eq!(creation_valable(Some(0.0), 100.0), None);
+        assert_eq!(creation_valable(Some(-1.0), 100.0), None);
+        assert_eq!(creation_valable(Some(f64::NAN), 100.0), None);
+        assert_eq!(creation_valable(None, 100.0), None);
+    }
+
     /// Le cas de Jean Valjean, sur les TROIS chemins qui récrivent le
     /// `mtime` : une piste scannée avant la correction (donc sans première
     /// vue) garde la date qu'on lui affichait, et ne remonte pas.
@@ -6278,5 +6573,203 @@ mod tests_doubtful_source_locale_20260927 {
             "le compte doit valoir la liste"
         );
         assert_eq!(liste, 2, "les deux pistes locales, pas la distante");
+    }
+}
+
+/// b209 — l'ordre des pistes d'un album, et le rattrapage des numéros 0 que
+/// l'import UPnP rangeait sur chaque piste.
+#[cfg(test)]
+pub(crate) mod tests_b209_ordre_dans_l_album {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    /// `(id, titre, disque, numéro, source)` — un album où disque et numéro
+    /// sont tantôt dits, tantôt NULL, tantôt 0.
+    pub(crate) const PISTES: [(i64, &str, Option<i64>, Option<i64>, &str); 6] = [
+        (1, "Alive", Some(1), Some(3), "upnp"),
+        (2, "Believer", Some(1), Some(1), "upnp"),
+        (3, "Aaa sans numéro", None, None, "upnp"),
+        (4, "Dreaming", None, Some(2), "upnp"),
+        (5, "Zéro", Some(1), Some(0), "local"),
+        (6, "Disque deux", Some(2), Some(1), "upnp"),
+    ];
+
+    /// Disque (inconnu = 1), numéro, sans numéro en dernier, titre.
+    pub(crate) const ATTENDU: [&str; 6] = [
+        "Believer",
+        "Dreaming",
+        "Alive",
+        "Aaa sans numéro",
+        "Zéro",
+        "Disque deux",
+    ];
+
+    /// La règle d'idempotence de l'indexation UPnP, sur les deux moteurs
+    /// (b209) : réécrire une piste distante à l'identique ne touche pas le
+    /// `SystemUpdateID` (`upnp_catalog_revision`) ; apprendre un numéro le
+    /// fait avancer d'un cran. `id` désigne une piste UPnP SANS numéro (NULL).
+    pub(crate) fn regle_d_idempotence_upnp(db: Arc<dyn DbBackend>, id: i64) {
+        let revision = || {
+            db.query_one("SELECT value FROM upnp_catalog_revision WHERE id = 1", &[])
+                .unwrap()
+                .unwrap()[0]
+                .as_i64()
+                .unwrap()
+        };
+        let repo = TrackRepo::with_backend(db.clone());
+        let piste = repo.get(id).unwrap().expect("piste UPnP");
+        let avant = revision();
+
+        // Passe identique : la ligne reçoit les valeurs qu'elle porte déjà.
+        repo.update_distante(&piste, None, None).unwrap();
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), None, None)
+            .unwrap();
+        assert_eq!(ecrites, 0, "NULL contre NULL : rien à écrire");
+        assert_eq!(
+            revision(),
+            avant,
+            "réindexation identique : le SystemUpdateID ne bouge pas"
+        );
+
+        // Contre-épreuve : `update` (le 0 du modèle) PUIS la publication
+        // (NULL) — l'aller-retour d'avant le correctif — fait bien avancer
+        // le compteur de deux, alors que la ligne finit identique.
+        repo.update(&piste).unwrap();
+        repo.publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), None, None)
+            .unwrap();
+        assert_eq!(
+            revision(),
+            avant + 2,
+            "l'aller-retour 0 puis NULL compte deux changements"
+        );
+        let avant = revision();
+
+        // Un numéro réellement appris est un changement, et UN seul.
+        repo.update_distante(&piste, Some(1), Some(4)).unwrap();
+        assert_eq!(
+            revision(),
+            avant + 1,
+            "un numéro appris fait avancer le compteur"
+        );
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), Some(1), Some(4))
+            .unwrap();
+        assert_eq!(ecrites, 0, "déjà écrit par `update_distante`");
+        assert_eq!(revision(), avant + 1);
+        let numeros = db
+            .query_one(
+                &format!(
+                    "SELECT disc_number, track_number FROM tracks WHERE id = {}",
+                    id
+                ),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(numeros[0].as_i64(), Some(1));
+        assert_eq!(numeros[1].as_i64(), Some(4));
+
+        // La publication seule apprend aussi (piste neuve, rangée 0 par
+        // `create`) : elle écrit, et le compteur avance.
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), Some(1), Some(5))
+            .unwrap();
+        assert_eq!(ecrites, 1);
+        assert_eq!(revision(), avant + 2);
+    }
+
+    fn banc() -> (Arc<SqliteDb>, Arc<dyn DbBackend>) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let sqlite = Arc::new(db);
+        let db: Arc<dyn DbBackend> = sqlite.clone();
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Album')", &[])
+            .unwrap();
+        for (id, titre, disque, numero, source) in PISTES {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, 1000)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &titre.to_string(),
+                    &disque,
+                    &numero,
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        }
+        (sqlite, db)
+    }
+
+    #[test]
+    fn b209_les_pistes_sans_numero_passent_apres_les_numerotees() {
+        let (_s, db) = banc();
+        let repo = TrackRepo::with_backend(db);
+        let titres: Vec<String> = repo
+            .list_by_album(1)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(
+            titres, ATTENDU,
+            "sans le correctif, SQLite place NULL en tête : la piste sans \
+             numéro et celle sans disque passaient devant la piste 1"
+        );
+        let ids: Vec<i64> = repo
+            .ids_by_album_ids(&[1])
+            .unwrap()
+            .into_iter()
+            .map(|(piste, _)| piste)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 4, 1, 3, 5, 6],
+            "même ordre pour « jouer l'album »"
+        );
+    }
+
+    #[test]
+    fn b209_reindexer_une_piste_upnp_identique_ne_touche_pas_le_system_update_id() {
+        let (_s, db) = banc();
+        // Piste 3 : UPnP, sans disque ni numéro.
+        regle_d_idempotence_upnp(db, 3);
+    }
+
+    #[test]
+    fn b209_le_demarrage_remet_a_null_les_zeros_upnp_et_seulement_eux() {
+        let (sqlite, db) = banc();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES (7, 'Ancien import', 1, 0, 0, 'upnp', 1000)",
+            &[],
+        )
+        .unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let valeur = |id: i64, colonne: &str| {
+            db.query_one(
+                &format!("SELECT {colonne} FROM tracks WHERE id = ?1"),
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_i64())
+        };
+        assert_eq!(valeur(7, "track_number"), None, "sans le rattrapage : 0");
+        assert_eq!(valeur(7, "disc_number"), None);
+        assert_eq!(
+            valeur(5, "track_number"),
+            Some(0),
+            "une piste locale n'est pas touchée"
+        );
+        assert_eq!(valeur(2, "track_number"), Some(1), "un vrai numéro reste");
+        assert_eq!(valeur(1, "disc_number"), Some(1));
     }
 }
