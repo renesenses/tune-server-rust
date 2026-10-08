@@ -1278,6 +1278,303 @@ mod tests {
         http_handle.abort();
     }
 
+    /// #5978 (Steve Taylor, fil 2182) — reprise OAAT après une pause longue.
+    ///
+    /// La session de flux est morte : l'orchestrateur rétablit la lecture à
+    /// la position d'arrêt, et le serveur sert un WAV **déjà déplacé** (sa
+    /// première trame est à N dans la piste). La sortie reçoit N par
+    /// `set_pending_start_position_ms`. Avant le correctif, le chemin HTTP
+    /// repartait de `sample_offset = 0` : la position publiée retombait à
+    /// 0:00 au premier paquet, plafonnait à la durée RESTANTE, et la fenêtre
+    /// d'armement de la suivante, calculée sur la durée de la piste, n'était
+    /// jamais atteinte.
+    ///
+    /// Le banc sert les 2 dernières secondes d'une piste de 62 s, reprise à
+    /// 60 s. Il exige :
+    ///
+    /// 1. une position publiée qui ne descend jamais sous N, et qui atteint
+    ///    la durée de la piste (donc la fenêtre d'armement) ;
+    /// 2. un premier paquet `FIRST_PACKET` au compteur absolu N, dont le PTS
+    ///    est à moins de 5 s (l'endpoint ne programme pas au-delà) ;
+    /// 3. un cadencement temps réel : ni rafale (tout envoyé d'un coup), ni
+    ///    attente de N secondes ;
+    /// 4. une fin de piste propre : `LAST_PACKET`, une seule requête, sans
+    ///    `Range`.
+    #[tokio::test]
+    async fn reprise_a_une_position_publie_une_position_absolue_qui_progresse() {
+        use oaat_core::format::AudioFormat as FormatOaat;
+        use oaat_core::wire::PacketFlags;
+
+        const REPRISE_MS: u64 = 60_000;
+        const RESTE_MS: u32 = 2_000;
+        const DUREE_PISTE_MS: u64 = REPRISE_MS + RESTE_MS as u64;
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        // Collecteur audio : (instant d'arrivée, horloge murale en ns, en-tête).
+        let audio_rx = tokio::spawn(async move {
+            let mut paquets: Vec<(std::time::Instant, u64, AudioPacketHeader)> = Vec::new();
+            let mut datagram = vec![0u8; 8192];
+            loop {
+                let Ok(Ok(n)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    audio_udp.recv(&mut datagram),
+                )
+                .await
+                else {
+                    break;
+                };
+                if n < AUDIO_HEADER_SIZE {
+                    continue;
+                }
+                let header_bytes: [u8; AUDIO_HEADER_SIZE] =
+                    datagram[..AUDIO_HEADER_SIZE].try_into().unwrap();
+                let Ok(header) = AudioPacketHeader::decode(&header_bytes) else {
+                    continue;
+                };
+                if header.flags.contains(PacketFlags::FEC) {
+                    continue;
+                }
+                let mur_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let dernier = header.flags.contains(PacketFlags::LAST_PACKET);
+                paquets.push((std::time::Instant::now(), mur_ns, header));
+                if dernier {
+                    break;
+                }
+            }
+            paquets
+        });
+
+        let endpoint_handle = tokio::spawn(async move {
+            let _clock = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                loop {
+                    match clock_udp.recv_from(&mut buf).await {
+                        Ok((n, peer)) if n >= 28 => {
+                            let _ = clock_udp.send_to(&buf[..n], peer).await;
+                        }
+                        _ => break,
+                    }
+                }
+            });
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), tcp.accept()).await
+            else {
+                return;
+            };
+            let mut codec = FrameCodec::new();
+            let mut read_buf = [0u8; 8192];
+            let n = stream.read(&mut read_buf).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            codec.feed(&read_buf[..n]);
+            if !matches!(codec.decode_next(), Ok(Some(Message::Hello(_)))) {
+                return;
+            }
+            let ack = Message::HelloAck(HelloAck {
+                protocol_version: oaat_core::PROTOCOL_VERSION,
+                endpoint_id: "mock-ep-5978".into(),
+                endpoint_name: "Mock DigiOneSig".into(),
+                capabilities: EndpointCapabilities {
+                    pcm_max_rate: 192000,
+                    pcm_max_bits: 32,
+                    dsd_max_rate: None,
+                    channels_max: 2,
+                    formats: vec![FormatOaat::PcmS16le, FormatOaat::PcmS24le],
+                    volume: None,
+                    gapless: true,
+                    seek: false,
+                },
+                audio_port,
+                clock_port,
+                buffer_size_ms: 100,
+            });
+            let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+            loop {
+                let n = match tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    stream.read(&mut read_buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => n,
+                };
+                codec.feed(&read_buf[..n]);
+                while let Ok(Some(msg)) = codec.decode_next() {
+                    if let Message::FormatPropose(fp) = msg {
+                        let accept = Message::FormatAccept(FormatAccept {
+                            stream_id: fp.stream_id,
+                        });
+                        let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                    }
+                }
+            }
+        });
+
+        // Le WAV déjà déplacé : seulement le reste de la piste, en-tête neuf.
+        let wav = make_test_wav_sized(16, RESTE_MS);
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_srv = requests.clone();
+        let http_handle = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut s, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), http_tcp.accept())
+                        .await
+                else {
+                    break;
+                };
+                // Lire la requête ENTIÈRE avant de répondre (sinon RST, #1358).
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(1) => req.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                requests_srv
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).into_owned());
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&wav).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let output = OaatOutput::new(
+            "Mock DigiOneSig".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-ep-5978".into(),
+        );
+        // Ce que fait `send_to_output` sur un rétablissement (transport.rs).
+        output.set_pending_start_position_ms(REPRISE_MS);
+        let url = format!("http://127.0.0.1:{http_port}/vesperian-drift.wav");
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Vesperian Drift"),
+                duration_ms: Some(DUREE_PISTE_MS),
+                ..Default::default()
+            })
+            .await
+            .expect("play_media");
+
+        // Relever la position publiée — celle que lit le sondeur — pendant
+        // toute la lecture.
+        let mut positions: Vec<u64> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let status = output.get_status().await.expect("get_status");
+            positions.push(status.position_ms);
+            if audio_rx.is_finished()
+                && !output.diagnostics_snapshot()["playing"]
+                    .as_bool()
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let paquets = audio_rx.await.expect("collecteur audio");
+
+        assert!(
+            paquets.len() > 50,
+            "le banc doit dépasser le pré-remplissage de 50 paquets pour juger le cadencement ({} paquets)",
+            paquets.len()
+        );
+
+        // 1. Position publiée : jamais sous N, et jusqu'à la fin de piste.
+        let min = *positions.iter().min().unwrap();
+        let max = *positions.iter().max().unwrap();
+        assert!(
+            min >= REPRISE_MS,
+            "la position publiée est retombée à {min} ms après une reprise à {REPRISE_MS} ms : \
+             la barre repart à 0:00 (#5978)"
+        );
+        assert!(
+            max + 250 >= DUREE_PISTE_MS,
+            "la position publiée plafonne à {max} ms pour une piste de {DUREE_PISTE_MS} ms : \
+             la fenêtre d'armement de la suivante n'est jamais atteinte (#5978)"
+        );
+
+        // 2. Premier paquet : FIRST_PACKET, compteur absolu, PTS proche.
+        let (_, mur_ns, premier) = &paquets[0];
+        assert!(
+            premier.flags.contains(PacketFlags::FIRST_PACKET),
+            "le premier paquet d'un flux repris doit porter FIRST_PACKET"
+        );
+        assert_eq!(
+            premier.sample_offset,
+            REPRISE_MS * 44_100 / 1000,
+            "le compteur du premier paquet doit être absolu dans la piste"
+        );
+        let avance_ns = premier.pts_ns.saturating_sub(*mur_ns);
+        assert!(
+            avance_ns < 5_000_000_000,
+            "PTS du premier paquet à {} ms dans le futur : l'endpoint ne le programmerait pas",
+            avance_ns / 1_000_000
+        );
+        let pts_dernier = paquets.last().unwrap().2.pts_ns;
+        let etendue_pts_ms = (pts_dernier - premier.pts_ns) / 1_000_000;
+        assert!(
+            etendue_pts_ms + 50 >= RESTE_MS as u64 && etendue_pts_ms <= RESTE_MS as u64 + 50,
+            "les PTS doivent couvrir le reste servi, sans saut ({etendue_pts_ms} ms pour {RESTE_MS} ms)"
+        );
+
+        // 3. Cadencement temps réel après le pré-remplissage.
+        let duree_envoi = paquets.last().unwrap().0 - paquets[0].0;
+        assert!(
+            duree_envoi >= std::time::Duration::from_millis(1_000),
+            "{RESTE_MS} ms d'audio envoyés en {duree_envoi:?} : rafale, le cadencement est perdu"
+        );
+        assert!(
+            duree_envoi <= std::time::Duration::from_millis(6_000),
+            "{RESTE_MS} ms d'audio envoyés en {duree_envoi:?} : la boucle a attendu"
+        );
+
+        // 4. Fin de piste propre.
+        assert!(
+            paquets
+                .last()
+                .unwrap()
+                .2
+                .flags
+                .contains(PacketFlags::LAST_PACKET),
+            "aucun LAST_PACKET : la fin de piste n'a pas été atteinte"
+        );
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "une seule requête attendue — {seen:?}");
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.to_ascii_lowercase().contains("range:")),
+            "aucune reprise par Range ne doit être tentée — {seen:?}"
+        );
+
+        output.stop().await.ok();
+        endpoint_handle.abort();
+        http_handle.abort();
+    }
+
     /// La contre-épreuve de bout en bout du #3163, sur un fait de base : **un
     /// flux dont la longueur n'est pas un multiple de la taille de trame
     /// aboutit, et le nombre d'octets réellement délivrés est celui attendu.**

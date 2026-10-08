@@ -705,3 +705,8 @@ path = "tests/ecrire_balises_edition_tranche4.rs"
 name = "clap_hors_async_5138"
 path = "tests/clap_hors_async_5138.rs"
 required-features = ["audio-embedding"]
+
+# La conversion WAV 24 bits progressive contre `flac -d` (zone 10 du .18, 08/10).
+[[test]]
+name = "wav24_chaine_progressive_b209bf"
+path = "tests/wav24_chaine_progressive_b209bf.rs"
