@@ -74,15 +74,76 @@ pub(super) fn build_conditions(
     engine: Engine,
     exclude: &str,
     collection: Option<&CollectionScope>,
+    socle: &SocleResolu,
 ) -> (Vec<String>, Vec<SqlValue>) {
     let (mut conds, params) = build_facet_conditions(q, engine, exclude, collection);
-    // Albums masqués (#1391) : leurs pistes sortent de TOUS les effectifs de
-    // facettes — le prédicat de SOCLE que `TrackRepo::list_filtered` pose de
-    // son côté. Sans lui, « Jazz (12) » compterait des pistes que la liste ne
-    // rend plus, précisément la divergence que ce fichier combat. Poussé en
+    // Le SOCLE de la vue (albums masqués #1391, double distant #4146, copie
+    // de moindre qualité #4101) : le MÊME que `TrackRepo::list_filtered` pose
+    // de son côté. Sans lui, « Jazz (12) » compte des pistes que la liste ne
+    // rend plus — #5977 : le rail de Dominique Pamingle annonçait 12 pour 6
+    // pistes listées, il ne posait que le premier des trois. Poussé en
     // DERNIER et sans marqueur : la numérotation des facettes ne bouge pas.
-    conds.push(tune_core::db::facet_filter::hidden_tracks_excluded().to_string());
+    conds.extend(socle.predicats(engine));
     (conds, params)
+}
+
+/// #5977 — le socle de la vue des pistes, RÉSOLU une fois par requête HTTP.
+///
+/// Les deux replis coûteux (double distant, copie de moindre qualité) sont
+/// des sous-requêtes corrélées : posées telles quelles dans chacune des
+/// requêtes du rail, elles se rejouaient une vingtaine de fois sur toute la
+/// bibliothèque (mesuré sur 104 317 pistes : rail de 0,8 à 1,8 s). On
+/// lit donc UNE fois les pistes qu'ils écartent
+/// ([`tune_core::db::facet_filter::sql_pistes_ecartees_par_le_socle`], mêmes
+/// fragments que la liste), puis chaque requête pose `t.id NOT IN (…)` — nos
+/// propres `i64`, inlinés comme les ids d'une collection intelligente.
+///
+/// Si la lecture échoue, on retombe sur les fragments SQL eux-mêmes : plus
+/// lent, jamais faux.
+pub(super) enum SocleResolu {
+    /// Les pistes écartées par les deux replis coûteux.
+    Ecartees(Vec<i64>),
+    /// Repli : les prédicats SQL complets, évalués par chaque requête.
+    EnSql,
+}
+
+impl SocleResolu {
+    pub(super) fn resoudre(state: &AppState) -> Self {
+        let sql =
+            tune_core::db::facet_filter::sql_pistes_ecartees_par_le_socle(state.backend.engine());
+        match state.backend.query_many(&sql, &[]) {
+            Ok(rows) => SocleResolu::Ecartees(
+                rows.iter()
+                    .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "facettes_socle_non_resolu");
+                SocleResolu::EnSql
+            }
+        }
+    }
+
+    /// Les prédicats du socle, alias `t`, sans marqueur.
+    fn predicats(&self, engine: Engine) -> Vec<String> {
+        match self {
+            SocleResolu::EnSql => {
+                tune_core::db::facet_filter::socle_de_la_vue_des_pistes(engine).to_vec()
+            }
+            SocleResolu::Ecartees(ids) => {
+                let mut p = vec![tune_core::db::facet_filter::hidden_tracks_excluded().to_string()];
+                if !ids.is_empty() {
+                    let liste = ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    p.push(format!("t.id NOT IN ({liste})"));
+                }
+                p
+            }
+        }
+    }
 }
 
 /// Faire tourner les lectures synchrones d'une route de bibliothèque HORS
@@ -520,10 +581,12 @@ fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|name| resolve_collection(state, name));
+    // #5977 — le socle, résolu une fois pour toutes les facettes.
+    let socle = SocleResolu::resoudre(state);
     let mut out = serde_json::Map::new();
     for field in requested {
         // Conditions narrow the count by the OTHER active facets (cumulative).
-        let (conds, params) = build_conditions(&q, engine, &field, coll.as_ref());
+        let (conds, params) = build_conditions(&q, engine, &field, coll.as_ref(), &socle);
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
         let rows: Vec<(String, i64)> = match field.as_str() {
@@ -543,7 +606,7 @@ fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
             "mood" => kv_facet(state, "mood", limit, &conds, &params),
             "source" => kv_facet(state, "source_media", limit, &conds, &params),
             "rating" => rating_facet(state, limit, &conds, &params),
-            "collection" => collection_facet(state, &q, engine),
+            "collection" => collection_facet(state, &q, engine, &socle),
             "original_year" => original_year_facet(state, limit, &conds, &params),
             // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
             // bibliothèque non taguée elle est vide, et une facette morte dans
@@ -1015,8 +1078,13 @@ fn rating_facet(
 /// resolves each collection's album ids and counts tracks in that set, narrowed
 /// by the OTHER active facets (collection self-excluded, cumulative). Empty
 /// collections are omitted (they'd read as 0, like other facets skip empties).
-fn collection_facet(state: &AppState, q: &FacetQuery, engine: Engine) -> Vec<(String, i64)> {
-    let (conds, params) = build_conditions(q, engine, "collection", None);
+fn collection_facet(
+    state: &AppState,
+    q: &FacetQuery,
+    engine: Engine,
+    socle: &SocleResolu,
+) -> Vec<(String, i64)> {
+    let (conds, params) = build_conditions(q, engine, "collection", None, socle);
     let extra = if conds.is_empty() {
         String::new()
     } else {
@@ -1327,6 +1395,10 @@ fn kv_facet(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "facets_socle_5977_tests.rs"]
+mod socle_5977_tests;
 
 #[cfg(test)]
 mod tests {

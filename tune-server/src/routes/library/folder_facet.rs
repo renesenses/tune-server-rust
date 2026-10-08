@@ -70,7 +70,9 @@ fn lire_les_dossiers(state: &AppState, filters: FacetQuery, p: FolderPathQuery) 
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|name| super::facets::resolve_collection(state, name));
-    let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref());
+    // #5977 — le socle de la liste, résolu une fois pour tous les dossiers.
+    let socle = super::facets::SocleResolu::resoudre(state);
+    let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref(), &socle);
 
     let path = p
         .path

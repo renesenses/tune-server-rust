@@ -19,7 +19,9 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use crate::error::AppError;
 use crate::state::AppState;
 
-use super::facets::{FacetQuery, build_conditions, hors_executeur, resolve_collection};
+use super::facets::{
+    FacetQuery, SocleResolu, build_conditions, hors_executeur, resolve_collection,
+};
 
 /// Une piste sans `album_id` n'est pas un album : elle n'a ni pochette, ni
 /// numéro de disque fiable, et regrouper toutes les orphelines sous une carte
@@ -82,7 +84,9 @@ fn lire_les_cartes(state: &AppState, q: FacetQuery) -> Value {
     // `exclude` vide : ici AUCUNE facette n'est exclue. Le rail exclut la
     // facette qu'il compte pour garder ses alternatives visibles ; une liste
     // d'albums, elle, doit refléter la sélection entière.
-    let (mut conds, params) = build_conditions(&q, engine, "", coll.as_ref());
+    // #5977 — le socle de la liste, résolu une fois pour le total et la page.
+    let socle = SocleResolu::resoudre(state);
+    let (mut conds, params) = build_conditions(&q, engine, "", coll.as_ref(), &socle);
     conds.push(ONLY_REAL_ALBUMS.to_string());
     let where_clause = format!(" WHERE {}", conds.join(" AND "));
 
