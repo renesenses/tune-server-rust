@@ -538,7 +538,7 @@ async fn mount_volume(Json(body): Json<MountVolumeBody>) -> Result<Json<Value>, 
         &body.uuid,
         &mount_point,
         crate::privilege::euid(),
-        crate::privilege::SUDO,
+        &crate::privilege::sudo(),
     )
     .await
     .map_err(AppError::internal)?;
@@ -797,7 +797,7 @@ async fn relocate(
             &uuid,
             &mount_point,
             crate::privilege::euid(),
-            crate::privilege::SUDO,
+            &crate::privilege::sudo(),
         )
         .await
         {

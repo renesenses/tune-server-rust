@@ -39,6 +39,24 @@ pub const ASSISTANT: &str = "/usr/local/libexec/tune-os-privilege";
 /// sudo, par son chemin absolu : jamais résolu par le `PATH` du service.
 pub const SUDO: &str = "/usr/bin/sudo";
 
+/// Le sudo que lancent les routes : [`SUDO`], sauf si `TUNE_SUDO_BIN` en
+/// désigne un autre.
+///
+/// Même mécanisme que `TUNE_SYSTEMCTL_BIN` ou `TUNE_NMCLI_BIN` : il sert aux
+/// tests d'intégration, qui ne tournent ni en root ni avec l'assistant
+/// installé, et y mettent un faux sudo jouant l'assistant. Ce faux vérifie
+/// la commande reçue et rejoue l'action ; le flux complet hors root reste
+/// ainsi éprouvé de bout en bout. Tune OS ne pose pas cette variable : le
+/// service lance `/usr/bin/sudo`, comme avant. Elle n'ouvre rien de plus
+/// que les autres `TUNE_*_BIN` : qui fixe l'environnement du service choisit
+/// déjà, en root, le `systemctl` qu'il exécute.
+pub fn sudo() -> String {
+    std::env::var("TUNE_SUDO_BIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| SUDO.to_string())
+}
+
 /// UID effectif du processus.
 pub fn euid() -> u32 {
     #[cfg(unix)]

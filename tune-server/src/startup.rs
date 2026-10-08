@@ -2627,7 +2627,7 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                 crate::smb::ESSAI_TIMEOUT,
                 crate::smb::commande_de_montage(
                     crate::privilege::euid(),
-                    crate::privilege::SUDO,
+                    &crate::privilege::sudo(),
                     &unc,
                     &path,
                     u,

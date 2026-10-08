@@ -301,7 +301,7 @@ async fn oublier_un_partage(
             Duration::from_secs(15),
             smb::commande_de_demontage(
                 crate::privilege::euid(),
-                crate::privilege::SUDO,
+                &crate::privilege::sudo(),
                 &mount_path,
             )
             .lancer(),
@@ -1280,7 +1280,7 @@ async fn mount_smb_share(
                 smb::ESSAI_TIMEOUT,
                 smb::commande_de_montage(
                     crate::privilege::euid(),
-                    crate::privilege::SUDO,
+                    &crate::privilege::sudo(),
                     &unc,
                     &mount_path,
                     user,
