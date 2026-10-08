@@ -37,11 +37,46 @@ tarball.
 docker run -d \
   --name tune-server \
   --network host \
+  --device /dev/snd \
+  --group-add audio \
   -v /path/to/music:/music:ro \
   -v tune-data:/data \
   -e TUNE_AUTO_SCAN=true \
   renesenses/tune:latest
 ```
+
+`--device /dev/snd --group-add audio` give the container the host's sound
+devices, for local output to a USB DAC plugged into this machine. Drop both
+lines on a host without `/dev/snd` (Docker Desktop on macOS/Windows, a headless
+VPS): network zones (DLNA, AirPlay, Chromecast...) do not need them. The image
+also keeps the host's own group of `/dev/snd` when it is not `audio` (29), as on
+Fedora (63).
+
+### Podman (Fedora)
+
+Rootless Podman under SELinux needs three more options: `--userns=keep-id` runs
+Tune as your own user (who already has access to the DAC from the desktop
+session), `--group-add keep-groups` keeps your host groups such as `audio`, and
+`--security-opt label=disable` lets the container open `/dev/snd` and read your
+music without relabelling it.
+
+```bash
+mkdir -p ~/.local/share/tune
+podman run -d \
+  --name tune-server \
+  --network host \
+  --userns=keep-id \
+  --group-add keep-groups \
+  --device /dev/snd \
+  --security-opt label=disable \
+  -v ~/Music:/music:ro \
+  -v ~/.local/share/tune:/data \
+  -e HOME=/data \
+  -e TUNE_AUTO_SCAN=true \
+  docker.io/renesenses/tune:latest
+```
+
+Rootful Podman (`sudo podman run`) takes the same options as `docker run` above.
 
 ### docker-compose
 
