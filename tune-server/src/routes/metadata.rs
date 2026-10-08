@@ -551,7 +551,12 @@ pub(crate) async fn edit_track(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if let Some(ref file_path) = track.file_path {
+    // Réglage « Écrire les modifications dans les fichiers audio » —
+    // désactivé par défaut (Bertrand, 05/10/2026) : la piste n'est alors
+    // modifiée qu'en base, le fichier n'est pas ouvert.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
+    let mut fichier_ecrit = false;
+    if ecrire_fichier && let Some(ref file_path) = track.file_path {
         let update = MetadataUpdate {
             title: body.title.clone(),
             artist: body.artist.clone(),
@@ -573,6 +578,7 @@ pub(crate) async fn edit_track(
             )
                 .into_response();
         }
+        fichier_ecrit = true;
     }
 
     if let Some(ref v) = body.title {
@@ -646,7 +652,54 @@ pub(crate) async fn edit_track(
             .into_response();
     }
 
-    Json(json!({ "status": "ok", "track_id": id })).into_response()
+    // Les champs corrigés à la main sont TENUS : une analyse complète, qui
+    // reconstruit la ligne depuis les balises, ne les défait plus
+    // (`tune_core::db::champs_tenus`, 05/10/2026).
+    {
+        use tune_core::db::champs_tenus::{self, Champ};
+        let mut champs = Vec::new();
+        if body.title.is_some() {
+            champs.push(Champ::Titre);
+        }
+        if body.artist.is_some() || body.artist_id.is_some() {
+            champs.push(Champ::Artiste);
+        }
+        if body.album.is_some() || body.album_id.is_some() {
+            champs.push(Champ::Album);
+        }
+        if body.album_artist.is_some() {
+            champs.push(Champ::ArtisteAlbum);
+        }
+        if body.genre.is_some() {
+            champs.push(Champ::Genre);
+        }
+        if body.track_number.is_some() {
+            champs.push(Champ::NumeroPiste);
+        }
+        if body.disc_number.is_some() {
+            champs.push(Champ::NumeroDisque);
+        }
+        if body.year.is_some() {
+            champs.push(Champ::Annee);
+        }
+        if body.composer.is_some() {
+            champs.push(Champ::Compositeur);
+        }
+        if body.label.is_some() {
+            champs.push(Champ::Label);
+        }
+        if let Err(e) = champs_tenus::tenir(&state.backend, &track, &champs) {
+            tracing::warn!(track_id = id, erreur = %e, "edit_track_champs_non_tenus");
+        }
+    }
+
+    Json(json!({
+        "status": "ok",
+        "track_id": id,
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+        "file_written": fichier_ecrit,
+    }))
+    .into_response()
 }
 
 async fn write_all_tags_compat(state: State<AppState>) -> impl IntoResponse {
@@ -733,11 +786,17 @@ async fn edit_artist(
     if let Some(ref v) = body.sort_name {
         artist.sort_name = Some(v.clone());
     }
+    let bio_avant = artist.bio.clone();
     if let Some(ref v) = body.bio {
         artist.bio = Some(v.clone());
     }
 
-    repo.update(&artist).ok();
+    if repo.update(&artist).is_ok()
+        && let Err(e) =
+            repo.oublier_provenance_si_bio_reecrite(id, bio_avant.as_deref(), artist.bio.as_deref())
+    {
+        tracing::warn!(artist_id = id, error = %e, "artist_bio_provenance_clear_failed");
+    }
 
     Json(json!({ "status": "ok", "artist_id": id })).into_response()
 }
@@ -814,7 +873,14 @@ async fn batch_set_artist(
             .backend
             .execute("UPDATE tracks SET artist_id = ?1 WHERE id = ?2", &params)
         {
-            Ok(n) => updated += n as i64,
+            Ok(n) => {
+                updated += n as i64;
+                tune_core::db::champs_tenus::tenir_par_id(
+                    &state.backend,
+                    *id,
+                    &[tune_core::db::champs_tenus::Champ::Artiste],
+                );
+            }
             Err(e) => {
                 tracing::warn!(track_id = *id, error = %e, "batch_set_artist_echec");
                 echecs += 1;
@@ -1135,8 +1201,8 @@ async fn auto_apply_suggestions(
 /// La lecture est celle de tout le reste du serveur
 /// ([`crate::i18n::lang_from_header`]) : la MÊME que `library/artists.rs`,
 /// `library/browse.rs` et `system/enrich.rs`, pas une seconde façon de lire la
-/// langue. Elle replie déjà sur `fr` quand l'en-tête est absent ou nomme une
-/// locale que l'interface ne parle pas.
+/// langue. Elle replie déjà sur l'anglais quand l'en-tête est absent ou ne
+/// nomme aucune locale que l'interface parle.
 ///
 /// Le défaut réparé ici (#1849, même famille que #2874) : cette route
 /// n'extrayait AUCUN en-tête. Elle demandait `("lang", "fr")` à Last.fm,
@@ -3154,23 +3220,23 @@ mod langue_des_bios {
         assert_eq!(wikis, vec!["de".to_string(), "en".to_string()]);
     }
 
-    /// Aucun en-tête : le repli reste `fr`, celui que porte déjà
-    /// `lang_from_header` — le comportement d'avant pour un client muet.
+    /// Aucun en-tête : le repli est l'anglais, celui que porte
+    /// `lang_from_header` — comme le client web, jamais le français par défaut.
     #[test]
-    fn sans_entete_le_repli_reste_le_francais() {
+    fn sans_entete_le_repli_est_l_anglais() {
         let (lang, wikis) = langue_et_encyclopedies(&entetes(None));
-        assert_eq!(lang, "fr");
-        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+        assert_eq!(lang, "en");
+        assert_eq!(wikis, vec!["en".to_string()]);
     }
 
-    /// Une locale que l'interface ne parle pas retombe sur `fr`, comme
+    /// Une locale que l'interface ne parle pas retombe sur l'anglais, comme
     /// partout ailleurs : la liste des encyclopédies suit ce repli, elle n'est
     /// jamais construite sur la locale refusée.
     #[test]
     fn une_locale_non_supportee_retombe_sur_le_repli() {
         let (lang, wikis) = langue_et_encyclopedies(&entetes(Some("pt-BR,pt;q=0.9")));
-        assert_eq!(lang, "fr");
-        assert_eq!(wikis, vec!["fr".to_string(), "en".to_string()]);
+        assert_eq!(lang, "en");
+        assert_eq!(wikis, vec!["en".to_string()]);
         assert!(
             !wikis.iter().any(|w| w == "pt"),
             "aucune Wikipédia « pt » ne doit être interrogée : la locale est refusée en amont"

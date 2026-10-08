@@ -7,6 +7,8 @@ mod admin;
 pub use admin::peers_payload;
 mod backup;
 mod config;
+// Fil 2145 : « Oublier ce partage » retire ses racines par le MEME chemin.
+pub(crate) use config::{pistes_qui_partiraient, retirer_un_dossier};
 mod config_backup;
 mod convert;
 mod database;
@@ -107,6 +109,12 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #5882 — refaire, sur demande, les mesures prises avant le correctif
+        // du vrai pic. Le `POST` rend les mesures périmées à la passe, par lots.
+        .route(
+            "/replaygain/reanalyze",
+            get(replaygain::replaygain_reanalyze_status).post(replaygain::replaygain_reanalyze),
+        )
         // #4185 — la plage dynamique n'avait AUCUN geste : sa mesure était le
         // troisième rang de la cascade de fond, après le ReplayGain et les
         // empreintes. Le `POST` la lance tout de suite (202 / 409), le `GET`
@@ -175,6 +183,7 @@ pub fn router() -> Router<AppState> {
             post(config::purge_orphan_tracks),
         )
         .route("/browse-dirs", get(config::browse_dirs))
+        .route("/browse-dirs/estimate", get(config::estimate_dir))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
         .route("/cleanup", post(enrich::cleanup))
@@ -228,6 +237,10 @@ pub fn router() -> Router<AppState> {
         .route("/discover-servers", get(admin::discover_servers))
         .route("/config/export", get(config::export_config))
         .route("/config/import", post(config::import_config))
+        .route(
+            "/config/import/preview",
+            post(config::preview_import_config),
+        )
         // Import routes
         //
         // #3914 : l'écran d'import TÉLÉVERSE un fichier (`multipart/form-data`,

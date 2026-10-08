@@ -76,10 +76,16 @@ pub(super) async fn get_zone_dsp(
 /// `local_gain_rabote_a_l_unite`) : au volume maximal, rien ne passe.
 /// L'écran annonçait pourtant « +8.4 dB rendus par le volume » à 100 % — un
 /// testeur perdait 8,4 dB sans que rien ne le lui dise. `volume` est le
-/// volume linéaire (0..1) sur lequel ce partage est calculé. Le ReplayGain de
-/// la piste, propre à chaque morceau, n'y entre pas. Sur une zone réseau
-/// (`stream_gain`), le volume ne rabote pas le gain cuit dans le flux :
+/// volume linéaire (0..1) sur lequel ce partage est calculé. Sur une zone
+/// réseau (`stream_gain`), le volume ne rabote pas le gain cuit dans le flux :
 /// `rendered_db` y vaut la demande, `unrendered_db` 0.
+///
+/// Lot eq-niveau — le ReplayGain de la piste EN COURS entre dans le partage
+/// local : le rabot porte sur le produit `volume × ReplayGain × compensation`
+/// (`effective_volume_units`), donc un ReplayGain négatif libère autant de
+/// marge. Au volume maximal, avec −6 dB de ReplayGain, une compensation de
+/// 4 dB passe en entier — la carte annonçait 0. `replaygain_db` dit le gain
+/// retenu ; il vaut 0 sous PURE (jamais appliqué), sans piste ou sans tag.
 pub(super) async fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
     let enabled = state.orchestrator.zone_compensation_de_niveau(zone_id);
     let (eq_db, crossfeed_db) = state.orchestrator.gain_moyen_du_dsp_de_zone(zone_id);
@@ -97,11 +103,12 @@ pub(super) async fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i6
         0.0
     };
     let volume = volume_de_zone(state, zone_id).await;
+    let replaygain = facteur_replaygain_de_zone(state, zone_id).await;
     // #5069 × #5071 : le partage par le volume ne vaut que pour la sortie
     // locale. Une zone réseau reçoit le gain cuit dans son flux, que le volume
     // ne rabote pas.
     let (rendu, non_rendu) = if sortie_locale {
-        part_rendue_par_le_volume(compensation_db, volume)
+        part_rendue_par_le_volume(compensation_db, volume * replaygain)
     } else {
         (compensation_db, 0.0)
     };
@@ -113,6 +120,7 @@ pub(super) async fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i6
         "rendered_db": arrondi(rendu),
         "unrendered_db": arrondi(non_rendu),
         "volume": (volume * 1000.0).round() / 1000.0,
+        "replaygain_db": arrondi(20.0 * replaygain.log10()),
         "local_output_only": false,
         "applied_by": if sortie_locale { "output_volume" } else { "stream_gain" },
     })
@@ -134,6 +142,33 @@ async fn volume_de_zone(state: &AppState, zone_id: i64) -> f64 {
     };
     if v.is_finite() {
         v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Lot eq-niveau — le facteur ReplayGain que la sortie locale multiplie
+/// RÉELLEMENT pour la piste en cours : la même expression que le chemin de
+/// lecture (`orchestrator/transport.rs`, `refresh_zone_pure_dsp`) — 1,0 sous
+/// PURE, 1,0 sans piste de la bibliothèque, sinon
+/// [`tune_core::audio::replaygain::playback_factor`] (mode piste ou album,
+/// pré-ampli et anti-écrêtage compris), borné comme
+/// `LocalOutput::set_replaygain_factor`.
+pub(super) async fn facteur_replaygain_de_zone(state: &AppState, zone_id: i64) -> f64 {
+    if tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id) {
+        return 1.0;
+    }
+    let piste = state
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .and_then(|np| np.track_id);
+    let f = piste.map_or(1.0, |tid| {
+        tune_core::audio::replaygain::playback_factor(&state.backend, tid)
+    });
+    if f.is_finite() && f > 0.0 {
+        f.min(4.0)
     } else {
         1.0
     }
@@ -670,3 +705,9 @@ pub(super) async fn eq_response(
             .into_response(),
     }
 }
+
+// Lot eq-niveau — `zones/dsp/replaygain_rendu_tests.rs`. Déclaré
+// `#[cfg(test)]` juste au-dessus du `mod` : c'est ce que le garde-fou
+// `eq_refresh_guard` reconnaît comme module de test, pas comme une route.
+#[cfg(test)]
+mod replaygain_rendu_tests;

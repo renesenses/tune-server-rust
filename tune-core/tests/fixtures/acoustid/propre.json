@@ -1,0 +1,320 @@
+{
+ "album": {
+  "titre": "Les Heures Claires",
+  "artiste": "Quatuor Imaginaire"
+ },
+ "pistes": [
+  {
+   "track_id": 101,
+   "titre": "Aube sur la Saône",
+   "artiste": "Quatuor Imaginaire",
+   "duree_s": 313,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000008",
+      "score": 0.952,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000007",
+        "title": "Aube sur la Saône",
+        "duration": 312,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000001",
+          "name": "Quatuor Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000002",
+          "title": "Les Heures Claires",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000003",
+            "country": "FR",
+            "date": {
+             "year": 2004,
+             "month": 3
+            },
+            "medium_count": 1,
+            "track_count": 4
+           },
+           {
+            "id": "7e100000-0000-4000-8000-000000000004",
+            "country": "DE",
+            "date": {
+             "year": 2011
+            },
+            "medium_count": 1,
+            "track_count": 4
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000005",
+          "title": "Le Meilleur du Quatuor Imaginaire",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000006",
+            "country": "XE",
+            "date": {
+             "year": 2015
+            },
+            "medium_count": 1,
+            "track_count": 18,
+            "title": "Le Meilleur du Quatuor Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-101"
+  },
+  {
+   "track_id": 102,
+   "titre": "Les Heures claires",
+   "artiste": "Quatuor Imaginaire",
+   "duree_s": 255,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000000a",
+      "score": 0.942,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000009",
+        "title": "Les Heures claires",
+        "duration": 254,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000001",
+          "name": "Quatuor Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000002",
+          "title": "Les Heures Claires",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000003",
+            "country": "FR",
+            "date": {
+             "year": 2004,
+             "month": 3
+            },
+            "medium_count": 1,
+            "track_count": 4
+           },
+           {
+            "id": "7e100000-0000-4000-8000-000000000004",
+            "country": "DE",
+            "date": {
+             "year": 2011
+            },
+            "medium_count": 1,
+            "track_count": 4
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000005",
+          "title": "Le Meilleur du Quatuor Imaginaire",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000006",
+            "country": "XE",
+            "date": {
+             "year": 2015
+            },
+            "medium_count": 1,
+            "track_count": 18,
+            "title": "Le Meilleur du Quatuor Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-102"
+  },
+  {
+   "track_id": 103,
+   "titre": "Contrepoint d'hiver",
+   "artiste": "Quatuor Imaginaire",
+   "duree_s": 402,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000000c",
+      "score": 0.9319999999999999,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-00000000000b",
+        "title": "Contrepoint d'hiver",
+        "duration": 401,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000001",
+          "name": "Quatuor Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000002",
+          "title": "Les Heures Claires",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000003",
+            "country": "FR",
+            "date": {
+             "year": 2004,
+             "month": 3
+            },
+            "medium_count": 1,
+            "track_count": 4
+           },
+           {
+            "id": "7e100000-0000-4000-8000-000000000004",
+            "country": "DE",
+            "date": {
+             "year": 2011
+            },
+            "medium_count": 1,
+            "track_count": 4
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000005",
+          "title": "Le Meilleur du Quatuor Imaginaire",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000006",
+            "country": "XE",
+            "date": {
+             "year": 2015
+            },
+            "medium_count": 1,
+            "track_count": 18,
+            "title": "Le Meilleur du Quatuor Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-103"
+  },
+  {
+   "track_id": 104,
+   "titre": "Final en sol",
+   "artiste": "Quatuor Imaginaire",
+   "duree_s": 189,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000000e",
+      "score": 0.9219999999999999,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-00000000000d",
+        "title": "Final en sol",
+        "duration": 188,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000001",
+          "name": "Quatuor Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000002",
+          "title": "Les Heures Claires",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000003",
+            "country": "FR",
+            "date": {
+             "year": 2004,
+             "month": 3
+            },
+            "medium_count": 1,
+            "track_count": 4
+           },
+           {
+            "id": "7e100000-0000-4000-8000-000000000004",
+            "country": "DE",
+            "date": {
+             "year": 2011
+            },
+            "medium_count": 1,
+            "track_count": 4
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000005",
+          "title": "Le Meilleur du Quatuor Imaginaire",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000006",
+            "country": "XE",
+            "date": {
+             "year": 2015
+            },
+            "medium_count": 1,
+            "track_count": 18,
+            "title": "Le Meilleur du Quatuor Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-104"
+  }
+ ],
+ "attendu": {
+  "release_id": "7e100000-0000-4000-8000-000000000003",
+  "release_group_id": "96a00000-0000-4000-8000-000000000002",
+  "enregistrements": {
+   "101": "5ec00000-0000-4000-8000-000000000007",
+   "102": "5ec00000-0000-4000-8000-000000000009",
+   "103": "5ec00000-0000-4000-8000-00000000000b",
+   "104": "5ec00000-0000-4000-8000-00000000000d"
+  }
+ },
+ "verite": {
+  "101": "5ec00000-0000-4000-8000-000000000007",
+  "102": "5ec00000-0000-4000-8000-000000000009",
+  "103": "5ec00000-0000-4000-8000-00000000000b",
+  "104": "5ec00000-0000-4000-8000-00000000000d"
+ }
+}

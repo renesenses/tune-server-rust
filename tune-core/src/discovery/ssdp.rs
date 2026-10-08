@@ -1147,6 +1147,10 @@ fn build_renderer_device(
         "event_sub_urls".into(),
         serde_json::to_value(desc.event_sub_urls()).unwrap_or_default(),
     );
+    device.capabilities.insert(
+        "scpd_urls".into(),
+        serde_json::to_value(desc.scpd_urls()).unwrap_or_default(),
+    );
     // We just fetched the description over TCP, so the ARP cache has this host:
     // recover the MAC (stable identity + brand display) while it is warm.
     super::mac::enrich_identity(&mut device);

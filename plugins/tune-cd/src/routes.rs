@@ -3,7 +3,15 @@
 //! * `GET  /etat`   — le lecteur et le disque ;
 //! * `GET  /disque` — la TOC, l'identifiant et les métadonnées ;
 //! * `POST /jouer`  — `{ "zone_id": 3, "piste": 5 }` : pose le disque entier
-//!   en file sur la zone et joue la piste demandée (la 1ʳᵉ sans `piste`).
+//!   en file sur la zone et joue la piste demandée (la 1ʳᵉ sans `piste`) ;
+//! * `POST /ejecter` — `{ "forcer": true }` facultatif : éjecte le disque du
+//!   lecteur courant (fil 2135). Si une zone le joue (ou le tient en pause),
+//!   refus `409 lecture_en_cours` qui nomme les zones ; avec `forcer`, ces
+//!   zones sont d'abord arrêtées, puis le disque est éjecté.
+//!
+//! Pendant une extraction (#2466, `extraction/routes.rs`), `/jouer` et
+//! `/ejecter` refusent par `409 extraction_en_cours`, même avec `forcer` :
+//! on annule d'abord l'extraction.
 
 use std::sync::Arc;
 
@@ -14,12 +22,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 use crate::discid::disc_id;
 use crate::ejection::ZonesDuDisque;
-use crate::fournisseur::source_id;
+use crate::extraction::Extractions;
+use crate::fournisseur::{SOURCE, source_id};
 use crate::hote::{ElementFile, HoteLecture};
-use crate::lecteur::{ErreurCd, LecteurDisque, Presence, plateforme_prise_en_charge};
+use crate::lecteur::{
+    ErreurCd, ErreurEjection, LecteurDisque, Presence, plateforme_prise_en_charge,
+};
 use crate::musicbrainz::{Consultation, InfosDisque};
 use crate::toc::Toc;
 
@@ -29,17 +41,36 @@ pub struct EtatRoutes {
     pub hote: Arc<dyn HoteLecture>,
     pub consultation: Arc<dyn Consultation>,
     pub zones: ZonesDuDisque,
+    /// Réveille la surveillance (`ejection::Surveillant`) : après une
+    /// éjection commandée, la source `cd` passe à `vide` et
+    /// `sources.changed` part tout de suite, sans attendre le tour suivant.
+    pub reveil: Arc<Notify>,
+    /// #2466 — les extractions. `None` : routes d'extraction absentes.
+    pub extraction: Option<Arc<Extractions>>,
 }
 
 pub fn router(etat: EtatRoutes) -> Router<()> {
-    Router::new()
+    let base = Router::new()
         .route("/etat", get(etat_du_lecteur))
         .route("/disque", get(disque))
         .route("/jouer", post(jouer))
-        .with_state(etat)
+        .route("/ejecter", post(ejecter))
+        .with_state(etat.clone());
+    match etat.extraction.clone() {
+        Some(ex) => base.merge(crate::extraction::routes::router(etat, ex)),
+        None => base,
+    }
 }
 
-fn refus(code: StatusCode, motif: &str, message: String) -> Response {
+/// L'extraction en cours, s'il y en a une (#2466).
+fn extraction_en_cours(etat: &EtatRoutes) -> Option<String> {
+    etat.extraction
+        .as_ref()
+        .and_then(|e| e.en_cours())
+        .map(|t| t.id.clone())
+}
+
+pub(crate) fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
 }
 
@@ -55,7 +86,7 @@ fn aucun_lecteur() -> Refus {
 }
 
 /// La TOC du disque inséré, ou le refus qui dit pourquoi il n'y en a pas.
-async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
+pub(crate) async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
     let Some(lecteur) = etat.lecteur.clone() else {
         return Err(aucun_lecteur());
     };
@@ -183,6 +214,13 @@ pub(crate) async fn jouer_disque(
     zone_id: i64,
     piste: Option<u8>,
 ) -> Result<Value, Refus> {
+    if extraction_en_cours(etat).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "extraction_en_cours",
+            "Le disque est en cours d'extraction : annulez-la pour le jouer.".into(),
+        ));
+    }
     let toc = toc_ou_refus(etat).await?;
     let disc = disc_id(&toc);
     let infos = etat.consultation.consulter(&disc).await;
@@ -207,6 +245,121 @@ pub(crate) async fn jouer_disque(
             }))
         }
         Err(e) => Err((StatusCode::BAD_GATEWAY, "lecture", e)),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DemandeEjecter {
+    /// Arrêter d'abord les zones qui jouent le disque (le client a demandé
+    /// confirmation). Sans lui, une lecture en cours fait refuser.
+    #[serde(default)]
+    forcer: bool,
+}
+
+/// Les zones qui jouent ce disque ou le tiennent en pause, triées.
+pub(crate) async fn zones_qui_jouent_le_disque(etat: &EtatRoutes) -> Vec<i64> {
+    let candidates: Vec<i64> = etat.zones.lock().await.iter().copied().collect();
+    let mut v = Vec::new();
+    for z in candidates {
+        if etat.hote.source_en_cours(z).await.as_deref() == Some(SOURCE) {
+            v.push(z);
+        }
+    }
+    v.sort_unstable();
+    v
+}
+
+/// Fil 2135 — éjecter le disque. La lecture et l'extraction (#2466) tiennent
+/// le disque : la première s'arrête sur confirmation, la seconde s'annule.
+async fn ejecter(State(etat): State<EtatRoutes>, corps: Option<Json<DemandeEjecter>>) -> Response {
+    let forcer = corps.map(|Json(d)| d.forcer).unwrap_or(false);
+    if let Some(id) = extraction_en_cours(&etat) {
+        return crate::extraction::routes::conflit_extraction(&id);
+    }
+    let Some(lecteur) = etat.lecteur.clone() else {
+        let (code, motif, message) = aucun_lecteur();
+        return refus(code, motif, message);
+    };
+    let l = lecteur.clone();
+    let presence = tokio::task::spawn_blocking(move || l.presence())
+        .await
+        .unwrap_or(Presence::AucunLecteur);
+    match presence {
+        Presence::AucunLecteur => {
+            let (code, motif, message) = aucun_lecteur();
+            return refus(code, motif, message);
+        }
+        Presence::Vide => {
+            return refus(
+                StatusCode::CONFLICT,
+                "aucun_disque",
+                "Le lecteur est vide.".into(),
+            );
+        }
+        Presence::Disque => {}
+    }
+
+    let zones = zones_qui_jouent_le_disque(&etat).await;
+    if !zones.is_empty() && !forcer {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "lecture_en_cours",
+                "message": format!(
+                    "Le disque est en lecture sur {} zone(s) : arrêtez la lecture, \
+                     ou confirmez l'éjection pour l'arrêter.",
+                    zones.len()
+                ),
+                "zones": zones,
+            })),
+        )
+            .into_response();
+    }
+    // La lecture d'abord : une zone arrêtée ne lit plus de secteurs, et le
+    // système ne refuse pas l'éjection d'un disque qu'on lit encore.
+    for &z in &zones {
+        tracing::info!(zone_id = z, "cd_zone_arretee_avant_ejection");
+        etat.hote.arreter(z).await;
+    }
+    {
+        let mut suivies = etat.zones.lock().await;
+        for z in &zones {
+            suivies.remove(z);
+        }
+    }
+
+    let l = lecteur.clone();
+    let resultat = tokio::task::spawn_blocking(move || l.ejecter_disque())
+        .await
+        .unwrap_or_else(|e| Err(ErreurEjection::Echec(e.to_string())));
+    // Dans tous les cas : la présence a pu changer (éjection partielle).
+    etat.reveil.notify_one();
+    match resultat {
+        Ok(()) => Json(json!({
+            "ejecte": true,
+            "lecteur": lecteur.chemin(),
+            "zones_arretees": zones,
+        }))
+        .into_response(),
+        Err(ErreurEjection::AucunLecteur) => {
+            let (code, motif, message) = aucun_lecteur();
+            refus(code, motif, message)
+        }
+        Err(ErreurEjection::AucunDisque) => refus(
+            StatusCode::CONFLICT,
+            "aucun_disque",
+            "Le lecteur est vide.".into(),
+        ),
+        Err(ErreurEjection::NonPrisEnCharge) => refus(
+            StatusCode::NOT_IMPLEMENTED,
+            "ejection_non_prise_en_charge",
+            "Ce lecteur ne peut pas être éjecté par Tune.".into(),
+        ),
+        Err(ErreurEjection::Echec(raison)) => refus(
+            StatusCode::BAD_GATEWAY,
+            "ejection",
+            format!("Le système a refusé l'éjection : {raison}"),
+        ),
     }
 }
 
@@ -252,6 +405,8 @@ mod tests {
                 hote: hote.clone(),
                 consultation: c,
                 zones: Arc::default(),
+                reveil: Arc::default(),
+                extraction: None,
             },
             hote,
         )
@@ -387,5 +542,151 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "piste_inconnue");
+    }
+
+    // ─── Fil 2135 : éjecter ────────────────────────────────────────────────
+
+    fn simule_arc() -> Arc<LecteurSimule> {
+        Arc::new(LecteurSimule::new(toc_du_vecteur()))
+    }
+
+    /// La surveillance a-t-elle été réveillée ? (`Notify` garde le jeton.)
+    async fn reveillee(e: &EtatRoutes) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), e.reveil.notified())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn ejecter_sans_lecture_ejecte_le_disque_et_reveille_la_surveillance() {
+        let l = simule_arc();
+        let (e, hote) = etat(Some(l.clone()), Arc::new(SansReseau));
+        let (code, v) = appel(router(e.clone()), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(
+            v,
+            json!({"ejecte": true, "lecteur": "simulé", "zones_arretees": []})
+        );
+        assert_eq!(l.ejections(), 1);
+        assert_eq!(l.presence(), Presence::Vide);
+        assert!(hote.arrets.lock().await.is_empty());
+        assert!(
+            reveillee(&e).await,
+            "sources.changed doit partir tout de suite"
+        );
+        // Plus rien à éjecter.
+        let (code, v) = appel(router(e), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(v["error"], "aucun_disque");
+        assert_eq!(l.ejections(), 1);
+    }
+
+    /// Une zone joue le disque : sans confirmation, REFUS qui nomme la zone,
+    /// et rien n'est touché — ni la zone, ni le disque.
+    #[tokio::test]
+    async fn ejecter_pendant_la_lecture_est_refuse_sans_confirmation() {
+        let l = simule_arc();
+        let (e, hote) = etat(Some(l.clone()), Arc::new(SansReseau));
+        let (code, _) = appel(
+            router(e.clone()),
+            "POST",
+            "/jouer",
+            Some(json!({"zone_id": 3})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, v) = appel(router(e.clone()), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "lecture_en_cours");
+        assert_eq!(v["zones"], json!([3]));
+        assert!(v["message"].as_str().unwrap().contains("1 zone"));
+        assert_eq!(l.ejections(), 0, "le disque n'est pas éjecté");
+        assert_eq!(l.presence(), Presence::Disque);
+        assert!(hote.arrets.lock().await.is_empty(), "la zone joue encore");
+        assert!(e.zones.lock().await.contains(&3));
+        // `forcer: false` explicite : même refus.
+        let (code, _) = appel(
+            router(e),
+            "POST",
+            "/ejecter",
+            Some(json!({"forcer": false})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(l.ejections(), 0);
+    }
+
+    /// Confirmé (`forcer`) : la zone est arrêtée D'ABORD, puis le disque est
+    /// éjecté. Une zone passée à autre chose (radio) n'est pas touchée.
+    #[tokio::test]
+    async fn ejecter_confirme_arrete_la_lecture_puis_ejecte() {
+        let l = simule_arc();
+        let (e, hote) = etat(Some(l.clone()), Arc::new(SansReseau));
+        for z in [3, 5] {
+            let (code, _) = appel(
+                router(e.clone()),
+                "POST",
+                "/jouer",
+                Some(json!({"zone_id": z})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+        }
+        hote.sources.lock().await.insert(5, "radio".into());
+        let (code, v) = appel(
+            router(e.clone()),
+            "POST",
+            "/ejecter",
+            Some(json!({"forcer": true})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["zones_arretees"], json!([3]));
+        assert_eq!(*hote.arrets.lock().await, vec![3]);
+        assert_eq!(l.ejections(), 1);
+        assert!(!e.zones.lock().await.contains(&3));
+    }
+
+    #[tokio::test]
+    async fn les_refus_d_ejection_disent_pourquoi() {
+        let (e, _) = etat(None, Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "POST", "/ejecter", None).await;
+        assert_eq!(
+            (code, v["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("aucun_lecteur"))
+        );
+
+        let l = simule_arc();
+        l.debrancher();
+        let (e, _) = etat(Some(l), Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "POST", "/ejecter", None).await;
+        assert_eq!(
+            (code, v["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("aucun_lecteur"))
+        );
+
+        // Le système refuse (disque occupé) : 502, la raison du système.
+        let l = simule_arc();
+        l.refuser_ejection("Device or resource busy");
+        let (e, _) = etat(Some(l.clone()), Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(v["error"], "ejection");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("Device or resource busy")
+        );
+        assert_eq!(l.presence(), Presence::Disque);
+
+        // Un lecteur qui ne sait pas éjecter (volume fabriqué) : 501.
+        let v =
+            crate::cddafs::tests::faux_volume("ejecter-501", &crate::cddafs::tests::petite_toc());
+        let l = crate::cddafs::LecteurVolume::sur_dossier(v.to_path_buf());
+        let (e, _) = etat(Some(Arc::new(l)), Arc::new(SansReseau));
+        let (code, v) = appel(router(e), "POST", "/ejecter", None).await;
+        assert_eq!(code, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(v["error"], "ejection_non_prise_en_charge");
     }
 }

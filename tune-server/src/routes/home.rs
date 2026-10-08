@@ -8,7 +8,8 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
-use tune_core::db::home_queries::{self, HISTORIQUE_VERS_ALBUM};
+use tune_core::db::home_queries;
+use tune_core::db::home_queries::TriAjouts;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -52,6 +53,23 @@ struct RecentlyAddedParams {
     limit: Option<i64>,
     /// Largeur de la fenetre en jours. Absent ⇒ [`FENETRE_JOURS_DEFAUT`].
     days: Option<i64>,
+    /// `modification` (defaut, le tri historique) ou `creation` (#5402).
+    /// Toute autre valeur : 400.
+    tri: Option<String>,
+}
+
+/// Le tri demande, ou le refus qui dit les valeurs admises (#5402). Absent ⇒
+/// le tri historique : un client deja deploye ne voit rien changer.
+fn tri_demande(tri: Option<&str>) -> Result<TriAjouts, AppError> {
+    match tri {
+        None => Ok(TriAjouts::default()),
+        Some(v) => TriAjouts::depuis_parametre(v).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "tri={v} inconnu : les ajouts recents se trient par `modification` \
+                 (defaut) ou par `creation`"
+            ))
+        }),
+    }
 }
 
 /// La fenetre servie quand le client n'en demande aucune.
@@ -120,33 +138,6 @@ fn ph(engine: Engine, idx: usize) -> String {
         Engine::Sqlite => SqliteDialect.placeholder(idx),
         Engine::Postgres => PostgresDialect.placeholder(idx),
     }
-}
-
-/// Les cinq genres les plus ecoutes : celui de la piste s'il est connu, sinon
-/// celui de l'album. Partage entre les recommandations et les « top mixes »,
-/// qui prenaient tous deux le genre d'un album homonyme (#2731).
-///
-/// Le filtre sur le genre se pose sur la sous-requete `g`, ou `genre`
-/// n'existe qu'une fois. Pose DANS la sous-requete, a cote de `t.genre` et
-/// `a.genre`, `WHERE genre IS NOT NULL` etait ambigu pour les deux moteurs —
-/// « column reference "genre" is ambiguous » dans le journal de jfpaquet
-/// (#3181, PostgreSQL), « ambiguous column name: genre » sur SQLite — et
-/// l'echec, avale par `ou_defaut_journalise`, faisait tirer « A decouvrir »
-/// au hasard et laissait les « top mixes » vides, sans rien dire a l'ecran.
-///
-/// L'alias `g` n'est pas decoratif : jusqu'a PostgreSQL 15, une sous-requete
-/// de `FROM` doit en porter un. Le second critere de tri rend l'ordre des
-/// ex aequo defini, donc le meme sur les deux moteurs.
-fn sql_top_genres() -> String {
-    format!(
-        "SELECT g.genre, COUNT(*) AS cnt \
-         FROM (SELECT COALESCE(t.genre, a.genre) AS genre \
-               FROM listen_history lh \
-               LEFT JOIN tracks t ON lh.track_id = t.id \
-               LEFT JOIN albums a ON {HISTORIQUE_VERS_ALBUM}) g \
-         WHERE g.genre IS NOT NULL AND g.genre <> '' \
-         GROUP BY g.genre ORDER BY cnt DESC, g.genre LIMIT 5"
-    )
 }
 
 /// Aggregated home page: returns all sections in a single response.
@@ -280,6 +271,67 @@ fn fetch_continue_listening(
     limit: i64,
     zone_id: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
+    fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG)
+}
+
+/// Le temps laisse au SECOND rang de « Continuer l'ecoute » (les albums
+/// deduits de l'historique) avant de rendre la section sans lui (fil 2130).
+///
+/// Sur PostgreSQL, 113 842 pistes, cette requete a pris 25,7 s ; le widget
+/// abandonne a 8 s (`DELAI_MS`, `PageWidgets.svelte`) et affichait
+/// « (delai) » a la place de TOUT, y compris des contextes du premier rang,
+/// deja calcules. La requete est reecrite (`historique_rattache_a_son_album`) ;
+/// cette borne est le filet : un second rang lent ne coute plus que lui-meme.
+const BORNE_SECOND_RANG: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Execute `tache` sur un fil a part et attend au plus `borne`. `None` si la
+/// borne est depassee (ou si le fil est tombe) : l'appelant rend alors ce
+/// qu'il a deja.
+///
+/// La tache abandonnee n'est PAS interrompue : elle finit sur son fil et son
+/// resultat est jete. Sur PostgreSQL elle garde donc une connexion du pool
+/// jusqu'a sa fin — c'est le prix d'une borne valable pour les deux moteurs,
+/// et la raison pour laquelle la requete elle-meme a ete reecrite.
+///
+/// `spawn_blocking` quand un moteur tokio est la (le cas du serveur : le
+/// `block_in_place` du backend PostgreSQL y fonctionne), un fil nu sinon (les
+/// tests synchrones). L'attente passe par `block_in_place` sur un moteur
+/// multi-fil, pour ne pas immobiliser un ouvrier async pendant la borne.
+fn executer_dans_la_borne<T: Send + 'static>(
+    tache: impl FnOnce() -> T + Send + 'static,
+    borne: std::time::Duration,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let envoi = move || {
+        let _ = tx.send(tache());
+    };
+    let multi_fil = match tokio::runtime::Handle::try_current() {
+        Ok(moteur) => {
+            let multi = moteur.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread;
+            drop(moteur.spawn_blocking(envoi));
+            multi
+        }
+        Err(_) => {
+            std::thread::spawn(envoi);
+            false
+        }
+    };
+    let attendre = || rx.recv_timeout(borne).ok();
+    if multi_fil {
+        tokio::task::block_in_place(attendre)
+    } else {
+        attendre()
+    }
+}
+
+/// [`fetch_continue_listening`] avec la borne du second rang en parametre —
+/// pour que les tests la mettent a zero.
+fn fetch_continue_listening_borne(
+    state: &AppState,
+    limit: i64,
+    zone_id: Option<i64>,
+    borne: std::time::Duration,
+) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
     // When a zone_id filter is provided, only show entries that were listened
     // to on that zone.  This ensures the "continue listening" section matches
@@ -302,8 +354,8 @@ fn fetch_continue_listening(
     //   plus son disque : « Tune doit refleter la realite de ce qu'a voulu
     //   faire l'auditeur », pas doubler chaque geste.
     //
-    // Le comptage, lui, reste sur TOUTES les lignes (HISTORIQUE_VERS_ALBUM
-    // inchange depuis #2731) : n'avancer que sur les lignes sans contexte
+    // Le comptage, lui, reste sur TOUTES les lignes (la regle de
+    // rattachement inchangee depuis #2731) : n'avancer que sur les lignes sans contexte
     // sous-estimerait un disque commence avant la mise a jour et poursuivi
     // apres.
     //
@@ -330,12 +382,25 @@ fn fetch_continue_listening(
         .collect();
     let sql = home_queries::continue_listening_albums_deduits(engine, &zone_filter);
     let marge = marge_de_contextes(limit);
-    let params: [&dyn ToSqlValue; 1] = [&marge];
-    for cols in state
-        .backend
-        .query_many(&sql, &params)
-        .ou_defaut_journalise()
-    {
+    // Borne (fil 2130) : au-dela, la section part avec son premier rang seul.
+    let backend = state.backend.clone();
+    let deduits = executer_dans_la_borne(
+        move || {
+            let params: [&dyn ToSqlValue; 1] = [&marge];
+            backend.query_many(&sql, &params)
+        },
+        borne,
+    )
+    .unwrap_or_else(|| {
+        tracing::warn!(
+            borne_ms = borne.as_millis() as u64,
+            contextes_rendus = items.len(),
+            "continuer_l_ecoute_second_rang_abandonne : les albums deduits de \
+             l'historique n'ont pas repondu dans la borne, la section part sans eux"
+        );
+        Ok(Vec::new())
+    });
+    for cols in deduits.ou_defaut_journalise() {
         let album_id = cols.first().and_then(|v| v.as_i64()).unwrap_or(0);
         if deja.contains(&album_id) {
             continue;
@@ -969,13 +1034,16 @@ mod tests_homonymes {
         assert!(
             items.is_empty(),
             "limite connue : « LIVE » ne rejoint pas « Live » — voir le cout \
-             mesure sur HISTORIQUE_VERS_ALBUM avant de changer ceci : {items:?}"
+             mesure sur home_queries::repli_par_artiste_ou_titre_seul avant de changer ceci : {items:?}"
         );
     }
 
     /// Les genres les plus ecoutes, tels que la requete les rend.
     fn genres_ecoutes(state: &AppState) -> Vec<(String, i64)> {
-        let Ok(lignes) = state.backend.query_many(&sql_top_genres(), &[]) else {
+        let Ok(lignes) = state
+            .backend
+            .query_many(&home_queries::top_genres_ecoutes(), &[])
+        else {
             panic!("la requete des genres doit repondre")
         };
         lignes
@@ -1738,7 +1806,8 @@ async fn recently_added(
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
     let depuis = borne_basse_de_fenetre(p.days)?;
-    let items = fetch_recently_added(&state, limit, depuis)?;
+    let tri = tri_demande(p.tri.as_deref())?;
+    let items = fetch_recently_added_par(&state, limit, depuis, tri)?;
     Ok(Json(json!(items)))
 }
 
@@ -1753,8 +1822,9 @@ async fn recently_added_summary(
     Query(p): Query<RecentlyAddedParams>,
 ) -> Result<Json<Value>, AppError> {
     let depuis = borne_basse_de_fenetre(p.days)?;
+    let tri = tri_demande(p.tri.as_deref())?;
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added_totaux(engine);
+    let sql = home_queries::recently_added_totaux_par(engine, tri);
     let params: [&dyn ToSqlValue; 1] = [&depuis];
     let rows = state
         .backend
@@ -1772,6 +1842,13 @@ async fn recently_added_summary(
         // valeurs que l'ecran affiche telle quelle (« 5 h 55 min »), et la
         // division n'a pas a etre refaite par chaque client.
         "duration_seconds": duree_ms / 1000,
+        // #5402 — le tri servi, et les pistes de la fenetre sans date de
+        // creation (NFS, SMB, Docker, ou scannees avant la colonne). En tri
+        // par creation, celles-la sont rangees par leur date d'ajout : l'ecran
+        // le dit. La presence de `tri` dit aussi au client que le serveur
+        // connait le parametre.
+        "tri": tri.nom(),
+        "tracks_without_creation_date": nombre(3),
     })))
 }
 
@@ -1788,8 +1865,19 @@ async fn recently_added_summary(
 /// de [`borne_basse_de_fenetre`], qui l'a deja bornee. Elle etait auparavant
 /// recalculee ici a 7 jours en dur, hors d'atteinte de tout appelant (#3039).
 fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec<Value>, AppError> {
+    fetch_recently_added_par(state, limit, depuis, TriAjouts::default())
+}
+
+/// [`fetch_recently_added`] pour le tri choisi (#5402). `added_at` porte alors
+/// la date de ce tri.
+fn fetch_recently_added_par(
+    state: &AppState,
+    limit: i64,
+    depuis: f64,
+    tri: TriAjouts,
+) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added(engine);
+    let sql = home_queries::recently_added_par(engine, tri);
     let params: [&dyn ToSqlValue; 2] = [&depuis, &limit];
     let rows = state
         .backend
@@ -1837,7 +1925,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
     // Find top genres from listen history
     let top_genres: Vec<String> = state
         .backend
-        .query_many(&sql_top_genres(), &[])
+        .query_many(&home_queries::top_genres_ecoutes(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
@@ -1878,25 +1966,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
 /// Les albums des `genres` donnes que l'historique ne connait pas, au hasard,
 /// `limit` au plus.
 fn albums_du_genre_non_ecoutes(state: &AppState, genres: &[String], limit: i64) -> Vec<Value> {
-    let engine = state.backend.engine();
-    // Build engine-specific placeholders for the IN clause.
-    let genre_placeholders: String = genres
-        .iter()
-        .enumerate()
-        .map(|(i, _)| ph(engine, i + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let limit_ph = ph(engine, genres.len() + 1);
-    let sql = format!(
-        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
-         FROM albums a \
-         LEFT JOIN artists ar ON a.artist_id = ar.id \
-         WHERE a.genre IN ({genre_placeholders}) \
-           AND NOT EXISTS (SELECT 1 FROM listen_history lh \
-                           WHERE {HISTORIQUE_VERS_ALBUM}) \
-         ORDER BY RANDOM() \
-         LIMIT {limit_ph}"
-    );
+    let sql = home_queries::albums_du_genre_non_ecoutes(state.backend.engine(), genres.len());
 
     // Build a Vec of owned SqlValue-able params: genres + limit.
     let mut param_vals: Vec<Box<dyn ToSqlValue>> = genres
@@ -1940,7 +2010,7 @@ async fn top_mixes(
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = state
         .backend
-        .query_many(&sql_top_genres(), &[])
+        .query_many(&home_queries::top_genres_ecoutes(), &[])
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|cols| {
@@ -3256,5 +3326,136 @@ mod tests_contexte_de_service {
             "la vignette s'ouvre chez Qobuz, pas dans la bibliotheque : {items:?}"
         );
         assert_eq!(items[0]["title"].as_str(), Some("Les indispensables"));
+    }
+}
+
+/// Fil 2130 — la borne du second rang de « Continuer l'ecoute ».
+///
+/// Le widget abandonnait a 8 s et affichait « (delai) » a la place de TOUT,
+/// parce que la requete des albums deduits en prenait 25,7. Avec la borne, un
+/// second rang lent ne coute plus que lui-meme : les contextes du premier rang
+/// partent quand meme.
+#[cfg(test)]
+mod tests_borne_2130 {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Une ecoute qui DIT son contexte (premier rang) et une ecoute d'avant la
+    /// migration 84, sans contexte, sur un album local inacheve (second rang).
+    fn un_contexte_et_un_album_deduit(state: &AppState) -> i64 {
+        let b = &state.backend;
+        b.execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let playlist = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Pulp')", &[])
+            .unwrap();
+        let artiste = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, track_count) VALUES ('Different Class', ?1, 12)",
+            &[&artiste as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let album = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, source, context_type, context_id, listened_at) \
+             VALUES ('So What', 'Miles Davis', 'Kind of Blue', 'local', 'playlist', ?1, \
+                     '2026-10-03T22:00:00Z')",
+            &[&playlist.to_string() as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO listen_history \
+             (title, artist_name, album_title, album_id, listened_at) \
+             VALUES ('Disco 2000', 'Pulp', 'Different Class', ?1, '2026-10-03T21:00:00Z')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+        album
+    }
+
+    /// Le temoin : borne a zero, le second rang est abandonne et la section
+    /// part avec le premier rang SEUL — au lieu de rien. Sans la borne (la
+    /// requete lue en direct), l'album deduit serait la et ce test rougirait.
+    #[test]
+    fn un_second_rang_hors_borne_rend_le_premier_rang_seul() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let album = un_contexte_et_un_album_deduit(&state);
+
+        // Dans la borne : les deux rangs.
+        let Ok(complet) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la section doit repondre")
+        };
+        assert_eq!(
+            complet.len(),
+            2,
+            "dans la borne, la playlist ET l'album deduit sont attendus : {complet:?}"
+        );
+        assert!(
+            complet
+                .iter()
+                .any(|i| i["album_id"].as_i64() == Some(album))
+        );
+
+        // Hors borne : le premier rang seul.
+        let Ok(partiel) = fetch_continue_listening_borne(&state, 10, None, Duration::ZERO) else {
+            panic!("la section doit repondre meme quand le second rang traine")
+        };
+        assert_eq!(
+            partiel.len(),
+            1,
+            "hors borne, seule la playlist du premier rang doit partir — le \
+             second rang n'est pas borne (fil 2130) : {partiel:?}"
+        );
+        assert_eq!(partiel[0]["context_type"], "playlist");
+        assert!(
+            partiel
+                .iter()
+                .all(|i| i["album_id"].as_i64() != Some(album)),
+            "l'album deduit est arrive malgre la borne : {partiel:?}"
+        );
+    }
+
+    /// La borne rend la main A L'HEURE : une tache de 2 s sous une borne de
+    /// 50 ms ne fait pas attendre l'appelant.
+    #[test]
+    fn la_borne_rend_la_main_sans_attendre_la_tache() {
+        let debut = Instant::now();
+        let r = executer_dans_la_borne(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                42
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, None, "hors borne, rien n'est rendu");
+        assert!(
+            debut.elapsed() < Duration::from_secs(1),
+            "l'appelant a attendu la tache : {:?}",
+            debut.elapsed()
+        );
+
+        let r = executer_dans_la_borne(|| 42, Duration::from_secs(5));
+        assert_eq!(r, Some(42), "dans la borne, le resultat est rendu");
+    }
+
+    /// Meme chose sous un moteur tokio multi-fil, le cas du serveur :
+    /// `spawn_blocking` et l'attente en `block_in_place`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_borne_tient_sous_un_moteur_multi_fil() {
+        let debut = Instant::now();
+        let r = executer_dans_la_borne(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                42
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, None);
+        assert!(debut.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            executer_dans_la_borne(|| 7, Duration::from_secs(5)),
+            Some(7)
+        );
     }
 }

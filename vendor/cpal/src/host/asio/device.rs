@@ -191,6 +191,58 @@ impl Device {
     }
 }
 
+impl Device {
+    /// Tune (#5643): does the driver accept the DSD I/O format
+    /// (`kAsioCanDoIoFormat`)? `false` on any driver error.
+    ///
+    /// A `true` here does not yet say which DSD rates or which sample type
+    /// the driver will use: `build_output_stream_raw` with
+    /// `SampleFormat::DsdU8` checks both after switching.
+    pub fn supports_dsd_output(&self) -> bool {
+        self.driver
+            .can_io_format(sys::AsioIoFormatType::Dsd)
+            .unwrap_or(false)
+    }
+
+    /// Tune (#5643, lots C-D): the DSD rates (`dsd::DSD_RATES`) the driver
+    /// accepts for native output. Empty when the driver has no DSD mode, when
+    /// a stream of this device is alive (the probe never touches a driver in
+    /// use), or on any driver error.
+    ///
+    /// Switches the driver to DSD, asks `ASIOCanSampleRate` for each rate,
+    /// then switches back to PCM. Buffers left by an earlier, dropped PCM
+    /// stream are released first (the switch requires the `Initialized`
+    /// state); the next PCM stream prepares new ones, as after a DSD stream.
+    /// The caller serialises this with every other use of the driver (Tune's
+    /// process-wide ASIO device lock).
+    pub fn dsd_output_rates(&self) -> Vec<u32> {
+        if self.driver.callback_count() > 0 || !self.supports_dsd_output() {
+            return Vec::new();
+        }
+        super::stream::forget_asio_buffers(&self.asio_streams);
+        if self.driver.dispose_buffers().is_err()
+            || self
+                .driver
+                .set_io_format(sys::AsioIoFormatType::Dsd)
+                .is_err()
+        {
+            let _ = self.driver.set_io_format(sys::AsioIoFormatType::Pcm);
+            return Vec::new();
+        }
+        let rates = super::dsd::DSD_RATES
+            .iter()
+            .copied()
+            .filter(|rate| {
+                self.driver
+                    .can_sample_rate(f64::from(*rate))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let _ = self.driver.set_io_format(sys::AsioIoFormatType::Pcm);
+        rates
+    }
+}
+
 impl Devices {
     pub fn new(asio: Arc<sys::Asio>) -> Result<Self, DevicesError> {
         let drivers = asio.driver_names().into_iter();
@@ -239,6 +291,12 @@ pub(crate) fn convert_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat
         sys::AsioSampleType::ASIOSTFloat32LSB => SampleFormat::F32,
         sys::AsioSampleType::ASIOSTFloat64MSB => SampleFormat::F64,
         sys::AsioSampleType::ASIOSTFloat64LSB => SampleFormat::F64,
+        // Tune (#5643): packed 1-bit DSD, MSB first or LSB first. The bit
+        // order is converted by the DSD output path (`dsd::DsdLayout`).
+        // `ASIOSTDSDInt8NER8` (8-bit DSD words) stays unmapped: it does not
+        // carry `DsdU8`.
+        sys::AsioSampleType::ASIOSTDSDInt8MSB1 => SampleFormat::DsdU8,
+        sys::AsioSampleType::ASIOSTDSDInt8LSB1 => SampleFormat::DsdU8,
         _ => return None,
     };
     Some(fmt)

@@ -411,7 +411,7 @@ fn dispositions_de(entrees: &[Value], device_id: &str) -> Vec<String> {
 // Le parc audio n'existe QUE derrière cette fonctionnalité :
 // `zones::canaux_des_peripheriques_locaux` rend `Vec::new()` sans elle, et le
 // handler de `GET /devices/audio` rend `devices: []`. Un binaire sans
-// `local-audio` — l'image Docker, exemption motivée — publie donc `[]`
+// `local-audio` (l'image Docker jusqu'à #5968) publie donc `[]`
 // partout, et c'est le comportement CORRECT : sans énumération, le serveur ne
 // sait rien des canaux de l'appareil.
 //

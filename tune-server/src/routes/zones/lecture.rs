@@ -4,8 +4,9 @@ use super::*;
 /// DEMANDÉ (`dsd_mode`).
 ///
 /// Le sélecteur propose « natif » et « dop ». Sur une sortie locale, les deux
-/// emballent le DSD en DoP : aucun chemin natif n'existe dans
-/// `tune-core/src/outputs/local.rs`. L'écran affichait donc « natif » pendant
+/// emballaient le DSD en DoP : aucun chemin natif n'existait dans
+/// `tune-core/src/outputs/local.rs` (#5643 en ouvre un, par ASIO : valeur
+/// `natif`). L'écran affichait donc « natif » pendant
 /// que du DoP partait, et le testeur qui bascule d'un mode à l'autre refait
 /// deux fois le même essai. `dsd_mode` reste ce qui est réglé ; ce champ dit
 /// ce qui part.
@@ -24,7 +25,20 @@ fn dsd_transport_value(zone: &Zone, dsd_mode: &str) -> Value {
         .as_deref()
         .is_some_and(|id| id.starts_with("local:"));
     let is_network = tune_core::orchestrator::is_network_output_type(zone.output_type.as_deref());
-    json!(tune_core::orchestrator::transport_dsd(is_local, is_network, dsd_mode).as_str())
+    // #5643 — « natif » quand la sortie est un pilote ASIO dont la capacité
+    // DSD est DÉJÀ connue (sondée une fois par la résolution d'une piste).
+    // Lu, jamais sondé : une route de lecture ne touche pas au pilote.
+    let natif_annonce =
+        tune_core::outputs::capacite_dsd_natif::natif_annonce(zone.output_device_id.as_deref());
+    json!(
+        tune_core::orchestrator::transport_dsd_publie(
+            is_local,
+            is_network,
+            dsd_mode,
+            natif_annonce
+        )
+        .as_str()
+    )
 }
 
 pub(super) async fn sync_status(State(state): State<AppState>) -> Json<Value> {

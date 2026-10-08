@@ -198,3 +198,70 @@ async fn i5669_gratuit_les_autres_verrous_restent() {
     .await;
     assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{v}");
 }
+
+/// #5669, décision de Bertrand du 05/10 : le bouton « Tester » ne coupe pas
+/// la musique. Sur une zone qui joue déjà, rien n'est lancé et la route le
+/// dit (409 `zone_en_lecture`) au lieu d'un `tested: true` mensonger.
+#[tokio::test]
+async fn i5669_tester_un_reveil_sur_une_zone_qui_joue_ne_coupe_rien() {
+    use tune_core::db::backend::ToSqlValue;
+    let s = etat(true).await;
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(s.backend.clone())
+        .create("Pièce par défaut", Some("dlna"), None)
+        .unwrap();
+    let id = creer(&s, reveil(json!("daily"), None)).await;
+    s.backend
+        .execute(
+            "UPDATE alarms SET zone_id = ?, one_shot = 1 WHERE id = ?",
+            &[&zone as &dyn ToSqlValue, &id],
+        )
+        .unwrap();
+    s.playback
+        .play(
+            zone,
+            tune_core::playback::NowPlaying {
+                title: "L’histoire du loup dans la bergerie".into(),
+                source: "qobuz".into(),
+                source_id: Some("qobuz-123".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let avant = s.playback.get_state(zone).await.track_generation;
+
+    let (st, v) = request(
+        &s,
+        Method::POST,
+        &format!("/api/v1/alarms/{id}/test"),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "#5669 : l'essai sur une zone qui joue doit être refusé — {v}"
+    );
+    assert_eq!(v["error"], "zone_en_lecture", "{v}");
+    assert_eq!(
+        v["message"], "La zone joue déjà : le test n'a pas été lancé",
+        "{v}"
+    );
+    assert_eq!(v["zones"], json!([zone]), "{v}");
+    let apres = s.playback.get_state(zone).await;
+    assert_eq!(
+        apres.track_generation, avant,
+        "#5669 : le bouton « Tester » a relancé une lecture sur une zone qui jouait"
+    );
+    assert_eq!(
+        apres.now_playing.as_ref().map(|np| np.source.as_str()),
+        Some("qobuz"),
+        "#5669 : le bouton « Tester » a coupé la musique en cours"
+    );
+    let sched = AlarmScheduler::with_backend(s.backend.clone(), s.orchestrator.clone());
+    assert_eq!(
+        sched.get_alarm(id).unwrap().unwrap()["enabled"],
+        1,
+        "un essai qui n'a rien joué ne consomme pas un réveil unique"
+    );
+}

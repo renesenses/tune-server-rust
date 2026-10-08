@@ -579,15 +579,22 @@ impl PlaybackOrchestrator {
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        // #5871 — chaque étape dit sa durée au-delà de 500 ms.
+        let _preparation = super::dsp::EtapeDePreparation::debut(req.zone_id, "preparation_locale");
         let repo = TrackRepo::with_backend(self.db.clone());
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "lecture_de_la_piste");
         let mut track = repo
             .get(track_id)
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
+        drop(etape);
         // #4907 — le fichier À LIRE est choisi parmi les exemplaires de la
         // piste, avant toute décision de format : préférence de l'album,
         // qualité, ordre des répertoires, puis repli sur le suivant joignable.
-        crate::library::exemplaires::appliquer_a_la_lecture(&*self.db, &mut track);
+        {
+            let _e = super::dsp::EtapeDePreparation::debut(req.zone_id, "choix_de_l_exemplaire");
+            crate::library::exemplaires::appliquer_a_la_lecture(&*self.db, &mut track);
+        }
 
         // #3631 — une piste de feuille CUE n'a PAS de `file_path` : `tracks.
         // file_path` est `UNIQUE` et une feuille découpe N pistes dans le même
@@ -695,6 +702,7 @@ impl PlaybackOrchestrator {
             }
         }
 
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "decision_de_lecture");
         let decision = match self
             .decider_la_lecture_locale(
                 req,
@@ -710,6 +718,8 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Resolu(resolu) => return Ok(resolu),
             DecisionOuResolu::Decision(decision) => decision,
         };
+        drop(etape);
+        let etape = super::dsp::EtapeDePreparation::debut(req.zone_id, "armement_du_flux");
         let (
             session_id,
             out_mime,
@@ -723,6 +733,7 @@ impl PlaybackOrchestrator {
         } else {
             self.servir_en_passthrough(req, &decision).await?
         };
+        drop(etape);
         let DecisionLocale {
             is_network_output,
             needs_transcode,
@@ -998,7 +1009,53 @@ impl PlaybackOrchestrator {
         } else {
             String::new()
         };
-        let transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
+        let mut transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
+
+        // #5643 — « natif » sur une sortie locale ASIO dont le pilote déclare
+        // le DSD à la cadence du fichier : du DSD natif, pour de vrai. Sinon
+        // `NatifServiEnDop`, comme avant, avec le motif au journal.
+        let mut motif_natif = None;
+        if transport == TransportDsd::NatifServiEnDop && source_format == Some(AudioFormat::Dsd) {
+            let entete = sonder_l_entete_dsd(file_path);
+            let sortie = self
+                .sortie_dsd_locale(req.output_device_id.as_deref())
+                .await;
+            match decider_dsd_natif_local(
+                &sortie,
+                entete.map(|(cadence, _)| cadence),
+                source.zone_max_sample_rate,
+                crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+            ) {
+                Ok(()) => {
+                    transport = TransportDsd::Natif;
+                    let (cadence, canaux) = entete.unwrap_or_default();
+                    info!(
+                        zone_id = req.zone_id,
+                        cadence,
+                        canaux,
+                        transport = transport.as_str(),
+                        "dsd_local_natif_retenu"
+                    );
+                    let fenetre = match tranche_cue {
+                        Some(t) => {
+                            let seek = req.seek_ms.unwrap_or(0);
+                            crate::audio::dsd_brut::Fenetre {
+                                debut_ms: t.debut_ms + seek,
+                                fin_ms: t.duree_ms.map(|d| t.debut_ms + d.max(seek)),
+                            }
+                        }
+                        None => crate::audio::dsd_brut::Fenetre {
+                            debut_ms: req.seek_ms.unwrap_or(0),
+                            fin_ms: None,
+                        },
+                    };
+                    return self
+                        .servir_le_dsd_natif(track, file_path.to_string(), cadence, canaux, fenetre)
+                        .await;
+                }
+                Err(motif) => motif_natif = Some(motif),
+            }
+        }
         let dop_requested = transport != TransportDsd::Pcm;
 
         // #2369 — « natif » sur une sortie locale N'EST PAS natif.
@@ -1017,6 +1074,7 @@ impl PlaybackOrchestrator {
             warn!(
                 zone_id = req.zone_id,
                 transport = transport.as_str(),
+                motif = motif_natif.map_or("source_non_dsd", MotifDsdServiEnDop::as_str),
                 "dsd_local_natif_indisponible_servi_en_dop"
             );
         }
@@ -1115,7 +1173,21 @@ impl PlaybackOrchestrator {
         let browser_needs_wav = navigateur_exige_le_wav(is_browser_output, source_format);
 
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
-        let dsd_passthrough = if source_format == Some(AudioFormat::Dsd) && is_network_output {
+        let dsd_passthrough = if source_format == Some(AudioFormat::Dsd)
+            && is_network_output
+            && crate::audio::dff::est_un_dff_dst(file_path)
+        {
+            // #4378 — un DSDIFF compressé DST n'est pas du DSD : le servir
+            // brut ferait lire au renderer des trames DST comme des bits DSD,
+            // donc du bruit. Il passe par le décodeur, quel que soit le mode
+            // DSD de la zone et quoi qu'annonce le renderer.
+            info!(
+                zone_id = req.zone_id,
+                file = %file_path,
+                "dsd_dst_jamais_servi_brut"
+            );
+            false
+        } else if source_format == Some(AudioFormat::Dsd) && is_network_output {
             let did = identifiant_du_renderer(
                 req.output_device_id.as_deref(),
                 zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
@@ -1590,6 +1662,150 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #5643 — ce que la sortie locale `device_id` permet en DSD natif.
+    ///
+    /// Le bras se lit sur la sortie elle-même (`sort_par_asio_exclusif`, la
+    /// règle de `play_url`). La capacité du pilote vient de la table
+    /// `capacite_dsd_natif` ; absente, elle est sondée UNE fois, hors du fil
+    /// asynchrone, et seulement si le verrou de périphérique ASIO est libre —
+    /// jamais pendant qu'un autre flux tient le pilote.
+    async fn sortie_dsd_locale(&self, device_id: Option<&str>) -> SortieDsdLocale {
+        #[cfg(feature = "local-audio")]
+        {
+            use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
+            let Some(device_id) = device_id else {
+                return SortieDsdLocale::NonAsio;
+            };
+            let Some(sortie) = ({ self.outputs.lock().await.get(device_id) }) else {
+                return SortieDsdLocale::NonAsio;
+            };
+            let (asio, nom) = {
+                let sortie = sortie.lock().await;
+                match sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    Some(locale) => (
+                        locale.sort_par_asio_exclusif(),
+                        locale.nom_du_peripherique().to_string(),
+                    ),
+                    None => return SortieDsdLocale::NonAsio,
+                }
+            };
+            if !asio {
+                capacite::retenir(&nom, CapaciteConnue::SortieNonAsio);
+                return SortieDsdLocale::NonAsio;
+            }
+            if let Some(CapaciteConnue::Asio { cadences }) = capacite::connue(&nom) {
+                return SortieDsdLocale::Asio { cadences };
+            }
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            {
+                let nom_sonde = nom.clone();
+                let sonde = tokio::task::spawn_blocking(move || {
+                    crate::outputs::asio_exclusive::sonder_cadences_dsd(&nom_sonde)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(cadences) = sonde {
+                    info!(device = %nom, cadences = ?cadences, "asio_dsd_natif_capacite_sondee");
+                    capacite::retenir(
+                        &nom,
+                        CapaciteConnue::Asio {
+                            cadences: cadences.clone(),
+                        },
+                    );
+                    return SortieDsdLocale::Asio { cadences };
+                }
+            }
+            SortieDsdLocale::AsioNonSondee
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = device_id;
+            SortieDsdLocale::NonAsio
+        }
+    }
+
+    /// #5643 — sert la piste en DSD brut (`DsdU8`, MSB-first) à la sortie
+    /// locale ASIO : une session HTTP dont le premier bloc est l'en-tête
+    /// `audio::dsd_brut` (cadence et canaux lus dans le fichier), puis les
+    /// octets DSD tels quels. Aucun DoP, aucune conversion de niveau.
+    async fn servir_le_dsd_natif(
+        &self,
+        track: &crate::db::models::Track,
+        file_path: String,
+        cadence: u32,
+        canaux: u32,
+        fenetre: crate::audio::dsd_brut::Fenetre,
+    ) -> Result<Option<ResolvedStream>, String> {
+        let canaux16 = u16::try_from(canaux).unwrap_or(2);
+        let duree_ms = match fenetre.fin_ms {
+            Some(fin) => fin.saturating_sub(fenetre.debut_ms),
+            None => (track.duration_ms as u64).saturating_sub(fenetre.debut_ms),
+        };
+        let info = StreamInfo {
+            format: "dsd".into(),
+            mime_type: crate::audio::dsd_brut::MIME.into(),
+            sample_rate: cadence,
+            bit_depth: 1,
+            channels: canaux16,
+            file_size: None,
+            duration_ms: Some(duree_ms),
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, true, 128).await;
+        info!(
+            file = %file_path,
+            cadence,
+            canaux,
+            debut_ms = fenetre.debut_ms,
+            fin_ms = ?fenetre.fin_ms,
+            "dsd_natif_streaming"
+        );
+        let ext = std::path::Path::new(&file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("dsf")
+            .to_lowercase();
+        let fp = file_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            match crate::audio::dsd_brut::diffuser_dsd_brut(
+                &fp,
+                &ext,
+                fenetre,
+                tx,
+                &data_ready,
+                &rt,
+                crate::http::streamer::SESSION_IDLE_TIMEOUT,
+            ) {
+                Ok(_) => tracing::debug!("dsd_natif_stream_complete"),
+                Err(e) => tracing::warn!(error = %e, "dsd_natif_stream_failed"),
+            }
+        });
+        let server_ip = self.server_ip();
+        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "dsd");
+        Ok(Some(ResolvedStream {
+            url: stream_url,
+            stream_id: Some(session_id),
+            title: track.title.clone(),
+            artist: track.artist_name.clone(),
+            album: track.album_title.clone(),
+            duration_ms: Some(track.duration_ms),
+            source: "local".into(),
+            mime_type: crate::audio::dsd_brut::MIME.into(),
+            sample_rate: Some(cadence),
+            bit_depth: Some(1),
+            channels: Some(canaux),
+            origin_url: None,
+            bitrate_kbps: None,
+            cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
+            file_size: None,
+        }))
+    }
+
     /// DoP anticipé : une source DSD que la sortie prend en DoP est résolue
     /// ici même, cadence et canaux lus DANS LE FICHIER (l'en-tête WAV
     /// décrivait la ligne `tracks`). `None` quand la cadence DoP dépasse le
@@ -1619,26 +1835,7 @@ impl PlaybackOrchestrator {
         // réellement sur le fil, et c'est la même que celle dont
         // l'encodeur se sert (`decode_dsd_to_dop_streaming`). La base
         // ne sert plus que de repli si l'en-tête est illisible.
-        let dsd_probe = {
-            let ext = std::path::Path::new(&file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("dsf")
-                .to_lowercase();
-            if ext == "dff" {
-                crate::audio::dff::parse_dff(&file_path)
-                    .ok()
-                    .map(|i| (i.sample_rate, i.channels))
-            } else if ext == "iso" {
-                crate::audio::sacd::parametres_de_lecture(std::path::Path::new(&file_path))
-                    .ok()
-                    .map(|(frequence, canaux)| (frequence, canaux as u32))
-            } else {
-                crate::audio::dsf::parse_dsf(&file_path)
-                    .ok()
-                    .map(|i| (i.sample_rate, i.channels))
-            }
-        };
+        let dsd_probe = sonder_l_entete_dsd(&file_path);
         if dsd_probe.is_none() {
             warn!(
                 path = %file_path,
@@ -3437,5 +3634,30 @@ impl PlaybackOrchestrator {
             )
         };
         Ok(flux)
+    }
+}
+
+/// La cadence et le nombre de canaux d'une source DSD, lus DANS LE FICHIER
+/// (DSF, DFF, ISO SACD) — `None` si l'en-tête est illisible. Partagé par le
+/// DoP (`anticiper_le_dop`, #1894) et le DSD natif (#5643) : une seule
+/// lecture de la même vérité.
+fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("dsf")
+        .to_lowercase();
+    if ext == "dff" {
+        crate::audio::dff::parse_dff(file_path)
+            .ok()
+            .map(|i| (i.sample_rate, i.channels))
+    } else if ext == "iso" {
+        crate::audio::sacd::parametres_de_lecture(std::path::Path::new(file_path))
+            .ok()
+            .map(|(frequence, canaux)| (frequence, canaux as u32))
+    } else {
+        crate::audio::dsf::parse_dsf(file_path)
+            .ok()
+            .map(|i| (i.sample_rate, i.channels))
     }
 }

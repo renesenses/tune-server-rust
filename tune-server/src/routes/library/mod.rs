@@ -17,6 +17,8 @@ mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
+// #4805 — les crédits d'un album lus juste après son identification.
+mod credits_apres_identification;
 mod duplicates;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;
@@ -33,7 +35,7 @@ mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
-mod identification_lot;
+pub(crate) mod identification_lot;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
@@ -41,6 +43,9 @@ mod query_multi;
 mod ratings;
 mod reidentify;
 mod reports;
+// tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
+// fichiers de CETTE machine.
+mod reveler;
 mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
@@ -333,6 +338,9 @@ pub fn router() -> Router<AppState> {
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        // tune-web-client#1875 — admin, depuis cette machine seulement.
+        .route("/reveal/available", get(reveler::revelation_disponible))
+        .route("/albums/{id}/reveal", post(reveler::reveler_album))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}/editions", get(albums::album_editions))
         // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.
@@ -436,6 +444,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
+        .route(
+            "/tracks/{id}/tenues",
+            get(tracks::champs_tenus_get).delete(tracks::champs_tenus_retablir),
+        )
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))

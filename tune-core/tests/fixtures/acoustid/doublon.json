@@ -1,0 +1,102 @@
+{
+ "album": {
+  "titre": "Single Imaginaire",
+  "artiste": "Solo Imaginaire"
+ },
+ "pistes": [
+  {
+   "track_id": 801,
+   "titre": "Single Imaginaire",
+   "artiste": "Solo Imaginaire",
+   "duree_s": 215,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000059",
+      "score": 0.93,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000058",
+        "title": "Single Imaginaire",
+        "duration": 215,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000055",
+          "name": "Solo Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000056",
+          "title": "Single Imaginaire",
+          "type": "Single",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000057",
+            "country": "FR",
+            "date": {
+             "year": 2020
+            },
+            "medium_count": 1,
+            "track_count": 1,
+            "title": "Single Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "id": "a0c00000-0000-4000-8000-00000000005a",
+      "score": 0.91,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000058",
+        "title": "Single Imaginaire",
+        "duration": 215,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000055",
+          "name": "Solo Imaginaire"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000056",
+          "title": "Single Imaginaire",
+          "type": "Single",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000057",
+            "country": "FR",
+            "date": {
+             "year": 2020
+            },
+            "medium_count": 1,
+            "track_count": 1,
+            "title": "Single Imaginaire"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-801"
+  }
+ ],
+ "attendu": {
+  "release_id": "7e100000-0000-4000-8000-000000000057",
+  "release_group_id": "96a00000-0000-4000-8000-000000000056",
+  "enregistrements": {
+   "801": "5ec00000-0000-4000-8000-000000000058"
+  }
+ },
+ "verite": {
+  "801": "5ec00000-0000-4000-8000-000000000058"
+ }
+}

@@ -217,6 +217,7 @@ impl AmazonMusicService {
             .unwrap_or("Unknown")
             .to_string();
         StreamAlbum {
+            ai_generated: None,
             release_type: None,
             id: data["id"]
                 .as_str()

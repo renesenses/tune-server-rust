@@ -75,6 +75,19 @@ impl DeviceDescription {
         map
     }
 
+    /// #5793 — les `SCPDURL` par service, même clé que [`Self::service_urls`].
+    /// C'est le SCPD de `RenderingControl` qui donne la plage du volume et
+    /// les canaux permis.
+    pub fn scpd_urls(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for svc in &self.services {
+            if !svc.scpd_url.trim().is_empty() {
+                map.insert(service_key(&svc.service_type), svc.scpd_url.clone());
+            }
+        }
+        map
+    }
+
     pub fn event_sub_urls(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for svc in &self.services {
