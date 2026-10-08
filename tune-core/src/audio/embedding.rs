@@ -813,6 +813,49 @@ pub async fn analyze_embedding_batch<E: Inference>(
     done
 }
 
+/// Ce qu'a donné un tour de balayage ([`tour_de_balayage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TourDeBalayage {
+    /// Aucune piste ne reste à analyser : le modèle n'a pas été chargé.
+    RienAAnalyser,
+    /// Il restait des pistes, mais le modèle n'a pas pu être chargé.
+    ModeleIndisponible,
+    /// Un lot a tourné ; il a traité tant de pistes.
+    Lot(usize),
+}
+
+/// Un tour de la passe acoustique : charger le modèle s'il le faut, puis
+/// analyser un lot.
+///
+/// `charger` construit la session (le vrai modèle CLAP en production, un faux
+/// dans les essais, qui n'ont ni le modèle de 287 Mo ni onnxruntime).
+pub async fn tour_de_balayage<E, F, Fut>(
+    backend: &Arc<dyn DbBackend>,
+    embedder: &mut Option<Arc<std::sync::Mutex<E>>>,
+    charger: F,
+) -> TourDeBalayage
+where
+    E: Inference,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<E>>,
+{
+    if embedder.is_none()
+        && let Some(e) = charger().await
+    {
+        *embedder = Some(Arc::new(std::sync::Mutex::new(e)));
+    }
+    let Some(emb) = embedder.as_ref() else {
+        return TourDeBalayage::ModeleIndisponible;
+    };
+    // Une passe lourde à la fois (#1576) : si ReplayGain décode, on attend
+    // notre tour — les deux ensemble ont déjà éteint une machine.
+    let did = {
+        let _slot = crate::audio::replaygain::ANALYSIS_SLOT.lock().await;
+        analyze_embedding_batch(backend, emb).await
+    };
+    TourDeBalayage::Lot(did)
+}
+
 /// Écrire le vecteur d'une piste. Upsert portable (SQLite ≥ 3.24 + PG) :
 /// `track_id` est la clé primaire.
 fn ecrire_empreinte(backend: &Arc<dyn DbBackend>, track_id: i64, emb: &[f32], now: i64) {
@@ -1596,153 +1639,49 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     continue;
                 }
 
-                if embedder.is_none() {
-                    // No model path configured: `enabled=true` and yet the sweep
-                    // can do nothing at all. Before this, that branch fell
-                    // through in complete silence — no batch, no error, just the
-                    // 900 s idle sleep — which reads exactly like a sweep that
-                    // has finished. Lived on .18 (2026-08-11): the rebuilt
-                    // database had lost `audio_embedding_model_path`, the
-                    // feature was on, and the journal said nothing whatsoever
-                    // for twelve minutes.
-                    //
-                    // Latched like the memory pause: once on the way in, once on
-                    // the way out. This loop comes round every 900 s and a line
-                    // per round would be noise.
-                    // Plus de branche « aucun chemin configuré » : le chemin est
-                    // désormais toujours résolu, avec un défaut. Avant, activer
-                    // l'analyse sur une installation dont le réglage n'avait
-                    // jamais été écrit ne téléchargeait RIEN — la passe voyait
-                    // `None` et repartait dormir. Elle le signalait, ce qui
-                    // valait mieux que le silence, mais un avertissement n'a
-                    // jamais téléchargé un modèle.
-                    let p = configured_model_path(&settings);
-                    if let Err(e) = ensure_model(&p).await {
-                        warn!(error = %e, path = %p.display(), "audio_model_unavailable");
-                    } else if let Err(e) = ensure_runtime_loaded(&p).await {
-                        warn!(error = %e, "audio_runtime_unavailable");
-                    } else if load_abandonne {
-                        // Déjà signalé : on ne réessaie pas, sous peine
-                        // d'empiler les fils bloqués. Voir `load_abandonne`.
-                    } else {
-                        // Une trace AVANT la tentative. Sans elle, un appel
-                        // qui ne revient pas est indiscernable d'une passe qui
-                        // ne s'est jamais planifiée : le journal s'arrête, un
-                        // point c'est tout, et rien ne dit où. C'est ce qui a
-                        // rendu le cas d'Yves si long à établir.
-                        info!(
-                            model = %p.display(),
-                            intra_threads = threads,
-                            "audio_embedder_loading"
-                        );
-                        // `AudioEmbedder::load` construit une session ORT :
-                        // c'est du travail bloquant, lancé jusqu'ici À MÊME la
-                        // tâche async. Un blocage y figeait donc aussi un fil
-                        // du runtime tokio, au détriment de tout le serveur.
-                        let chemin = p.clone();
-                        let charge = tokio::task::spawn_blocking(move || {
-                            AudioEmbedder::load(&chemin, threads)
-                        });
-                        let delai = std::time::Duration::from_secs(MODEL_LOAD_TIMEOUT_SECS);
-                        match tokio::time::timeout(delai, charge).await {
-                            Ok(Ok(Ok(e))) => {
-                                info!(
-                                    model = %p.display(),
-                                    intra_threads = threads,
-                                    "audio_embedder_loaded"
-                                );
-                                embedder = Some(Arc::new(std::sync::Mutex::new(e)));
-                                loaded_threads = threads;
-                            }
-                            Ok(Ok(Err(e))) => warn!(error = %e, "audio_embedder_load_failed"),
-                            // La tâche bloquante a paniqué : sans ce bras, la
-                            // panique restait dans le `JoinError` et personne
-                            // ne l'apprenait.
-                            //
-                            // Elle CONDAMNE la passe, exactement comme le
-                            // dépassement de délai juste en dessous, et pour une
-                            // raison plus dure encore : `AudioEmbedder::load` ne
-                            // verrouille rien lui-même, il bâtit une session ORT.
-                            // Une panique survenue là empoisonne le verrou
-                            // d'initialisation d'ORT — verrou interne à la
-                            // bibliothèque, que ce dépôt ne peut ni voir ni
-                            // désarmer — et un `std::sync::Mutex` empoisonné le
-                            // reste pour TOUTE la vie du processus. Chaque
-                            // tentative suivante repanique donc avant d'avoir rien
-                            // tenté.
-                            //
-                            // Sans ce verrouillage, la passe se replanifiait
-                            // toutes les `IDLE_SLEEP_SECS` et rejouait le même
-                            // échec indéfiniment. Mesuré chez Yves Corbat le
-                            // 01/09/2026 : 28 tentatives, 28 paniques
-                            // « Mutex poisoned », toutes en moins d'une
-                            // milliseconde, sur huit heures de journal — aucune
-                            // empreinte produite, et un avertissement identique
-                            // tous les quarts d'heure pour seule trace. La
-                            // première panique, celle qui a empoisonné le verrou,
-                            // précédait même la fenêtre du journal.
-                            //
-                            // Un quart d'heure d'attente ne désempoisonne rien :
-                            // mieux vaut une ligne qui dit quoi faire que
-                            // quatre-vingt-seize par jour qui ne disent rien.
-                            Ok(Err(e)) => {
-                                load_abandonne = true;
-                                warn!(
-                                    error = %e,
-                                    model = %p.display(),
-                                    intra_threads = threads,
-                                    "audio_embedder_load_panicked — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; une panique dans l'initialisation ONNX empoisonne son verrou pour toute la vie du processus, et réessayer ne peut plus rien y changer"
-                                )
-                            }
-                            Err(_) => {
-                                load_abandonne = true;
-                                warn!(
-                                    timeout_s = MODEL_LOAD_TIMEOUT_SECS,
-                                    model = %p.display(),
-                                    intra_threads = threads,
-                                    "audio_embedder_load_timed_out — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; le fil de chargement ne peut pas être repris"
-                                );
-                            }
-                        }
-                    }
+                let p = configured_model_path(&settings);
+                let abandon = &mut load_abandonne;
+                let tour = tour_de_balayage(&backend, &mut embedder, move || {
+                    charger_le_modele(p, threads, abandon)
+                })
+                .await;
+                if embedder.is_some() {
+                    loaded_threads = threads;
                 }
-                if let Some(emb) = embedder.as_ref() {
-                    // Une passe lourde à la fois (#1576) : si ReplayGain
-                    // décode, on attend notre tour — les deux ensemble ont
-                    // déjà éteint une machine.
-                    let did = {
-                        let _slot = crate::audio::replaygain::ANALYSIS_SLOT.lock().await;
-                        analyze_embedding_batch(&backend, emb).await
-                    };
-                    // Le seul signal d'activité que cette passe publiait était
-                    // sa RAISON DE PAUSE, et `Aucune` reste posée pendant les
-                    // 15 minutes de sieste d'une passe drainée : lu comme « en
-                    // cours », il aurait affiché un balayage perpétuel. Le
-                    // dernier lot a-t-il rendu quelque chose : voilà la
-                    // question, et voilà la réponse.
-                    BALAYAGE_EN_COURS.store(did > 0, std::sync::atomic::Ordering::Relaxed);
-                    if did > 0 {
+                match tour {
+                    TourDeBalayage::Lot(did) if did > 0 => {
+                        // Le seul signal d'activité que cette passe publiait était
+                        // sa RAISON DE PAUSE, et `Aucune` reste posée pendant les
+                        // 15 minutes de sieste d'une passe drainée : lu comme « en
+                        // cours », il aurait affiché un balayage perpétuel. Le
+                        // dernier lot a-t-il rendu quelque chose : voilà la
+                        // question, et voilà la réponse.
+                        BALAYAGE_EN_COURS.store(true, std::sync::atomic::Ordering::Relaxed);
                         // More to do — loop promptly; the per-file pauses throttle.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         continue;
                     }
-                    // Passe drainée : héritage vers les formats exclus (#1732
-                    // phase 1). Le DSD n'est jamais analysé — quand la même
-                    // piste existe en FLAC analysé, on copie son vecteur pour
-                    // qu'elle remonte dans les ambiances. Pur SQL, pas de
-                    // décodage : sa place est APRÈS l'analyse, jamais à la
-                    // place d'un lot.
-                    let inherited = {
-                        let backend = backend.clone();
-                        tokio::task::spawn_blocking(move || {
-                            embedding_store::inherit_from_local_twins(&backend)
-                        })
-                        .await
-                        .unwrap_or(0)
-                    };
-                    if inherited > 0 {
-                        info!(inherited, "audio_embed_inherited_from_twins");
+                    TourDeBalayage::Lot(_) | TourDeBalayage::RienAAnalyser => {
+                        BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
+                        // Passe drainée : héritage vers les formats exclus (#1732
+                        // phase 1). Le DSD n'est jamais analysé — quand la même
+                        // piste existe en FLAC analysé, on copie son vecteur pour
+                        // qu'elle remonte dans les ambiances. Pur SQL, pas de
+                        // décodage : sa place est APRÈS l'analyse, jamais à la
+                        // place d'un lot.
+                        let inherited = {
+                            let backend = backend.clone();
+                            tokio::task::spawn_blocking(move || {
+                                embedding_store::inherit_from_local_twins(&backend)
+                            })
+                            .await
+                            .unwrap_or(0)
+                        };
+                        if inherited > 0 {
+                            info!(inherited, "audio_embed_inherited_from_twins");
+                        }
                     }
+                    TourDeBalayage::ModeleIndisponible => {}
                 }
             }
             // Une zone joue à la fin du tour : ne PAS s'endormir un quart
@@ -1765,6 +1704,123 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             tokio::time::sleep(std::time::Duration::from_secs(sieste)).await;
         }
     });
+}
+
+/// Construire la session CLAP : vérifier le modèle, charger le runtime, bâtir
+/// la session ORT hors de l'exécuteur et sous délai. `None` quand ce n'est pas
+/// possible — la raison est déjà au journal.
+///
+/// `load_abandonne` : voir son commentaire dans [`spawn`].
+async fn charger_le_modele(
+    p: PathBuf,
+    threads: usize,
+    load_abandonne: &mut bool,
+) -> Option<AudioEmbedder> {
+    // No model path configured: `enabled=true` and yet the sweep
+    // can do nothing at all. Before this, that branch fell
+    // through in complete silence — no batch, no error, just the
+    // 900 s idle sleep — which reads exactly like a sweep that
+    // has finished. Lived on .18 (2026-08-11): the rebuilt
+    // database had lost `audio_embedding_model_path`, the
+    // feature was on, and the journal said nothing whatsoever
+    // for twelve minutes.
+    //
+    // Latched like the memory pause: once on the way in, once on
+    // the way out. This loop comes round every 900 s and a line
+    // per round would be noise.
+    // Plus de branche « aucun chemin configuré » : le chemin est
+    // désormais toujours résolu, avec un défaut. Avant, activer
+    // l'analyse sur une installation dont le réglage n'avait
+    // jamais été écrit ne téléchargeait RIEN — la passe voyait
+    // `None` et repartait dormir. Elle le signalait, ce qui
+    // valait mieux que le silence, mais un avertissement n'a
+    // jamais téléchargé un modèle.
+    if let Err(e) = ensure_model(&p).await {
+        warn!(error = %e, path = %p.display(), "audio_model_unavailable");
+    } else if let Err(e) = ensure_runtime_loaded(&p).await {
+        warn!(error = %e, "audio_runtime_unavailable");
+    } else if *load_abandonne {
+        // Déjà signalé : on ne réessaie pas, sous peine
+        // d'empiler les fils bloqués. Voir `load_abandonne`.
+    } else {
+        // Une trace AVANT la tentative. Sans elle, un appel
+        // qui ne revient pas est indiscernable d'une passe qui
+        // ne s'est jamais planifiée : le journal s'arrête, un
+        // point c'est tout, et rien ne dit où. C'est ce qui a
+        // rendu le cas d'Yves si long à établir.
+        info!(
+            model = %p.display(),
+            intra_threads = threads,
+            "audio_embedder_loading"
+        );
+        // `AudioEmbedder::load` construit une session ORT :
+        // c'est du travail bloquant, lancé jusqu'ici À MÊME la
+        // tâche async. Un blocage y figeait donc aussi un fil
+        // du runtime tokio, au détriment de tout le serveur.
+        let chemin = p.clone();
+        let charge = tokio::task::spawn_blocking(move || AudioEmbedder::load(&chemin, threads));
+        let delai = std::time::Duration::from_secs(MODEL_LOAD_TIMEOUT_SECS);
+        match tokio::time::timeout(delai, charge).await {
+            Ok(Ok(Ok(e))) => {
+                info!(
+                    model = %p.display(),
+                    intra_threads = threads,
+                    "audio_embedder_loaded"
+                );
+                return Some(e);
+            }
+            Ok(Ok(Err(e))) => warn!(error = %e, "audio_embedder_load_failed"),
+            // La tâche bloquante a paniqué : sans ce bras, la
+            // panique restait dans le `JoinError` et personne
+            // ne l'apprenait.
+            //
+            // Elle CONDAMNE la passe, exactement comme le
+            // dépassement de délai juste en dessous, et pour une
+            // raison plus dure encore : `AudioEmbedder::load` ne
+            // verrouille rien lui-même, il bâtit une session ORT.
+            // Une panique survenue là empoisonne le verrou
+            // d'initialisation d'ORT — verrou interne à la
+            // bibliothèque, que ce dépôt ne peut ni voir ni
+            // désarmer — et un `std::sync::Mutex` empoisonné le
+            // reste pour TOUTE la vie du processus. Chaque
+            // tentative suivante repanique donc avant d'avoir rien
+            // tenté.
+            //
+            // Sans ce verrouillage, la passe se replanifiait
+            // toutes les `IDLE_SLEEP_SECS` et rejouait le même
+            // échec indéfiniment. Mesuré chez Yves Corbat le
+            // 01/09/2026 : 28 tentatives, 28 paniques
+            // « Mutex poisoned », toutes en moins d'une
+            // milliseconde, sur huit heures de journal — aucune
+            // empreinte produite, et un avertissement identique
+            // tous les quarts d'heure pour seule trace. La
+            // première panique, celle qui a empoisonné le verrou,
+            // précédait même la fenêtre du journal.
+            //
+            // Un quart d'heure d'attente ne désempoisonne rien :
+            // mieux vaut une ligne qui dit quoi faire que
+            // quatre-vingt-seize par jour qui ne disent rien.
+            Ok(Err(e)) => {
+                *load_abandonne = true;
+                warn!(
+                    error = %e,
+                    model = %p.display(),
+                    intra_threads = threads,
+                    "audio_embedder_load_panicked — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; une panique dans l'initialisation ONNX empoisonne son verrou pour toute la vie du processus, et réessayer ne peut plus rien y changer"
+                )
+            }
+            Err(_) => {
+                *load_abandonne = true;
+                warn!(
+                    timeout_s = MODEL_LOAD_TIMEOUT_SECS,
+                    model = %p.display(),
+                    intra_threads = threads,
+                    "audio_embedder_load_timed_out — l'analyse acoustique est abandonnée jusqu'au prochain redémarrage du serveur ; le fil de chargement ne peut pas être repris"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Banc de mesure de #5138 (ignoré : vrai modèle, vrai runtime).
