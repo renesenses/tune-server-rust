@@ -20,7 +20,7 @@ mauvais répertoire.
 
 | Geste | Route | Ce qu'il efface RÉELLEMENT |
 |---|---|---|
-| **Vider la bibliothèque** | `POST /system/library/clear` — `tune-server/src/routes/system/scan.rs` (`library_clear`) | `tracks`, `albums`, `artists`, `track_credits`, les entrées de file qui pointent vers une piste, **et par cascade (SQLite)** le contenu local des playlists, les notes d'albums, les signets et les métadonnées de pistes et d'albums ; les favoris, étiquettes et masquages deviennent orphelins. Aucun scan ne les reconstruit. Depuis #5973, une copie de la base est faite juste avant dans `backups/` (`tune_<horodatage>_avant_vidage.db`, SQLite seulement ; sous PostgreSQL, lancer `pg_dump` avant). |
+| **Vider la bibliothèque** | `POST /system/library/clear` — `tune-server/src/routes/system/scan.rs` (`library_clear`) | `tracks`, `albums`, `artists`, `track_credits`, les entrées de file qui pointent vers une piste, **et par cascade (SQLite)** le contenu local des playlists, les notes d'albums, les signets et les métadonnées de pistes et d'albums ; les favoris, étiquettes et masquages deviennent orphelins. Aucun scan ne les reconstruit. **Rien d'autre** n'est effacé : réglages, comptes, zones, radios et noms des playlists restent. Depuis #5973, une copie de la base est faite juste avant dans `backups/` (`tune_<horodatage>_avant_vidage.db`, SQLite seulement ; sous PostgreSQL, lancer `pg_dump` avant). |
 | Supprimer toutes les zones | `DELETE /zones` | les zones (suppression logique) |
 | Vider l'historique d'écoute | `DELETE /history` | l'historique seul |
 | Oublier les sorties détectées | `POST /devices/clear` | la liste des sorties en mémoire et les sorties manuelles |
