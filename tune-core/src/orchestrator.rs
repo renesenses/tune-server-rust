@@ -1217,6 +1217,8 @@ pub struct PlaybackOrchestrator {
     /// #5065 — le registre commun des sources physiques (CD, entrées…).
     /// Voir `crate::sources_physiques`.
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
+    /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
+    pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1586,6 +1588,7 @@ impl PlaybackOrchestrator {
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
+            volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
             versions: Default::default(),
         }
     }
@@ -1679,6 +1682,10 @@ mod prepa_lecture_5871_tests;
 mod service_wav_progressif_5080;
 
 mod dsp;
+// #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+mod volume_coalescent;
+#[cfg(test)]
+mod volume_coalescent_5662_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]

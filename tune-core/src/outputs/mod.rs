@@ -20,6 +20,7 @@ pub mod chromecast;
 pub mod coreaudio_exclusive;
 pub mod didl;
 pub mod dlna;
+pub mod dlna_annonce_suivante;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
 pub(crate) mod dlna_journal_volume;

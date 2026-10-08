@@ -121,18 +121,25 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
 /// d'avant la version courante, et si une campagne les rend à la passe.
 /// Compté sur le pool bloquant : le `COUNT` parcourt `tracks`.
 async fn releve_de_remesure(state: &AppState) -> Value {
+    use tune_core::audio::replaygain::rattrapage_crete;
     let backend = state.backend.clone();
-    let perimees = tokio::task::spawn_blocking(move || {
-        tune_core::audio::replaygain::remesure::compter_les_mesures_perimees(&backend)
+    let (perimees, cretes) = tokio::task::spawn_blocking(move || {
+        (
+            tune_core::audio::replaygain::remesure::compter_les_mesures_perimees(&backend),
+            rattrapage_crete::compter_les_cretes_a_refaire(&backend),
+        )
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or((None, None));
     json!({
         "stale": perimees,
         "running": tune_core::audio::replaygain::remesure::en_cours(),
         "algo": tune_core::audio::replaygain::RG_ALGO,
         "enabled": tune_core::audio::replaygain::analysis_enabled(&state.backend),
+        // #2713 — crêtes vraies à refaire par le rattrapage de fond (sans
+        // toucher aux gains), et la version qu'elles recevront.
+        "true_peak_stale": cretes,
+        "true_peak_algo": rattrapage_crete::TRUE_PEAK_ALGO,
     })
 }
 
@@ -144,7 +151,10 @@ async fn releve_de_remesure(state: &AppState) -> Value {
 /// - `running` : une campagne les rend à la passe, par lots ;
 /// - `algo` : la version courante de la mesure ;
 /// - `enabled` : l'analyse ReplayGain est armée. Sans elle, rien ne
-///   remesurerait.
+///   remesurerait ;
+/// - `true_peak_stale` : crêtes vraies de Tune d'avant `true_peak_algo`, que
+///   le rattrapage de fond refait seul, sans campagne ni effacement (#2713).
+///   `null` si le comptage échoue.
 pub(crate) async fn replaygain_reanalyze_status(State(state): State<AppState>) -> Json<Value> {
     Json(releve_de_remesure(&state).await)
 }

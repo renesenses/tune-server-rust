@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{
-    MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee,
-    TransportState,
+    AnnonceSuivante, MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia,
+    SuivantePreparee, TransportState,
 };
 use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
@@ -37,6 +37,9 @@ pub(crate) mod pause_701_tests_5050;
 #[cfg(test)]
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
+
+#[path = "dlna_volume_illisible_5662.rs"]
+pub(crate) mod volume_illisible_5662;
 
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
@@ -525,6 +528,9 @@ pub struct DlnaOutput {
     /// Un compteur qui ne revient jamais en arrière n'a pas de période : deux
     /// émissions ne partagent plus jamais d'id sur la vie du processus.
     item_id_seq: AtomicU64,
+    /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
+    /// la ligne `dlna_volume_illisible` a déjà été écrite.
+    volume_illisible: AtomicBool,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -589,6 +595,14 @@ pub struct DlnaOutput {
     /// abouti : un échec réseau ne fige pas le profil standard pour la vie
     /// du processus.
     profil_volume: tokio::sync::OnceCell<super::dlna_profil_volume::ProfilVolume>,
+    /// #3967 — URL du SCPD d'`AVTransport`, telle que le descriptif de
+    /// l'appareil l'annonce. `None` : sortie construite sans descriptif, la
+    /// suivante est armée comme avant.
+    scpd_av_transport: std::sync::RwLock<Option<String>>,
+    /// #3967 — ce que ce SCPD dit de `SetNextAVTransportURI`, lu UNE fois.
+    /// Vide tant que la lecture n'a pas abouti : un échec réseau ne fige
+    /// rien, l'armement suivant relira.
+    annonce_suivante: tokio::sync::OnceCell<AnnonceSuivante>,
     /// #5575 — débit des lignes INFO d'acquittement de `SetVolume` (voir
     /// [`super::dlna_journal_volume`]). Partagé avec la tâche de rattrapage
     /// qui écrit la dernière valeur d'un glissement.
@@ -724,6 +738,7 @@ impl DlnaOutput {
             play_delay_ms: AtomicU64::new(0),
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
+            volume_illisible: AtomicBool::new(false),
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -737,6 +752,8 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
+            scpd_av_transport: std::sync::RwLock::new(None),
+            annonce_suivante: tokio::sync::OnceCell::new(),
             journal_volume: Arc::default(),
             volume_relu: AtomicBool::new(false),
             niveau_acquitte: Arc::default(),
@@ -943,6 +960,72 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #3967 — l'URL du SCPD d'`AVTransport`, absolue. Sans elle, la
+    /// suivante est armée comme avant (verdict `Inconnue`).
+    pub fn with_av_transport_scpd(self, url: Option<String>) -> Self {
+        *self
+            .scpd_av_transport
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
+        self
+    }
+
+    /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
+    /// lu au premier armement puis retenu. Un SCPD injoignable ou illisible
+    /// rend `Inconnue` SANS le retenir.
+    async fn lire_annonce_suivante(&self) -> AnnonceSuivante {
+        if let Some(a) = self.annonce_suivante.get() {
+            return *a;
+        }
+        let url = self
+            .scpd_av_transport
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(url) = url else {
+            return AnnonceSuivante::Inconnue;
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            resp.text().await.map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("délai dépassé".to_string()));
+        match lu {
+            Ok(xml) => {
+                let annonce = super::dlna_annonce_suivante::depuis_scpd(&xml);
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    annonce = ?annonce,
+                    "dlna_scpd_avtransport_lu"
+                );
+                if annonce != AnnonceSuivante::Inconnue {
+                    let _ = self.annonce_suivante.set(annonce);
+                }
+                annonce
+            }
+            Err(raison) => {
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    url = %url,
+                    raison = %raison,
+                    "dlna_scpd_avtransport_illisible — suivante armée comme avant"
+                );
+                AnnonceSuivante::Inconnue
+            }
+        }
     }
 
     /// #5793 — le profil de volume de l'appareil, lu dans son SCPD à la
@@ -1298,7 +1381,16 @@ impl DlnaOutput {
                 "<InstanceID>0</InstanceID>",
             )
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                // #5662 — l'échec SOAP finit lui aussi au repli : le dire.
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    "soap_echec",
+                    &e,
+                );
+                String::new()
+            })
         } else {
             let profil = self.profil_volume().await;
             self.rc_action(
@@ -1312,15 +1404,27 @@ impl DlnaOutput {
         };
         let niveau =
             extract_tag(&volume_resp, "CurrentVolume").and_then(|v| v.trim().parse::<f64>().ok());
-        Ok(match niveau {
+        let volume = match niveau {
             // Sonos : `GroupVolume` est toujours 0–100.
             Some(v) if sonos => v / 100.0,
             Some(v) => match self.profil_volume.get() {
                 Some(p) => p.fraction(v),
                 None => v / 100.0,
             },
-            None => 0.5,
-        })
+            None => {
+                // #5662 — repli inchangé, mais visible une fois par épisode.
+                // (Sans effet si l'échec SOAP d'un Sonos vient de l'ouvrir.)
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    volume_illisible_5662::raison_illisible(&volume_resp),
+                    &volume_resp,
+                );
+                return Ok(volume_illisible_5662::REPLI_ILLISIBLE);
+            }
+        };
+        volume_illisible_5662::constater_lisible(&self.volume_illisible, &self.name, volume);
+        Ok(volume)
     }
 
     /// #5050 — un 701 sur `Pause` nomme un état, comme sur `Play` (#2581) :
@@ -2984,6 +3088,10 @@ impl OutputTarget for DlnaOutput {
             .send()
             .await
             .is_ok()
+    }
+
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        self.lire_annonce_suivante().await
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

@@ -2368,6 +2368,28 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "file_first_seen_created_at",
         up: "",
     },
+    // #2713 — la crête vraie a sa version (`rg_true_peak_algo`,
+    // `rg_album_true_peak_algo`). Les crêtes déjà en base viennent de
+    // l'interpolation Catmull-Rom 4× d'avant l'annexe 2 de BS.1770 : elles
+    // sont ÉTIQUETÉES `catmull-rom-4x`, pas effacées. Effacer priverait
+    // `prevent_clipping` de sa crête jusqu'au rattrapage (il retomberait sur
+    // le pic d'échantillon, plus bas) ; étiquetées, elles servent jusqu'à leur
+    // remplacement par le rattrapage de fond
+    // (`audio::replaygain::rattrapage_crete`). Les gains ne sont pas touchés.
+    //
+    // Idempotente : `DO NOTHING` sur une version déjà posée. Une crête sans
+    // version écrite après coup (retour à un ancien binaire) reste
+    // rattrapable : le rattrapage vise toute crête qui n'a pas la version
+    // COURANTE, étiquette ou non.
+    //
+    // Numérotée 121 / PG 085 : la 120 / PG 084 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et aucune PR ouverte ne prend la
+    // 121 ni la 085. Jumelle PG : 085.
+    Migration {
+        version: 121,
+        name: "true_peak_algo_etiquette",
+        up: SQL_ETIQUETTE_CRETES_VRAIES,
+    },
     // #2264 — les index des identifiants d'ENREGISTREMENT : l'ISRC et le MBID
     // d'enregistrement, sous la forme pliée que comparent le regroupement des
     // versions et la règle de lecture (`library::groupes_versions`). Index
@@ -2375,14 +2397,9 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
     // ''), ' ', ''))` et `LOWER(TRIM(musicbrainz_recording_id))`, qu'un index
     // sur la colonne nue ne servirait pas.
     //
-    // Numérotée 122 / PG 086 : la 120 / PG 084 est la dernière sur
-    // `batch/feat-rc3-20261002` le 07/10, et la 121 / PG 085 est prise par
-    // #5959 (crête vraie), en PR. Le lanceur ne joue que `version > MAX` :
-    // cette migration EXIGE #5959 fusionnée avant elle — sinon elle se
-    // renumérote à la promotion. Les gardes de contiguïté
-    // (`migration_count_matches`, et côté PG
-    // `pg_migrations_are_contiguous_and_include_numeric_heals`) le signalent
-    // tant qu'elle manque.
+    // Numérotée 122 / PG 086 : la 121 / PG 085 est celle de #5959 (crête
+    // vraie), fusionnée dans `batch/feat-rc3-20261002` le 08/10. Le lanceur
+    // ne joue que `version > MAX` : elle vient donc APRÈS la 121.
     //
     // Posés dans le bloc de version et dans la passe finale, PAS dans `up` :
     // même règle qu'à la 119. Jumelle PG : 086.
@@ -2392,6 +2409,19 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         up: "",
     },
 ];
+
+/// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
+/// même texte que la jumelle PG 085, à la transaction près.
+const SQL_ETIQUETTE_CRETES_VRAIES: &str = "
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_track_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_album_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_album_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+";
 
 /// Les index de la migration 122 (#2264). L'expression est EXACTEMENT celle
 /// des requêtes par identifiant ([`SQL_ISRC_PLIE`], [`SQL_MBID_PLIE`]) :
@@ -3316,6 +3346,19 @@ pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS i
 ///
 /// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
 /// [`TRACKS_CLE_DE_COPIE_INDEX`], pour ne pas prendre de numéro de migration.
+/// b209 — les pistes UPnP importées avant que le numéro ne soit lu portent 0
+/// (le défaut du modèle), sur chaque piste. 0 n'est pas un numéro : il passe
+/// à NULL. Le vrai numéro revient à la synchronisation suivante, qui réécrit
+/// chaque piste vue. Une piste LOCALE n'est jamais touchée.
+///
+/// Rejouée à chaque démarrage, sur les deux moteurs, sans numéro de
+/// migration — même raison que [`TRACKS_SOURCE_ID_INDEX`]. Idempotente : au
+/// second passage, plus aucune ligne ne correspond, et
+/// `idx_tracks_source_path (source, …)` borne la lecture aux pistes UPnP.
+pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_number = NULL \
+     WHERE source = 'upnp' AND track_number = 0;
+     UPDATE tracks SET disc_number = NULL WHERE source = 'upnp' AND disc_number = 0;";
+
 pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
@@ -4140,6 +4183,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
         warn!(error = %e, "sqlite_dr_album_index_failed");
     }
+    // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
+        warn!(error = %e, "sqlite_upnp_numeros_zero_a_null_failed");
+    }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
     db.execute_batch(include_str!("../../migrations/upnp_catalog_revision.sql"))?;
@@ -4867,8 +4914,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "file_first_seen_created_at",
         include_str!("../../migrations/postgres/084_file_first_seen_created_at.sql"),
     ),
+    // Jumelle de la SQLite 121 (#2713) : les crêtes vraies d'avant l'annexe 2
+    // de BS.1770 étiquetées `catmull-rom-4x`, rien n'est effacé.
+    (
+        85,
+        "true_peak_algo_etiquette",
+        include_str!("../../migrations/postgres/085_true_peak_algo_etiquette.sql"),
+    ),
     // Jumelle de la SQLite 122 (#2264) : les index d'expression de l'ISRC et
-    // du MBID d'enregistrement pliés. EXIGE la 85 (#5959) avant elle.
+    // du MBID d'enregistrement pliés. Vient après la 85 (#5959).
     (
         86,
         "tracks_recording_identifier_indexes",
@@ -5075,6 +5129,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // pas encore quand `ensure_schema` tourne a la connexion.
     if let Err(e) = sqlx::raw_sql(TRACKS_SOURCE_ID_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_source_id_index_failed");
+    }
+    // b209 — même passe que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(UPNP_NUMEROS_ZERO_A_NULL).execute(pool).await {
+        warn!(error = %e, "pg_upnp_numeros_zero_a_null_failed");
     }
 
     // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
@@ -7301,6 +7359,66 @@ mod tests {
     }
 
     #[test]
+    fn migration_121_etiquette_les_cretes_vraies_sans_rien_effacer() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 121 && m.name == "true_peak_algo_etiquette")
+        );
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path)
+                 VALUES (1, 'a', 1, 1, '/a'), (2, 'b', 1, 1, '/b'), (3, 'c', 1, 1, '/c');
+             -- 1 : crête d'avant #2713, crête d'album aussi.
+             INSERT INTO track_metadata (track_id, key, value) VALUES
+                 (1, 'rg_track_true_peak', '0.790000'),
+                 (1, 'rg_album_true_peak', '0.950000'),
+                 (1, 'rg_track_gain', '-6.50 dB'),
+             -- 2 : crête déjà versionnée.
+                 (2, 'rg_track_true_peak', '0.900000'),
+                 (2, 'rg_true_peak_algo', 'bs1770-a2-fir-v1'),
+             -- 3 : pas de crête du tout.
+                 (3, 'rg_track_gain', '-3.00 dB');",
+        )
+        .unwrap();
+        // Jouée deux fois : idempotente.
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let lire = |id: i64, cle: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM track_metadata WHERE track_id = ?1 AND key = ?2",
+                rusqlite::params![id, cle],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(
+            lire(1, "rg_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        assert_eq!(
+            lire(1, "rg_album_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        // Rien n'est effacé : les valeurs restent en service.
+        assert_eq!(lire(1, "rg_track_true_peak").as_deref(), Some("0.790000"));
+        assert_eq!(lire(1, "rg_album_true_peak").as_deref(), Some("0.950000"));
+        assert_eq!(lire(1, "rg_track_gain").as_deref(), Some("-6.50 dB"));
+        // Une version déjà posée ne s'écrase pas.
+        assert_eq!(
+            lire(2, "rg_true_peak_algo").as_deref(),
+            Some("bs1770-a2-fir-v1")
+        );
+        // Pas de crête, pas d'étiquette.
+        assert_eq!(lire(3, "rg_true_peak_algo"), None);
+    }
+
+    #[test]
     fn migration_count_matches() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -7801,9 +7919,10 @@ mod tests {
         // 84 : `file_first_seen_created_at` (#5402), jumelle de la SQLite 120.
         // Pose `file_first_seen.created_at`, que le scan écrit et que le tri
         // « par création » des ajouts récents NOMME.
+        // 85 : `true_peak_algo_etiquette` (#2713), jumelle de la SQLite 121.
+        // Étiquette les crêtes vraies Catmull-Rom, que le rattrapage NOMME.
         // 86 : `tracks_recording_identifier_indexes` (#2264), jumelle de la
-        // SQLite 122. La 85 est celle de #5959 : tant qu'elle n'est pas
-        // fusionnée, la garde de contiguïté ci-dessus rougit, et c'est voulu.
+        // SQLite 122. Vient après la 85 de #5959.
         assert_eq!(pg_latest_version(), 86, "latest PG migration must be 86");
         for wanted in [10, 11, 13, 36] {
             assert!(
