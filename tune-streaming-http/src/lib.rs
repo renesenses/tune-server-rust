@@ -1653,8 +1653,15 @@ async fn youtube_charts() -> Json<Value> {
     Json(json!({"charts": [], "message": "YouTube charts not yet implemented"}))
 }
 
+/// Talon : aucune catégorie d'ambiance tant que le service n'est pas branché.
+///
+/// La forme est celle que les clients LISENT — un TABLEAU de catégories
+/// (`api.ts:getYouTubeMoods`, `tune_api_client.dart` : `as List<dynamic>`).
+/// L'ancien talon rendait un objet `{moods, message}` : le client Flutter
+/// échouait sur sa conversion, et l'écran web recevait un objet là où il
+/// attend une liste (#1897, balayage des lectures cartographiées).
 async fn youtube_moods() -> Json<Value> {
-    Json(json!({"moods": [], "message": "YouTube moods not yet implemented"}))
+    Json(json!([]))
 }
 
 async fn youtube_library() -> Json<Value> {
