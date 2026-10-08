@@ -14,7 +14,7 @@ use std::sync::Arc;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::db::backend::DbBackend;
@@ -114,8 +114,105 @@ impl TextEmbedder {
     }
 }
 
-/// Process-global text embedder, provisioned + loaded once on first search.
-static TEXT_EMBEDDER: OnceCell<Mutex<TextEmbedder>> = OnceCell::const_new();
+/// Session chargée à la demande et relâchée après une période d'inactivité.
+///
+/// Le modèle texte CLAP pèse ~500 Mo résidents. Il vivait dans un `OnceCell` :
+/// chargé à la première recherche par texte, gardé ensuite pour toute la vie du
+/// processus — relevé sur le .18 le 08/10, un bloc de 500 Mo jamais rendu,
+/// alors qu'une recherche « ambiance » est un geste ponctuel. Désormais la
+/// session se relâche après [`TEXT_IDLE`] sans recherche, et la recherche
+/// suivante la recharge (quelques secondes, une fois).
+pub(crate) struct ALaDemande<T> {
+    valeur: Option<T>,
+    dernier_usage: Option<std::time::Instant>,
+}
+
+impl<T> ALaDemande<T> {
+    pub(crate) const fn vide() -> Self {
+        Self {
+            valeur: None,
+            dernier_usage: None,
+        }
+    }
+
+    /// La valeur, chargée par `charger` si elle ne l'est pas. Le booléen dit
+    /// si elle vient d'être chargée. Un échec de chargement n'est pas retenu :
+    /// la demande suivante réessaie.
+    pub(crate) async fn obtenir<F, Fut>(
+        &mut self,
+        charger: F,
+        maintenant: std::time::Instant,
+    ) -> Result<(&mut T, bool), String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        let chargee = self.valeur.is_none();
+        if chargee {
+            self.valeur = Some(charger().await?);
+        }
+        self.dernier_usage = Some(maintenant);
+        match self.valeur.as_mut() {
+            Some(v) => Ok((v, chargee)),
+            None => Err("session texte absente".into()),
+        }
+    }
+
+    /// Relâcher la valeur si elle n'a pas servi depuis `delai`. `true` quand
+    /// une valeur vivante vient d'être relâchée.
+    pub(crate) fn relacher_si_inactive(
+        &mut self,
+        maintenant: std::time::Instant,
+        delai: std::time::Duration,
+    ) -> bool {
+        let inactive = self
+            .dernier_usage
+            .is_none_or(|t| maintenant.saturating_duration_since(t) >= delai);
+        if self.valeur.is_some() && inactive {
+            self.valeur = None;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn est_chargee(&self) -> bool {
+        self.valeur.is_some()
+    }
+}
+
+/// Inactivité au-delà de laquelle le modèle texte est relâché.
+const TEXT_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Cadence de la veille qui relâche le modèle texte inactif.
+const TEXT_VEILLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-global text embedder, loaded on demand and released after
+/// [`TEXT_IDLE`] without a search.
+static TEXT_EMBEDDER: Mutex<ALaDemande<TextEmbedder>> = Mutex::const_new(ALaDemande::vide());
+
+/// Veille lancée à chaque chargement : relâche le modèle texte après
+/// [`TEXT_IDLE`] sans recherche, rend la mémoire, et s'arrête. Une seule à la
+/// fois : elle ne naît qu'au chargement, qui n'a lieu que session absente, et
+/// elle s'éteint dès que la session l'est.
+fn veiller_sur_le_modele_texte(backend: Arc<dyn DbBackend>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TEXT_VEILLE).await;
+            let mut slot = TEXT_EMBEDDER.lock().await;
+            if !slot.est_chargee() {
+                return;
+            }
+            if slot.relacher_si_inactive(std::time::Instant::now(), TEXT_IDLE) {
+                drop(slot);
+                info!(
+                    idle_s = TEXT_IDLE.as_secs(),
+                    "text_embedder_released — modèle texte relâché après inactivité"
+                );
+                super::embedding::rendre_la_memoire_si_rien_ne_joue(&backend).await;
+                return;
+            }
+        }
+    });
+}
 
 /// Resolve the text model + tokenizer cache paths. Both live next to the
 /// configured audio model (sharing the onnxruntime dylib) when the audio sweep
@@ -150,26 +247,117 @@ fn text_paths(settings: &SettingsRepo) -> (PathBuf, PathBuf) {
 /// requests is fine. Returns an `Err` string the handler maps to 503 when the
 /// model cannot be provisioned (offline, unconfigured, checksum failure).
 pub async fn embed_query(backend: &Arc<dyn DbBackend>, query: &str) -> Result<Vec<f32>, String> {
-    let cell = TEXT_EMBEDDER
-        .get_or_try_init(|| async {
-            let settings = SettingsRepo::with_backend(backend.clone());
-            let (model, tokenizer) = text_paths(&settings);
-            super::embedding::ensure_file(&model, TEXT_MODEL_URL, TEXT_MODEL_SHA256, "text_model")
+    let mut slot = TEXT_EMBEDDER.lock().await;
+    let (embedder, chargee) = slot
+        .obtenir(
+            || async {
+                let settings = SettingsRepo::with_backend(backend.clone());
+                let (model, tokenizer) = text_paths(&settings);
+                super::embedding::ensure_file(
+                    &model,
+                    TEXT_MODEL_URL,
+                    TEXT_MODEL_SHA256,
+                    "text_model",
+                )
                 .await?;
-            super::embedding::ensure_file(
-                &tokenizer,
-                TOKENIZER_URL,
-                TOKENIZER_SHA256,
-                "text_tokenizer",
-            )
-            .await?;
-            let dir = model.parent().unwrap_or_else(|| Path::new("."));
-            super::runtime::ensure_loaded(dir).await?;
-            let embedder = TextEmbedder::load(&model, &tokenizer)?;
-            info!(model = %model.display(), "text_embedder_loaded");
-            Ok::<Mutex<TextEmbedder>, String>(Mutex::new(embedder))
-        })
+                super::embedding::ensure_file(
+                    &tokenizer,
+                    TOKENIZER_URL,
+                    TOKENIZER_SHA256,
+                    "text_tokenizer",
+                )
+                .await?;
+                let dir = model
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                super::runtime::ensure_loaded(&dir).await?;
+                // Hors de l'exécuteur : bâtir une session de 500 Mo est du
+                // travail bloquant, et il revient désormais après chaque
+                // relâchement pour inactivité.
+                let m = model.clone();
+                let embedder =
+                    tokio::task::spawn_blocking(move || TextEmbedder::load(&m, &tokenizer))
+                        .await
+                        .map_err(|e| format!("text embedder load task: {e}"))??;
+                info!(model = %model.display(), "text_embedder_loaded");
+                Ok(embedder)
+            },
+            std::time::Instant::now(),
+        )
         .await?;
-    let mut guard = cell.lock().await;
-    guard.embed_text(query)
+    let vecteur = embedder.embed_text(query);
+    drop(slot);
+    if chargee {
+        veiller_sur_le_modele_texte(backend.clone());
+    }
+    vecteur
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Le modèle texte se charge à la première recherche, pas aux suivantes,
+    /// se relâche après l'inactivité — pas avant — et la recherche d'après le
+    /// recharge : la recherche par texte ne casse pas.
+    #[tokio::test]
+    async fn le_modele_texte_se_relache_apres_inactivite_et_se_recharge_a_la_demande() {
+        let chargements = AtomicUsize::new(0);
+        let charger = || async {
+            chargements.fetch_add(1, Ordering::SeqCst);
+            Ok::<u32, String>(7)
+        };
+        let mut slot = ALaDemande::vide();
+        let t0 = Instant::now();
+
+        let (v, chargee) = slot.obtenir(charger, t0).await.unwrap();
+        assert_eq!((*v, chargee), (7, true));
+        let (_, chargee) = slot
+            .obtenir(charger, t0 + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            !chargee,
+            "deuxième recherche : la session sert, pas de rechargement"
+        );
+        assert_eq!(chargements.load(Ordering::SeqCst), 1);
+
+        assert!(
+            !slot.relacher_si_inactive(t0 + Duration::from_secs(60), TEXT_IDLE),
+            "une minute après la dernière recherche : trop tôt pour relâcher"
+        );
+        assert!(slot.est_chargee());
+        assert!(
+            slot.relacher_si_inactive(t0 + Duration::from_secs(5) + TEXT_IDLE, TEXT_IDLE),
+            "après TEXT_IDLE sans recherche, les ~500 Mo doivent être rendus"
+        );
+        assert!(!slot.est_chargee());
+        assert!(
+            !slot.relacher_si_inactive(t0 + TEXT_IDLE * 3, TEXT_IDLE),
+            "rien à relâcher deux fois"
+        );
+
+        let (v, chargee) = slot.obtenir(charger, t0 + TEXT_IDLE * 4).await.unwrap();
+        assert_eq!((*v, chargee), (7, true), "la recherche suivante recharge");
+        assert_eq!(chargements.load(Ordering::SeqCst), 2);
+    }
+
+    /// Un échec de chargement n'est pas retenu : la recherche suivante réessaie
+    /// (c'était déjà le cas avec `OnceCell::get_or_try_init`).
+    #[tokio::test]
+    async fn un_echec_de_chargement_n_est_pas_retenu() {
+        let mut slot: ALaDemande<u32> = ALaDemande::vide();
+        let t0 = Instant::now();
+        assert!(
+            slot.obtenir(|| async { Err("hors ligne".to_string()) }, t0)
+                .await
+                .is_err()
+        );
+        assert!(!slot.est_chargee());
+        let (v, chargee) = slot.obtenir(|| async { Ok(3) }, t0).await.unwrap();
+        assert_eq!((*v, chargee), (3, true));
+    }
 }
