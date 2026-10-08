@@ -928,6 +928,15 @@ impl PositionPoller {
         zone_id: i64,
         next_pos: i64,
     ) -> Result<crate::orchestrator::ResolvedQueueItem, String> {
+        #[cfg(test)]
+        {
+            // #5970 — banc : une résolution artificiellement lente.
+            let (retard, appels) = RESOLUTION_LENTE_5970.with(|c| c.get());
+            RESOLUTION_LENTE_5970.with(|c| c.set((retard, appels + 1)));
+            if let Some(d) = retard {
+                tokio::time::sleep(d).await;
+            }
+        }
         match self
             .orchestrator
             .resolve_queue_item_url(zone_id, next_pos)
@@ -948,6 +957,7 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
+        fin_estimee: Instant,
     ) -> GaplessPrep {
         // #4806 / #5143 — une suivante BANNIE (locale ou de service) n'est
         // jamais armée : armée, elle serait jouée par le renderer sans que la
@@ -994,7 +1004,7 @@ impl PositionPoller {
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
-        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme)
+        self.armer_le_flux_suivant(zone_id, next_pos, device_id, arme, fin_estimee)
             .await
     }
 
@@ -1087,9 +1097,35 @@ impl PositionPoller {
         next_pos: i64,
         device_id: &str,
         arme: Option<ArmedNext>,
+        fin_estimee: Instant,
     ) -> GaplessPrep {
         let t0 = Instant::now();
-        match self.resolve_gapless_next(zone_id, next_pos).await {
+        // #5970 — la résolution est attendue DANS le tick, qui sonde toutes
+        // les zones : elle a un budget, pris sur ce qui reste de la piste en
+        // cours. Hors budget, on renonce à l'enchaînement pour cette piste ;
+        // la fin de piste jouera la suivante explicitement. Une session déjà
+        // créée par la résolution interrompue est ramassée comme toute
+        // session inactive.
+        let budget =
+            decisions::budget_de_resolution_gapless(fin_estimee.saturating_duration_since(t0));
+        let resolution = match tokio::time::timeout(
+            budget,
+            self.resolve_gapless_next(zone_id, next_pos),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    zone_id,
+                    budget_ms = budget.as_millis() as u64,
+                    resolve_ms = t0.elapsed().as_millis() as u64,
+                    "gapless_preparation_abandonnee_hors_budget"
+                );
+                return GaplessPrep::Abandonnee;
+            }
+        };
+        match resolution {
             Ok(resolved) => {
                 let resolve_ms = t0.elapsed().as_millis() as u64;
                 let is_streaming = resolved.stream_id.is_some();
@@ -1201,6 +1237,21 @@ impl PositionPoller {
                         track_number: resolved.track_number,
                         disc_number: resolved.disc_number,
                     };
+                    // #5970 — prête trop tard : la piste en cours est finie
+                    // ou presque, le renderer peut déjà être arrêté. Un
+                    // `SetNext` n'y ferait rien ; la fin de piste la jouera
+                    // par `SetAVTransportURI` + `Play`, une seule fois.
+                    if decisions::suivante_trop_tardive_pour_setnext(
+                        fin_estimee.saturating_duration_since(Instant::now()),
+                    ) {
+                        warn!(
+                            zone_id,
+                            resolve_ms,
+                            prep_ms = t0.elapsed().as_millis() as u64,
+                            "gapless_suivante_prete_trop_tard"
+                        );
+                        return GaplessPrep::Abandonnee;
+                    }
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         GaplessPrep::NotArmed
@@ -1239,6 +1290,15 @@ impl PositionPoller {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #5970 — banc : retard imposé à la résolution de la suivante, et nombre
+    /// de résolutions tentées. Par fil : `#[tokio::test]` tourne sur le fil
+    /// du test, les autres tests n'en voient rien.
+    pub(super) static RESOLUTION_LENTE_5970: std::cell::Cell<(Option<Duration>, usize)> =
+        const { std::cell::Cell::new((None, 0)) };
 }
 
 #[cfg(test)]
