@@ -242,7 +242,8 @@ fn text_paths(settings: &SettingsRepo) -> (PathBuf, PathBuf) {
 /// Embed a natural-language query into the CLAP joint space for acoustic search.
 ///
 /// Lazily provisions the runtime + text model + tokenizer on first call and
-/// caches a single loaded session, serialised by a mutex: ORT sessions are not
+/// caches a single loaded session — released after [`TEXT_IDLE`] without a
+/// search, reloaded by the next one — serialised by a mutex: ORT sessions are not
 /// concurrent-run friendly and a query embed is sub-100 ms, so serialising query
 /// requests is fine. Returns an `Err` string the handler maps to 503 when the
 /// model cannot be provisioned (offline, unconfigured, checksum failure).
