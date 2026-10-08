@@ -158,15 +158,20 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
                 .get("mode")
                 .and_then(Value::as_str)
                 .unwrap_or(mode::COMPLETER);
-            match Snapshots::new(hote).apercu_restauration(&snapshot_id, mode) {
-                Ok((plan, a_rajouter, a_retirer)) => reponse(
-                    200,
-                    json!({
-                        "plan": plan,
-                        "a_rajouter": a_rajouter,
-                        "a_retirer_par_vous": a_retirer,
-                    }),
-                ),
+            let snapshots = Snapshots::new(hote);
+            match snapshots.apercu_restauration(&snapshot_id, mode) {
+                Ok((plan, a_rajouter, a_retirer)) => {
+                    let introuvables = snapshots.introuvables(&plan);
+                    reponse(
+                        200,
+                        json!({
+                            "plan": plan,
+                            "a_rajouter": a_rajouter,
+                            "a_retirer_par_vous": a_retirer,
+                            "introuvables": introuvables,
+                        }),
+                    )
+                }
                 Err(e) => erreur(&e),
             }
         }

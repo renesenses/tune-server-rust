@@ -15,7 +15,11 @@ paquet publié (archives, installeur Windows, `.app`, image Docker), sous
 `plugins/playlists-converter/`. Le gestionnaire d'extensions le montre avec
 `premium: true` ; sans licence Premium, ses routes rendent 402 (garde
 `Feature::PluginMarketplace`, posée par l'hôte) et `enable`/`install`/`update`
-aussi, comme pour les greffons audio payants. Il peut encore s'installer depuis
+aussi, comme pour les greffons audio payants. **Exception** (Bertrand,
+08/10/2026) : les copies datées (`/snapshot`, `/snapshots`,
+`/snapshot/restauration/apercu`, `/snapshot/restauration`) restent
+**gratuites**, parce qu'elles portent les sauvegardes de playlists de l'écran
+v2. La liste est tenue par l'hôte (`ROUTES_GRATUITES`, `routes/plugins.rs`). Il peut encore s'installer depuis
 la boutique de mozaiklabs.fr, dès que sa fiche y est publiée (payante : un
 `price` > 0 exige Premium à l'installation). Source :
 `plugins/tune-playlists-converter`.
@@ -39,10 +43,12 @@ qu'un, celui-ci :
 | `POST /playlist-transfer/transfer` et `/preview` (`tune_core::playlist_transfer`) | **Retirés** : aucun client ne les appelait. |
 | `POST /playlist-manager/batch-transfer` — écrivait « started » et ne transférait rien | **Retiré.** Le mode par lot est celui du greffon (`/apercu` avec plusieurs playlists). |
 | `GET /playlist-manager/history` — l'historique du seul premier moteur | Montre les **lots du greffon** (`id` = numéro du lot, `lot_id` = `lot-N`), quel que soit le chemin emprunté, puis les entrées de l'ancien moteur, figées. Détail : `/history/lot-N`. |
-| `/playlist-manager/links*` (liens) et `/playlist-manager/backup(s)*` (sauvegardes) — doublons de `/liens` et des snapshots | **Alias dépréciés** pendant une version : ils répondent comme avant, avec `Deprecation: @1791331200` (RFC 9745) et un `Link` `rel="successor-version"` vers `/liens` ou `/snapshots`. Les clients livrés passent par le greffon. Suppression dans la version suivante (`routes/playlist_manager_deprecie.rs`). |
+| `/playlist-manager/links*` (liens) et `/playlist-manager/backup(s)*` (sauvegardes) — doublons de `/liens` et des snapshots | **Alias dépréciés** dès la 1.0 : ils répondent comme avant, avec `Deprecation: @1791331200` (RFC 9745), `Sunset` (RFC 8594, retrait annoncé pour la **1.1** ; la date exacte de la 1.1 n'étant pas fixée, la valeur est provisoire) et un `Link` `rel="successor-version"` vers `/liens` ou `/snapshots`. Les clients livrés passent par le greffon. Suppression à la 1.1 (`routes/playlist_manager_deprecie.rs`). |
 
-La route historique appelle le greffon **au nom du profil de l'appelant**
-(`X-Profile-Id`) : une playlist locale lue ou créée l'est sous ce profil.
+Toute route du greffon est appelée **au nom du profil de l'appelant**
+(`X-Profile-Id`, Bertrand, 08/10/2026), la route historique comme
+`/api/v1/plugins/{id}/…` : une playlist locale lue ou créée l'est sous ce
+profil. C'est la règle de tous les greffons WASM.
 
 La **bibliothèque locale** vaut comme source **et** comme cible : appariement
 par `host_library_match_track`, création par `host_playlist_create`, ajout par
@@ -97,7 +103,7 @@ aucune licence.
 | `GET /snapshots` | — | `{count, playlists: [{service, playlist_id, nom, snapshots, dernier_le_ms}], retention_par_playlist}` |
 | `GET /snapshots?service=S&playlist_id=P` | — | `{count, snapshots: [en-tête…], retention_par_playlist}`, du plus récent au plus ancien |
 | `GET /snapshot?id=snap-K-N` | — | `{snapshot: {…en-tête, pistes: [{id, titre, artiste, duree_ms, isrc}]}}` ; `404` inconnu ou expiré |
-| `POST /snapshot/restauration/apercu` | `{snapshot_id, mode: "completer"\|"recreer"}` | `{plan, a_rajouter: [piste…], a_retirer_par_vous: [piste…]}` — **rien n'est écrit** |
+| `POST /snapshot/restauration/apercu` | `{snapshot_id, mode: "completer"\|"recreer"}` | `{plan, a_rajouter: [piste…], a_retirer_par_vous: [piste…], introuvables: [piste…]}` — **rien n'est écrit** |
 | `POST /snapshot/restauration` | `{plan_id, accord: true}` | `{plan, a_retirer_par_vous}` ; `409` sans accord ou plan déjà exécuté |
 
 | `POST /liens` | `{a: {service, playlist_id}, b: {service, playlist_id}, sens?: "a_vers_b"\|"deux_sens", cadence_minutes?}` | `{lien}` — état `attente_premier_apercu` ; `400` si même service, cadence hors bornes ou playlist illisible |
@@ -144,7 +150,7 @@ destructif**, et se fait toujours en deux temps — **aperçu**, puis **accord**
 | Mode | Ce qui est fait | Ce qui ne l'est pas |
 |---|---|---|
 | `completer` (défaut) | les pistes du snapshot qui ont disparu de la playlist y sont **rajoutées** (en fin de playlist) | les pistes ajoutées depuis le snapshot **restent** : elles sont listées dans `a_retirer_par_vous`, et c'est à **l'utilisateur** de les retirer lui-même, depuis l'application du service, s'il le souhaite. L'ordre d'origine n'est pas rétabli. |
-| `recreer` | une **nouvelle** playlist est créée avec le nom et les pistes du snapshot | l'ancienne playlist n'est ni modifiée ni supprimée |
+| `recreer` | une **nouvelle** playlist est créée **dans Tune** (la bibliothèque) avec le nom et les pistes du snapshot ; celles d'un snapshot pris chez un service y sont **appariées** par la règle du transfert, et celles que la bibliothèque n'a pas sont rendues dans `introuvables` (Bertrand, 08/10/2026) | l'ancienne playlist n'est ni modifiée ni supprimée, et **rien n'est écrit chez un service** : l'export vers un service reste le transfert |
 
 Le retour en arrière n'écrit jamais **plus** que l'aperçu accepté (une piste
 disparue après l'aperçu attendra un nouvel aperçu), et en mode `completer` il

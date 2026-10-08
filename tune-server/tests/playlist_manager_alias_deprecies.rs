@@ -2,13 +2,14 @@
 //!
 //! Ces routes font double emploi avec le greffon « Playlists converter »
 //! (`/liens`, `/snapshots`). Les clients livrés passent par le greffon ; les
-//! routes restent UNE version pour les anciens clients, et le disent par
-//! l'en-tête `Deprecation` (RFC 9745) et un `Link` vers leur remplaçante.
+//! routes restent pour les anciens clients jusqu'à la 1.1, et le disent par
+//! les en-têtes `Deprecation` (RFC 9745), `Sunset` (RFC 8594) et un `Link`
+//! vers leur remplaçante.
 //!
 //! Ce fichier prouve trois choses :
 //!
 //! 1. chaque alias répond ENCORE comme avant (statut et effet en base) ;
-//! 2. chaque réponse d'alias porte `Deprecation` et le bon `Link` — y compris
+//! 2. chaque réponse d'alias porte `Deprecation`, `Sunset` et le bon `Link` — y compris
 //!    un 404 ;
 //! 3. les routes de `/playlist-manager` qui ne sont PAS des doublons
 //!    (`services`, `history`, `merge`…) ne portent pas l'en-tête : un marquage
@@ -20,6 +21,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const DEPRECATION: &str = "@1791331200";
+/// Retrait annoncé pour la 1.1 (décision du 08/10/2026), RFC 8594.
+const SUNSET: &str = "Fri, 01 Jan 2027 00:00:00 GMT";
 const LIEN_LIENS: &str = "</api/v1/plugins/playlists-converter/liens>; rel=\"successor-version\"";
 const LIEN_SAUVEGARDES: &str =
     "</api/v1/plugins/playlists-converter/snapshots>; rel=\"successor-version\"";
@@ -60,6 +63,11 @@ fn assert_deprecie(route: &str, en_tetes: &HeaderMap, lien: &str) {
         en_tetes.get("deprecation").and_then(|v| v.to_str().ok()),
         Some(DEPRECATION),
         "{route} doit porter l'en-tête Deprecation ; en-têtes reçus : {en_tetes:?}"
+    );
+    assert_eq!(
+        en_tetes.get("sunset").and_then(|v| v.to_str().ok()),
+        Some(SUNSET),
+        "{route} doit annoncer son retrait (en-tête Sunset) ; en-têtes reçus : {en_tetes:?}"
     );
     assert_eq!(
         en_tetes.get("link").and_then(|v| v.to_str().ok()),
@@ -215,7 +223,7 @@ async fn les_routes_qui_ne_sont_pas_des_doublons_ne_sont_pas_depreciees() {
     ] {
         let (_, h, _) = appel(&app, methode, route, None).await;
         assert!(
-            h.get("deprecation").is_none(),
+            h.get("deprecation").is_none() && h.get("sunset").is_none(),
             "{methode} {route} n'est pas un doublon et ne doit pas se dire dépréciée"
         );
     }

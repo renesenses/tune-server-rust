@@ -15,14 +15,14 @@
 //! | `DELETE /playlist-manager/backups/{id}` | aucune : le greffon garde un anneau de 10 copies par playlist |
 //!
 //! Les clients livrés (web, appli iPad, appli Flutter) passent désormais par
-//! le greffon. Ces alias ne restent que pour les ANCIENS clients, pendant UNE
-//! version : ils répondent comme avant, avec en plus l'en-tête `Deprecation`
-//! (RFC 9745) et un `Link` vers la route qui les remplace
+//! le greffon. Ces alias ne restent que pour les ANCIENS clients : ils
+//! répondent comme avant, avec en plus l'en-tête `Deprecation` (RFC 9745),
+//! l'en-tête `Sunset` (RFC 8594) et un `Link` vers la route qui les remplace
 //! (`rel="successor-version"`).
 //!
-//! Calendrier : présents, dépréciés, dans la première version publiée après la
-//! rc3 ; ce fichier et ses deux `merge` dans `playlist_manager::router` sont
-//! supprimés dans la version suivante. Rien d'autre n'en dépend.
+//! Calendrier (décision de Bertrand, 08/10/2026) : dépréciés dès la 1.0,
+//! RETIRÉS à la 1.1. Ce fichier et ses deux `merge` dans
+//! `playlist_manager::router` sont alors supprimés. Rien d'autre n'en dépend.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -45,9 +45,18 @@ use crate::state::AppState;
 /// 2026-10-07T00:00:00Z, le jour où le retrait des doublons a été décidé.
 pub(crate) const DEPRECATION: &str = "@1791331200";
 
+/// Date de retrait annoncée, au format HTTP-date de RFC 8594 : le retrait
+/// est prévu pour la version 1.1 (décision du 08/10/2026).
+///
+/// ⚠️ DATE PROVISOIRE : la date de publication de la 1.1 n'est pas fixée.
+/// C'est la seule valeur à changer quand elle le sera (avec sa copie dans
+/// l'essai `playlist_manager_alias_deprecies`).
+pub(crate) const SUNSET: &str = "Fri, 01 Jan 2027 00:00:00 GMT";
+
 fn marquer(mut reponse: Response, successeur: &'static str) -> Response {
     let en_tetes = reponse.headers_mut();
     en_tetes.insert("deprecation", HeaderValue::from_static(DEPRECATION));
+    en_tetes.insert("sunset", HeaderValue::from_static(SUNSET));
     en_tetes.insert("link", HeaderValue::from_static(successeur));
     reponse
 }

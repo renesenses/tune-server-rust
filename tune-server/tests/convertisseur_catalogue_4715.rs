@@ -135,10 +135,17 @@ async fn fiche_du_greffon(app: &axum::Router) -> Value {
 }
 
 /// Sans Premium : le verrou, sur les routes des onglets comme sur les gestes
-/// du gestionnaire.
+/// du gestionnaire — sauf les copies datées, qui portent les sauvegardes de
+/// l'écran v2 et restent gratuites (décision de Bertrand, 08/10/2026, #5966).
 async fn sans_premium_tout_est_verrouille(app: &axum::Router) {
     let base = format!("/api/v1/plugins/{ID}");
-    for (methode, route) in [("GET", "/lots"), ("GET", "/snapshots"), ("GET", "/liens")] {
+    let (status, corps) = call(app, "GET", &format!("{base}/snapshots"), Value::Null).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "les copies datées restent gratuites : {corps}"
+    );
+    for (methode, route) in [("GET", "/lots"), ("GET", "/liens")] {
         let (status, corps) = call(app, methode, &format!("{base}{route}"), Value::Null).await;
         assert_eq!(
             status,

@@ -44,6 +44,37 @@ pub fn router() -> Router<AppState> {
     router
 }
 
+/// Les routes d'un greffon premium qui restent GRATUITES, décidées par l'hôte
+/// (la licence est l'affaire de l'hôte, jamais du greffon — RFC §3.5).
+///
+/// Décision de Bertrand (08/10/2026, #5966) : les sauvegardes de playlists de
+/// l'écran v2 restent gratuites. Elles passent désormais par les copies
+/// datées du greffon « Playlists converter » ; les liens de synchronisation
+/// et le transfert entre services restent Premium.
+#[cfg(feature = "plugins-wasm")]
+const ROUTES_GRATUITES: &[(&str, &str, &str)] = &[
+    ("playlists-converter", "POST", "/snapshot"),
+    ("playlists-converter", "GET", "/snapshots"),
+    ("playlists-converter", "GET", "/snapshot"),
+    (
+        "playlists-converter",
+        "POST",
+        "/snapshot/restauration/apercu",
+    ),
+    ("playlists-converter", "POST", "/snapshot/restauration"),
+];
+
+/// Cette route d'un greffon premium est-elle gratuite ? Correspondance
+/// EXACTE de la méthode et du chemin : un préfixe ouvrirait aussi les routes
+/// qu'un greffon ajouterait plus tard sous le même nom.
+#[cfg(feature = "plugins-wasm")]
+fn route_gratuite(greffon: &str, methode: &str, chemin: &str) -> bool {
+    let chemin = chemin.trim_end_matches('/');
+    ROUTES_GRATUITES
+        .iter()
+        .any(|(g, m, c)| *g == greffon && m.eq_ignore_ascii_case(methode) && *c == chemin)
+}
+
 /// Dispatch an HTTP request to a loaded wasm plugin (P2, RFC §3.5).
 ///
 /// Packages the request as `{method, path, query, body}` JSON, runs the plugin
@@ -54,6 +85,7 @@ pub fn router() -> Router<AppState> {
 #[cfg(feature = "plugins-wasm")]
 async fn wasm_dispatch(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     method: axum::http::Method,
     Path((id, subpath)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
@@ -77,7 +109,8 @@ async fn wasm_dispatch(
 
     // Premium gate BEFORE dispatch: the host owns licensing, not the plugin
     // (RFC §3.5). Reuse the same guard the native premium routes use.
-    if loaded.manifest.premium {
+    let chemin = format!("/{subpath}");
+    if loaded.manifest.premium && !route_gratuite(&id, method.as_str(), &chemin) {
         if let Err(resp) = crate::premium_guard::require_premium(
             &state.license,
             tune_core::license::Feature::PluginMarketplace,
@@ -97,10 +130,13 @@ async fn wasm_dispatch(
         &state,
         &id,
         method.as_str(),
-        &format!("/{subpath}"),
+        &chemin,
         &query.unwrap_or_default(),
         body_json,
-        None,
+        // `X-Profile-Id` de l'appelant (décision du 08/10/2026, #5966) : une
+        // playlist locale lue ou créée par le greffon l'est sous le profil de
+        // celui qui agit, comme pour `/playlist-manager/transfer` (#4741).
+        Some(profile.id()),
     )
     .await
     {

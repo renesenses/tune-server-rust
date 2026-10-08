@@ -713,3 +713,119 @@ async fn dupliquer_dans_la_bibliotheque_reste_gratuit_4741() {
         .unwrap_or_else(|| panic!("aucune copie : {rendu}"));
     assert_eq!(repo.get_track_ids(copie.id.unwrap()).unwrap(), vec![1]);
 }
+
+// ---------------------------------------------------------------------------
+// 6. Décisions de Bertrand du 08/10/2026 (#5966)
+// ---------------------------------------------------------------------------
+
+const BASE_GREFFON: &str = "/api/v1/plugins/playlists-converter";
+
+/// 🔴 Les sauvegardes de l'écran v2 restent GRATUITES, et une restauration
+/// recrée la playlist DANS TUNE :
+///
+/// - un compte gratuit prend une copie datée d'une playlist de service, la
+///   liste, puis la restaure ;
+/// - la playlist est recréée dans la bibliothèque, avec la piste que la
+///   bibliothèque possède, et l'autre est rendue dans `introuvables` ;
+/// - elle l'est sous le profil de l'APPELANT (`X-Profile-Id: 2`), pas sous
+///   le profil actif global : l'en-tête est transmis au greffon ;
+/// - rien n'est écrit chez le service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_sauvegarde_v2_est_gratuite_et_se_restaure_dans_tune_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+
+    let (st, rendu) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot"),
+        json!({ "service": "source", "playlist_id": "pl-1" }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "copie datée refusée à un compte gratuit : {rendu}"
+    );
+    let snapshot_id = rendu["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (st, liste) = appel_profil(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshots"),
+        Value::Null,
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{liste}");
+
+    let (st, apercu) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/restauration/apercu"),
+        json!({ "snapshot_id": snapshot_id, "mode": "recreer" }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{apercu}");
+    assert_eq!(apercu["plan"]["a_rajouter_ids"], json!(["1"]), "{apercu}");
+    assert_eq!(
+        apercu["introuvables"][0]["titre"], "Introuvable ailleurs",
+        "{apercu}"
+    );
+
+    let (st, fait) = appel_profil(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/restauration"),
+        json!({ "plan_id": apercu["plan"]["plan_id"], "accord": true }),
+        Some("2"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{fait}");
+    assert_eq!(fait["plan"]["etat"], "termine", "{fait}");
+
+    let repo = PlaylistRepo::with_backend(b.state.backend.clone());
+    let noms = |profil: i64| -> Vec<String> {
+        repo.list(profil, 100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    };
+    let recreee = repo
+        .list(2, 100, 0)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "Mes classiques")
+        .unwrap_or_else(|| {
+            panic!(
+                "la playlist restaurée doit être dans Tune, chez le profil 2 : {:?} / profil 1 : {:?}",
+                noms(2),
+                noms(1)
+            )
+        });
+    assert_eq!(repo.get_track_ids(recreee.id.unwrap()).unwrap(), vec![1]);
+    assert!(
+        !noms(1).contains(&"Mes classiques".to_string()),
+        "pas chez le profil actif global"
+    );
+    assert!(
+        journal(&b.ecritures_source).is_empty() && journal(&b.ecritures_cible).is_empty(),
+        "une restauration n'écrit rien chez un service"
+    );
+}
+
+/// Témoin de l'exception : seules les copies datées sont gratuites. Les liens
+/// de synchronisation restent Premium.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_liens_du_greffon_restent_premium_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    let (st, refus) = appel(&b.app, "GET", &format!("{BASE_GREFFON}/liens"), Value::Null).await;
+    assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{refus}");
+}
