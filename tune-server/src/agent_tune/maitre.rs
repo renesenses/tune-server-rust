@@ -1,5 +1,13 @@
 //! Côté MAÎTRE : appairer un agent, rattacher ses sorties à des zones, les
 //! réinscrire au démarrage, l'oublier (#4626).
+//!
+//! Le sort des zones d'un agent (décision de Bertrand, 08/10) :
+//! - l'agent ne répond plus : ses zones passent HORS LIGNE et sont gardées
+//!   (file, réglages) — un agent éteint revient ;
+//! - l'appairage est RÉVOQUÉ, d'un côté ou de l'autre : ses zones sont
+//!   SUPPRIMÉES chez le maître, comme par `DELETE /zones/{id}` (arrêtées si
+//!   elles jouent, puis masquées). Un nouvel appairage vaut consentement et
+//!   les fait réapparaître.
 
 use std::time::Duration;
 
@@ -7,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::playback::PlayState;
 
 use super::sortie::{SortieAgentTune, device_id_maitre, nom_de_zone};
 use super::{
@@ -17,6 +26,9 @@ use crate::state::AppState;
 
 const DELAI_APPAIRAGE: Duration = Duration::from_secs(10);
 const DELAI_SONDE: Duration = Duration::from_secs(3);
+/// Le temps laissé à l'arrêt d'une zone avant sa suppression, comme pour
+/// `DELETE /zones/{id}` (#5322) : un agent muet ne fait pas attendre.
+const DELAI_ARRET: Duration = Duration::from_secs(10);
 
 /// Un agent appairé, tel que le maître le garde. Le jeton est en clair : il
 /// faut le présenter. La clé est exclue des sauvegardes de configuration.
@@ -107,6 +119,7 @@ pub async fn appairer(
             code: code.to_string(),
             maitre_id,
             maitre_nom,
+            maitre_port: Some(state.port),
         })
         .send()
         .await
@@ -137,6 +150,17 @@ pub async fn appairer(
     enregistrer_agents(state, &liste)?;
     tracing::info!(agent = %agent.nom, agent_id = %agent.agent_id, sorties = reponse.sorties.len(), "agent_tune_agent_appaire");
     let zones = inscrire_sorties(state, &agent, &reponse.sorties).await;
+    // L'appairage vaut consentement : une zone supprimée par une révocation
+    // précédente (ou à la main) revient, puisque l'utilisateur vient de
+    // redemander ces sorties.
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    for zone in &zones {
+        if repo.is_device_hidden(&zone.device_id)
+            && let Err(e) = repo.unhide(zone.zone_id)
+        {
+            tracing::warn!(zone_id = zone.zone_id, error = %e, "agent_tune_zone_non_demasquee");
+        }
+    }
     Ok((agent, zones))
 }
 
@@ -187,7 +211,8 @@ pub async fn inscrire_sorties(
 }
 
 /// Retire du registre les sorties d'un agent et met ses zones hors ligne.
-/// Les zones sont GARDÉES (file, réglages) : un agent éteint revient.
+/// Les zones sont GARDÉES (file, réglages) : un agent éteint revient. La
+/// révocation, elle, passe aussi par [`supprimer_zones`].
 async fn retirer_sorties(state: &AppState, agent_id: &str) {
     let prefixe = format!("{PREFIXE_DEVICE_ID}{agent_id}:");
     let retirees: Vec<String> = {
@@ -208,31 +233,162 @@ async fn retirer_sorties(state: &AppState, agent_id: &str) {
     }
 }
 
-/// Lit les sorties d'un agent appairé (`None` s'il est injoignable ou s'il a
-/// révoqué l'appairage).
-pub async fn lire_sorties(agent: &AgentAppaire) -> Result<Vec<SortieExposee>, String> {
+/// Supprime chez le maître les zones d'un agent dont l'appairage est révoqué,
+/// comme le fait `DELETE /zones/{id}` : une zone qui joue est d'abord arrêtée,
+/// puis masquée, et `ZoneDeleted` est émis.
+async fn supprimer_zones(state: &AppState, agent_id: &str) {
+    let prefixe = format!("{PREFIXE_DEVICE_ID}{agent_id}:");
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let zones = match repo.list() {
+        Ok(zones) => zones,
+        Err(e) => {
+            tracing::warn!(agent_id = %agent_id, error = %e, "agent_tune_zones_illisibles");
+            return;
+        }
+    };
+    for zone in zones {
+        let Some(id) = zone.id else { continue };
+        let Some(device_id) = zone
+            .output_device_id
+            .as_deref()
+            .filter(|d| d.starts_with(&prefixe))
+        else {
+            continue;
+        };
+        if state.playback.get_state(id).await.state != PlayState::Stopped {
+            let arret = state.orchestrator.stop(id, Some(device_id));
+            if tokio::time::timeout(DELAI_ARRET, arret).await.is_err() {
+                tracing::warn!(
+                    zone_id = id,
+                    "agent_tune_arret_hors_delai_suppression_maintenue"
+                );
+            }
+        }
+        match repo.delete(id) {
+            Ok(0) => {}
+            Ok(_) => {
+                tracing::info!(zone_id = id, device_id = %device_id, "agent_tune_zone_supprimee_appairage_revoque");
+                state.event_bus.emit_typed(
+                    tune_core::event_types::EventType::ZoneDeleted,
+                    json!({ "id": id }),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(zone_id = id, error = %e, "agent_tune_zone_non_supprimee");
+            }
+        }
+    }
+}
+
+/// Retire l'agent de la liste des agents appairés et le rend.
+fn retirer_de_la_liste(state: &AppState, agent_id: &str) -> Option<AgentAppaire> {
+    let mut liste = agents(state);
+    let position = liste.iter().position(|a| a.agent_id == agent_id)?;
+    let agent = liste.remove(position);
+    if let Err(e) = enregistrer_agents(state, &liste) {
+        tracing::warn!(error = %e, "agent_tune_agent_non_retire");
+        return None;
+    }
+    Some(agent)
+}
+
+/// Pourquoi les sorties d'un agent n'ont pas pu être lues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EchecLecture {
+    /// Pas de réponse, ou une réponse qui n'est pas un refus du jeton.
+    Injoignable(String),
+    /// L'agent répond, mais refuse le jeton (401) : révocation probable, à
+    /// confirmer par [`revocation_confirmee`].
+    JetonRefuse,
+}
+
+impl std::fmt::Display for EchecLecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Injoignable(motif) => f.write_str(motif),
+            Self::JetonRefuse => f.write_str("jeton d'appairage refusé par l'agent"),
+        }
+    }
+}
+
+/// Lit les sorties d'un agent appairé.
+pub async fn lire_sorties(agent: &AgentAppaire) -> Result<Vec<SortieExposee>, EchecLecture> {
     let reponse = client()
         .get(format!("{}/agent-tune/sorties", agent.base_url()))
         .header(ENTETE_JETON, &agent.jeton)
         .timeout(DELAI_SONDE)
         .send()
         .await
-        .map_err(|e| format!("agent injoignable : {e}"))?;
+        .map_err(|e| EchecLecture::Injoignable(format!("agent injoignable : {e}")))?;
+    if reponse.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(EchecLecture::JetonRefuse);
+    }
     if !reponse.status().is_success() {
-        return Err(format!("agent : {}", reponse.status()));
+        return Err(EchecLecture::Injoignable(format!(
+            "agent : {}",
+            reponse.status()
+        )));
     }
     reponse
         .json()
         .await
-        .map_err(|e| format!("réponse illisible : {e}"))
+        .map_err(|e| EchecLecture::Injoignable(format!("réponse illisible : {e}")))
 }
 
-/// Au démarrage : réinscrit les sorties de chaque agent joignable.
+/// L'agent a-t-il VRAIMENT révoqué ce maître ? Il faut que le serveur joint à
+/// son adresse refuse notre jeton ET qu'il soit bien cet agent : après un
+/// changement d'adresse (DHCP), un autre serveur Tune peut répondre 401 à la
+/// même adresse, et ses zones n'ont pas à en pâtir.
+async fn revocation_confirmee(agent: &AgentAppaire) -> bool {
+    if lire_sorties(agent).await != Err(EchecLecture::JetonRefuse) {
+        return false;
+    }
+    sonder_annonce(&agent.host, agent.port)
+        .await
+        .and_then(|a| {
+            a.get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|id| id == agent.agent_id)
+}
+
+/// L'appairage avec cet agent est révoqué : il quitte la liste, ses sorties
+/// le registre, et ses zones sont supprimées.
+async fn apres_revocation(state: &AppState, agent_id: &str) {
+    if let Some(agent) = retirer_de_la_liste(state, agent_id) {
+        supprimer_zones(state, agent_id).await;
+        retirer_sorties(state, agent_id).await;
+        tracing::info!(agent = %agent.nom, agent_id = %agent_id, "agent_tune_revocation_constatee");
+    }
+}
+
+/// Un agent annonce qu'il a révoqué ce maître (`POST /agent-tune/revocation`).
+/// L'annonce n'est pas crue sur parole : la révocation est vérifiée auprès de
+/// l'agent. Rend `true` si elle est confirmée et appliquée.
+pub async fn constater_revocation(state: &AppState, agent_id: &str) -> bool {
+    let Some(agent) = agents(state).into_iter().find(|a| a.agent_id == agent_id) else {
+        return false;
+    };
+    if !revocation_confirmee(&agent).await {
+        tracing::info!(agent_id = %agent_id, "agent_tune_revocation_non_confirmee");
+        return false;
+    }
+    apres_revocation(state, agent_id).await;
+    true
+}
+
+/// Au démarrage : réinscrit les sorties de chaque agent joignable. Un agent
+/// muet garde ses zones hors ligne ; un agent qui a révoqué ce maître pendant
+/// son absence fait supprimer les siennes.
 pub async fn reinscrire_les_agents(state: &AppState) {
     for agent in agents(state) {
         match lire_sorties(&agent).await {
             Ok(sorties) => {
                 inscrire_sorties(state, &agent, &sorties).await;
+            }
+            Err(EchecLecture::JetonRefuse) if revocation_confirmee(&agent).await => {
+                apres_revocation(state, &agent.agent_id).await;
             }
             Err(e) => {
                 tracing::info!(agent = %agent.nom, error = %e, "agent_tune_agent_hors_ligne");
@@ -242,18 +398,16 @@ pub async fn reinscrire_les_agents(state: &AppState) {
     }
 }
 
-/// Oublie un agent : ses sorties quittent le registre, ses zones passent hors
-/// ligne, et l'agent est prié (au mieux) d'oublier ce maître.
+/// Oublie un agent (révocation côté maître) : ses zones sont supprimées, ses
+/// sorties quittent le registre, et l'agent est prié (au mieux) d'oublier ce
+/// maître.
 pub async fn oublier(state: &AppState, agent_id: &str) -> bool {
-    let mut liste = agents(state);
-    let Some(position) = liste.iter().position(|a| a.agent_id == agent_id) else {
+    let Some(agent) = retirer_de_la_liste(state, agent_id) else {
         return false;
     };
-    let agent = liste.remove(position);
-    if let Err(e) = enregistrer_agents(state, &liste) {
-        tracing::warn!(error = %e, "agent_tune_agent_non_retire");
-        return false;
-    }
+    // Avant de retirer les sorties : l'arrêt d'une zone qui joue passe encore
+    // par la sortie de l'agent, qui connaît toujours ce maître.
+    supprimer_zones(state, agent_id).await;
     retirer_sorties(state, agent_id).await;
     let _ = client()
         .post(format!("{}/agent-tune/oublier", agent.base_url()))

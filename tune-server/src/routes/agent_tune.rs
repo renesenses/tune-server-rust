@@ -12,7 +12,7 @@
 //!   (`x-tune-agent-jeton`), sauf l'annonce (publique, comme
 //!   `/system/peer-info`) et l'appairage (gardé par le code).
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crate::agent_tune::agent::{self, MaitreAppaire, RefusAppairage};
 use crate::agent_tune::{
-    DemandeAppairage, DemandeEtat, ENTETE_JETON, OrdreSortie, identite, maitre,
+    AvisDeRevocation, DemandeAppairage, DemandeEtat, ENTETE_JETON, OrdreSortie, identite, maitre,
 };
 use crate::auth::RequireAdmin;
 use crate::state::AppState;
@@ -44,6 +44,7 @@ pub fn router_entre_serveurs() -> Router<AppState> {
         .route("/sorties/etat", post(etat_sortie))
         .route("/sorties/commande", post(commande_sortie))
         .route("/oublier", post(oublier_par_le_maitre))
+        .route("/revocation", post(revocation_par_l_agent))
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ async fn oublier_maitre(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    if agent::oublier_maitre(&state, &id).await {
+    if agent::oublier_maitre(&state, &id, true).await {
         // 200 et un corps : le client web lit du JSON (pas de 204).
         Json(json!({ "ok": true })).into_response()
     } else {
@@ -194,11 +195,30 @@ async fn annonce(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn appairer(
-    State(state): State<AppState>,
-    Json(demande): Json<DemandeAppairage>,
-) -> Response {
-    match agent::appairer(&state, &demande).await {
+/// Taille maximale d'une demande d'appairage (quelques champs courts).
+const CORPS_APPAIRAGE_MAX: usize = 16 * 1024;
+
+async fn appairer(State(state): State<AppState>, requete: Request) -> Response {
+    // L'adresse d'où vient la demande : c'est là que l'agent préviendra le
+    // maître d'une révocation. Lue dans les extensions plutôt que par
+    // l'extracteur `ConnectInfo`, qui rendrait une erreur 500 à un routeur
+    // servi sans elle.
+    let ip_du_maitre = requete
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(pair)| pair.ip());
+    let demande: DemandeAppairage =
+        match axum::body::to_bytes(requete.into_body(), CORPS_APPAIRAGE_MAX)
+            .await
+            .ok()
+            .and_then(|octets| serde_json::from_slice(&octets).ok())
+        {
+            Some(d) => d,
+            None => {
+                return (StatusCode::BAD_REQUEST, "demande d'appairage illisible").into_response();
+            }
+        };
+    match agent::appairer(&state, &demande, ip_du_maitre).await {
         Ok(reponse) => Json(reponse).into_response(),
         Err(refus) => {
             let code = match refus {
@@ -255,6 +275,18 @@ async fn oublier_par_le_maitre(State(state): State<AppState>, headers: HeaderMap
         Ok(m) => m,
         Err(r) => return r,
     };
-    agent::oublier_maitre(&state, &m.maitre_id).await;
+    agent::oublier_maitre(&state, &m.maitre_id, false).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Côté maître : un agent annonce qu'il a révoqué l'appairage. Rien n'est
+/// cru sur parole — le maître vérifie auprès de l'agent que son jeton y est
+/// refusé ([`maitre::constater_revocation`]). La réponse est la même dans
+/// tous les cas : elle n'apprend rien à qui l'appelle.
+async fn revocation_par_l_agent(
+    State(state): State<AppState>,
+    Json(avis): Json<AvisDeRevocation>,
+) -> Response {
+    maitre::constater_revocation(&state, &avis.agent_id).await;
     StatusCode::NO_CONTENT.into_response()
 }

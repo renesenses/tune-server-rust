@@ -42,9 +42,13 @@ struct Serveur {
 
 impl Serveur {
     async fn demarrer() -> Self {
+        Self::demarrer_avec(Default::default()).await
+    }
+
+    async fn demarrer_avec(config: tune_server::config::TuneConfig) -> Self {
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = ecoute.local_addr().unwrap().port();
-        let state = AppState::new(":memory:", port, Default::default()).unwrap();
+        let state = AppState::new(":memory:", port, config).unwrap();
         let app: Router = tune_server::routes::router(state.clone());
         tokio::spawn(async move {
             axum::serve(
@@ -770,6 +774,9 @@ async fn l_agent_qui_revoque_le_maitre_coupe_ses_ordres() {
     let (agent, _) = agent().await;
     let maitre = Serveur::demarrer().await;
     let (_, _, device_id) = appaires(&maitre, &agent).await;
+    // Prise AVANT la révocation : le maître, prévenu, retire ensuite la
+    // sortie de son registre.
+    let sortie = sortie_du_maitre(&maitre, &device_id).await;
     let (maitre_id, _) = tune_server::agent_tune::identite(&maitre.state);
     let r = client()
         .delete(agent.url(&format!("/api/v1/agent-tune/agent/maitres/{maitre_id}")))
@@ -777,16 +784,28 @@ async fn l_agent_qui_revoque_le_maitre_coupe_ses_ordres() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let sortie = sortie_du_maitre(&maitre, &device_id).await;
     let refus = sortie.lock().await.set_volume(0.5).await.unwrap_err();
     assert!(refus.contains("401"), "{refus}");
 }
 
+/// Une zone visible (en ligne ou non) chez le maître pour ce `device_id` ?
+fn zone_visible(maitre: &Serveur, device_id: &str) -> Option<tune_core::db::zone_repo::Zone> {
+    ZoneRepo::with_backend(maitre.state.backend.clone())
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|z| z.output_device_id.as_deref() == Some(device_id))
+}
+
+/// Révocation côté MAÎTRE : l'utilisateur du maître oublie l'agent. Ses
+/// sorties quittent le registre, sa zone est SUPPRIMÉE (décision du 08/10),
+/// et l'agent oublie ce maître.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn le_maitre_qui_oublie_l_agent_retire_ses_sorties_et_garde_la_zone_hors_ligne() {
+async fn le_maitre_qui_oublie_l_agent_retire_ses_sorties_et_supprime_ses_zones() {
     let (agent, _) = agent().await;
     let maitre = Serveur::demarrer().await;
     let (agent_id, zone_id, device_id) = appaires(&maitre, &agent).await;
+    assert!(zone_visible(&maitre, &device_id).is_some());
     let r = client()
         .delete(maitre.url(&format!("/api/v1/agent-tune/agents/{agent_id}")))
         .send()
@@ -794,11 +813,22 @@ async fn le_maitre_qui_oublie_l_agent_retire_ses_sorties_et_garde_la_zone_hors_l
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(!maitre.state.outputs.lock().await.contains(&device_id));
-    let zone = ZoneRepo::with_backend(maitre.state.backend.clone())
-        .get_by_device_id(&device_id)
+    assert!(
+        zone_visible(&maitre, &device_id).is_none(),
+        "la zone d'un agent oublié doit être supprimée chez le maître"
+    );
+    let liste: Value = client()
+        .get(maitre.url("/api/v1/zones"))
+        .send()
+        .await
         .unwrap()
-        .expect("la zone est gardée");
-    assert_eq!(zone.id, Some(zone_id));
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !liste.to_string().contains(&device_id),
+        "GET /zones ne doit plus montrer la zone {zone_id} : {liste}"
+    );
     // Et l'agent a oublié ce maître.
     attendre(
         || {
@@ -808,4 +838,234 @@ async fn le_maitre_qui_oublie_l_agent_retire_ses_sorties_et_garde_la_zone_hors_l
         "l'agent oublie le maître",
     )
     .await;
+}
+
+/// Révocation côté AGENT : l'utilisateur de l'agent retire le maître. Le
+/// maître, prévenu, vérifie la révocation puis supprime la zone. Un nouvel
+/// appairage la fait revenir : il vaut consentement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l_agent_qui_revoque_le_maitre_fait_supprimer_ses_zones_chez_le_maitre() {
+    let (agent, _) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (agent_id, zone_id, device_id) = appaires(&maitre, &agent).await;
+    let (maitre_id, _) = tune_server::agent_tune::identite(&maitre.state);
+    let r = client()
+        .delete(agent.url(&format!("/api/v1/agent-tune/agent/maitres/{maitre_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    attendre(
+        || {
+            let visible = zone_visible(&maitre, &device_id).is_some();
+            async move { !visible }
+        },
+        "la zone de l'agent qui a révoqué le maître est supprimée chez le maître",
+    )
+    .await;
+    assert!(!maitre.state.outputs.lock().await.contains(&device_id));
+    assert!(
+        tune_server::agent_tune::maitre::agents(&maitre.state)
+            .iter()
+            .all(|a| a.agent_id != agent_id),
+        "le maître doit oublier un agent qui l'a révoqué"
+    );
+
+    // Nouvel appairage : la MÊME zone revient, visible et en ligne.
+    let (_, zone_id_2, device_id_2) = appaires(&maitre, &agent).await;
+    assert_eq!(device_id_2, device_id);
+    assert_eq!(zone_id_2, zone_id, "le nom et la zone sont gardés");
+    let zone = zone_visible(&maitre, &device_id)
+        .expect("un nouvel appairage doit faire revenir la zone supprimée");
+    assert!(zone.online);
+}
+
+/// Un avis de révocation n'est pas cru sur parole : tant que l'agent accepte
+/// le jeton du maître, l'avis ne supprime rien.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_faux_avis_de_revocation_ne_supprime_rien() {
+    let (agent, _) = agent().await;
+    let maitre = Serveur::demarrer().await;
+    let (agent_id, _, device_id) = appaires(&maitre, &agent).await;
+    let r = client()
+        .post(maitre.url("/agent-tune/revocation"))
+        .json(&json!({ "agent_id": agent_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert!(
+        zone_visible(&maitre, &device_id).is_some(),
+        "un avis non confirmé par l'agent ne doit rien supprimer"
+    );
+    assert!(maitre.state.outputs.lock().await.contains(&device_id));
+}
+
+/// Au démarrage du maître : un agent qui a révoqué le maître pendant son
+/// absence fait supprimer ses zones ; un agent qui ne répond plus garde les
+/// siennes, hors ligne.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn au_demarrage_une_revocation_supprime_les_zones_un_agent_muet_les_garde_hors_ligne() {
+    let maitre = Serveur::demarrer().await;
+    let (revoque, _) = agent().await;
+    let (muet, _) = agent().await;
+    let (_, _, device_revoque) = appaires(&maitre, &revoque).await;
+    let (id_muet, _, device_muet) = appaires(&maitre, &muet).await;
+    let (maitre_id, _) = tune_server::agent_tune::identite(&maitre.state);
+
+    // Révocation sans avis au maître (il était éteint).
+    assert!(
+        tune_server::agent_tune::agent::oublier_maitre(&revoque.state, &maitre_id, false).await
+    );
+    // L'agent muet : le maître le cherche à une adresse où rien n'écoute.
+    let ferme = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_ferme = ferme.local_addr().unwrap().port();
+    drop(ferme);
+    let mut liste = tune_server::agent_tune::maitre::agents(&maitre.state);
+    for a in liste.iter_mut().filter(|a| a.agent_id == id_muet) {
+        a.port = port_ferme;
+    }
+    SettingsRepo::with_backend(maitre.state.backend.clone())
+        .set("agent_tune_agents", &serde_json::to_string(&liste).unwrap())
+        .unwrap();
+
+    tune_server::agent_tune::maitre::reinscrire_les_agents(&maitre.state).await;
+
+    assert!(
+        zone_visible(&maitre, &device_revoque).is_none(),
+        "la zone d'un agent qui a révoqué le maître doit être supprimée au démarrage"
+    );
+    let zone_muette = zone_visible(&maitre, &device_muet)
+        .expect("la zone d'un agent qui ne répond plus doit être gardée");
+    assert!(
+        !zone_muette.online,
+        "la zone d'un agent qui ne répond plus doit passer hors ligne"
+    );
+    assert!(
+        tune_server::agent_tune::maitre::agents(&maitre.state)
+            .iter()
+            .any(|a| a.agent_id == id_muet),
+        "un agent muet reste appairé"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plafond de zones gratuites
+// ---------------------------------------------------------------------------
+
+/// Une zone prêtée par un agent compte dans le plafond de zones gratuites du
+/// MAÎTRE (décision du 08/10), pas chez l'agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_zone_d_agent_compte_dans_le_plafond_du_maitre_pas_chez_l_agent() {
+    let une_zone = || tune_server::config::TuneConfig {
+        free_max_zones: 1,
+        ..Default::default()
+    };
+
+    // 1. Maître gratuit dont l'unique zone gratuite est déjà prise : la zone
+    //    d'agent est refusée comme n'importe quelle nouvelle zone.
+    let (agent_1, _) = agent().await;
+    let plein = Serveur::demarrer_avec(une_zone()).await;
+    let repo = ZoneRepo::with_backend(plein.state.backend.clone());
+    let deja = repo
+        .create("Salon", Some("dlna"), Some("uuid:salon"))
+        .unwrap();
+    repo.update_online(deja, true).unwrap();
+    repo.save_playback_position(deja, 0, Some(1), Some("local"), None)
+        .unwrap();
+    let (_, zone_agent, _) = appaires(&plein, &agent_1).await;
+    let r = client()
+        .post(plein.url(&format!("/api/v1/zones/{zone_agent}/play")))
+        .json(&json!({ "track_id": 1 }))
+        .send()
+        .await
+        .unwrap();
+    let code = r.status();
+    let corps: Value = r.json().await.unwrap_or(Value::Null);
+    assert_eq!(
+        code, 402,
+        "la zone d'agent doit compter dans le plafond du maître : {corps}"
+    );
+    assert_eq!(corps["code"], "free_zone_cap_reached", "{corps}");
+
+    // 2. Maître gratuit libre : la zone d'agent joue et prend SA place chez
+    //    le maître ; l'agent, gratuit lui aussi, ne la compte pas.
+    let (agent_2, sortie_agent) = agent().await;
+    let zones_agent = ZoneRepo::with_backend(agent_2.state.backend.clone());
+    let zone_locale = zones_agent
+        .create("DAC USB d'essai", Some("local"), Some(DEVICE_LOCAL))
+        .unwrap();
+    zones_agent.update_online(zone_locale, true).unwrap();
+    let maitre = Serveur::demarrer_avec(une_zone()).await;
+    let (_, zone_id, _) = appaires(&maitre, &agent_2).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let chemin = dossier.path().join("piste.wav");
+    std::fs::write(&chemin, wav(&pcm_de_reference())).unwrap();
+    let mut t = tune_core::db::models::Track::new("Piste".into());
+    t.file_path = Some(chemin.to_string_lossy().into_owned());
+    t.format = Some("wav".into());
+    t.sample_rate = Some(44_100);
+    t.bit_depth = Some(16);
+    t.channels = 2;
+    t.duration_ms = 1_000;
+    t.file_size = Some(std::fs::metadata(&chemin).unwrap().len() as i64);
+    let track_id = tune_core::db::track_repo::TrackRepo::with_backend(maitre.state.backend.clone())
+        .create(&t)
+        .unwrap();
+    let r = client()
+        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/play")))
+        .json(&json!({ "track_id": track_id }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "lecture : {}", r.status());
+    attendre(
+        || {
+            let e = sortie_agent.clone();
+            async move { e.lectures.load(Ordering::SeqCst) > 0 }
+        },
+        "ordre de lecture reçu par l'agent",
+    )
+    .await;
+    // La zone est ACTIVÉE au premier enregistrement de sa position : le
+    // sondeur le fait périodiquement, une pause tout de suite. Le banc n'a pas
+    // de sondeur, la pause de l'utilisateur en tient lieu.
+    let r = client()
+        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/pause")))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "pause : {}", r.status());
+    for _ in 0..200 {
+        if maitre.state.license.plafond_zones().await.actives == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let zone_maitre = ZoneRepo::with_backend(maitre.state.backend.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        maitre.state.license.plafond_zones().await.actives,
+        1,
+        "la zone d'agent doit consommer le quota du maître (en ligne : {}, dernière piste : {:?})",
+        zone_maitre.online,
+        zone_maitre.last_track_id
+    );
+    let chez_l_agent = agent_2.state.license.plafond_zones().await;
+    assert_eq!(
+        chez_l_agent.actives, 0,
+        "la zone d'agent ne doit rien consommer chez l'agent : {chez_l_agent:?}"
+    );
+    assert!(!chez_l_agent.atteint());
+    assert!(
+        zones_agent
+            .get(zone_locale)
+            .unwrap()
+            .unwrap()
+            .last_track_id
+            .is_none(),
+        "la zone locale de l'agent ne doit pas être activée par le maître"
+    );
 }

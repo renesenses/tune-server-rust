@@ -104,6 +104,20 @@ pub struct DemandeAppairage {
     pub code: String,
     pub maitre_id: String,
     pub maitre_nom: String,
+    /// Le port HTTP du maître. Avec l'adresse d'où vient la demande, l'agent
+    /// sait où PRÉVENIR le maître quand il révoque l'appairage. Absent d'un
+    /// maître plus ancien : l'agent ne prévient alors personne, et le maître
+    /// constate la révocation à son prochain démarrage.
+    #[serde(default)]
+    pub maitre_port: Option<u16>,
+}
+
+/// L'agent prévient le maître qu'il a révoqué l'appairage
+/// (`POST /agent-tune/revocation`). Le maître ne croit pas ce message sur
+/// parole : il vérifie auprès de l'agent que son jeton est bien refusé.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvisDeRevocation {
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

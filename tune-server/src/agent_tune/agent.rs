@@ -10,8 +10,9 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::outputs::traits::{OutputTarget, PlayMedia, TransportState};
 
 use super::{
-    Bail, CLE_MAITRES, Commande, DemandeAppairage, EtatSortieDistante, ReponseAppairage,
-    SortieExposee, TYPES_EXPOSES, empreinte, identite, maintenant, secret_aleatoire,
+    AvisDeRevocation, Bail, CLE_MAITRES, Commande, DemandeAppairage, EtatSortieDistante,
+    ReponseAppairage, SortieExposee, TYPES_EXPOSES, empreinte, identite, maintenant,
+    secret_aleatoire,
 };
 use crate::state::AppState;
 
@@ -37,6 +38,16 @@ pub struct MaitreAppaire {
     pub nom: String,
     pub empreinte_jeton: String,
     pub appaire_le: i64,
+    /// Où joindre le maître (`http://hôte:port`) pour le prévenir d'une
+    /// révocation : l'adresse d'où est venue la demande d'appairage, et le
+    /// port que le maître a annoncé. `None` pour un maître qui ne l'annonce pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adresse: Option<String>,
+}
+
+/// `http://hôte:port`, l'IPv6 entre crochets.
+fn adresse_http(ip: std::net::IpAddr, port: u16) -> String {
+    format!("http://{}", std::net::SocketAddr::new(ip, port))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,9 +103,12 @@ pub fn emettre_code(state: &AppState) -> (String, i64) {
 }
 
 /// Consomme le code et appaire le maître. Rend la réponse à lui transmettre.
+/// `ip_du_maitre` : l'adresse d'où vient la demande, gardée (avec le port
+/// annoncé) pour prévenir le maître d'une révocation.
 pub async fn appairer(
     state: &AppState,
     demande: &DemandeAppairage,
+    ip_du_maitre: Option<std::net::IpAddr>,
 ) -> Result<ReponseAppairage, RefusAppairage> {
     let (agent_id, agent_nom) = identite(state);
     if demande.maitre_id == agent_id {
@@ -128,6 +142,9 @@ pub async fn appairer(
         nom: demande.maitre_nom.clone(),
         empreinte_jeton: empreinte(&jeton),
         appaire_le: maintenant(),
+        adresse: ip_du_maitre
+            .zip(demande.maitre_port)
+            .map(|(ip, port)| adresse_http(ip, port)),
     });
     if let Err(e) = enregistrer_maitres(state, &liste) {
         tracing::warn!(error = %e, "agent_tune_maitre_non_persiste");
@@ -152,13 +169,17 @@ pub fn maitre_du_jeton(state: &AppState, jeton: &str) -> Option<MaitreAppaire> {
 }
 
 /// Retire un maître ; les sorties qu'il tenait sont arrêtées.
-pub async fn oublier_maitre(state: &AppState, maitre_id: &str) -> bool {
+///
+/// `prevenir` : la révocation vient de l'utilisateur de l'agent, et le maître
+/// en est averti (au mieux, en tâche de fond) pour qu'il supprime les zones
+/// qu'il tenait de cet agent. Quand c'est le maître lui-même qui s'est retiré
+/// (`POST /agent-tune/oublier`), il n'y a personne à prévenir.
+pub async fn oublier_maitre(state: &AppState, maitre_id: &str, prevenir: bool) -> bool {
     let mut liste = maitres(state);
-    let avant = liste.len();
-    liste.retain(|m| m.maitre_id != maitre_id);
-    if liste.len() == avant {
+    let Some(position) = liste.iter().position(|m| m.maitre_id == maitre_id) else {
         return false;
-    }
+    };
+    let oublie = liste.remove(position);
     if let Err(e) = enregistrer_maitres(state, &liste) {
         tracing::warn!(error = %e, "agent_tune_maitre_non_retire");
         return false;
@@ -181,6 +202,23 @@ pub async fn oublier_maitre(state: &AppState, maitre_id: &str) -> bool {
         }
     }
     tracing::info!(maitre_id = %maitre_id, "agent_tune_maitre_oublie");
+    if prevenir && let Some(adresse) = oublie.adresse {
+        let (agent_id, _) = identite(state);
+        tokio::spawn(async move {
+            let envoi = tune_core::http::client::builder()
+                .build()
+                .unwrap_or_default()
+                .post(format!("{adresse}/agent-tune/revocation"))
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&AvisDeRevocation { agent_id })
+                .send()
+                .await;
+            if let Err(e) = envoi {
+                // Le maître constatera la révocation à son prochain démarrage.
+                tracing::info!(error = %e, "agent_tune_revocation_non_transmise");
+            }
+        });
+    }
     true
 }
 
