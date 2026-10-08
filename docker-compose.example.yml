@@ -9,6 +9,13 @@ services:
     volumes:
       - /chemin/vers/musique:/music:ro
       - tune-data:/data
+    # Sortie audio locale vers un DAC USB de cette machine (#5968) : les
+    # peripheriques son de l'hote, et le groupe qui les ouvre. A retirer si
+    # l'hote n'a pas de /dev/snd. Podman/Fedora : voir « Podman » du README.
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
     environment:
       # Mettre `[]` pour demarrer SANS aucun dossier de bibliotheque et
       # les choisir depuis Reglages. Un `/music` non monte est un volume
