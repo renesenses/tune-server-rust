@@ -296,14 +296,28 @@ async fn oublier_un_partage(
     let chemin = std::path::Path::new(&mount_path);
     let mut demonte = false;
     if smb::est_un_point_de_montage(chemin) {
+        // Hors root (Tune OS sous `tune`, #3206) : par l'assistant, via sudo.
         let res = tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new("umount").arg(&mount_path).output(),
+            smb::commande_de_demontage(
+                crate::privilege::euid(),
+                &crate::privilege::sudo(),
+                &mount_path,
+            )
+            .lancer(),
         )
         .await;
         let echec = match res {
             Ok(Ok(out)) if out.status.success() => None,
-            Ok(Ok(out)) => Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                    warn!(id, path = %mount_path, error = %stderr, "smb_umount_elevation_refusee");
+                    Some(crate::privilege::message_de_refus(&stderr))
+                } else {
+                    Some(stderr)
+                }
+            }
             Ok(Err(e)) => Some(e.to_string()),
             Err(_) => Some("délai dépassé".to_string()),
         };
@@ -1141,7 +1155,22 @@ async fn mount_smb_share(
     }
 
     // Create mount directory
-    if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+    //
+    // Hors root (Tune OS sous `tune`, #3206), /mnt appartient a root et le
+    // reste : c'est l'assistant privilegie qui cree le point, apres l'avoir
+    // verifie. Un /mnt ouvert au compte du service lui permettrait d'y poser
+    // un lien vers /etc et d'y faire monter un partage par root.
+    let creation = match tokio::fs::create_dir_all(&mount_path).await {
+        Err(e)
+            if crate::privilege::euid() != 0
+                && e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            info!(path = %mount_path, "smb_mount_dir_par_l_assistant");
+            Ok(())
+        }
+        autre => autre,
+    };
+    if let Err(e) = creation {
         // Journalise AUSSI, et pas seulement dans la reponse HTTP : le client
         // web n'affichait que le statut, donc la cause n'existait nulle part
         // (#1847).
@@ -1239,19 +1268,26 @@ async fn mount_smb_share(
 
         let mut dernier = None;
         for dialecte in smb::DIALECTES {
-            let opts = smb::options_de_montage(user, pass, dialecte);
-            // JAMAIS `opts` dans une trace : il porte le mot de passe.
             info!(
                 host = %body.host,
                 share = %body.share_name,
                 dialect = smb::etiquette(dialecte),
                 "smb_mount_attempt"
             );
+            // root : `mount.cifs` direct ; sinon l'assistant, via sudo, le
+            // mot de passe sur son entree (#3206).
             let res = tokio::time::timeout(
                 smb::ESSAI_TIMEOUT,
-                Command::new("mount.cifs")
-                    .args([&unc, &mount_path, "-o", &opts])
-                    .output(),
+                smb::commande_de_montage(
+                    crate::privilege::euid(),
+                    &crate::privilege::sudo(),
+                    &unc,
+                    &mount_path,
+                    user,
+                    pass,
+                    dialecte,
+                )
+                .lancer(),
             )
             .await;
 
@@ -1317,6 +1353,18 @@ async fn mount_smb_share(
             // La vraie cause, et non l'erreur du dernier dialecte essaye.
             if smb::est_deja_monte(&stderr) {
                 return point_occupe(&mount_path, None);
+            }
+            if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
+                // le message dit a l'utilisateur ce qui manque.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "elevation_refusee",
+                        "message": crate::privilege::message_de_refus(&stderr),
+                    })),
+                )
+                    .into_response();
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
