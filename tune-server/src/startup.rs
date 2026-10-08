@@ -2620,13 +2620,21 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
         let mut dernier = None;
         let mut gagnant = None;
         for dialecte in echelle {
-            let opts = crate::smb::options_de_montage(u, &pass, dialecte);
-            // JAMAIS `opts` dans une trace : il porte le mot de passe.
+            // root : `mount.cifs` direct ; sinon l'assistant, via sudo, le
+            // mot de passe sur son entree (#3206). Un refus de sudo arrete
+            // l'echelle et part au journal avec la cause.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
-                tokio::process::Command::new("mount.cifs")
-                    .args([&unc, &path, "-o", &opts])
-                    .output(),
+                crate::smb::commande_de_montage(
+                    crate::privilege::euid(),
+                    &crate::privilege::sudo(),
+                    &unc,
+                    &path,
+                    u,
+                    &pass,
+                    dialecte,
+                )
+                .lancer(),
             )
             .await;
             let arreter = match &res {
@@ -2691,8 +2699,14 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
 /// Un refus de `mount.cifs`/`mount_smbfs` : définitif s'il porte sur les
 /// identifiants (réessayer ne ferait que resservir la même réponse), sinon
 /// un nouvel essai peut réussir (#5682).
+///
+/// Un refus de sudo (service hors root sans règle sudoers, #3206) est
+/// définitif lui aussi : réessayer toutes les dix secondes ne ferait que
+/// remplir le journal du même refus.
 pub(crate) fn issue_d_un_refus(stderr: &str) -> IssueMontage {
-    if crate::smb::est_refus_d_authentification(stderr) {
+    if crate::smb::est_refus_d_authentification(stderr)
+        || crate::privilege::est_un_refus_d_elevation(stderr)
+    {
         IssueMontage::Definitif
     } else {
         IssueMontage::Echec
@@ -4234,6 +4248,16 @@ mod nouveaux_essais_de_montage_tests_5682 {
         assert_eq!(
             issue_d_un_refus("mount error(101): Network is unreachable"),
             IssueMontage::Echec
+        );
+    }
+
+    /// #3206 : service sous `tune` sans règle sudoers — réessayer ne changera
+    /// rien, le refus est définitif.
+    #[test]
+    fn un_refus_de_sudo_n_est_pas_retente_3206() {
+        assert_eq!(
+            issue_d_un_refus("sudo: a password is required"),
+            IssueMontage::Definitif
         );
     }
 
