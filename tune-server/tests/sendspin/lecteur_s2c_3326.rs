@@ -143,9 +143,15 @@ struct Pair {
 
 impl Pair {
     async fn ouvrir(b: &Banc, id: &Identite, cle: &PskPair, support: Value) -> (Self, Value) {
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/sendspin", b.adresse))
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/sendspin", b.adresse))
             .await
             .unwrap();
+        Self::mener(ws, id, cle, support).await
+    }
+
+    /// La séquence de l'enceinte sur une prise déjà ouverte, quel que soit le
+    /// côté qui a composé : l'enceinte parle la première (`client/init`).
+    async fn mener(mut ws: Socket, id: &Identite, cle: &PskPair, support: Value) -> (Self, Value) {
         let suite = Suite::ChaChaPoly;
         let init = json!({"type":"client/init","payload":{"client_id":id.id(),"version":1,"suite":suite.nom()}}).to_string();
         ws.send(Message::Text(init.clone().into())).await.unwrap();
@@ -900,3 +906,6 @@ async fn i3326_s2c_client_leave_arrete_la_lecture_sans_fin_naturelle() {
 
 #[path = "lecteur_aiosendspin_3326.rs"]
 mod aiosendspin;
+
+#[path = "sortantes_3326.rs"]
+mod sortantes;

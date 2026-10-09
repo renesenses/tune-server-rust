@@ -390,7 +390,12 @@ async fn i3326_s2c_interop_aiosendspin_lecteur_de_reference() {
                 trames * 1_000_000 / taux <= 150_000,
                 "flux {n} morceau {k} > 150 ms"
             );
-            if m["synchro"].as_bool().unwrap() {
+            // L'heure de lecture prédite ne vaut que si le filtre de temps
+            // d'aiosendspin a déjà convergé à mieux qu'une milliseconde : juste
+            // après sa première synchronisation, son erreur se compte en
+            // centaines de millisecondes (mesuré sous charge).
+            let fiable = m["erreur_filtre_us"].as_f64().is_some_and(|e| e < 1_000.0);
+            if fiable {
                 let avance =
                     m["lecture_predite"].as_i64().unwrap() - m["arrivee"].as_i64().unwrap();
                 assert!(
@@ -442,4 +447,110 @@ async fn i3326_s2c_interop_aiosendspin_lecteur_de_reference() {
         erreur < 1_000.0,
         "erreur du filtre de temps {erreur} us >= 1 ms"
     );
+}
+
+/// Connexion initiée par le SERVEUR contre aiosendspin : l'enceinte de
+/// référence écoute (`ClientListener`, boucle locale), son adresse est remise
+/// au scanner mDNS de Tune (faux annonceur : pas de multicast sur un runner),
+/// et c'est TUNE qui compose. Puis appairage « Pairing PSK », lecture d'une
+/// sinusoïde, contrôle bit à bit et horloge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "interop aiosendspin : exige TUNE_AIOSENDSPIN_PYTHON (aiosendspin + soundfile)"]
+async fn i3326_sortante_interop_aiosendspin_en_ecoute_tune_compose() {
+    let python = interpreteur_aiosendspin();
+    let temporaire = tempfile::tempdir().unwrap();
+    let dossier = dossier_des_journaux()
+        .unwrap_or(temporaire.path().to_path_buf())
+        .join("sortante");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let b = Banc::nouveau(&[]).await;
+    let a_wav = dossier.join("a-1khz-44100-16.wav");
+    let pcm_a = sinus_wav(&a_wav, 44_100, 16, 2.0, 1_000.0);
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/sendspin/banc_aiosendspin.py"
+    );
+    let mut enfant = Command::new(&python)
+        .arg("-I")
+        .arg(script)
+        .arg("--ecoute")
+        .args(["--dossier", dossier.to_str().unwrap()])
+        .args(["--formats", "pcm:44100:16:2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("lancer aiosendspin");
+    let sortie = BufReader::new(enfant.stdout.take().unwrap());
+    let mut lecteur = Lecteur { enfant, sortie };
+    let client_id = lecteur.ligne("CLIENT_ID=");
+    let jeton = lecteur.ligne("TOKEN=");
+    let port: u16 = lecteur.ligne("ECOUTE=").parse().unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let scanner = std::sync::Arc::new(tune_core::discovery::mdns::MdnsScanner::new(tx).unwrap());
+    let appareil = tune_core::discovery::sendspin::appareil_annonce(
+        "127.0.0.1",
+        port,
+        Some("/sendspin"),
+        Some("aiosendspin (banc Tune)"),
+    );
+    scanner.annoncer(&appareil.id.clone(), Some(appareil)).await;
+    *b.etat.mdns_scanner.lock().unwrap() = Some(scanner);
+    lecteur.ligne("CONNECTE");
+
+    let http = reqwest::Client::new();
+    let url = format!(
+        "http://{}/api/v1/devices/sendspin/{client_id}/pair",
+        b.adresse
+    );
+    let r = http
+        .post(&url)
+        .json(&json!({"method": "pairing_psk", "token": jeton}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status().is_success(),
+        "appairage refuse : {}",
+        r.text().await.unwrap()
+    );
+    let sortie = tokio::time::timeout(Duration::from_secs(20), b.sortie(&client_id))
+        .await
+        .expect("la zone apparait sur la prise composee par Tune");
+    attendre("enceinte disponible", 10, || {
+        let s = sortie.clone();
+        async move { s.lock().await.is_available().await }
+    })
+    .await;
+    let a = a_wav.to_str().unwrap().to_owned();
+    sortie
+        .lock()
+        .await
+        .play_media(&jouer(&a, 44_100, 2_000))
+        .await
+        .unwrap();
+    attendre("fin naturelle de A", 15, || {
+        let s = sortie.clone();
+        async move { s.lock().await.get_status().await.unwrap().ended_naturally }
+    })
+    .await;
+    sortie.lock().await.stop().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(lecteur.enfant.stdin.take());
+    lecteur.ligne("JOURNAL_ECRIT");
+    assert!(lecteur.enfant.wait().unwrap().success());
+    let journal: Value =
+        serde_json::from_slice(&std::fs::read(dossier.join("journal.json")).unwrap()).unwrap();
+    let flux = journal["flux"].as_array().unwrap();
+    assert_eq!(flux.len(), 1);
+    assert!(
+        echantillons(&flux[0]) == reference(&pcm_a, 16),
+        "A recue octet pour octet sur la prise sortante"
+    );
+    let erreur = journal["horloge"].as_array().unwrap().last().unwrap()["erreur_us"]
+        .as_f64()
+        .expect("filtre converge");
+    eprintln!("sortante : horloge erreur {erreur} us");
+    assert!(erreur < 1_000.0);
 }
