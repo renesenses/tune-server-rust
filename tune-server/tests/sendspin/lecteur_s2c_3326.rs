@@ -37,10 +37,15 @@ impl Drop for Banc {
 
 /// Un WAV PCM 16 bits stéréo de `trames` trames, au contenu non trivial.
 fn ecrire_wav(chemin: &std::path::Path, trames: usize) -> Vec<u8> {
+    ecrire_wav_a(chemin, trames, TAUX, 0)
+}
+
+/// Idem à `taux`, avec un motif décalé par `graine` (deux pistes différentes).
+fn ecrire_wav_a(chemin: &std::path::Path, trames: usize, taux: u32, graine: usize) -> Vec<u8> {
     let mut pcm = Vec::with_capacity(trames * 4);
     for i in 0..trames {
-        let g = ((i * 37) % 65_536) as u16 as i16;
-        let d = ((i * 101 + 7) % 65_536) as u16 as i16;
+        let g = ((i * 37 + graine) % 65_536) as u16 as i16;
+        let d = ((i * 101 + 7 + graine * 3) % 65_536) as u16 as i16;
         pcm.extend_from_slice(&g.to_le_bytes());
         pcm.extend_from_slice(&d.to_le_bytes());
     }
@@ -52,8 +57,8 @@ fn ecrire_wav(chemin: &std::path::Path, trames: usize) -> Vec<u8> {
     f.extend_from_slice(&16u32.to_le_bytes());
     f.extend_from_slice(&1u16.to_le_bytes());
     f.extend_from_slice(&2u16.to_le_bytes());
-    f.extend_from_slice(&TAUX.to_le_bytes());
-    f.extend_from_slice(&(TAUX * 4).to_le_bytes());
+    f.extend_from_slice(&taux.to_le_bytes());
+    f.extend_from_slice(&(taux * 4).to_le_bytes());
     f.extend_from_slice(&4u16.to_le_bytes());
     f.extend_from_slice(&16u16.to_le_bytes());
     f.extend_from_slice(b"data");
@@ -260,7 +265,7 @@ fn support_pcm16() -> Value {
     json!({
         "buffer_capacity": 1_000_000,
         "supported_formats": [
-            {"codec": "flac", "sample_rate": 48000, "bit_depth": 24, "channels": 2},
+            {"codec": "opus", "sample_rate": 48000, "bit_depth": 16, "channels": 2},
             {"codec": "pcm", "sample_rate": TAUX, "bit_depth": 16, "channels": 2},
         ]
     })
@@ -335,7 +340,7 @@ async fn i3326_s2c_enceinte_appairee_devient_une_zone_et_recoit_le_pcm_horodate(
     assert_eq!(g["payload"]["playback_state"], "playing");
     let debut = p.json().await;
     assert_eq!(debut["type"], "stream/start");
-    // Le FLAC est en tête mais pas encore produit : premier PCM annoncé.
+    // Opus est en tête mais Tune ne le produit pas : premier PCM annoncé.
     assert_eq!(
         debut["payload"]["player"],
         json!({"codec":"pcm","sample_rate":TAUX,"channels":2,"bit_depth":16})
@@ -550,3 +555,348 @@ async fn i3326_s2c_session_sentinelle_ne_devient_jamais_une_zone() {
         "une session Sentinelle n'enregistre aucune sortie"
     );
 }
+
+/// Démarre la lecture et consomme activate + group/update ; rend le
+/// `stream/start`.
+async fn demarrer(
+    p: &mut Pair,
+    sortie: &std::sync::Arc<tokio::sync::Mutex<Box<dyn OutputTarget>>>,
+    chemin: &str,
+    taux: Option<u32>,
+    duree_ms: u64,
+) -> Value {
+    sortie
+        .lock()
+        .await
+        .play_media(&PlayMedia {
+            url: chemin,
+            file_path: Some(chemin),
+            duration_ms: Some(duree_ms),
+            sample_rate: taux,
+            ..Default::default()
+        })
+        .await
+        .expect("play_media");
+    assert_eq!(p.json().await["type"], "server/activate");
+    assert_eq!(p.json().await["payload"]["playback_state"], "playing");
+    let debut = p.json().await;
+    assert_eq!(debut["type"], "stream/start");
+    debut
+}
+
+#[tokio::test]
+async fn i3326_s2c_flac_trames_completes_sans_perte() {
+    // « Servers MUST support the flac and pcm codecs » ; « flac: one or more
+    // complete FLAC frames. codec_header is required ».
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [79; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let support = json!({"buffer_capacity": 1_000_000, "supported_formats": [
+        {"codec": "flac", "sample_rate": TAUX, "bit_depth": 16, "channels": 2},
+        {"codec": "pcm", "sample_rate": TAUX, "bit_depth": 16, "channels": 2}]});
+    let (mut p, _) = Pair::ouvrir(&b, &id, &lt, support).await;
+    assert_eq!(p.json().await["type"], "group/update");
+    p.envoyer("client/state", etat_client(json!([]))).await;
+    let sortie = b.sortie(&id.id()).await;
+    let debut = demarrer(&mut p, &sortie, &media(&b), Some(TAUX), 500).await;
+    let joueur = &debut["payload"]["player"];
+    assert_eq!(joueur["codec"], "flac");
+    let entete = base64::engine::general_purpose::STANDARD
+        .decode(
+            joueur["codec_header"]
+                .as_str()
+                .expect("codec_header requis en FLAC"),
+        )
+        .expect("Base64 standard");
+    assert_eq!(&entete[..4], b"fLaC");
+    let mut flux = entete;
+    let mut ts_attendu = None;
+    let mut trames_recues = 0u64;
+    while trames_recues < (TAUX / 2) as u64 {
+        let Recu::Audio { ts, pcm: trame, .. } = p.recevoir().await else {
+            panic!("audio attendu");
+        };
+        // Chaque morceau est UNE trame FLAC complète : synchro 0xFFF8 en tête.
+        assert_eq!(
+            &trame[..2],
+            &[0xFF, 0xF8],
+            "trame FLAC complete en tete de morceau"
+        );
+        if let Some(t) = ts_attendu {
+            assert_eq!(ts, t, "ligne de temps continue en FLAC");
+        }
+        flux.extend_from_slice(&trame);
+        let tmp = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+        std::fs::write(tmp.path(), &flux).unwrap();
+        let n = tune_core::audio::decode::decode_to_pcm(
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            0.0,
+            0.0,
+        )
+        .unwrap()
+        .samples_i32
+        .len() as u64
+            / 2;
+        let morceau = n - trames_recues;
+        assert!(
+            morceau * 1_000_000 / u64::from(TAUX) <= 150_000,
+            "morceau <= 150 ms"
+        );
+        trames_recues = n;
+        ts_attendu = Some(ts + (morceau * 1_000_000 / u64::from(TAUX)) as i64);
+    }
+    let tmp = tempfile::Builder::new().suffix(".flac").tempfile().unwrap();
+    std::fs::write(tmp.path(), &flux).unwrap();
+    let dec =
+        tune_core::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
+            .unwrap();
+    let attendu: Vec<i32> = b
+        .pcm
+        .chunks_exact(2)
+        .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    assert!(
+        dec.samples_i32 == attendu,
+        "FLAC recu = PCM du fichier, echantillon pour echantillon"
+    );
+}
+
+#[tokio::test]
+async fn i3326_s2c_enchainement_sans_coupure_et_changement_de_format_en_place() {
+    // « Track transitions: stream commands SHOULD NOT be sent, except
+    // stream/start to update the existing stream configuration » et « Servers
+    // MUST timestamp the first chunk in the new format to follow the last
+    // chunk in the previous format on the existing timeline ».
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [80; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let support = json!({"buffer_capacity": 1_000_000, "supported_formats": [
+        {"codec": "pcm", "sample_rate": TAUX, "bit_depth": 16, "channels": 2},
+        {"codec": "pcm", "sample_rate": 48000, "bit_depth": 16, "channels": 2}]});
+    let (mut p, _) = Pair::ouvrir(&b, &id, &lt, support).await;
+    assert_eq!(p.json().await["type"], "group/update");
+    p.envoyer("client/state", etat_client(json!([]))).await;
+    let sortie = b.sortie(&id.id()).await;
+    let seconde = b._temporaire.path().join("seconde.wav");
+    let pcm2 = ecrire_wav_a(&seconde, 48_000 / 2, 48_000, 11);
+    let seconde = seconde.to_str().unwrap().to_owned();
+
+    let debut = demarrer(&mut p, &sortie, &media(&b), Some(TAUX), 500).await;
+    assert_eq!(debut["payload"]["player"]["sample_rate"], TAUX);
+    sortie
+        .lock()
+        .await
+        .set_next_media(&PlayMedia {
+            url: &seconde,
+            file_path: Some(&seconde),
+            duration_ms: Some(500),
+            sample_rate: Some(48_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Piste 1 : tout le PCM, puis un stream/start EN PLACE (rien d'autre).
+    let (bascule, morceaux1) = p.jusqu_a("stream/start").await;
+    assert_eq!(
+        bascule["payload"]["player"],
+        json!({"codec":"pcm","sample_rate":48000,"channels":2,"bit_depth":16})
+    );
+    let pcm1: Vec<u8> = morceaux1.iter().flat_map(|m| m.2.clone()).collect();
+    assert_eq!(pcm1, b.pcm, "piste 1 entiere, octet pour octet");
+    let mut trames = 0u64;
+    let t0 = morceaux1[0].0;
+    for (i, (ts, _, octets)) in morceaux1.iter().enumerate() {
+        assert_eq!(
+            *ts,
+            t0 + (trames * 1_000_000 / u64::from(TAUX)) as i64,
+            "piste 1 morceau {i}"
+        );
+        trames += (octets.len() / 4) as u64;
+    }
+    let fin1 = t0 + (trames * 1_000_000 / u64::from(TAUX)) as i64;
+
+    // Piste 2 : premier morceau horodaté À LA SUITE du dernier de la piste 1.
+    let mut pcm_recu2 = Vec::new();
+    let mut trames2 = 0u64;
+    while pcm_recu2.len() < pcm2.len() {
+        match p.recevoir().await {
+            Recu::Audio { ts, pcm, .. } => {
+                assert_eq!(
+                    ts,
+                    fin1 + (trames2 * 1_000_000 / 48_000) as i64,
+                    "ligne de temps continue a travers le changement de format"
+                );
+                trames2 += (pcm.len() / 4) as u64;
+                pcm_recu2.extend_from_slice(&pcm);
+            }
+            Recu::Json(v) => panic!("ni stream/clear ni stream/end entre deux pistes : {v}"),
+        }
+    }
+    assert_eq!(pcm_recu2, pcm2, "piste 2 entiere, octet pour octet");
+
+    // L'état suit la ligne de temps : piste 2 une fois la frontière jouée.
+    let s = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = sortie.lock().await.get_status().await.unwrap();
+            if s.current_uri.as_deref() == Some(seconde.as_str()) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("la piste 2 devient la piste courante");
+    assert!(tune_core::sendspin::horloge::maintenant_us() >= fin1);
+    assert!(
+        s.position_ms < 500,
+        "la position repart de zero sur la piste 2"
+    );
+    assert_eq!(s.state, TransportState::Playing);
+}
+
+#[tokio::test]
+async fn i3326_s2c_preference_changee_en_lecture_stream_start_en_place_sans_trou() {
+    // « When format changes while a player stream is active, the server
+    // re-derives the stream format and sends a stream/start if it changed ».
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [81; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let support = json!({"buffer_capacity": 1_000_000, "supported_formats": [
+        {"codec": "pcm", "sample_rate": TAUX, "bit_depth": 16, "channels": 2},
+        {"codec": "pcm", "sample_rate": TAUX, "bit_depth": 24, "channels": 2}]});
+    let (mut p, _) = Pair::ouvrir(&b, &id, &lt, support).await;
+    assert_eq!(p.json().await["type"], "group/update");
+    p.envoyer("client/state", etat_client(json!([]))).await;
+    let sortie = b.sortie(&id.id()).await;
+    let longue = b._temporaire.path().join("longue.wav");
+    let pcm = ecrire_wav_a(&longue, TAUX as usize * 4, TAUX, 5);
+    let longue = longue.to_str().unwrap().to_owned();
+    let debut = demarrer(&mut p, &sortie, &longue, Some(TAUX), 4_000).await;
+    assert_eq!(debut["payload"]["player"]["bit_depth"], 16);
+
+    // Quelques morceaux en 16 bits, puis l'enceinte préfère le 24 bits.
+    let mut morceaux16 = Vec::new();
+    while morceaux16.len() < 3 {
+        if let Recu::Audio { ts, pcm, .. } = p.recevoir().await {
+            morceaux16.push((ts, pcm));
+        }
+    }
+    let mut etat = etat_client(json!([]));
+    etat["player"]["format"] =
+        json!({"codec":"pcm","sample_rate":TAUX,"channels":2,"bit_depth":24});
+    p.envoyer("client/state", etat).await;
+    let (bascule, suite16) = p.jusqu_a("stream/start").await;
+    assert_eq!(bascule["payload"]["player"]["bit_depth"], 24);
+    morceaux16.extend(suite16.into_iter().map(|(ts, _, pcm)| (ts, pcm)));
+    let t0 = morceaux16[0].0;
+    let mut trames = 0u64;
+    let mut recu: Vec<i32> = Vec::new();
+    for (ts, pcm) in &morceaux16 {
+        assert_eq!(*ts, t0 + (trames * 1_000_000 / u64::from(TAUX)) as i64);
+        trames += (pcm.len() / 4) as u64;
+        recu.extend(
+            pcm.chunks_exact(2)
+                .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]]))),
+        );
+    }
+    let attendu_ts = t0 + (trames * 1_000_000 / u64::from(TAUX)) as i64;
+    // Le premier morceau en 24 bits suit le dernier en 16 bits, sans trou ni
+    // recouvrement, et reprend à la trame suivante du fichier.
+    let mut premier24 = true;
+    while recu.len() < pcm.len() / 2 {
+        let Recu::Audio { ts, pcm: p24, .. } = p.recevoir().await else {
+            panic!("audio attendu");
+        };
+        if premier24 {
+            assert_eq!(
+                ts, attendu_ts,
+                "le 24 bits suit le 16 bits sur la meme ligne de temps"
+            );
+            premier24 = false;
+        }
+        recu.extend(
+            p24.chunks_exact(3)
+                .map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 16),
+        );
+    }
+    let attendu: Vec<i32> = pcm
+        .chunks_exact(2)
+        .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    assert!(
+        recu == attendu,
+        "rien de renvoye, rien de saute au changement de format"
+    );
+    sortie.lock().await.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn i3326_s2c_enceinte_indisponible_le_serveur_arrete_sa_lecture() {
+    // *External Source Handling* : groupe solo → stream/end et group/update
+    // `stopped` ; pas de reprise automatique.
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [82; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let (mut p, _) = Pair::ouvrir(&b, &id, &lt, support_pcm16()).await;
+    assert_eq!(p.json().await["type"], "group/update");
+    let mut etat = etat_client(json!([]));
+    etat["player"]["required_lead_time_ms"] = json!(2000);
+    p.envoyer("client/state", etat.clone()).await;
+    let sortie = b.sortie(&id.id()).await;
+    demarrer(&mut p, &sortie, &media(&b), Some(TAUX), 500).await;
+    etat["available"] = json!(false);
+    p.envoyer("client/state", etat).await;
+    let (_, _) = p.jusqu_a("stream/end").await;
+    assert_eq!(p.json().await["payload"]["playback_state"], "stopped");
+    assert_eq!(p.json().await["payload"]["activities"], json!([]));
+    let s = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = sortie.lock().await.get_status().await.unwrap();
+            if s.state == TransportState::Stopped {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("la sortie s'arrete");
+    assert!(
+        !s.ended_naturally,
+        "un arret force n'est pas une fin naturelle"
+    );
+    assert!(!sortie.lock().await.is_available().await);
+}
+
+#[tokio::test]
+async fn i3326_s2c_client_leave_arrete_la_lecture_sans_fin_naturelle() {
+    // `client/leave` : traité comme l'indisponibilité, l'enceinte reste
+    // disponible et ne reprend pas seule.
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [83; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let (mut p, _) = Pair::ouvrir(&b, &id, &lt, support_pcm16()).await;
+    assert_eq!(p.json().await["type"], "group/update");
+    p.envoyer("client/state", etat_client(json!([]))).await;
+    let sortie = b.sortie(&id.id()).await;
+    demarrer(&mut p, &sortie, &media(&b), Some(TAUX), 500).await;
+    p.envoyer("client/leave", json!({})).await;
+    let (_, _) = p.jusqu_a("stream/end").await;
+    assert_eq!(p.json().await["payload"]["playback_state"], "stopped");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let s = sortie.lock().await.get_status().await.unwrap();
+    assert_eq!(s.state, TransportState::Stopped);
+    assert!(
+        !s.ended_naturally,
+        "client/leave n'est pas une fin naturelle"
+    );
+    assert!(
+        sortie.lock().await.is_available().await,
+        "l'enceinte reste disponible"
+    );
+}
+
+#[path = "lecteur_aiosendspin_3326.rs"]
+mod aiosendspin;

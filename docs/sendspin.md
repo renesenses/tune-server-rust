@@ -8,7 +8,12 @@ appairage, fragmentation) est dans
 
 ## Sources et versions
 
-Relevé du 07/10/2026.
+Relevé du 07/10/2026, revu le 09/10/2026 contre `main` @ `ee8aad96`
+(08/10/2026) : cinq clarifications depuis l'étiquette (#290, #295, #297, #298,
+#304). Deux touchent le serveur et sont suivies : l'heure de réception se prend
+au plus tard quand la pile WebSocket livre le message (#298, `server_received`
+est désormais lu avant le déchiffrement), et un fragment tronqué est une
+séquence malformée (#297, déjà refusé par `transport/fragmentation.rs`).
 
 | Source | Version | Licence |
 |---|---|---|
@@ -141,29 +146,48 @@ horodater juste et envoyer assez tôt.
 | Noise `KKpsk2`, deux suites, mode de transition en clair (fermé par défaut) | livré (S2-a) | `tune-core/src/sendspin/{poignee,transport,transition}.rs` |
 | Appairage CPace, PSK longue durée persistées, commandes opérateur | livré (S2-b) | `tune-core/src/sendspin/{appairage,pake,magasin}.rs` |
 | Fragmentation | livré | `tune-core/src/sendspin/transport/fragmentation.rs` |
-| **Rôle `player@v1` et sortie (zone) Sendspin** | **cette PR, première version** | `tune-core/src/sendspin/{lecteur,horloge}.rs`, `tune-core/src/outputs/sendspin.rs`, `tune-server/src/routes/sendspin/{pilote,zones}.rs` |
+| **Rôle `player@v1` et sortie (zone) Sendspin** | **cette PR** | `tune-core/src/sendspin/{lecteur,horloge}.rs`, `tune-core/src/outputs/sendspin.rs`, `tune-core/src/audio/encoder.rs` (`EncodeurTramesFlac`), `tune-server/src/routes/sendspin/{pilote,zones}.rs` |
 
-### La première version du rôle `player@v1`
+### Le rôle `player@v1`
 
 - **Qui obtient une zone** : une enceinte connectée à Tune (mode initié par le
   client), authentifiée par une **PSK longue durée** (donc appairée), qui
   annonce `player@v1` avec l'objet `player@v1_support` et au moins un format
-  PCM que Tune produit. Elle reçoit `active_roles: ["player@v1"]` et un
+  que Tune produit. Elle reçoit `active_roles: ["player@v1"]` et un
   `group/update`. Au premier `client/state`, la sortie `sendspin:<client_id>`
   est enregistrée et sa zone créée (ou remise en ligne) selon les règles des
   autres sorties réseau. À la déconnexion, la sortie est retirée et la zone
   passe hors ligne.
-- **Formats** : PCM 16, 24 ou 32 bits, mono ou stéréo, 8 à 384 kHz. Tune
+- **Formats** : PCM 16, 24 ou 32 bits et FLAC 16 ou 24 bits (les deux codecs
+  que la spécification impose au serveur), mono ou stéréo, 8 à 384 kHz. Tune
   décode le fichier par le décodeur progressif existant, à la cadence, aux
-  canaux et à la profondeur du format choisi.
+  canaux et à la profondeur du format choisi. En FLAC, chaque morceau est UNE
+  trame FLAC complète (taille de bloc fixe = la durée d'un morceau), et
+  `codec_header` porte `fLaC` + STREAMINFO en Base64 standard.
+- **Choix du format** : la préférence de l'enceinte (`client/state.format`)
+  si Tune la produit ; sinon, la première entrée produisible au **taux natif
+  de la piste** (la spécification le permet pour éviter un
+  rééchantillonnage) ; sinon la première entrée produisible.
 - **Cadrage** : morceaux de 50 ms (moins si `buffer_capacity` l'impose),
   horodatés sur une ligne de temps continue à partir de
   `t0 = maintenant + max(min_buffer, required_lead_time) + output_delay + 150 ms`.
   `send_ahead` est calculé juste avant le chiffrement. L'envoi se fait au plus
   1,5 s au-delà de l'avance de départ, et jamais au-delà de `buffer_capacity`.
 - **Lecture** : `server/activate` `['playback']`, `group/update` `playing`,
-  `stream/start`, puis l'audio. Piste suivante ou seek : `stream/clear`, le
-  flux reste ouvert (et `stream/start` en place si le format change).
+  `stream/start`, puis l'audio. Saut de piste ou seek : `stream/clear`, le
+  flux reste ouvert.
+- **Une seule ligne de temps** : la piste suivante préparée par l'orchestrateur
+  (`set_next_media`, la sortie déclare `can_gapless`) est posée à la suite de
+  la précédente, sans `stream/clear` ni `stream/end`. Si le format change —
+  taux natif de la piste suivante, ou préférence envoyée par l'enceinte en
+  pleine lecture — un `stream/start` **en place** l'annonce, et le premier
+  morceau du nouveau format est horodaté exactement à la fin du dernier de
+  l'ancien ; le décodeur reprend à la trame qui suit la dernière envoyée (rien
+  n'est renvoyé). L'état (`current_uri`, position) bascule sur la piste
+  suivante quand l'horloge atteint la frontière.
+- **Enceinte indisponible** (`client/state.available: false`) ou
+  `client/leave` : `stream/end`, `group/update` `stopped`, activité retirée ;
+  la sortie s'arrête (sans « fin naturelle ») et rien ne reprend seul.
 - **Pause** (choix de cette version, à confirmer) : `stream/end` et
   `group/update` `stopped`, l'activité `playback` reste déclarée ; la reprise
   envoie un nouveau `stream/start` et repart de la position atteinte.
@@ -184,23 +208,37 @@ horodater juste et envoyer assez tôt.
   un flux en cours, et la porte de sortie de l'issue (deux enceintes du même
   type synchrones sur la durée d'un album). Chaque enceinte a aujourd'hui son
   groupe solo.
-- **FLAC** (obligatoire côté serveur) : l'encodeur FLAC en flux existe
-  (`audio/encoder.rs`) ; il faut l'en-tête `codec_header` et des morceaux en
-  trames FLAC complètes. Tant qu'il manque, une enceinte qui n'annonce que FLAC
-  n'obtient pas de rôle (donc pas de zone muette).
 - **Connexions initiées par le serveur** : Tune parcourt déjà
   `_sendspin._tcp` mais ne compose pas vers ces enceintes. C'est le mode
   recommandé par la spécification ; il faut un client WebSocket qui mène la
   même séquence serveur.
 - **Accès non appairé** : la spécification permet `playback` sous Sentinelle
   quand l'enceinte l'autorise. Tune ne l'utilise pas (question ouverte).
-- **Changement de format en cours de lecture** à la demande de l'enceinte
-  (`client/state.format`), `set_output_delay`, les rôles `metadata`,
-  `artwork`, `controller`, `visualizer`.
+- `set_output_delay`, Opus (facultatif), les rôles `metadata`, `artwork`,
+  `controller`, `visualizer`.
 - **Source HTTP** : une URL distante est téléchargée en entier avant le
   décodage (même chemin qu'AirPlay). Le décodage progressif sur plage HTTP
   existe et serait le bon branchement.
-- **Interopérabilité** : les témoins jouent contre un pair simulé écrit d'après
-  la spécification. `aiosendspin` 10.0.0, publié le 05/10/2026, est la
-  première version publiée qui parle le chiffrement : c'est le prochain banc,
-  avant du matériel réel.
+- **Matériel réel** : le rôle est validé contre un pair simulé écrit d'après
+  la spécification ET contre le lecteur de référence `aiosendspin` 10.0.0
+  (`tune-server/tests/sendspin/lecteur_aiosendspin_3326.rs`, `#[ignore]`,
+  `--ignored` avec `TUNE_AIOSENDSPIN_PYTHON`), pas encore contre une enceinte. Le banc ne
+  mesure pas la précision de sortie (±1 ms), qui est à la charge du lecteur et
+  se mesure au DAC.
+
+## Banc d'interopérabilité aiosendspin
+
+```sh
+uv venv /chemin/venv && uv pip install -p /chemin/venv/bin/python aiosendspin soundfile
+TUNE_AIOSENDSPIN_PYTHON=/chemin/venv/bin/python TUNE_AIOSENDSPIN_DOSSIER=/tmp/banc \
+  cargo test -p tune-server --test sendspin_point_d_acces_s2a -- aiosendspin --ignored --nocapture
+```
+
+Le script `tests/sendspin/banc_aiosendspin.py` fait d'aiosendspin un lecteur
+qui enregistre au lieu de jouer ; il s'appaire par « Pairing PSK » via la
+route opérateur. Le test vérifie la séquence de contrôle vue par le lecteur,
+la ligne de temps (continue dans chaque flux et à travers les `stream/start`
+en place), l'avance de chaque morceau sur l'heure de lecture prédite par le
+filtre de Kalman d'aiosendspin, le contenu bit à bit (PCM tel quel, FLAC
+décodé par libsndfile, pas par Tune), et l'erreur du filtre de temps (< 1 ms).
+Les journaux des deux côtés restent dans `TUNE_AIOSENDSPIN_DOSSIER`.

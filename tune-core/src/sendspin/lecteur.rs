@@ -1,7 +1,8 @@
 //! Le rôle `player@v1` côté SERVEUR : ce que Tune envoie à une enceinte (#3326, S2-c).
 //!
-//! Contrat : `Sendspin/spec` 1.0.0-rc1 (`671a34d4`), `messaging.md` et
-//! `roles/player/v1.md`. Résumé et liens dans `docs/sendspin.md`.
+//! Contrat : `Sendspin/spec` 1.0.0-rc1 (`671a34d4`, revu contre `main` @
+//! `ee8aad96` le 09/10/2026), `messaging.md` et `roles/player/v1.md`. Résumé
+//! et liens dans `docs/sendspin.md`.
 //!
 //! Ce module ne fait AUCUNE entrée-sortie. Il contient :
 //!
@@ -67,29 +68,44 @@ impl FormatAudio {
         usize::from(self.channels) * usize::from(self.bit_depth / 8)
     }
 
-    fn objet(&self) -> Value {
-        json!({
+    /// L'objet `player` de `stream/start`. `codec_header` (Base64 standard,
+    /// avec remplissage) est requis pour FLAC, absent pour PCM.
+    fn objet(&self, codec_header: Option<&str>) -> Value {
+        let mut v = json!({
             "codec": self.codec,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "bit_depth": self.bit_depth,
-        })
+        });
+        if let Some(h) = codec_header {
+            v["codec_header"] = Value::String(h.to_owned());
+        }
+        v
+    }
+
+    #[must_use]
+    pub fn est_flac(&self) -> bool {
+        self.codec == "flac"
     }
 }
 
-/// Ce que Tune sait PRODUIRE dans cette première version : du PCM entier
-/// petit-boutiste, 16, 24 (sur 3 octets) ou 32 bits, mono ou stéréo.
+/// Ce que Tune sait PRODUIRE : les deux codecs que la spécification impose au
+/// serveur (`roles/player/v1.md` : « Servers MUST support the flac and pcm
+/// codecs »), mono ou stéréo.
 ///
-/// La spécification impose `flac` ET `pcm` au serveur ; FLAC n'est pas encore
-/// branché (voir `docs/sendspin.md`, « Ce qui reste »). Une enceinte qui
-/// n'annonce que FLAC n'obtient donc PAS de rôle actif : mieux vaut pas de
-/// zone qu'une zone muette.
+/// - `pcm` : entier petit-boutiste, 16, 24 (sur 3 octets) ou 32 bits ;
+/// - `flac` : 16 ou 24 bits, une trame FLAC complète par morceau, l'en-tête
+///   `fLaC` + STREAMINFO dans `codec_header`.
+///
+/// `opus` (facultatif pour un serveur) n'est pas produit.
 #[must_use]
 pub fn sait_produire(f: &FormatAudio) -> bool {
-    f.codec == "pcm"
-        && matches!(f.bit_depth, 16 | 24 | 32)
-        && (1..=2).contains(&f.channels)
-        && (8_000..=384_000).contains(&f.sample_rate)
+    let profondeur = match f.codec.as_str() {
+        "pcm" => matches!(f.bit_depth, 16 | 24 | 32),
+        "flac" => matches!(f.bit_depth, 16 | 24),
+        _ => false,
+    };
+    profondeur && (1..=2).contains(&f.channels) && (8_000..=384_000).contains(&f.sample_rate)
 }
 
 /// Les formats de `supported_formats`, dans l'ordre de préférence de
@@ -115,12 +131,19 @@ pub fn capacite_tampon(support: &Value) -> Option<u64> {
 }
 
 /// Règle de `roles/player/v1.md` : le format que l'état préfère s'il est
-/// annoncé et que nous savons le produire, sinon la première entrée de
+/// annoncé et que nous savons le produire ; sinon la première entrée de
 /// `supported_formats` que nous savons produire.
+///
+/// `taux_piste` : la fréquence native de la piste, quand elle est connue. La
+/// spécification permet (« MAY ») de choisir une autre entrée « to match a
+/// track's native sample rate and avoid resampling » : sans préférence de
+/// l'enceinte, Tune prend la première entrée produisible à ce taux, et ne
+/// rééchantillonne que si l'enceinte n'en annonce aucune.
 #[must_use]
 pub fn choisir_format(
     annonces: &[FormatAudio],
     prefere: Option<&FormatAudio>,
+    taux_piste: Option<u32>,
 ) -> Option<FormatAudio> {
     if let Some(p) = prefere
         && annonces.contains(p)
@@ -128,7 +151,13 @@ pub fn choisir_format(
     {
         return Some(p.clone());
     }
-    annonces.iter().find(|f| sait_produire(f)).cloned()
+    let produisibles = || annonces.iter().filter(|f| sait_produire(f));
+    if let Some(t) = taux_piste
+        && let Some(f) = produisibles().find(|f| f.sample_rate == t)
+    {
+        return Some(f.clone());
+    }
+    produisibles().next().cloned()
 }
 
 /// L'objet `player` de `client/state`.
@@ -156,6 +185,9 @@ pub struct EtatClient {
     /// `None` tant qu'aucun `client/state` n'est arrivé.
     pub available: Option<bool>,
     pub lecteur: Option<EtatLecteur>,
+    /// Le serveur a arrêté la lecture parce que l'enceinte l'a quittée
+    /// (`available: false` ou `client/leave`) ; levé au prochain départ.
+    pub lecture_quittee: bool,
 }
 
 impl EtatClient {
@@ -208,6 +240,7 @@ pub fn fondre_etat(precedent: &EtatClient, payload: &Value) -> Result<EtatClient
     Ok(EtatClient {
         available: Some(available),
         lecteur,
+        lecture_quittee: precedent.lecture_quittee,
     })
 }
 
@@ -321,7 +354,11 @@ impl ComptabiliteTampon {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrdreLecteur {
     /// Ouvre le flux (ou change son format en place) : `stream/start`.
-    Demarrer(FormatAudio),
+    /// `codec_header` : Base64 de l'en-tête du codec (FLAC), `None` en PCM.
+    Demarrer {
+        format: FormatAudio,
+        codec_header: Option<String>,
+    },
     /// Un morceau déjà horodaté dans le domaine du serveur.
     Morceau {
         timestamp_us: i64,
@@ -416,7 +453,7 @@ impl SessionLecteur {
         }
         let support = hello.reste.get(CLE_SUPPORT_LECTEUR)?;
         let formats = formats_annonces(support);
-        choisir_format(&formats, None)?;
+        choisir_format(&formats, None, None)?;
         Some(Self {
             formats,
             groupe_id: format!("tune-{client_id}"),
@@ -492,6 +529,21 @@ impl SessionLecteur {
         Ok(premier && self.etat.lecteur.is_some())
     }
 
+    /// L'enceinte quitte la lecture : `client/state` avec `available: false`
+    /// (*External Source Handling*) ou `client/leave`. Groupe solo : la
+    /// lecture s'arrête, `stream/end` pour le flux actif, `group/update`
+    /// `stopped` s'il ne l'était pas, et l'activité `playback` est retirée
+    /// (« drop an activity as soon as that purpose ends »). La spécification
+    /// interdit de reprendre seul quand l'enceinte redevient disponible : la
+    /// sortie verra son prochain morceau refusé et s'arrêtera.
+    pub fn quitter_la_lecture(&mut self) -> Vec<Sortie> {
+        let sorties = self.executer(OrdreLecteur::Arreter, 0).unwrap_or_default();
+        if !sorties.is_empty() {
+            self.etat.lecture_quittee = true;
+        }
+        sorties
+    }
+
     fn etat_lecteur(&self) -> Result<&EtatLecteur, RefusOrdre> {
         self.etat.lecteur.as_ref().ok_or(RefusOrdre::EtatAttendu)
     }
@@ -503,12 +555,19 @@ impl SessionLecteur {
         maintenant_us: i64,
     ) -> Result<Vec<Sortie>, RefusOrdre> {
         match ordre {
-            OrdreLecteur::Demarrer(format) => {
+            OrdreLecteur::Demarrer {
+                format,
+                codec_header,
+            } => {
                 self.etat_lecteur()?;
                 if !self.etat.disponible() {
                     return Err(RefusOrdre::Indisponible);
                 }
                 if !self.formats.contains(&format) || !sait_produire(&format) {
+                    return Err(RefusOrdre::FormatRefuse);
+                }
+                if format.est_flac() != codec_header.is_some() {
+                    // `codec_header` est requis pour FLAC, absent pour PCM.
                     return Err(RefusOrdre::FormatRefuse);
                 }
                 let mut sorties = Vec::new();
@@ -522,12 +581,13 @@ impl SessionLecteur {
                 if !self.groupe_joue {
                     sorties.push(self.groupe(true));
                 }
+                self.etat.lecture_quittee = false;
                 if self.flux.as_ref() != Some(&format) {
                     sorties.push(Sortie::Json {
                         type_message: "stream/start",
                         payload: json!({
                             "server_transmitted": maintenant_us,
-                            "player": format.objet(),
+                            "player": format.objet(codec_header.as_deref()),
                         }),
                     });
                     self.flux = Some(format);

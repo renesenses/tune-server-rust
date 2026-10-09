@@ -16,7 +16,7 @@ use tune_core::sendspin::lecteur::{
     CLE_SUPPORT_LECTEUR, CoteConnexion, Demande, LiaisonLecteur, OrdreLecteur, RefusOrdre,
     SessionLecteur, Sortie, TYPE_AUDIO, avance_d_envoi, capacite_tampon, corps_audio, relier,
 };
-use tune_core::sendspin::messages::{ClientHello, Enveloppe, EnveloppeBrute, ServerHello};
+use tune_core::sendspin::messages::{ClientHello, Enveloppe, EnveloppeBrute};
 use tune_core::sendspin::poignee::InfosPair;
 use tune_core::sendspin::psk::PskPair;
 use tune_core::sendspin::{ErreurSendspin, PoigneeServeur, TransportNoise, registre};
@@ -217,10 +217,12 @@ impl Pilote {
                     return Err(sequence("message en clair apres Noise"));
                 }
                 Evenement::Message(Some(Ok(Message::Binary(b)))) => {
+                    // *Receive timestamps* : au plus tard quand la pile
+                    // WebSocket livre le message, donc AVANT le déchiffrement.
+                    let recu = maintenant_us();
                     let Some(texte) = self.transport.recevoir_json(&b)? else {
                         continue;
                     };
-                    let recu = maintenant_us();
                     let message: EnveloppeBrute = serde_json::from_str(&texte)
                         .map_err(|_| sequence("JSON chiffre illisible"))?;
                     if !message.payload.is_object() {
@@ -236,7 +238,8 @@ impl Pilote {
                                 .ok_or_else(|| sequence("client/time sans horodatage entier"))?;
                             self.envoyer("server/time",json!({"client_transmitted":t,"server_received":recu,"server_transmitted":maintenant_us()})).await?;
                         }
-                        "client/state" => self.recevoir_etat(&message.payload).await,
+                        "client/state" => self.recevoir_etat(&message.payload).await?,
+                        "client/leave" => self.quitter_la_lecture().await?,
                         typ if typ.starts_with("client/pair-") || typ == "pair/abort" => {
                             let a = self
                                 .appairage
@@ -468,26 +471,10 @@ impl Pilote {
         self.contexte.verifier_longue_duree(&self.infos).await?;
         self.appairage = None;
         self.compteur = 0;
-        let hello = ServerHello {
-            name: format!("Tune ({})", tune_core::discovery::system_hostname()),
-            languages: None,
-        };
-        self.envoyer(
-            "server/hello",
-            serde_json::to_value(hello).map_err(|_| sequence("hello serveur"))?,
-        )
-        .await?;
-        let texte = tokio::select! {
-            _ = self.inscription.revocation.changed() => return Err(sequence("session revoquee")),
-            texte = super::lire_json_chiffre(&mut self.socket, &mut self.transport, "client/hello apres re-echange") => texte?,
-        };
-        let m: EnveloppeBrute =
-            serde_json::from_str(&texte).map_err(|_| sequence("hello chiffre invalide"))?;
-        if m.type_message != "client/hello" {
-            return Err(sequence("client/hello attendu apres re-echange"));
-        }
-        self.hello = serde_json::from_value(m.payload.clone())
-            .map_err(|_| sequence("hello du pair invalide"))?;
+        // Spécification 1.0 (« Re-handshake ») : ni `server/hello` ni
+        // `client/hello` ne sont renvoyés ; le premier message sous les
+        // nouvelles clés est `server/activate`. Le hello reçu à l'ouverture
+        // reste celui de la connexion ; seule la confiance change.
         self.inscription
             .confiance(&self.infos, decrire_methodes(&methodes(&self.hello)));
         registre::enregistrer(registre::PairVu {
@@ -499,12 +486,9 @@ impl Pilote {
             nom: self.hello.name.clone(),
             roles: self.hello.supported_roles.clone(),
             player_support: self.hello.support_du_lecteur().cloned(),
-            hello_brut: m.payload,
+            hello_brut: serde_json::to_value(&self.hello).unwrap_or(Value::Null),
             vu_a: registre::maintenant(),
         });
-        if *self.inscription.revocation.borrow() {
-            return Err(sequence("revocation pendant le hello"));
-        }
         if let Some(s) = self.lecteur.as_ref() {
             // Role conserve (cle longue duree des deux cotes) : l'activation
             // reprend le role et l'activite en cours, le flux persiste.
@@ -549,19 +533,25 @@ impl Pilote {
     /// `client/state` : met à jour la session, publie l'état à la sortie, et
     /// enregistre la sortie au premier état complet du rôle `player`. Un état
     /// mal formé est journalisé et ignoré ; l'état précédent reste en vigueur.
-    async fn recevoir_etat(&mut self, payload: &Value) {
+    async fn recevoir_etat(&mut self, payload: &Value) -> Result<(), ErreurSendspin> {
         let Some(s) = self.lecteur.as_mut() else {
-            return;
+            return Ok(());
         };
         let premier = match s.recevoir_etat(payload) {
             Ok(p) => p,
             Err(raison) => {
                 tracing::warn!(client_id = %self.infos.client_id, raison, "sendspin_client_state_ignore");
-                return;
+                return Ok(());
             }
         };
+        let indisponible = !s.etat().disponible();
         if let Some(c) = self.cote.as_ref() {
             c.etat.send_replace(s.etat().clone());
+        }
+        if indisponible {
+            // *External Source Handling* : l'enceinte est prise par autre
+            // chose et ne cédera pas ; le serveur arrête sa lecture.
+            self.quitter_la_lecture().await?;
         }
         if premier
             && let (Some(zones), Some(liaison)) = (self.contexte.zones(), self.a_raccorder.take())
@@ -569,5 +559,24 @@ impl Pilote {
             let nom = self.hello.name.clone().unwrap_or_else(|| "Sendspin".into());
             self.garde = Some(zones.arrivee(&self.infos.client_id, &nom, liaison).await);
         }
+        Ok(())
+    }
+
+    /// `client/leave`, ou `available: false` : groupe solo arrêté.
+    async fn quitter_la_lecture(&mut self) -> Result<(), ErreurSendspin> {
+        let Some(s) = self.lecteur.as_mut() else {
+            return Ok(());
+        };
+        let sorties = s.quitter_la_lecture();
+        if !sorties.is_empty() {
+            tracing::info!(client_id = %self.infos.client_id, "sendspin_lecteur_quitte_la_lecture");
+        }
+        if let Some(c) = self.cote.as_ref() {
+            c.etat.send_replace(s.etat().clone());
+        }
+        for sortie in sorties {
+            emettre_hors_boucle(&mut self.socket, &mut self.transport, sortie).await?;
+        }
+        Ok(())
     }
 }

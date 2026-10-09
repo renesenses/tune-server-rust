@@ -53,25 +53,165 @@ fn i3326_format_prefere_puis_premier_produisible() {
     assert_eq!(annonces.len(), 3);
     // Opus est en tête mais Tune ne sait pas le produire : on saute.
     assert_eq!(
-        choisir_format(&annonces, None),
+        choisir_format(&annonces, None, None),
         Some(FormatAudio::pcm(48000, 2, 24))
     );
     // La préférence de l'état l'emporte si elle est annoncée et produisible.
     let p = FormatAudio::pcm(44100, 2, 16);
-    assert_eq!(choisir_format(&annonces, Some(&p)), Some(p));
+    assert_eq!(choisir_format(&annonces, Some(&p), Some(48000)), Some(p));
     // Une préférence non annoncée est ignorée.
     let hors = FormatAudio::pcm(96000, 2, 24);
     assert_eq!(
-        choisir_format(&annonces, Some(&hors)),
+        choisir_format(&annonces, Some(&hors), None),
         Some(FormatAudio::pcm(48000, 2, 24))
     );
 }
 
 #[test]
-fn i3326_un_lecteur_flac_seul_n_obtient_pas_de_role() {
+fn i3326_sans_preference_le_taux_natif_de_la_piste_evite_le_reechantillonnage() {
+    // « MAY select a different entry ... to match a track's native sample
+    // rate and avoid resampling ».
+    let annonces = formats_annonces(&support_pcm());
+    assert_eq!(
+        choisir_format(&annonces, None, Some(44100)),
+        Some(FormatAudio::pcm(44100, 2, 16))
+    );
+    // Taux non annoncé : la première entrée produisible (Tune rééchantillonne).
+    assert_eq!(
+        choisir_format(&annonces, None, Some(96000)),
+        Some(FormatAudio::pcm(48000, 2, 24))
+    );
+    // Une préférence de l'enceinte prime sur le taux de la piste.
+    let p = FormatAudio::pcm(48000, 2, 24);
+    assert_eq!(choisir_format(&annonces, Some(&p), Some(44100)), Some(p));
+}
+
+#[test]
+fn i3326_flac_est_produit_comme_l_exige_la_specification() {
+    // « Servers MUST support the flac and pcm codecs » : un lecteur FLAC seul
+    // obtient le rôle.
     let h = hello(json!({"buffer_capacity": 1000, "supported_formats": [
         {"codec": "flac", "sample_rate": 48000, "bit_depth": 24, "channels": 2}]}));
+    assert!(SessionLecteur::admettre("id", "Cuisine", &h).is_some());
+    // FLAC 32 bits et Opus ne sont pas produits : pas de rôle sans eux.
+    let h = hello(json!({"buffer_capacity": 1000, "supported_formats": [
+        {"codec": "flac", "sample_rate": 48000, "bit_depth": 32, "channels": 2},
+        {"codec": "opus", "sample_rate": 48000, "bit_depth": 16, "channels": 2}]}));
     assert!(SessionLecteur::admettre("id", "Cuisine", &h).is_none());
+}
+
+#[test]
+fn i3326_stream_start_flac_porte_codec_header_et_pcm_jamais() {
+    let support = json!({"buffer_capacity": 100_000, "supported_formats": [
+        {"codec": "flac", "sample_rate": 44100, "bit_depth": 16, "channels": 2},
+        {"codec": "pcm", "sample_rate": 44100, "bit_depth": 16, "channels": 2}]});
+    let mut s = SessionLecteur::admettre("id", "Cuisine", &hello(support)).unwrap();
+    s.activation_initiale();
+    s.recevoir_etat(&etat(true, &[])).unwrap();
+    let flac = FormatAudio {
+        codec: "flac".into(),
+        ..FormatAudio::pcm(44100, 2, 16)
+    };
+    // FLAC sans en-tête, PCM avec : refusés, rien ne part.
+    assert_eq!(
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: flac.clone(),
+                codec_header: None
+            },
+            0
+        ),
+        Err(RefusOrdre::FormatRefuse)
+    );
+    assert_eq!(
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: FormatAudio::pcm(44100, 2, 16),
+                codec_header: Some("x".into())
+            },
+            0
+        ),
+        Err(RefusOrdre::FormatRefuse)
+    );
+    let d = s
+        .executer(
+            OrdreLecteur::Demarrer {
+                format: flac.clone(),
+                codec_header: Some("ZkxhQw==".into()),
+            },
+            5,
+        )
+        .unwrap();
+    let start = d
+        .iter()
+        .find_map(|x| match x {
+            Sortie::Json {
+                type_message: "stream/start",
+                payload,
+            } => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(start["player"]["codec"], "flac");
+    assert_eq!(start["player"]["codec_header"], "ZkxhQw==");
+    // Changement de format EN PLACE : un seul stream/start, ni activate ni
+    // groupe, et sans codec_header en PCM.
+    let d = s
+        .executer(
+            OrdreLecteur::Demarrer {
+                format: FormatAudio::pcm(44100, 2, 16),
+                codec_header: None,
+            },
+            6,
+        )
+        .unwrap();
+    assert_eq!(types(&d), vec!["stream/start"]);
+    let Sortie::Json { payload, .. } = &d[0] else {
+        unreachable!()
+    };
+    assert!(payload["player"].get("codec_header").is_none());
+}
+
+#[test]
+fn i3326_indisponible_ou_client_leave_arrete_la_lecture_du_groupe_solo() {
+    let mut s = SessionLecteur::admettre("id", "Cuisine", &hello(support_pcm())).unwrap();
+    s.activation_initiale();
+    s.recevoir_etat(&etat(true, &[])).unwrap();
+    assert!(
+        s.quitter_la_lecture().is_empty(),
+        "rien a arreter : rien ne part"
+    );
+    let f = FormatAudio::pcm(48000, 2, 24);
+    s.executer(
+        OrdreLecteur::Demarrer {
+            format: f,
+            codec_header: None,
+        },
+        0,
+    )
+    .unwrap();
+    s.recevoir_etat(&etat(false, &[])).unwrap();
+    let sorties = s.quitter_la_lecture();
+    assert_eq!(
+        types(&sorties),
+        vec!["stream/end", "group/update", "server/activate"]
+    );
+    let Sortie::Json { payload, .. } = &sorties[1] else {
+        unreachable!()
+    };
+    assert_eq!(payload["playback_state"], "stopped");
+    assert!(!s.flux_actif());
+    // Plus de flux : un morceau est refusé, la sortie s'arrêtera.
+    assert_eq!(
+        s.executer(
+            OrdreLecteur::Morceau {
+                timestamp_us: 1,
+                donnees: vec![0; 4]
+            },
+            0
+        ),
+        Err(RefusOrdre::FluxInactif)
+    );
 }
 
 #[test]
@@ -194,7 +334,13 @@ fn i3326_aucun_flux_ni_commande_avant_le_premier_client_state() {
     let mut s = SessionLecteur::admettre("cid", "Cuisine", &hello(support_pcm())).unwrap();
     let f = FormatAudio::pcm(48000, 2, 24);
     assert_eq!(
-        s.executer(OrdreLecteur::Demarrer(f.clone()), 1),
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: f.clone(),
+                codec_header: None
+            },
+            1
+        ),
         Err(RefusOrdre::EtatAttendu)
     );
     assert_eq!(
@@ -203,7 +349,13 @@ fn i3326_aucun_flux_ni_commande_avant_le_premier_client_state() {
     );
     assert!(s.recevoir_etat(&etat(false, &["volume"])).unwrap());
     assert_eq!(
-        s.executer(OrdreLecteur::Demarrer(f), 1),
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: f,
+                codec_header: None
+            },
+            1
+        ),
         Err(RefusOrdre::Indisponible)
     );
 }
@@ -229,11 +381,25 @@ fn i3326_cycle_de_vie_du_flux() {
         Err(RefusOrdre::FluxInactif)
     );
     assert_eq!(
-        s.executer(OrdreLecteur::Demarrer(FormatAudio::pcm(96000, 2, 24)), 0),
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: FormatAudio::pcm(96000, 2, 24),
+                codec_header: None
+            },
+            0
+        ),
         Err(RefusOrdre::FormatRefuse),
         "format non annoncé"
     );
-    let d = s.executer(OrdreLecteur::Demarrer(f.clone()), 777).unwrap();
+    let d = s
+        .executer(
+            OrdreLecteur::Demarrer {
+                format: f.clone(),
+                codec_header: None,
+            },
+            777,
+        )
+        .unwrap();
     assert_eq!(
         types(&d),
         vec!["server/activate", "group/update", "stream/start"]
@@ -246,9 +412,15 @@ fn i3326_cycle_de_vie_du_flux() {
     assert_eq!(payload["player"]["bit_depth"], 24);
     // Même format, flux ouvert : aucun nouveau stream/start (piste suivante).
     assert!(
-        s.executer(OrdreLecteur::Demarrer(f.clone()), 0)
-            .unwrap()
-            .is_empty()
+        s.executer(
+            OrdreLecteur::Demarrer {
+                format: f.clone(),
+                codec_header: None
+            },
+            0
+        )
+        .unwrap()
+        .is_empty()
     );
     assert_eq!(
         types(&s.executer(OrdreLecteur::Vider, 5).unwrap()),
@@ -265,7 +437,16 @@ fn i3326_cycle_de_vie_du_flux() {
     );
     // Reprise : nouveau stream/start, mais pas de second server/activate.
     assert_eq!(
-        types(&s.executer(OrdreLecteur::Demarrer(f), 0).unwrap()),
+        types(
+            &s.executer(
+                OrdreLecteur::Demarrer {
+                    format: f,
+                    codec_header: None
+                },
+                0
+            )
+            .unwrap()
+        ),
         vec!["group/update", "stream/start"]
     );
     // Arrêt : l'activité playback est retirée.
