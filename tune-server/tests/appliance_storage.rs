@@ -46,9 +46,47 @@ fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::Pat
     p
 }
 
+/// Variables d'environnement posées par l'épreuve, retirées par `Drop`.
+///
+/// Retirées même quand l'épreuve panique : sinon `TUNE_APPLIANCE=1` survit
+/// à l'échec et fait rougir l'épreuve suivante du même binaire
+/// (`appliance_endpoints_full_flow`, qui attend 404 hors appliance et lit
+/// 200), masquant la vraie panne derrière une seconde.
+struct EnvironnementDeLEpreuve;
+
+const VARIABLES_DE_L_EPREUVE: [&str; 15] = [
+    "TUNE_APPLIANCE",
+    "TUNE_PROC_MOUNTS",
+    "TUNE_BLKID_BIN",
+    "TUNE_DF_BIN",
+    "TUNE_SYSTEMCTL_BIN",
+    "TUNE_MOUNT_UNIT_DIR",
+    "TUNE_DATA_MOUNT_POINT",
+    "TUNE_CONFIG_PATH",
+    "TUNE_LSBLK_BIN",
+    "TUNE_MUSIC_MOUNT_BASE",
+    "TUNE_DEV_DIR",
+    "TUNE_IMAGE_URL",
+    "TUNE_INSTALL_PIPELINE",
+    "TUNE_ARTWORK_DIR",
+    "TUNE_SUDO_BIN",
+];
+
+impl Drop for EnvironnementDeLEpreuve {
+    fn drop(&mut self) {
+        unsafe {
+            for v in VARIABLES_DE_L_EPREUVE {
+                std::env::remove_var(v);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn relocation_full_flow() {
     let _environment = crate::lock_environment();
+    // Déclaré APRÈS le verrou : retiré avant lui, verrou encore tenu.
+    let _variables = EnvironnementDeLEpreuve;
     let tmp = tune_core::test_scratch::scratch_dir("tune-reloc-test");
 
     // Source : une vraie petite base SQLite + un cache pochettes.
@@ -113,6 +151,26 @@ async fn relocation_full_flow() {
         "#!/bin/bash\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho '/dev/sdz1 1953480700 100 1953480600 1% /media/sdz1'\n",
     );
     let systemctl = write_stub(&tmp, "systemctl.sh", "#!/bin/bash\nexit 0\n");
+    // #3206 — hors root (la CI, Shrek), l'unité de montage passe par
+    // `sudo -n tune-os-privilege volume-mount <uuid> <point>`. Ni sudo ni
+    // l'assistant ne sont là : ce faux sudo les joue. Il refuse toute autre
+    // commande comme le ferait sudoers, et note chaque appel accepté.
+    let journal_sudo = tmp.join("sudo.log");
+    let faux_sudo = write_stub(
+        &tmp,
+        "sudo.sh",
+        &format!(
+            concat!(
+                "#!/bin/bash\n",
+                "if [ \"$1\" != -n ] || [ \"$2\" != /usr/local/libexec/tune-os-privilege ] \\\n",
+                "   || [ \"$3\" != volume-mount ] || [ $# -ne 5 ]; then\n",
+                "  echo \"sudo: commande non autorisee: $*\" >&2; exit 1\n",
+                "fi\n",
+                "printf '%s\\n' \"$*\" >> '{}'\n",
+            ),
+            journal_sudo.display()
+        ),
+    );
     // Inventaire lsblk : clé système sdy, SATA interne sda avec partition ntfs
     // NON montée (le cas Gil), disque USB sdz monté.
     let lsblk = write_stub(
@@ -144,7 +202,10 @@ async fn relocation_full_flow() {
         std::env::set_var("TUNE_MUSIC_MOUNT_BASE", tmp.join("music-mounts"));
         std::env::set_var("TUNE_DEV_DIR", tmp.join("dev"));
         std::env::set_var("TUNE_ARTWORK_DIR", &cache_servi);
+        std::env::set_var("TUNE_SUDO_BIN", &faux_sudo);
     }
+    // En root, le serveur écrit l'unité lui-même ; sinon l'assistant.
+    let en_root = tune_server::privilege::euid() == 0;
     std::fs::create_dir_all(tmp.join("dev")).unwrap();
 
     // App dont la config pointe sur la source réelle.
@@ -207,15 +268,34 @@ async fn relocation_full_flow() {
     }
     assert_eq!(phase, "done");
 
-    // Unité systemd écrite avec l'UUID.
     let unit_files: Vec<_> = std::fs::read_dir(&units).unwrap().flatten().collect();
-    assert_eq!(unit_files.len(), 1);
-    let unit_body = std::fs::read_to_string(unit_files[0].path()).unwrap();
-    assert!(
-        unit_body.contains("What=/dev/disk/by-uuid/TEST-UUID"),
-        "{unit_body}"
-    );
-    assert!(unit_body.contains("Options=nofail"));
+    if en_root {
+        // Unité systemd écrite avec l'UUID.
+        assert_eq!(unit_files.len(), 1);
+        let unit_body = std::fs::read_to_string(unit_files[0].path()).unwrap();
+        assert!(
+            unit_body.contains("What=/dev/disk/by-uuid/TEST-UUID"),
+            "{unit_body}"
+        );
+        assert!(unit_body.contains("Options=nofail"));
+    } else {
+        // Hors root : le serveur n'écrit RIEN dans /etc/systemd/system (il
+        // ne le pourrait pas) ; il confie l'UUID et le point de montage à
+        // l'assistant, jamais le texte de l'unité.
+        assert!(
+            unit_files.is_empty(),
+            "unité écrite hors root : {unit_files:?}"
+        );
+        let journal = std::fs::read_to_string(&journal_sudo).unwrap_or_default();
+        assert_eq!(
+            journal,
+            format!(
+                "-n /usr/local/libexec/tune-os-privilege volume-mount TEST-UUID {}\n",
+                srv.display()
+            ),
+            "appel de l'assistant pour la relocalisation"
+        );
+    }
 
     // Données copiées et intègres.
     let target_db = srv.join("TuneData/tune.db");
@@ -262,15 +342,30 @@ async fn relocation_full_flow() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let mount_path = body["mount_path"].as_str().unwrap().to_string();
     assert!(mount_path.contains("music-mounts"), "{mount_path}");
-    let unit_bodies: Vec<String> = std::fs::read_dir(&units)
-        .unwrap()
-        .flatten()
-        .map(|e| std::fs::read_to_string(e.path()).unwrap())
-        .collect();
-    assert!(
-        unit_bodies.iter().any(|u| u.contains("by-uuid/MUSIC-UUID")),
-        "unit musique manquante"
-    );
+    if en_root {
+        let unit_bodies: Vec<String> = std::fs::read_dir(&units)
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(
+            unit_bodies.iter().any(|u| u.contains("by-uuid/MUSIC-UUID")),
+            "unit musique manquante"
+        );
+    } else {
+        let journal = std::fs::read_to_string(&journal_sudo).unwrap_or_default();
+        assert_eq!(
+            journal.lines().last(),
+            Some(
+                format!(
+                    "-n /usr/local/libexec/tune-os-privilege volume-mount MUSIC-UUID {mount_path}"
+                )
+                .as_str()
+            ),
+            "appel de l'assistant pour le montage musique : {journal}"
+        );
+        assert_eq!(journal.lines().count(), 2, "{journal}");
+    }
     // UUID inconnu ou déjà monté → 400.
     let (status, _) = post_json(
         &app,
@@ -338,25 +433,4 @@ async fn relocation_full_flow() {
         std::fs::read_to_string(tmp.join("dev/sda")).unwrap(),
         "tune-os-image"
     );
-
-    unsafe {
-        for v in [
-            "TUNE_APPLIANCE",
-            "TUNE_PROC_MOUNTS",
-            "TUNE_BLKID_BIN",
-            "TUNE_DF_BIN",
-            "TUNE_SYSTEMCTL_BIN",
-            "TUNE_MOUNT_UNIT_DIR",
-            "TUNE_DATA_MOUNT_POINT",
-            "TUNE_CONFIG_PATH",
-            "TUNE_LSBLK_BIN",
-            "TUNE_MUSIC_MOUNT_BASE",
-            "TUNE_DEV_DIR",
-            "TUNE_IMAGE_URL",
-            "TUNE_INSTALL_PIPELINE",
-            "TUNE_ARTWORK_DIR",
-        ] {
-            std::env::remove_var(v);
-        }
-    }
 }

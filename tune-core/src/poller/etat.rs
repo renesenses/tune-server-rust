@@ -169,6 +169,11 @@ pub(super) struct ZonePollState {
     /// de transition (durée/position) et le DMP-A8 rapporte des durées
     /// inexactes — fausse transition garantie. Cleared au changement de
     /// génération et à chaque transition, comme `gapless_arm_logged`.
+    ///
+    /// #5970 — le même verrou tient pour une préparation ABANDONNÉE (hors
+    /// budget, ou prête trop tard pour un `SetNext`) : même conduite, même
+    /// cycle de vie — ne pas re-résoudre, laisser la fin de piste jouer la
+    /// suivante.
     pub(super) gapless_dsd_skip_pos: Option<i64>,
     /// La LIGNE de file (`queue_items.id`) que le renderer a ACCEPTEE comme
     /// piste suivante, et la position qu'elle occupait alors (#3026).
@@ -372,6 +377,11 @@ pub(super) enum GaplessPrep {
     /// acceptée : la tient-il vraiment ?
     Armed(Option<ArmedNext>, SuivantePreparee),
     DsdNextSkipped,
+    /// #5970 — la suivante n'a pas été résolue dans son budget, ou l'a été
+    /// trop près de la fin de la piste en cours pour un `SetNext`. Comme
+    /// pour le DSD : on ne re-tente pas pour cette position (le tick ne se
+    /// fige pas une seconde fois), et la fin de piste la joue explicitement.
+    Abandonnee,
     NotArmed,
 }
 

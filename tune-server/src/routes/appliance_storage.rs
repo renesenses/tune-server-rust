@@ -302,6 +302,58 @@ fn mount_unit_contents(uuid: &str, mount_point: &str) -> String {
     )
 }
 
+/// Écrit l'unité de montage d'un volume, recharge systemd et l'active.
+///
+/// En root, le serveur le fait lui-même. Il faut alors que
+/// `/etc/systemd/system` soit dans les `ReadWritePaths` de `tune.service` :
+/// sous `ProtectSystem=strict`, `/etc` est en lecture seule, root compris, et
+/// l'écriture échouait par `Read-only file system` (#3206).
+///
+/// Sous un autre compte (Tune OS sous `tune`), c'est l'assistant privilégié
+/// qui écrit l'unité, avec le MÊME contenu ([`mount_unit_contents`]) : le
+/// service lui donne l'UUID et le point de montage, jamais le texte d'une
+/// unité, qui pourrait sinon monter n'importe quoi n'importe où.
+async fn installer_l_unite_de_montage(
+    uuid: &str,
+    mount_point: &str,
+    euid: u32,
+    sudo: &str,
+) -> Result<(), String> {
+    if euid != 0 {
+        let commande =
+            crate::privilege::Commande::par_l_assistant(sudo, "volume-mount", &[uuid, mount_point]);
+        // Trois étapes sous UN délai (écriture + daemon-reload, enable --now,
+        // montage), là où le chemin root en accorde un à chacune : sur une
+        // petite machine, deux rechargements de systemd dépassent 20 s.
+        return match tokio::time::timeout(CMD_TIMEOUT * 3, commande.lancer()).await {
+            Ok(Ok(out)) if out.status.success() => Ok(()),
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if crate::privilege::est_un_refus_d_elevation(&stderr) {
+                    tracing::warn!(error = %stderr, "volume_mount_elevation_refusee");
+                    Err(crate::privilege::message_de_refus(&stderr))
+                } else {
+                    Err(format!("volume-mount: {stderr}"))
+                }
+            }
+            Ok(Err(e)) => Err(format!("{sudo}: {e}")),
+            Err(_) => Err("volume-mount: timeout".into()),
+        };
+    }
+    let unit_dir = env_or("TUNE_MOUNT_UNIT_DIR", "/etc/systemd/system");
+    let unit_name = mount_unit_name(mount_point);
+    let unit_path = Path::new(&unit_dir).join(&unit_name);
+    std::fs::write(&unit_path, mount_unit_contents(uuid, mount_point))
+        .map_err(|e| format!("write {}: {e}", unit_path.display()))?;
+    for args in [
+        vec!["daemon-reload"],
+        vec!["enable", "--now", unit_name.as_str()],
+    ] {
+        run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &args).await?;
+    }
+    Ok(())
+}
+
 /// Snapshot cohérent d'une base vivante via `VACUUM INTO` (SQLite ≥ 3.27) —
 /// pas besoin de fermer le pool, et la copie est compactée au passage.
 fn sqlite_backup(src: &Path, dst: &Path) -> Result<(), String> {
@@ -482,19 +534,14 @@ async fn mount_volume(Json(body): Json<MountVolumeBody>) -> Result<Json<Value>, 
         env_or("TUNE_MUSIC_MOUNT_BASE", "/mnt/tune-music"),
         short
     );
-    let unit_dir = env_or("TUNE_MOUNT_UNIT_DIR", "/etc/systemd/system");
-    let unit_name = mount_unit_name(&mount_point);
-    let unit_path = Path::new(&unit_dir).join(&unit_name);
-    std::fs::write(&unit_path, mount_unit_contents(&body.uuid, &mount_point))
-        .map_err(|e| AppError::internal(format!("write {}: {e}", unit_path.display())))?;
-    for args in [
-        vec!["daemon-reload"],
-        vec!["enable", "--now", unit_name.as_str()],
-    ] {
-        run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &args)
-            .await
-            .map_err(AppError::internal)?;
-    }
+    installer_l_unite_de_montage(
+        &body.uuid,
+        &mount_point,
+        crate::privilege::euid(),
+        &crate::privilege::sudo(),
+    )
+    .await
+    .map_err(AppError::internal)?;
     tracing::info!(uuid = %body.uuid, mount = %mount_point, "music_volume_mounted");
     Ok(Json(json!({
         "mount_path": mount_point,
@@ -746,19 +793,15 @@ async fn relocate(
     tokio::spawn(async move {
         // 1) systemd mount unit by UUID → stable path, then mount now.
         set_phase("mounting");
-        let unit_dir = env_or("TUNE_MOUNT_UNIT_DIR", "/etc/systemd/system");
-        let unit_name = mount_unit_name(&mount_point);
-        let unit_path = Path::new(&unit_dir).join(&unit_name);
-        if let Err(e) = std::fs::write(&unit_path, mount_unit_contents(&uuid, &mount_point)) {
-            return fail_job(format!("write {}: {e}", unit_path.display()));
-        }
-        for args in [
-            vec!["daemon-reload"],
-            vec!["enable", "--now", unit_name.as_str()],
-        ] {
-            if let Err(e) = run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &args).await {
-                return fail_job(e);
-            }
+        if let Err(e) = installer_l_unite_de_montage(
+            &uuid,
+            &mount_point,
+            crate::privilege::euid(),
+            &crate::privilege::sudo(),
+        )
+        .await
+        {
+            return fail_job(e);
         }
 
         let target_root = Path::new(&mount_point).join(DATA_SUBDIR);
@@ -933,6 +976,36 @@ tmpfs /run tmpfs rw 0 0
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    /// #3206 : hors root, l'unité passe par l'assistant ; un refus de sudo
+    /// remonte avec sa cause, un accord rend Ok. Le faux sudo vérifie les
+    /// arguments : UUID et point de montage, jamais le texte d'une unité.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hors_root_l_unite_passe_par_l_assistant_3206() {
+        let tmp = tempfile::tempdir().unwrap();
+        let faux =
+            |nom: &str, corps: &str| crate::privilege::script_de_test(&tmp.path().join(nom), corps);
+        let refus = faux("refus", "echo 'sudo: a password is required' >&2; exit 1");
+        let err =
+            installer_l_unite_de_montage("A1B2-C3D4", "/mnt/tune-music/A1B2C3D4", 1000, &refus)
+                .await
+                .unwrap_err();
+        assert!(err.contains("élévation refusée"), "{err}");
+        assert!(err.contains("a password is required"), "{err}");
+
+        let accord = faux(
+            "accord",
+            &format!(
+                "[ \"$*\" = '-n {} volume-mount A1B2-C3D4 /mnt/tune-music/A1B2C3D4' ] || \
+                 {{ echo \"tune-os-privilege: arguments inattendus: $*\" >&2; exit 2; }}",
+                crate::privilege::ASSISTANT
+            ),
+        );
+        installer_l_unite_de_montage("A1B2-C3D4", "/mnt/tune-music/A1B2C3D4", 1000, &accord)
+            .await
+            .unwrap();
     }
 
     #[test]

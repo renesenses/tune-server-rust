@@ -583,6 +583,14 @@ mod like_escape_tests {
 /// deduplicate(), random_ids() with RANDOM()) retain SQLite-specific
 /// fragments behind TODO comments; phase 4 swaps them for PG
 /// equivalents via dialect helpers.
+/// La liste des pistes paginée côté serveur, triée et comptée par
+/// provenance (tune-web-client#1716).
+mod page_de_pistes;
+pub use page_de_pistes::{
+    COLONNES_TRIABLES, ColonneDeTri, ComptesParProvenance, DemandeDePistes, PageDePistes,
+    expression_provenance,
+};
+
 pub mod sql {
     use super::{Engine, SqlDialect};
 
@@ -1014,11 +1022,27 @@ pub mod sql {
         )
     }
 
+    /// L'ordre des pistes d'UN album : disque, puis numéro, les pistes SANS
+    /// numéro en dernier, puis titre (b209).
+    ///
+    /// 0 et NULL disent tous deux « numéro inconnu » : le scan local range 0,
+    /// l'import UPnP range NULL. SQLite place NULL EN TÊTE d'un tri croissant,
+    /// PostgreSQL EN FIN : sans le `CASE`, la même fiche s'ordonnait
+    /// différemment selon le moteur, et une piste sans numéro passait devant
+    /// la piste 1. Le troisième terme rend NULL pour TOUTE piste sans numéro,
+    /// pour que 0 et NULL se départagent par le titre sur les deux moteurs.
+    /// Un disque inconnu (NULL ou 0) est le disque 1.
+    pub const ORDRE_DANS_L_ALBUM: &str = "COALESCE(NULLIF(CAST(t.disc_number AS INTEGER), 0), 1), \
+         CASE WHEN COALESCE(CAST(t.track_number AS INTEGER), 0) > 0 THEN 0 ELSE 1 END, \
+         CASE WHEN CAST(t.track_number AS INTEGER) > 0 THEN CAST(t.track_number AS INTEGER) END, \
+         t.title";
+
     pub fn list_by_album<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.album_id = {} ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+            "{} WHERE t.album_id = {} ORDER BY {}",
             select_track(),
-            d.placeholder(1)
+            d.placeholder(1),
+            ORDRE_DANS_L_ALBUM
         )
     }
 
@@ -2184,6 +2208,18 @@ impl TrackRepo {
     }
 
     fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
+        self.update_inner_numeros(track, &track.disc_number, &track.track_number)
+    }
+
+    /// [`Self::update_inner`], les numéros de disque et de piste pris à part :
+    /// le modèle les porte en entiers (0 = inconnu), une source distante les
+    /// range NULL quand elle ne les connaît pas (b209).
+    fn update_inner_numeros(
+        &self,
+        track: &Track,
+        disque: &dyn ToSqlValue,
+        piste: &dyn ToSqlValue,
+    ) -> Result<(), TuneError> {
         let id = track
             .id
             .ok_or_else(|| TuneError::NotFound("track has no id".into()))?;
@@ -2193,9 +2229,9 @@ impl TrackRepo {
             &track.album_id,
             &track.artist_id,
             &track.album_artist,
-            &track.disc_number,
+            disque,
             &track.disc_subtitle,
-            &track.track_number,
+            piste,
             &track.duration_ms,
             &track.file_path,
             &track.format,
@@ -2229,6 +2265,59 @@ impl TrackRepo {
 
     pub fn update(&self, track: &Track) -> Result<(), TuneError> {
         self.update_inner(track).map_err(TuneError::from)
+    }
+
+    /// [`Self::update`] d'une piste DISTANTE (b209) : les numéros de disque et
+    /// de piste sont écrits tels que la source les dit, `None` rangé NULL —
+    /// jamais le 0 / 1 du modèle.
+    ///
+    /// Sans elle, l'indexation UPnP écrivait d'abord 0 par [`Self::update`],
+    /// puis NULL par son `UPDATE` explicite : deux changements réels par
+    /// piste, à chaque passe, même sur une source identique — et le
+    /// `SystemUpdateID` (`upnp_catalog_revision`) avançait de deux par piste.
+    /// Ici la ligne reçoit d'emblée la valeur finale : une passe identique ne
+    /// change rien, et les déclencheurs de révision (`IS NOT` en SQLite,
+    /// `IS DISTINCT FROM` en PostgreSQL) restent muets.
+    pub fn update_distante(
+        &self,
+        track: &Track,
+        disque: Option<i32>,
+        piste: Option<i32>,
+    ) -> Result<(), TuneError> {
+        self.update_inner_numeros(track, &disque, &piste)
+    }
+
+    /// Pochette et numéros d'une piste UPnP, écrits SEULEMENT s'ils changent
+    /// (b209).
+    ///
+    /// `create` range les entiers du modèle (0 = inconnu) et `update` ne
+    /// touche pas `cover_path` : l'indexation publie donc ces trois colonnes
+    /// à part. La garde `IS NOT` (SQLite) / `IS DISTINCT FROM` (PostgreSQL)
+    /// compare aussi NULL à NULL — `=` ne le ferait pas : une passe identique
+    /// ne touche aucune ligne. Rend le nombre de lignes écrites.
+    pub fn publier_pochette_et_numeros_upnp(
+        &self,
+        id: i64,
+        pochette: Option<&str>,
+        disque: Option<i32>,
+        piste: Option<i32>,
+    ) -> Result<u64, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "UPDATE tracks SET cover_path = ?1, track_number = ?2, disc_number = ?3 \
+                 WHERE id = ?4 AND source = 'upnp' \
+                 AND (cover_path IS NOT ?1 OR track_number IS NOT ?2 OR disc_number IS NOT ?3)"
+            }
+            Engine::Postgres => {
+                "UPDATE tracks SET cover_path = $1, track_number = $2, disc_number = $3 \
+                 WHERE id = $4 AND source = 'upnp' \
+                 AND (cover_path IS DISTINCT FROM $1 OR track_number IS DISTINCT FROM $2 \
+                 OR disc_number IS DISTINCT FROM $3)"
+            }
+        };
+        let params: [&dyn ToSqlValue; 4] = [&pochette, &piste, &disque, &id];
+        let n = self.db.execute(sql, &params).map_err(TuneError::Db)?;
+        Ok(n as u64)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), TuneError> {
@@ -2364,8 +2453,15 @@ impl TrackRepo {
             .iter()
             .filter_map(|r| r.first().and_then(|v| v.as_i64()))
             .collect();
+        Ok((self.hydrater_dans_l_ordre(&ids)?, total))
+    }
+
+    /// Les pistes de `ids`, dans l'ORDRE de `ids` — le second temps de
+    /// [`Self::list_visible_avec_total`] et de [`Self::page_de_pistes`].
+    /// Liste vide : aucune requête.
+    fn hydrater_dans_l_ordre(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
-            return Ok((Vec::new(), total));
+            return Ok(Vec::new());
         }
         // Des entiers lus dans notre propre base : les inscrire en clair est
         // sûr, et évite une liste de marqueurs de longueur variable.
@@ -2379,8 +2475,7 @@ impl TrackRepo {
             .map(row_to_track)
             .filter_map(|t| t.id.map(|id| (id, t)))
             .collect();
-        let pistes = ids.iter().filter_map(|id| par_id.remove(id)).collect();
-        Ok((pistes, total))
+        Ok(ids.iter().filter_map(|id| par_id.remove(id)).collect())
     }
 
     /// Le SQL de la vue pistes par défaut, sous la projection `tete` (qui
@@ -2414,27 +2509,20 @@ impl TrackRepo {
         }
     }
 
-    /// Filtered track listing with optional WHERE clauses.
+    /// Le `WHERE` de [`Self::list_filtered`] : les facettes, puis le SOCLE
+    /// de la vue (albums masqués, doublon distant, copie de moindre qualité).
+    /// Rend les conditions et les valeurs à lier, dans l'ordre des marqueurs
+    /// demandés à `ph`.
     ///
-    /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
-    /// se combinent en **OU** (`format = aiff OU flac`) ; deux facettes
-    /// différentes se combinent en **ET** (`format = flac ET genre = jazz`).
-    /// Une facette dont la liste est vide ne produit AUCUN prédicat — ni
-    /// `IN ()`, ni un `1 = 1` qui rendrait la bibliothèque entière.
-    ///
-    /// Returns (items, total_matching_count).
-    pub fn list_filtered(
+    /// Extrait tel quel de `list_filtered` (#1716) pour que la page triée de
+    /// [`Self::page_de_pistes`] filtre EXACTEMENT comme la liste facettée :
+    /// deux rédactions du même `WHERE` finiraient par diverger.
+    pub(crate) fn conditions_du_filtre(
         &self,
         f: &TrackFilter,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<Track>, i64), TuneError> {
+        ph: &mut Placeholders,
+    ) -> (Vec<String>, Vec<SqlValue>) {
         let engine = self.db.engine();
-        // Un SEUL compteur de marqueurs pour tout le WHERE : en SQLite ils
-        // s'écrivent tous `?` et seul l'ORDRE de liaison compte, donc chaque
-        // valeur doit être empilée exactement quand son marqueur est demandé.
-        let mut ph = Placeholders::new(engine);
-
         let mut conditions: Vec<String> = Vec::new();
         let mut owned_params: Vec<SqlValue> = Vec::new();
 
@@ -2689,7 +2777,7 @@ impl TrackRepo {
             // recherche passe par `/library/search`), ce qui explique que
             // personne ne l'ait signalé.
             // #5192 — la rédaction PARTAGÉE du texte libre d'Oxygen.
-            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(&mut ph, query);
+            let (c, valeurs) = crate::db::facet_filter::condition_texte_libre(ph, query);
             conditions.push(c);
             owned_params.extend(valeurs);
         }
@@ -2712,6 +2800,30 @@ impl TrackRepo {
         // facette : le compteur juste en dessous partage `where_clause`, donc
         // la fenêtre suivante part du bon décalage.
         conditions.push(crate::db::facet_filter::copie_de_moindre_qualite_exclue());
+
+        (conditions, owned_params)
+    }
+
+    /// Filtered track listing with optional WHERE clauses.
+    ///
+    /// **Sémantique des facettes (#2168)** : plusieurs valeurs DANS une facette
+    /// se combinent en **OU** (`format = aiff OU flac`) ; deux facettes
+    /// différentes se combinent en **ET** (`format = flac ET genre = jazz`).
+    /// Une facette dont la liste est vide ne produit AUCUN prédicat — ni
+    /// `IN ()`, ni un `1 = 1` qui rendrait la bibliothèque entière.
+    ///
+    /// Returns (items, total_matching_count).
+    pub fn list_filtered(
+        &self,
+        f: &TrackFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Track>, i64), TuneError> {
+        // Un SEUL compteur de marqueurs pour tout le WHERE : en SQLite ils
+        // s'écrivent tous `?` et seul l'ORDRE de liaison compte, donc chaque
+        // valeur doit être empilée exactement quand son marqueur est demandé.
+        let mut ph = Placeholders::new(self.db.engine());
+        let (conditions, owned_params) = self.conditions_du_filtre(f, &mut ph);
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -2846,7 +2958,8 @@ impl TrackRepo {
             .join(",");
         let sql = format!(
             "SELECT t.id, t.album_id FROM tracks t WHERE t.album_id IN ({id_list}) \
-             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title, t.id"
+             ORDER BY {}, t.id",
+            sql::ORDRE_DANS_L_ALBUM
         );
         let rows = self.db.query_many(&sql, &[])?;
         Ok(rows
@@ -6491,5 +6604,203 @@ mod tests_doubtful_source_locale_20260927 {
             "le compte doit valoir la liste"
         );
         assert_eq!(liste, 2, "les deux pistes locales, pas la distante");
+    }
+}
+
+/// b209 — l'ordre des pistes d'un album, et le rattrapage des numéros 0 que
+/// l'import UPnP rangeait sur chaque piste.
+#[cfg(test)]
+pub(crate) mod tests_b209_ordre_dans_l_album {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    /// `(id, titre, disque, numéro, source)` — un album où disque et numéro
+    /// sont tantôt dits, tantôt NULL, tantôt 0.
+    pub(crate) const PISTES: [(i64, &str, Option<i64>, Option<i64>, &str); 6] = [
+        (1, "Alive", Some(1), Some(3), "upnp"),
+        (2, "Believer", Some(1), Some(1), "upnp"),
+        (3, "Aaa sans numéro", None, None, "upnp"),
+        (4, "Dreaming", None, Some(2), "upnp"),
+        (5, "Zéro", Some(1), Some(0), "local"),
+        (6, "Disque deux", Some(2), Some(1), "upnp"),
+    ];
+
+    /// Disque (inconnu = 1), numéro, sans numéro en dernier, titre.
+    pub(crate) const ATTENDU: [&str; 6] = [
+        "Believer",
+        "Dreaming",
+        "Alive",
+        "Aaa sans numéro",
+        "Zéro",
+        "Disque deux",
+    ];
+
+    /// La règle d'idempotence de l'indexation UPnP, sur les deux moteurs
+    /// (b209) : réécrire une piste distante à l'identique ne touche pas le
+    /// `SystemUpdateID` (`upnp_catalog_revision`) ; apprendre un numéro le
+    /// fait avancer d'un cran. `id` désigne une piste UPnP SANS numéro (NULL).
+    pub(crate) fn regle_d_idempotence_upnp(db: Arc<dyn DbBackend>, id: i64) {
+        let revision = || {
+            db.query_one("SELECT value FROM upnp_catalog_revision WHERE id = 1", &[])
+                .unwrap()
+                .unwrap()[0]
+                .as_i64()
+                .unwrap()
+        };
+        let repo = TrackRepo::with_backend(db.clone());
+        let piste = repo.get(id).unwrap().expect("piste UPnP");
+        let avant = revision();
+
+        // Passe identique : la ligne reçoit les valeurs qu'elle porte déjà.
+        repo.update_distante(&piste, None, None).unwrap();
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), None, None)
+            .unwrap();
+        assert_eq!(ecrites, 0, "NULL contre NULL : rien à écrire");
+        assert_eq!(
+            revision(),
+            avant,
+            "réindexation identique : le SystemUpdateID ne bouge pas"
+        );
+
+        // Contre-épreuve : `update` (le 0 du modèle) PUIS la publication
+        // (NULL) — l'aller-retour d'avant le correctif — fait bien avancer
+        // le compteur de deux, alors que la ligne finit identique.
+        repo.update(&piste).unwrap();
+        repo.publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), None, None)
+            .unwrap();
+        assert_eq!(
+            revision(),
+            avant + 2,
+            "l'aller-retour 0 puis NULL compte deux changements"
+        );
+        let avant = revision();
+
+        // Un numéro réellement appris est un changement, et UN seul.
+        repo.update_distante(&piste, Some(1), Some(4)).unwrap();
+        assert_eq!(
+            revision(),
+            avant + 1,
+            "un numéro appris fait avancer le compteur"
+        );
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), Some(1), Some(4))
+            .unwrap();
+        assert_eq!(ecrites, 0, "déjà écrit par `update_distante`");
+        assert_eq!(revision(), avant + 1);
+        let numeros = db
+            .query_one(
+                &format!(
+                    "SELECT disc_number, track_number FROM tracks WHERE id = {}",
+                    id
+                ),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(numeros[0].as_i64(), Some(1));
+        assert_eq!(numeros[1].as_i64(), Some(4));
+
+        // La publication seule apprend aussi (piste neuve, rangée 0 par
+        // `create`) : elle écrit, et le compteur avance.
+        let ecrites = repo
+            .publier_pochette_et_numeros_upnp(id, piste.cover_path.as_deref(), Some(1), Some(5))
+            .unwrap();
+        assert_eq!(ecrites, 1);
+        assert_eq!(revision(), avant + 2);
+    }
+
+    fn banc() -> (Arc<SqliteDb>, Arc<dyn DbBackend>) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let sqlite = Arc::new(db);
+        let db: Arc<dyn DbBackend> = sqlite.clone();
+        db.execute("INSERT INTO albums (id, title) VALUES (1, 'Album')", &[])
+            .unwrap();
+        for (id, titre, disque, numero, source) in PISTES {
+            db.execute(
+                "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, 1000)",
+                &[
+                    &id as &dyn ToSqlValue,
+                    &titre.to_string(),
+                    &disque,
+                    &numero,
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        }
+        (sqlite, db)
+    }
+
+    #[test]
+    fn b209_les_pistes_sans_numero_passent_apres_les_numerotees() {
+        let (_s, db) = banc();
+        let repo = TrackRepo::with_backend(db);
+        let titres: Vec<String> = repo
+            .list_by_album(1)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(
+            titres, ATTENDU,
+            "sans le correctif, SQLite place NULL en tête : la piste sans \
+             numéro et celle sans disque passaient devant la piste 1"
+        );
+        let ids: Vec<i64> = repo
+            .ids_by_album_ids(&[1])
+            .unwrap()
+            .into_iter()
+            .map(|(piste, _)| piste)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 4, 1, 3, 5, 6],
+            "même ordre pour « jouer l'album »"
+        );
+    }
+
+    #[test]
+    fn b209_reindexer_une_piste_upnp_identique_ne_touche_pas_le_system_update_id() {
+        let (_s, db) = banc();
+        // Piste 3 : UPnP, sans disque ni numéro.
+        regle_d_idempotence_upnp(db, 3);
+    }
+
+    #[test]
+    fn b209_le_demarrage_remet_a_null_les_zeros_upnp_et_seulement_eux() {
+        let (sqlite, db) = banc();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES (7, 'Ancien import', 1, 0, 0, 'upnp', 1000)",
+            &[],
+        )
+        .unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let valeur = |id: i64, colonne: &str| {
+            db.query_one(
+                &format!("SELECT {colonne} FROM tracks WHERE id = ?1"),
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_i64())
+        };
+        assert_eq!(valeur(7, "track_number"), None, "sans le rattrapage : 0");
+        assert_eq!(valeur(7, "disc_number"), None);
+        assert_eq!(
+            valeur(5, "track_number"),
+            Some(0),
+            "une piste locale n'est pas touchée"
+        );
+        assert_eq!(valeur(2, "track_number"), Some(1), "un vrai numéro reste");
+        assert_eq!(valeur(1, "disc_number"), Some(1));
     }
 }
