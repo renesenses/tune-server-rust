@@ -251,6 +251,22 @@ async fn run_server(
         config.web_dir = wd.clone();
     }
     config.auto_scan = true;
+    // Build mobile : aucune mise à jour hors du magasin d'applications. Le
+    // défaut est déjà `false`, on le pose quand même pour qu'un changement de
+    // défaut côté serveur ne l'active pas ici en silence.
+    config.auto_update = false;
+
+    // Le serveur range plusieurs fichiers en chemin RELATIF (le cache de
+    // pochettes `artwork_cache` en premier, cf. `chemins_de_donnees`). Un
+    // binaire a son `WorkingDirectory` ; une application Android, elle, tourne
+    // avec `/` pour répertoire courant, en lecture seule : les pochettes ne
+    // s'écrivaient nulle part. On se place donc à côté de la base, seul
+    // dossier dont l'hôte garantit qu'il est inscriptible.
+    if let Some(dossier) = dossier_de_travail(&config.db_path)
+        && let Err(e) = std::env::set_current_dir(&dossier)
+    {
+        tracing::warn!(dossier = %dossier.display(), error = %e, "tune_ffi_cwd_inchange");
+    }
 
     // Initialize state
     let state = AppState::new(&config.db_path, config.port, config.clone())
@@ -266,7 +282,7 @@ async fn run_server(
     tune_server::background::spawn_background_tasks(&state, &config).await;
 
     // Build router
-    let app = tune_server::routes::router(state);
+    let app = tune_server::routes::router(state).layer(axum::middleware::from_fn(garde_mobile));
 
     // Bind and serve
     let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
@@ -285,6 +301,68 @@ async fn run_server(
         .map_err(|e| format!("serve: {e}"))?;
 
     Ok(())
+}
+
+/// Le dossier où se placer avant de démarrer : celui de la base, s'il est
+/// désigné par un chemin absolu. Un chemin relatif ne dit rien de plus que le
+/// répertoire courant, qu'on laisse alors tel quel.
+pub(crate) fn dossier_de_travail(db_path: &str) -> Option<std::path::PathBuf> {
+    let base = std::path::Path::new(db_path);
+    if !base.is_absolute() {
+        return None;
+    }
+    base.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+}
+
+/// Routes que le build mobile refuse.
+///
+/// Le serveur tourne ici en BIBLIOTHÈQUE, dans le processus de l'application
+/// hôte. Les gestes qui remplacent ou relancent un exécutable n'y ont aucun
+/// sens, et certains sont dangereux :
+/// - `system/update/install|apply` : une application Play ou App Store ne se
+///   met pas à jour elle-même (règles des magasins) ;
+/// - `system/restart` : `exec()` de `current_exe()`, c'est-à-dire du lanceur
+///   de l'application hôte, pas d'un serveur ;
+/// - `system/stop` : `process::exit(0)` tue l'application entière ;
+/// - `appliance/*` en écriture : `systemctl poweroff`, Wi-Fi, installation
+///   sur disque — propres à Tune OS.
+///
+/// Les lectures (`GET`) restent permises : un client qui demande l'état d'une
+/// mise à jour ou de l'appliance reçoit une réponse normale.
+pub(crate) fn route_refusee_sur_mobile(methode: &axum::http::Method, chemin: &str) -> bool {
+    use axum::http::Method;
+    if methode == Method::GET || methode == Method::HEAD || methode == Method::OPTIONS {
+        return false;
+    }
+    let chemin = chemin.trim_end_matches('/');
+    const EXACTES: &[&str] = &[
+        "/api/v1/system/update/install",
+        "/api/v1/system/update/apply",
+        "/api/v1/system/restart",
+        "/api/v1/system/stop",
+    ];
+    EXACTES.contains(&chemin) || chemin.starts_with("/api/v1/appliance/")
+}
+
+async fn garde_mobile(
+    requete: axum::extract::Request,
+    suite: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if route_refusee_sur_mobile(requete.method(), requete.uri().path()) {
+        tracing::info!(chemin = %requete.uri().path(), "tune_ffi_route_refusee_sur_mobile");
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "unavailable_on_mobile",
+                "detail": "Cette action n'existe pas dans l'application mobile.",
+            })),
+        )
+            .into_response();
+    }
+    suite.run(requete).await
 }
 
 // ---------------------------------------------------------------------------
@@ -336,5 +414,110 @@ mod tests {
         // Stopping a server that never started must return -1, not panic.
         RUNNING.store(false, Ordering::SeqCst);
         assert_eq!(tune_server_stop(), -1);
+    }
+
+    #[test]
+    fn le_dossier_de_travail_est_celui_de_la_base() {
+        assert_eq!(
+            dossier_de_travail("/data/user/0/com.mozaiklabs.tune/app_flutter/tune.db"),
+            Some(std::path::PathBuf::from(
+                "/data/user/0/com.mozaiklabs.tune/app_flutter"
+            ))
+        );
+        // Relatif ou nu : on ne bouge pas.
+        assert_eq!(dossier_de_travail("tune.db"), None);
+        assert_eq!(dossier_de_travail(":memory:"), None);
+        assert_eq!(dossier_de_travail("data/tune.db"), None);
+    }
+
+    #[test]
+    fn les_gestes_de_processus_sont_refuses_sur_mobile() {
+        use axum::http::Method;
+        for chemin in [
+            "/api/v1/system/update/install",
+            "/api/v1/system/update/apply",
+            "/api/v1/system/update/apply/",
+            "/api/v1/system/restart",
+            "/api/v1/system/stop",
+            "/api/v1/appliance/shutdown",
+            "/api/v1/appliance/wifi/connect",
+        ] {
+            assert!(
+                route_refusee_sur_mobile(&Method::POST, chemin),
+                "{chemin} doit être refusé"
+            );
+        }
+    }
+
+    #[test]
+    fn les_lectures_et_le_reste_passent_sur_mobile() {
+        use axum::http::Method;
+        // Les lectures d'état restent permises, et rien d'autre n'est touché.
+        assert!(!route_refusee_sur_mobile(
+            &Method::GET,
+            "/api/v1/system/update/status"
+        ));
+        assert!(!route_refusee_sur_mobile(
+            &Method::GET,
+            "/api/v1/system/update/check"
+        ));
+        assert!(!route_refusee_sur_mobile(
+            &Method::GET,
+            "/api/v1/appliance/status"
+        ));
+        assert!(!route_refusee_sur_mobile(
+            &Method::POST,
+            "/api/v1/zones/1/play"
+        ));
+        assert!(!route_refusee_sur_mobile(
+            &Method::POST,
+            "/api/v1/system/scan"
+        ));
+        assert!(!route_refusee_sur_mobile(
+            &Method::POST,
+            "/api/v1/system/restarted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn la_garde_rend_403_avant_le_gestionnaire() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        static APPELS: AtomicUsize = AtomicUsize::new(0);
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/system/restart",
+                axum::routing::post(|| async {
+                    APPELS.fetch_add(1, Ordering::SeqCst);
+                    "relancé"
+                }),
+            )
+            .route("/api/v1/zones", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(garde_mobile));
+
+        let refus = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/system/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refus.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            APPELS.load(Ordering::SeqCst),
+            0,
+            "le gestionnaire ne doit pas tourner"
+        );
+
+        let permis = app
+            .oneshot(Request::post("/api/v1/zones").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(permis.status(), StatusCode::OK);
     }
 }
