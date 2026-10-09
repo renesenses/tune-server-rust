@@ -682,6 +682,26 @@ fn dop_reports_both_safety_bypasses_and_keeps_native_bits() {
     assert!(status.reasons.is_empty());
 }
 
+/// #4176 — PURE allumé sur une zone sans aucun traitement armé : le contrat
+/// dit qu'il n'y avait RIEN à contourner (Jean Valjean, fil 1798 : 17 bascules,
+/// `reasons=[]` des deux côtés, aucun changement visible).
+#[test]
+fn pure_sans_traitement_arme_dit_qu_il_n_y_a_rien_a_contourner() {
+    let status = runtime_contract(true, false, 1000, None, true);
+    assert!(status.bit_perfect);
+    assert_eq!(status.dsp, OutputDspState::PureSansObjet);
+    assert!(status.reasons.is_empty());
+}
+
+/// #4176 — témoin : avec un égaliseur armé, PURE contourne vraiment, et le
+/// contrat le dit toujours.
+#[test]
+fn pure_avec_un_egaliseur_arme_le_contourne_toujours() {
+    let status = runtime_contract(true, false, 1000, Some(test_eq()), true);
+    assert!(status.bit_perfect);
+    assert_eq!(status.dsp, OutputDspState::BypassedPure);
+}
+
 #[test]
 fn producer_verdict_cannot_be_upgraded_by_a_later_state_snapshot() {
     let slot = std::sync::Mutex::new(None);
