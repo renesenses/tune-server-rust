@@ -32,6 +32,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tracing::info;
 
 /// Cadence du guet dans la dernière seconde.
 pub(super) const PAS_DU_GUET: Duration = Duration::from_millis(100);
@@ -53,40 +54,61 @@ pub(super) const FENETRE_DU_GUET_MS: u64 = 1_000;
 /// position dans la dernière seconde avant cette durée.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn doit_guetter_la_frontiere(
-    _is_dlna: bool,
-    _gapless_sent: bool,
-    _next_ignore_connu: bool,
-    _track_duration_ms: u64,
-    _reported_duration_ms: u64,
-    _position_ms: u64,
+    is_dlna: bool,
+    gapless_sent: bool,
+    next_ignore_connu: bool,
+    track_duration_ms: u64,
+    reported_duration_ms: u64,
+    position_ms: u64,
 ) -> bool {
-    false
+    is_dlna
+        && gapless_sent
+        && next_ignore_connu
+        // Mêmes bornes que `dlna_epingle_sur_la_piste_finie` : une durée
+        // rapportée crédible, au plus 2 s sous celle de la file.
+        && reported_duration_ms > super::decisions::END_MARGIN_MS
+        && reported_duration_ms <= track_duration_ms
+        && reported_duration_ms.saturating_add(2000) >= track_duration_ms
+        && position_ms < reported_duration_ms
+        && position_ms.saturating_add(FENETRE_DU_GUET_MS) >= reported_duration_ms
 }
 
 /// Sonde la position toutes les `pas` jusqu'à la voir atteindre
 /// `duree_rapportee_ms` ; rend l'instant de la frontière. `None` si le
 /// renderer ne répond plus ou n'y arrive pas avant `plafond`.
 pub(super) async fn guetter_la_frontiere<F, Fut>(
-    _sonder: F,
-    _duree_rapportee_ms: u64,
-    _pas: Duration,
-    _plafond: Duration,
+    mut sonder: F,
+    duree_rapportee_ms: u64,
+    pas: Duration,
+    plafond: Duration,
 ) -> Option<Instant>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<u64>>,
 {
-    None
+    let limite = Instant::now() + plafond;
+    loop {
+        let position = sonder().await?;
+        let maintenant = Instant::now();
+        if position >= duree_rapportee_ms {
+            return Some(maintenant);
+        }
+        if maintenant + pas > limite {
+            return None;
+        }
+        tokio::time::sleep(pas).await;
+    }
 }
 
 /// L'instant où le sondeur peut conclure : la frontière, plus la queue de
 /// piste que l'arrondi cache, plus la marge.
 pub(super) fn instant_de_conclusion(
     frontiere: Instant,
-    _track_duration_ms: u64,
-    _reported_duration_ms: u64,
+    track_duration_ms: u64,
+    reported_duration_ms: u64,
 ) -> Instant {
-    frontiere + Duration::from_secs(1)
+    let queue = Duration::from_millis(track_duration_ms.saturating_sub(reported_duration_ms));
+    frontiere + queue + MARGE_APRES_LA_FRONTIERE
 }
 
 /// Une fin précise posée par le guetteur, pour un flux donné.
@@ -99,11 +121,144 @@ pub(super) struct FinPrecise {
 
 /// Le sondeur peut-il conclure maintenant, sur la foi du guetteur ?
 pub(super) fn conclusion_permise(
-    _fin: Option<&FinPrecise>,
-    _flux: Option<&str>,
-    _maintenant: Instant,
+    fin: Option<&FinPrecise>,
+    flux: Option<&str>,
+    maintenant: Instant,
 ) -> bool {
-    false
+    match (fin, flux.filter(|f| !f.is_empty())) {
+        (Some(fin), Some(flux)) => {
+            fin.flux == flux && fin.conclure_a.is_some_and(|t| maintenant >= t)
+        }
+        _ => false,
+    }
+}
+
+/// La carte des fins précises, par zone : partagée avec les guetteurs.
+pub(super) type FinsPrecises =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, FinPrecise>>>;
+
+impl super::PositionPoller {
+    /// L'appareil est-il dans la mémoire « Next ignoré » ? Muet, à la
+    /// différence de `next_deja_ignore`, qui le journalise à chaque fin.
+    fn next_ignore_connu(&self, device_id: &str) -> bool {
+        self.appareils_qui_ignorent_next
+            .lock()
+            .map(|a| a.contains(device_id))
+            .unwrap_or(false)
+    }
+
+    /// Lance le guet de la frontière si la zone s'y prête — au plus un guet
+    /// par flux. Ne fait rien, sans même toucher la mémoire, pour une sortie
+    /// qui n'est pas DLNA ou dont la position est loin de la fin.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn lancer_le_guet_si_besoin(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        flux: Option<&str>,
+        is_dlna: bool,
+        gapless_sent: bool,
+        track_duration_ms: u64,
+        reported_duration_ms: u64,
+        position_ms: u64,
+    ) {
+        let Some(flux) = flux.filter(|f| !f.is_empty()) else {
+            return;
+        };
+        if !is_dlna || !gapless_sent {
+            return;
+        }
+        if !doit_guetter_la_frontiere(
+            is_dlna,
+            gapless_sent,
+            self.next_ignore_connu(device_id),
+            track_duration_ms,
+            reported_duration_ms,
+            position_ms,
+        ) {
+            return;
+        }
+        {
+            let mut carte = self.fins_precises.lock().unwrap_or_else(|e| e.into_inner());
+            if carte.get(&zone_id).is_some_and(|f| f.flux == flux) {
+                return;
+            }
+            carte.insert(
+                zone_id,
+                FinPrecise {
+                    flux: flux.to_string(),
+                    conclure_a: None,
+                },
+            );
+        }
+        let output_arc = {
+            let outputs = self.outputs.lock().await;
+            match outputs.get(device_id) {
+                Some(o) => o,
+                None => return,
+            }
+        };
+        info!(
+            zone_id,
+            device = %device_id,
+            position_ms,
+            duree_rapportee_ms = reported_duration_ms,
+            "sondage_accelere_fin_de_piste"
+        );
+        let carte = self.fins_precises.clone();
+        let flux = flux.to_string();
+        tokio::spawn(async move {
+            let sonder = || {
+                let arc = output_arc.clone();
+                async move {
+                    let sortie = arc.lock().await;
+                    tokio::time::timeout(Duration::from_millis(500), sortie.get_status())
+                        .await
+                        .ok()?
+                        .ok()
+                        .map(|s| s.position_ms)
+                }
+            };
+            let Some(frontiere) =
+                guetter_la_frontiere(sonder, reported_duration_ms, PAS_DU_GUET, PLAFOND_DU_GUET)
+                    .await
+            else {
+                info!(zone_id, "sondage_accelere_abandonne");
+                return;
+            };
+            let conclure_a =
+                instant_de_conclusion(frontiere, track_duration_ms, reported_duration_ms);
+            {
+                let mut carte = carte.lock().unwrap_or_else(|e| e.into_inner());
+                match carte.get_mut(&zone_id) {
+                    Some(f) if f.flux == flux => f.conclure_a = Some(conclure_a),
+                    _ => return,
+                }
+            }
+            info!(
+                zone_id,
+                attente_ms = conclure_a
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64,
+                "sondage_accelere_frontiere_saisie"
+            );
+            tokio::time::sleep_until(conclure_a).await;
+            super::TRACK_END_NOTIFY.notify_one();
+        });
+    }
+
+    /// Le guetteur a-t-il établi la fin de CE flux, et son heure est-elle
+    /// venue ? Une entrée laissée par un autre flux est jetée au passage.
+    pub(super) fn fin_precise_atteinte(&self, zone_id: i64, flux: Option<&str>) -> bool {
+        let mut carte = self.fins_precises.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = carte.get(&zone_id) {
+            if flux.is_none_or(|fl| fl != f.flux) {
+                carte.remove(&zone_id);
+                return false;
+            }
+        }
+        conclusion_permise(carte.get(&zone_id), flux, Instant::now())
+    }
 }
 
 #[cfg(test)]

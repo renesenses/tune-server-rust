@@ -3265,6 +3265,33 @@ impl PositionPoller {
                     // n'enchaînera pas (25/08 : PLAYING éternel) ; attendre
                     // `durée + END_MARGIN_MS` sur l'horloge de Tune n'ajoutait
                     // que du silence.
+                    // #4382, rc4 — renderer qui n'enchaîne pas seul : la
+                    // dernière seconde est guettée à 100 ms, et la fin vaut
+                    // dès que la queue de piste est jouée, sans attendre un
+                    // sondage « inchangé » (jusqu'à 1,35 s de silence).
+                    let flux_courant = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref());
+                    if !in_seek_grace {
+                        self.lancer_le_guet_si_besoin(
+                            zone_id,
+                            &device_id,
+                            flux_courant,
+                            is_dlna,
+                            ps.gapless_sent,
+                            track_duration_ms,
+                            status.duration_ms,
+                            status.position_ms,
+                        )
+                        .await;
+                    }
+                    let position_precedente_pour_l_epingle =
+                        if is_dlna && self.fin_precise_atteinte(zone_id, flux_courant) {
+                            status.position_ms
+                        } else {
+                            prev_position_ms
+                        };
                     let epingle_piste_finie = !in_seek_grace
                         && decisions::dlna_epingle_sur_la_piste_finie(
                             is_dlna,
@@ -3273,7 +3300,7 @@ impl PositionPoller {
                             track_duration_ms,
                             status.duration_ms,
                             status.position_ms,
-                            prev_position_ms,
+                            position_precedente_pour_l_epingle,
                             decisions::uri_nomme_le_flux(
                                 status.current_uri.as_deref(),
                                 zone_state
