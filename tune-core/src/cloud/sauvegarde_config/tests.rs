@@ -675,7 +675,7 @@ fn relier(b: &Arc<dyn DbBackend>, base: &str, server_id: &str) {
 #[tokio::test]
 async fn bout_en_bout_depot_rotation_et_reprise() {
     let (base, site) = faux_site().await;
-    let http = reqwest::Client::new();
+    let http = crate::http::client::shared().clone();
     let b = machine_configuree();
     relier(&b, &base, "serveur-a");
     let s = reglages(&b);
@@ -753,7 +753,7 @@ async fn bout_en_bout_depot_rotation_et_reprise() {
 /// Désactivée, ou sans compte relié : la passe automatique n'envoie rien.
 #[tokio::test]
 async fn rien_ne_part_sans_activation_ni_compte() {
-    let http = reqwest::Client::new();
+    let http = crate::http::client::shared().clone();
     let b = machine_configuree();
     let s = reglages(&b);
     creer_la_cle(&s, PHRASE).unwrap();
