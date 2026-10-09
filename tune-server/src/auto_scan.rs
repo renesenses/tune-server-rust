@@ -314,6 +314,21 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         if !exclude_patterns.is_empty() {
             info!(patterns = ?exclude_patterns, "scan_exclude_paths_active");
         }
+        // #6019 (Tades, fil 2195, Tune OS) — le scan de DÉMARRAGE parcourait
+        // et `stat`ait toute la bibliothèque sans un mot sur le bus : sur trois
+        // montages réseau, plusieurs minutes où `scan/status` dit « scanning »
+        // (badge « analyse en cours ») et où l'écran n'a aucun chiffre à
+        // afficher. Le scan manuel, lui, annonce sa phase `indexing` dès le
+        // départ puis à chaque cadence du parcours (#2203) : même charge utile
+        // ici, pour que les deux scans se lisent pareil.
+        event_bus.emit(
+            "library.scan.started",
+            serde_json::json!({ "music_dirs": &music_dirs, "phase": "indexing", "total": 0, "auto": true }),
+        );
+        event_bus.emit(
+            "library.scan.progress",
+            serde_json::json!({ "phase": "indexing", "scanned": 0i64, "added": 0i64, "total": 0i64 }),
+        );
         // #5552 — « Arrêter » est lu à chaque entrée du parcours. Interrompu,
         // il ne rend aucune liste, et le scan s'arrête sans rien écrire : une
         // liste partielle ferait croire à des fichiers disparus.
@@ -321,7 +336,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             &music_dirs,
             &exclude_patterns,
             tune_core::scanner::walker::CADENCE_PROGRESSION_PARCOURS,
-            &mut |_| {},
+            &mut |p| {
+                event_bus.emit(
+                    "library.scan.progress",
+                    serde_json::json!({
+                        "phase": "indexing",
+                        "scanned": p.fichiers_vus as i64,
+                        "added": 0i64,
+                        "total": 0i64,
+                        "current_dir": p.dossier_courant,
+                    }),
+                );
+            },
             &crate::routes::system::scan::scan_cancel_requested,
         ) else {
             scan_de_demarrage_arrete(&event_bus, "parcours");
@@ -399,6 +425,18 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         };
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
+        // #6019 — le parcours est fini, la passe `stat` commence : sur un
+        // partage réseau, c'est la plus longue. L'écran garde le compte des
+        // fichiers repérés au lieu d'un badge sans chiffre.
+        event_bus.emit(
+            "library.scan.progress",
+            serde_json::json!({
+                "phase": "indexing",
+                "scanned": total_discovered as i64,
+                "added": 0i64,
+                "total": 0i64,
+            }),
+        );
 
         // NFC-normalized set of every path found on disk this scan. Used after
         // the scan to prune tracks whose files were deleted while the server was
@@ -3615,6 +3653,9 @@ mod surveillant_metadonnees_tests_5346;
 #[cfg(test)]
 #[path = "compteur_demarrage_tests_5371.rs"]
 mod compteur_demarrage_tests_5371;
+#[cfg(test)]
+#[path = "progression_demarrage_tests_6019.rs"]
+mod progression_demarrage_tests_6019;
 
 #[cfg(test)]
 #[path = "coffret_manuel_scan_tests_5319.rs"]
