@@ -1,0 +1,29 @@
+{
+  "id": "channel-remap",
+  "sdk": {
+    "major": 0,
+    "minor": 1
+  },
+  "kind": "dsp",
+  "config_version": 1,
+  "entitlement": "channel_remap",
+  "distribution": "source",
+  "capabilities": [
+    {
+      "id": "audio-process",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "zone-settings",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    }
+  ]
+}

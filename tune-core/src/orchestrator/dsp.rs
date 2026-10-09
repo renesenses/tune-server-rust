@@ -1545,6 +1545,12 @@ impl PlaybackOrchestrator {
             // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+            // #6044 — la réaffectation est elle aussi gouvernée par PURE.
+            local_output.set_reaffectation(self.reaffectation_de_la_piste(
+                zone_id,
+                track_id,
+                local_output.current_format().map(|(_, ch)| u32::from(ch)),
+            ));
             // Même raison pour la rampe (#1590) : `zone_soft_mute_ms` rend 0 en
             // PURE, donc une zone qui ENTRE en PURE doit la perdre dans le même
             // geste, et une zone qui en sort doit la retrouver — sans attendre
@@ -2337,6 +2343,83 @@ impl PlaybackOrchestrator {
                 device_id = %device_id,
                 mono,
                 "zone_mono_downmix_refreshed_live"
+            );
+            true
+        }
+    }
+
+    /// #6044 — la matrice de réaffectation des canaux d'une zone pour une
+    /// piste : la règle de l'album prime, puis celle de la zone ; `None` en
+    /// PURE, sans règle armée, ou quand la règle ne part pas du nombre de
+    /// canaux de la source.
+    pub fn reaffectation_de_la_piste(
+        &self,
+        zone_id: i64,
+        track_id: Option<i64>,
+        canaux_du_flux: Option<u32>,
+    ) -> Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>> {
+        use crate::audio::reaffectation_canaux as rc;
+        let (album_id, canaux_en_base) = track_id
+            .map(|tid| rc::album_et_canaux_de_la_piste(&self.db, tid))
+            .unwrap_or((None, None));
+        let canaux = canaux_du_flux
+            .and_then(|c| u16::try_from(c).ok())
+            .filter(|c| *c > 0)
+            .or(canaux_en_base);
+        rc::regle_effective_with(&self.db, zone_id, album_id, canaux).map(|r| r.matrice)
+    }
+
+    /// #6044 — réappliquer la réaffectation des canaux à la sortie locale qui
+    /// joue, sans attendre la piste suivante. Comme le repli mono : aucun état
+    /// à emporter, la nouvelle matrice prend effet au bloc suivant. Rend
+    /// `true` si une sortie locale vivante l'a reçue.
+    pub async fn refresh_zone_reaffectation(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let matrice = self.reaffectation_de_la_piste(
+                zone_id,
+                track_id,
+                local_output.current_format().map(|(_, ch)| u32::from(ch)),
+            );
+            let armee = matrice.is_some();
+            local_output.set_reaffectation(matrice);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                armee,
+                "zone_reaffectation_refreshed_live"
             );
             true
         }

@@ -692,6 +692,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-channel-remap"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "tune-plugin-abi",
+ "tune-plugin-sdk",
+ "tune-plugin-testkit",
+]
+
+[[package]]
 name = "tune-plugin-converter"
 version = "0.1.0"
 dependencies = [

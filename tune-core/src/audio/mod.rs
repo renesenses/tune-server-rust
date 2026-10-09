@@ -94,6 +94,9 @@ pub mod pcm_teneur;
 /// `test` de la CI, qui ne compile pas `local-audio`.
 pub mod periode_alsa;
 pub mod pipeline;
+/// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
+/// album, résolution de la règle qui s'applique à une piste.
+pub mod reaffectation_canaux;
 pub mod replaygain;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).

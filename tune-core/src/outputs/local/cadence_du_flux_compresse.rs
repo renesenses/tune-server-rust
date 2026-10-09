@@ -115,14 +115,27 @@ pub(super) fn journaliser_la_cadence_du_flux_compresse(
 /// Met la piste décodée (après DSP) au format réellement ouvert : canaux,
 /// puis cadence. Piste entière en mémoire : `rubato_resample_track` retire le
 /// délai de groupe du sinc et rend exactement `round(trames × ratio)` (#2246).
+///
+/// #6044 — `reaffectation` : la matrice de la zone, quand elle correspond à la
+/// source et à la sortie, remplace l'adaptation par défaut (`None` ou PURE :
+/// l'adaptation d'avant, inchangée).
 pub(super) fn conformer_la_piste_decodee(
     samples: Vec<f32>,
     source_sr: u32,
     source_ch: u16,
     sortie: FormatOuvert,
+    reaffectation: Option<(&super::CreneauReaffectation, bool)>,
 ) -> Vec<f32> {
     let mut samples = samples;
-    if source_ch != sortie.canaux {
+    if let Some((creneau, intouchable)) = reaffectation {
+        samples = super::reaffectation::adapter_les_canaux(
+            creneau,
+            samples,
+            source_ch,
+            sortie.canaux,
+            intouchable,
+        );
+    } else if source_ch != sortie.canaux {
         samples = adapt_channels(&samples, source_ch, sortie.canaux);
     }
     if source_sr != sortie.cadence {
