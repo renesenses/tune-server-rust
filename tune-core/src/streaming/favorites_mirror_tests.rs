@@ -604,6 +604,25 @@ async fn pg_5997_favoris_miroir_sur_postgresql() {
             &[],
         )
         .unwrap();
+    // La colonne `profile_id` telle que la laisse une base de bascule (TEXT,
+    // `PG_FULL_SCHEMA`) : c'est le cas qui tombait en CI (« text = bigint »).
+    // Posé ICI, l'épreuve ne dépend plus de l'ordre des étapes ; le type
+    // d'origine est remis à la fin.
+    let type_avant = backend
+        .query_one(
+            "SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() \
+             AND table_name = 'streaming_favorites' AND column_name = 'profile_id'",
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_string()))
+        .unwrap_or_default();
+    backend
+        .execute_batch(
+            "ALTER TABLE streaming_favorites ALTER COLUMN profile_id DROP DEFAULT; \
+             ALTER TABLE streaming_favorites ALTER COLUMN profile_id TYPE TEXT USING profile_id::text",
+        )
+        .unwrap();
     let profils_repo = ProfileRepo::with_backend(backend.clone());
     let suffixe = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let a = profils_repo
@@ -643,7 +662,7 @@ async fn pg_5997_favoris_miroir_sur_postgresql() {
     // Un profil sans ses lignes les reçoit par l'alignement.
     backend
         .execute(
-            "DELETE FROM streaming_favorites WHERE service = 'miroir-pg' AND profile_id = $1",
+            "DELETE FROM streaming_favorites WHERE service = 'miroir-pg' AND profile_id::text = ($1)::text",
             &[&b],
         )
         .unwrap();
@@ -677,4 +696,12 @@ async fn pg_5997_favoris_miroir_sur_postgresql() {
         .unwrap();
     let _ = profils_repo.delete(a);
     let _ = profils_repo.delete(b);
+    if type_avant == "bigint" {
+        backend
+            .execute_batch(
+                "ALTER TABLE streaming_favorites ALTER COLUMN profile_id TYPE BIGINT USING profile_id::bigint; \
+                 ALTER TABLE streaming_favorites ALTER COLUMN profile_id SET DEFAULT 1",
+            )
+            .unwrap();
+    }
 }

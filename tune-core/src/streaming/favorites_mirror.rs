@@ -285,6 +285,18 @@ fn ph(backend: &Arc<dyn DbBackend>, n: usize) -> String {
     }
 }
 
+/// `col` comparé au profil lié en `idx` — en texte sur PostgreSQL, où
+/// `profile_id` peut être TEXT (voir `streaming_favorites_repo::sql::profil_egal`).
+fn profil(backend: &Arc<dyn DbBackend>, col: &str, idx: usize, egal: bool) -> String {
+    use crate::db::streaming_favorites_repo::sql::{profil_different, profil_egal};
+    match (backend.engine(), egal) {
+        (Engine::Sqlite, true) => profil_egal(&SqliteDialect, col, idx),
+        (Engine::Sqlite, false) => profil_different(&SqliteDialect, col, idx),
+        (Engine::Postgres, true) => profil_egal(&PostgresDialect, col, idx),
+        (Engine::Postgres, false) => profil_different(&PostgresDialect, col, idx),
+    }
+}
+
 fn texte(v: Option<&SqlValue>) -> Option<String> {
     v.and_then(|x| x.as_string())
 }
@@ -429,13 +441,13 @@ pub fn aligner_profil(
     for service in services {
         let manquants = format!(
             "SELECT DISTINCT a.item_type, a.service_id FROM streaming_favorites a \
-             WHERE a.service = {} AND a.profile_id <> {} \
+             WHERE a.service = {} AND {} \
                AND a.miroir_etat IN ('{ETAT_SYNCHRO}', '{ETAT_AJOUT_EN_ATTENTE}') \
-               AND NOT EXISTS (SELECT 1 FROM streaming_favorites b WHERE b.profile_id = {} \
+               AND NOT EXISTS (SELECT 1 FROM streaming_favorites b WHERE {} \
                    AND b.item_type = a.item_type AND b.service = a.service AND b.service_id = a.service_id)",
             ph(backend, 1),
-            ph(backend, 2),
-            ph(backend, 3)
+            profil(backend, "a.profile_id", 2, false),
+            profil(backend, "b.profile_id", 3, true)
         );
         let lignes = backend.query_many_strong(&manquants, &[service, &profile_id, &profile_id])?;
         let copie = format!(
@@ -445,18 +457,18 @@ pub fn aligner_profil(
              SELECT {}, item_type, service, service_id, title, artist, album, cover_url, created_at, \
               first_seen_at, ai_generated, album_ref, miroir_etat, miroir_erreur, isrc \
              FROM streaming_favorites WHERE service = {} AND item_type = {} AND service_id = {} \
-               AND profile_id <> {} AND id = (SELECT MIN(id) FROM streaming_favorites c \
-                   WHERE c.service = {} AND c.item_type = {} AND c.service_id = {} AND c.profile_id <> {}) \
+               AND {} AND id = (SELECT MIN(id) FROM streaming_favorites c \
+                   WHERE c.service = {} AND c.item_type = {} AND c.service_id = {} AND {}) \
              ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING",
             ph(backend, 1),
             ph(backend, 2),
             ph(backend, 3),
             ph(backend, 4),
-            ph(backend, 5),
+            profil(backend, "profile_id", 5, false),
             ph(backend, 6),
             ph(backend, 7),
             ph(backend, 8),
-            ph(backend, 9)
+            profil(backend, "c.profile_id", 9, false)
         );
         for l in &lignes {
             let (Some(t), Some(id)) = (texte(l.first()), texte(l.get(1))) else {
