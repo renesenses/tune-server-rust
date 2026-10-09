@@ -1988,6 +1988,10 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
+/// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
+#[cfg(test)]
+mod seek_bibliotheque_sans_range_6017;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
