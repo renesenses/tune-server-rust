@@ -104,6 +104,15 @@ pub trait FournisseurPcm: Send + Sync {
     /// l'implémentation peut parler au matériel.
     fn ouvrir(&self, source_id: &str, depuis_ms: u64) -> Result<FluxPcm, String>;
 
+    /// Faux pour une source dont l'OUVERTURE a un effet immédiat (#6018 :
+    /// ouvrir un titre Spotify, c'est le lancer sur l'appareil librespot).
+    /// Le pré-armement gapless (`resolve_queue_item_url`) ouvre la piste
+    /// suivante pendant que l'autre joue : il la couperait. La piste suivante
+    /// est alors ouverte à la fin de la précédente, comme sans gapless.
+    fn pre_armable(&self) -> bool {
+        true
+    }
+
     /// Vrai pour une source SANS FIN (#5051) : l'orchestrateur appelle alors
     /// [`Self::ouvrir_direct`] et sert un flux en direct, jamais `ouvrir`.
     fn en_direct(&self) -> bool {

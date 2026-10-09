@@ -37,7 +37,10 @@ const REDIRECT_PATH: &str = "/api/v1/streaming/spotify/callback";
 pub fn default_redirect_uri(api_port: u16) -> String {
     format!("http://127.0.0.1:{api_port}{REDIRECT_PATH}")
 }
-const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public";
+/// #6018 — `streaming` connecte librespot au compte ; les deux portées
+/// `*-playback-state` laissent l'API Web désigner et piloter son appareil.
+/// Un compte relié AVANT ce changement doit se reconnecter une fois.
+const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public streaming user-read-playback-state user-modify-playback-state";
 
 pub struct SpotifyService {
     client: Client,
@@ -376,7 +379,7 @@ impl SpotifyService {
     }
 
     #[cfg(test)]
-    fn avec_doublure(mut self, base: &str) -> Self {
+    pub(crate) fn avec_doublure(mut self, base: &str) -> Self {
         self.token_url = format!("{base}/api/token");
         self.api_base = format!("{base}/v1");
         self
@@ -435,6 +438,96 @@ impl SpotifyService {
             return Err("token expired".into());
         }
         resp.json().await.map_err(|e| format!("spotify json: {e}"))
+    }
+
+    /// #6018 — le jeton d'accès courant, que librespot reçoit pour se
+    /// connecter au compte (`--access-token`).
+    pub fn jeton_d_acces(&self) -> Option<String> {
+        self.access_token.clone()
+    }
+
+    /// #6018 — l'identifiant API Web de l'appareil Connect nommé `nom`.
+    pub async fn appareil_par_nom(&self, nom: &str) -> Result<Option<String>, String> {
+        let d = self.api_get("/me/player/devices").await?;
+        Ok(d["devices"].as_array().and_then(|appareils| {
+            appareils
+                .iter()
+                .find(|a| a["name"].as_str() == Some(nom))
+                .and_then(|a| a["id"].as_str())
+                .map(Into::into)
+        }))
+    }
+
+    /// #6018 — demande à l'appareil Connect `nom` (le librespot de Tune) de
+    /// jouer `piste` depuis `position_ms`. Un seul titre : la file de Tune
+    /// enchaîne. L'appareil met quelques secondes à apparaître après le
+    /// démarrage de librespot : il est cherché plusieurs fois.
+    pub async fn lancer_sur_l_appareil(
+        &self,
+        nom: &str,
+        piste: &str,
+        position_ms: u64,
+    ) -> Result<(), String> {
+        let token = self
+            .access_token
+            .clone()
+            .ok_or("Spotify n'est pas connecté")?;
+        let mut appareil = None;
+        for essai in 0..20 {
+            if essai > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            appareil = self.appareil_par_nom(nom).await?;
+            if appareil.is_some() {
+                break;
+            }
+        }
+        let appareil = appareil.ok_or_else(|| {
+            format!(
+                "L'appareil Spotify Connect « {nom} » n'apparaît pas : librespot n'a pas pu se \
+                 connecter au compte. Spotify Premium est exigé ; reconnecter Spotify dans les \
+                 Réglages si le compte a été relié avant la version qui lit Spotify."
+            )
+        })?;
+        let resp = self
+            .client
+            .put(format!(
+                "{}/me/player/play?device_id={}",
+                self.api_base,
+                urlencoding::encode(&appareil)
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "uris": [format!("spotify:track:{piste}")],
+                "position_ms": position_ms,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("spotify api: {e}"))?;
+        let statut = resp.status().as_u16();
+        match statut {
+            200 | 202 | 204 => {
+                info!(appareil = %appareil, piste, position_ms, "spotify_lecture_lancee");
+                Ok(())
+            }
+            401 => {
+                self.note_token_rejected();
+                Err("Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.".into())
+            }
+            _ => {
+                let detail = resp.text().await.unwrap_or_default();
+                if statut == 403 {
+                    Err(format!(
+                        "Spotify refuse la lecture : un compte Spotify Premium est exigé, et la \
+                         connexion doit porter les droits de lecture (se reconnecter). {detail}"
+                    ))
+                } else {
+                    Err(format!(
+                        "Spotify a refusé la lecture (HTTP {statut}) : {detail}"
+                    ))
+                }
+            }
+        }
     }
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
@@ -2044,5 +2137,104 @@ mod tests {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         );
         assert_eq!(c1, base64url_encode(&Sha256::digest(v1.as_bytes())));
+    }
+
+    /// #6018 — l'appareil librespot est désigné par son NOM, et l'API Web lui
+    /// demande de jouer le titre à la position voulue.
+    #[tokio::test]
+    async fn spotify_6018_lancer_sur_l_appareil_designe_librespot() {
+        #[derive(Clone, Default)]
+        struct Vu(Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>);
+        let vu = Vu::default();
+        let app = axum::Router::new()
+            .route(
+                "/v1/me/player/devices",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"devices": [
+                        {"id": "dev-salon", "name": "Salon", "is_active": true},
+                        {"id": "dev-tune", "name": "Tune", "is_active": false}
+                    ]}))
+                }),
+            )
+            .route(
+                "/v1/me/player/play",
+                axum::routing::put(
+                    |axum::extract::State(v): axum::extract::State<Vu>,
+                     axum::extract::RawQuery(q): axum::extract::RawQuery,
+                     corps: axum::Json<serde_json::Value>| async move {
+                        v.0.lock().unwrap().push((q.unwrap_or_default(), corps.0));
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(vu.clone());
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+
+        assert_eq!(
+            svc.appareil_par_nom("Tune").await.unwrap().as_deref(),
+            Some("dev-tune")
+        );
+        svc.lancer_sur_l_appareil("Tune", "4uLU6hMCjMI75M1A2tKUQC", 5000)
+            .await
+            .expect("lecture lancée");
+        let vu = vu.0.lock().unwrap().clone();
+        assert_eq!(vu.len(), 1);
+        assert_eq!(vu[0].0, "device_id=dev-tune");
+        assert_eq!(
+            vu[0].1,
+            json!({"uris": ["spotify:track:4uLU6hMCjMI75M1A2tKUQC"], "position_ms": 5000})
+        );
+    }
+
+    /// Sans Premium, Spotify répond 403 : Tune le dit en clair.
+    #[tokio::test]
+    async fn spotify_6018_un_refus_403_parle_de_premium() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/me/player/devices",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"devices": [{"id": "dev-tune", "name": "Tune"}]}))
+                }),
+            )
+            .route(
+                "/v1/me/player/play",
+                axum::routing::put(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error": {"status": 403, "message": "Player command failed: Premium required", "reason": "PREMIUM_REQUIRED"}})),
+                    )
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ecoute.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ecoute, app).await.unwrap() });
+        let mut svc =
+            SpotifyService::with_config(Some("client-essai"), None, 8888).avec_doublure(&base);
+        svc.access_token = Some("jeton".into());
+        let err = svc
+            .lancer_sur_l_appareil("Tune", "x", 0)
+            .await
+            .expect_err("403");
+        assert!(err.contains("Premium"), "{err}");
+    }
+
+    /// Piloter l'appareil et connecter librespot exigent ces portées.
+    #[test]
+    fn spotify_6018_les_portees_permettent_la_lecture() {
+        for portee in [
+            "streaming",
+            "user-read-playback-state",
+            "user-modify-playback-state",
+        ] {
+            assert!(
+                SCOPES.split(' ').any(|p| p == portee),
+                "portée OAuth manquante : {portee}"
+            );
+        }
     }
 }

@@ -15,6 +15,8 @@ pub mod radiofrance;
 pub mod registry;
 pub mod spotify;
 pub mod spotify_connect;
+/// #6018 — la lecture d'un titre Spotify par librespot, comme source PCM.
+pub mod spotify_lecture;
 pub mod tidal;
 pub mod traits;
 /// La vignette d'un podcast mise en cache à l'abonnement (#5214).

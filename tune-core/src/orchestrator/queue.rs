@@ -1250,6 +1250,19 @@ impl PlaybackOrchestrator {
                     .unwrap_or_else(|| "tidal".into())
             }
         };
+        // #6018 — une source dont l'ouverture JOUE (Spotify : lancer le titre
+        // sur l'appareil librespot) ne se pré-arme pas : elle couperait la
+        // piste en cours. La suivante s'ouvrira à la fin de celle-ci.
+        if self
+            .sources_pcm
+            .fournisseur(&source)
+            .is_some_and(|f| !f.pre_armable())
+        {
+            return Err(format!(
+                "source « {source} » : pas de pré-armement, la piste suivante s'ouvre à la fin \
+                 de la piste en cours"
+            ));
+        }
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()

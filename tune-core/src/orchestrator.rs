@@ -1895,6 +1895,9 @@ mod niveaux_source_pcm_5078;
 mod resolution_annoncee_tests;
 #[cfg(test)]
 mod saut_de_piste_pcm_5079;
+/// #6018 — un titre Spotify joué par librespot, jusqu'à la session de la zone.
+#[cfg(all(test, unix))]
+mod spotify_6018_tests;
 
 /// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
 /// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
