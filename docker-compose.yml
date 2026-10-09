@@ -29,6 +29,13 @@ services:
     environment:
       - TUNE_MUSIC_DIRS=["/music"]
     restart: unless-stopped
+    # Local audio output to a USB DAC on this host (#5968): uncomment both.
+    # The host must have /dev/snd (not Docker Desktop on macOS/Windows).
+    # Podman/Fedora: see "Podman" in the README.
+    # devices:
+    #   - /dev/snd:/dev/snd
+    # group_add:
+    #   - audio
 
 volumes:
   tune-data:

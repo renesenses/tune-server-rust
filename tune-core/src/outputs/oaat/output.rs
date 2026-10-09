@@ -2324,7 +2324,22 @@ impl OutputTarget for OaatOutput {
             };
 
             // Streaming loop
-            let mut sample_offset: u64 = 0;
+            //
+            // #5978 — un rétablissement de session (pause longue, session de
+            // flux supprimée) ouvre un flux DÉJÀ déplacé côté serveur
+            // (`resolve_local`, `seek_s`) : sa première trame est à
+            // `start_position_ms` dans la piste. Le compteur part donc de là,
+            // en absolu, comme après un seek en flux. Parti de 0, il publiait
+            // 0:00, plafonnait avant la durée de la piste, et la fenêtre
+            // d'armement de la suivante n'était jamais atteinte.
+            //
+            // Le PTS, le pré-remplissage et le cadencement repartent, eux, de
+            // MAINTENANT (`origine_flux`, comme `pacing_origin_sample` du
+            // fichier direct) : l'endpoint ne programme pas un premier PTS à
+            // plus de 5 s, et la boucle dormirait d'autant.
+            let mut sample_offset: u64 =
+                start_position_ms.saturating_mul(cur_sample_rate as u64) / 1000;
+            let mut origine_flux: u64 = sample_offset;
             // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
             let mut stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
@@ -2505,6 +2520,9 @@ impl OutputTarget for OaatOutput {
                                             sample_offset = seek_pos
                                                 .saturating_mul(cur_sample_rate as u64)
                                                 / 1000;
+                                            // Le seek garde son propre repère
+                                            // (compteur absolu, `start` recalé).
+                                            origine_flux = 0;
                                             let elapsed_eq = std::time::Duration::from_millis(seek_pos);
                                             start = std::time::Instant::now() - elapsed_eq;
                                             horloge_pause.recaler_temps_media(elapsed_eq);
@@ -2628,7 +2646,7 @@ impl OutputTarget for OaatOutput {
                                 // Bytes already SENT define the resume point; drop
                                 // any received-but-unsent bytes (they'll be re-
                                 // fetched) so we neither duplicate nor lose audio.
-                                let source_frames = ((sample_offset as u128
+                                let source_frames = ((direct_pcm_elapsed_samples(sample_offset, origine_flux) as u128
                                     * source_sample_rate as u128)
                                     / cur_sample_rate.max(1) as u128)
                                     as u64;
@@ -2778,10 +2796,10 @@ impl OutputTarget for OaatOutput {
                                     let pts_ns = if is_dsd {
                                         stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                                     } else {
-                                        stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                        stream_start_ns + (direct_pcm_elapsed_samples(sample_offset, origine_flux) as f64 / cur_sample_rate as f64 * 1e9) as u64
                                     };
                                     let mut flags = PacketFlags::empty();
-                                    if !payload.is_empty() && sample_offset == 0 && byte_offset == 0 {
+                                    if !payload.is_empty() && sample_offset == origine_flux && byte_offset == 0 {
                                         flags |= PacketFlags::FIRST_PACKET;
                                     }
                                     if paquet.dernier {
@@ -2963,6 +2981,7 @@ impl OutputTarget for OaatOutput {
                                     }
 
                                     sample_offset = 0;
+                                    origine_flux = 0;
                                     byte_offset = 0;
                                     position_ms.store(0, Ordering::SeqCst);
                                     stream_start_ns = super::helpers::now_ns() + 500_000_000;
@@ -2995,9 +3014,9 @@ impl OutputTarget for OaatOutput {
                             let pts_ns = if is_dsd {
                                 stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
-                                stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                stream_start_ns + (direct_pcm_elapsed_samples(sample_offset, origine_flux) as f64 / cur_sample_rate as f64 * 1e9) as u64
                             };
-                            let flags = if sample_offset == 0 && byte_offset == 0 {
+                            let flags = if sample_offset == origine_flux && byte_offset == 0 {
                                 PacketFlags::FIRST_PACKET
                             } else {
                                 PacketFlags::empty()
@@ -3052,7 +3071,7 @@ impl OutputTarget for OaatOutput {
                                 }
                             }
 
-                            if sample_offset == 0 && byte_offset == 0 {
+                            if sample_offset == origine_flux && byte_offset == 0 {
                                 info!(device = %device_name, payload_bytes = payload.len(), "oaat: first audio packet sent");
                             }
 
@@ -3071,7 +3090,8 @@ impl OutputTarget for OaatOutput {
                             let packet_num = if uses_byte_offset {
                                 byte_offset / packet_size as u64
                             } else {
-                                sample_offset / PCM_SAMPLES_PER_PACKET as u64
+                                direct_pcm_elapsed_samples(sample_offset, origine_flux)
+                                    / PCM_SAMPLES_PER_PACKET as u64
                             };
                             if packet_num > 50 {
                                 // Le cadencement aussi : caler l'envoi FLAC sur
@@ -3086,7 +3106,7 @@ impl OutputTarget for OaatOutput {
                                 };
                                 let expected = duree_audio_envoyee(
                                     base_de_temps,
-                                    sample_offset,
+                                    direct_pcm_elapsed_samples(sample_offset, origine_flux),
                                     byte_offset,
                                     cur_sample_rate,
                                     bytes_per_frame,

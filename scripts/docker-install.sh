@@ -137,6 +137,21 @@ services:
       - ${TUNE_MUSIC_PATH:?set TUNE_MUSIC_PATH in .env}:/music:ro
     env_file:
       - .env.tune
+COMPOSEEOF
+# Local audio output (USB DAC, #5968): only when this host has sound devices —
+# `docker compose up` refuses a `devices:` entry that does not exist.
+if [ -d /dev/snd ]; then
+    cat >> docker-compose.yml <<'COMPOSEEOF'
+    # Local audio output (USB DAC, #5968): the host's sound devices and the
+    # group that opens them. Podman/Fedora: see "Podman" in the README.
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+COMPOSEEOF
+    echo "Sound devices found: /dev/snd passed to the container (local output)."
+fi
+cat >> docker-compose.yml <<'COMPOSEEOF'
 
 volumes:
   tune-data:
