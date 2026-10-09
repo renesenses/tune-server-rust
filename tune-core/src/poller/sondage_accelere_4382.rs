@@ -251,11 +251,11 @@ impl super::PositionPoller {
     /// venue ? Une entrée laissée par un autre flux est jetée au passage.
     pub(super) fn fin_precise_atteinte(&self, zone_id: i64, flux: Option<&str>) -> bool {
         let mut carte = self.fins_precises.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = carte.get(&zone_id) {
-            if flux.is_none_or(|fl| fl != f.flux) {
-                carte.remove(&zone_id);
-                return false;
-            }
+        if let Some(f) = carte.get(&zone_id)
+            && flux.is_none_or(|fl| fl != f.flux)
+        {
+            carte.remove(&zone_id);
+            return false;
         }
         conclusion_permise(carte.get(&zone_id), flux, Instant::now())
     }
