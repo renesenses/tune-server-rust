@@ -5,6 +5,7 @@ pub mod deezer_decrypt;
 pub mod favorites_date;
 pub mod favorites_identity;
 pub mod favorites_import;
+pub mod favorites_mirror;
 pub mod matching;
 pub mod podcasts;
 pub mod qobuz;

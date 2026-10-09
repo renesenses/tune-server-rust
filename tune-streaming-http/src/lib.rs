@@ -1081,6 +1081,9 @@ async fn service_add_favorite(
     // playlist, quel que soit l'endpoint amont que le connecteur choisit : la
     // purge n'a pas à connaître ce détail.
     purge_contenu_utilisateur(&service);
+    // #5997 — écriture directe chez le service : le miroir des favoris est
+    // périmé, la prochaine lecture de la liste le rafraîchit.
+    tune_core::streaming::favorites_mirror::invalider(&service);
     reponse
 }
 
@@ -1092,6 +1095,7 @@ async fn service_remove_favorite(
         .remove_favorite(&fav_type, &item_id)
         .await);
     purge_contenu_utilisateur(&service);
+    tune_core::streaming::favorites_mirror::invalider(&service);
     reponse
 }
 

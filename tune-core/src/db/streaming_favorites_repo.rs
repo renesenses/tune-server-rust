@@ -49,6 +49,17 @@ pub struct StreamingFavorite {
     /// Absent du JSON dans ce cas, pour que la forme rendue ne change pas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
+    /// #5997 — l'état du favori dans le MIROIR du service : `synchro` (le
+    /// service l'a confirmé) ou `ajout_en_attente` (posé dans Tune, pas encore
+    /// confirmé chez le service). Absent hors miroir et sur une ligne d'avant
+    /// la rc4 : la forme rendue ne change pas pour elles. Une ligne
+    /// `retrait_en_attente` n'est jamais rendue par la liste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miroir_etat: Option<String>,
+    /// #5997 — le dernier motif d'échec chez le service, absent après un
+    /// succès.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miroir_erreur: Option<String>,
 }
 
 /// Engine-agnostic SQL builders.
@@ -236,19 +247,28 @@ pub mod sql {
     // l'insérer ailleurs décalerait silencieusement le rang manuel.
     // `ai_generated` (#5530) suit `first_seen_at`, à l'indice 11 dans les
     // DEUX listes ; `position` passe donc en 12.
-    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated \
+    //
+    // #5997 — `miroir_etat` et `miroir_erreur` suivent `ai_generated`, aux
+    // indices 12 et 13 dans les DEUX listes ; `position` passe donc en 14.
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur \
          FROM streaming_favorites";
+
+    /// #5997 — un retrait demandé dans Tune et pas encore confirmé par le
+    /// service est MASQUÉ : l'auditeur a retiré son cœur, il ne doit pas le
+    /// voir revenir pendant que le serveur retente.
+    const HORS_RETRAIT_EN_ATTENTE: &str =
+        "(miroir_etat IS NULL OR miroir_etat <> 'retrait_en_attente')";
 
     pub fn list_all<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS} WHERE profile_id = {} ORDER BY created_at DESC",
+            "{SELECT_COLS} WHERE profile_id = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
             d.placeholder(1)
         )
     }
 
     pub fn list_by_type<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS} WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
+            "{SELECT_COLS} WHERE profile_id = {} AND item_type = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -259,19 +279,19 @@ pub mod sql {
     /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
     /// n'est lue que par le tri manuel et n'entre JAMAIS dans
     /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
-    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, position \
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position \
          FROM streaming_favorites";
 
     pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} ORDER BY created_at DESC",
+            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
             d.placeholder(1)
         )
     }
 
     pub fn list_by_type_pour_rang<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
+            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} AND item_type = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -619,10 +639,10 @@ impl StreamingFavoritesRepo {
                 self.db.query_many(&sql, &params)?
             };
             favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
-                // 12 et non 10 : `first_seen_at` puis `ai_generated` (#5530)
-                // se sont glissés entre `created_at` et `position` dans
-                // SELECT_COLS_POUR_RANG.
-                r.get(12).and_then(|v| v.as_i64())
+                // 14 et non 10 : `first_seen_at`, `ai_generated` (#5530) puis
+                // `miroir_etat` et `miroir_erreur` (#5997) se sont glissés
+                // entre `created_at` et `position` dans SELECT_COLS_POUR_RANG.
+                r.get(14).and_then(|v| v.as_i64())
             });
             return Ok(rows.iter().map(row_to_streaming_favorite).collect());
         }
@@ -707,6 +727,8 @@ fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
             .get(11)
             .and_then(|v| v.as_string())
             .and_then(|v| marquage_ia_lu(&v)),
+        miroir_etat: cols.get(12).and_then(|v| v.as_string()),
+        miroir_erreur: cols.get(13).and_then(|v| v.as_string()),
     }
 }
 
@@ -1007,10 +1029,9 @@ mod tests {
         ));
         // Le rang doit etre LU, et seulement par la requete dediee : la
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
-        assert!(
-            sql::list_by_type_pour_rang(&SqliteDialect)
-                .contains("created_at, first_seen_at, ai_generated, position")
-        );
+        assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains(
+            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position"
+        ));
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }
 

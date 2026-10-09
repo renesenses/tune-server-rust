@@ -175,6 +175,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
 
+      # #5997 — miroir des favoris de service : écriture pour tous les profils,
+      # alignement (INSERT … SELECT … ON CONFLICT), retrait au rafraîchissement,
+      # panne. Sans cette étape, l'épreuve prendrait son saut annoncé.
+      - name: Favoris de service en miroir sur PostgreSQL (#5997)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5997 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
