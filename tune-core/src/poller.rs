@@ -1006,6 +1006,8 @@ mod fin_de_piste;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.
 mod next_ignore_4382;
 pub(crate) mod refus_de_piste;
+/// #4382 — sondage accéléré dans la dernière seconde (renderer qui n'enchaîne pas seul).
+mod sondage_accelere_4382;
 
 mod tick;
 
