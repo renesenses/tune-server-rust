@@ -102,21 +102,45 @@ pub(super) fn build_conditions(
 /// lent, jamais faux.
 pub(super) enum SocleResolu {
     /// Les pistes écartées par les deux replis coûteux.
-    Ecartees(Vec<i64>),
+    Ecartees(std::sync::Arc<Vec<i64>>),
     /// Repli : les prédicats SQL complets, évalués par chaque requête.
     EnSql,
 }
 
+/// #5993 — le dernier socle résolu, sous le jeton de la base qui l'a rendu
+/// ([`tune_core::db::backend::DbBackend::jeton_des_donnees`]). Le jeton change
+/// à CHAQUE écriture validée, par n'importe quelle connexion : un socle gardé
+/// sous un jeton encore valide est donc exactement celui que la base rendrait.
+/// Une seule entrée : une base par serveur.
+type SocleEnCache = Option<((u64, i64), std::sync::Arc<Vec<i64>>)>;
+static SOCLE_EN_CACHE: std::sync::Mutex<SocleEnCache> = std::sync::Mutex::new(None);
+
 impl SocleResolu {
     pub(super) fn resoudre(state: &AppState) -> Self {
+        // Le jeton est lu AVANT la résolution : une écriture validée entre
+        // les deux change le jeton suivant, et le socle gardé ici n'est alors
+        // plus jamais servi. L'ordre inverse pourrait garder un socle ancien
+        // sous un jeton neuf.
+        let jeton = state.backend.jeton_des_donnees();
+        if let Some(garde) = Self::en_cache(jeton) {
+            return garde;
+        }
         let sql =
             tune_core::db::facet_filter::sql_pistes_ecartees_par_le_socle(state.backend.engine());
         match state.backend.query_many(&sql, &[]) {
-            Ok(rows) => SocleResolu::Ecartees(
-                rows.iter()
-                    .filter_map(|r| r.first().and_then(|v| v.as_i64()))
-                    .collect(),
-            ),
+            Ok(rows) => {
+                let ids: std::sync::Arc<Vec<i64>> = std::sync::Arc::new(
+                    rows.iter()
+                        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                        .collect(),
+                );
+                if let Some(j) = jeton
+                    && let Ok(mut cache) = SOCLE_EN_CACHE.lock()
+                {
+                    *cache = Some((j, ids.clone()));
+                }
+                SocleResolu::Ecartees(ids)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "facettes_socle_non_resolu");
                 SocleResolu::EnSql
@@ -124,15 +148,75 @@ impl SocleResolu {
         }
     }
 
+    /// Le socle gardé en mémoire, s'il l'a été sous ce jeton.
+    fn en_cache(jeton: Option<(u64, i64)>) -> Option<Self> {
+        let j = jeton?;
+        let cache = SOCLE_EN_CACHE.lock().ok()?;
+        let (jeton_garde, ids) = cache.as_ref()?;
+        (*jeton_garde == j).then(|| SocleResolu::Ecartees(ids.clone()))
+    }
+
+    /// Les pistes repliées, si le socle a été résolu (`None` pour `EnSql`).
+    pub(super) fn ids(&self) -> Option<&[i64]> {
+        match self {
+            SocleResolu::Ecartees(ids) => Some(ids),
+            SocleResolu::EnSql => None,
+        }
+    }
+
+    /// #5993 — les pistes repliées des seuls albums `albums` (ceux d'un
+    /// dossier). Le socle de toute la bibliothèque coûte ≈ 30 à 45 ms sur
+    /// 100 000 pistes, deux à trois fois la lecture d'un dossier d'artiste :
+    /// on ne résout que ces albums-là. Le socle gardé en mémoire, s'il est
+    /// encore valide, sert tel quel ; au-delà de `ALBUMS_PAR_DOSSIER` albums,
+    /// on résout la bibliothèque entière, qui se garde. `None` : le socle n'a
+    /// pas pu être résolu, l'appelant pose le socle en SQL.
+    pub(super) fn ecartees_parmi(
+        state: &AppState,
+        albums: &[i64],
+    ) -> Option<std::collections::HashSet<i64>> {
+        const ALBUMS_PAR_DOSSIER: usize = 500;
+        let en_ensemble = |s: &SocleResolu| s.ids().map(|ids| ids.iter().copied().collect());
+        if let Some(garde) = Self::en_cache(state.backend.jeton_des_donnees()) {
+            return en_ensemble(&garde);
+        }
+        if albums.is_empty() {
+            return Some(std::collections::HashSet::new());
+        }
+        if albums.len() > ALBUMS_PAR_DOSSIER {
+            return en_ensemble(&Self::resoudre(state));
+        }
+        let liste = albums
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = tune_core::db::facet_filter::sql_pistes_ecartees_parmi_les_albums(
+            state.backend.engine(),
+            &liste,
+        );
+        match state.backend.query_many(&sql, &[]) {
+            Ok(rows) => Some(
+                rows.iter()
+                    .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "facettes_socle_non_resolu");
+                None
+            }
+        }
+    }
+
     /// Le socle réduit aux albums masqués : ce que posent les requêtes du
     /// rail compté par soustraction (#5993).
     pub(super) fn masques_seuls() -> Self {
-        SocleResolu::Ecartees(Vec::new())
+        SocleResolu::Ecartees(std::sync::Arc::new(Vec::new()))
     }
 
     /// Les pistes repliées, en liste SQL d'entiers (`12,57,…`) ; `None` s'il
     /// n'y en a aucune ou si le socle n'a pas pu être résolu.
-    fn liste_des_ecartees(&self) -> Option<String> {
+    pub(super) fn liste_des_ecartees(&self) -> Option<String> {
         match self {
             SocleResolu::Ecartees(ids) if !ids.is_empty() => Some(
                 ids.iter()

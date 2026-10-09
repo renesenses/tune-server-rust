@@ -737,12 +737,32 @@ pub fn socle_de_la_vue_des_pistes(engine: Engine) -> [String; 3] {
 ///   se répète sont donc candidats (lecture de `idx_tracks_cle_de_copie`),
 ///   et [`copie_de_moindre_qualite_exclue`] tranche parmi leurs pistes.
 pub fn sql_pistes_ecartees_par_le_socle(engine: Engine) -> String {
+    sql_pistes_ecartees(engine, None)
+}
+
+/// [`sql_pistes_ecartees_par_le_socle`], limité aux albums `albums` (liste
+/// SQL d'entiers, `12,57,…`) — #5993 : la facette Dossiers n'a besoin que
+/// des pistes repliées de SON dossier. La restriction porte sur l'ALBUM, pas
+/// sur le chemin : une copie se départage contre toutes les pistes de son
+/// album, même rangées ailleurs, exactement comme dans la liste.
+pub fn sql_pistes_ecartees_parmi_les_albums(engine: Engine, albums: &str) -> String {
+    sql_pistes_ecartees(engine, Some(albums))
+}
+
+fn sql_pistes_ecartees(engine: Engine, albums: Option<&str>) -> String {
+    let (parmi_dist, parmi_pistes) = match albums {
+        Some(a) => (
+            format!(" AND dist.id IN ({a})"),
+            format!(" AND album_id IN ({a})"),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         "SELECT t.id FROM tracks t WHERE t.album_id IN \
-           (SELECT dist.id FROM albums dist WHERE {double}) \
+           (SELECT dist.id FROM albums dist WHERE {double}{parmi_dist}) \
          UNION \
          SELECT t.id FROM tracks t WHERE t.album_id IN \
-           (SELECT album_id FROM tracks WHERE album_id IS NOT NULL \
+           (SELECT album_id FROM tracks WHERE album_id IS NOT NULL{parmi_pistes} \
             GROUP BY album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), \
                      LOWER(TRIM(COALESCE(title, ''))) \
             HAVING COUNT(*) > 1) \

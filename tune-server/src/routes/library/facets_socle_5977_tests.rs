@@ -360,3 +360,131 @@ fn le_rail_par_soustraction_compte_comme_le_socle_complet() {
         );
     }
 }
+
+/// #5993 — les cartes d'albums (correction par album) et la facette Dossiers
+/// (soustraction) rendent EXACTEMENT ce que rend le socle complet posé dans
+/// chaque requête : même JSON, pour plusieurs sélections, pages et dossiers.
+#[test]
+fn les_cartes_et_les_dossiers_sans_sonde_comptent_comme_le_socle_complet() {
+    use super::super::albums_detailed::lire_les_cartes_sur;
+    use super::super::folder_facet::{FolderPathQuery, lire_les_dossiers, lire_les_dossiers_sur};
+    use super::{FacetQuery, SocleResolu};
+    let (_app, state) = bibliotheque();
+    let resolu = SocleResolu::resoudre(&state);
+    assert!(
+        matches!(&resolu, SocleResolu::Ecartees(ids) if !ids.is_empty()),
+        "la fixture doit replier des pistes"
+    );
+    for (limite, decalage, brut) in [
+        (500, 0, String::new()),
+        (1, 1, String::new()),
+        (500, 0, format!("genre={}", GENRE.replace(' ', "%20"))),
+        (500, 0, "format=mp3".to_string()),
+        (500, 0, "format=flac".to_string()),
+    ] {
+        let q = || {
+            FacetQuery {
+                limit: Some(limite),
+                offset: Some(decalage),
+                ..Default::default()
+            }
+            .hydrate(Some(&brut))
+            .ok()
+            .expect("requête")
+        };
+        assert_eq!(
+            lire_les_cartes_sur(&state, q(), &resolu),
+            lire_les_cartes_sur(&state, q(), &SocleResolu::EnSql),
+            "cartes : {brut} limit={limite} offset={decalage}"
+        );
+        for chemin in [None, Some("/m"), Some("/m/Alda"), Some("/m/Masque")] {
+            let p = || FolderPathQuery {
+                path: chemin.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                lire_les_dossiers_sur(&state, q(), p(), &resolu),
+                lire_les_dossiers_sur(&state, q(), p(), &SocleResolu::EnSql),
+                "dossiers : {brut} {chemin:?}"
+            );
+            // Le socle limité aux albums du dossier (#5993) : même réponse.
+            assert_eq!(
+                lire_les_dossiers(&state, q(), p()),
+                lire_les_dossiers_sur(&state, q(), p(), &SocleResolu::EnSql),
+                "dossiers, socle du dossier : {brut} {chemin:?}"
+            );
+        }
+    }
+}
+
+/// #5993 — le socle est gardé en mémoire sous le jeton de la base ; une
+/// écriture le périme. Sur une base FICHIER (en mémoire, rien n'est gardé) :
+/// une copie MP3 ajoutée se replie aussitôt, et redevient visible dès que son
+/// original FLAC disparaît.
+#[tokio::test]
+async fn le_socle_garde_en_memoire_suit_chaque_ecriture() {
+    let dossier = tempfile::tempdir().unwrap();
+    let chemin = dossier.path().join("cache.db");
+    let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
+    assert!(
+        state.backend.jeton_des_donnees().is_some(),
+        "une base fichier SQLite doit rendre un jeton"
+    );
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');\n\
+             INSERT INTO albums (id, title, artist_id, source) VALUES (10, 'Disque', 1, 'local');\n\
+             INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number, file_path, \
+               duration_ms, format, sample_rate, bit_depth, source) VALUES \
+               (1, 'Un', 10, 1, 1, 1, '/m/A/Disque/01.flac', 1000, 'flac', 44100, 16, 'local'), \
+               (2, 'Deux', 10, 1, 1, 2, '/m/A/Disque/02.flac', 1000, 'flac', 44100, 16, 'local');",
+        )
+        .unwrap();
+    let app = crate::routes::router(state.clone());
+    let formats = |rail: &Value| -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = rail["format"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["value"].as_str().unwrap().to_string(),
+                    e["count"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let uri = "/api/v1/library/facets?fields=format";
+    assert_eq!(formats(&get(&app, uri).await), [("flac".to_string(), 2)]);
+    // Une copie MP3 de la piste 1 : repliée.
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, track_number, file_path, \
+               duration_ms, format, sample_rate, bit_depth, source) VALUES \
+               (3, 'Un', 10, 1, 1, 1, '/m/A/Disque/01.mp3', 1000, 'mp3', 44100, NULL, 'local');",
+        )
+        .unwrap();
+    assert_eq!(
+        formats(&get(&app, uri).await),
+        [("flac".to_string(), 2)],
+        "la copie MP3 ajoutée doit être repliée"
+    );
+    let cartes = get(&app, "/api/v1/library/albums-detailed").await;
+    assert_eq!(cartes["items"][0]["track_count"], 2, "{cartes}");
+    // L'original disparaît : la copie redevient la piste visible.
+    state
+        .backend
+        .execute_batch("DELETE FROM tracks WHERE id = 1;")
+        .unwrap();
+    assert_eq!(
+        formats(&get(&app, uri).await),
+        [("flac".to_string(), 1), ("mp3".to_string(), 1)],
+        "le socle gardé en mémoire ne doit pas survivre à l'écriture"
+    );
+    let cartes = get(&app, "/api/v1/library/albums-detailed").await;
+    assert_eq!(cartes["items"][0]["track_count"], 2, "{cartes}");
+}
