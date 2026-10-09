@@ -124,6 +124,26 @@ impl SocleResolu {
         }
     }
 
+    /// Le socle réduit aux albums masqués : ce que posent les requêtes du
+    /// rail compté par soustraction (#5993).
+    pub(super) fn masques_seuls() -> Self {
+        SocleResolu::Ecartees(Vec::new())
+    }
+
+    /// Les pistes repliées, en liste SQL d'entiers (`12,57,…`) ; `None` s'il
+    /// n'y en a aucune ou si le socle n'a pas pu être résolu.
+    fn liste_des_ecartees(&self) -> Option<String> {
+        match self {
+            SocleResolu::Ecartees(ids) if !ids.is_empty() => Some(
+                ids.iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            _ => None,
+        }
+    }
+
     /// Les prédicats du socle, alias `t`, sans marqueur.
     fn predicats(&self, engine: Engine) -> Vec<String> {
         match self {
@@ -556,7 +576,15 @@ pub(super) async fn library_facets(
 }
 
 /// Le corps de `GET /library/facets`, exécuté HORS de l'exécuteur async.
-fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
+pub(super) fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
+    // #5977 — le socle, résolu une fois pour toutes les facettes.
+    let socle = SocleResolu::resoudre(state);
+    compter_avec_le_socle(state, q, &socle)
+}
+
+/// [`compter_les_facettes`], le socle déjà résolu — séparé pour que le banc
+/// de #5993 mesure le même code avec et sans les replis.
+pub(super) fn compter_avec_le_socle(state: &AppState, q: FacetQuery, socle: &SocleResolu) -> Value {
     // `limit <= 0` means "no limit" (show every facet value); otherwise clamp to
     // a sane ceiling. Absent → the historical default of 200.
     let limit: Option<i64> = match q.limit {
@@ -581,47 +609,88 @@ fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|name| resolve_collection(state, name));
-    // #5977 — le socle, résolu une fois pour toutes les facettes.
-    let socle = SocleResolu::resoudre(state);
+    // #5993 — les pistes repliées, en liste SQL, une fois pour tout le rail.
+    let ecartees = socle.liste_des_ecartees();
     let mut out = serde_json::Map::new();
     for field in requested {
-        // Conditions narrow the count by the OTHER active facets (cumulative).
-        let (conds, params) = build_conditions(&q, engine, &field, coll.as_ref(), &socle);
         // The column / key is chosen from this fixed allow-list only, so the
         // formatted SQL below is never influenced by request input.
-        let rows: Vec<(String, i64)> = match field.as_str() {
-            "genre" => genre_facet(state, limit, &conds, &params),
-            "label" => column_facet(state, "label", limit, &conds, &params),
-            // Le classique se navigue par compositeur avant de se naviguer par
-            // artiste : colonne `tracks` directe, donc même facette de colonne.
-            "composer" => column_facet(state, "composer", limit, &conds, &params),
-            "year" => column_facet(state, "year", limit, &conds, &params),
-            "artist" => artist_facet(state, limit, &conds, &params),
-            // Technical dimensions an audiophile browses by (Bertrand): direct
-            // `tracks` columns, so a plain column facet — like genre/year.
-            "format" => column_facet(state, "format", limit, &conds, &params),
-            "sample_rate" => column_facet(state, "sample_rate", limit, &conds, &params),
-            "bit_depth" => column_facet(state, "bit_depth", limit, &conds, &params),
-            "country" => kv_facet(state, "release_country", limit, &conds, &params),
-            "mood" => kv_facet(state, "mood", limit, &conds, &params),
-            "source" => kv_facet(state, "source_media", limit, &conds, &params),
-            "rating" => rating_facet(state, limit, &conds, &params),
-            "collection" => collection_facet(state, &q, engine, &socle),
-            "original_year" => original_year_facet(state, limit, &conds, &params),
-            // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
-            // bibliothèque non taguée elle est vide, et une facette morte dans
-            // le rail coûte une requête pour ne rien montrer. Un client la
-            // demande explicitement (`fields=…,dr`).
-            "dr" => dr_facet(state, engine, limit, &conds, &params),
-            // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
-            // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
-            // tant que les crédits ne sont pas là, un client la demande
-            // explicitement (`fields=…,instrument`).
-            "instrument" => instrument_facet(state, engine, limit, &conds, &params),
-            "favorite" => favorite_facet(state, &conds, &params),
-            "playlist" => playlist_facet(state, limit, &conds, &params),
-            "untagged" => untagged_facet(state, &conds, &params),
-            _ => continue,
+        let compter = |conds: &[String],
+                       params: &[SqlValue],
+                       limit: Option<i64>|
+         -> Option<Vec<(String, i64)>> {
+            Some(match field.as_str() {
+                "genre" => genre_facet(state, limit, conds, params),
+                "label" => column_facet(state, "label", limit, conds, params),
+                // Le classique se navigue par compositeur avant de se naviguer par
+                // artiste : colonne `tracks` directe, donc même facette de colonne.
+                "composer" => column_facet(state, "composer", limit, conds, params),
+                "year" => column_facet(state, "year", limit, conds, params),
+                "artist" => artist_facet(state, limit, conds, params),
+                // Technical dimensions an audiophile browses by (Bertrand): direct
+                // `tracks` columns, so a plain column facet — like genre/year.
+                "format" => column_facet(state, "format", limit, conds, params),
+                "sample_rate" => column_facet(state, "sample_rate", limit, conds, params),
+                "bit_depth" => column_facet(state, "bit_depth", limit, conds, params),
+                "country" => kv_facet(state, "release_country", limit, conds, params),
+                "mood" => kv_facet(state, "mood", limit, conds, params),
+                "source" => kv_facet(state, "source_media", limit, conds, params),
+                "rating" => rating_facet(state, limit, conds, params),
+                "collection" => collection_facet(state, &q, engine, socle),
+                "original_year" => original_year_facet(state, limit, conds, params),
+                // Dynamic Range (#2144). Absente du jeu par DÉFAUT : sur une
+                // bibliothèque non taguée elle est vide, et une facette morte dans
+                // le rail coûte une requête pour ne rien montrer. Un client la
+                // demande explicitement (`fields=…,dr`).
+                "dr" => dr_facet(state, engine, limit, conds, params),
+                // Instrument (CRD-6) : vient de `track_credits`, remplie par la passe
+                // automatique (CRD-5). Comme `dr`, absente du jeu par défaut : vide
+                // tant que les crédits ne sont pas là, un client la demande
+                // explicitement (`fields=…,instrument`).
+                "instrument" => instrument_facet(state, engine, limit, conds, params),
+                "favorite" => favorite_facet(state, conds, params),
+                "playlist" => playlist_facet(state, limit, conds, params),
+                "untagged" => untagged_facet(state, conds, params),
+                _ => return None,
+            })
+        };
+        // Conditions narrow the count by the OTHER active facets (cumulative).
+        let rows: Vec<(String, i64)> = match (&ecartees, field.as_str()) {
+            // #5993 — le rail compte PAR SOUSTRACTION : chaque requête ne pose
+            // que les albums masqués, et l'on retranche ce que comptent les
+            // seules pistes repliées (`t.id IN (…)`, quelques milliers de
+            // lectures par clé primaire). Poser `t.id NOT IN (…)` coûtait une
+            // sonde par piste de la bibliothèque, dans chaque requête : +29 à
+            // 34 % sur le rail d'Oxygen (#5977). Les effectifs sont additifs
+            // sur des pistes disjointes — `COUNT(*)` comme
+            // `COUNT(DISTINCT track_id)` —, la différence est donc EXACTE.
+            // La facette Collections garde le socle complet : elle compte
+            // ailleurs, collection par collection.
+            (Some(liste), f) if f != "collection" => {
+                let (conds, params) = build_conditions(
+                    &q,
+                    engine,
+                    &field,
+                    coll.as_ref(),
+                    &SocleResolu::masques_seuls(),
+                );
+                let mut parmi_les_ecartees = conds.clone();
+                parmi_les_ecartees.push(format!("t.id IN ({liste})"));
+                let (Some(tout), Some(retrait)) = (
+                    compter(&conds, &params, None),
+                    compter(&parmi_les_ecartees, &params, None),
+                ) else {
+                    continue;
+                };
+                soustraire_les_ecartees(tout, retrait, ordre_de_la_facette(f), limit)
+            }
+            _ => {
+                let (conds, params) = build_conditions(&q, engine, &field, coll.as_ref(), socle);
+                match compter(&conds, &params, limit) {
+                    Some(rows) => rows,
+                    None => continue,
+                }
+            }
         };
         let arr: Vec<Value> = rows
             .into_iter()
@@ -630,6 +699,74 @@ fn compter_les_facettes(state: &AppState, q: FacetQuery) -> Value {
         out.insert(field, Value::Array(arr));
     }
     Value::Object(out)
+}
+
+/// L'ordre dans lequel une facette rend ses valeurs — celui de son `ORDER BY`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum OrdreDeFacette {
+    /// Effectif décroissant (`ORDER BY n DESC`).
+    Effectif,
+    /// Effectif décroissant, puis valeur croissante (instrument).
+    EffectifPuisValeur,
+    /// L'ordre de la requête, indépendant des effectifs (année d'origine, DR,
+    /// note : par valeur décroissante ; favoris, étiquettes manquantes : fixe).
+    TelQuel,
+}
+
+fn ordre_de_la_facette(field: &str) -> OrdreDeFacette {
+    match field {
+        "original_year" | "dr" | "rating" | "favorite" | "untagged" => OrdreDeFacette::TelQuel,
+        "instrument" => OrdreDeFacette::EffectifPuisValeur,
+        _ => OrdreDeFacette::Effectif,
+    }
+}
+
+/// #5993 — `tout` (le jeu sans les deux replis) moins `retrait` (les seules
+/// pistes repliées), puis l'ordre et la troncature que la requête aurait
+/// appliqués. Les deux listes sont comptées SANS `LIMIT` : retrancher après
+/// coup d'une liste tronquée perdrait une valeur qui remonte dans le classement.
+///
+/// Une valeur de `retrait` se retrouve dans `tout` à l'identique ; sinon, sans
+/// la casse — les facettes qui fusionnent les casses (`fusionner_les_casses`)
+/// peuvent retenir une autre orthographe pour le même groupe. Une valeur
+/// tombée à zéro disparaît, comme une valeur absente de la requête directe.
+pub(super) fn soustraire_les_ecartees(
+    tout: Vec<(String, i64)>,
+    retrait: Vec<(String, i64)>,
+    ordre: OrdreDeFacette,
+    limit: Option<i64>,
+) -> Vec<(String, i64)> {
+    let mut sortie = tout;
+    let exact: std::collections::HashMap<String, usize> = sortie
+        .iter()
+        .enumerate()
+        .map(|(i, (v, _))| (v.clone(), i))
+        .collect();
+    let sans_casse: std::collections::HashMap<String, usize> = sortie
+        .iter()
+        .enumerate()
+        .map(|(i, (v, _))| (v.to_lowercase(), i))
+        .collect();
+    for (valeur, n) in retrait {
+        if let Some(&i) = exact
+            .get(&valeur)
+            .or_else(|| sans_casse.get(&valeur.to_lowercase()))
+        {
+            sortie[i].1 -= n;
+        }
+    }
+    sortie.retain(|(_, n)| *n > 0);
+    match ordre {
+        OrdreDeFacette::Effectif => sortie.sort_by_key(|e| std::cmp::Reverse(e.1)),
+        OrdreDeFacette::EffectifPuisValeur => {
+            sortie.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))
+        }
+        OrdreDeFacette::TelQuel => {}
+    }
+    if let Some(n) = limit {
+        sortie.truncate(n.max(0) as usize);
+    }
+    sortie
 }
 
 /// Une entrée `{ value, count }` du rail, enrichie pour les deux facettes

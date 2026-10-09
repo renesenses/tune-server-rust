@@ -286,3 +286,77 @@ fn le_socle_resolu_et_le_socle_en_sql_comptent_pareil() {
         assert_eq!(compte("Jazz"), Some(2), "{rows:?}");
     }
 }
+
+/// #5993 — le rail compte PAR SOUSTRACTION (jeu sans les replis, moins les
+/// seules pistes repliées). Il doit rendre, facette par facette, les MÊMES
+/// effectifs que le socle complet posé dans chaque requête — avec et sans
+/// plafond de valeurs, avec et sans facette cochée.
+#[test]
+fn le_rail_par_soustraction_compte_comme_le_socle_complet() {
+    use super::{FacetQuery, SocleResolu, compter_avec_le_socle, compter_les_facettes};
+    use std::collections::BTreeMap;
+    let (_app, state) = bibliotheque();
+    // Des valeurs dont l'effectif tombe à zéro une fois les replis retirés
+    // (le format `mp3`, le label de la jumelle distante) et des casses mêlées.
+    state
+        .backend
+        .execute_batch(
+            "UPDATE tracks SET label = 'Distant Label' WHERE source = 'upnp';\n\
+             UPDATE tracks SET label = 'Northern' WHERE album_id = 10 AND format = 'flac';\n\
+             UPDATE tracks SET label = 'NORTHERN' WHERE album_id = 10 AND format = 'mp3';\n\
+             UPDATE tracks SET composer = 'X' WHERE album_id = 13;",
+        )
+        .unwrap();
+    const CHAMPS: &str = "genre,label,year,artist,format,sample_rate,bit_depth,composer,\
+                          country,mood,source,rating,original_year,dr,instrument,favorite,\
+                          playlist,untagged";
+    let par_valeur = |v: &Value| -> BTreeMap<String, BTreeMap<String, i64>> {
+        v.as_object()
+            .unwrap()
+            .iter()
+            .map(|(champ, entrees)| {
+                let m = entrees
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| {
+                        (
+                            e["value"].as_str().unwrap().to_lowercase(),
+                            e["count"].as_i64().unwrap(),
+                        )
+                    })
+                    .collect();
+                (champ.clone(), m)
+            })
+            .collect()
+    };
+    for (limite, brut) in [
+        (200, String::new()),
+        (1, String::new()),
+        (200, format!("genre={}", GENRE.replace(' ', "%20"))),
+    ] {
+        let q = || {
+            FacetQuery {
+                fields: Some(CHAMPS.to_string()),
+                limit: Some(limite),
+                ..Default::default()
+            }
+            .hydrate(Some(&brut))
+            .ok()
+            .expect("requête")
+        };
+        let par_soustraction = compter_les_facettes(&state, q());
+        let socle_complet = compter_avec_le_socle(&state, q(), &SocleResolu::EnSql);
+        assert_eq!(
+            par_valeur(&par_soustraction),
+            par_valeur(&socle_complet),
+            "{brut}"
+        );
+        // Le rail par soustraction écarte bien quelque chose ici : sans
+        // replis, `format` compterait aussi le mp3.
+        assert!(
+            par_soustraction["format"].as_array().unwrap().len() == 1,
+            "{brut}"
+        );
+    }
+}
