@@ -401,11 +401,16 @@ impl LibrespotDaemon {
         if let Some(script) = self.preparer_le_script() {
             args.extend(["--onevent".into(), script]);
         }
-        if let Some(jeton) = jeton {
-            args.extend(["--access-token".into(), jeton.to_string()]);
-        }
         let binaire = self.binaire();
-        let mut proc = Command::new(&binaire)
+        let mut commande = Command::new(&binaire);
+        // Le jeton OAuth ne passe JAMAIS par les arguments, que `ps` montre à
+        // tous les comptes de la machine : librespot lit chaque option aussi
+        // dans `LIBRESPOT_<OPTION>`, et masque celle-ci dans ses traces.
+        match jeton {
+            Some(jeton) => commande.env("LIBRESPOT_ACCESS_TOKEN", jeton),
+            None => commande.env_remove("LIBRESPOT_ACCESS_TOKEN"),
+        };
+        let mut proc = commande
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

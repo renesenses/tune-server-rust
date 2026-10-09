@@ -125,11 +125,43 @@ pub fn identifiant_de_piste(source_id: &str) -> &str {
 pub struct FournisseurSpotify {
     recepteur: Arc<SpotifyConnectManager>,
     pilote: Arc<dyn PiloteSpotify>,
+    autorisee: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// Le réglage persistant « Lecture Spotify (expérimental) », désactivé par
+/// défaut (décision de Bertrand, 09/10) : librespot n'est pas un client
+/// officiel de Spotify.
+pub const CLE_REGLAGE: &str = "spotify_lecture_experimentale";
+
+/// Préfixe du refus « option non activée », reconnu par la route de lecture
+/// qui le rend en 409 avec un code stable (`spotify_playback_disabled`).
+pub const SENTINELLE_NON_ACTIVEE: &str = "spotify_playback_disabled:";
+
+pub const MOTIF_NON_ACTIVEE: &str =
+    "Lecture Spotify non activée (option expérimentale dans les Réglages)";
+
+/// Le réglage est-il activé ? Absent ou illisible : non.
+pub fn lecture_activee(db: &Arc<dyn crate::db::backend::DbBackend>) -> bool {
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(CLE_REGLAGE)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
 }
 
 impl FournisseurSpotify {
-    pub fn new(recepteur: Arc<SpotifyConnectManager>, pilote: Arc<dyn PiloteSpotify>) -> Self {
-        Self { recepteur, pilote }
+    /// `autorisee` est relue à CHAQUE ouverture : le réglage s'applique sans
+    /// redémarrer le serveur.
+    pub fn new(
+        recepteur: Arc<SpotifyConnectManager>,
+        pilote: Arc<dyn PiloteSpotify>,
+        autorisee: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            recepteur,
+            pilote,
+            autorisee,
+        }
     }
 }
 
@@ -137,6 +169,11 @@ impl FournisseurPcm for FournisseurSpotify {
     fn ouvrir(&self, source_id: &str, depuis_ms: u64) -> Result<FluxPcm, String> {
         // Appelé depuis un fil bloquant de l'orchestrateur : on y attend les
         // appels asynchrones sur le runtime qui l'a lancé.
+        // Option expérimentale désactivée : refus propre, AVANT de toucher à
+        // librespot ou à l'API Web.
+        if !(self.autorisee)() {
+            return Err(format!("{SENTINELLE_NON_ACTIVEE}{MOTIF_NON_ACTIVEE}"));
+        }
         let rt = tokio::runtime::Handle::current();
         let piste = identifiant_de_piste(source_id).to_string();
         if piste.is_empty() {
@@ -265,6 +302,7 @@ pub(crate) mod essais {
     const FAUX_LIBRESPOT: &str = r#"#!/bin/sh
 D=$(dirname "$0")
 printf '%s\n' "$*" > "$D/args"
+printf '%s' "$LIBRESPOT_ACCESS_TOKEN" > "$D/jeton"
 EV=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -295,8 +333,18 @@ done
         pub fn args(&self) -> String {
             std::fs::read_to_string(self.dossier.path().join("args")).unwrap_or_default()
         }
+        pub fn jeton_recu(&self) -> String {
+            std::fs::read_to_string(self.dossier.path().join("jeton")).unwrap_or_default()
+        }
         pub fn fournisseur(&self) -> FournisseurSpotify {
-            FournisseurSpotify::new(self.recepteur.clone(), self.pilote.clone())
+            self.fournisseur_autorise(true)
+        }
+        pub fn fournisseur_autorise(&self, autorisee: bool) -> FournisseurSpotify {
+            FournisseurSpotify::new(
+                self.recepteur.clone(),
+                self.pilote.clone(),
+                Arc::new(move || autorisee),
+            )
         }
     }
 
@@ -406,17 +454,73 @@ done
             "l'API Web désigne l'appareil librespot et le titre"
         );
         let args = b.args();
-        for attendu in [
-            "--backend pipe",
-            "--access-token jeton-essai",
-            "--autoplay off",
-            "--onevent",
-        ] {
+        for attendu in ["--backend pipe", "--autoplay off", "--onevent"] {
             assert!(
                 args.contains(attendu),
                 "librespot lancé sans « {attendu} » : {args}"
             );
         }
+    }
+
+    /// Le jeton OAuth ne doit JAMAIS figurer dans les arguments de librespot :
+    /// `ps` les montre à tous les comptes de la machine. Il passe par
+    /// `LIBRESPOT_ACCESS_TOKEN`, que librespot lit comme `--access-token`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_6018_le_jeton_n_apparait_pas_dans_les_arguments() {
+        let b = banc(1000, OCTETS_PAR_SECONDE as u64);
+        let f = b.fournisseur();
+        tokio::task::spawn_blocking(move || ouvrir(f, "piste", 0))
+            .await
+            .unwrap();
+        let args = b.args();
+        assert!(!args.is_empty(), "le faux librespot n'a pas été lancé");
+        assert!(
+            !args.contains("jeton-essai") && !args.contains("--access-token"),
+            "le jeton OAuth est visible dans les arguments de librespot (ps) : {args}"
+        );
+        assert_eq!(
+            b.jeton_recu(),
+            "jeton-essai",
+            "librespot doit recevoir le jeton par LIBRESPOT_ACCESS_TOKEN"
+        );
+    }
+
+    /// Option expérimentale désactivée (le défaut) : refus PROPRE, avec la
+    /// sentinelle que la route rend en 409 ; ni librespot ni l'API Web ne
+    /// sont touchés.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_6018_lecture_non_activee_refusee_proprement() {
+        let b = banc(1000, OCTETS_PAR_SECONDE as u64);
+        let f = b.fournisseur_autorise(false);
+        let refus = tokio::task::spawn_blocking(move || f.ouvrir("piste", 0).err())
+            .await
+            .unwrap()
+            .expect("la lecture doit être refusée tant que l'option est désactivée");
+        assert!(
+            refus.starts_with(SENTINELLE_NON_ACTIVEE) && refus.contains(MOTIF_NON_ACTIVEE),
+            "{refus}"
+        );
+        assert!(b.pilote.lancements.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            b.args().is_empty(),
+            "librespot lancé alors que l'option est désactivée"
+        );
+    }
+
+    /// Le réglage est désactivé par défaut et se lit en base.
+    #[test]
+    fn spotify_6018_le_reglage_est_desactive_par_defaut() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+        assert!(!lecture_activee(&db), "désactivé par défaut");
+        let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+        reglages.set(CLE_REGLAGE, "true").unwrap();
+        assert!(lecture_activee(&db));
+        reglages.set(CLE_REGLAGE, "false").unwrap();
+        assert!(!lecture_activee(&db));
     }
 
     /// librespot finit un peu avant la durée de l'API Web : le flux est

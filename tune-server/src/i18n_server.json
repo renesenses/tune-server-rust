@@ -2358,5 +2358,17 @@
     "ko": "앰비언트",
     "ro": "Ambient",
     "sv": "Ambient"
+  },
+  "spotify.playback.disabled": {
+    "fr": "Lecture Spotify non activée (option expérimentale dans les Réglages).",
+    "en": "Spotify playback is not enabled (experimental option in Settings).",
+    "de": "Spotify-Wiedergabe ist nicht aktiviert (experimentelle Option in den Einstellungen).",
+    "es": "La reproducción de Spotify no está activada (opción experimental en Ajustes).",
+    "it": "La riproduzione Spotify non è attivata (opzione sperimentale nelle Impostazioni).",
+    "zh": "Spotify 播放未启用（设置中的实验性选项）。",
+    "ja": "Spotify の再生は有効になっていません（設定の試験的オプション）。",
+    "ko": "Spotify 재생이 활성화되지 않았습니다(설정의 실험적 옵션).",
+    "ro": "Redarea Spotify nu este activată (opțiune experimentală în Setări).",
+    "sv": "Spotify-uppspelning är inte aktiverad (experimentellt alternativ i Inställningar)."
   }
 }

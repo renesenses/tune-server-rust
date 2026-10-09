@@ -18,6 +18,48 @@ pub fn router() -> Router<AppState> {
         .route("/disable", post(disable_connect))
         .route("/devices", get(list_connect_devices))
         .route("/transfer", post(transfer_playback))
+        .route("/lecture-experimentale", post(regler_lecture_experimentale))
+}
+
+/// Le statut du récepteur, plus l'état du réglage « Lecture Spotify
+/// (expérimental) » (#6018), que le récepteur ne connaît pas.
+async fn statut_complet(state: &AppState) -> Value {
+    let mut statut = state.spotify_connect.status().await;
+    if let Some(objet) = statut.as_object_mut() {
+        objet.insert(
+            "lecture_experimentale".into(),
+            Value::Bool(tune_core::streaming::spotify_lecture::lecture_activee(
+                &state.backend,
+            )),
+        );
+    }
+    statut
+}
+
+#[derive(Deserialize)]
+struct CorpsLectureExperimentale {
+    enabled: bool,
+}
+
+/// #6018 — active ou désactive la lecture Spotify par librespot. Désactivée
+/// par défaut : librespot n'est pas un client officiel de Spotify.
+async fn regler_lecture_experimentale(
+    State(state): State<AppState>,
+    Json(corps): Json<CorpsLectureExperimentale>,
+) -> impl IntoResponse {
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = reglages.set(
+        tune_core::streaming::spotify_lecture::CLE_REGLAGE,
+        if corps.enabled { "true" } else { "false" },
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("réglage non enregistré : {e}")})),
+        )
+            .into_response();
+    }
+    info!(enabled = corps.enabled, "spotify_lecture_experimentale");
+    Json(statut_complet(&state).await).into_response()
 }
 
 async fn spotify_token(state: &AppState) -> Option<String> {
@@ -30,7 +72,7 @@ async fn spotify_token(state: &AppState) -> Option<String> {
 }
 
 async fn connect_status(State(state): State<AppState>) -> Json<Value> {
-    Json(state.spotify_connect.status().await)
+    Json(statut_complet(&state).await)
 }
 
 #[derive(Deserialize)]
@@ -50,7 +92,7 @@ async fn enable_connect(
     }
 
     if let Err(e) = state.spotify_connect.enable(zone_id).await {
-        let mut status = state.spotify_connect.status().await;
+        let mut status = statut_complet(&state).await;
         if let Some(object) = status.as_object_mut() {
             object.insert("error".into(), Value::String(e));
         }
@@ -63,7 +105,7 @@ async fn enable_connect(
         .set("spotify_connect_zone_id", &zone_id.to_string())
         .ok();
 
-    Json(state.spotify_connect.status().await)
+    Json(statut_complet(&state).await)
 }
 
 async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
@@ -72,7 +114,7 @@ async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("spotify_connect_enabled", "false").ok();
 
-    Json(state.spotify_connect.status().await)
+    Json(statut_complet(&state).await)
 }
 
 async fn list_connect_devices(State(state): State<AppState>) -> impl IntoResponse {
@@ -174,5 +216,81 @@ pub async fn auto_start(state: &AppState) {
     match state.spotify_connect.enable(zone_id).await {
         Ok(()) => info!(zone_id, "spotify_connect_auto_started"),
         Err(e) => info!(error = %e, "spotify_connect_auto_start_failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use crate::state::AppState;
+
+    async fn appel(
+        app: &axum::Router,
+        methode: &str,
+        chemin: &str,
+        corps: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(methode)
+            .uri(chemin)
+            .header("content-type", "application/json")
+            .body(
+                corps
+                    .map(|c| Body::from(c.to_string()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap();
+        let rep = app.clone().oneshot(req).await.unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            statut,
+            serde_json::from_slice(&octets).unwrap_or(Value::Null),
+        )
+    }
+
+    /// #6018 — « Lecture Spotify (expérimental) » : désactivée par défaut,
+    /// annoncée dans le statut, persistée par sa route.
+    #[tokio::test]
+    async fn spotify_6018_le_reglage_experimental_se_lit_et_s_ecrit() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let db = state.backend.clone();
+        let app = crate::routes::router_with_plugins(state, Vec::new());
+        let (statut, corps) = appel(&app, "GET", "/api/v1/spotify-connect/status", None).await;
+        assert_eq!(statut, StatusCode::OK);
+        assert_eq!(
+            corps["lecture_experimentale"], false,
+            "désactivée par défaut : {corps}"
+        );
+
+        let (statut, corps) = appel(
+            &app,
+            "POST",
+            "/api/v1/spotify-connect/lecture-experimentale",
+            Some(serde_json::json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(corps["lecture_experimentale"], true);
+        assert!(
+            tune_core::streaming::spotify_lecture::lecture_activee(&db),
+            "persistée"
+        );
+
+        let (_, corps) = appel(
+            &app,
+            "POST",
+            "/api/v1/spotify-connect/lecture-experimentale",
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(corps["lecture_experimentale"], false);
+        assert!(!tune_core::streaming::spotify_lecture::lecture_activee(&db));
     }
 }

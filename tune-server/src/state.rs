@@ -514,6 +514,14 @@ impl AppState {
                             services.clone(),
                         ),
                     ),
+                    // Option expérimentale, désactivée par défaut : relue à
+                    // chaque ouverture de titre.
+                    {
+                        let db = backend.clone();
+                        Arc::new(move || {
+                            tune_core::streaming::spotify_lecture::lecture_activee(&db)
+                        })
+                    },
                 ),
             ),
         );
