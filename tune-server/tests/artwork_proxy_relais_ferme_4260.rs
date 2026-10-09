@@ -867,3 +867,261 @@ async fn l_exemption_didl_ne_profite_pas_du_serveur_decouvert_4954() {
     assert_ne!(statut, StatusCode::OK);
     assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// #4895 — la pochette d'un serveur multimédia TIERS du réseau local (UPnP),
+// hors bibliothèque : lecture en cours, file d'attente. Admise si — et
+// seulement si — l'hôte:port de l'URL est EXACTEMENT celui d'un serveur du
+// registre SSDP courant, revérifié à chaque saut de redirection ; réponse
+// `image/…` exigée.
+// ---------------------------------------------------------------------------
+
+/// Un serveur multimédia tiers du banc : une pochette sur un chemin à lui, des
+/// redirections, une réponse texte. Compte TOUT ce qu'il reçoit.
+async fn amont_upnp() -> Amont {
+    let requetes = Arc::new(AtomicUsize::new(0));
+    let c = |r: &Arc<AtomicUsize>| {
+        let r = r.clone();
+        move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let (c1, c2, c3, c4, c5, c6) = (
+        c(&requetes),
+        c(&requetes),
+        c(&requetes),
+        c(&requetes),
+        c(&requetes),
+        c(&requetes),
+    );
+    let app = Router::new()
+        .route(
+            "/cover/1.jpg",
+            get(move || {
+                c1();
+                async { ([(header::CONTENT_TYPE, "image/jpeg")], POCHETTE) }
+            }),
+        )
+        // Redirection vers une autre adresse du réseau local, hors registre.
+        .route(
+            "/vers-ailleurs",
+            get(move || {
+                c2();
+                async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "http://192.168.1.77:9000/cover/1.jpg")],
+                    )
+                }
+            }),
+        )
+        // Redirection relative, même hôte:port : suivie.
+        .route(
+            "/vers-cover",
+            get(move || {
+                c3();
+                async { (StatusCode::FOUND, [(header::LOCATION, "/cover/1.jpg")]) }
+            }),
+        )
+        // Même hôte, AUTRE port.
+        .route(
+            "/vers-autre-port",
+            get(move || {
+                c4();
+                async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "http://127.0.0.1:1/cover/1.jpg")],
+                    )
+                }
+            }),
+        )
+        .route(
+            "/page.txt",
+            get(move || {
+                c5();
+                async { ([(header::CONTENT_TYPE, "text/plain")], "pas une image") }
+            }),
+        )
+        .fallback(move || {
+            c6();
+            async { "secret interne".into_response() }
+        });
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port libre");
+    let port = ecoute.local_addr().expect("adresse locale").port();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    Amont { port, requetes }
+}
+
+/// LE témoin de #4895 : la pochette d'un serveur au registre est relayée.
+#[tokio::test]
+async fn la_pochette_d_un_serveur_multimedia_au_registre_est_relayee_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    let url = format!("http://127.0.0.1:{}/cover/1.jpg", amont.port);
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::OK, "{}", texte(&corps));
+    assert_eq!(corps, POCHETTE);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
+}
+
+/// Une redirection vers le même hôte:port est suivie (revérifiée, admise).
+#[tokio::test]
+async fn une_redirection_vers_le_meme_serveur_est_suivie_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    let url = format!("http://127.0.0.1:{}/vers-cover", amont.port);
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::OK, "{}", texte(&corps));
+    assert_eq!(corps, POCHETTE);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 2);
+}
+
+/// Même hôte, autre port que celui du registre ⇒ refus, rien ne part.
+#[tokio::test]
+async fn le_meme_hote_sur_un_autre_port_est_refuse_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port.wrapping_add(1)).await;
+    let app = app(&state, DISTANT);
+
+    let url = format!("http://127.0.0.1:{}/cover/1.jpg", amont.port);
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{}", texte(&corps));
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Une adresse du réseau local hors registre ⇒ refus, rien ne part — pas un
+/// sous-réseau entier.
+#[tokio::test]
+async fn une_ip_locale_hors_registre_est_refusee_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    for url in [
+        format!("http://192.168.1.50:{}/cover/1.jpg", amont.port),
+        "http://10.0.0.8/cover/1.jpg".to_string(),
+    ] {
+        let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{url} : {}", texte(&corps));
+    }
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Une redirection vers une adresse hors registre — autre IP ou même IP sur
+/// un autre port — est refusée : seul le premier saut a touché l'amont.
+#[tokio::test]
+async fn une_redirection_hors_registre_est_refusee_4895() {
+    for chemin_amont in ["/vers-ailleurs", "/vers-autre-port"] {
+        let amont = amont_upnp().await;
+        let state = etat_avec_relais_lan();
+        decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+        let app = app(&state, DISTANT);
+
+        let url = format!("http://127.0.0.1:{}{chemin_amont}", amont.port);
+        let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "{chemin_amont} : {}",
+            texte(&corps)
+        );
+        assert!(amont.requetes.load(Ordering::SeqCst) <= 1, "{chemin_amont}");
+    }
+}
+
+/// Un serveur sorti du registre ⇒ sa pochette est refusée de nouveau.
+#[tokio::test]
+async fn un_serveur_sorti_du_registre_est_refuse_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+    let url = format!("http://127.0.0.1:{}/cover/1.jpg", amont.port);
+    let (statut, _) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::OK);
+
+    state.media_servers.lock().await.clear();
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{}", texte(&corps));
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
+}
+
+/// Un serveur au registre mais dont la fenêtre `max-age` est écoulée ⇒ refusé.
+#[tokio::test]
+async fn un_serveur_expire_est_refuse_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    // Un `Instant` dans le passé n'existe pas toujours (machine démarrée
+    // récemment) : le test ne prouve rien alors, et le dit.
+    let Some(vieux) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(7200))
+    else {
+        eprintln!("horloge monotone trop jeune : test d'expiration sauté");
+        return;
+    };
+    for s in state.media_servers.lock().await.values_mut() {
+        s.last_seen = vieux;
+    }
+    let app = app(&state, DISTANT);
+    let url = format!("http://127.0.0.1:{}/cover/1.jpg", amont.port);
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{}", texte(&corps));
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Une réponse qui n'est pas une image n'est pas relayée.
+#[tokio::test]
+async fn une_reponse_qui_n_est_pas_une_image_n_est_pas_relayee_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    for chemin_amont in ["/page.txt", "/secret"] {
+        let url = format!("http://127.0.0.1:{}{chemin_amont}", amont.port);
+        let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+        assert_ne!(statut, StatusCode::OK, "{chemin_amont}");
+        assert!(!texte(&corps).contains("secret interne"));
+        assert!(!texte(&corps).contains("pas une image"));
+    }
+}
+
+/// Ni un autre schéma, ni des identifiants, ni l'API d'un serveur découvert,
+/// ni par l'exemption DIDL.
+#[tokio::test]
+async fn les_cas_hors_regle_restent_refuses_4895() {
+    let amont = amont_upnp().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app_web = app(&state, DISTANT);
+    for url in [
+        format!("http://u:p@127.0.0.1:{}/cover/1.jpg", amont.port),
+        format!("http://127.0.0.1:{}/api/v1/system/profile", amont.port),
+        format!("http://127.0.0.1:{}/API/v1/zones", amont.port),
+        format!("ftp://127.0.0.1:{}/cover/1.jpg", amont.port),
+    ] {
+        let (statut, _) = appel(&app_web, &chemin_relais(&url), None).await;
+        assert_ne!(statut, StatusCode::OK, "{url}");
+    }
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+
+    enable_auth(&state);
+    let app_didl = app(&state, RENDERER_LAN);
+    let url = format!("http://127.0.0.1:{}/cover/1.jpg", amont.port);
+    let (statut, _) = appel(&app_didl, &chemin_relais(&url), None).await;
+    assert_ne!(statut, StatusCode::OK);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}

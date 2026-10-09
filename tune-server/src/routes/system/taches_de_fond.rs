@@ -177,6 +177,10 @@ pub(crate) fn instantane(state: &AppState) -> Value {
         // #5168 — le rattrapage des rapports `foo_dr.txt` : tourne-t-il, et
         // qu'a fait son dernier passage.
         "dynamic_range_sidecar": tune_core::taches_de_fond::rapports_dr::releve(),
+        // #4805 (idée 4) — l'identification par empreinte AcoustID peut-elle
+        // tourner ? Sans `fpcalc` (Tune OS aujourd'hui) ou sans clé, la passe
+        // est désactivée et ce bloc dit pourquoi, pour l'écran Santé.
+        "acoustid": crate::routes::library::identification_lot::acoustid::disponibilite(state),
     })
 }
 

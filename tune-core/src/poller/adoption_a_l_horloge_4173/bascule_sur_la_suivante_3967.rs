@@ -58,6 +58,15 @@ impl Banc {
         mock.bascule_honoree(honore);
     }
 
+    /// `GetMediaInfo` ne dit plus rien pendant la surveillance.
+    async fn le_transport_se_tait(&self) {
+        let reg = self.outputs.lock().await;
+        let arc = reg.get(APPAREIL).unwrap();
+        let sortie = arc.lock().await;
+        let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        mock.transport_muet(true);
+    }
+
     /// Combien de `Next` sont partis vers l'appareil.
     async fn bascules(&self) -> u64 {
         let reg = self.outputs.lock().await;
@@ -142,8 +151,8 @@ async fn l_appareil_qui_tient_la_suivante_bascule_sans_aucune_relance() {
 
 /// **La contre-épreuve, celle qui doit rester verte quoi qu'il arrive.**
 /// L'appareil a promis — il nommait la suivante, il déclarait `Next` — et il
-/// ACQUITTE le `Next` sans bouger d'un millisecondes. Passé les trois
-/// sondages, le repli d'aujourd'hui reprend **sur la piste adoptée** : la
+/// ACQUITTE le `Next` sans bouger d'un millisecondes, et son transport le dit
+/// (#4382, rc2). Le repli reprend **sur la piste adoptée** : la
 /// file ne saute aucun titre, et le silence n'est pas définitif.
 #[tokio::test]
 async fn l_appareil_qui_acquitte_le_next_sans_l_honorer_retombe_sur_le_repli() {
@@ -162,28 +171,16 @@ async fn l_appareil_qui_acquitte_le_next_sans_l_honorer_retombe_sur_le_repli() {
         "le `Next` vient de partir : on lui laisse ses trois sondages"
     );
 
-    // Un sondage dans le délai : l'appareil est toujours figé, on attend.
+    // #4382 (rc2) — au premier sondage, l'appareil est toujours figé et son
+    // transport DÉCLARE la suivante encore en attente : rien à attendre de
+    // plus, le repli part tout de suite.
     banc.renderer_a(POSITION_GELEE_MS, 1).await;
-    banc.tic().await;
-    assert!(banc.surveillance().is_some(), "dans le délai, on attend");
-    assert_eq!(banc.play_complets().await, Vec::<String>::new());
-
-    // Le délai est écoulé (horloge injectée), l'appareil n'a jamais bougé.
-    banc.poll_states
-        .get_mut(&banc.zone_id)
-        .unwrap()
-        .adoption_horloge
-        .as_mut()
-        .unwrap()
-        .depuis = Instant::now() - Duration::from_secs(BASCULE_DELAI_SECS + 1);
-    banc.renderer_a(POSITION_GELEE_MS, BASCULE_DELAI_SECS + 1)
-        .await;
     banc.tic().await;
 
     assert_eq!(
         banc.play_complets().await,
         vec![ARMEE.to_string()],
-        "sans signe de vie, le repli relance la piste ADOPTÉE — le comportement d'avant"
+        "sans signe de vie, le repli relance la piste ADOPTÉE"
     );
     let (position, titre, _) = banc.ecran().await;
     assert_eq!(
@@ -519,6 +516,10 @@ async fn chaque_sondage_de_la_fenetre_d_une_bascule_ignoree_lit_le_transport() {
     banc.l_appareil_dit_de_la_suivante(SuivantePreparee::Tenue)
         .await;
     banc.l_appareil_honore_le_next(false).await;
+    // #4382 (rc2) — un transport qui DÉCLARE la suivante toujours en attente
+    // fait relancer au premier sondage (`blanc_du_dmp_a6_rc2_4382`). Ici il
+    // se tait : la fenêtre garde son délai, et chaque sondage lit quand même.
+    banc.le_transport_se_tait().await;
     let (flux, _) = banc.armer().await;
     banc.la_signature_du_dmp_a6(&flux).await;
     banc.la_fin_a_l_horloge().await;

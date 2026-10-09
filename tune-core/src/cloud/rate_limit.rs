@@ -13,6 +13,11 @@ use crate::db::settings_repo::SettingsRepo;
 
 const PREFIX: &str = "cloud_rate_limit_until:";
 
+/// Fenêtre du limiteur de `GET /api/v1/user` côté mozaiklabs : trente
+/// requêtes par minute. Un refus propre à cette route ne peut donc pas
+/// annoncer plus de soixante secondes d'attente.
+pub const FENETRE_PROFIL_COMPTE_S: u64 = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudScope {
     Telemetry,
@@ -75,6 +80,25 @@ impl CloudScope {
         }
     }
 
+    /// Le plus long délai qu'un refus de CETTE route peut légitimement
+    /// annoncer, quand on le connaît.
+    ///
+    /// Un `Retry-After` plus long ne relève pas du plafond de cette route. Le
+    /// mémoriser bloquerait la connexion au compte bien au-delà de ce que la
+    /// route impose — et, la persistance survivant aux redémarrages, chaque
+    /// nouvel essai serait refusé sans même partir. Un tel délai n'est donc
+    /// ni mémorisé, ni relu.
+    pub const fn fenetre_max_s(self) -> Option<u64> {
+        match self {
+            Self::UserProfile => Some(FENETRE_PROFIL_COMPTE_S),
+            _ => None,
+        }
+    }
+
+    fn hors_fenetre(self, secondes: u64) -> bool {
+        self.fenetre_max_s().is_some_and(|max| secondes > max)
+    }
+
     fn key(self) -> String {
         format!("{PREFIX}{}", self.as_str())
     }
@@ -118,13 +142,22 @@ pub fn retry_after_secs(headers: &HeaderMap) -> Option<u64> {
 
 /// Memorise jusqu'a quand ce sous-systeme doit se taire. Sans en-tete
 /// exploitable, rien n'est invente : l'appelant arrete tout de meme son cycle,
-/// mais le prochain cycle reste libre de retenter.
+/// mais le prochain cycle reste libre de retenter. Un delai plus long que la
+/// fenetre connue de la portee ([`CloudScope::fenetre_max_s`]) n'est pas
+/// memorise non plus.
 pub fn defer_from_headers(
     settings: &SettingsRepo,
     scope: CloudScope,
     headers: &HeaderMap,
 ) -> Option<ActiveCloudBackoff> {
     let retry_after_seconds = retry_after_secs(headers)?;
+    if scope.hors_fenetre(retry_after_seconds) {
+        warn!(
+            scope = scope.as_str(),
+            retry_after_seconds, "cloud_rate_limit_hors_fenetre_non_memorise"
+        );
+        return None;
+    }
     let until_epoch = now_epoch().saturating_add(retry_after_seconds);
     settings.set(&scope.key(), &until_epoch.to_string()).ok()?;
     Some(ActiveCloudBackoff {
@@ -135,11 +168,16 @@ pub fn defer_from_headers(
 }
 
 /// Rend le delai encore actif et efface paresseusement une echeance passee.
+///
+/// Une echeance plus lointaine que la fenetre connue de la portee est effacee
+/// de la meme facon : elle a ete posee avant que la fenetre ne soit verifiee a
+/// l'ecriture, et elle bloquerait sinon la portee bien au-dela de ce que la
+/// route peut imposer.
 pub fn active(settings: &SettingsRepo, scope: CloudScope) -> Option<ActiveCloudBackoff> {
     let key = scope.key();
     let until_epoch = settings.get(&key).ok().flatten()?.parse::<u64>().ok()?;
     let now = now_epoch();
-    if until_epoch <= now {
+    if until_epoch <= now || scope.hors_fenetre(until_epoch - now) {
         settings.delete(&key).ok();
         return None;
     }
@@ -333,6 +371,47 @@ mod tests {
             None
         );
         assert!(active_all(&settings).is_empty());
+    }
+
+    /// Le cas vécu : `GET /api/v1/user` annonçait 1 433 s d'attente pour une
+    /// fenêtre d'une minute. La portée du profil ne le mémorise pas ; une
+    /// portée sans fenêtre connue garde le comportement d'avant.
+    #[test]
+    fn un_delai_hors_fenetre_du_profil_n_est_pas_memorise() {
+        let settings = settings();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("1433"),
+        );
+
+        assert_eq!(
+            defer_from_headers(&settings, CloudScope::UserProfile, &headers),
+            None
+        );
+        assert!(active(&settings, CloudScope::UserProfile).is_none());
+
+        assert!(defer_from_headers(&settings, CloudScope::Telemetry, &headers).is_some());
+        assert!(active(&settings, CloudScope::Telemetry).is_some());
+
+        // La fenêtre elle-même reste mémorisée.
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("60"));
+        assert!(defer_from_headers(&settings, CloudScope::UserProfile, &headers).is_some());
+        assert!(active(&settings, CloudScope::UserProfile).is_some());
+    }
+
+    /// Une échéance hors fenêtre déjà stockée (posée par une version
+    /// antérieure) ne bloque plus, et elle est effacée.
+    #[test]
+    fn une_echeance_stockee_hors_fenetre_est_oubliee() {
+        let settings = settings();
+        let lointaine = (now_epoch() + 1433).to_string();
+        settings
+            .set(&CloudScope::UserProfile.key(), &lointaine)
+            .unwrap();
+
+        assert!(active(&settings, CloudScope::UserProfile).is_none());
+        assert_eq!(settings.get(&CloudScope::UserProfile.key()).unwrap(), None);
     }
 
     /// Une portée oubliée dans `ALL` serait posée par `defer_from_headers`

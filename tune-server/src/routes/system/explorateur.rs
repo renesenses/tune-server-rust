@@ -197,6 +197,122 @@ pub(crate) fn la_cible_reste_dans_le_perimetre(chemin: &std::path::Path) -> bool
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Lecteurs Windows et garde-fou d'ajout (fil forum 2171)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// La requête demande-t-elle la LISTE DES LECTEURS (Windows) ?
+///
+/// `/` et `\` n'ont pas de sens sous Windows en dehors d'un lecteur : ils
+/// désignent « le poste », c'est-à-dire la liste `C:\`, `D:\`… Une racine de
+/// lecteur (`C:\`), elle, désigne son CONTENU. La route confondait les deux :
+/// `C:\` rendait la liste des lecteurs, si bien qu'un clic sur « C » ramenait
+/// à la même liste et que le lecteur système n'était jamais explorable.
+pub(crate) fn liste_des_lecteurs_demandee(chemin: &str) -> bool {
+    matches!(chemin.trim(), "" | "/" | "\\")
+}
+
+/// `C:\`, `C:/` ou `C:` : la racine d'un lecteur Windows.
+pub(crate) fn est_une_racine_de_lecteur(chemin: &str) -> bool {
+    crate::chemin_inaccessible::lettre_de_lecteur(chemin).is_some()
+        && chemin[2..].trim_matches(['/', '\\']).is_empty()
+}
+
+/// Le parent à rendre au client. Sous Windows, une racine de lecteur remonte
+/// vers la liste des lecteurs (`/`), sans quoi le bouton « .. » disparaît et
+/// l'on reste prisonnier du lecteur où l'on est entré.
+pub(crate) fn parent_a_rendre(
+    chemin: &str,
+    parent_natif: Option<String>,
+    windows: bool,
+) -> Option<String> {
+    if windows && est_une_racine_de_lecteur(chemin) {
+        return Some("/".into());
+    }
+    parent_natif
+}
+
+/// Durée maximale du comptage qui précède l'ajout d'un dossier. Au-delà, le
+/// compte est rendu tel quel, marqué incomplet : « au moins N fichiers ».
+pub(crate) const ESTIMATION_DUREE_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Nombre maximal d'entrées visitées par ce comptage, quelle que soit la
+/// vitesse du disque.
+pub(crate) const ESTIMATION_ENTREES_MAX: u64 = 200_000;
+
+/// Ce que l'ajout d'un dossier ferait analyser, mesuré vite et borné.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Estimation {
+    pub fichiers_audio: u64,
+    pub dossiers: u64,
+    /// `false` : le comptage s'est arrêté sur une borne (durée ou entrées).
+    /// Les nombres sont alors des MINIMUMS.
+    pub complete: bool,
+}
+
+/// Compte les fichiers audio sous `racine`, sans suivre les liens
+/// symboliques, sans entrer dans les dossiers cachés ni dans les arbres
+/// système, et sans dépasser ni `echeance` ni `entrees_max`.
+///
+/// Les extensions sont celles du scan (`LIBRARY_AUDIO_EXTENSIONS`) : le
+/// chiffre annoncé est celui que le scan trouverait.
+pub(crate) fn estimer_le_contenu(
+    racine: &std::path::Path,
+    echeance: std::time::Instant,
+    entrees_max: u64,
+) -> Estimation {
+    use tune_core::audio::support::LIBRARY_AUDIO_EXTENSIONS;
+
+    let mut e = Estimation {
+        complete: true,
+        ..Estimation::default()
+    };
+    let mut entrees: u64 = 0;
+    let mut a_visiter = vec![racine.to_path_buf()];
+    while let Some(dossier) = a_visiter.pop() {
+        let Ok(lecture) = std::fs::read_dir(&dossier) else {
+            continue;
+        };
+        for entree in lecture.flatten() {
+            entrees += 1;
+            if entrees > entrees_max || std::time::Instant::now() >= echeance {
+                e.complete = false;
+                return e;
+            }
+            let nom = entree.file_name();
+            let nom = nom.to_string_lossy();
+            if nom.starts_with('.') {
+                continue;
+            }
+            // `file_type` ne suit pas les liens : un lien n'est ni compté ni
+            // parcouru, ce qui écarte aussi les boucles.
+            let Ok(genre) = entree.file_type() else {
+                continue;
+            };
+            if genre.is_dir() {
+                let chemin = entree.path();
+                if nom == "$RECYCLE.BIN"
+                    || nom == "System Volume Information"
+                    || dans_un_arbre_systeme(&chemin.to_string_lossy())
+                {
+                    continue;
+                }
+                e.dossiers += 1;
+                a_visiter.push(chemin);
+            } else if genre.is_file() {
+                let audio = std::path::Path::new(&*nom)
+                    .extension()
+                    .map(|x| x.to_string_lossy().to_ascii_lowercase())
+                    .is_some_and(|x| LIBRARY_AUDIO_EXTENSIONS.contains(&x.as_str()));
+                if audio {
+                    e.fichiers_audio += 1;
+                }
+            }
+        }
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +514,104 @@ mod tests {
         let ordinaire = verbatim.strip_prefix(r"\\?\").unwrap();
         assert!(!dans_un_arbre_systeme(verbatim));
         assert!(dans_un_arbre_systeme(ordinaire));
+    }
+
+    // -----------------------------------------------------------------
+    // Lecteurs Windows et garde-fou d'ajout (fil forum 2171).
+    // -----------------------------------------------------------------
+
+    /// `C:\` désigne le CONTENU du lecteur, pas la liste des lecteurs. Ce
+    /// test tombe si l'on revient à l'ancienne condition, où `C:\` rendait la
+    /// liste et rendait le lecteur système inexplorable.
+    #[test]
+    fn une_racine_de_lecteur_n_est_pas_la_liste_des_lecteurs() {
+        for chemin in ["/", "\\", ""] {
+            assert!(liste_des_lecteurs_demandee(chemin), "{chemin:?}");
+        }
+        for chemin in [r"C:\", "C:/", r"D:\Musique", "/mnt/musique"] {
+            assert!(!liste_des_lecteurs_demandee(chemin), "{chemin:?}");
+        }
+    }
+
+    #[test]
+    fn les_racines_de_lecteur_sont_reconnues() {
+        for chemin in [r"C:\", "D:/", "e:", r"Z:\\"] {
+            assert!(est_une_racine_de_lecteur(chemin), "{chemin:?}");
+        }
+        for chemin in [r"C:\Musique", "/", r"\\NAS\Musique", "C:toto"] {
+            assert!(!est_une_racine_de_lecteur(chemin), "{chemin:?}");
+        }
+    }
+
+    /// Sous Windows, « .. » depuis `D:\` ramène à la liste des lecteurs ;
+    /// ailleurs, le parent natif est rendu tel quel.
+    #[test]
+    fn une_racine_de_lecteur_remonte_vers_la_liste_des_lecteurs() {
+        assert_eq!(parent_a_rendre(r"D:\", None, true).as_deref(), Some("/"));
+        assert_eq!(
+            parent_a_rendre(r"D:\Musique", Some(r"D:\".into()), true).as_deref(),
+            Some(r"D:\")
+        );
+        assert_eq!(parent_a_rendre("/", None, false), None);
+        assert_eq!(
+            parent_a_rendre("/mnt/a", Some("/mnt".into()), false).as_deref(),
+            Some("/mnt")
+        );
+    }
+
+    /// `/tmp` et non `std::env::temp_dir()` : sous macOS ce dernier vit sous
+    /// `/private/var`, arbre système dont le comptage écarte les enfants.
+    #[cfg(unix)]
+    fn arbre_de_test(etiquette: &str) -> tune_core::test_scratch::ScratchDir {
+        let base = tune_core::test_scratch::scratch_dir_in("/tmp", etiquette);
+        let a = base.join("Artiste").join("Album");
+        std::fs::create_dir_all(&a).unwrap();
+        for f in ["01.flac", "02.FLAC", "03.mp3", "cover.jpg", "notes.txt"] {
+            std::fs::write(a.join(f), b"x").unwrap();
+        }
+        let cache = base.join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("cache.flac"), b"x").unwrap();
+        base
+    }
+
+    /// Le comptage ne retient que les extensions du scan, casse ignorée, et
+    /// n'entre pas dans les dossiers cachés.
+    #[cfg(unix)]
+    #[test]
+    fn l_estimation_compte_les_fichiers_audio_du_scan() {
+        let base = arbre_de_test("tune-estimation-2171");
+        let e = estimer_le_contenu(
+            &base,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            ESTIMATION_ENTREES_MAX,
+        );
+        assert_eq!(
+            e,
+            Estimation {
+                fichiers_audio: 3,
+                dossiers: 2,
+                complete: true
+            }
+        );
+    }
+
+    /// La borne d'entrées arrête le comptage et le dit : un disque entier ne
+    /// peut pas faire attendre la réponse.
+    #[cfg(unix)]
+    #[test]
+    fn l_estimation_s_arrete_sur_sa_borne_et_le_dit() {
+        let base = arbre_de_test("tune-estimation-borne-2171");
+        let e = estimer_le_contenu(
+            &base,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            2,
+        );
+        assert!(!e.complete);
+        let e = estimer_le_contenu(&base, std::time::Instant::now(), ESTIMATION_ENTREES_MAX);
+        assert!(
+            !e.complete,
+            "une échéance dépassée doit arrêter le comptage"
+        );
     }
 }

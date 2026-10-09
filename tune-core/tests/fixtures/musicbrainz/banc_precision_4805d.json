@@ -1,0 +1,6414 @@
+{
+  "enregistre_le": "2026-10-06",
+  "methode": "Banc #4805 D (précision) : les pressages que lisent les quatre chaînes et le pressage de référence de chaque album, lus par /release/{id}?inc=recordings+artist-credits+labels+release-groups. Graine : banc_artistes_4805.json (#5864, 05/10/2026). Le reste enregistré auprès de MusicBrainz, 1 requête / 1,1 s, User-Agent TuneServer. Réponses réduites aux champs lus par parse_release_detail.",
+  "recherches": {
+    "release:\"Symphony No. 9\" AND artist:\"Berliner Philharmoniker\"": {
+      "releases": [
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Dvořák"
+            },
+            {
+              "joinphrase": "",
+              "name": "Berliner Philharmoniker"
+            }
+          ],
+          "id": "f1884d0c-c1f8-4324-a8fd-8d9d0cfee3df",
+          "release-group": {
+            "id": "69cd90b2-2658-40d1-bf4c-759df8dc9954"
+          },
+          "score": 100,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 4
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Beethoven"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Claudio Abbado"
+            }
+          ],
+          "country": "GB",
+          "date": "2004",
+          "id": "9142b030-32f1-48b3-b72a-be71a17a6e7a",
+          "release-group": {
+            "id": "35470db9-00fe-4420-ad51-74278a36a110"
+          },
+          "score": 89,
+          "status": "Official",
+          "title": "Symphony No. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Beethoven"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Claudio Abbado"
+            }
+          ],
+          "country": "GB",
+          "date": "2000",
+          "id": "e1ee21e1-d257-410e-8b40-0314065866b7",
+          "release-group": {
+            "id": "023d02c1-6462-4d9c-b9d3-82ec159d7bc8"
+          },
+          "score": 89,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Leonard Bernstein"
+            }
+          ],
+          "country": "XE",
+          "date": "2010-01-04",
+          "id": "141757b4-71de-4678-a656-6aaca4f58655",
+          "release-group": {
+            "id": "cf75d60d-efb8-3fbd-bda4-2468a3a031fe"
+          },
+          "score": 89,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 4
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Bruckner"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Günter Wand"
+            }
+          ],
+          "id": "20c93d10-0cdc-4363-b26f-ea0f361acf31",
+          "release-group": {
+            "id": "c247a1ce-ba43-3f80-bdfc-4b5214953d64"
+          },
+          "score": 89,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 3
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Bruckner"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Günter Wand"
+            },
+            {
+              "joinphrase": "",
+              "name": "Berliner Philharmoniker"
+            }
+          ],
+          "country": "XE",
+          "date": "1999",
+          "id": "04e073b1-291c-4be5-9868-b0dbd1d4da9e",
+          "release-group": {
+            "id": "c247a1ce-ba43-3f80-bdfc-4b5214953d64"
+          },
+          "score": 89,
+          "status": "Official",
+          "title": "Symphony No. 9",
+          "track-count": 3
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "",
+              "name": "Berliner Philharmoniker"
+            }
+          ],
+          "country": "GB",
+          "date": "2007",
+          "id": "4e32e6a6-ce93-4b26-9c46-746dd53e62cd",
+          "release-group": {
+            "id": "e53bb069-1615-448e-a27e-492b01ec9d52"
+          },
+          "score": 87,
+          "status": "Official",
+          "title": "Symphony No. 9 in D major (conclusion)",
+          "track-count": 3
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Dmitri Shostakovich"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Kirill Petrenko"
+            }
+          ],
+          "id": "71c5423f-a287-467d-89e3-975dde8eb4ce",
+          "release-group": {
+            "id": "1546c6f0-93d0-44c8-a491-237a51e02568"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Gustav Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Claudio Abbado"
+            }
+          ],
+          "country": "XW",
+          "date": "2012-11-05",
+          "id": "f1ee1d4e-1228-42d6-ab14-a4b606b3d710",
+          "release-group": {
+            "id": "256029d6-5baa-37ab-8b5e-cc7c582f30f3"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Sir John Barbirolli"
+            }
+          ],
+          "country": "US",
+          "date": "2002",
+          "id": "cac29d10-f701-4587-9002-9563698b06c5",
+          "release-group": {
+            "id": "1964665d-44bc-308e-925c-82da8eaa2f67"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 4
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Sir John Barbirolli"
+            }
+          ],
+          "country": "XE",
+          "date": "2002",
+          "id": "cc82d923-d5aa-4bc7-851c-78a286b9aeb0",
+          "release-group": {
+            "id": "1964665d-44bc-308e-925c-82da8eaa2f67"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 4
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Gustav Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Claudio Abbado"
+            }
+          ],
+          "country": "DE",
+          "date": "2002-06-03",
+          "id": "dee757d0-8776-4469-bd25-3cd080d96f65",
+          "release-group": {
+            "id": "256029d6-5baa-37ab-8b5e-cc7c582f30f3"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Gustav Mahler"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Claudio Abbado"
+            }
+          ],
+          "country": "XW",
+          "date": "2012-11-05",
+          "id": "d0a046e1-0822-48b6-ad91-c63d49f637aa",
+          "release-group": {
+            "id": "256029d6-5baa-37ab-8b5e-cc7c582f30f3"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Beethoven"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Herbert von Karajan"
+            }
+          ],
+          "country": "DE",
+          "date": "1999-07-01",
+          "id": "c07a0583-e763-31d9-a682-a00af4baf661",
+          "release-group": {
+            "id": "7a863760-3267-34b1-9ecf-1a93a470f24a"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        },
+        {
+          "artist-credit": [
+            {
+              "joinphrase": "; ",
+              "name": "Ludwig van Beethoven"
+            },
+            {
+              "joinphrase": ", ",
+              "name": "Berliner Philharmoniker"
+            },
+            {
+              "joinphrase": "",
+              "name": "Karajan"
+            }
+          ],
+          "country": "XE",
+          "date": "2003-09-23",
+          "id": "f9f58401-f595-402e-abc4-aa243d201ba6",
+          "release-group": {
+            "id": "9303391e-21f0-49db-9f32-0b26c2913671"
+          },
+          "score": 86,
+          "status": "Official",
+          "title": "Symphony no. 9",
+          "track-count": 5
+        }
+      ]
+    }
+  },
+  "releases": {
+    "024f7544-e682-4e3f-b544-025b45ecb304": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Air"
+        }
+      ],
+      "country": "US",
+      "date": "2004",
+      "id": "024f7544-e682-4e3f-b544-025b45ecb304",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "f703d7dd-ba12-48dc-a54b-cb0d71a3910e"
+              },
+              "title": "Venus"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "833769db-6c5b-4a08-82ff-4fb0ab6ab1dc"
+              },
+              "title": "Cherry Blossom Girl"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "09cb1175-4f16-4e0e-b389-4b1b37d9118f"
+              },
+              "title": "Run"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "2a4090df-cd3d-458e-884f-400e84004602"
+              },
+              "title": "Universal Traveler"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "63d8081c-740a-4d20-a1f1-1f907d58ecdf"
+              },
+              "title": "Mike Mills"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "57285276-9b6a-4453-a578-57491e5fb66b"
+              },
+              "title": "Surfing on a Rocket"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "b7111a38-dcaf-45f9-afcc-c3e1aa776211"
+              },
+              "title": "Another Day"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "4a2bff1b-a5bf-4751-b94c-c44b0f6bcc65"
+              },
+              "title": "Alpha Beta Gaga"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "af8c7a88-dd3f-4130-b147-6cf9dd816147"
+              },
+              "title": "Biological"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "f900f8e2-7d49-4cca-a9a9-ee67dda88e6e"
+              },
+              "title": "Alone in Kyoto"
+            }
+          ]
+        }
+      ],
+      "title": "Talkie Walkie"
+    },
+    "0d33ef7a-1f5d-4365-b807-b412271b99c3": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Massive Attack"
+        }
+      ],
+      "country": "US",
+      "date": "1998-05-12",
+      "id": "0d33ef7a-1f5d-4365-b807-b412271b99c3",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "8e74dd9d-e5a3-4acd-918a-c36a0f8cda84"
+              },
+              "title": "Angel"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "02011500-814c-461c-b3a6-f24fe68ee5a1"
+              },
+              "title": "Risingson"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "f3bba4cd-8018-468b-902e-bc8f029593e5"
+              },
+              "title": "Teardrop"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "cb704029-adf6-408f-b91b-6883df02540a"
+              },
+              "title": "Inertia Creeps"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "1bfc064e-fcd0-406b-98ca-1ec69f72fef6"
+              },
+              "title": "Exchange"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "c3ace904-a6bd-4e70-b550-c88785610ef9"
+              },
+              "title": "Dissolved Girl"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "9b08eb49-1df7-4138-9bfa-2487c6fa0925"
+              },
+              "title": "Man Next Door"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "048e135c-204d-4d77-8e6a-203920768e4f"
+              },
+              "title": "Black Milk"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "c671a7e3-dd6e-4d38-a96d-f30bcafe7dd5"
+              },
+              "title": "Mezzanine"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "27c4755a-7299-49a6-8e46-227eb4ebf575"
+              },
+              "title": "Group Four"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "b6293447-05bf-4123-bfe5-099754348bbf"
+              },
+              "title": "(Exchange)"
+            }
+          ]
+        }
+      ],
+      "title": "Mezzanine"
+    },
+    "146bf1df-d9e0-332c-a2da-e086b4d80378": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "King Crimson"
+        }
+      ],
+      "country": "JP",
+      "date": "2004-01-28",
+      "id": "146bf1df-d9e0-332c-a2da-e086b4d80378",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "7dd3f76d-504d-4621-8f64-9cbf6a3fd1e2"
+              },
+              "title": "21st Century Schizoid Man (including Mirrors)"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "bba03961-9793-4fdc-aa14-2adba0c306d5"
+              },
+              "title": "I Talk to the Wind"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "8987f84a-9cb8-4366-8e62-f5c61685b4d1"
+              },
+              "title": "Epitaph (including March for No Reason and Tomorrow and Tomorrow)"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "52d5d674-5c40-47ed-83d2-a70034a3c29b"
+              },
+              "title": "Moonchild (including The Dream and The Illusion)"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "ebf1a9cc-bdc8-47b3-866e-4603316e6cfa"
+              },
+              "title": "The Court of the Crimson King (including The Return of the Fire Witch and The Dance of the Puppets)"
+            }
+          ]
+        }
+      ],
+      "title": "In the Court of the Crimson King"
+    },
+    "17de58a1-09f0-391e-8969-65a055c10ecf": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Patti Smith"
+        }
+      ],
+      "country": "DE",
+      "date": "2008-09-19",
+      "id": "17de58a1-09f0-391e-8969-65a055c10ecf",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "06821d3d-c57c-466a-b0aa-060344945c2f"
+              },
+              "title": "Gloria"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "3aaabe8a-330c-4bac-90c6-6894ff49fe31"
+              },
+              "title": "Redondo Beach"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "7fe95863-b37a-4e08-b50e-65cf3b2ecca6"
+              },
+              "title": "Birdland"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "7dad4e3d-2b22-44e6-bc26-3f9af45f022f"
+              },
+              "title": "Free Money"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "94b75fe9-6cbd-4949-993c-cf81de6657c0"
+              },
+              "title": "Kimberly"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "d15576e6-ce05-4def-83fe-357337c82af4"
+              },
+              "title": "Break It Up"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "dbe01cc9-386d-430f-88a2-fd243aca0bc1"
+              },
+              "title": "Land: Horses / Land of a Thousand Dances / La Mer (De)"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "3d7c871b-b913-4a61-9674-37efdd7a7560"
+              },
+              "title": "Elegie"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "42d500ed-75be-4e4c-b8cd-d9c66eb191b3"
+              },
+              "title": "My Generation"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "27175c2c-b4f8-48d3-af60-3bc338836078"
+              },
+              "title": "Gloria"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "f0f57c61-8c38-4115-acf9-e421616297b4"
+              },
+              "title": "Redondo Beach"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "0bc87096-dc24-454e-84eb-bffec27d6ab3"
+              },
+              "title": "Birdland"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0c55e794-abcd-48f6-a104-e9a4bb17acb1"
+              },
+              "title": "Free Money"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "671650e3-815e-409d-a7ea-8bbfd9dbc3e6"
+              },
+              "title": "Kimberly"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "6c20d297-5aca-45ab-ab24-f207ec4b2fb4"
+              },
+              "title": "Break It Up"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "3f2dad94-8ef3-4338-999c-8549fa70e3a2"
+              },
+              "title": "Land: Horses / Land of a Thousand Dances / La Mer (De)"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "402f63c9-8f96-4777-a4f7-a029a2c6d891"
+              },
+              "title": "Elegie"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "8a10211f-63f4-4a4c-945f-afa011934322"
+              },
+              "title": "My Generation"
+            }
+          ]
+        }
+      ],
+      "title": "Horses/Horses"
+    },
+    "1a835a8f-6ae0-40db-bcc6-b1363c1410c6": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Georges Bizet"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Maria Callas"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Nicolai Gedda"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Andréa Guiot"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Robert Massard"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Chœur René Duclos"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Orchestre de l'Opéra National de Paris"
+        },
+        {
+          "joinphrase": "",
+          "name": "Georges Prêtre"
+        }
+      ],
+      "date": "2009",
+      "id": "1a835a8f-6ae0-40db-bcc6-b1363c1410c6",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "1d410f1d-4da9-47f2-8697-f02cf73f3cd5"
+              },
+              "title": "Carmen: Prélude"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "b0a20db8-dfc0-42a5-b188-2246c9805fc0"
+              },
+              "title": "Carmen: Act I. \"Sur la place\""
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "9174f8c2-5802-4601-a59b-0fd36530a21b"
+              },
+              "title": "Carmen: Act I. \"Avec la garde montante\""
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "2465bbf2-4bb1-4665-bca8-f4b4cc983032"
+              },
+              "title": "Carmen: Act I. \"C'est bien là, n'est-ce pas\""
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "f6e2b5dd-5f1c-482c-bcca-6f2b0deb5bcd"
+              },
+              "title": "Carmen: Act I. \"La cloche a sonné…\"\" / \"\"Dans l'air, nous suivons des yeux la fumée\""
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "4131a37a-815c-46d5-b276-92f091a91c8d"
+              },
+              "title": "Carmen: Act I. \"Quand je vous aimerai…?\" / \"L'amour est un oiseau rebelle\""
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "92f11540-82da-43d8-821c-94ea68e711a4"
+              },
+              "title": "Carmen: Act I. \"Carmen ! sur tes pas nous nous pressons tous !\""
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "aa24bab3-b48e-42f0-b470-b88ac7590d69"
+              },
+              "title": "Carmen: Act I. \"Quels regards ! Quelle effronterie !\""
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "57e04f33-1b97-483f-bc67-8975f585b912"
+              },
+              "title": "Carmen: Act I. \"Parle-moi de ma mère !\""
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "69253932-fdd7-40e6-9f51-48dfdb4335e3"
+              },
+              "title": "Carmen: Act I. \"Reste là, maintenant, pendant que je lirai\""
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "b710265c-eeab-4a0d-8ef2-641a392eb68f"
+              },
+              "title": "Carmen: Act I. \"Que se passe-t-il donc là-bas ?\" / \"Au secours ! Au secours !\""
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "764c549e-9923-4d0f-9d06-7bdb864353ed"
+              },
+              "title": "Carmen: Act I. \"Mon officier, c'était une querelle\""
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "44e73620-0c98-4c25-bc05-0f1348fb285b"
+              },
+              "title": "Carmen: Act I. \"Près des remparts de Séville\""
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "7859841e-04a8-4936-90d8-84499fd67095"
+              },
+              "title": "Carmen: Act I. \"Voici l'ordre ; partez\""
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "9cbfdcce-8241-4b1d-a014-ce76b8cc3677"
+              },
+              "title": "Carmen: Act I. Entr'acte"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "5fab0d9c-4cb8-478d-a6aa-37a62caf459d"
+              },
+              "title": "Carmen: Act II. \"Les tringles des sistres tintaient\""
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "7cb01996-debf-4cde-a493-90c7acc4b9a8"
+              },
+              "title": "Carmen: Act II. \"Messieurs, Pastia me dit\""
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "a9610894-f0cf-4ad4-b5d1-d6a572afda6c"
+              },
+              "title": "Carmen: Act II. \"Vivat ! vivat le toréro !\""
+            },
+            {
+              "number": "19",
+              "position": 19,
+              "recording": {
+                "id": "2a609d74-2b35-4c84-9054-c1dcb9191797"
+              },
+              "title": "Carmen: Act II. \"Votre toast, je peux vous le rendre\""
+            },
+            {
+              "number": "20",
+              "position": 20,
+              "recording": {
+                "id": "9624c2ab-64f4-4687-a106-534bcaa07cfe"
+              },
+              "title": "Carmen: Act II. \"La belle, un mot\""
+            },
+            {
+              "number": "21",
+              "position": 21,
+              "recording": {
+                "id": "a475623b-12c2-4371-b3c6-dd3fb0d51cc8"
+              },
+              "title": "Carmen: Act II. \"Eh bien ! vite, quelles nouvelles ?\" / \"Nous avons en tête une affaire !\""
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "4d659fe0-71b1-4ccf-bad8-3967c7ba8695"
+              },
+              "title": "Carmen: Act II. \"Mais qui donc attends-tu ?\""
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "e8752255-0ee6-487d-920d-dfaa64b5188a"
+              },
+              "title": "Carmen: Act II. \"Halte là !\""
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "558acdb5-6487-4eee-95b9-fbf18d188450"
+              },
+              "title": "Carmen: Act II. \"Enfin c'est toi !\" / \"Tout doux, Monsieur, tout doux\""
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "fb41c8cc-dcb3-4d5f-b58e-f44a170252d9"
+              },
+              "title": "Carmen: Act II. \"La fleur que tu m'avais jetée\" / \"Non, tu ne m'aimes pas\""
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "59c95b1c-19e4-4dc3-80f9-9d6ca2065463"
+              },
+              "title": "Carmen: Act II. \"Holà ! Carmen ! Holà ! Holà !\""
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "52847b40-ea3e-481e-ab97-7304b6f561f5"
+              },
+              "title": "Carmen: Act II. Entr'acte"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "4b13969c-3809-4503-be65-1f5be6b97316"
+              },
+              "title": "Carmen: Act III. \"Écoute, écoute, compagnon, écoute\""
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "2b31b282-35a5-4cf4-b0f5-3e78e65ede18"
+              },
+              "title": "Carmen: Act III. \"Reposons-nous une heure ici, mes camarades\""
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "0dfc0aef-09ab-4f86-8646-bf0bb381ced0"
+              },
+              "title": "Carmen: Act III. \"Mêlons ! Coupons !\""
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "9562bfc0-fc84-4d6f-98d5-3538ebe97d1f"
+              },
+              "title": "Carmen: Act III. \"Eh bien ?\""
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "66d4fb6f-767e-4daa-9723-74f3faaaac5d"
+              },
+              "title": "Carmen: Act III. \"Quant au douanier, c'est notre affaire\""
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "69c647b6-22d4-4beb-95fd-80fcacb188d7"
+              },
+              "title": "Carmen: Act III. \"C'est des contrebandiers le refuge ordinaire\" / \"Je dis que rien ne m'épouvante\""
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "6c788683-c626-4cd2-899e-394c6a6587cc"
+              },
+              "title": "Carmen: Act III. \"Je ne me trompe pas… c'est lui sur ce rocher\""
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "999a4af5-9ae1-485f-aece-bb0f77ca4057"
+              },
+              "title": "Carmen: Act III. \"Quelques lignes plus bas…\" / \"Holà, holà ! José !\""
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "5c893639-c0b8-4b04-ac5b-d34dd1c36893"
+              },
+              "title": "Carmen: Act III. Entr'acte"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "5c5dc560-f2cb-40a5-88c1-fce792944619"
+              },
+              "title": "Carmen: Act IV. \"A deux cuartos ! A deux cuartos !\""
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "76d656a6-8713-4339-a251-e34769633c4e"
+              },
+              "title": "Carmen: Act IV. \"Les voici ! voici la quadrille !\""
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "78960de5-265f-4283-b8ee-7c489324d6cc"
+              },
+              "title": "Carmen: Act IV. \"C'est toi !\" / \"Carmen, il est temps encore\" / \"Viva ! la course est belle !\""
+            }
+          ]
+        }
+      ],
+      "title": "Carmen"
+    },
+    "1b534702-66e6-4543-978d-75082f66bbc8": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Various Artists"
+        }
+      ],
+      "country": "JP",
+      "date": "2024-03-27",
+      "id": "1b534702-66e6-4543-978d-75082f66bbc8",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "df767468-8cdc-4c84-900c-b378c70be53d"
+              },
+              "title": "Pumpkin and Honey Bunny / Misirlou"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "e5a77768-ff64-46f2-a13e-9d368b413cff"
+              },
+              "title": "Royale With Cheese"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "afd7680d-0df0-41d8-8d80-318090702f90"
+              },
+              "title": "Jungle Boogie"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "b3384c19-483c-49ae-94d8-ec00ab56a25b"
+              },
+              "title": "Let's Stay Together"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "7a400a5e-7f40-4fd5-9d6f-d168293c4368"
+              },
+              "title": "Bustin' Surfboards"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "6690a4d2-4dc3-4262-8546-bb666c388418"
+              },
+              "title": "Lonesome Town"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "47da814e-c620-41b9-9ed3-098d6261b74b"
+              },
+              "title": "Son of a Preacher Man"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "f649b36a-4b43-4054-8d5a-cf4782922663"
+              },
+              "title": "Zed's Dead, Baby / Bullwinkle Part II"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "05da1733-00d2-402d-a647-5a03a1c72f3e"
+              },
+              "title": "Jack Rabbit Slims Twist Contest / You Never Can Tell"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "6b48ce08-c98b-40a0-8b1b-030c6c9ba49a"
+              },
+              "title": "Girl, You'll Be a Woman Soon"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "7944d365-6320-4c56-900c-35068f021718"
+              },
+              "title": "If Love Is a Red Dress (Hang Me in Rags)"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "7090d2a7-13d7-4b9b-9cd0-8b17e31ffe05"
+              },
+              "title": "Bring Out the Gimp / Comanche"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "39b16495-6e17-4710-a92e-cae93cc46dfd"
+              },
+              "title": "Flowers on the Wall"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "df0af428-5b32-4c4c-9233-20b15561d8d4"
+              },
+              "title": "Personality Goes a Long Way"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "cf630eff-b387-48b4-8281-81cc2e10cb6a"
+              },
+              "title": "Surf Rider"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "6fd25f63-e244-47c0-a8d6-324c6cc7fcba"
+              },
+              "title": "Ezekiel 25:17"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "8e7d5733-487e-47e3-b599-4ec4aa51fe54"
+              },
+              "title": "Since I First Met You"
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "e225ae8d-315d-427a-8536-33415c5e8309"
+              },
+              "title": "Rumble"
+            },
+            {
+              "number": "19",
+              "position": 19,
+              "recording": {
+                "id": "2dc90c25-ad50-4150-8860-5e58421359dc"
+              },
+              "title": "Strawberry Letter #23"
+            },
+            {
+              "number": "20",
+              "position": 20,
+              "recording": {
+                "id": "dc35b5b9-fa2c-4a98-ace1-f518a72eb0b4"
+              },
+              "title": "Out of Limits"
+            },
+            {
+              "number": "21",
+              "position": 21,
+              "recording": {
+                "id": "db8c05e9-e170-4bf0-b796-b1bc4e33452d"
+              },
+              "title": "Tarantino Talks!"
+            }
+          ]
+        }
+      ],
+      "title": "Pulp Fiction"
+    },
+    "1d6b086a-aca2-4511-8dfc-789b560ae3fb": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Portishead"
+        }
+      ],
+      "country": "CA",
+      "date": "1994",
+      "id": "1d6b086a-aca2-4511-8dfc-789b560ae3fb",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "b5d7d380-f43a-4c1f-a5de-694150b093ac"
+              },
+              "title": "Mysterons"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "1234a7ae-2af2-4291-aa84-bd0bafe291a1"
+              },
+              "title": "Sour Times"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "e97f805a-ab48-4c52-855e-07049142113d"
+              },
+              "title": "Strangers"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "c837f888-d471-4b07-bcbc-1b9f7406ec1a"
+              },
+              "title": "It Could Be Sweet"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "9170054a-8a9b-4f33-b31f-4ed58347154a"
+              },
+              "title": "Wandering Star"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "46d6ebba-8d3f-4600-a2a3-9eab4713458d"
+              },
+              "title": "It’s a Fire"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "977c23ba-10e0-4c03-a882-5896e58717ae"
+              },
+              "title": "Numb"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "8a49dba0-253a-4535-b87f-78bb035336ce"
+              },
+              "title": "Roads"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "c7baf0bc-77ed-454e-92a0-687f6b70d612"
+              },
+              "title": "Pedestal"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "5efc1689-a6e8-45d3-a481-774be58e8b59"
+              },
+              "title": "Biscuit"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "145f5c43-0ac2-4886-8b09-63d0e92ded5d"
+              },
+              "title": "Glory Box"
+            }
+          ]
+        }
+      ],
+      "title": "Dummy"
+    },
+    "20aec3ab-e0a3-4565-a490-4cf64a5057b5": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Pat Metheny"
+        }
+      ],
+      "country": "JP",
+      "date": "2016-10-26",
+      "id": "20aec3ab-e0a3-4565-a490-4cf64a5057b5",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "6cbda46a-4db9-4575-865d-5be479e30b84"
+              },
+              "title": "Bright Size Life"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "40b0cd34-d1ff-418b-8f35-0fe599ef39f9"
+              },
+              "title": "Sirabhorn"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "ea10c672-ed5b-46e6-b032-4884042a879f"
+              },
+              "title": "Unity Village"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "6ef65d8d-076e-4890-8a26-ff9f8717abf8"
+              },
+              "title": "Missouri Uncompromised"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "7777ba91-96e7-44c2-b89f-294c25085bda"
+              },
+              "title": "Midwestern Nights Dream"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "f7d03ef2-8982-42b9-9b69-e82c9a61db96"
+              },
+              "title": "Unquity Road"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "bd93b808-ffbd-4c74-a129-518c9978616a"
+              },
+              "title": "Omaha Celebration"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "16a4b02d-3a1b-4d2b-bb96-f3077966ecf4"
+              },
+              "title": "Round Trip / Broadway Blues"
+            }
+          ]
+        }
+      ],
+      "title": "Bright Size Life"
+    },
+    "3cfb401d-a1e7-4d8a-a4e4-53889bf2c609": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Various Artists"
+        }
+      ],
+      "country": "US",
+      "date": "1996-02-06",
+      "disambiguation": "BMG club edition",
+      "id": "3cfb401d-a1e7-4d8a-a4e4-53889bf2c609",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "fd52bd8b-b07f-45f1-a8f0-2dedaca14d35"
+              },
+              "title": "Stayin’ Alive"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "b64bdccc-64eb-4ead-864d-bd8a7914f7da"
+              },
+              "title": "How Deep Is Your Love"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "8bb16130-76a1-49bb-97a5-64ffd80b4565"
+              },
+              "title": "Night Fever"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "7e79dfb0-dd94-4d1e-998f-452ac47e4368"
+              },
+              "title": "More Than a Woman"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "81490a96-2177-4da2-abc4-276d9a076ebe"
+              },
+              "title": "If I Can’t Have You"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "a744b77a-4b34-430d-a3a4-e9eebe251996"
+              },
+              "title": "A Fifth of Beethoven"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "97134bc0-9cbe-4852-b03c-98485a7c6213"
+              },
+              "title": "More Than a Woman"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "00d69bf7-6775-49fe-a92e-c3f42f89093c"
+              },
+              "title": "Manhattan Skyline"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "bf788ffb-6d12-457e-9473-5b4a74243829"
+              },
+              "title": "Calypso Breakdown"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "bc605b87-fd5f-4ea7-bb7b-9597110b21f3"
+              },
+              "title": "Night on Disco Mountain"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "2c21e7be-9aca-498c-b61a-c24c7f2fd36d"
+              },
+              "title": "Open Sesame"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "d4734031-c35b-4994-811d-da5d299e1f6e"
+              },
+              "title": "Jive Talkin’"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "998e57a7-9ac2-47ee-ab37-936dee1478a3"
+              },
+              "title": "You Should Be Dancing"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "7486c3e7-ddf1-4f3a-bbb3-c908810993f5"
+              },
+              "title": "Boogie Shoes"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "cbb69405-15b0-4814-99c7-ec0841b2c70f"
+              },
+              "title": "Salsation"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "586014d2-6862-4d89-abef-674670af8a65"
+              },
+              "title": "K‐Jee"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "fe1bbf77-90a5-4d5d-9a7e-b002966510c8"
+              },
+              "title": "Disco Inferno"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "6e9a06a8-c8bb-3ea9-877a-417e74bb1c2e"
+      },
+      "status": "Official",
+      "title": "Saturday Night Fever: The Original Movie Soundtrack"
+    },
+    "3d602e6e-4cea-3906-8d62-947392c2c7c6": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Patti Smith"
+        }
+      ],
+      "country": "GB",
+      "date": "2002-04-29",
+      "disambiguation": "",
+      "id": "3d602e6e-4cea-3906-8d62-947392c2c7c6",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "A1",
+              "position": 1,
+              "recording": {
+                "id": "06821d3d-c57c-466a-b0aa-060344945c2f"
+              },
+              "title": "Gloria: In Excelsis Deo / Gloria (version)"
+            },
+            {
+              "number": "A2",
+              "position": 2,
+              "recording": {
+                "id": "3aaabe8a-330c-4bac-90c6-6894ff49fe31"
+              },
+              "title": "Redondo Beach"
+            },
+            {
+              "number": "A3",
+              "position": 3,
+              "recording": {
+                "id": "7fe95863-b37a-4e08-b50e-65cf3b2ecca6"
+              },
+              "title": "Birdland"
+            },
+            {
+              "number": "A4",
+              "position": 4,
+              "recording": {
+                "id": "7dad4e3d-2b22-44e6-bc26-3f9af45f022f"
+              },
+              "title": "Free Money"
+            },
+            {
+              "number": "B1",
+              "position": 5,
+              "recording": {
+                "id": "94b75fe9-6cbd-4949-993c-cf81de6657c0"
+              },
+              "title": "Kimberly"
+            },
+            {
+              "number": "B2",
+              "position": 6,
+              "recording": {
+                "id": "d15576e6-ce05-4def-83fe-357337c82af4"
+              },
+              "title": "Break It Up"
+            },
+            {
+              "number": "B3",
+              "position": 7,
+              "recording": {
+                "id": "dbe01cc9-386d-430f-88a2-fd243aca0bc1"
+              },
+              "title": "Land: Horses / Land of a Thousand Dances / La Mer (De)"
+            },
+            {
+              "number": "B4",
+              "position": 8,
+              "recording": {
+                "id": "d16e45c5-cfe1-4119-aae1-24047f60e9a5"
+              },
+              "title": "Elegie"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "ff8f533c-3cb3-3877-9209-11f433edaad2"
+      },
+      "status": "Official",
+      "title": "Horses"
+    },
+    "488477d8-10b4-47fe-a482-549f011406a5": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Daft Punk"
+        }
+      ],
+      "country": "XE",
+      "date": "2021",
+      "id": "488477d8-10b4-47fe-a482-549f011406a5",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "60fa767a-d85d-4991-82bc-4294e0b11ae7"
+              },
+              "title": "One More Time"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "7c0e11a3-1c7a-4e6d-a14d-6e86d86dbaad"
+              },
+              "title": "Aerodynamic"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "15f16efc-8762-4151-95ab-c12d06268640"
+              },
+              "title": "Digital Love"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "f1a6a40f-78f5-4918-968d-f64363bae94c"
+              },
+              "title": "Harder, Better, Faster, Stronger"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "d63ad586-1124-4df1-9a2b-c014d7b7cb02"
+              },
+              "title": "Crescendolls"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "712edd8d-b413-4e4e-aca4-9b91fce2e65c"
+              },
+              "title": "Nightvision"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "8a98614f-0533-44ef-890a-639cab407a2d"
+              },
+              "title": "Superheroes"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "07b720fc-0d6f-4342-a6df-876d1749de0b"
+              },
+              "title": "High Life"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "defbfcb2-7a5c-4456-be28-b7e5ccf92cc2"
+              },
+              "title": "Something About Us"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "e1fe1d12-dac2-4325-ae1b-25e0ef06b998"
+              },
+              "title": "Voyager"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "2a220770-1150-4190-b0e0-57d89a0a7469"
+              },
+              "title": "Veridis Quo"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "3f60ae01-43cc-4db9-86ec-97b79f83764f"
+              },
+              "title": "Short Circuit"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "59038571-03ea-4ca4-965c-a57eae2aa138"
+              },
+              "title": "Face to Face"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "1a915a2d-e2f4-4300-a230-96fc9c8a7b60"
+              },
+              "title": "Too Long"
+            }
+          ]
+        }
+      ],
+      "title": "Discovery"
+    },
+    "4b3d18cc-8937-36f4-8de0-481088be58e6": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Radiohead"
+        }
+      ],
+      "country": "CA",
+      "date": "1997-06-17",
+      "id": "4b3d18cc-8937-36f4-8de0-481088be58e6",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "4a7fea2e-545b-4c63-bc9a-9943cc3a29d7"
+              },
+              "title": "Airbag"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "9f9cf187-d6f9-437f-9d98-d59cdbd52757"
+              },
+              "title": "Paranoid Android"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "bd82738d-163c-4b1a-bfaf-7acffe30e68a"
+              },
+              "title": "Subterranean Homesick Alien"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "23c3c36b-9449-4484-9040-6ef2125999aa"
+              },
+              "title": "Exit Music (for a Film)"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "47b02a82-c3bf-4647-b894-dd1c8f608e7f"
+              },
+              "title": "Let Down"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "9e2ad5bc-c6f9-40d2-a36f-3122ee2072a3"
+              },
+              "title": "Karma Police"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "5838f978-0822-4e28-874f-e1511324ec3a"
+              },
+              "title": "Fitter Happier"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "ba0a796c-bd1f-4d4b-85a8-918f217a204a"
+              },
+              "title": "Electioneering"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "c7225576-001e-423c-adc1-58f0985dcb27"
+              },
+              "title": "Climbing Up the Walls"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "980a426e-623e-4ea5-98c7-008d037a0508"
+              },
+              "title": "No Surprises"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "79047824-f821-4b1a-9893-e0cea1c947dd"
+              },
+              "title": "Lucky"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "610c0012-6eb4-42a0-b759-3a2532ce0f15"
+              },
+              "title": "The Tourist"
+            }
+          ]
+        }
+      ],
+      "title": "OK Computer"
+    },
+    "4c12e0aa-ea26-47a1-b853-b1a65bc37281": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Nirvana"
+        }
+      ],
+      "country": "US",
+      "date": "2011-09-27",
+      "id": "4c12e0aa-ea26-47a1-b853-b1a65bc37281",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "5fb524f1-8cc8-4c04-a921-e34c0a911ea7"
+              },
+              "title": "Smells Like Teen Spirit"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "593e9317-a327-4a31-b796-416c62dcf49d"
+              },
+              "title": "In Bloom"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "70ac6733-068f-4613-b06b-bea17cfbcc30"
+              },
+              "title": "Come as You Are"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0cf9f95f-70e7-4f2e-8075-5d8ba38dd4a3"
+              },
+              "title": "Breed"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "3fac712c-4196-4865-8c1a-94231a7da309"
+              },
+              "title": "Lithium"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "d088ed9e-1921-4568-ae75-fba8b15ed206"
+              },
+              "title": "Polly"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "dbaa10b1-d46a-4960-8b50-4e2d80c8113c"
+              },
+              "title": "Territorial Pissings"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "11cc49bd-f531-4cdd-9b59-e1f59b06c1d7"
+              },
+              "title": "Drain You"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "aef0677b-93b4-4c66-be74-10120d0e6f5a"
+              },
+              "title": "Lounge Act"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "8bf26383-8b9b-4252-9cb3-0efa4d3f47f1"
+              },
+              "title": "Stay Away"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "ea61d42b-9a76-47fd-bcf7-df911640c309"
+              },
+              "title": "On a Plain"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "758bc548-4443-486f-94a4-14738aecb288"
+              },
+              "title": "Something in the Way / Endless, Nameless"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "8948f7a2-ce0e-4693-9a30-db17014d302b"
+              },
+              "title": "Even in His Youth"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "132ef378-d98d-4584-a65d-7734d333b6f3"
+              },
+              "title": "Aneurysm"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "1f77ce61-179b-40fb-a90c-45a9e234dcf2"
+              },
+              "title": "Curmudgeon"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "20e34783-976b-4937-a0d6-9c77b9da7905"
+              },
+              "title": "D‐7 (live at the BBC)"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "85ae42f5-cccd-4815-b5b0-15314948e24e"
+              },
+              "title": "Been a Son (live)"
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "1d1db11e-7776-42e0-b392-290bd2402c90"
+              },
+              "title": "School (live)"
+            },
+            {
+              "number": "19",
+              "position": 19,
+              "recording": {
+                "id": "0b43560e-389b-406e-a745-73614c83eaae"
+              },
+              "title": "Drain You (live)"
+            },
+            {
+              "number": "20",
+              "position": 20,
+              "recording": {
+                "id": "e78da5d6-ae82-41da-a343-685315cd36b3"
+              },
+              "title": "Sliver (live)"
+            },
+            {
+              "number": "21",
+              "position": 21,
+              "recording": {
+                "id": "a373a781-c13f-4122-bcae-47661a900756"
+              },
+              "title": "Polly (live)"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "e0b34092-01e8-40b9-90c4-80aba2a89bb2"
+              },
+              "title": "In Bloom"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "a1f54ec1-238a-4511-89a2-4d832ad6ee36"
+              },
+              "title": "Immodium (Breed)"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "2425cb37-157f-42f1-98bf-91f8b56afbc6"
+              },
+              "title": "Lithium"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "a2e30506-9c16-4e54-8fff-a98186be9834"
+              },
+              "title": "Polly"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "73319360-66b2-44e5-b364-3bed2a0bb0f7"
+              },
+              "title": "Pay to Play"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "9dd964dd-0dfc-4684-ba9f-1e3e9df17404"
+              },
+              "title": "Here She Comes Now"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "1e551ecc-bb1c-44dd-80bb-d24ad0614f1b"
+              },
+              "title": "Dive"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "873cfc0b-a848-4042-9a9f-5cb35124d200"
+              },
+              "title": "Sappy"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "f561a381-5b69-4db4-9089-bbdc30dee35f"
+              },
+              "title": "Smells Like Teen Spirit"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "c4321a26-1dcb-46ee-8dad-ff9ecf1bf19a"
+              },
+              "title": "Verse Chorus Verse"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "f953af99-8db1-4cd3-8a87-d16bd637138d"
+              },
+              "title": "Territorial Pissings"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "896566d9-2aef-4d4e-9a44-3829ee0ecca5"
+              },
+              "title": "Lounge Act"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "7ddcd592-7adb-4109-a5de-8b09a0ecd1b5"
+              },
+              "title": "Come as You Are"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "5d644925-d3b1-4a61-9c66-b0a282ccec36"
+              },
+              "title": "Old Age"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "16207a9c-b68f-4d98-becf-5fb1187c29d2"
+              },
+              "title": "Something in the Way"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "a8fa40e5-db2c-4d9e-a939-f0e58e8e73db"
+              },
+              "title": "On a Plain"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "3b4db3ba-2ab6-4b57-bb28-c83a3d6f39b3"
+              },
+              "title": "Drain You"
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "ac404399-8b28-41d9-bfce-c3176b13d718"
+              },
+              "title": "Something in the Way"
+            }
+          ]
+        }
+      ],
+      "title": "Nevermind (deluxe edition)"
+    },
+    "4fa9c6d8-731e-3870-8b5b-580811b2d4e0": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "John Coltrane"
+        }
+      ],
+      "country": "XE",
+      "date": "2005",
+      "id": "4fa9c6d8-731e-3870-8b5b-580811b2d4e0",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "0827b81a-c1df-4601-9b63-226fd3d70feb"
+              },
+              "title": "A Love Supreme, Part 1: Acknowledgement"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "aa31b489-5c17-47d6-8c64-715780925203"
+              },
+              "title": "A Love Supreme, Part 2: Resolution"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "15b8f95f-3501-43ff-8c7d-38fb6cd47927"
+              },
+              "title": "A Love Supreme, Part 3: Pursuance"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "e6fe1d4c-e542-4915-8ddd-53d0ac87c52f"
+              },
+              "title": "A Love Supreme, Part 4: Psalm"
+            }
+          ]
+        }
+      ],
+      "title": "A Love Supreme"
+    },
+    "5621f656-8f63-4988-97dc-ab79c8a18008": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Bizet"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Maria Callas"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Nicolai Gedda"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Andréa Guiot"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Robert Massard"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Chœurs René Duclos"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Jean Laforge"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Orchestre du Théâtre National de l’Opéra"
+        },
+        {
+          "joinphrase": "",
+          "name": "Georges Prêtre"
+        }
+      ],
+      "country": "GB",
+      "date": "1964",
+      "disambiguation": "",
+      "id": "5621f656-8f63-4988-97dc-ab79c8a18008",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "A1",
+              "position": 1,
+              "recording": {
+                "id": "1d410f1d-4da9-47f2-8697-f02cf73f3cd5"
+              },
+              "title": "Carmen : Prélude"
+            },
+            {
+              "number": "A2",
+              "position": 2,
+              "recording": {
+                "id": "b0a20db8-dfc0-42a5-b188-2246c9805fc0"
+              },
+              "title": "Carmen : Acte I. Scène et chœur « Sur la place »"
+            },
+            {
+              "number": "A3",
+              "position": 3,
+              "recording": {
+                "id": "9174f8c2-5802-4601-a59b-0fd36530a21b"
+              },
+              "title": "Carmen : Acte I. Chœur des gamins"
+            },
+            {
+              "number": "A4",
+              "position": 4,
+              "recording": {
+                "id": "f6e2b5dd-5f1c-482c-bcca-6f2b0deb5bcd"
+              },
+              "title": "Carmen : Acte I. Chœur des cigarières"
+            },
+            {
+              "number": "A5",
+              "position": 5,
+              "recording": {
+                "id": "4131a37a-815c-46d5-b276-92f091a91c8d"
+              },
+              "title": "Carmen : Acte I. Habanera"
+            },
+            {
+              "number": "A6",
+              "position": 6,
+              "recording": {
+                "id": "92f11540-82da-43d8-821c-94ea68e711a4"
+              },
+              "title": "Carmen : Acte I. Scène « Carmen sur tes pas »"
+            },
+            {
+              "number": "B1",
+              "position": 7,
+              "recording": {
+                "id": "57e04f33-1b97-483f-bc67-8975f585b912"
+              },
+              "title": "Carmen : Acte I. Duo et scène « Parle-moi de ma mère »"
+            },
+            {
+              "number": "B2",
+              "position": 8,
+              "recording": {
+                "id": "b710265c-eeab-4a0d-8ef2-641a392eb68f"
+              },
+              "title": "Carmen : Acte I. Chœur de la dispute"
+            },
+            {
+              "number": "B3",
+              "position": 9,
+              "recording": {
+                "id": "022736cc-d133-4918-8973-0fd07edbde5d"
+              },
+              "title": "Carmen : Acte I. Chanson et mélodrame « Mon officier, c’était une querelle »"
+            },
+            {
+              "number": "B4",
+              "position": 10,
+              "recording": {
+                "id": "44e73620-0c98-4c25-bc05-0f1348fb285b"
+              },
+              "title": "Carmen : Acte I. Séguedille et duo"
+            },
+            {
+              "number": "B5",
+              "position": 11,
+              "recording": {
+                "id": "7859841e-04a8-4936-90d8-84499fd67095"
+              },
+              "title": "Carmen : Acte I. Final"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "C1",
+              "position": 1,
+              "recording": {
+                "id": "5fab0d9c-4cb8-478d-a6aa-37a62caf459d"
+              },
+              "title": "Carmen : Acte II. Chanson bohème (scène)"
+            },
+            {
+              "number": "C2",
+              "position": 2,
+              "recording": {
+                "id": "a9610894-f0cf-4ad4-b5d1-d6a572afda6c"
+              },
+              "title": "Carmen : Acte II. Chœur « Vivat »"
+            },
+            {
+              "number": "C3",
+              "position": 3,
+              "recording": {
+                "id": "2a609d74-2b35-4c84-9054-c1dcb9191797"
+              },
+              "title": "Carmen : Acte II. « Votre toast, je peux vous le rendre » (Escamillo, chœur)"
+            },
+            {
+              "number": "C4",
+              "position": 4,
+              "recording": {
+                "id": "b9623fdc-2ca7-48ec-884f-629fb951deb9"
+              },
+              "title": "Carmen : Acte II. Couplets d'Escamillo (scène)"
+            },
+            {
+              "number": "C5",
+              "position": 5,
+              "recording": {
+                "id": "a475623b-12c2-4371-b3c6-dd3fb0d51cc8"
+              },
+              "title": "Carmen : Acte II. Quintette (scène)"
+            },
+            {
+              "number": "C6",
+              "position": 6,
+              "recording": {
+                "id": "e8752255-0ee6-487d-920d-dfaa64b5188a"
+              },
+              "title": "Carmen : Acte II. Scène « Halte-là »"
+            },
+            {
+              "number": "C7",
+              "position": 7,
+              "recording": {
+                "id": "558acdb5-6487-4eee-95b9-fbf18d188450"
+              },
+              "title": "Carmen : Acte II. Duo Carmen-Don José (1re partie)"
+            },
+            {
+              "number": "D1",
+              "position": 8,
+              "recording": {
+                "id": "fb41c8cc-dcb3-4d5f-b58e-f44a170252d9"
+              },
+              "title": "Carmen : Acte II. « La fleur que tu m'avais jetée » (duo)"
+            },
+            {
+              "number": "D2",
+              "position": 9,
+              "recording": {
+                "id": "59c95b1c-19e4-4dc3-80f9-9d6ca2065463"
+              },
+              "title": "Carmen : Acte II. Final"
+            },
+            {
+              "number": "D3",
+              "position": 10,
+              "recording": {
+                "id": "ec640a2f-ed24-4c6c-91c9-100cfcddfa0e"
+              },
+              "title": "Carmen : Acte II. Final sextuor (scène et chœur)"
+            }
+          ]
+        },
+        {
+          "position": 3,
+          "tracks": [
+            {
+              "number": "E1",
+              "position": 1,
+              "recording": {
+                "id": "9562bfc0-fc84-4d6f-98d5-3538ebe97d1f"
+              },
+              "title": "Carmen : Acte III. Trio des cartes (scène)"
+            },
+            {
+              "number": "E2",
+              "position": 2,
+              "recording": {
+                "id": "66d4fb6f-767e-4daa-9723-74f3faaaac5d"
+              },
+              "title": "Carmen : Acte III. Ensemble « Quant au douanier »"
+            },
+            {
+              "number": "E3",
+              "position": 3,
+              "recording": {
+                "id": "69c647b6-22d4-4beb-95fd-80fcacb188d7"
+              },
+              "title": "Carmen : Acte III. Air de Micaela (scène)"
+            },
+            {
+              "number": "E4",
+              "position": 4,
+              "recording": {
+                "id": "70285131-708a-453d-ab26-5eb49be7b188"
+              },
+              "title": "Carmen : Acte III. « Je suis Escamillo »"
+            },
+            {
+              "number": "E5",
+              "position": 5,
+              "recording": {
+                "id": "5444bf26-d09e-4f32-820e-fe81d373299e"
+              },
+              "title": "Carmen : Acte III. Final (1re partie)"
+            },
+            {
+              "number": "F1",
+              "position": 6,
+              "recording": {
+                "id": "f732c3b4-40fa-4ec2-a95a-fee03ac23806"
+              },
+              "title": "Carmen : Acte III. Final (2e partie)"
+            },
+            {
+              "number": "F2",
+              "position": 7,
+              "recording": {
+                "id": "5c5dc560-f2cb-40a5-88c1-fce792944619"
+              },
+              "title": "Carmen : Acte IV. « A dos cuartos »"
+            },
+            {
+              "number": "F3",
+              "position": 8,
+              "recording": {
+                "id": "76d656a6-8713-4339-a251-e34769633c4e"
+              },
+              "title": "Carmen : Acte IV. « Voici la quadrille »"
+            },
+            {
+              "number": "F4",
+              "position": 9,
+              "recording": {
+                "id": "78960de5-265f-4283-b8ee-7c489324d6cc"
+              },
+              "title": "Carmen : Acte IV. Duo et chœur final"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "66b42168-aa4b-4802-a6a0-10cc53a4d5a4"
+      },
+      "status": "Official",
+      "title": "Carmen"
+    },
+    "5ef79d37-46d3-4ea2-ad57-810a93d4a15e": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "John Coltrane"
+        }
+      ],
+      "country": "XW",
+      "date": "2019-11-21",
+      "id": "5ef79d37-46d3-4ea2-ad57-810a93d4a15e",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "1f1fd94d-35f2-4ca4-8b29-01100caa2a19"
+              },
+              "title": "Blue Train"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "6b2408c4-ced6-4c72-ba51-2d02f014f60a"
+              },
+              "title": "Moment’s Notice"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "ca9af83b-ebe2-4e81-88d9-21a7ffe94bde"
+              },
+              "title": "Locomotion"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "6dc63505-78a7-4cd7-a59d-f26bbe2cf62d"
+              },
+              "title": "I’m Old Fashioned"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "6426daf4-340a-453f-8be3-7c60989e070a"
+              },
+              "title": "Lazy Bird"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "f350e0d0-7c09-45d8-add2-04e3ceff2485"
+              },
+              "title": "Blue Train (alternate take)"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "90f474f8-7805-4022-a25f-46fa41ba77b6"
+              },
+              "title": "Lazy Bird (alternate take)"
+            }
+          ]
+        }
+      ],
+      "title": "Blue Train"
+    },
+    "6bb3793b-f991-378e-9bff-0bd3117f2298": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "The Beatles"
+        }
+      ],
+      "country": "JP",
+      "date": "1983-05-21",
+      "disambiguation": "",
+      "id": "6bb3793b-f991-378e-9bff-0bd3117f2298",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "485bbe7f-d0f7-4ffe-8adb-0f1093dd2dbf"
+              },
+              "title": "Come Together"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "b849acd4-0638-49ea-8e40-7391613d4890"
+              },
+              "title": "Something"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "a92380e6-f10d-4407-aceb-5825b17fed5a"
+              },
+              "title": "Maxwell’s Silver Hammer"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "de896c41-463d-4eaa-8fe4-d826e2afa0f8"
+              },
+              "title": "Oh! Darling"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "15127932-c879-466e-b0f8-a1c5022d16e7"
+              },
+              "title": "Octopus’s Garden"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "a9a83384-3da3-4c84-af6d-33fcdb1c3e27"
+              },
+              "title": "I Want You (She’s So Heavy)"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "440f60e8-0b25-4ec4-abb1-c6beec624ab0"
+              },
+              "title": "Here Comes the Sun"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "1e1d1f33-346c-4f9a-ad05-03aa715c2f37"
+              },
+              "title": "Because"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "474546e9-0b30-4881-9269-c6c1c8bbf07b"
+              },
+              "title": "You Never Give Me Your Money"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "d057c75d-04eb-438f-be0b-74f629f2953c"
+              },
+              "title": "Sun King"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "99c004fb-ba87-41be-afd4-e0157b40516a"
+              },
+              "title": "Mean Mr. Mustard"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "65ca55c8-d857-4a3b-9246-835b1e54fe4d"
+              },
+              "title": "Polythene Pam"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "c19db4d3-6640-4732-a0b2-e358ed80c5c4"
+              },
+              "title": "She Came In Through the Bathroom Window"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "3d7f2000-123d-4cac-862b-e04ead24c5f2"
+              },
+              "title": "Golden Slumbers"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "daaee15a-8a4c-4275-a7c1-5b6211f0ec69"
+              },
+              "title": "Carry That Weight"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "5ad78393-77c2-451e-beb1-074df7e06e57"
+              },
+              "title": "The End"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "ed8d1b3b-8757-447a-baba-3efe027f2765"
+              },
+              "title": "Her Majesty"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "9162580e-5df4-32de-80cc-f45a8d8a9b1d"
+      },
+      "status": "Official",
+      "title": "Abbey Road"
+    },
+    "759c4afe-4fe7-41e9-b877-2de8600cdd13": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "John Coltrane"
+        }
+      ],
+      "country": "XE",
+      "date": "1990",
+      "id": "759c4afe-4fe7-41e9-b877-2de8600cdd13",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "a4b7eed8-56bc-48c5-82a8-89fcfcfad376"
+              },
+              "title": "My Favorite Things"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "503aea6d-42d2-4870-bec8-50993889eca4"
+              },
+              "title": "Everytime We Say Goodbye"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "a8661daf-63c6-4ef1-a746-ce162abb11ef"
+              },
+              "title": "Summertime"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0ce974ff-d220-4ba8-be31-6a3a385011bd"
+              },
+              "title": "But Not for Me"
+            }
+          ]
+        }
+      ],
+      "title": "My Favorite Things"
+    },
+    "7ec069c0-4424-3169-8ed0-d5e2473e0e84": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Fleetwood Mac"
+        }
+      ],
+      "country": "GB",
+      "date": "1977",
+      "id": "7ec069c0-4424-3169-8ed0-d5e2473e0e84",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "A1",
+              "position": 1,
+              "recording": {
+                "id": "18ca3bc6-b646-4a6b-82bc-07584bd28e95"
+              },
+              "title": "Second Hand News"
+            },
+            {
+              "number": "A2",
+              "position": 2,
+              "recording": {
+                "id": "248cc9d1-97ea-493e-84d4-4c5ec718683b"
+              },
+              "title": "Dreams"
+            },
+            {
+              "number": "A3",
+              "position": 3,
+              "recording": {
+                "id": "3636f491-b535-4a0c-a042-db63f3a7901c"
+              },
+              "title": "Never Going Back Again"
+            },
+            {
+              "number": "A4",
+              "position": 4,
+              "recording": {
+                "id": "1c0a78be-b883-4c5d-93f2-4f48405dbcb2"
+              },
+              "title": "Don’t Stop"
+            },
+            {
+              "number": "A5",
+              "position": 5,
+              "recording": {
+                "id": "66908b7f-050f-4e8d-82b0-a768a3d80c63"
+              },
+              "title": "Go Your Own Way"
+            },
+            {
+              "number": "A6",
+              "position": 6,
+              "recording": {
+                "id": "70b64435-e956-4141-9149-789b19ebcf9f"
+              },
+              "title": "Songbird"
+            },
+            {
+              "number": "B1",
+              "position": 7,
+              "recording": {
+                "id": "cd06c484-9319-4376-a104-504871e19756"
+              },
+              "title": "The Chain"
+            },
+            {
+              "number": "B2",
+              "position": 8,
+              "recording": {
+                "id": "cce551a1-5a6c-494b-89fe-6dfac5e8aed1"
+              },
+              "title": "You Make Loving Fun"
+            },
+            {
+              "number": "B3",
+              "position": 9,
+              "recording": {
+                "id": "fc53705e-f3d6-4246-b0e3-23d1acc8f1d1"
+              },
+              "title": "I Don’t Want to Know"
+            },
+            {
+              "number": "B4",
+              "position": 10,
+              "recording": {
+                "id": "0c9684a3-1109-44cb-ac8c-808168ae8715"
+              },
+              "title": "Oh Daddy"
+            },
+            {
+              "number": "B5",
+              "position": 11,
+              "recording": {
+                "id": "6eda00db-318c-495b-96a1-494d249b04f5"
+              },
+              "title": "Gold Dust Woman"
+            }
+          ]
+        }
+      ],
+      "title": "Rumours"
+    },
+    "850363df-b8a6-36b2-9724-fab99a90b9e8": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Vivaldi"
+        },
+        {
+          "joinphrase": "",
+          "name": "Nigel Kennedy"
+        }
+      ],
+      "country": "GB",
+      "date": "2008-03-09",
+      "id": "850363df-b8a6-36b2-9724-fab99a90b9e8",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "bf012c09-4cf0-425f-a445-b85b2ee498b8"
+              },
+              "title": "Concerto no. 1 in E major, RV 269 “La primavera”: I. Allegro"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "842768ef-e0bd-4f2a-9912-cf1c6d26b227"
+              },
+              "title": "Concerto no. 1 in E major, RV 269 “La primavera”: II. Largo"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "ca2b7985-c23e-4533-b28f-0d6193b0cf3d"
+              },
+              "title": "Concerto no. 1 in E major, RV 269 “La primavera”: III. Allegro"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "b7c169ff-2c3f-4f25-a663-ecf32ec4fe83"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: I. Allegro non molto"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "999419af-a165-45bb-a072-2349be7cd4ed"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: II. Adagio"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "87ce3935-fc47-43c4-8fe6-8cdba1099a06"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: III. Presto"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "c0eb7074-73e2-4aed-b3af-9fdec82dfa2d"
+              },
+              "title": "Concerto no. 3 in F major, RV 293 “L’autunno”: I. Allegro"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "f76eb0d7-af16-48d8-8b8f-c0c5ae4abc4a"
+              },
+              "title": "Concerto no. 3 in F major, RV 293 “L’autunno”: II. Adagio molto"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "70c9b45b-4e46-40f2-9abc-6422b210929e"
+              },
+              "title": "Concerto no. 3 in F major, RV 293 “L’autunno”: III. Allegro"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "0bd9759d-6d08-4393-bb47-4d694f8db0f0"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: I. Allegro non molto"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "17cb0028-ccab-4a1d-b277-9e8629e716c0"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: II. Largo"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "65f34585-e761-4d09-8d5e-3bd7939dd904"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: III. Allegro"
+            }
+          ]
+        }
+      ],
+      "title": "The Four Seasons"
+    },
+    "8d197ade-1e3d-345a-8900-bbc7d5c7e677": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Chopin"
+        },
+        {
+          "joinphrase": "",
+          "name": "Maria João Pires"
+        }
+      ],
+      "country": "XE",
+      "date": "2009",
+      "id": "8d197ade-1e3d-345a-8900-bbc7d5c7e677",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "c9fa0c4d-ec82-48ad-ab86-5e40a318be5c"
+              },
+              "title": "Nocturne No. 1 in B-flat minor, Op. 9 No. 1: Larghetto"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "6acbbdea-d56c-4cd6-a5fc-5f694cfcb6e2"
+              },
+              "title": "Nocturne No. 2 in E-flat major, Op. 9 No. 2: Andante"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "f74e0f90-9809-4ef3-bcdd-7aa3ddb788b2"
+              },
+              "title": "Nocturne No. 3 in B major, Op. 9 No. 3: Allegretto"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "afc030a6-cf41-4710-b45a-75b9c64764b9"
+              },
+              "title": "Nocturne No. 4 in F major, Op. 15 No. 1: Andante cantabile"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "6904d90a-6013-4d5a-a92b-5eee06c0dd5b"
+              },
+              "title": "Nocturne No. 5 in F-sharp major, Op. 15 No. 2: Larghetto"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "d4e76ef3-25e3-4154-8267-5ae519d64cbc"
+              },
+              "title": "Nocturne No. 6 in G minor, Op. 15 No. 3: Lento"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "6d587b25-bca9-4c6f-9279-fcf710470933"
+              },
+              "title": "Nocturne No. 7 in C-sharp minor, Op. 27 No. 1: Larghetto"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "69039e0d-9f3c-48bc-b067-72fc8b3f0d00"
+              },
+              "title": "Nocturne No. 8 in D-flat major, Op. 27 No. 2: Lento sostenuto"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "afe0d225-2f2d-48dc-9a9f-801d73288044"
+              },
+              "title": "Nocturne No. 9 in B major, Op. 32 No. 1: Andante sostenuto"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "21dd55bd-dc36-4e40-8258-b900703c36b7"
+              },
+              "title": "Nocturne No. 10 in A-flat major, Op. 32 No. 2: Lento"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "78a892bf-54c1-4cb2-983e-f1a06ae938ea"
+              },
+              "title": "Nocturne No. 11 in G minor, Op. 37 No. 1: Andante sostenuto"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "3eaee22d-1a0f-4818-a09d-93a8a8620d2c"
+              },
+              "title": "Nocturne No. 12 in G major, Op. 37 No. 2: Andantino"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "9af01734-a777-40a0-aeb4-8ab74908181f"
+              },
+              "title": "Nocturne No. 13 in C minor, Op. 48 No. 2: Lento"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "457fef4a-bf50-43bc-8a9b-980e498cccf1"
+              },
+              "title": "Nocturne No. 14 in F-sharp minor, Op. 48 No. 2: Andantino"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "795128fb-15e8-4d9e-be84-b0a7b7306dd0"
+              },
+              "title": "Nocturne No. 15 in F minor, Op. 55 No. 1: Andante"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "fbf89593-b652-4c74-80ef-525f89db4561"
+              },
+              "title": "Nocturne No. 16 in E-flat major, Op. 55 No. 2: Lento sostenuto"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "43545baf-50d5-4ea0-81df-d50a10f717ec"
+              },
+              "title": "Nocturne No. 17 in B major, Op. 62 No. 1: Andante"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "144b0087-eec6-4c3c-94b8-fe5d0fd523f2"
+              },
+              "title": "Nocturne No. 18 in E major, Op. 62 No. 2: Lento"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "a19cabd0-0cd7-411d-ac5f-adcbb6668040"
+              },
+              "title": "Nocturne No. 19 in E minor, Op. post. 72 No. 1: Andante"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "283591c5-f328-48d2-9d39-ec91350ce378"
+              },
+              "title": "Nocturne No. 20 in C-sharp minor, Op. post: Lento con gran espressione"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "a4280081-e955-47df-af89-28c7fb2e1e54"
+              },
+              "title": "Nocturne No. 21 in C minor, Op. post."
+            }
+          ]
+        }
+      ],
+      "title": "Nocturnes"
+    },
+    "9142b030-32f1-48b3-b72a-be71a17a6e7a": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Beethoven"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Berliner Philharmoniker"
+        },
+        {
+          "joinphrase": "",
+          "name": "Claudio Abbado"
+        }
+      ],
+      "country": "GB",
+      "date": "2004",
+      "disambiguation": "",
+      "id": "9142b030-32f1-48b3-b72a-be71a17a6e7a",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "e96b7525-3cde-4fa9-b675-6f1350e34c7e"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125 “Choral”: I. Allegro ma non troppo, un poco maestoso"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "9ff7b8ca-be88-40b9-8ade-27739f2cce3c"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125 “Choral”: II. Molto vivace"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "1d641124-4634-412f-a89b-5593601f82e0"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125 “Choral”: III. Adagio molto e cantabile"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "dc8ba1aa-6dff-447b-a128-3bc4fe1166c1"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125 “Choral”: IV. Finale"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "763fc7fa-9776-4825-87c4-3a21ce9e8a44"
+              },
+              "title": "The Creatures of Prometheus, Op. 43: No. 16. Finale. Allegretto"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "35470db9-00fe-4420-ad51-74278a36a110"
+      },
+      "status": "Official",
+      "title": "Symphony No. 9"
+    },
+    "94fe35ca-4fda-4757-b178-b901bc2faf89": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Claude Debussy"
+        },
+        {
+          "joinphrase": "",
+          "name": "Krystian Zimerman"
+        }
+      ],
+      "country": "XE",
+      "date": "1994-01",
+      "id": "94fe35ca-4fda-4757-b178-b901bc2faf89",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "8462e999-3b4b-4c9d-884c-362e271db495"
+              },
+              "title": "Danseuses de Delphes"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "5e687b11-6d6c-47c5-919c-fceaf040c013"
+              },
+              "title": "Voiles"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "6b645f65-57e7-4142-83f1-8be5f9b065e1"
+              },
+              "title": "Le vent dans la plaine"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "568bf609-154d-4222-9665-801e4dec05e1"
+              },
+              "title": "«Les sons et les parfums tournent dans lʼair du soir»"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "6ca74d17-cdde-42c1-a18e-3a710080f575"
+              },
+              "title": "Les collines dʼAnacapri"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "9cec2dcd-f351-48b5-a70c-9c3d20bd2b83"
+              },
+              "title": "Des pas sur la neige"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "dd763aff-2fe1-40e4-9843-50d3b24b4624"
+              },
+              "title": "Ce quʼa vu le vent dʼouest"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "2c413724-620b-4a88-bfce-841bd855023d"
+              },
+              "title": "La fille aux cheveux de lin"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "da614ec6-405c-4f7c-8e34-6c129710e5e4"
+              },
+              "title": "La sérénade interrompue"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "425ff1c2-87ef-4bda-a3b6-c5bfb7348bcd"
+              },
+              "title": "La cathédrale engloutie"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "54c0e1d4-e152-416d-a320-2c3e5740aec9"
+              },
+              "title": "La danse de Puck"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "7edf0b5d-6339-4135-8184-83faf93bb26d"
+              },
+              "title": "Minstrels"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "660dd94e-7009-4ff4-9923-04353b580e47"
+              },
+              "title": "Brouillards"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "553796b1-2a4d-4fa2-836b-0af4a3f01aca"
+              },
+              "title": "Feuilles Mortes"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "5010d251-7ef1-4128-a8f0-38aeb39a2992"
+              },
+              "title": "La puerta del vino"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "7fa111ee-22c3-477e-a2fd-e5659c397c63"
+              },
+              "title": "Les fées sont dʼexquises danseuses"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "cc5d35c8-40e8-4db5-845c-0aedc7f226ba"
+              },
+              "title": "Bruyères"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "d5c5eafe-8355-4ce6-b3eb-a3a38faa19b6"
+              },
+              "title": "«General Lavine» - excentric"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "c5276360-e880-4ac5-b0cc-cfb4254d09b5"
+              },
+              "title": "La terrasse des audiences du clair de lune"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "d0ceee70-e918-4cf1-87a5-8f297d37fe42"
+              },
+              "title": "Ondine"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "7737aab5-3402-48f6-8b1c-dfffb41f1573"
+              },
+              "title": "Hommage à S. Pickwick Esq. P.P.M.P.C."
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "4df56895-fd5f-42c5-a313-d884ae9d4e97"
+              },
+              "title": "Canope"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "e7aaa16b-50fc-48d9-8195-8fa2d479fa17"
+              },
+              "title": "Les tierces alternées"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "1b839f83-dea9-4247-a07a-fa8c882a7d9a"
+              },
+              "title": "Feux dʼartifice"
+            }
+          ]
+        }
+      ],
+      "title": "Préludes"
+    },
+    "977f543a-19b7-4fb3-b7f3-ae4d5f5fd498": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Cannonball Adderley"
+        }
+      ],
+      "country": "JP",
+      "date": "2004-03-24",
+      "id": "977f543a-19b7-4fb3-b7f3-ae4d5f5fd498",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "69c7f51f-10bf-44b1-a319-3c1fb60f538d"
+              },
+              "title": "Autumn Leaves"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "d5e82ffa-d988-4022-bdee-31059f768b33"
+              },
+              "title": "Love for Sale"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "3082d124-1345-4023-b3c9-21bc4949ef5a"
+              },
+              "title": "Somethin’ Else"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0acb8682-2fbd-4dba-ba70-d0b2700540a0"
+              },
+              "title": "One for Daddy‐O"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "8590b891-5981-4584-8c1d-aadad1f45004"
+              },
+              "title": "Dancing in the Dark"
+            }
+          ]
+        }
+      ],
+      "title": "Somethin’ Else"
+    },
+    "9830ba5c-f24d-4df5-9d1a-76db4c19cb40": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Various Artists"
+        }
+      ],
+      "country": "US",
+      "date": "2017-07-03",
+      "id": "9830ba5c-f24d-4df5-9d1a-76db4c19cb40",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "6f80dec2-661d-4a18-94df-dc4a7e463cab"
+              },
+              "title": "I'm Gonna Rock"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "05860e7a-e1c5-4ff6-8196-3d70f1e84d65"
+              },
+              "title": "Rockin' At Home"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "812b040e-30bc-4fb6-a3b0-d91c9e112188"
+              },
+              "title": "Shout Sister Shout"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "9dc0aac6-aeee-4bd3-906a-448765c558e4"
+              },
+              "title": "Gonna Paint The Town Red"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "b4ba8b51-25d3-407e-9823-f061b6960c9d"
+              },
+              "title": "I'm So Glad I Could Jump And Shout"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "c453e80d-842d-4c45-b13b-3a9fc12c602a"
+              },
+              "title": "We're Gonna Go Fishin'"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "6bfbeb01-9f1f-4dc9-b7c8-37b4fb084a2e"
+              },
+              "title": "Little Red Hen"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "be6f87f8-2ce1-413a-ace4-e6dc39471998"
+              },
+              "title": "Ain't Get No Grindin'"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "69945454-f9b0-43ed-820d-e6a1b8bdbc18"
+              },
+              "title": "Saturday Night Fish Fry"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "d26ac594-7118-4d95-867c-1abf82984de5"
+              },
+              "title": "Waking Up Baby"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "2ec92c45-bad9-4cce-ac72-537d8a97a6bb"
+              },
+              "title": "A-Sleeping At The Foot Of The Bed"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "bf9f9ba8-084c-470a-aca5-23555d1b05b7"
+              },
+              "title": "Baby Don't You Want To Go"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "3b6eae69-32f1-4dd9-9187-7449583613d7"
+              },
+              "title": "Chattanooga Shoe Shine Boy"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "13ec9069-f978-421f-8541-b06505407e8e"
+              },
+              "title": "Pan American Boogie"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "32923073-6727-41c3-a785-b95ce4666e8b"
+              },
+              "title": "Marijuana Boogie"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "e1ec6e82-8b60-4b8c-9987-6b88adb087c0"
+              },
+              "title": "Bingo Boogie"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "4bd7921b-d877-4e12-843d-04bde7bb3cfa"
+              },
+              "title": "Run Mister Rabbit"
+            },
+            {
+              "number": "18",
+              "position": 18,
+              "recording": {
+                "id": "6d479b6a-33cf-4f6b-80b8-49aed3e0af6f"
+              },
+              "title": "When The Rooster Crows"
+            }
+          ]
+        }
+      ],
+      "title": "Saturday Night Fever"
+    },
+    "99184b1e-c7d9-4499-88a2-775203fa49d4": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "The Alan Parsons Project"
+        }
+      ],
+      "country": "FR",
+      "date": "",
+      "id": "99184b1e-c7d9-4499-88a2-775203fa49d4",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "84884031-015e-4904-aed3-c453b205378f"
+              },
+              "title": "A Dream Within a Dream (instrumental)"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "10d226b9-c4d7-4258-80c8-f2ffe1e4e398"
+              },
+              "title": "The Raven"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "c782cc64-7070-4797-bb70-194b5e38936a"
+              },
+              "title": "The Tell‐Tale Heart"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "d1b80a9a-4473-4c03-b00d-f1490754a022"
+              },
+              "title": "The Cask of Amontillado"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "c55ae696-d541-4de4-ad37-dea0208c1ff8"
+              },
+              "title": "(The System of) Doctor Tarr and Professor Fether"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "ada593f5-3f60-4fb0-858b-7d93db4c69f1"
+              },
+              "title": "The Fall of the House of Usher (instrumental): I Prelude"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "aa1545d1-ec50-471b-8fc2-9f259eb17ff4"
+              },
+              "title": "The Fall of the House of Usher (instrumental): II Arrival"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "b7246b1d-b807-4967-a4f5-aa5f55409a5f"
+              },
+              "title": "The Fall of the House of Usher (instrumental): III Intermezzo"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "9df4506b-b042-4063-89f1-32fe59dc7d0c"
+              },
+              "title": "The Fall of the House of Usher (instrumental): IV Pavane"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "d3fb67af-df0f-4d73-bfa4-64b7a406618b"
+              },
+              "title": "The Fall of the House of Usher (instrumental): V Fall"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "4c6235e3-b7c0-45e1-bf55-4ef4f3f998fd"
+              },
+              "title": "To One in Paradise"
+            }
+          ]
+        }
+      ],
+      "title": "Tales of Mystery and Imagination"
+    },
+    "9d14c055-4c82-44c7-bf12-e3741ee86e84": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Pink Floyd"
+        }
+      ],
+      "country": "JP",
+      "date": "1985-06-21",
+      "id": "9d14c055-4c82-44c7-bf12-e3741ee86e84",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "1be4459a-4bda-4530-bf8e-421fdddbdbfc"
+              },
+              "title": "In the Flesh?"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "eff36e5e-5abb-4f7e-a0aa-64c154c5b28d"
+              },
+              "title": "The Thin Ice"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "82d8444b-3478-480c-8652-bf8aa6cb3dc5"
+              },
+              "title": "Another Brick in the Wall, Part 1"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "84978bae-46e2-4d9d-b390-5bd8a1c31983"
+              },
+              "title": "The Happiest Days of Our Lives"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "597eae0b-ccb6-4076-b997-0ce940586076"
+              },
+              "title": "Another Brick in the Wall, Part 2"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "2423ca5e-99d3-4b49-be53-542e6ee38a82"
+              },
+              "title": "Mother"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "bb0d3c16-b684-4a5a-a107-e12bbd4f3041"
+              },
+              "title": "Goodbye Blue Sky"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "b56432a2-6231-4c6f-af00-2656804a95d1"
+              },
+              "title": "Empty Spaces"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "919dd9f4-cd78-4359-8e89-195abd9b79cf"
+              },
+              "title": "Young Lust"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "7003ec02-7bc2-4054-b477-f739efd6df45"
+              },
+              "title": "One of My Turns"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "c0a217dc-4c2c-45f9-afd4-9b5f366386ef"
+              },
+              "title": "Don’t Leave Me Now"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "ae5096a0-4b53-455a-ac9c-0348108208c3"
+              },
+              "title": "Another Brick in the Wall, Part 3"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "bc3448ee-53bb-412a-99d6-ea6cc862928a"
+              },
+              "title": "Goodbye Cruel World"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "daebd800-fe8a-48bf-bfb4-d8655a895dff"
+              },
+              "title": "Hey You"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "5893b2c3-243c-4b79-bfbf-c6624770a97b"
+              },
+              "title": "Is There Anybody Out There?"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "cfc2fb95-2fc0-4129-acf3-5a5dfb9bceef"
+              },
+              "title": "Nobody Home"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "eb2fbdca-089e-493b-ae03-bb24cdf2b176"
+              },
+              "title": "Vera"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "e7840a7d-38e4-4d69-b666-0ee4c92fe832"
+              },
+              "title": "Bring the Boys Back Home"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "9ffabbe4-e078-4906-80a7-3a02b537e251"
+              },
+              "title": "Comfortably Numb"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "e90a6932-b238-4cc0-8331-6637469b7a34"
+              },
+              "title": "The Show Must Go On"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "89881237-8c35-43b7-af8f-950fb6183fee"
+              },
+              "title": "In the Flesh"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "d36e0b66-a91c-44ee-98c1-881ac8157439"
+              },
+              "title": "Run Like Hell"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "da31bbd5-d020-41d8-8ed5-908c18c13c55"
+              },
+              "title": "Waiting for the Worms"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "92e2cb40-de60-47e4-80bc-60595fb5a488"
+              },
+              "title": "Stop"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "a362cf52-5d85-4f34-8a69-e830ef87b5cb"
+              },
+              "title": "The Trial"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "a0545de0-0c68-4301-8cd4-1b77e4b0dc3e"
+              },
+              "title": "Outside the Wall"
+            }
+          ]
+        }
+      ],
+      "title": "The Wall"
+    },
+    "9e2a119a-cb85-412f-b375-964c46ce1312": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Mozart"
+        },
+        {
+          "joinphrase": "",
+          "name": "Herbert von Karajan"
+        }
+      ],
+      "id": "9e2a119a-cb85-412f-b375-964c46ce1312",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "8336160c-fe84-4fb3-81dd-eb9f0c65fd6e"
+              },
+              "title": "Requiem, KV 626: I. Introitus: Requiem"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "6dc786ca-55bc-47fd-a407-9b0df5403177"
+              },
+              "title": "Requiem, KV 626: II. Kyrie"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "575a1947-747e-453b-bd69-c27226f6d9f8"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 1. Dies irae"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0abc02c4-fe5b-42af-90d2-797f03161843"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 2. Tuba mirum"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "67ae5318-f1bb-4ff0-9753-16e55b7fd299"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 3. Rex tremendae"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "bf0853ff-9169-40f7-a96f-68a99e5686fb"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 4. Recordare"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "ebde0d6a-633c-4277-b7ed-ac38d5e4f558"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 5. Confutatis"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "6bee761a-2743-48ea-9704-0efb7f94a202"
+              },
+              "title": "Requiem, KV 626: III. Sequenz: No. 6. Lacrimosa"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "c19111c0-d753-4efa-b8a9-13b10f2db12f"
+              },
+              "title": "Requiem, KV 626: IV. Offertorium: No. 1. Domine Jesu"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "70fe81a4-4249-4198-a6fa-309f31545a9a"
+              },
+              "title": "Requiem, KV 626: IV. Offertorium: No. 2. Hostias"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "c90ff3a7-664f-42ad-bd78-ae7b2afcdae4"
+              },
+              "title": "Requiem, KV 626: V. Sanctus"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "517d64e0-df0f-4caf-986a-3eef68ef8110"
+              },
+              "title": "Requiem, KV 626: VI. Benedictus"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "883e676e-797b-48e5-84a9-454567f1e333"
+              },
+              "title": "Requiem, KV 626: VII. Agnus Dei"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "d78884e5-3f7d-4b3f-a1d7-1933e1dcb4b5"
+              },
+              "title": "Requiem, KV 626: VIII. Communio: Lux aeterna"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "3d64c99b-bc27-4e6c-a34a-a3142a5b95ee"
+              },
+              "title": "Adagio und Fuge c-moll für Streicher, KV 546"
+            }
+          ]
+        }
+      ],
+      "title": "Requiem"
+    },
+    "9e9ce82a-2aa9-4c6d-a68f-9e3d14cac5b2": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Pink Floyd"
+        }
+      ],
+      "country": "JP",
+      "date": "2023-10-13",
+      "id": "9e9ce82a-2aa9-4c6d-a68f-9e3d14cac5b2",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "bef3fddb-5aca-49f5-b2fd-d56a23268d63"
+              },
+              "title": "Speak to Me"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "ecbc7c9b-e79d-4ec8-ac77-44e4a7f7f1b8"
+              },
+              "title": "Breathe (in the Air)"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "19084069-642f-465f-9127-f71bcd800a05"
+              },
+              "title": "On the Run"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "0e11c0fd-a1da-4b88-a438-7ef55c5809ec"
+              },
+              "title": "Time"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "73b01cea-2dad-4fc2-9e61-02a31477c1b1"
+              },
+              "title": "The Great Gig in the Sky"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "7fef22bd-76aa-4803-b56b-93a5d6e70662"
+              },
+              "title": "Money"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "2d1201cf-59bb-4ffa-9f52-f5b3afa13346"
+              },
+              "title": "Us and Them"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "7c278a16-ae04-460c-88ea-39155cadcd09"
+              },
+              "title": "Any Colour You Like"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "71c0e054-b700-4fd2-a35b-95c7afc566cb"
+              },
+              "title": "Brain Damage"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "c46641c1-fdbc-4401-8b1d-23a4062a207a"
+              },
+              "title": "Eclipse"
+            }
+          ]
+        }
+      ],
+      "title": "The Dark Side of the Moon"
+    },
+    "aa52e83d-9c2c-4824-b41a-318eedb1c004": {
+      "artist-credit": [
+        {
+          "joinphrase": ", ",
+          "name": "Brahms"
+        },
+        {
+          "joinphrase": "",
+          "name": "Herbert von Karajan"
+        }
+      ],
+      "country": "XW",
+      "date": "2023-10-23",
+      "disambiguation": "2023 Remastered, Vienna 1947",
+      "id": "aa52e83d-9c2c-4824-b41a-318eedb1c004",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "ee5a0c7e-af6d-44f6-a078-7ed2098ec1b0"
+              },
+              "title": "I. Selig sind, die da Leid tragen. Ziemlich langsam und mit Ausdruck"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "caff5e87-61ac-407b-bc5a-3a7b40e911b5"
+              },
+              "title": "II. Denn alles Fleisch es ist wie Gras. Langsam, marschmäßig"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "c50d31e6-3d94-4c18-ac7b-7fe924702878"
+              },
+              "title": "III. Herr, lehre doch mich. Andante moderato"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "340a210a-c91b-4b1d-aca4-d0f88846f442"
+              },
+              "title": "IV. Wie lieblich sind deine Wohnungen. Mäßig bewegt"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "a64d79fb-16e7-4f75-945f-a4448fbe3134"
+              },
+              "title": "V. Ihr habt nun Traurigkeit. Langsam"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "5a143969-274e-473a-87a3-0ae428ec2f39"
+              },
+              "title": "VI. Denn wir haben hie keine bleibende Statt. Andante"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "62c27c5c-4e47-461a-ad1e-dc92416584f7"
+              },
+              "title": "VII. Selig sind die Toten. Feierlich"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "27fb7c74-2880-3f72-8a28-45172d933ce2"
+      },
+      "status": "Official",
+      "title": "Ein deutsches Requiem"
+    },
+    "adccd851-a871-4f32-997d-2b19819b16d2": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Various Artists"
+        }
+      ],
+      "country": "CA",
+      "date": "1994",
+      "disambiguation": "",
+      "id": "adccd851-a871-4f32-997d-2b19819b16d2",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "df767468-8cdc-4c84-900c-b378c70be53d"
+              },
+              "title": "Pumpkin and Honey Bunny / Misirlou"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "e5a77768-ff64-46f2-a13e-9d368b413cff"
+              },
+              "title": "Royale With Cheese"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "afd7680d-0df0-41d8-8d80-318090702f90"
+              },
+              "title": "Jungle Boogie"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "b3384c19-483c-49ae-94d8-ec00ab56a25b"
+              },
+              "title": "Let's Stay Together"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "7a400a5e-7f40-4fd5-9d6f-d168293c4368"
+              },
+              "title": "Bustin' Surfboards"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "6690a4d2-4dc3-4262-8546-bb666c388418"
+              },
+              "title": "Lonesome Town"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "47da814e-c620-41b9-9ed3-098d6261b74b"
+              },
+              "title": "Son of a Preacher Man"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "f649b36a-4b43-4054-8d5a-cf4782922663"
+              },
+              "title": "Zed's Dead, Baby / Bullwinkle Part II"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "05da1733-00d2-402d-a647-5a03a1c72f3e"
+              },
+              "title": "Jack Rabbit Slims Twist Contest / You Never Can Tell"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "6b48ce08-c98b-40a0-8b1b-030c6c9ba49a"
+              },
+              "title": "Girl, You'll Be a Woman Soon"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "7944d365-6320-4c56-900c-35068f021718"
+              },
+              "title": "If Love Is a Red Dress (Hang Me in Rags)"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "7090d2a7-13d7-4b9b-9cd0-8b17e31ffe05"
+              },
+              "title": "Bring Out the Gimp / Comanche"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "39b16495-6e17-4710-a92e-cae93cc46dfd"
+              },
+              "title": "Flowers on the Wall"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "df0af428-5b32-4c4c-9233-20b15561d8d4"
+              },
+              "title": "Personality Goes a Long Way"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "cf630eff-b387-48b4-8281-81cc2e10cb6a"
+              },
+              "title": "Surf Rider"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "6fd25f63-e244-47c0-a8d6-324c6cc7fcba"
+              },
+              "title": "Ezekiel 25:17"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "1703cd63-9401-33c0-87c6-50c4ba2e0ba8"
+      },
+      "status": "Official",
+      "title": "Pulp Fiction: Music From the Motion Picture"
+    },
+    "aed4b4a3-baf4-4d44-b172-e0fed427fa7b": {
+      "artist-credit": [
+        {
+          "joinphrase": " & ",
+          "name": "Charlie Haden"
+        },
+        {
+          "joinphrase": "",
+          "name": "Pat Metheny"
+        }
+      ],
+      "country": "XE",
+      "date": "1997",
+      "id": "aed4b4a3-baf4-4d44-b172-e0fed427fa7b",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "6cab18a9-fbd6-4936-a010-bae7ef09ea14"
+              },
+              "title": "Waltz for Ruth"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "58052e01-05a1-4299-a97e-e800588a19f4"
+              },
+              "title": "Our Spanish Love Song"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "2de08a80-f410-431d-a5c1-54f02956f8c1"
+              },
+              "title": "Message to a Friend"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "643b273b-4bdb-47b6-ae2b-81e578ce8cbe"
+              },
+              "title": "Two for the Road"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "2d898b63-edba-43fc-909a-cdaaeede7a71"
+              },
+              "title": "First Song (For Ruth)"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "12a95197-6bf9-4ccf-8616-2ebac610432d"
+              },
+              "title": "The Moon Is a Harsh Mistress"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "97673a1b-18e1-4185-a50a-83fcab389736"
+              },
+              "title": "The Precious Jewel"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "9af58406-169a-4e65-b9d5-4620a740b38a"
+              },
+              "title": "He’s Gone Away"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "16354d2a-f8c9-4114-993c-4ef1c345bd42"
+              },
+              "title": "The Moon Song"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "ebb2095e-a56a-42ca-b746-92ecf1f883ef"
+              },
+              "title": "Tears of Rain"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "d1784022-559c-49be-9678-3faf821f59e0"
+              },
+              "title": "Cinema Paradiso (love theme)"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "dd7b40b6-12f7-4d3c-bf28-205da615711e"
+              },
+              "title": "Cinema Paradiso (main theme)"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "7375caa9-b026-4bf6-b60a-60b790494bf0"
+              },
+              "title": "Spiritual"
+            }
+          ]
+        }
+      ],
+      "title": "Beyond The Missouri Sky (Short Stories)"
+    },
+    "afa8c799-4c41-477f-b0b8-c95b7f38cc8c": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Björk"
+        }
+      ],
+      "country": "CA",
+      "date": "1997",
+      "id": "afa8c799-4c41-477f-b0b8-c95b7f38cc8c",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "95be89c5-f55f-40a8-96bd-7a285c348096"
+              },
+              "title": "Hunter"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "83534ada-9f60-4093-bbf3-ca182a03cf8b"
+              },
+              "title": "Jóga"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "20af32c5-38f3-4717-a65b-8dcb26ce53b8"
+              },
+              "title": "Unravel"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "8ddbc4f1-f3db-47f1-b727-b4ceaf98cef8"
+              },
+              "title": "Bachelorette"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "e7dacee3-36f2-4a40-a658-61fd2ce04d28"
+              },
+              "title": "All Neon Like"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "ca9bb619-50d9-45f5-a65c-bd0b53dcf848"
+              },
+              "title": "5 Years"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "5125ec6f-b7cb-4573-a255-26a1227ae160"
+              },
+              "title": "Immature"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "32abc30c-3655-460d-b910-1086bf10e48b"
+              },
+              "title": "Alarm Call"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "d6febbc3-1495-45f5-a987-0f236d094086"
+              },
+              "title": "Pluto"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "7f527f79-3303-4f30-add1-3b58b65181d9"
+              },
+              "title": "All Is Full of Love"
+            }
+          ]
+        }
+      ],
+      "title": "Homogenic"
+    },
+    "b185d950-2cb4-4da3-809f-cd3efed1a2fc": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "The Beatles"
+        }
+      ],
+      "country": "US",
+      "date": "2008",
+      "id": "b185d950-2cb4-4da3-809f-cd3efed1a2fc",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "485bbe7f-d0f7-4ffe-8adb-0f1093dd2dbf"
+              },
+              "title": "Come Together"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "b849acd4-0638-49ea-8e40-7391613d4890"
+              },
+              "title": "Something"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "a92380e6-f10d-4407-aceb-5825b17fed5a"
+              },
+              "title": "Maxwell’s Silver Hammer"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "de896c41-463d-4eaa-8fe4-d826e2afa0f8"
+              },
+              "title": "Oh! Darling"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "15127932-c879-466e-b0f8-a1c5022d16e7"
+              },
+              "title": "Octopus’s Garden"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "a9a83384-3da3-4c84-af6d-33fcdb1c3e27"
+              },
+              "title": "I Want You (She’s So Heavy)"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "440f60e8-0b25-4ec4-abb1-c6beec624ab0"
+              },
+              "title": "Here Comes the Sun"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "1e1d1f33-346c-4f9a-ad05-03aa715c2f37"
+              },
+              "title": "Because"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "474546e9-0b30-4881-9269-c6c1c8bbf07b"
+              },
+              "title": "You Never Give Me Your Money"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "d057c75d-04eb-438f-be0b-74f629f2953c"
+              },
+              "title": "Sun King"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "99c004fb-ba87-41be-afd4-e0157b40516a"
+              },
+              "title": "Mean Mr Mustard"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "65ca55c8-d857-4a3b-9246-835b1e54fe4d"
+              },
+              "title": "Polythene Pam"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "c19db4d3-6640-4732-a0b2-e358ed80c5c4"
+              },
+              "title": "She Came In Through the Bathroom Window"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "3d7f2000-123d-4cac-862b-e04ead24c5f2"
+              },
+              "title": "Golden Slumbers"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "daaee15a-8a4c-4275-a7c1-5b6211f0ec69"
+              },
+              "title": "Carry That Weight"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "5ad78393-77c2-451e-beb1-074df7e06e57"
+              },
+              "title": "The End"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "ed8d1b3b-8757-447a-baba-3efe027f2765"
+              },
+              "title": "Her Majesty"
+            }
+          ]
+        }
+      ],
+      "title": "Abbey Road"
+    },
+    "b69421eb-20b8-320a-9d49-b62ea173520d": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Pink Floyd"
+        }
+      ],
+      "country": "JP",
+      "date": "1998-09-19",
+      "id": "b69421eb-20b8-320a-9d49-b62ea173520d",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "54029746-25ba-4f88-9885-387ac581e45f"
+              },
+              "title": "Shine On You Crazy Diamond, Parts I–V"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "3794be20-3b5c-41e8-99d5-1d5649fe3821"
+              },
+              "title": "Welcome to the Machine"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "29fba82a-3a79-484d-9595-251745359ee6"
+              },
+              "title": "Have a Cigar"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "feecff58-8ee2-4a7f-ac23-dc8ce7925286"
+              },
+              "title": "Wish You Were Here"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "5bdf011c-a186-4c1c-b7b6-e0faed39d4c3"
+              },
+              "title": "Shine On You Crazy Diamond, Parts VI–IX"
+            }
+          ]
+        }
+      ],
+      "title": "Wish You Were Here"
+    },
+    "b7cf6ab3-1fab-45cd-97a2-8e684ffcada1": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Miles Davis"
+        }
+      ],
+      "country": "US",
+      "date": "1970",
+      "id": "b7cf6ab3-1fab-45cd-97a2-8e684ffcada1",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "09448c9d-36f3-4eb0-8730-8b1b3aea5608"
+              },
+              "title": "Pharaoh’s Dance"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "fa340982-56ff-4d4d-9848-017ec8f1c244"
+              },
+              "title": "Bitches Brew"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "19b3dca2-97b8-4f3a-a78a-7e37b677af5d"
+              },
+              "title": "Spanish Key"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "814a41d5-5c62-4f94-ad38-059ffd3940fa"
+              },
+              "title": "John McLaughlin"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "d9bfa893-1fc6-4a10-ab08-70080173846d"
+              },
+              "title": "Miles Runs the Voodoo Down"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "f9ac7c2b-694f-414d-8c5e-a776dd061131"
+              },
+              "title": "Sanctuary"
+            }
+          ]
+        }
+      ],
+      "title": "Bitches Brew"
+    },
+    "badb712e-ab89-49a9-a690-de746d555c8f": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Air"
+        }
+      ],
+      "country": "US",
+      "date": "2023-02",
+      "id": "badb712e-ab89-49a9-a690-de746d555c8f",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "A1",
+              "position": 1,
+              "recording": {
+                "id": "864c7424-c9ab-481e-a9c0-ad986e646c67"
+              },
+              "title": "La Femme d’argent"
+            },
+            {
+              "number": "A2",
+              "position": 2,
+              "recording": {
+                "id": "738920d3-c6e6-41c7-b504-57761bb625fd"
+              },
+              "title": "Sexy Boy"
+            },
+            {
+              "number": "A3",
+              "position": 3,
+              "recording": {
+                "id": "e9759a5a-5efc-4030-8168-f08790ae4ddc"
+              },
+              "title": "All I Need"
+            },
+            {
+              "number": "A4",
+              "position": 4,
+              "recording": {
+                "id": "f3fb6ec6-46b2-412d-9ab3-956c1a5cf89f"
+              },
+              "title": "Kelly Watch the Stars"
+            },
+            {
+              "number": "B1",
+              "position": 5,
+              "recording": {
+                "id": "8967ca1e-3e0c-4e41-81f6-08757fae829d"
+              },
+              "title": "Talisman"
+            },
+            {
+              "number": "B2",
+              "position": 6,
+              "recording": {
+                "id": "1f21c40d-6e29-4c67-a5c9-fa50aa59b3e7"
+              },
+              "title": "Remember"
+            },
+            {
+              "number": "B3",
+              "position": 7,
+              "recording": {
+                "id": "579dac4e-abc2-4ffb-b85a-4c22f4f7ac47"
+              },
+              "title": "You Make It Easy"
+            },
+            {
+              "number": "B4",
+              "position": 8,
+              "recording": {
+                "id": "85a8d1a3-1475-43c3-b4c5-e4499bd9751f"
+              },
+              "title": "Ce matin-là"
+            },
+            {
+              "number": "B5",
+              "position": 9,
+              "recording": {
+                "id": "062f1c9f-564c-4eb7-9baf-b8944cd17ad3"
+              },
+              "title": "New Star in the Sky"
+            },
+            {
+              "number": "B6",
+              "position": 10,
+              "recording": {
+                "id": "e731a2a1-8e3a-42f6-8dbe-af356714f836"
+              },
+              "title": "Le Voyage de Pénélope"
+            }
+          ]
+        }
+      ],
+      "title": "Moon Safari"
+    },
+    "c07a0583-e763-31d9-a682-a00af4baf661": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Beethoven"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Berliner Philharmoniker"
+        },
+        {
+          "joinphrase": "",
+          "name": "Herbert von Karajan"
+        }
+      ],
+      "country": "DE",
+      "date": "1999-07-01",
+      "id": "c07a0583-e763-31d9-a682-a00af4baf661",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "abb7c704-7a38-42aa-854d-314321a0fa99"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125: I. Allegro ma non troppo, un poco maestoso"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "76f3dad1-0984-42df-8282-a8f73acd4a15"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125: II. Molto vivace"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "7721acc4-7f28-40ea-92f9-faa6c7b8a928"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125: III. Adagio molto e cantabile"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "4bde76af-727c-4a1d-8079-a005a8582361"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125: IV. Presto"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "a3d98427-1af4-496c-ac5e-8d6209edf154"
+              },
+              "title": "Symphony No. 9 in D minor, Op. 125: IV. Presto - \"O Freunde, nicht diese Töne!\" - Allegro assai: Final chorus from Schiller's \"Ode to Joy\""
+            }
+          ]
+        }
+      ],
+      "title": "Symphony no. 9"
+    },
+    "c91b59d9-c72d-35e2-b97b-67884b5117d5": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Radiohead"
+        }
+      ],
+      "country": "AU",
+      "date": "2000-10",
+      "id": "c91b59d9-c72d-35e2-b97b-67884b5117d5",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "60bd9d53-01ff-4562-8058-eb44b3940317"
+              },
+              "title": "Everything in Its Right Place"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "0852f01a-1832-453d-ae8e-345499ecc027"
+              },
+              "title": "Kid A"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "c7492f6e-adf3-4ff5-85dc-33d527dc81d8"
+              },
+              "title": "The National Anthem"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "740d324e-4356-4116-812d-17ea76a190ce"
+              },
+              "title": "How to Disappear Completely"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "31c89fdc-afdb-4d84-bc61-2dbabf0b4f23"
+              },
+              "title": "Treefingers"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "4d7b8fcb-fafc-4416-9170-752f12e10a2e"
+              },
+              "title": "Optimistic"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "27f5b46c-f749-40e7-bc10-1524393168f0"
+              },
+              "title": "In Limbo"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "1c0377bb-c00b-4bbe-b4b2-615f13324adc"
+              },
+              "title": "Idioteque"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "5616efb3-4c50-40ab-a792-e2e34faae75f"
+              },
+              "title": "Morning Bell"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "f8764ab0-996b-40c8-9645-10f47e8c43d0"
+              },
+              "title": "Motion Picture Soundtrack"
+            }
+          ]
+        }
+      ],
+      "title": "Kid A"
+    },
+    "dc06742a-d49d-4127-abff-f209b570257c": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Antonín Dvořák"
+        },
+        {
+          "joinphrase": "",
+          "name": "Herbert von Karajan"
+        }
+      ],
+      "country": "JP",
+      "date": "",
+      "disambiguation": "",
+      "id": "dc06742a-d49d-4127-abff-f209b570257c",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "c6cf2d42-a4de-4d8c-a426-fb45e5da17ad"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95 \"From the New World\": I. Adagio - Allegro molto"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "b80555e9-47df-472a-aaf1-0ca7d2b7e79e"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95 \"From the New World\": II. Largo"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "ebde801c-c600-4cf2-a4a6-05ee9730b6e2"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95 \"From the New World\": III. Molto vivace"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "6a222609-b2a6-4c4e-ae3b-d7bb829924cb"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95 \"From the New World\": IV. Allegro con fuoco"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "713c3873-dac5-4662-a467-f5b1b09ccf00"
+      },
+      "status": "Official",
+      "title": "Symphony no. 9 in E minor, \"From the New World\""
+    },
+    "e32a3f0b-1c19-3170-bb1c-650893774744": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Miles Davis"
+        }
+      ],
+      "country": "US",
+      "date": "1987",
+      "id": "e32a3f0b-1c19-3170-bb1c-650893774744",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "60f750f4-d222-46b7-ad5c-905334c9a48a"
+              },
+              "title": "So What"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "852bf62a-29f9-4026-abc5-86d6e973196f"
+              },
+              "title": "Freddie Freeloader"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "67a9794c-153a-4a24-82ec-9eace7e208f2"
+              },
+              "title": "Blue in Green"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "b7ebe185-21e9-4400-a17a-3d0cee232925"
+              },
+              "title": "All Blues"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "250b3f1d-7620-42a9-87b3-5d1a166e0f2f"
+              },
+              "title": "Flamenco Sketches"
+            }
+          ]
+        }
+      ],
+      "title": "Kind of Blue"
+    },
+    "f1593b9e-481c-4f0f-bd99-823391e888e6": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Vivaldi"
+        },
+        {
+          "joinphrase": ", ",
+          "name": "Nigel Kennedy"
+        },
+        {
+          "joinphrase": "",
+          "name": "English Chamber Orchestra"
+        }
+      ],
+      "country": "US",
+      "date": "1989",
+      "disambiguation": "",
+      "id": "f1593b9e-481c-4f0f-bd99-823391e888e6",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "bf012c09-4cf0-425f-a445-b85b2ee498b8"
+              },
+              "title": "Concerto no. 1 in E, RV 269 “La primavera”: I. Allegro"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "842768ef-e0bd-4f2a-9912-cf1c6d26b227"
+              },
+              "title": "Concerto no. 1 in E, RV 269 “La primavera”: II. Largo"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "ca2b7985-c23e-4533-b28f-0d6193b0cf3d"
+              },
+              "title": "Concerto no. 1 in E, RV 269 “La primavera”: III. Allegro"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "b7c169ff-2c3f-4f25-a663-ecf32ec4fe83"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: I. Allegro non molto"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "999419af-a165-45bb-a072-2349be7cd4ed"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: II. Adagio"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "87ce3935-fc47-43c4-8fe6-8cdba1099a06"
+              },
+              "title": "Concerto no. 2 in G minor, RV 315 “L’estate”: III. Presto"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "c0eb7074-73e2-4aed-b3af-9fdec82dfa2d"
+              },
+              "title": "Concerto no. 3 in F, RV 293 “L’autunno”: I. Allegro"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "f76eb0d7-af16-48d8-8b8f-c0c5ae4abc4a"
+              },
+              "title": "Concerto no. 3 in F, RV 293 “L’autunno”: II. Adagio molto"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "70c9b45b-4e46-40f2-9abc-6422b210929e"
+              },
+              "title": "Concerto no. 3 in F, RV 293 “L’autunno”: III. Allegro"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "0bd9759d-6d08-4393-bb47-4d694f8db0f0"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: I. Allegro non molto"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "17cb0028-ccab-4a1d-b277-9e8629e716c0"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: II. Largo"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "65f34585-e761-4d09-8d5e-3bd7939dd904"
+              },
+              "title": "Concerto no. 4 in F minor, RV 297 “L’inverno”: III. Allegro"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "4a121fa2-7761-4d8c-b627-ebf38e5ddead"
+      },
+      "status": "Official",
+      "title": "The Four Seasons"
+    },
+    "f1884d0c-c1f8-4324-a8fd-8d9d0cfee3df": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Dvořák"
+        },
+        {
+          "joinphrase": "",
+          "name": "Berliner Philharmoniker"
+        }
+      ],
+      "disambiguation": "",
+      "id": "f1884d0c-c1f8-4324-a8fd-8d9d0cfee3df",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "32c83302-609d-4b71-89bf-2be8f94e5ec0"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95, B. 178 “From the New World”: I. Adagio – Allegro molto"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "78c2ea4b-e1ba-48e1-b800-a4aa303643eb"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95, B. 178 “From the New World”: II. Largo"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "fd4af812-423f-490a-8037-d5f1ec90ed38"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95, B. 178 “From the New World”: III. Scherzo (Molto vivace)"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "d9f63069-35d6-48cd-afc7-8af4cb37eeaa"
+              },
+              "title": "Symphony no. 9 in E minor, op. 95, B. 178 “From the New World”: IV. Allegro con fuoco"
+            }
+          ]
+        }
+      ],
+      "release-group": {
+        "id": "69cd90b2-2658-40d1-bf4c-759df8dc9954"
+      },
+      "status": "Official",
+      "title": "Symphony no. 9"
+    },
+    "f7e81a34-d83e-4fd9-b41e-799724381eb0": {
+      "artist-credit": [
+        {
+          "joinphrase": "",
+          "name": "Various Artists"
+        }
+      ],
+      "country": "FR",
+      "date": "2022-04-22",
+      "id": "f7e81a34-d83e-4fd9-b41e-799724381eb0",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "765ccfc9-1ee5-4da5-8bf6-f7b9af7bb54e"
+              },
+              "title": "You Are Close"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "810e899c-c3e6-4554-88ad-7ecb69c55b20"
+              },
+              "title": "Daydream"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "d5c29074-162f-4b50-a32a-e2d3f7d43ad0"
+              },
+              "title": "School Is Out"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "5db9adbb-73bf-42b9-b08f-c01776abc2ef"
+              },
+              "title": "Karmapa Khenno"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "369e9f53-9de3-46be-bbda-800674b539da"
+              },
+              "title": "The Ashes Fall"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "f3c55aa0-35de-4030-9ba6-1bd04993754a"
+              },
+              "title": "Mumbai"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "a6c10d4d-d28b-4477-8718-dd77821d188e"
+              },
+              "title": "Ston Ourano (Throdef Remix)"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "294ffc13-3298-4e30-ac31-cc6f1e06bc2a"
+              },
+              "title": "Wild Flower"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "776e406f-64e1-4e13-91db-17de0def60ff"
+              },
+              "title": "Siente Tu Corazon"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "4af7ee34-5681-4579-a549-cb9db2056025"
+              },
+              "title": "Prince Of Tears (Radio Edit)"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "01bbb6cb-9477-42ff-8c91-7ab90bbeeafd"
+              },
+              "title": "Pirhan"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "6ff1cc4e-a416-47a6-bbf0-b2d3b4b25bd8"
+              },
+              "title": "Kartan Modga Shemedgoma"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "8f8c9134-3b76-4024-a457-ac5d1e2d880a"
+              },
+              "title": "Fora"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "f362e9d6-341f-4524-a43b-8007f364408b"
+              },
+              "title": "Memoria (Dope & Cano Guru Remix)"
+            },
+            {
+              "number": "15",
+              "position": 15,
+              "recording": {
+                "id": "49b08b5c-2c1a-44a7-a773-b06938725281"
+              },
+              "title": "Behind The Mountains (Ravin Remix)"
+            },
+            {
+              "number": "16",
+              "position": 16,
+              "recording": {
+                "id": "214e30dc-3091-4dbe-88b3-8c504fa9dabc"
+              },
+              "title": "Eco Ballad (Extended Mix)"
+            },
+            {
+              "number": "17",
+              "position": 17,
+              "recording": {
+                "id": "b09d91b7-8cc7-4cb6-a76b-d9bde97efdf5"
+              },
+              "title": "Lamizè Pa Dous (Henrik Schwarz Remix)"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "tracks": [
+            {
+              "number": "1",
+              "position": 1,
+              "recording": {
+                "id": "4d635b92-acfb-43b9-8132-94e6bc677100"
+              },
+              "title": "Zhara"
+            },
+            {
+              "number": "2",
+              "position": 2,
+              "recording": {
+                "id": "577fb9ac-b652-42cf-83c9-1e6da666c3a3"
+              },
+              "title": "Star Anise"
+            },
+            {
+              "number": "3",
+              "position": 3,
+              "recording": {
+                "id": "43b57823-ab9d-49cc-8866-2f9eeb47b719"
+              },
+              "title": "Echo Mantra (Radio Mix)"
+            },
+            {
+              "number": "4",
+              "position": 4,
+              "recording": {
+                "id": "65cc9c62-b809-4f11-9aef-0d5e222c8240"
+              },
+              "title": "Saigon Acid"
+            },
+            {
+              "number": "5",
+              "position": 5,
+              "recording": {
+                "id": "363cdbb8-666b-4a78-bfdd-f95e9d1e26c9"
+              },
+              "title": "Breathe Into Me (Original Mix)"
+            },
+            {
+              "number": "6",
+              "position": 6,
+              "recording": {
+                "id": "e8f43a96-c9b7-4a3f-943c-7d8a5424e207"
+              },
+              "title": "Mirage (Nomad Saleh Remix)"
+            },
+            {
+              "number": "7",
+              "position": 7,
+              "recording": {
+                "id": "8b13cbcc-6134-4688-a9fd-7dda5f76cd6e"
+              },
+              "title": "Les Parapluies De Cherbourg"
+            },
+            {
+              "number": "8",
+              "position": 8,
+              "recording": {
+                "id": "b7d54883-92f6-492f-9bfe-e523876e88eb"
+              },
+              "title": "One For The Sun"
+            },
+            {
+              "number": "9",
+              "position": 9,
+              "recording": {
+                "id": "98051097-e328-43c8-a68f-ff817b050f6e"
+              },
+              "title": "Hindi Dub (Original Mix)"
+            },
+            {
+              "number": "10",
+              "position": 10,
+              "recording": {
+                "id": "410ffc97-e499-41dd-b165-17d3124957a1"
+              },
+              "title": "Anabalina"
+            },
+            {
+              "number": "11",
+              "position": 11,
+              "recording": {
+                "id": "1145a9b2-72e8-43b2-a996-22b9493db13d"
+              },
+              "title": "Innocence"
+            },
+            {
+              "number": "12",
+              "position": 12,
+              "recording": {
+                "id": "e84bf758-8181-49d5-a645-c3ebe421a9ac"
+              },
+              "title": "Pipe Of The Space"
+            },
+            {
+              "number": "13",
+              "position": 13,
+              "recording": {
+                "id": "bf95bf57-01d5-4f69-873d-b72ac9b8ed86"
+              },
+              "title": "Kuda Hwenyu"
+            },
+            {
+              "number": "14",
+              "position": 14,
+              "recording": {
+                "id": "74bff509-3944-4b9e-b83f-ab2dca69e5c6"
+              },
+              "title": "Morgenland"
+            }
+          ]
+        }
+      ],
+      "title": "Buddha‐Bar XXIV"
+    },
+    "fdf79451-b70a-4d96-b2c1-40507ab8f427": {
+      "artist-credit": [
+        {
+          "joinphrase": "; ",
+          "name": "Bach"
+        },
+        {
+          "joinphrase": "",
+          "name": "Glenn Gould"
+        }
+      ],
+      "country": "JP",
+      "date": "2022-09-28",
+      "id": "fdf79451-b70a-4d96-b2c1-40507ab8f427",
+      "media": [
+        {
+          "position": 1,
+          "tracks": [
+            {
+              "number": "A1",
+              "position": 1,
+              "recording": {
+                "id": "d57d7065-020f-4648-b1ca-12c9ba72f78d"
+              },
+              "title": "Goldberg Variations, BWV 988: I. Aria"
+            },
+            {
+              "number": "A2",
+              "position": 2,
+              "recording": {
+                "id": "efb39634-473c-4464-9bb0-f1656173304c"
+              },
+              "title": "Goldberg Variations, BWV 988: II. Variation 1"
+            },
+            {
+              "number": "A3",
+              "position": 3,
+              "recording": {
+                "id": "2aaaf99c-8060-4b17-a932-89280e972c91"
+              },
+              "title": "Goldberg Variations, BWV 988: III. Variation 2"
+            },
+            {
+              "number": "A4",
+              "position": 4,
+              "recording": {
+                "id": "8d7588f3-9ac0-42b5-8086-a1994065dc95"
+              },
+              "title": "Goldberg Variations, BWV 988: IV. Variation 3"
+            },
+            {
+              "number": "A5",
+              "position": 5,
+              "recording": {
+                "id": "a620a6f0-41a0-47f8-a993-17a76a2cb6b8"
+              },
+              "title": "Goldberg Variations, BWV 988: V. Variation 4"
+            },
+            {
+              "number": "A6",
+              "position": 6,
+              "recording": {
+                "id": "458f6e29-0a5e-4d81-ae97-645edf76ee2d"
+              },
+              "title": "Goldberg Variations, BWV 988: VI. Variation 5"
+            },
+            {
+              "number": "A7",
+              "position": 7,
+              "recording": {
+                "id": "5187687e-bc85-4468-8605-f30ae6ffb009"
+              },
+              "title": "Goldberg Variations, BWV 988: VII. Variation 6"
+            },
+            {
+              "number": "A8",
+              "position": 8,
+              "recording": {
+                "id": "df22c486-2e50-4111-981d-11723871bb52"
+              },
+              "title": "Goldberg Variations, BWV 988: VIII. Variation 7"
+            },
+            {
+              "number": "A9",
+              "position": 9,
+              "recording": {
+                "id": "7d81a6ad-19e3-455f-8ce0-4f2a6cefef46"
+              },
+              "title": "Goldberg Variations, BWV 988: IX. Variation 8"
+            },
+            {
+              "number": "A10",
+              "position": 10,
+              "recording": {
+                "id": "12cc8157-dd93-40f1-b320-ceeb233dd728"
+              },
+              "title": "Goldberg Variations, BWV 988: X. Variation 9"
+            },
+            {
+              "number": "A11",
+              "position": 11,
+              "recording": {
+                "id": "71f3718d-4ff4-488c-9b9e-1671e9731906"
+              },
+              "title": "Goldberg Variations, BWV 988: XI. Variation 10"
+            },
+            {
+              "number": "A12",
+              "position": 12,
+              "recording": {
+                "id": "7c17ce1b-f9a3-4369-ba2d-3285cc50fce9"
+              },
+              "title": "Goldberg Variations, BWV 988: XII. Variation 11"
+            },
+            {
+              "number": "A13",
+              "position": 13,
+              "recording": {
+                "id": "eeb6b284-7fb4-4e27-a04b-8d2270fde50e"
+              },
+              "title": "Goldberg Variations, BWV 988: XIII. Variation 12"
+            },
+            {
+              "number": "A14",
+              "position": 14,
+              "recording": {
+                "id": "61846e01-dd88-4a16-82cc-166334df32aa"
+              },
+              "title": "Goldberg Variations, BWV 988: XIV. Variation 13"
+            },
+            {
+              "number": "A15",
+              "position": 15,
+              "recording": {
+                "id": "db33a86e-da5d-496e-999f-34ba4d4ad93d"
+              },
+              "title": "Goldberg Variations, BWV 988: XV. Variation 14"
+            },
+            {
+              "number": "A16",
+              "position": 16,
+              "recording": {
+                "id": "eeeb9a7e-549f-440b-adfc-a8451d96610f"
+              },
+              "title": "Goldberg Variations, BWV 988: XVI. Variation 15"
+            },
+            {
+              "number": "B1",
+              "position": 17,
+              "recording": {
+                "id": "beb4ba24-ab1a-4eac-899b-0a63d8686367"
+              },
+              "title": "Goldberg Variations, BWV 988: XVII. Variation 16"
+            },
+            {
+              "number": "B2",
+              "position": 18,
+              "recording": {
+                "id": "200dd8bb-e0ff-4dba-9a52-3c2cae04f63e"
+              },
+              "title": "Goldberg Variations, BWV 988: XVIII. Variation 17"
+            },
+            {
+              "number": "B3",
+              "position": 19,
+              "recording": {
+                "id": "29b94490-8df4-42b3-bdaf-0e48bac091bf"
+              },
+              "title": "Goldberg Variations, BWV 988: XIX. Variation 18"
+            },
+            {
+              "number": "B4",
+              "position": 20,
+              "recording": {
+                "id": "87728147-be4f-4c79-8e13-3686ca1b877d"
+              },
+              "title": "Goldberg Variations, BWV 988: XX. Variation 19"
+            },
+            {
+              "number": "B5",
+              "position": 21,
+              "recording": {
+                "id": "d3af6a38-af74-4dbe-8b84-cef52cf0f6e0"
+              },
+              "title": "Goldberg Variations, BWV 988: XXI. Variation 20"
+            },
+            {
+              "number": "B6",
+              "position": 22,
+              "recording": {
+                "id": "7fb8b982-71aa-4d6d-8817-00812fa2e227"
+              },
+              "title": "Goldberg Variations, BWV 988: XXII. Variation 21"
+            },
+            {
+              "number": "B7",
+              "position": 23,
+              "recording": {
+                "id": "7c042eca-dd7d-4dcc-9e23-2e641ef7800e"
+              },
+              "title": "Goldberg Variations, BWV 988: XXIII. Variation 22"
+            },
+            {
+              "number": "B8",
+              "position": 24,
+              "recording": {
+                "id": "a7cd22df-06d4-461d-a346-3dc691e5f7b6"
+              },
+              "title": "Goldberg Variations, BWV 988: XXIV. Variation 23"
+            },
+            {
+              "number": "B9",
+              "position": 25,
+              "recording": {
+                "id": "abc7c01d-67ef-4fd0-ad31-af2a4028d0f3"
+              },
+              "title": "Goldberg Variations, BWV 988: XXV. Variation 24"
+            },
+            {
+              "number": "B10",
+              "position": 26,
+              "recording": {
+                "id": "a9d72441-3c0e-4bbc-becf-0133b4d65306"
+              },
+              "title": "Goldberg Variations, BWV 988: XXVI. Variation 25"
+            },
+            {
+              "number": "B11",
+              "position": 27,
+              "recording": {
+                "id": "71de69c6-0daa-4067-adf5-906db77c4d7c"
+              },
+              "title": "Goldberg Variations, BWV 988: XXVII. Variation 26"
+            },
+            {
+              "number": "B12",
+              "position": 28,
+              "recording": {
+                "id": "8b108931-3ee7-499f-a862-7635ca426e9c"
+              },
+              "title": "Goldberg Variations, BWV 988: XXVIII. Variation 27"
+            },
+            {
+              "number": "B13",
+              "position": 29,
+              "recording": {
+                "id": "9379654c-08df-4bf6-8f47-b863a8bdf8e6"
+              },
+              "title": "Goldberg Variations, BWV 988: XXIX. Variation 28"
+            },
+            {
+              "number": "B14",
+              "position": 30,
+              "recording": {
+                "id": "40e3da41-2f7e-4a6b-8083-64cb42ec9543"
+              },
+              "title": "Goldberg Variations, BWV 988: XXX. Variation 29"
+            },
+            {
+              "number": "B15",
+              "position": 31,
+              "recording": {
+                "id": "0083efaf-1f1f-413e-b9da-cc1fc29f4788"
+              },
+              "title": "Goldberg Variations, BWV 988: XXXI. Variation 30"
+            },
+            {
+              "number": "B16",
+              "position": 32,
+              "recording": {
+                "id": "caa8cab9-557c-4b59-924d-e0f714b3e50e"
+              },
+              "title": "Goldberg Variations, BWV 988: XXXII. Aria (reprise)"
+            }
+          ]
+        }
+      ],
+      "title": "Bach: Goldberg Variations (1955 mono)"
+    }
+  }
+}

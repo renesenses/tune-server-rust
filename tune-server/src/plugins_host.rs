@@ -331,6 +331,7 @@ impl HostContext for AppStateHost {
                     duration_ms: t.get("duration_ms").and_then(Value::as_i64).unwrap_or(0),
                     track_number: t.get("track_number").and_then(Value::as_i64),
                     disc_number: t.get("disc_number").and_then(Value::as_i64),
+                    album_ref: t.get("album_ref").and_then(Value::as_str).map(String::from),
                 });
             }
         }
@@ -416,6 +417,7 @@ impl HostContext for AppStateHost {
     }
 
     fn pause(&self, zone: i64) -> Result<Value, String> {
+        info!(zone_id = zone, origine = "greffon", "pause_requested");
         let device_id = self.zone_device_id(zone);
         block_on(self.orchestrator.pause(zone, device_id.as_deref()))
             .map_err(|error| error.to_string())?;

@@ -2203,7 +2203,249 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "item_tags_created_at",
         up: "",
     },
+
+    // Fil 2121 (FabienM, 03/10) — la RÉFÉRENCE D'ALBUM d'une piste de service
+    // (`StreamTrack.album_id`), gardée avec la piste dans la file, les favoris
+    // de service et l'historique : `queue_items.album_ref`,
+    // `streaming_favorites.album_ref`, `listen_history.album_ref`.
+    //
+    // Pour Bandcamp, c'est l'adresse de la page album ou piste, et c'est la
+    // SEULE chose qui permette de resigner une URL de flux expirée : le
+    // `source_id` d'une piste Bandcamp EST l'URL bcbits signée, qui meurt en
+    // 410 au bout de quelques jours (2,7 jours dans le journal de Fabien), et
+    // seule une nouvelle lecture de la page en donne une fraîche. Aucune des
+    // trois tables ne la gardait : le relais n'avait rien pour resigner.
+    //
+    // NULL pour toutes les lignes existantes : rien dans la base ne dit de
+    // quelle page venait une piste déjà rangée. Elles gardent le comportement
+    // d'avant (pas de nouvelle résolution, échec dit par le relais).
+    //
+    // Numérotée 114 / PG 078 : vérifié le 03/10 sur `origin/rc/v1.0.0`,
+    // `origin/batch/bugs-rc3-20261002` et `origin/batch/feat-rc3-20261002`,
+    // dont la dernière est 113 / PG 077 sur les trois.
+    //
+    // Colonnes posées par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 078.
+    Migration {
+        version: 114,
+        name: "references_d_album_de_service",
+        up: "",
+    },
+    // Fil 2130 (04/10) — « Reprendre l'écoute » tombait en « (delai) » sur
+    // PostgreSQL : la jointure de l'historique vers l'album prenait 25,7 s
+    // pour 8 571 albums. La requête est réécrite en deux branches `UNION ALL`
+    // (`home_queries::historique_rattache_a_son_album`) ; cet index sert la
+    // première (`a.id = lh.album_id`, `album_id IN (…)`) et isole la seconde
+    // (`album_id IS NULL`). Aucun index ne portait `listen_history.album_id`.
+    //
+    // Numérotée 115 / PG 079, PAS 114 : la 114 (PG 078) est prise par #5706
+    // (Bandcamp, fil 2121), en PR en même temps que celle-ci. Vérifié le 04/10
+    // sur `origin/rc/v1.0.0`, `origin/batch/bugs-rc3-20261002` et
+    // `origin/batch/feat-rc3-20261002` (dernière : 113 / PG 077) et sur
+    // `fix/bandcamp-resignature-adresse` (114 / PG 078). Le lanceur ne joue
+    // que `version > MAX` : une 115 appliquée AVANT la 114 la ferait sauter en
+    // silence sur toute base déjà montée. Cette migration EXIGE donc la 114
+    // avant elle — sinon, elle se renumérote à la promotion.
+    //
+    // Index posé dans le bloc de version, PAS dans `up` : même règle qu'à la
+    // 113, la colonne est d'abord garantie. Rejoué aussi dans la passe finale
+    // (`IF NOT EXISTS`). Jumelle PG : 079.
+    Migration {
+        version: 115,
+        name: "listen_history_album_id_index",
+        up: "",
+    },
+    // #4991 (b) — la marque « déjà tenté, rien trouvé » de l'identification
+    // en lot. Un album que MusicBrainz n'a pas (verdict `not_found`, service
+    // en bonne santé) ne reçoit pas de `musicbrainz_release_id` : sans marque,
+    // il restait en tête de la sélection `ORDER BY al.id`, et la relance
+    // réattaquait l'amas qui venait d'échouer. La sélection range désormais
+    // les albums jamais tentés en tête, puis les tentés du plus ancien au plus
+    // récent ; aucun album n'est exclu.
+    //
+    // TEXT ISO-8601 UTC, NULL pour l'existant (= jamais tenté), posée par
+    // `add_column_if_missing` dans le bloc de version et dans la passe finale.
+    // Numérotée 116 / PG 080 : dernière sur `batch/feat-rc3-20261002` le
+    // 05/10 = 115 / PG 079 (fil 2130). Jumelle PG : 080.
+    Migration {
+        version: 116,
+        name: "albums_identification_tentee_le",
+        up: "",
+    },
+    // Section « Live » de la fiche artiste (Bertrand, 05/10/2026, suite de
+    // #5616) — `albums.release_secondary_types` : les types SECONDAIRES
+    // MusicBrainz (`live`, `compilation`, `soundtrack`, `remix`…) séparés par
+    // `;`. `albums.release_type` ne garde que le primaire : sans cette
+    // colonne, un live restait dans Albums.
+    //
+    // Numérotée 117 / PG 081, PAS 116 / 080 : la 116 et la PG 080 sont prises
+    // par #5763 (`albums_identification_tentee_le`), PR ouverte vers
+    // `batch/feat-rc3-20261002` en même temps que celle-ci. Le lanceur ne joue
+    // que `version > MAX` : une 117 appliquée AVANT la 116 ferait sauter la 116
+    // en silence. Cette migration EXIGE donc #5763 fusionnée avant elle —
+    // sinon, elle se renumérote à la promotion. `migration_count_matches` le
+    // signale tant que la 116 manque.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 081.
+    Migration {
+        version: 117,
+        name: "albums_types_secondaires",
+        up: "",
+    },
+    // #5530 (FabienM, fil 2053) — le marquage « généré par IA » de Qobuz,
+    // gardé avec le favori de service : `streaming_favorites.ai_generated`.
+    // '1' = marqué, '0' = le service dit non, NULL = inconnu (toute ligne
+    // existante, et tout service qui ne dit rien). TEXT, comme `album_ref` :
+    // une base PostgreSQL de bascule part d'un schéma tout-TEXT, où une
+    // colonne numérique ajoutée par `ADD COLUMN IF NOT EXISTS` resterait TEXT
+    // (voir `pg_sqlite_type_parity`) — le même type partout, donc aucun écart. C'est ce qui permet à une
+    // règle « Généré par IA : non » d'écarter un favori Qobuz marqué.
+    //
+    // Numérotée 118 / PG 082 : la 116 / PG 080 est prise par #5763 (#4991),
+    // sur laquelle cette branche est empilée, et la 117 / PG 081 par #5822
+    // (section Live, #5616), en PR en même temps. Dernière sur
+    // `batch/feat-rc3-20261002` le 05/10 : 115 / PG 079. Ordre de fusion
+    // EXIGÉ : #5763 → … → #5822 → celle-ci (garde de contiguïté).
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — même règle qu'à la 106. Jumelle PG : 082.
+    Migration {
+        version: 118,
+        name: "streaming_favorites_ai_generated",
+        up: "",
+    },
+    // #5594 (lot 1) — la clé du signal PCM d'une piste FLAC,
+    // `tracks.audio_pcm_key` (`flac-md5-v1:<md5>:<total_samples>:
+    // <sample_rate>:<channels>:<bits>`), et son témoin de lecture
+    // `tracks.audio_pcm_key_seen`.
+    //
+    // La clé vient du MD5 des échantillons que STREAMINFO porte : deux pistes
+    // qui la partagent contiennent le même signal, donc la même sonie et le
+    // même pic. NUL pour un MD5 nul, une piste CUE, tout ce qui n'est pas du
+    // FLAC — jamais une clé inventée. Le témoin garde l'`audio_hash` de l'état
+    // du fichier lu (NUL = jamais lu) ; la passe
+    // `taches_de_fond::cle_pcm` remplit les deux, en fond, par l'en-tête
+    // seulement.
+    //
+    // NUL pour toutes les lignes existantes : la passe les rattrape.
+    //
+    // Numérotée 119 / PG 083, PAS 118 : vérifié le 06/10, la 117 (PG 081)
+    // est sur `batch/feat-rc3-20261002` (#5822) et la 118 (PG 082) est prise
+    // par #5827, en PR. Le lanceur ne joue que `version > MAX` : une 119
+    // appliquée AVANT la 118 la ferait sauter en silence sur toute base déjà
+    // montée. Cette migration EXIGE donc #5827 fusionnée avant elle — sinon,
+    // elle se renumérote à la promotion. Les gardes de contiguïté
+    // (`migration_count_matches`,
+    // `les_deux_migrations_104_renumerotees_s_appliquent_dans_l_ordre`, et
+    // côté PG `pg_migrations_are_contiguous_and_include_numeric_heals`) le
+    // signalent tant qu'elle manque.
+    //
+    // Colonnes et index posés dans le bloc de version et dans la passe
+    // finale, PAS dans `up` : même règle qu'à la 115. Jumelle PG : 083.
+    Migration {
+        version: 119,
+        name: "tracks_audio_pcm_key",
+        up: "",
+    },
+    // #5402 — la date de CRÉATION d'un fichier, `file_first_seen.created_at`,
+    // à côté de sa première vue. `first_seen_at` reste la date d'ajout
+    // (modification d'abord, #4546) ; `created_at` porte le btime que le
+    // système donne, NULL quand il n'en donne pas (NFS, SMB, Docker). Le tri
+    // « par création » des ajouts récents la lit, et retombe sur la date
+    // d'ajout quand elle manque. Aucun rattrapage : seuls les fichiers
+    // nouveaux ou rescannés la reçoivent.
+    //
+    // Numérotée 120 / PG 084 : la 119 / PG 083 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et aucune PR ouverte ne prend la
+    // 120 ni la 084.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version et
+    // dans la passe finale, PAS dans `up` : la table vient aussi de la passe
+    // finale, et un ALTER TABLE rejoué échouerait. Jumelle PG : 084.
+    Migration {
+        version: 120,
+        name: "file_first_seen_created_at",
+        up: "",
+    },
+    // #2713 — la crête vraie a sa version (`rg_true_peak_algo`,
+    // `rg_album_true_peak_algo`). Les crêtes déjà en base viennent de
+    // l'interpolation Catmull-Rom 4× d'avant l'annexe 2 de BS.1770 : elles
+    // sont ÉTIQUETÉES `catmull-rom-4x`, pas effacées. Effacer priverait
+    // `prevent_clipping` de sa crête jusqu'au rattrapage (il retomberait sur
+    // le pic d'échantillon, plus bas) ; étiquetées, elles servent jusqu'à leur
+    // remplacement par le rattrapage de fond
+    // (`audio::replaygain::rattrapage_crete`). Les gains ne sont pas touchés.
+    //
+    // Idempotente : `DO NOTHING` sur une version déjà posée. Une crête sans
+    // version écrite après coup (retour à un ancien binaire) reste
+    // rattrapable : le rattrapage vise toute crête qui n'a pas la version
+    // COURANTE, étiquette ou non.
+    //
+    // Numérotée 121 / PG 085 : la 120 / PG 084 est la dernière sur
+    // `batch/feat-rc3-20261002` le 07/10, et aucune PR ouverte ne prend la
+    // 121 ni la 085. Jumelle PG : 085.
+    Migration {
+        version: 121,
+        name: "true_peak_algo_etiquette",
+        up: SQL_ETIQUETTE_CRETES_VRAIES,
+    },
 ];
+
+/// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
+/// même texte que la jumelle PG 085, à la transaction près.
+const SQL_ETIQUETTE_CRETES_VRAIES: &str = "
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_track_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+INSERT INTO track_metadata (track_id, key, value)
+SELECT m.track_id, 'rg_album_true_peak_algo', 'catmull-rom-4x' FROM track_metadata m
+WHERE m.key = 'rg_album_true_peak'
+ON CONFLICT (track_id, key) DO NOTHING;
+";
+
+/// La colonne de la migration 120 (#5402). La table d'abord : elle n'est
+/// garantie que par la passe finale, qui tourne APRÈS les blocs de version.
+fn date_de_creation_des_fichiers(db: &SqliteDb) {
+    if let Err(e) = db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at REAL NOT NULL);",
+    ) {
+        warn!(erreur = %e, "migration_120_table_file_first_seen");
+    }
+    add_column_if_missing(db, "file_first_seen", "created_at", "REAL");
+}
+
+/// L'index de la migration 119 (#5594). `IF NOT EXISTS` : rejouable, et posé
+/// par la migration ET par la passe finale de `run_migrations`.
+const SQL_INDEX_CLE_PCM: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)";
+
+/// Garantit les deux colonnes puis pose l'index de la 119. Un échec de
+/// l'index est JOURNALISÉ, jamais rendu : sans lui, la recherche par clé est
+/// lente, pas fausse.
+fn cle_pcm_des_pistes(db: &SqliteDb) {
+    add_column_if_missing(db, "tracks", "audio_pcm_key", "TEXT");
+    add_column_if_missing(db, "tracks", "audio_pcm_key_seen", "TEXT");
+    if let Err(e) = db.execute_batch(SQL_INDEX_CLE_PCM) {
+        warn!(erreur = %e, "migration_119_index_tracks_audio_pcm_key");
+    }
+}
+
+/// L'index de la migration 115 (fil 2130). `IF NOT EXISTS` : rejouable, et
+/// posé par la migration ET par la passe finale de `run_migrations`.
+const SQL_INDEX_HISTORIQUE_ALBUM_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_listen_history_album_id ON listen_history(album_id)";
+
+/// Garantit la colonne puis pose l'index de la 115. Un échec est JOURNALISÉ,
+/// jamais rendu : sans l'index, « Reprendre l'écoute » est lent, pas faux, et
+/// cela ne vaut pas un démarrage refusé.
+fn index_historique_album_id(db: &SqliteDb) {
+    add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
+    if let Err(e) = db.execute_batch(SQL_INDEX_HISTORIQUE_ALBUM_ID) {
+        warn!(erreur = %e, "migration_115_index_listen_history_album_id");
+    }
+}
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
 ///
@@ -3041,6 +3283,44 @@ fn recaler_la_qualite_des_albums_sqlite(db: &SqliteDb) {
 /// rejouée à chaque démarrage, comme [`TRACKS_SOURCE_ID_INDEX`], pour ne pas
 /// prendre de numéro de migration.
 pub(crate) const TRACKS_CLE_DE_COPIE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_cle_de_copie ON tracks(album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), LOWER(TRIM(COALESCE(title, ''))))";
+/// Ticket 190 — les deux index de la table « un album, son DR »
+/// ([`super::facet_filter::dr_album_source`]) : la liste des valeurs du rail
+/// de filtres, la tranche, le tri et la fiche.
+///
+/// Sans eux, la requête lisait chaque ligne `dr_album` / `dr_track` par
+/// `idx_track_metadata_key`, puis la ligne de `track_metadata` et celle de
+/// `tracks` dans les tables : sur un banc de 25 200 pistes, 6 399 pages lues
+/// sur 13 543, presque la moitié de la base, dans le désordre. Sur un disque
+/// lent et pendant un scan, `slow_query` a dit 7,6 s. Avec eux, la requête
+/// ne lit que les deux index : 311 pages.
+///
+/// * `idx_track_metadata_dr` est PARTIEL : il ne porte que les clés de DR, et
+///   la valeur, pour ne pas toucher la table. Sa clause `WHERE` est le texte
+///   de [`super::facet_filter::dr_tag_where`] : SQLite ne prend un index
+///   partiel que si la requête porte le même terme (le plan le vérifie,
+///   `filtre_dr_190_tests`).
+/// * `idx_tracks_id_album` donne l'album d'une piste sans lire sa ligne. Le
+///   planificateur le prend au banc de 25 200 pistes ; sur une petite base,
+///   il lui préfère la clé primaire.
+///
+/// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
+/// [`TRACKS_CLE_DE_COPIE_INDEX`], pour ne pas prendre de numéro de migration.
+/// b209 — les pistes UPnP importées avant que le numéro ne soit lu portent 0
+/// (le défaut du modèle), sur chaque piste. 0 n'est pas un numéro : il passe
+/// à NULL. Le vrai numéro revient à la synchronisation suivante, qui réécrit
+/// chaque piste vue. Une piste LOCALE n'est jamais touchée.
+///
+/// Rejouée à chaque démarrage, sur les deux moteurs, sans numéro de
+/// migration — même raison que [`TRACKS_SOURCE_ID_INDEX`]. Idempotente : au
+/// second passage, plus aucune ligne ne correspond, et
+/// `idx_tracks_source_path (source, …)` borne la lecture aux pistes UPnP.
+pub(crate) const UPNP_NUMEROS_ZERO_A_NULL: &str = "UPDATE tracks SET track_number = NULL \
+     WHERE source = 'upnp' AND track_number = 0;
+     UPDATE tracks SET disc_number = NULL WHERE source = 'upnp' AND disc_number = 0;";
+
+pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_metadata_dr \
+     ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
+     CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
@@ -3213,6 +3493,43 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Date du dépôt dans une étiquette (#5478). Sans défaut : NULL =
             // INCONNUE, et c'est ce que reçoit toute pose existante.
             add_column_if_missing(db, "item_tags", "created_at", "TEXT");
+        }
+        if migration.version == 114 {
+            // Référence d'album d'une piste de service (fil 2121). Sans
+            // défaut : NULL = INCONNUE pour toute ligne existante.
+            add_column_if_missing(db, "queue_items", "album_ref", "TEXT");
+            add_column_if_missing(db, "streaming_favorites", "album_ref", "TEXT");
+            add_column_if_missing(db, "listen_history", "album_ref", "TEXT");
+        }
+        if migration.version == 115 {
+            // Index de `listen_history.album_id` (fil 2130).
+            index_historique_album_id(db);
+        }
+        if migration.version == 116 {
+            // Marque « déjà tenté, rien trouvé » de l'identification en lot
+            // (#4991). Sans défaut : NULL = jamais tenté.
+            add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
+        }
+        if migration.version == 117 {
+            // Types secondaires MusicBrainz (section « Live »). Sans défaut :
+            // NULL = INCONNU pour tout album existant ; le prochain scan qui
+            // relit ses fichiers les pose depuis la balise.
+            add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
+        }
+        if migration.version == 118 {
+            // Marquage IA d'un favori de service (#5530). Sans défaut : NULL =
+            // INCONNU pour toute ligne existante.
+            add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
+        }
+        if migration.version == 119 {
+            // Clé du signal PCM et son témoin (#5594). Sans défaut : NULL =
+            // pas de clé, jamais lu.
+            cle_pcm_des_pistes(db);
+        }
+        if migration.version == 120 {
+            // Date de création des fichiers (#5402). Sans défaut : NULL =
+            // inconnue, le tri retombe sur la date d'ajout.
+            date_de_creation_des_fichiers(db);
         }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
@@ -3562,6 +3879,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // colonne ferait echouer TOUTES les requetes d'albums.
     add_column_if_missing(db, "albums", "release_type", "TEXT");
 
+    // Types secondaires du disque (migration v117, section « Live »). La fiche
+    // artiste NOMME cette colonne : une base qui arriverait ici sans elle
+    // perdrait la section « Live ».
+    add_column_if_missing(db, "albums", "release_secondary_types", "TEXT");
+
     // Credits MusicBrainz par disque (migration v107, #4767). La page artiste
     // et la passe des credits NOMMENT ces deux colonnes : une base qui
     // arriverait ici sans elles ferait echouer ces deux lectures.
@@ -3704,6 +4026,22 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ON streaming_hidden_items(item_type, source, source_id);",
     )
     .ok();
+    // Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
+    // de MetaRust). SANS migration numérotée, pour la raison écrite juste
+    // au-dessus pour `streaming_hidden_items` : une table neuve n'en a pas
+    // besoin, et réserver un numéro pendant que d'autres lots en tiennent
+    // casserait la contiguïté. Le CORE_SCHEMA de `sqlite.rs` la porte aussi.
+    // Une base sans elle reste juste : la lecture rend « absent », et la
+    // passe des crédits interroge MusicBrainz comme avant.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (\
+            mbid TEXT PRIMARY KEY,\
+            inc TEXT NOT NULL,\
+            corps BLOB NOT NULL,\
+            fetched_at TEXT NOT NULL\
+        );",
+    )
+    .ok();
     // Rang manuel des favoris de service (migration 100, #2001 piste 2) —
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
@@ -3720,6 +4058,34 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // NOMMENT, et une base arrivée sans elle ne pourrait plus rien étiqueter.
     // PG : migration 077.
     add_column_if_missing(db, "item_tags", "created_at", "TEXT");
+    // Référence d'album d'une piste de service (migration 114, fil 2121) —
+    // posée ICI aussi : l'écriture de la file, des favoris de service et de
+    // l'historique la NOMME, et une base arrivée sans elle ne pourrait plus
+    // rien mettre en file. `streaming_favorites` est garantie juste au-dessus.
+    // PG : migration 078.
+    add_column_if_missing(db, "queue_items", "album_ref", "TEXT");
+    add_column_if_missing(db, "streaming_favorites", "album_ref", "TEXT");
+    add_column_if_missing(db, "listen_history", "album_ref", "TEXT");
+    // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
+    // aussi : une base arrivée sans lui reste juste, mais « Reprendre
+    // l'écoute » y redevient lent. PG : migration 079.
+    index_historique_album_id(db);
+    // Marque « déjà tenté, rien trouvé » (migration 116, #4991) — posée ICI
+    // aussi : la sélection de `identify-all` la NOMME, et une base arrivée
+    // sans elle ne pourrait plus lancer la passe. PG : migration 080.
+    add_column_if_missing(db, "albums", "identification_tentee_le", "TEXT");
+    // Marquage IA d'un favori de service (migration 118, #5530) — posé ICI
+    // aussi : l'écriture et la lecture des favoris de service la NOMMENT.
+    // PG : migration 082.
+    add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
+    // Clé du signal PCM et son témoin (migration 119, #5594) — posés ICI
+    // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
+    // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.
+    cle_pcm_des_pistes(db);
+    // Date de création des fichiers (migration 120, #5402) — posée ICI
+    // aussi : le scan l'écrit et le tri « par création » la NOMME. PG :
+    // migration 084.
+    date_de_creation_des_fichiers(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -3763,6 +4129,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Clé de copie (#5138) : même passe, même raison — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_CLE_DE_COPIE_INDEX) {
         warn!(error = %e, "sqlite_tracks_cle_de_copie_index_failed");
+    }
+    // Table « un album, son DR » (ticket 190) : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
+        warn!(error = %e, "sqlite_dr_album_index_failed");
+    }
+    // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
+        warn!(error = %e, "sqlite_upnp_numeros_zero_a_null_failed");
     }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
@@ -4441,6 +4815,63 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "item_tags_created_at",
         include_str!("../../migrations/postgres/077_item_tags_created_at.sql"),
     ),
+    // Jumelle de la SQLite 114 (fil 2121) : `album_ref` sur `queue_items`,
+    // `streaming_favorites` et `listen_history`, NULL pour l'existant.
+    (
+        78,
+        "references_d_album_de_service",
+        include_str!("../../migrations/postgres/078_references_d_album_de_service.sql"),
+    ),
+    // Jumelle de la SQLite 115 (fil 2130) : l'index de
+    // `listen_history.album_id`. EXIGE la 78 (#5706) avant elle.
+    (
+        79,
+        "listen_history_album_id_index",
+        include_str!("../../migrations/postgres/079_listen_history_album_id_index.sql"),
+    ),
+    // Jumelle de la SQLite 116 (#4991 b) : `albums.identification_tentee_le`,
+    // la marque « déjà tenté, rien trouvé » de l'identification en lot.
+    (
+        80,
+        "albums_identification_tentee_le",
+        include_str!("../../migrations/postgres/080_albums_identification_tentee_le.sql"),
+    ),
+    // Jumelle de la SQLite 117 (section « Live ») : types secondaires du
+    // disque. Numérotée 81 : la 80 est prise par #5763, PR ouverte en même
+    // temps. Elle EXIGE la 80 avant elle — la garde de contiguïté le signale.
+    (
+        81,
+        "albums_types_secondaires",
+        include_str!("../../migrations/postgres/081_albums_types_secondaires.sql"),
+    ),
+    // Jumelle de la SQLite 118 (#5530) : `streaming_favorites.ai_generated`,
+    // NULL pour l'existant. EXIGE la 80 (#5763) et la 81 (#5822) avant elle.
+    (
+        82,
+        "streaming_favorites_ai_generated",
+        include_str!("../../migrations/postgres/082_streaming_favorites_ai_generated.sql"),
+    ),
+    // Jumelle de la SQLite 119 (#5594) : `tracks.audio_pcm_key`, son témoin
+    // `audio_pcm_key_seen` et l'index de la clé. EXIGE la 82 (#5827) avant elle.
+    (
+        83,
+        "tracks_audio_pcm_key",
+        include_str!("../../migrations/postgres/083_tracks_audio_pcm_key.sql"),
+    ),
+    // Jumelle de la SQLite 120 (#5402) : `file_first_seen.created_at`, la
+    // date de création d'un fichier, NULL quand le système ne la donne pas.
+    (
+        84,
+        "file_first_seen_created_at",
+        include_str!("../../migrations/postgres/084_file_first_seen_created_at.sql"),
+    ),
+    // Jumelle de la SQLite 121 (#2713) : les crêtes vraies d'avant l'annexe 2
+    // de BS.1770 étiquetées `catmull-rom-4x`, rien n'est effacé.
+    (
+        85,
+        "true_peak_algo_etiquette",
+        include_str!("../../migrations/postgres/085_true_peak_algo_etiquette.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -4642,6 +5073,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // pas encore quand `ensure_schema` tourne a la connexion.
     if let Err(e) = sqlx::raw_sql(TRACKS_SOURCE_ID_INDEX).execute(pool).await {
         warn!(error = %e, "pg_tracks_source_id_index_failed");
+    }
+    // b209 — même passe que la passe finale SQLite.
+    if let Err(e) = sqlx::raw_sql(UPNP_NUMEROS_ZERO_A_NULL).execute(pool).await {
+        warn!(error = %e, "pg_upnp_numeros_zero_a_null_failed");
     }
 
     // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
@@ -6369,6 +6804,201 @@ mod tests {
         );
     }
 
+    /// #5530 — la migration 118 pose `streaming_favorites.ai_generated`,
+    /// nullable, sur une base neuve comme sur une base montée, sans rien
+    /// inventer pour les favoris existants ; la jumelle PG 082 est enregistrée
+    /// et la colonne est aussi garantie par les deux schémas PostgreSQL.
+    #[test]
+    fn la_migration_118_pose_le_marquage_ia_des_favoris_5530() {
+        let colonne = |db: &SqliteDb| -> Option<bool> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(streaming_favorites)")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _)| nom == "ai_generated")
+                .map(|(_, non_nul)| non_nul != 0)
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(
+            colonne(&neuve),
+            Some(false),
+            "base neuve : colonne nullable"
+        );
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "ALTER TABLE streaming_favorites DROP COLUMN ai_generated;
+                 DELETE FROM _migrations WHERE version >= 118;
+                 INSERT INTO streaming_favorites (profile_id, item_type, service, service_id)
+                     VALUES (1, 'album', 'qobuz', 'tj9je5zd70wsc');",
+            )
+            .unwrap();
+        assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
+        assert_eq!(current_version(&montee).unwrap(), 117);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(
+            colonne(&montee),
+            Some(false),
+            "base montée : colonne nullable"
+        );
+        {
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, renseignees): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(ai_generated) FROM streaming_favorites",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((lignes, renseignees), (1, 0), "aucun marquage inventé");
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "082_streaming_favorites_ai_generated.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (82, 'streaming_favorites_ai_generated')"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let alter = "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT";
+        assert!(sql_pg.contains("to_regclass('streaming_favorites')") && sql_pg.contains(alter));
+        assert!(
+            include_str!("pg_migrate.rs").contains(alter),
+            "PG_FULL_SCHEMA"
+        );
+        assert!(
+            include_str!("postgres.rs").contains(alter),
+            "ENSURE_COLUMNS"
+        );
+    }
+
+    /// Fil 2121 — la migration 114 pose `album_ref` (la référence d'album du
+    /// service, pour Bandcamp l'adresse de la page) sur les trois tables qui
+    /// gardent une piste de service, sur une base NEUVE comme sur une base
+    /// MONTÉE en 113 avec des lignes ; la colonne est NULLABLE et l'existant
+    /// reste NULL ; la jumelle PG 078 existe, est enregistrée et marque le bon
+    /// numéro, et le schéma de bascule comme `ensure_schema` la portent.
+    #[test]
+    fn la_migration_114_pose_la_reference_d_album_sur_les_trois_tables_2121() {
+        const TABLES: [&str; 3] = ["queue_items", "streaming_favorites", "listen_history"];
+        // (nom, NOT NULL ?) de `album_ref` dans `table`, ou None.
+        let colonne = |db: &SqliteDb, table: &str| -> Option<bool> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _)| nom == "album_ref")
+                .map(|(_, non_nul)| non_nul != 0)
+        };
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        for t in TABLES {
+            assert_eq!(
+                colonne(&neuve, t),
+                Some(false),
+                "base neuve : `{t}.album_ref` doit exister et être nullable"
+            );
+        }
+
+        // Base MONTÉE en 113 : les trois colonnes retirées, la version
+        // ramenée à 113, une ligne existante dans chaque table.
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "ALTER TABLE queue_items DROP COLUMN album_ref;
+                 ALTER TABLE streaming_favorites DROP COLUMN album_ref;
+                 ALTER TABLE listen_history DROP COLUMN album_ref;
+                 DELETE FROM _migrations WHERE version >= 114;
+                 INSERT INTO zones (name, output_type) VALUES ('Parents', 'chromecast');
+                 INSERT INTO queue_items (zone_id, position, source, source_id, title)
+                     VALUES (1, 0, 'bandcamp', 'https://t4.bcbits.com/stream/e4/mp3-128/2?ts=1', 'Piste');
+                 INSERT INTO streaming_favorites (profile_id, item_type, service, service_id)
+                     VALUES (1, 'track', 'bandcamp', 'https://t4.bcbits.com/stream/e4/mp3-128/2');
+                 INSERT INTO listen_history (title, source, source_id, duration_ms)
+                     VALUES ('Piste', 'bandcamp', 'https://t4.bcbits.com/stream/e4/mp3-128/2?ts=1', 1);",
+            )
+            .unwrap();
+        for t in TABLES {
+            assert_eq!(
+                colonne(&montee, t),
+                None,
+                "préparation : `{t}.album_ref` retirée"
+            );
+        }
+        assert_eq!(current_version(&montee).unwrap(), 113);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 114);
+        for t in TABLES {
+            assert_eq!(
+                colonne(&montee, t),
+                Some(false),
+                "base montée : `{t}.album_ref` doit exister et être nullable"
+            );
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, renseignees): (i64, i64) = conn
+                .query_row(
+                    &format!("SELECT COUNT(*), COUNT(album_ref) FROM {t}"),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (lignes, renseignees),
+                (1, 0),
+                "`{t}` : la ligne existante survit, sans référence inventée"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "078_references_d_album_de_service.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (78, 'references_d_album_de_service')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains(fichier),
+            "{fichier} n'est pas enregistrée"
+        );
+        let pg_migrate = include_str!("pg_migrate.rs");
+        let postgres = include_str!("postgres.rs");
+        for t in TABLES {
+            let alter = format!("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS album_ref TEXT");
+            assert!(
+                sql_pg.contains(&format!("to_regclass('{t}')")) && sql_pg.contains(&alter),
+                "la jumelle PG ne pose pas `{t}.album_ref` sous garde to_regclass"
+            );
+            assert!(
+                pg_migrate.contains(&alter),
+                "pg_migrate.rs ne pose pas `{t}.album_ref`"
+            );
+            assert!(
+                postgres.contains(&alter),
+                "ENSURE_COLUMNS ne pose pas `{t}.album_ref`"
+            );
+        }
+    }
+
     /// #5034 — la migration 111 pose la SOURCE de la pochette d'album, sur
     /// une base NEUVE comme sur une base ANCIENNE ; une ligne existante naît
     /// de source INCONNUE (la valeur par défaut prudente : rien n'est classé
@@ -6576,6 +7206,160 @@ mod tests {
                 "la jumelle PG ne pose pas `{colonne}`"
             );
         }
+    }
+
+    /// #5402 — la migration 120 pose `file_first_seen.created_at`, sur une
+    /// base neuve comme sur une base arrêtée à la 119.
+    #[test]
+    fn migration_120_pose_la_date_de_creation_des_fichiers() {
+        let a_la_colonne = |db: &SqliteDb| {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(file_first_seen)").unwrap();
+            let colonnes: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+            colonnes.iter().any(|c| c == "created_at")
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert!(a_la_colonne(&neuve), "base neuve sans `created_at`");
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 120 && m.name == "file_first_seen_created_at")
+        );
+    }
+
+    /// Section « Live » — la migration 117 pose `albums.release_secondary_types`
+    /// sur une base ANCIENNE (sans toucher aux lignes, qui naissent INCONNUES)
+    /// comme sur une base NEUVE, et sa jumelle PG 081 est enregistrée.
+    #[test]
+    fn migration_117_pose_les_types_secondaires() {
+        let colonnes = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut st = conn.prepare("PRAGMA table_info(albums)").unwrap();
+            st.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert!(
+            colonnes(&neuve)
+                .iter()
+                .any(|c| c == "release_secondary_types")
+        );
+
+        let ancienne = SqliteDb::open_in_memory().unwrap();
+        ancienne
+            .connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist_id INTEGER,
+                    year INTEGER,
+                    folder_path TEXT
+                );
+                INSERT INTO albums (title) VALUES ('Live Rust');",
+            )
+            .unwrap();
+        ancienne.init_schema().unwrap();
+        run_migrations(&ancienne).unwrap();
+        assert!(
+            colonnes(&ancienne)
+                .iter()
+                .any(|c| c == "release_secondary_types")
+        );
+        let t: Option<String> = ancienne
+            .connection()
+            .lock()
+            .unwrap()
+            .query_row("SELECT MAX(release_secondary_types) FROM albums", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(t.is_none(), "un album existant reste INCONNU : {t:?}");
+
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 117 && m.name == "albums_types_secondaires")
+        );
+        let sql_pg = include_str!("../../migrations/postgres/081_albums_types_secondaires.sql");
+        assert!(sql_pg.contains("ADD COLUMN IF NOT EXISTS release_secondary_types TEXT"));
+        assert!(sql_pg.contains("VALUES (81, 'albums_types_secondaires')"));
+        assert!(
+            include_str!("migrations.rs")
+                .contains("(\n        81,\n        \"albums_types_secondaires\"")
+        );
+    }
+
+    #[test]
+    fn migration_121_etiquette_les_cretes_vraies_sans_rien_effacer() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.version == 121 && m.name == "true_peak_algo_etiquette")
+        );
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path)
+                 VALUES (1, 'a', 1, 1, '/a'), (2, 'b', 1, 1, '/b'), (3, 'c', 1, 1, '/c');
+             -- 1 : crête d'avant #2713, crête d'album aussi.
+             INSERT INTO track_metadata (track_id, key, value) VALUES
+                 (1, 'rg_track_true_peak', '0.790000'),
+                 (1, 'rg_album_true_peak', '0.950000'),
+                 (1, 'rg_track_gain', '-6.50 dB'),
+             -- 2 : crête déjà versionnée.
+                 (2, 'rg_track_true_peak', '0.900000'),
+                 (2, 'rg_true_peak_algo', 'bs1770-a2-fir-v1'),
+             -- 3 : pas de crête du tout.
+                 (3, 'rg_track_gain', '-3.00 dB');",
+        )
+        .unwrap();
+        // Jouée deux fois : idempotente.
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        db.execute_batch(SQL_ETIQUETTE_CRETES_VRAIES).unwrap();
+        let conn = db.connection().lock().unwrap();
+        let lire = |id: i64, cle: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM track_metadata WHERE track_id = ?1 AND key = ?2",
+                rusqlite::params![id, cle],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(
+            lire(1, "rg_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        assert_eq!(
+            lire(1, "rg_album_true_peak_algo").as_deref(),
+            Some("catmull-rom-4x")
+        );
+        // Rien n'est effacé : les valeurs restent en service.
+        assert_eq!(lire(1, "rg_track_true_peak").as_deref(), Some("0.790000"));
+        assert_eq!(lire(1, "rg_album_true_peak").as_deref(), Some("0.950000"));
+        assert_eq!(lire(1, "rg_track_gain").as_deref(), Some("-6.50 dB"));
+        // Une version déjà posée ne s'écrase pas.
+        assert_eq!(
+            lire(2, "rg_true_peak_algo").as_deref(),
+            Some("bs1770-a2-fir-v1")
+        );
+        // Pas de crête, pas d'étiquette.
+        assert_eq!(lire(3, "rg_true_peak_algo"), None);
     }
 
     #[test]
@@ -7059,7 +7843,29 @@ mod tests {
         // 77 : `item_tags_created_at` (#5478), jumelle de la SQLite 113. Pose
         // `item_tags.created_at`, que `tag_item` et `items_by_tag_dated`
         // NOMMENT.
-        assert_eq!(pg_latest_version(), 77, "latest PG migration must be 77");
+        // 78 : `references_d_album_de_service` (fil 2121), jumelle de la
+        // SQLite 114. Pose `album_ref` sur `queue_items`,
+        // `streaming_favorites` et `listen_history`, que leurs écritures
+        // NOMMENT.
+        // 79 : `listen_history_album_id_index` (fil 2130), jumelle de la
+        // SQLite 115. L'index de `listen_history.album_id` que la jointure de
+        // « Reprendre l'écoute » réécrite en `UNION ALL` emprunte. La 78 est
+        // celle de #5706.
+        // 80 : `albums_identification_tentee_le` (#4991 b), jumelle de la
+        // SQLite 116. La marque « déjà tenté, rien trouvé » que la sélection
+        // de `identify-all` NOMME.
+        // 81 : `albums_types_secondaires` (section « Live »), jumelle de la
+        // SQLite 117. Pose `albums.release_secondary_types`, que la fiche
+        // artiste NOMME.
+        // 83 : `tracks_audio_pcm_key` (#5594), jumelle de la SQLite 119. La
+        // 82 est celle de #5827 : tant qu'elle n'est pas fusionnée, la garde
+        // de contiguïté ci-dessus rougit, et c'est voulu.
+        // 84 : `file_first_seen_created_at` (#5402), jumelle de la SQLite 120.
+        // Pose `file_first_seen.created_at`, que le scan écrit et que le tri
+        // « par création » des ajouts récents NOMME.
+        // 85 : `true_peak_algo_etiquette` (#2713), jumelle de la SQLite 121.
+        // Étiquette les crêtes vraies Catmull-Rom, que le rattrapage NOMME.
+        assert_eq!(pg_latest_version(), 85, "latest PG migration must be 85");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

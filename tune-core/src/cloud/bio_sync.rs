@@ -176,7 +176,10 @@ fn apres_refus(status: reqwest::StatusCode) -> ApresRefus {
 
 /// Source label for a downloaded community bio — defaults to "community"
 /// when the payload carries no explicit source.
-fn bio_source(source: &Option<String>) -> &str {
+///
+/// Public : le chemin proxy des routes `/bio` du serveur (bio servie par le
+/// site sans passer par la base) étiquette sa provenance avec la MÊME règle.
+pub fn bio_source(source: &Option<String>) -> &str {
     match source.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => "community",

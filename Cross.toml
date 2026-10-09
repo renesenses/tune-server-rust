@@ -117,7 +117,8 @@ pre-build = [
 # ## Depuis le 29/09/2026 (1.0.0-rc1) : TUNE_VERSION entre dans le conteneur
 #
 # `tune_core::version()` lit `option_env!("TUNE_VERSION")` A LA COMPILATION,
-# repli sur CARGO_PKG_VERSION. release.yml pose TUNE_VERSION depuis le tag,
+# repli sur `X.Y.Z-dev` (avant le 06/10 : CARGO_PKG_VERSION, soit `X.Y.Z` nu).
+# release.yml pose TUNE_VERSION depuis le tag,
 # mais `cross` compile dans un conteneur qui ne recoit que les variables
 # listees ici. Tant que tag et Cargo.toml disaient la meme chose (X.Y.Z), le
 # repli masquait l'oubli. Avec le tag v1.0.0-rc1 et des fichiers a 1.0.0, les

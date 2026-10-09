@@ -215,7 +215,7 @@ Configuration via `tune.toml` or environment variables (env vars take precedence
 | `TUNE_WEB_DIR` | web | Web client directory |
 | `TUNE_ARTWORK_DIR` | artwork_cache | Artwork cache directory |
 | `TUNE_MUSIC_DIRS` | [] | JSON array or comma-separated paths |
-| `TUNE_AUTO_SCAN` | false | Scan music dirs on startup |
+| `TUNE_AUTO_SCAN` | false | Scan music dirs on startup. Overridden by Settings › Library › « Scan library on startup » once the user sets it (setting `library_scan_on_startup`; order: user setting, then `TUNE_AUTO_SCAN` / `auto_scan` in `tune.toml`, then `false`; applies at the next start) |
 | `TUNE_AUTO_UPDATE` | false | Check for new releases every 6 h and record the notice (never installs) |
 | `TUNE_LOG_LEVEL` | info | Log level (trace/debug/info/warn/error) |
 | `QOBUZ_APP_ID` | | Qobuz API app ID |
@@ -264,11 +264,11 @@ WantedBy=multi-user.target
 
 ## Docker
 
-### Image: `renesenses/tune:dev`
+### Image: `renesenses/tune:latest`
 
 ```bash
-# Build
-docker build -t renesenses/tune:dev .
+# Pull the published image (amd64/arm64)
+docker pull renesenses/tune:latest
 
 # Run
 docker run -d \
@@ -277,7 +277,7 @@ docker run -d \
   -v /path/to/music:/music:ro \
   -v tune-data:/data \
   -e TUNE_AUTO_SCAN=true \
-  renesenses/tune:dev
+  renesenses/tune:latest
 ```
 
 ### docker-compose
@@ -285,7 +285,7 @@ docker run -d \
 ```yaml
 services:
   tune:
-    image: renesenses/tune:dev
+    image: renesenses/tune:latest
     container_name: tune-server
     restart: unless-stopped
     network_mode: host

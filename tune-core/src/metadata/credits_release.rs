@@ -405,11 +405,14 @@ pub fn albums_avec_mbid(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
-/// `force` : oublie les curseurs, pour tout réinterroger.
+/// `force` : oublie les curseurs, pour tout réinterroger — réponses gardées
+/// en base comprises (`musicbrainz_release_cache`) : sans quoi `force`
+/// relirait la base au lieu de MusicBrainz.
 pub fn oublier_les_curseurs(backend: &Arc<dyn DbBackend>) {
     if let Err(e) = backend.execute("UPDATE albums SET credits_mb_at = NULL", &[]) {
         warn!(erreur = %e, "credits_release_curseurs_non_effaces");
     }
+    super::musicbrainz_release_cache::oublier_tout(backend);
 }
 
 /// Avancement de la passe, tel qu'il est publié.
@@ -466,11 +469,44 @@ const JALON: usize = 10;
 ///
 /// `sur_avancement` est appelée à chaque disque (le registre des tâches du
 /// serveur s'y branche) ; l'avancement persisté l'est tous les [`JALON`].
+///
+/// #4805 (idée 3 de MetaRust) — chaque disque se lit D'ABORD dans
+/// `musicbrainz_release_cache`, où l'identification a gardé la release avec
+/// les `inc` des crédits. Une requête ne part que si la réponse manque, est
+/// périmée ou ne couvre pas [`INC_CREDITS_RELEASE`] ; le créneau MusicBrainz
+/// n'est réservé que dans ce cas.
+///
+/// [`INC_CREDITS_RELEASE`]: super::musicbrainz_release::INC_CREDITS_RELEASE
 pub async fn remplir_credits_depuis_musicbrainz(
     backend: Arc<dyn DbBackend>,
     task_id: &str,
     sur_avancement: &(dyn Fn(&Avancement) + Send + Sync),
 ) -> Avancement {
+    remplir_credits_par(backend, task_id, sur_avancement, |id, inc| async move {
+        super::musicbrainz_release::rate_limit_delay().await;
+        super::musicbrainz_release::lire_release_brute(&id, inc).await
+    })
+    .await
+}
+
+/// Le corps de [`remplir_credits_depuis_musicbrainz`], transport en
+/// paramètre : `interroger` reçoit le MBID et les `inc` à demander, et porte
+/// l'attente du créneau. La couture sert au banc #4805, qui compte les
+/// requêtes sans réseau.
+pub(crate) async fn remplir_credits_par<F, Fut>(
+    backend: Arc<dyn DbBackend>,
+    task_id: &str,
+    sur_avancement: &(dyn Fn(&Avancement) + Send + Sync),
+    interroger: F,
+) -> Avancement
+where
+    F: Fn(String, &'static str) -> Fut,
+    Fut: std::future::Future<Output = super::musicbrainz_release::LectureRelease>,
+{
+    let purgees = super::musicbrainz_release_cache::purger(&backend, chrono::Utc::now());
+    if purgees > 0 {
+        debug!(purgees, "credits_release_cache_purge");
+    }
     let candidats = albums_candidats(&backend);
     let mut av = Avancement {
         total: candidats.len(),
@@ -483,8 +519,14 @@ pub async fn remplir_credits_depuis_musicbrainz(
     for (album_id, release_id) in &candidats {
         crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::Enrichissement)
             .await;
-        super::musicbrainz_release::rate_limit_delay().await;
-        match super::musicbrainz_release::lookup_release_credits(release_id).await {
+        let (lecture, _provenance) = super::musicbrainz_release::lire_release_gardee_par(
+            &backend,
+            release_id,
+            super::musicbrainz_release::INC_CREDITS_RELEASE,
+            &interroger,
+        )
+        .await;
+        match lecture {
             super::musicbrainz_release::LectureRelease::Lue(release) => {
                 let bilan = appliquer_release(&backend, *album_id, &release);
                 if bilan.pistes_creditees > 0 {

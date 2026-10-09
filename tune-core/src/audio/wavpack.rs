@@ -1495,11 +1495,8 @@ pub fn decode_wavpack_to_pcm(
         0
     };
 
-    let max_samples = if max_duration_s > 0.0 {
-        (max_duration_s * source_rate as f64 * source_channels as f64) as usize
-    } else {
-        usize::MAX
-    };
+    let max_samples =
+        super::decode::echantillons_de_la_fenetre(max_duration_s, source_rate, source_channels);
 
     let mut all_samples: Vec<i32> = Vec::new();
     let mut samples_processed: u64 = 0;

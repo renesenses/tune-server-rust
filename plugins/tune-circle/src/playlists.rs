@@ -9,6 +9,7 @@
 //! | `PATCH /playlists/{id}` `{ name, version }`          | idem                                         |
 //! | `DELETE /playlists/{id}`                             | idem                                         |
 //! | `POST /playlists/{id}/items` `{ items?, track_ids?, service_tracks?, position?, version }` | `{ items, position?, version }` |
+//! | `POST /playlists/{id}/bulk-items` `{ entries }`      | `GET /playlists/{id}`, puis `POST …/items` par lots de 100 |
 //! | `DELETE /playlists/{id}/items/{item_id}?version=`    | idem, requête comprise                       |
 //! | `PUT /playlists/{id}/order` `{ item_ids, version }`  | idem                                         |
 //! | `POST /playlists/{id}/resolve`                       | `GET /playlists/{id}`, résolu ICI            |
@@ -35,6 +36,9 @@
 //!   ([`crate::references`]) — jamais un chemin, jamais un `source_id` local.
 //!   Les `items` bruts du client partent tels quels : c'est le cloud qui
 //!   refuse une clé hors de sa liste blanche.
+//! * **Ajout groupé** (`bulk-items`) : un album, une sélection, une playlist
+//!   entière — voir [`ajouter_en_lot`]. Le plafond est celui du cloud
+//!   ([`MORCEAUX_MAX`]) ; ce qui ne se référence pas est COMPTÉ, pas refusé.
 //! * **Rejouer** : [`crate::resolution`], chez l'appelant, sans écrire chez
 //!   aucun service.
 //! * **Récupérer** (décisions 3 et 5 du 28/09) : la copie locale n'existe
@@ -83,6 +87,24 @@ pub const CODE_COPIE_ECHOUEE: &str = "circle.copy_failed";
 /// au-delà, aucune référence n'est construite ni cherchée chez un service.
 pub const AJOUTS_MAX: usize = 100;
 
+/// Plafond de morceaux d'une playlist de cercle, celui du cloud
+/// (`CirclePlaylist::MAX_ITEMS`, site-mozaiklabs#236). Au-delà, le cloud
+/// refuse TOUT l'ajout (`playlist_too_large`) : l'ajout groupé s'arrête
+/// donc à la place qui reste.
+pub const MORCEAUX_MAX: usize = 2000;
+/// Entrées lues au plus par un ajout groupé : de quoi décrire une playlist
+/// pleine plusieurs fois, sans laisser un corps démesuré occuper le serveur.
+pub const ENTREES_MAX: usize = 10_000;
+/// Conflits de version tolérés par lot (un autre membre écrit en même
+/// temps) avant d'interrompre l'ajout groupé.
+const ESSAIS_SUR_CONFLIT: usize = 3;
+/// `bulk-items` sans tableau `entries` non vide.
+pub const CODE_ENTREES_REQUISES: &str = "circle.entries_required";
+/// La playlist a déjà [`MORCEAUX_MAX`] morceaux : rien n'est parti.
+pub const CODE_PLAYLIST_PLEINE: &str = "circle.playlist_full";
+/// Aucune des entrées ne donne une référence : rien n'est parti.
+pub const CODE_RIEN_A_AJOUTER: &str = "circle.nothing_referenceable";
+
 /// Profil par défaut, celui de `tune_http_types::DEFAULT_PROFILE_ID`.
 const PROFIL_PAR_DEFAUT: i64 = 1;
 
@@ -102,6 +124,7 @@ pub fn router(etat: Arc<Collaboratif>) -> Router<()> {
             get(lire).patch(renommer).delete(supprimer),
         )
         .route("/playlists/{id}/items", post(ajouter))
+        .route("/playlists/{id}/bulk-items", post(ajouter_en_lot))
         .route("/playlists/{id}/items/{item_id}", delete(retirer))
         .route("/playlists/{id}/order", put(ordonner))
         .route("/playlists/{id}/resolve", post(resoudre))
@@ -308,6 +331,222 @@ async fn ajouter(
     )
 }
 
+// Ajout groupé --------------------------------------------------------------
+
+/// La référence d'UNE entrée de l'ajout groupé, `None` si elle ne se
+/// référence pas :
+/// - `{ track_id }` : une piste de la base, comme `track_ids` ;
+/// - `{ source, source_id, title, … }` : un titre de service décrit par le
+///   client ([`references::depuis_une_description`]) ;
+/// - `{ source, source_id }` sans titre : lu chez le service, comme
+///   `service_tracks`.
+async fn reference_d_entree(e: &Collaboratif, entree: &Value) -> Option<Value> {
+    if let Some(tid) = entree.get("track_id").and_then(Value::as_i64) {
+        return references::depuis_la_bibliotheque(e.resolveur.backend(), tid)
+            .ok()
+            .flatten();
+    }
+    let source = entree["source"].as_str()?.trim().to_ascii_lowercase();
+    let decrit = entree["title"]
+        .as_str()
+        .is_some_and(|t| !t.trim().is_empty());
+    if decrit {
+        return references::depuis_une_description(&source, entree);
+    }
+    let source_id = match &entree["source_id"] {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if source_id.is_empty() {
+        return None;
+    }
+    let piste = e.resolveur.piste_du_service(&source, &source_id).await?;
+    references::depuis_le_service(&source, &piste)
+}
+
+/// Le corps JSON d'une réponse 2xx du cloud qui porte une playlist.
+fn playlist_de_l_issue(issue: &Issue) -> Option<Value> {
+    match issue {
+        Issue::Reponse { statut, corps, .. } if (200..300).contains(statut) => {
+            serde_json::from_slice::<Value>(corps)
+                .ok()
+                .filter(|p| p["items"].is_array())
+        }
+        _ => None,
+    }
+}
+
+/// La version jointe à un 409 `version_conflict`, si c'en est un.
+fn version_du_conflit(issue: &Issue) -> Option<Value> {
+    match issue {
+        Issue::Reponse {
+            statut: 409, corps, ..
+        } => serde_json::from_slice::<Value>(corps)
+            .ok()
+            .map(|c| c["playlist"]["version"].clone())
+            .filter(|v| !v.is_null()),
+        _ => None,
+    }
+}
+
+/// `{ status, code }` d'un refus qui a interrompu l'ajout groupé.
+fn motif(issue: &Issue) -> Value {
+    match issue {
+        Issue::NonConnecte => json!({ "status": 412, "code": crate::routes::CODE_NON_CONNECTE }),
+        Issue::Indisponible { .. } => {
+            json!({ "status": 503, "code": crate::routes::CODE_CLOUD_INDISPONIBLE })
+        }
+        Issue::Reponse { statut, corps, .. } => {
+            let c = serde_json::from_slice::<Value>(corps).unwrap_or(Value::Null);
+            let code = c["code"].as_str().or_else(|| c["error"].as_str());
+            json!({ "status": statut, "code": code })
+        }
+    }
+}
+
+/// `POST /playlists/{id}/bulk-items` `{ entries: [...] }` : ajoute d'un coup
+/// un album, une sélection ou une playlist entière, EN FIN de playlist et
+/// dans l'ordre des entrées.
+///
+/// * La playlist est relue d'abord : sa version, et la place qui reste sous
+///   [`MORCEAUX_MAX`]. Pleine : 422 [`CODE_PLAYLIST_PLEINE`], rien ne part.
+/// * Une entrée qui ne se référence pas (piste inconnue, titre vide, service
+///   hors liste — radio, Bandcamp…) est COMPTÉE (`unreferenceable`) et
+///   sautée : elle n'empêche pas les autres de partir.
+/// * Au-delà de la place, les entrées ne sont ni lues ni envoyées : elles
+///   sont comptées (`over_limit`).
+/// * Les références partent par lots de [`AJOUTS_MAX`] (le plafond par
+///   requête du cloud), chacun sur la version rendue par le précédent. Un
+///   409 (un autre membre écrit) reprend la version jointe et refait le
+///   lot, [`ESSAIS_SUR_CONFLIT`] fois au plus.
+/// * Un refus en route arrête l'ajout. Si rien n'est parti, le refus est
+///   relayé tel quel (404 compris) ; sinon 200 avec `interrupted` et ce qui
+///   a été ajouté — l'écran le dit.
+async fn ajouter_en_lot(
+    State(e): State<Arc<Collaboratif>>,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if !identifiant_valide(&id) {
+        return introuvable();
+    }
+    let demande = lu(&corps);
+    let Some(entrees) = demande["entries"].as_array().filter(|v| !v.is_empty()) else {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": CODE_ENTREES_REQUISES }),
+        );
+    };
+    if entrees.len() > ENTREES_MAX {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": CODE_TROP_D_AJOUTS, "max": ENTREES_MAX }),
+        );
+    }
+    let lue = lire_la_playlist(&e.relais, &id).await;
+    let Some(mut playlist) = playlist_de_l_issue(&lue) else {
+        return en_reponse(lue);
+    };
+    let deja = playlist["items"].as_array().map_or(0, Vec::len);
+    let place = MORCEAUX_MAX.saturating_sub(deja);
+    if place == 0 {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "code": CODE_PLAYLIST_PLEINE, "max_items": MORCEAUX_MAX, "added": 0 }),
+        );
+    }
+
+    let mut references = Vec::new();
+    let mut non_referencables = 0usize;
+    let mut lues = 0usize;
+    for entree in entrees {
+        if references.len() == place {
+            break;
+        }
+        lues += 1;
+        match reference_d_entree(&e, entree).await {
+            Some(r) => references.push(r),
+            None => non_referencables += 1,
+        }
+    }
+    let hors_plafond = entrees.len() - lues;
+    if references.is_empty() {
+        return refus(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "code": CODE_RIEN_A_AJOUTER,
+                "requested": entrees.len(),
+                "unreferenceable": non_referencables,
+            }),
+        );
+    }
+
+    let mut version = playlist["version"].clone();
+    let mut ajoutes = 0usize;
+    let mut interruption: Option<Issue> = None;
+    'lots: for lot in references.chunks(AJOUTS_MAX) {
+        let mut conflits = 0;
+        loop {
+            let envoi = json!({ "items": lot, "version": version });
+            let issue = e
+                .relais
+                .appeler(
+                    "POST /playlists/{id}/items",
+                    Method::POST,
+                    &["playlists", &id, "items"],
+                    Some(&envoi),
+                )
+                .await;
+            if let Some(p) = playlist_de_l_issue(&issue) {
+                version = p["version"].clone();
+                playlist = p;
+                ajoutes += lot.len();
+                break;
+            }
+            match version_du_conflit(&issue) {
+                Some(v) if conflits < ESSAIS_SUR_CONFLIT => {
+                    conflits += 1;
+                    version = v;
+                }
+                _ => {
+                    interruption = Some(issue);
+                    break 'lots;
+                }
+            }
+        }
+    }
+    if ajoutes == 0
+        && let Some(issue) = interruption
+    {
+        return en_reponse(issue);
+    }
+    let version_finale = playlist["version"].clone();
+    let mut reponse = Json(json!({
+        "ok": true,
+        "playlist": playlist,
+        // Entrées reçues.
+        "requested": entrees.len(),
+        // Morceaux écrits au cloud par CET appel.
+        "added": ajoutes,
+        // Entrées sautées : rien n'en fait une référence.
+        "unreferenceable": non_referencables,
+        // Entrées non lues : la playlist atteignait le plafond.
+        "over_limit": hors_plafond,
+        "max_items": MORCEAUX_MAX,
+        // Références prêtes que le refus en route a empêché d'envoyer.
+        "not_sent": references.len() - ajoutes,
+        "interrupted": interruption.as_ref().map(motif),
+    }))
+    .into_response();
+    if let Some(v) = version_finale.as_i64()
+        && let Ok(etag) = axum::http::HeaderValue::from_str(&format!("\"{v}\""))
+    {
+        reponse.headers_mut().insert(header::ETAG, etag);
+    }
+    reponse
+}
+
 async fn retirer(
     State(e): State<Arc<Collaboratif>>,
     Path((id, item_id)): Path<(String, String)>,
@@ -422,6 +661,7 @@ fn en_file(trouvee: &Trouvee) -> Option<QueueInput> {
             duration_ms: piste.duration_ms as i64,
             track_number: piste.track_number.map(i64::from),
             disc_number: piste.disc_number.map(i64::from),
+            album_ref: piste.album_id.clone(),
         }),
     }
 }

@@ -274,6 +274,455 @@ fn etage_e(fichiers: &[String]) {
     );
 }
 
+/// Une empreinte fait plusieurs Kio : on n'en journalise qu'un condensé
+/// (FNV-1a 64 bits), assez pour un `cmp` entre deux versions.
+fn condense(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// La pause que la boucle de `replaygain::spawn` marque entre deux tours qui
+/// ont travaillé.
+fn pause_entre_deux_tours(b: &Arc<dyn DbBackend>) -> std::time::Duration {
+    tune_core::audio::replaygain::pause_entre_deux_tours(b)
+}
+
+/// F — LA BOUCLE RÉELLE sur une GRANDE base (#5519, mesure du 05/10).
+///
+/// Ni l'étage B (base de 40 pistes, `analyze_track_batch` seul) ni l'étage C
+/// (requêtes sans fichier) ne disent ce que voit Tades : 528 352 pistes, dont
+/// la plupart déjà analysées, et la boucle de `spawn` qui enchaîne un tour de
+/// cascade, la passe d'albums et sa pause. Ici : `pistes_synth` pistes déjà
+/// analysées (gains de piste et d'album, plage dynamique, empreinte), puis les
+/// vrais fichiers EN QUEUE d'identifiants — c'est l'ordre d'un scan, et le
+/// pire cas de la sélection, qui relit tout ce qui est déjà fait.
+fn etage_f(
+    rt: &tokio::runtime::Runtime,
+    fichiers: &[String],
+    dossier: &std::path::Path,
+    pistes_synth: i64,
+) {
+    use tune_core::audio::replaygain::{TourDeCascade, passe_d_albums_du_tour, un_tour_de_cascade};
+    let vitesses: Vec<String> = std::env::var("BANC_VITESSES")
+        .unwrap_or_else(|_| "normal,fast".into())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    for vitesse in vitesses {
+        let (db, b) = base_sur_disque(dossier, &format!("boucle-{vitesse}.db"));
+        b.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            &[
+                &tune_core::taches_de_fond::vitesse::CLE_REGLAGE as &dyn ToSqlValue,
+                &vitesse.as_str() as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+        let albums_synth = pistes_synth / 12 + 1;
+        let marque = format!("{}:-", tune_core::audio::empreinte::VERSION);
+        let t = Instant::now();
+        db.execute_batch(&format!(
+            "BEGIN;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {albums_synth})
+               INSERT INTO albums (id, title) SELECT i, 'a' FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {pistes_synth})
+               INSERT INTO tracks (id, title, album_id, file_path, duration_ms, sample_rate, channels, format, audio_fingerprint)
+               SELECT i, 't', i / 12 + 1, '/nulle/part/' || i || '.flac', 240000, 44100, 2, 'flac', '{marque}' FROM n;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_analyzed', '1' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_track_gain', '-3.00 dB' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_album_gain', '-3.00 dB' FROM tracks;
+             INSERT INTO track_metadata (track_id, key, value) SELECT id, 'dr_track', '12' FROM tracks;
+             COMMIT;"
+        ))
+        .expect("base synthetique");
+        let premier_album = albums_synth + 1;
+        for (i, f) in fichiers.iter().enumerate() {
+            let id = pistes_synth + 1 + i as i64;
+            let album = premier_album + i as i64 / 12;
+            b.execute(
+                "INSERT OR IGNORE INTO albums (id, title) VALUES (?, 'r')",
+                &[&album as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.execute(
+                "INSERT INTO tracks (id, title, album_id, file_path, duration_ms, sample_rate, channels, format) \
+                 VALUES (?, 't', ?, ?, 240000, 44100, 2, 'flac')",
+                &[&id as &dyn ToSqlValue, &album as &dyn ToSqlValue, f as &dyn ToSqlValue],
+            )
+            .unwrap();
+        }
+        let _ = db.execute_batch("ANALYZE;");
+        println!(
+            "F — {vitesse:<8} base de {pistes_synth} pistes analysees + {} a faire (remplissage {:.1} s, hors mesure)",
+            fichiers.len(),
+            t.elapsed().as_secs_f64()
+        );
+        let largeur = tune_core::taches_de_fond::vitesse::largeur_courante(&b);
+        let (mut t_cascade, mut t_album, mut t_pause) = (0.0, 0.0, 0.0);
+        let (mut tours, mut total) = (0usize, 0usize);
+        let debut = Instant::now();
+        loop {
+            let t0 = Instant::now();
+            let tour = rt.block_on(un_tour_de_cascade(&b));
+            t_cascade += t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let albums = rt.block_on(passe_d_albums_du_tour(&b, false));
+            t_album += t1.elapsed().as_secs_f64();
+            let n = match tour {
+                TourDeCascade::Travail(n) => n,
+                _ => 0,
+            };
+            println!(
+                "    tour {:>2} : {n:>2} pistes, {albums} album(s), cascade {:>6.2} s, albums {:>5.2} s",
+                tours + 1,
+                t1.duration_since(t0).as_secs_f64(),
+                t1.elapsed().as_secs_f64()
+            );
+            if n == 0 && albums == 0 {
+                break;
+            }
+            total += n;
+            tours += 1;
+            let t2 = Instant::now();
+            let pause = pause_entre_deux_tours(&b);
+            rt.block_on(async { tokio::time::sleep(pause).await });
+            t_pause += t2.elapsed().as_secs_f64();
+        }
+        let mur = debut.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let restant = tune_core::audio::replaygain::compter_les_candidats_replaygain(&b);
+        let t_compte = t.elapsed().as_secs_f64();
+        println!(
+            "  largeur {largeur} : {total} pistes en {mur:.1} s = {:.0} pistes/h ; {tours} tours",
+            total as f64 * 3600.0 / mur
+        );
+        println!(
+            "  cascade {t_cascade:.1} s ({:.0} %), passe d'albums {t_album:.1} s ({:.0} %), pauses {t_pause:.1} s ({:.0} %)",
+            100.0 * t_cascade / mur,
+            100.0 * t_album / mur,
+            100.0 * t_pause / mur
+        );
+        println!(
+            "  candidats restants {restant} (compte complet : {:.0} ms)",
+            t_compte * 1e3
+        );
+        // Ce que la passe a ÉCRIT pour les vrais fichiers, au caractère près :
+        // une ligne `V` par clé (sauf l'heure du témoin `rg_analyzed`), plus
+        // l'empreinte. À comparer avec `cmp` entre deux versions du code.
+        let ecrit = b
+            .query_many(
+                "SELECT t.file_path, m.key, m.value FROM track_metadata m \
+                 JOIN tracks t ON t.id = m.track_id \
+                 WHERE t.id > ? AND m.key != 'rg_analyzed' ORDER BY t.file_path, m.key",
+                &[&pistes_synth as &dyn ToSqlValue],
+            )
+            .unwrap_or_default();
+        for r in &ecrit {
+            let s = |i: usize| r.get(i).and_then(|v| v.as_string()).unwrap_or_default();
+            eprintln!("V {vitesse} {} {} {}", s(0), s(1), s(2));
+        }
+        let empreintes = b
+            .query_many(
+                "SELECT file_path, audio_fingerprint FROM tracks WHERE id > ? ORDER BY file_path",
+                &[&pistes_synth as &dyn ToSqlValue],
+            )
+            .unwrap_or_default();
+        for r in &empreintes {
+            let s = |i: usize| r.get(i).and_then(|v| v.as_string()).unwrap_or_default();
+            let e = s(1);
+            eprintln!("V {vitesse} {} empreinte {:x}", s(0), condense(&e));
+        }
+        drop(b);
+        drop(db);
+    }
+}
+
+/// G — LES DEUX POSTES de la suite #5519, isolés du décodage : la sélection
+/// des candidats et l'écriture d'un tour, sur une base de `pistes_synth`
+/// pistes déjà analysées et 25 candidates en queue d'identifiants.
+///
+/// Chaque mesure compare, sur la MÊME base et dans la même fenêtre de charge,
+/// la forme d'avant (recopiée ici telle qu'elle était) et la forme d'après
+/// (appelée par l'API publique). Sur SQLite, et sur PostgreSQL si
+/// `BANC_PG_URL` est posé (la base doit être vide : le banc y crée ses
+/// tables, puis les supprime).
+#[cfg(feature = "postgres")]
+fn base_pg(rt: &tokio::runtime::Runtime) -> Option<Arc<dyn DbBackend>> {
+    let url = std::env::var("BANC_PG_URL").ok()?;
+    let pool = rt
+        .block_on(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url),
+        )
+        .expect("connexion PostgreSQL");
+    Some(Arc::new(tune_core::db::backend::PostgresBackend::new(pool)))
+}
+
+#[cfg(not(feature = "postgres"))]
+fn base_pg(_rt: &tokio::runtime::Runtime) -> Option<Arc<dyn DbBackend>> {
+    None
+}
+
+fn remplir_g(b: &Arc<dyn DbBackend>, pistes_synth: i64, pg: bool) {
+    let serie = if pg {
+        format!("SELECT i FROM generate_series(1, {pistes_synth}) AS g(i)")
+    } else {
+        format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {pistes_synth}) SELECT i FROM n"
+        )
+    };
+    let reqs = [
+        format!(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, sample_rate, channels, format, audio_fingerprint) \
+             SELECT i, 't', '/nulle/part/' || i || '.flac', 240000, 44100, 2, 'flac', 'x' FROM ({serie}) s"
+        ),
+        "INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_analyzed', '1' FROM tracks".into(),
+        "INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_track_gain', '-3.00 dB' FROM tracks".into(),
+        "INSERT INTO track_metadata (track_id, key, value) SELECT id, 'rg_album_gain', '-3.00 dB' FROM tracks".into(),
+        "INSERT INTO track_metadata (track_id, key, value) SELECT id, 'dr_track', '12' FROM tracks".into(),
+    ];
+    for r in &reqs {
+        b.execute(r, &[]).expect("remplissage G");
+    }
+    for i in 1..=25i64 {
+        let id = pistes_synth + i;
+        let chemin = format!("/nulle/part/neuve-{i}.flac");
+        b.execute(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, sample_rate, channels, format) \
+             VALUES (?, 't', ?, 240000, 44100, 2, 'flac')",
+            &[&id as &dyn ToSqlValue, &chemin as &dyn ToSqlValue],
+        )
+        .unwrap();
+    }
+    let _ = pg;
+    let _ = b.execute("ANALYZE", &[]);
+}
+
+fn mediane(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn etage_g_sur(rt: &tokio::runtime::Runtime, b: &Arc<dyn DbBackend>, nom: &str, pistes_synth: i64) {
+    use tune_core::audio::replaygain as rg;
+    use tune_core::audio::replaygain::{
+        EcrituresDePiste, ecrire_le_tour, selectionner_les_candidats_replaygain,
+    };
+    use tune_core::db::track_metadata_repo::TrackMetadataRepo;
+    let seuil = "00000000000000000000";
+    // AVANT : la requête d'avant le curseur, telle qu'elle était.
+    let avant = "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
+         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_track_gain') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' AND m.value > ?) \
+         LIMIT ?";
+    let mesurer = |f: &dyn Fn() -> usize| -> (f64, usize) {
+        let mut t = Vec::new();
+        let mut n = 0;
+        for _ in 0..7 {
+            let d = Instant::now();
+            n = f();
+            t.push(d.elapsed().as_secs_f64() * 1e3);
+        }
+        (mediane(t), n)
+    };
+    let (t_avant, n_avant) = mesurer(&|| {
+        b.query_many(
+            avant,
+            &[&seuil as &dyn ToSqlValue, &25i64 as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .len()
+    });
+    // APRÈS : un tour suivant, curseur posé sur la dernière piste déjà vue
+    // (ici : la dernière déjà analysée), puis le tour complet de reprise.
+    let (t_curseur, n_curseur) = mesurer(&|| {
+        selectionner_les_candidats_replaygain(b, pistes_synth, 25)
+            .unwrap()
+            .len()
+    });
+    let (t_reprise, n_reprise) = mesurer(&|| {
+        selectionner_les_candidats_replaygain(b, 0, 25)
+            .unwrap()
+            .len()
+    });
+    // Le curseur au-delà de la dernière piste : ce que coûte le constat « rien
+    // après moi » qui précède la reprise depuis 0.
+    let (t_fin, _) = mesurer(&|| {
+        selectionner_les_candidats_replaygain(b, pistes_synth + 25, 25)
+            .unwrap()
+            .len()
+    });
+    println!(
+        "G {nom:<6} selection : avant {t_avant:>8.2} ms ({n_avant}) | curseur {t_curseur:>6.2} ms ({n_curseur}) | \
+         curseur en fin {t_fin:>6.2} ms | reprise depuis 0 {t_reprise:>8.2} ms ({n_reprise})"
+    );
+
+    // ÉCRITURES d'un tour de 25 pistes : mêmes clés, mêmes valeurs.
+    let ecritures = |base: i64| -> Vec<EcrituresDePiste> {
+        (1..=25i64)
+            .map(|i| EcrituresDePiste {
+                track_id: base + i,
+                effacer_le_report: true,
+                report: None,
+                mesure: Some((-12.5 - i as f64 / 7.0, 0.98, 1.01, Some(11))),
+                empreinte: Some(format!("env100ms-v1:{}", "ab".repeat(400))),
+                temoin: Some("1790000000".into()),
+            })
+            .collect()
+    };
+    let repo = TrackMetadataRepo::with_backend(b.clone());
+    let mut t_un = Vec::new();
+    let mut t_groupe = Vec::new();
+    for tour in 0..5 {
+        // AVANT : une instruction à la fois, chacune sa transaction — la
+        // séquence de l'ancienne `analyser_une_piste`.
+        let lot = ecritures(pistes_synth);
+        let d = Instant::now();
+        for e in &lot {
+            let id = e.track_id;
+            let _ = repo.delete(id, "rg_path_unresolved");
+            let (lufs, pk, tp, dr) = e.mesure.unwrap();
+            let _ = repo.set(
+                id,
+                "rg_track_gain",
+                &rg::format_gain(rg::track_gain_db(lufs)),
+            );
+            let _ = repo.set(id, "rg_track_peak", &rg::format_peak(pk));
+            let _ = repo.set(id, "rg_track_true_peak", &rg::format_peak(tp));
+            let _ = repo.set(id, rg::TRACK_SOURCE_KEY, rg::SOURCE_ANALYSIS);
+            let existant = repo
+                .get_all(id)
+                .ok()
+                .and_then(|m| m.get("dr_track").cloned());
+            if existant.is_none() {
+                let _ = repo.set(id, "dr_track", &dr.unwrap().to_string());
+                let _ = repo.set(id, "dr_source", "analysis");
+            }
+            let _ = b.execute(
+                "UPDATE tracks SET audio_fingerprint = ? WHERE id = ?",
+                &[
+                    &e.empreinte.as_deref().unwrap() as &dyn ToSqlValue,
+                    &id as &dyn ToSqlValue,
+                ],
+            );
+            let _ = repo.set(id, "rg_analyzed", e.temoin.as_deref().unwrap());
+        }
+        t_un.push(d.elapsed().as_secs_f64() * 1e3);
+        // Remise à l'état « à faire » pour la forme d'après.
+        b.execute(
+            "DELETE FROM track_metadata WHERE track_id > ?",
+            &[&pistes_synth as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let lot = ecritures(pistes_synth);
+        let d = Instant::now();
+        let issue = ecrire_le_tour(b, &lot);
+        t_groupe.push(d.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(
+            issue,
+            tune_core::audio::replaygain::EcritureDuTour::Groupee,
+            "tour {tour}"
+        );
+        b.execute(
+            "DELETE FROM track_metadata WHERE track_id > ?",
+            &[&pistes_synth as &dyn ToSqlValue],
+        )
+        .unwrap();
+    }
+    let _ = rt;
+    println!(
+        "G {nom:<6} ecriture d'un tour de 25 pistes : piste a piste {:>7.2} ms | groupee {:>7.2} ms (une transaction)",
+        mediane(t_un),
+        mediane(t_groupe)
+    );
+}
+
+fn etage_g(rt: &tokio::runtime::Runtime, dossier: &std::path::Path, pistes_synth: i64) {
+    let (db, b) = base_sur_disque(dossier, "selection.db");
+    db.execute_batch("BEGIN").unwrap();
+    remplir_g(&b, pistes_synth, false);
+    db.execute_batch("COMMIT").unwrap();
+    let _ = db.execute_batch("ANALYZE;");
+    etage_g_sur(rt, &b, "sqlite", pistes_synth);
+    for (nom, sql) in [
+        (
+            "avant",
+            "EXPLAIN QUERY PLAN SELECT t.id FROM tracks t WHERE t.file_path IS NOT NULL AND t.file_path != '' AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_analyzed') LIMIT 25",
+        ),
+        (
+            "apres",
+            "EXPLAIN QUERY PLAN SELECT t.id FROM tracks t WHERE t.file_path IS NOT NULL AND t.file_path != '' AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_analyzed') AND t.id > 1 ORDER BY t.id LIMIT 25",
+        ),
+    ] {
+        for r in b.query_many(sql, &[]).unwrap_or_default() {
+            let l: Vec<String> = r
+                .iter()
+                .map(|v| v.as_string().unwrap_or_default())
+                .collect();
+            println!("  plan sqlite {nom} : {}", l.join(" | "));
+        }
+    }
+    drop(b);
+    drop(db);
+    if let Some(pg) = base_pg(rt) {
+        // Le moteur PostgreSQL appelle `Handle::current()` : entrer dans le
+        // contexte du runtime, sans y exécuter de futur.
+        let _contexte = rt.enter();
+        for t in ["track_metadata", "tracks", "settings"] {
+            let _ = pg.execute(&format!("DROP TABLE IF EXISTS {t} CASCADE"), &[]);
+        }
+        pg.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE tracks (id BIGINT PRIMARY KEY, title TEXT, file_path TEXT,
+                duration_ms BIGINT, sample_rate BIGINT, channels BIGINT, format TEXT,
+                audio_fingerprint TEXT);
+             CREATE TABLE track_metadata (track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (track_id, key));
+             CREATE INDEX idx_track_metadata_key ON track_metadata(key);",
+        )
+        .expect("schema PG du banc");
+        remplir_g(&pg, pistes_synth, true);
+        etage_g_sur(rt, &pg, "pg", pistes_synth);
+        let predicat = "t.file_path IS NOT NULL AND t.file_path != '' \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_track_gain') \
+            AND NOT EXISTS (SELECT 1 FROM track_metadata m WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' AND m.value > '0')";
+        for (nom, sql) in [
+            (
+                "avant",
+                format!("EXPLAIN ANALYZE SELECT t.id FROM tracks t WHERE {predicat} LIMIT 25"),
+            ),
+            (
+                "apres",
+                format!(
+                    "EXPLAIN ANALYZE SELECT t.id FROM tracks t WHERE {predicat} AND t.id > {pistes_synth} ORDER BY t.id LIMIT 25"
+                ),
+            ),
+            (
+                "reprise",
+                format!(
+                    "EXPLAIN ANALYZE SELECT t.id FROM tracks t WHERE {predicat} AND t.id > 0 ORDER BY t.id LIMIT 25"
+                ),
+            ),
+        ] {
+            for r in pg.query_many(&sql, &[]).unwrap_or_default() {
+                let l: Vec<String> = r
+                    .iter()
+                    .map(|v| v.as_string().unwrap_or_default())
+                    .collect();
+                println!("  plan pg {nom} : {}", l.join(" | "));
+            }
+        }
+        for t in ["track_metadata", "tracks", "settings"] {
+            let _ = pg.execute(&format!("DROP TABLE IF EXISTS {t} CASCADE"), &[]);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dossier = std::path::PathBuf::from(args.get(1).expect("dossier"));
@@ -286,6 +735,14 @@ fn main() {
     let fichiers = lister(&dossier, max);
     println!("fichiers: {}", fichiers.len());
     let tmp = tempfile::TempDir::new().unwrap();
+    if std::env::var("BANC_SEUL_G").is_ok() {
+        etage_g(&rt, tmp.path(), pistes_synth);
+        return;
+    }
+    if std::env::var("BANC_SEUL_F").is_ok() {
+        etage_f(&rt, &fichiers, tmp.path(), pistes_synth);
+        return;
+    }
     if !fichiers.is_empty() {
         etage_a(&rt, &fichiers);
         etage_e(&fichiers);

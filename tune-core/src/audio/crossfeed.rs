@@ -78,6 +78,25 @@ pub fn ombre_du_reglage(reglage: &serde_json::Value) -> Option<tune_plugin_cross
     })
 }
 
+/// Préfixe d'identifiant de la FAMILLE du crossfeed chez les greffons natifs
+/// tiers : un étage tiers dont l'identifiant commence par `crossfeed-` est un
+/// crossfeed casque à part entière, qui REMPLACE le crossfeed intégré.
+pub const PREFIXE_FAMILLE_CROSSFEED: &str = "crossfeed-";
+
+/// Le premier étage tiers de la famille du crossfeed parmi `tiers`, s'il y en
+/// a un : c'est lui qui traite, et le crossfeed intégré se tait. Deux crossfeed
+/// en série croiseraient les voies DEUX fois ; ils ne s'additionnent jamais.
+///
+/// Sans dépendance hors de ce fichier : il est aussi compilé SEUL par l'oracle
+/// de parité DSP (`sdk/scripts/verify_dsp_parity.py`).
+pub fn etage_tiers_qui_remplace_le_crossfeed(
+    tiers: &[(String, serde_json::Value)],
+) -> Option<&str> {
+    tiers.iter().map(|(id, _)| id.as_str()).find(|id| {
+        id.len() > PREFIXE_FAMILLE_CROSSFEED.len() && id.starts_with(PREFIXE_FAMILLE_CROSSFEED)
+    })
+}
+
 pub struct CrossfeedProcessor {
     engine: CrossfeedEngine,
     amount: f32,
@@ -126,6 +145,9 @@ impl CrossfeedProcessor {
         ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
         tiers: &[(String, serde_json::Value)],
     ) -> Self {
+        // Un greffon tiers de la famille du crossfeed demandé par la zone
+        // éteint le crossfeed intégré : jamais les deux en série.
+        let reglage = reglage.filter(|_| etage_tiers_qui_remplace_le_crossfeed(tiers).is_none());
         let mut processeur = match reglage {
             Some((amount, delay_ms)) => Self::avec_ombre(sample_rate, amount, delay_ms, ombre),
             None => Self {
@@ -1320,5 +1342,89 @@ mod tests {
         sans.process_interleaved(&mut a);
         avec.process_interleaved(&mut b);
         assert_ne!(a, b, "le filtre d'ombre n'a pas atteint le moteur");
+    }
+}
+
+/// Un greffon natif tiers de la famille du crossfeed remplace le crossfeed
+/// intégré : les deux ne croisent jamais les voies en série.
+#[cfg(test)]
+mod famille_du_crossfeed_tests {
+    use super::*;
+
+    fn etage(id: &str) -> (String, serde_json::Value) {
+        (id.to_string(), serde_json::json!({"enabled": true}))
+    }
+
+    /// Un signal stéréo franc : tout à gauche, rien à droite.
+    fn traiter(p: &mut CrossfeedProcessor) -> Vec<f32> {
+        let mut s: Vec<f32> = std::iter::repeat_n([0.8_f32, 0.0], 256).flatten().collect();
+        p.process_interleaved(&mut s);
+        s
+    }
+
+    #[test]
+    fn un_greffon_de_la_famille_eteint_le_crossfeed_integre() {
+        let mut seul = CrossfeedProcessor::composer(48_000, Some((0.3, 0.3)), &[]);
+        assert!(
+            seul.amount() > 0.0,
+            "témoin : le crossfeed intégré tourne seul"
+        );
+        assert!(
+            traiter(&mut seul)
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .any(|r| r.abs() > 1e-3),
+            "témoin : le crossfeed intégré croise les voies"
+        );
+
+        let mut avec = CrossfeedProcessor::composer(
+            48_000,
+            Some((0.3, 0.3)),
+            &[etage("greffon-gain"), etage("crossfeed-essai")],
+        );
+        assert_eq!(
+            avec.amount(),
+            0.0,
+            "le crossfeed intégré tourne encore à côté du greffon de crossfeed"
+        );
+        assert!(
+            traiter(&mut avec)
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|r| *r == 0.0),
+            "le crossfeed intégré a croisé les voies malgré le greffon de crossfeed"
+        );
+        // Aucun gain fixe à compenser pour un crossfeed qui ne tourne pas.
+        assert_eq!(avec.gain_moyen_db(), 0.0);
+    }
+
+    #[test]
+    fn seule_la_famille_du_crossfeed_remplace_le_crossfeed_integre() {
+        assert_eq!(
+            etage_tiers_qui_remplace_le_crossfeed(&[
+                etage("greffon-gain"),
+                etage("crossfeed-essai")
+            ]),
+            Some("crossfeed-essai")
+        );
+        for id in [
+            "greffon-gain",
+            "crossfeedx",
+            "egaliseur-crossfeed-",
+            "crossfeed",
+        ] {
+            assert_eq!(
+                etage_tiers_qui_remplace_le_crossfeed(&[etage(id)]),
+                None,
+                "{id}"
+            );
+        }
+        let p = CrossfeedProcessor::composer(48_000, Some((0.3, 0.3)), &[etage("greffon-gain")]);
+        assert!(
+            p.amount() > 0.0,
+            "un étage tiers d'une autre famille s'ajoute, il ne remplace rien"
+        );
     }
 }

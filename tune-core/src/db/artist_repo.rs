@@ -1075,6 +1075,52 @@ impl ArtistRepo {
         Ok(())
     }
 
+    /// Efface la provenance de la bio (source, URL, licence, langue, date).
+    ///
+    /// Pour une bio réécrite à la main : l'ancienne provenance (un extrait
+    /// Wikipédia sous CC BY-SA, par exemple) ne décrit plus ce texte, et le
+    /// client afficherait sous lui une attribution fausse. `bio` n'est pas
+    /// touchée.
+    pub fn effacer_provenance_bio(&self, id: i64) -> Result<(), TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "UPDATE artists SET bio_source = NULL, bio_source_url = NULL, \
+                 bio_license = NULL, bio_lang = NULL, bio_fetched_at = NULL WHERE id = ?"
+            }
+            Engine::Postgres => {
+                "UPDATE artists SET bio_source = NULL, bio_source_url = NULL, \
+                 bio_license = NULL, bio_lang = NULL, bio_fetched_at = NULL WHERE id = $1"
+            }
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(sql, &params)?;
+        Ok(())
+    }
+
+    /// Une bio réécrite à la main perd la provenance de l'ancienne.
+    ///
+    /// `update` écrit `bio` sans toucher `bio_source` & co. : un extrait
+    /// Wikipédia remplacé par le texte de l'utilisateur gardait son
+    /// attribution (« Source : Wikipédia — licence CC BY-SA 4.0 ») sous un
+    /// texte qui n'en vient plus. Seul un texte CHANGÉ efface : renvoyer la
+    /// même bio avec un autre champ (le nom) garde l'attribution, qui reste
+    /// juste. Rend `true` si la provenance a été effacée.
+    ///
+    /// Appelée par `PUT /library/artists/{id}` et `POST /metadata/artists/{id}/edit`,
+    /// APRÈS `update`.
+    pub fn oublier_provenance_si_bio_reecrite(
+        &self,
+        id: i64,
+        avant: Option<&str>,
+        apres: Option<&str>,
+    ) -> Result<bool, TuneError> {
+        if avant == apres {
+            return Ok(false);
+        }
+        self.effacer_provenance_bio(id)?;
+        Ok(true)
+    }
+
     /// Bio provenance (source, url, license, lang, fetched_at) for the
     /// artist-detail endpoint. Returns None when no sourced bio is recorded.
     pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {

@@ -1,0 +1,288 @@
+{
+ "album": {
+  "titre": "Été 1998",
+  "artiste": "Various Artists"
+ },
+ "pistes": [
+  {
+   "track_id": 401,
+   "titre": "Sable chaud",
+   "artiste": "Lou Mirage",
+   "duree_s": 201,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000002d",
+      "score": 0.91,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000029",
+        "title": "Sable chaud",
+        "duration": 201,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000002a",
+          "name": "Lou Mirage"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000002b",
+          "title": "Lou Mirage (premier album)",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000002c",
+            "country": "FR",
+            "date": {
+             "year": 1997
+            },
+            "medium_count": 1,
+            "track_count": 10,
+            "title": "Lou Mirage (premier album)"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000027",
+          "title": "Été 1998",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000028",
+            "country": "FR",
+            "date": {
+             "year": 1998,
+             "month": 6
+            },
+            "medium_count": 1,
+            "track_count": 20,
+            "title": "Été 1998"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-401"
+  },
+  {
+   "track_id": 402,
+   "titre": "Glaçons",
+   "artiste": "Les Parasols",
+   "duree_s": 176,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000032",
+      "score": 0.92,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-00000000002e",
+        "title": "Glaçons",
+        "duration": 176,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000002f",
+          "name": "Les Parasols"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000030",
+          "title": "Les Parasols (premier album)",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000031",
+            "country": "FR",
+            "date": {
+             "year": 1997
+            },
+            "medium_count": 1,
+            "track_count": 10,
+            "title": "Les Parasols (premier album)"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000027",
+          "title": "Été 1998",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000028",
+            "country": "FR",
+            "date": {
+             "year": 1998,
+             "month": 6
+            },
+            "medium_count": 1,
+            "track_count": 20,
+            "title": "Été 1998"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-402"
+  },
+  {
+   "track_id": 403,
+   "titre": "Vent d'ouest",
+   "artiste": "Capitaine Brise",
+   "duree_s": 233,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000037",
+      "score": 0.93,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000033",
+        "title": "Vent d'ouest",
+        "duration": 233,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000034",
+          "name": "Capitaine Brise"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-000000000035",
+          "title": "Capitaine Brise (premier album)",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000036",
+            "country": "FR",
+            "date": {
+             "year": 1997
+            },
+            "medium_count": 1,
+            "track_count": 10,
+            "title": "Capitaine Brise (premier album)"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000027",
+          "title": "Été 1998",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000028",
+            "country": "FR",
+            "date": {
+             "year": 1998,
+             "month": 6
+            },
+            "medium_count": 1,
+            "track_count": 20,
+            "title": "Été 1998"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-403"
+  },
+  {
+   "track_id": 404,
+   "titre": "Dernier bain",
+   "artiste": "Mademoiselle Écume",
+   "duree_s": 259,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-00000000003c",
+      "score": 0.9400000000000001,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000038",
+        "title": "Dernier bain",
+        "duration": 259,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-000000000039",
+          "name": "Mademoiselle Écume"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000003a",
+          "title": "Mademoiselle Écume (premier album)",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000003b",
+            "country": "FR",
+            "date": {
+             "year": 1997
+            },
+            "medium_count": 1,
+            "track_count": 10,
+            "title": "Mademoiselle Écume (premier album)"
+           }
+          ]
+         },
+         {
+          "id": "96a00000-0000-4000-8000-000000000027",
+          "title": "Été 1998",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000028",
+            "country": "FR",
+            "date": {
+             "year": 1998,
+             "month": 6
+            },
+            "medium_count": 1,
+            "track_count": 20,
+            "title": "Été 1998"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-404"
+  }
+ ],
+ "attendu": {
+  "release_id": "7e100000-0000-4000-8000-000000000028",
+  "release_group_id": "96a00000-0000-4000-8000-000000000027",
+  "enregistrements": {
+   "401": "5ec00000-0000-4000-8000-000000000029",
+   "402": "5ec00000-0000-4000-8000-00000000002e",
+   "403": "5ec00000-0000-4000-8000-000000000033",
+   "404": "5ec00000-0000-4000-8000-000000000038"
+  }
+ },
+ "verite": {
+  "401": "5ec00000-0000-4000-8000-000000000029",
+  "402": "5ec00000-0000-4000-8000-00000000002e",
+  "403": "5ec00000-0000-4000-8000-000000000033",
+  "404": "5ec00000-0000-4000-8000-000000000038"
+ }
+}

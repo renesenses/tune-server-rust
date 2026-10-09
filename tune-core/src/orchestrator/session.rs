@@ -157,6 +157,7 @@ pub(crate) fn requete_de_retablissement(
         media_format: None,
         track_number: None,
         disc_number: None,
+        album_ref: None,
     }
 }
 

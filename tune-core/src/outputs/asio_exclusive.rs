@@ -304,43 +304,7 @@ impl AsioExclusiveOutput {
         );
 
         // -- 2. Resolve device ---------------------------------------------
-        let mut available_names: Vec<String> = Vec::new();
-        let device = if device_name == "default" {
-            host.default_output_device()
-                .ok_or_else(|| "No default ASIO output device found".to_string())?
-        } else {
-            let mut found = None;
-            let search = device_name.to_lowercase();
-            if let Ok(devices) = host.output_devices() {
-                for dev in devices {
-                    if let Ok(desc) = dev.description() {
-                        let name = desc.name().to_string();
-                        let lower = name.to_lowercase();
-                        available_names.push(name.clone());
-                        if lower == search || lower.contains(&search) || search.contains(&lower) {
-                            found = Some(dev);
-                            break;
-                        }
-                    }
-                }
-                if found.is_none() {
-                    warn!(
-                        requested = %device_name,
-                        available = ?available_names,
-                        "asio_device_not_found_listing_available"
-                    );
-                }
-            }
-            match found {
-                Some(dev) => dev,
-                None => {
-                    return Err(format!(
-                        "ASIO device not found: {device_name}. Available: {:?}",
-                        available_names
-                    ));
-                }
-            }
-        };
+        let device = resoudre_peripherique_asio(&host, device_name)?;
 
         let resolved_name = device
             .description()
@@ -902,6 +866,52 @@ impl AsioExclusiveOutput {
     }
 }
 
+/// Le périphérique ASIO désigné par `device_name` : `"default"` = le premier
+/// pilote listé, sinon une correspondance par sous-chaîne insensible à la
+/// casse. Sorti tel quel de `AsioExclusiveOutput::new` (#5643) pour que
+/// l'ouverture DSD native et le sondage de capacité résolvent le MÊME
+/// périphérique que le chemin PCM, avec les mêmes journaux et le même texte
+/// d'erreur.
+fn resoudre_peripherique_asio(
+    host: &cpal::Host,
+    device_name: &str,
+) -> Result<cpal::Device, String> {
+    if device_name == "default" {
+        return host
+            .default_output_device()
+            .ok_or_else(|| "No default ASIO output device found".to_string());
+    }
+    let mut available_names: Vec<String> = Vec::new();
+    let mut found = None;
+    let search = device_name.to_lowercase();
+    if let Ok(devices) = host.output_devices() {
+        for dev in devices {
+            if let Ok(desc) = dev.description() {
+                let name = desc.name().to_string();
+                let lower = name.to_lowercase();
+                available_names.push(name.clone());
+                if lower == search || lower.contains(&search) || search.contains(&lower) {
+                    found = Some(dev);
+                    break;
+                }
+            }
+        }
+        if found.is_none() {
+            warn!(
+                requested = %device_name,
+                available = ?available_names,
+                "asio_device_not_found_listing_available"
+            );
+        }
+    }
+    found.ok_or_else(|| {
+        format!(
+            "ASIO device not found: {device_name}. Available: {:?}",
+            available_names
+        )
+    })
+}
+
 /// Ce que la relecture de la cadence du pilote, après ouverture, autorise
 /// (#4184).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,6 +961,188 @@ impl Drop for AsioExclusiveOutput {
         // 176.4 kHz Repeat-One transitions).
         std::thread::sleep(teardown_settle_for(self.current_sample_rate));
         debug!(device = %self.device_name, "asio_exclusive_device_lock_releasing");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5643 — DSD natif (lot C)
+// ---------------------------------------------------------------------------
+
+/// Les cadences DSD natives que le pilote `device_name` déclare, sondées
+/// (`cpal` : bascule DSD, `ASIOCanSampleRate`, retour PCM).
+///
+/// `None` — rien n'est appris, rien n'est mis en cache — quand le verrou de
+/// périphérique est tenu (un flux joue : on ne touche JAMAIS au pilote d'un
+/// autre client), quand l'hôte ASIO est absent ou le périphérique
+/// introuvable. `Some(vec![])` : pilote sondé, pas de DSD.
+pub fn sonder_cadences_dsd(device_name: &str) -> Option<Vec<u32>> {
+    try_with_asio_device_lock(|| {
+        ensure_com_initialized();
+        let host = cpal::host_from_id(cpal::HostId::Asio).ok()?;
+        let device = resoudre_peripherique_asio(&host, device_name).ok()?;
+        match device.as_inner() {
+            cpal::platform::DeviceInner::Asio(asio) => Some(asio.dsd_output_rates()),
+            #[allow(unreachable_patterns)]
+            _ => Some(Vec::new()),
+        }
+    })
+    .flatten()
+}
+
+/// La sortie ASIO en DSD natif : le pilote basculé en DSD, un rappel
+/// `DsdU8` qui recopie l'anneau d'octets, rien d'autre.
+///
+/// - **Intouché** : aucun volume, aucun ReplayGain, aucun DSP. Le rappel ne
+///   lit que l'anneau et le témoin de pause (`audio::dsd_brut::remplir_tampon_dsd`).
+/// - **Retour au PCM** : le `Drop` du flux `cpal` remet le pilote en PCM
+///   (`vendor/cpal`, `Stream::drop`), et ce `Drop`-ci le déclenche aussi en
+///   cas de panique : le profil est `panic = "unwind"`, l'objet est un local
+///   du fil de lecture, son `Drop` s'exécute au déroulement.
+/// - **Un seul client** : le verrou de périphérique ASIO est pris en
+///   BLOQUANT à l'ouverture, comme le chemin PCM, et rendu après le délai de
+///   relâche du `Drop`.
+pub struct AsioDsdNatifOutput {
+    device_name: String,
+    cadence: u32,
+    canaux: u16,
+    stream: Option<cpal::Stream>,
+    anneau: Arc<crate::audio::dsd_brut::AnneauDsd>,
+    counters: Arc<RealtimeCounters>,
+    /// Déclaré en DERNIER : rendu après le flux et après le délai de relâche.
+    #[allow(dead_code)]
+    device_guard: MutexGuard<'static, ()>,
+}
+
+impl AsioDsdNatifOutput {
+    /// Ouvre `device_name` en DSD natif à `cadence` (2 822 400, 5 644 800 ou
+    /// 11 289 600) sur `canaux`. Ne démarre pas le rendu : [`Self::start`].
+    pub fn ouvrir(
+        device_name: &str,
+        cadence: u32,
+        canaux: u16,
+        paused: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let device_guard = ASIO_DEVICE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_com_initialized();
+        if !crate::audio::dsd_brut::CADENCES_DSD_NATIVES.contains(&cadence) {
+            return Err(format!(
+                "ASIO native DSD: {cadence} Hz is not a DSD64/128/256 rate"
+            ));
+        }
+        let host = cpal::host_from_id(cpal::HostId::Asio)
+            .map_err(|e| format!("Failed to get ASIO host: {e}"))?;
+        let device = resoudre_peripherique_asio(&host, device_name)?;
+        let resolved_name = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| device_name.to_string());
+        info!(
+            device = %resolved_name,
+            cadence,
+            canaux,
+            "asio_dsd_natif_opening"
+        );
+
+        let anneau = Arc::new(crate::audio::dsd_brut::AnneauDsd::new(
+            crate::audio::dsd_brut::AnneauDsd::contenance_deux_secondes(cadence, canaux),
+        ));
+        let counters = Arc::new(RealtimeCounters::default());
+        let config = cpal::StreamConfig {
+            channels: canaux,
+            sample_rate: cadence,
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let anneau_rappel = anneau.clone();
+        let compteurs_rappel = counters.clone();
+        let erreurs = counters.clone();
+        let stream = device
+            .build_output_stream_raw(
+                &config,
+                SampleFormat::DsdU8,
+                move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
+                    let famine = crate::audio::dsd_brut::remplir_tampon_dsd(
+                        &anneau_rappel,
+                        paused.load(Ordering::Relaxed),
+                        data.bytes_mut(),
+                    );
+                    if famine {
+                        compteurs_rappel.underruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                move |_| {
+                    erreurs.callback_errors.fetch_add(1, Ordering::Relaxed);
+                },
+                None,
+            )
+            .map_err(|e| {
+                format!("ASIO device {resolved_name} refused native DSD at {cadence} Hz: {e}")
+            })?;
+        info!(device = %resolved_name, cadence, canaux, "asio_dsd_natif_opened");
+        Ok(Self {
+            device_name: resolved_name,
+            cadence,
+            canaux,
+            stream: Some(stream),
+            anneau,
+            counters,
+            device_guard,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), String> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| "ASIO stream already released".to_string())?;
+        stream
+            .play()
+            .map_err(|e| format!("Failed to start ASIO native DSD stream: {e}"))?;
+        info!(device = %self.device_name, cadence = self.cadence, "asio_dsd_natif_started");
+        Ok(())
+    }
+
+    pub fn anneau(&self) -> &Arc<crate::audio::dsd_brut::AnneauDsd> {
+        &self.anneau
+    }
+
+    pub fn opened_device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn cadence(&self) -> u32 {
+        self.cadence
+    }
+
+    pub fn canaux(&self) -> u16 {
+        self.canaux
+    }
+
+    pub fn underrun_count(&self) -> u64 {
+        self.counters.underruns.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for AsioDsdNatifOutput {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            if let Err(e) = stream.pause() {
+                warn!(error = %e, "asio_dsd_natif_pause_failed");
+            }
+            // `cpal::Stream::drop` libère les tampons DSD et remet le pilote
+            // en PCM (`kAsioSetIoFormat`).
+            drop(stream);
+        }
+        info!(
+            device = %self.device_name,
+            underruns = self.underrun_count(),
+            callback_errors = self.counters.callback_errors.load(Ordering::Relaxed),
+            "asio_dsd_natif_released_driver_back_to_pcm"
+        );
+        // Même délai de relâche que le chemin PCM, au plafond (la bascule de
+        // format s'ajoute à la libération).
+        std::thread::sleep(teardown_settle_for(u32::MAX));
     }
 }
 

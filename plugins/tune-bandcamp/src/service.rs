@@ -195,6 +195,7 @@ pub(crate) fn pistes_depuis_album(album: &Value) -> Vec<StreamTrack> {
 /// L'album lui-même, tel que le registre l'attend.
 pub(crate) fn album_depuis_json(album: &Value) -> StreamAlbum {
     StreamAlbum {
+        ai_generated: None,
         release_type: None,
         id: album["url"].as_str().unwrap_or_default().to_string(),
         title: album["title"].as_str().unwrap_or_default().to_string(),
@@ -226,6 +227,7 @@ pub(crate) fn albums_de_collection(brut: &Value) -> Vec<StreamAlbum> {
                 return None;
             }
             Some(StreamAlbum {
+                ai_generated: None,
                 release_type: None,
                 id: url.to_string(),
                 title: it["item_title"].as_str().unwrap_or_default().to_string(),
@@ -273,6 +275,7 @@ pub(crate) fn albums_de_recherche(resultats: &[Value]) -> Vec<StreamAlbum> {
         .filter_map(|r| {
             let url = r["url"].as_str()?;
             Some(StreamAlbum {
+                ai_generated: None,
                 release_type: None,
                 id: url.to_string(),
                 title: r["titre"].as_str().unwrap_or_default().to_string(),
@@ -305,6 +308,7 @@ pub(crate) fn albums_de_discographie(racine: &str, entrees: &[Value]) -> Vec<Str
         .filter_map(|e| {
             let url = e["url"].as_str()?;
             Some(StreamAlbum {
+                ai_generated: None,
                 release_type: None,
                 id: url.to_string(),
                 title: e["titre"].as_str().unwrap_or_default().to_string(),

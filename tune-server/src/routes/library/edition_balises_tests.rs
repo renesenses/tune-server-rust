@@ -150,6 +150,7 @@ fn banc() -> Banc {
     }))
     .unwrap();
     edition_album::appliquer(&state.backend, 1, &m).unwrap();
+    crate::routes::ecriture_fichiers::activer_pour_test(&state.backend);
     Banc {
         state,
         _dir: dir,
@@ -242,6 +243,31 @@ async fn dry_run_rend_le_plan_et_n_ecrit_rien() {
     assert_eq!(champ("TRACKNUMBER")["apres"], "1");
     assert_eq!(champ("DISCSUBTITLE")["apres"], "Concert");
     assert_eq!(champ("COMPILATION")["apres"], "1");
+}
+
+/// « Écrire les modifications dans les fichiers audio » décoché : l'aperçu
+/// reste permis, l'écriture est refusée en 409 et aucun octet ne bouge.
+#[tokio::test]
+async fn reglage_desactive_apercu_permis_ecriture_refusee() {
+    let banc = banc();
+    tune_core::db::settings_repo::SettingsRepo::with_backend(banc.state.backend.clone())
+        .delete(tune_core::metadata::ecriture_fichiers::CLE)
+        .unwrap();
+    let avant = octets_de(&banc.album);
+    let (s, v) = appeler(&banc.state, 1, r#"{ "dry_run": true }"#).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["a_ecrire"], 3, "{v}");
+    let (s, v) = appeler(&banc.state, 1, r#"{ "dry_run": false }"#).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(
+        v["code"],
+        tune_core::metadata::ecriture_fichiers::CODE_REFUS
+    );
+    assert_eq!(
+        octets_de(&banc.album),
+        avant,
+        "réglage désactivé : un fichier a bougé"
+    );
 }
 
 #[tokio::test]

@@ -361,7 +361,9 @@ fn sqlvalue_to_json(v: &SqlValue) -> Value {
     }
 }
 
-fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+/// Aussi lu par l'export GRATUIT de configuration (`crate::config_export`),
+/// qui part de ces colonnes et y ajoute les réglages de zone.
+pub(crate) fn export_zones(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let cols = &[
         "id",
         "name",
