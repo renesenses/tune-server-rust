@@ -2930,7 +2930,10 @@ impl OutputTarget for DlnaOutput {
         // #5793 — la plage et le canal sont ceux que l'appareil annonce dans
         // son SCPD, plus une supposition 0–100 sur `Master`.
         let profil = self.profil_volume().await;
-        let niveau = profil.niveau(volume);
+        // #2147 — le niveau que l'appareil tient déjà : une flèche (±1 %) sur
+        // une plage étroite doit le bouger d'un cran, pas retomber dessus.
+        let tenu = self.event_state.lock().await.volume;
+        let niveau = profil.niveau_depuis(volume, tenu);
         let mut resp = String::new();
         for canal in profil.canaux_de_commande() {
             resp = self
