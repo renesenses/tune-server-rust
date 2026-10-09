@@ -8,10 +8,11 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
+use super::dlna_repli_set_uri as repli_set_uri;
 use super::oh_events::{EventState, UpnpEventListener};
 use super::traits::{
-    MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee,
-    TransportState,
+    AnnonceSuivante, MediaDuTransport, OutputCapabilities, OutputStatus, OutputTarget, PlayMedia,
+    SuivantePreparee, TransportState,
 };
 use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
@@ -37,6 +38,9 @@ pub(crate) mod pause_701_tests_5050;
 #[cfg(test)]
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
+
+#[path = "dlna_volume_illisible_5662.rs"]
+pub(crate) mod volume_illisible_5662;
 
 #[cfg(test)]
 #[path = "dlna_journal_volume_tests_5575.rs"]
@@ -525,6 +529,9 @@ pub struct DlnaOutput {
     /// Un compteur qui ne revient jamais en arrière n'a pas de période : deux
     /// émissions ne partagent plus jamais d'id sur la vie du processus.
     item_id_seq: AtomicU64,
+    /// #5662 — un épisode de réponses `GetVolume` illisibles est en cours :
+    /// la ligne `dlna_volume_illisible` a déjà été écrite.
+    volume_illisible: AtomicBool,
     /// Niveau de DIDL appris pour CET appareil (0 = complet, 1 = minimal,
     /// 2 = vide). La pile Platinum de l'Eversolo ne lit qu'un segment TCP de
     /// requête : le DIDL complet déborde et finit en « 500 sans corps », le
@@ -589,6 +596,14 @@ pub struct DlnaOutput {
     /// abouti : un échec réseau ne fige pas le profil standard pour la vie
     /// du processus.
     profil_volume: tokio::sync::OnceCell<super::dlna_profil_volume::ProfilVolume>,
+    /// #3967 — URL du SCPD d'`AVTransport`, telle que le descriptif de
+    /// l'appareil l'annonce. `None` : sortie construite sans descriptif, la
+    /// suivante est armée comme avant.
+    scpd_av_transport: std::sync::RwLock<Option<String>>,
+    /// #3967 — ce que ce SCPD dit de `SetNextAVTransportURI`, lu UNE fois.
+    /// Vide tant que la lecture n'a pas abouti : un échec réseau ne fige
+    /// rien, l'armement suivant relira.
+    annonce_suivante: tokio::sync::OnceCell<AnnonceSuivante>,
     /// #5575 — débit des lignes INFO d'acquittement de `SetVolume` (voir
     /// [`super::dlna_journal_volume`]). Partagé avec la tâche de rattrapage
     /// qui écrit la dernière valeur d'un glissement.
@@ -724,6 +739,7 @@ impl DlnaOutput {
             play_delay_ms: AtomicU64::new(0),
             budget_reveil_ms: AtomicU64::new(BUDGET_REVEIL_STANDBY.as_millis() as u64),
             item_id_seq: AtomicU64::new(1),
+            volume_illisible: AtomicBool::new(false),
             didl_niveau_appris: NiveauDidlAppris::neuf(),
             muted: AtomicBool::new(false),
             micromega_ip,
@@ -737,6 +753,8 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             scpd_rendering_control: std::sync::RwLock::new(None),
             profil_volume: tokio::sync::OnceCell::new(),
+            scpd_av_transport: std::sync::RwLock::new(None),
+            annonce_suivante: tokio::sync::OnceCell::new(),
             journal_volume: Arc::default(),
             volume_relu: AtomicBool::new(false),
             niveau_acquitte: Arc::default(),
@@ -943,6 +961,72 @@ impl DlnaOutput {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
         self
+    }
+
+    /// #3967 — l'URL du SCPD d'`AVTransport`, absolue. Sans elle, la
+    /// suivante est armée comme avant (verdict `Inconnue`).
+    pub fn with_av_transport_scpd(self, url: Option<String>) -> Self {
+        *self
+            .scpd_av_transport
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = url.filter(|u| !u.trim().is_empty());
+        self
+    }
+
+    /// #3967 — ce que le SCPD d'`AVTransport` dit de `SetNextAVTransportURI`,
+    /// lu au premier armement puis retenu. Un SCPD injoignable ou illisible
+    /// rend `Inconnue` SANS le retenir.
+    async fn lire_annonce_suivante(&self) -> AnnonceSuivante {
+        if let Some(a) = self.annonce_suivante.get() {
+            return *a;
+        }
+        let url = self
+            .scpd_av_transport
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(url) = url else {
+            return AnnonceSuivante::Inconnue;
+        };
+        let lu = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            resp.text().await.map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("délai dépassé".to_string()));
+        match lu {
+            Ok(xml) => {
+                let annonce = super::dlna_annonce_suivante::depuis_scpd(&xml);
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    annonce = ?annonce,
+                    "dlna_scpd_avtransport_lu"
+                );
+                if annonce != AnnonceSuivante::Inconnue {
+                    let _ = self.annonce_suivante.set(annonce);
+                }
+                annonce
+            }
+            Err(raison) => {
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    url = %url,
+                    raison = %raison,
+                    "dlna_scpd_avtransport_illisible — suivante armée comme avant"
+                );
+                AnnonceSuivante::Inconnue
+            }
+        }
     }
 
     /// #5793 — le profil de volume de l'appareil, lu dans son SCPD à la
@@ -1298,7 +1382,16 @@ impl DlnaOutput {
                 "<InstanceID>0</InstanceID>",
             )
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                // #5662 — l'échec SOAP finit lui aussi au repli : le dire.
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    "soap_echec",
+                    &e,
+                );
+                String::new()
+            })
         } else {
             let profil = self.profil_volume().await;
             self.rc_action(
@@ -1312,15 +1405,27 @@ impl DlnaOutput {
         };
         let niveau =
             extract_tag(&volume_resp, "CurrentVolume").and_then(|v| v.trim().parse::<f64>().ok());
-        Ok(match niveau {
+        let volume = match niveau {
             // Sonos : `GroupVolume` est toujours 0–100.
             Some(v) if sonos => v / 100.0,
             Some(v) => match self.profil_volume.get() {
                 Some(p) => p.fraction(v),
                 None => v / 100.0,
             },
-            None => 0.5,
-        })
+            None => {
+                // #5662 — repli inchangé, mais visible une fois par épisode.
+                // (Sans effet si l'échec SOAP d'un Sonos vient de l'ouvrir.)
+                volume_illisible_5662::constater_illisible(
+                    &self.volume_illisible,
+                    &self.name,
+                    volume_illisible_5662::raison_illisible(&volume_resp),
+                    &volume_resp,
+                );
+                return Ok(volume_illisible_5662::REPLI_ILLISIBLE);
+            }
+        };
+        volume_illisible_5662::constater_lisible(&self.volume_illisible, &self.name, volume);
+        Ok(volume)
     }
 
     /// #5050 — un 701 sur `Pause` nomme un état, comme sur `Play` (#2581) :
@@ -1949,6 +2054,7 @@ impl DlnaOutput {
         }
     }
 
+    #[cfg(test)]
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         Self::didl_metadata_mime(media, item_id, media.mime_type)
     }
@@ -2178,12 +2284,22 @@ impl OutputTarget for DlnaOutput {
         // previous behaviour. The Sink is NOT probed here: a healthy renderer
         // (Sonos & co) accepts this MIME, so the happy path does ZERO extra
         // GetProtocolInfo round-trip (no latency added in nominal playback).
-        // The Sink is probed ONLY when a 714 actually occurs (see below).
+        // The Sink is probed ONLY on a refusal (714, 501, 716 — see below).
         let mut attempt_mime = media.mime_type.to_string();
-        // Sink probed lazily on the first 714 and reused across the ≤2 retries.
+        // Sink probed lazily on the first refusal and reused across the ≤2 retries.
         let mut sink: Vec<String> = Vec::new();
         let mut tried_exact = false;
         let mut tried_fallback = false;
+        // Replis de PROFIL (MIME annoncé / DIDL), toutes fautes confondues
+        // (714, 501, 716) : deux au plus par pose d'URI, jamais de boucle.
+        let mut replis: u8 = 0;
+        // Niveau de DIDL imposé par un repli de profil (et non par l'échelle
+        // Platinum) : c'est lui qu'on mémorise avec le MIME.
+        let mut niveau_impose_par_repli: u8 = 0;
+        // Le MIME annoncé est-il un ALIAS du format servi (même octets, autre
+        // orthographe) ? Seul un alias est aussi servi en `Content-Type` ;
+        // l'étiquette PCM, elle, ne touche pas au flux.
+        let mut mime_est_un_alias = false;
         // Échelle de métadonnées : DIDL complet → minimal → vide. On ne
         // descend que sur un échec de LECTURE de la requête (500 sans corps,
         // Platinum) — jamais sur un défaut SOAP, qui a sa propre reprise 714.
@@ -2197,13 +2313,38 @@ impl OutputTarget for DlnaOutput {
         let mut niveau_didl: u8 = self
             .didl_niveau_appris
             .niveau_de_depart(maintenant_ms, &self.name);
+        // Le profil qui a fini par passer sur CET appareil (UDN) pour ce MIME
+        // source : on part de lui, sans repayer les refus à chaque piste.
+        let profil_appris = repli_set_uri::profil_memorise(&self.device_id, media.mime_type);
+        if let Some(profil) = &profil_appris {
+            attempt_mime = profil.mime_annonce.clone();
+            niveau_impose_par_repli = profil.niveau_didl_min;
+            niveau_didl = niveau_didl.max(profil.niveau_didl_min);
+            mime_est_un_alias = profil.servi_sous_ce_mime;
+            if mime_est_un_alias
+                && let Some(sid) = crate::http::streamer::stream_id_de_l_url(media.url)
+            {
+                crate::http::streamer::annoncer_mime_du_flux(sid, &attempt_mime);
+            }
+            info!(
+                device = %self.name,
+                device_id = %self.device_id,
+                mime_source = media.mime_type,
+                advertised_mime = %attempt_mime,
+                niveau_didl,
+                "dlna_set_uri_profil_memorise"
+            );
+        }
         let debut_set_uri = std::time::Instant::now();
+        let mut essai: u32 = 0;
         loop {
+            essai += 1;
             let metadata = match niveau_didl {
                 0 => Self::didl_metadata_mime(media, item_id, &attempt_mime),
                 1 => Self::didl_metadata_minimale(media, item_id, &attempt_mime),
                 _ => String::new(),
             };
+            let protocol_info = repli_set_uri::protocol_info_du_didl(&metadata);
             let set_uri_resp = match self.av_action("SetAVTransportURI", &format!(
                 "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
                 media.url
@@ -2226,6 +2367,36 @@ impl OutputTarget for DlnaOutput {
             if !(set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>")) {
                 self.didl_niveau_appris
                     .apprendre(niveau_didl, maintenant_ms, &self.name);
+                // Un profil autre que celui d'origine a passé : on le retient
+                // pour cet appareil et ce MIME source (piste suivante, gapless).
+                if replis > 0 || profil_appris.is_some() {
+                    if !attempt_mime.eq_ignore_ascii_case(media.mime_type)
+                        || niveau_impose_par_repli > 0
+                    {
+                        repli_set_uri::memoriser_profil(
+                            &self.device_id,
+                            media.mime_type,
+                            repli_set_uri::ProfilSetUri {
+                                mime_annonce: attempt_mime.clone(),
+                                niveau_didl_min: niveau_impose_par_repli,
+                                servi_sous_ce_mime: mime_est_un_alias,
+                            },
+                        );
+                    }
+                    if replis > 0 {
+                        warn!(
+                            device = %self.name,
+                            device_id = %self.device_id,
+                            essai,
+                            replis,
+                            mime_source = media.mime_type,
+                            advertised_mime = %attempt_mime,
+                            niveau_didl,
+                            protocol_info = protocol_info.as_deref().unwrap_or("-"),
+                            "dlna_set_uri_repli_accepte_et_memorise"
+                        );
+                    }
+                }
                 // Le SUCCÈS se journalise, pas seulement l'échec. Sans cette
                 // ligne, un SetAVTransportURI lent laisse un trou muet et
                 // l'incident n'est plus instruisable : dans le journal de
@@ -2236,10 +2407,32 @@ impl OutputTarget for DlnaOutput {
                     url = media.url,
                     niveau_didl,
                     advertised_mime = %attempt_mime,
+                    protocol_info = protocol_info.as_deref().unwrap_or("-"),
                     duree_ms = debut_set_uri.elapsed().as_millis() as u64,
                     "dlna_set_uri_ok"
                 );
                 break;
+            }
+
+            // Chaque refus se journalise avec ce qui a été ENVOYÉ : le
+            // protocolInfo, le niveau de DIDL, le MIME — et la réponse.
+            let faute = repli_set_uri::classer_faute_set_uri(&set_uri_resp);
+            warn!(
+                device = %self.name,
+                device_id = %self.device_id,
+                essai,
+                code = faute.code(),
+                mime_source = media.mime_type,
+                advertised_mime = %attempt_mime,
+                niveau_didl,
+                protocol_info = protocol_info.as_deref().unwrap_or("-"),
+                response = %set_uri_resp,
+                "dlna_set_uri_refus"
+            );
+            if essai == 1 && profil_appris.is_some() {
+                // Le profil mémorisé ne passe plus (mise à jour du renderer,
+                // autre réglage) : on l'oublie, la reprise repart de lui.
+                repli_set_uri::oublier_profil(&self.device_id, media.mime_type);
             }
 
             // Error 714 ("Illegal MIME-type"): the renderer parsed the DIDL but
@@ -2247,16 +2440,15 @@ impl OutputTarget for DlnaOutput {
             // Beoplay A9 / Sink audio/x-flac, forum 714: strict renderers (B&O,
             // Lyngdorf) reject `audio/flac` when their Sink only lists
             // `audio/x-flac`, even though they decode the stream. ONLY here (on
-            // a real 714) do we pay a single GetProtocolInfo probe, then retry
-            // up to twice: (a) with the exact Sink spelling, (b) with a PCM
-            // profile the Sink lists. Strict renderers gate on the announced
-            // MIME but decode by content, so a Sink-accepted label lets the
-            // actual FLAC bytes through.
-            let is_714 = set_uri_resp.contains(">714<")
-                || set_uri_resp.to_lowercase().contains("illegal mime");
+            // a real refusal) do we pay a single GetProtocolInfo probe, then
+            // retry up to twice: (a) with the exact Sink spelling, (b) with a
+            // PCM profile the Sink lists. Strict renderers gate on the
+            // announced MIME but decode by content, so a Sink-accepted label
+            // lets the actual FLAC bytes through.
+            let is_714 = faute == repli_set_uri::FauteSetUri::MimeIllegal714;
 
-            if is_714 && (!tried_exact || !tried_fallback) {
-                // Probe the Sink once, on the first 714 only.
+            if is_714 && replis < 2 && (!tried_exact || !tried_fallback) {
+                // Probe the Sink once, on the first refusal only.
                 if sink.is_empty() {
                     sink = self.get_protocol_info().await.unwrap_or_default();
                 }
@@ -2285,6 +2477,8 @@ impl OutputTarget for DlnaOutput {
                             crate::http::streamer::annoncer_mime_du_flux(sid, &exact);
                         }
                         attempt_mime = exact;
+                        mime_est_un_alias = true;
+                        replis += 1;
                         continue;
                     }
                 }
@@ -2303,10 +2497,72 @@ impl OutputTarget for DlnaOutput {
                                 "dlna_set_uri_714_pcm_fallback_retry"
                             );
                             attempt_mime = fb;
+                            mime_est_un_alias = false;
+                            replis += 1;
                             continue;
                         }
                     }
                 }
+            }
+
+            // 501 « Action Failed » / 716 : le refus ne nomme pas le MIME. Une
+            // pile stricte (libupnp range tout échec d'action en 501 ; upmpdcli
+            // y met le refus de son `checkcontentformat`, ou celui de son
+            // lecteur) le rend aussi bien sur la FORME de la commande que sur
+            // le format. Deux replis au plus, chacun précédé d'un Stop (un
+            // renderer resté sur sa propre source peut refuser la pose) :
+            // (1) la commande minimale et canonique — DIDL minimale (titre,
+            //     classe, une ressource, son protocolInfo) dans l'orthographe
+            //     de MIME que publie le Sink ; les octets ne changent pas ;
+            // (2) des métadonnées VIDES — rien à refuser dans la DIDL.
+            // L'étiquette PCM reste propre au 714, qui nomme le MIME : sur un
+            // 501 indépendant du format, elle ne changerait rien.
+            if matches!(
+                faute,
+                repli_set_uri::FauteSetUri::ActionEchouee501
+                    | repli_set_uri::FauteSetUri::RessourceIntrouvable716
+            ) && replis < 2
+                && niveau_didl < 2
+            {
+                if sink.is_empty() {
+                    sink = self.get_protocol_info().await.unwrap_or_default();
+                }
+                let (palier, mime_repli, niveau_repli) = if !tried_exact && niveau_didl < 1 {
+                    tried_exact = true;
+                    (
+                        "minimal_canonique",
+                        advertised_mime_for_sink(media.mime_type, &sink),
+                        1u8,
+                    )
+                } else {
+                    tried_exact = true;
+                    ("metadonnees_vides", attempt_mime.clone(), 2u8)
+                };
+                warn!(
+                    device = %self.name,
+                    code = faute.code(),
+                    repli = replis + 1,
+                    palier,
+                    advertised_mime = %attempt_mime,
+                    mime_repli = %mime_repli,
+                    niveau_didl = niveau_repli,
+                    sink = ?sink,
+                    "dlna_set_uri_repli_commande_conservatrice"
+                );
+                let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                if !mime_repli.eq_ignore_ascii_case(&attempt_mime) {
+                    mime_est_un_alias = !mime_repli.eq_ignore_ascii_case(media.mime_type);
+                    if mime_est_un_alias
+                        && let Some(sid) = crate::http::streamer::stream_id_de_l_url(media.url)
+                    {
+                        crate::http::streamer::annoncer_mime_du_flux(sid, &mime_repli);
+                    }
+                    attempt_mime = mime_repli;
+                }
+                niveau_didl = niveau_repli;
+                niveau_impose_par_repli = niveau_repli;
+                replis += 1;
+                continue;
             }
 
             if is_714 {
@@ -2326,7 +2582,17 @@ impl OutputTarget for DlnaOutput {
                     sink.len()
                 ));
             }
-            warn!(device = %self.name, response = %set_uri_resp, "dlna_set_uri_error");
+            warn!(
+                device = %self.name,
+                code = faute.code(),
+                essais = essai,
+                replis,
+                advertised_mime = %attempt_mime,
+                sink_entries = sink.len(),
+                sink = ?sink,
+                response = %set_uri_resp,
+                "dlna_set_uri_error"
+            );
             return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
         }
 
@@ -2986,6 +3252,10 @@ impl OutputTarget for DlnaOutput {
             .is_ok()
     }
 
+    async fn annonce_la_suivante(&self) -> AnnonceSuivante {
+        self.lire_annonce_suivante().await
+    }
+
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // Id neuf, distinct de celui du `SetAVTransportURI` qui précède comme de
         // tous ceux déjà émis vers cet appareil (#3675).
@@ -3004,10 +3274,25 @@ impl OutputTarget for DlnaOutput {
         let depart = self
             .didl_niveau_appris
             .niveau_de_depart(maintenant_ms, &self.name);
+        // Le profil appris par `play_media` sur un refus (501/714/716) vaut
+        // pour la suivante du même format : sans lui, le gapless repaierait le
+        // refus que la pose de la piste courante a déjà résolu.
+        let profil = repli_set_uri::profil_memorise(&self.device_id, media.mime_type);
+        let mime_suivant = profil
+            .as_ref()
+            .map(|p| p.mime_annonce.clone())
+            .unwrap_or_else(|| media.mime_type.to_string());
+        let depart = depart.max(profil.as_ref().map_or(0, |p| p.niveau_didl_min));
+        if let Some(p) = &profil
+            && p.servi_sous_ce_mime
+            && let Some(sid) = crate::http::streamer::stream_id_de_l_url(media.url)
+        {
+            crate::http::streamer::annoncer_mime_du_flux(sid, &p.mime_annonce);
+        }
         for niveau in depart..=2 {
             let metadata = match niveau {
-                0 => Self::didl_metadata(media, item_id),
-                1 => Self::didl_metadata_minimale(media, item_id, media.mime_type),
+                0 => Self::didl_metadata_mime(media, item_id, &mime_suivant),
+                1 => Self::didl_metadata_minimale(media, item_id, &mime_suivant),
                 _ => String::new(),
             };
             match self.av_action("SetNextAVTransportURI", &format!(
@@ -3508,6 +3793,17 @@ fn advertised_mime_for_sink(desired: &str, sink: &[String]) -> String {
         "audio/mp3" => &["audio/mpeg"],
         "audio/wav" => &["audio/x-wav"],
         "audio/x-wav" => &["audio/wav"],
+        // Mêmes octets, autres orthographes — celles qu'une pile stricte
+        // (upmpdcli : `audio/x-dsd`, `audio/aac`, `audio/x-aiff`…) publie
+        // sans publier la nôtre. Le DSD ne s'aligne que sur les génériques :
+        // `audio/dsf` / `audio/dff` nomment un conteneur précis.
+        "application/x-dsd" => &["audio/x-dsd", "audio/dsd"],
+        "audio/wave" | "audio/vnd.wave" => &["audio/wav", "audio/x-wav"],
+        "audio/aiff" => &["audio/x-aiff", "audio/aif"],
+        "audio/x-aiff" => &["audio/aiff"],
+        "audio/aacp" => &["audio/aac", "audio/x-aac"],
+        "audio/mp4" => &["audio/m4a", "audio/x-m4a"],
+        "application/ogg" | "audio/opus" => &["audio/ogg"],
         _ => &[],
     };
     for alias in aliases {

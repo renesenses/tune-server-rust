@@ -320,6 +320,95 @@ pub(super) struct TrackFilterQuery {
     /// Facette Collections : nom d'une collection manuelle ou intelligente.
     /// MONOVALUÉE — voir `TrackFilter::collection_ids`.
     pub collection: Option<String>,
+    /// tune-web-client#1716 — la PAGE TRIÉE de l'onglet Titres. Ces cinq
+    /// paramètres sont nouveaux : sans aucun d'eux, la réponse est celle
+    /// d'avant, au champ près (voir [`PageTriee::depuis`]).
+    ///
+    /// Clé de colonne du tableau (`title`, `artist`, `time`…), voir
+    /// `tune_core::db::track_repo::COLONNES_TRIABLES`.
+    pub sort: Option<String>,
+    /// `asc` (défaut) ou `desc`.
+    pub order: Option<String>,
+    /// Recherche de l'onglet Titres : titre OU artiste (≠ `q`, le texte
+    /// libre d'Oxygen).
+    pub search: Option<String>,
+    /// Clé de provenance : `local`, `upnp`, `upnp:<UDN>`, `qobuz`…
+    pub provenance: Option<String>,
+    /// `sources` : rendre aussi les comptes par provenance.
+    pub counts: Option<String>,
+}
+
+/// Ce que les paramètres de la page triée demandent, validé.
+struct PageTriee {
+    tri: Option<tune_core::db::track_repo::ColonneDeTri>,
+    descendant: bool,
+    recherche: Option<String>,
+    provenance: Option<String>,
+    avec_comptes: bool,
+}
+
+impl PageTriee {
+    /// `Ok(None)` quand AUCUN des nouveaux paramètres n'est posé : la route
+    /// suit alors son chemin d'avant, inchangé — c'est la promesse faite aux
+    /// anciens clients. Une valeur posée mais invalide rend 400, jamais
+    /// « paramètre ignoré » : un tri ignoré afficherait un ordre que l'en-tête
+    /// ne dit pas.
+    fn depuis(p: &TrackFilterQuery) -> Result<Option<Self>, AppError> {
+        let posee = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (sort, order, search, provenance, counts) = (
+            posee(&p.sort),
+            posee(&p.order),
+            posee(&p.search),
+            posee(&p.provenance),
+            posee(&p.counts),
+        );
+        if sort.is_none()
+            && order.is_none()
+            && search.is_none()
+            && provenance.is_none()
+            && counts.is_none()
+        {
+            return Ok(None);
+        }
+        let tri = match sort.as_deref() {
+            None => None,
+            Some(cle) => Some(
+                tune_core::db::track_repo::ColonneDeTri::depuis_cle(cle).ok_or_else(|| {
+                    AppError::bad_request(format!("parametre `sort` : colonne inconnue `{cle}`"))
+                })?,
+            ),
+        };
+        let descendant = match order.as_deref() {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(_) => {
+                return Err(AppError::bad_request(
+                    "parametre `order` : `asc` ou `desc` attendu",
+                ));
+            }
+        };
+        let avec_comptes = match counts.as_deref() {
+            None => false,
+            Some("sources") => true,
+            Some(_) => {
+                return Err(AppError::bad_request(
+                    "parametre `counts` : `sources` attendu",
+                ));
+            }
+        };
+        Ok(Some(Self {
+            tri,
+            descendant,
+            recherche: search,
+            provenance,
+            avec_comptes,
+        }))
+    }
 }
 
 pub(super) async fn list_tracks(
@@ -332,6 +421,7 @@ pub(super) async fn list_tracks(
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
     let filter = track_filter_from_raw(raw.as_deref())?;
+    let page_triee = PageTriee::depuis(&p)?;
     // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
     // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
     // compteur chez JeromeQ gelaient ce fil pour tout le reste du serveur :
@@ -340,8 +430,10 @@ pub(super) async fn list_tracks(
     // bloquants, comme la grille d'albums depuis #4800.
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     let profile_id = profile.id();
-    match tokio::task::spawn_blocking(move || lire_la_page_de_pistes(&state, profile_id, p, filter))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        lire_la_page_de_pistes(&state, profile_id, p, filter, page_triee)
+    })
+    .await
     {
         Ok(corps) => Ok(Json(corps)),
         Err(e) => {
@@ -359,6 +451,7 @@ fn lire_la_page_de_pistes(
     profile_id: i64,
     p: TrackFilterQuery,
     mut filter: tune_core::db::facet_filter::TrackFilter,
+    page_triee: Option<PageTriee>,
 ) -> Value {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
@@ -382,6 +475,13 @@ fn lire_la_page_de_pistes(
 
     filter.collection_ids = scope.albums;
     filter.collection_track_ids = scope.tracks;
+
+    // tune-web-client#1716 — la page triée de l'onglet Titres. Elle ne
+    // s'ouvre QUE sur l'un des nouveaux paramètres : un ancien client ne les
+    // envoie pas et retrouve plus bas exactement la réponse d'avant.
+    if let Some(pt) = page_triee {
+        return lire_la_page_triee(state, profile_id, &repo, filter, pt, limit, offset);
+    }
 
     // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
     // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
@@ -423,6 +523,58 @@ fn lire_la_page_de_pistes(
         };
         let items = joindre_dr_par_piste(state, profile_id, items);
         json!({"items": items, "total": total, "limit": limit, "offset": offset})
+    }
+}
+
+/// La page triée (tune-web-client#1716) : les champs d'avant (`items`,
+/// `total`, `limit`, `offset`), plus `sort` et `order` — l'ordre réellement
+/// appliqué, que le client lit aussi pour reconnaître un serveur qui sait
+/// paginer —, et sur `counts=sources` les comptes par provenance.
+fn lire_la_page_triee(
+    state: &AppState,
+    profile_id: i64,
+    repo: &TrackRepo,
+    filtre: tune_core::db::facet_filter::TrackFilter,
+    pt: PageTriee,
+    limit: i64,
+    offset: i64,
+) -> Value {
+    let demande = tune_core::db::track_repo::DemandeDePistes {
+        filtre,
+        recherche: pt.recherche,
+        provenance: pt.provenance,
+        tri: pt.tri,
+        descendant: pt.descendant,
+        limit,
+        offset,
+        avec_comptes: pt.avec_comptes,
+    };
+    let sort = pt.tri.map(|c| c.cle());
+    let order = if pt.descendant { "desc" } else { "asc" };
+    match repo.page_de_pistes(&demande) {
+        Ok(page) => {
+            let items = joindre_dr_par_piste(state, profile_id, page.pistes);
+            let mut corps = json!({
+                "items": items,
+                "total": page.total,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+                "order": order,
+            });
+            if let Some(c) = page.comptes {
+                let comptes: serde_json::Map<String, Value> =
+                    c.comptes.into_iter().map(|(k, n)| (k, json!(n))).collect();
+                corps["source_counts"] = Value::Object(comptes);
+                corps["total_all_sources"] = json!(c.total);
+            }
+            corps
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "list_tracks_page_triee_echec");
+            json!({"items": [], "total": 0, "limit": limit, "offset": offset,
+                   "sort": sort, "order": order})
+        }
     }
 }
 

@@ -452,12 +452,13 @@ pub(super) async fn list_duplicates(
 /// même (`audio/empreinte.rs`) : le rip FLAC et sa copie AAC, l'AIFF et son
 /// ALAC, deux résolutions du même master — ce que ni `audio_hash` (octets du
 /// conteneur) ni les métadonnées ne voient. Empreintes lues telles quelles,
-/// regroupées par `grouper_par_contenu_avec_durees` (durées réelles à une
-/// seconde près depuis #5455, préfiltre grossier, puis comparaison alignée
-/// avec tolérance). Base antérieure à la
+/// regroupées par `grouper_par_contenu_avec_durees_et_titres` (durées réelles
+/// à une seconde près depuis #5455, titres compatibles depuis #5976 — même
+/// titre normalisé, mêmes mentions de version —, préfiltre grossier, puis
+/// comparaison alignée avec tolérance). Base antérieure à la
 /// colonne : liste vide, sans bruit. `limit`/`offset` portent sur les groupes.
 fn doublons_par_contenu(state: &AppState, limit: i64, offset: i64) -> Vec<Value> {
-    use tune_core::audio::empreinte::{Empreinte, grouper_par_contenu_avec_durees};
+    use tune_core::audio::empreinte::{Empreinte, grouper_par_contenu_avec_durees_et_titres};
     let rows = match state
         .backend
         .query_many(&sql_pistes_a_empreinte_de_contenu(), &[])
@@ -475,6 +476,9 @@ fn doublons_par_contenu(state: &AppState, limit: i64, offset: i64) -> Vec<Value>
     // #5455 — la durée RÉELLE de chaque piste : c'est elle qui borne les
     // comparaisons, l'empreinte s'arrêtant à une minute.
     let mut durees_ms: Vec<Option<i64>> = Vec::new();
+    // #5976 — le titre de chaque piste : « Titre » et « Titre (Instrumental) »,
+    // même mixage sans la voix, ne sont pas le même enregistrement.
+    let mut titres: Vec<Option<String>> = Vec::new();
     for row in &rows {
         let Some(id) = row.first().and_then(|v| v.as_i64()) else {
             continue;
@@ -501,8 +505,9 @@ fn doublons_par_contenu(state: &AppState, limit: i64, offset: i64) -> Vec<Value>
         );
         empreintes.push((id, empreinte));
         durees_ms.push(row.get(4).and_then(|v| v.as_i64()));
+        titres.push(row.get(1).and_then(|v| v.as_string()));
     }
-    grouper_par_contenu_avec_durees(&empreintes, &durees_ms)
+    grouper_par_contenu_avec_durees_et_titres(&empreintes, &durees_ms, &titres)
         .into_iter()
         .skip(offset.max(0) as usize)
         .take(limit.max(0) as usize)

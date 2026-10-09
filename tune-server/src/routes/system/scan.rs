@@ -3756,11 +3756,50 @@ pub(super) async fn library_clear(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> Json<Value> {
+    // 🔴 #5973 — sauvegarde automatique AVANT de vider.
+    //
+    // Le vidage efface les pistes, et par les `ON DELETE CASCADE` le contenu
+    // des playlists, les notes d'albums, les signets et les métadonnées ; les
+    // favoris et les étiquettes deviennent orphelins. Aucun scan ne les
+    // reconstruit (perte réelle chez un testeur, fil 2171). Le vidage lui-même
+    // est inchangé ; il est simplement précédé d'une copie de la base, dont le
+    // chemin est rendu au client.
+    //
+    // Si la copie échoue, on NE vide PAS : le client annonce une sauvegarde,
+    // vider sans elle serait mentir sur ce qui est récupérable.
+    //
+    // Pas de copie pour une base en mémoire (épreuves), ni sous PostgreSQL :
+    // la sauvegarde de fichier ne concerne que SQLite (voir `backup.rs`) ;
+    // sous PG, c'est `pg_dump` qu'il faut lancer avant de vider.
+    let backup = match state.db.as_ref() {
+        Some(db) => match tune_core::db_backup::create_safety_backup(db, "avant_vidage") {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "library_clear_refused_backup_failed");
+                return Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "automatic backup failed, the library was NOT cleared: {e}"
+                    ),
+                }));
+            }
+        },
+        _ => None,
+    };
     let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     match repo.delete_all() {
         Ok(count) => {
-            tracing::info!(tracks_deleted = count, "library_cleared");
-            Json(json!({"ok": true, "deleted": count}))
+            tracing::info!(
+                tracks_deleted = count,
+                backup = backup.as_ref().map(|b| b.path.as_str()).unwrap_or("-"),
+                "library_cleared"
+            );
+            Json(json!({
+                "ok": true,
+                "deleted": count,
+                "backup": backup,
+                "backup_path": backup.as_ref().map(|b| b.path.clone()),
+            }))
         }
         Err(e) => {
             tracing::warn!(error = %e, "library_clear_failed");
@@ -5892,3 +5931,77 @@ mod scan_delete_tests_2147;
 #[cfg(test)]
 #[path = "scan_import_progress_tests.rs"]
 mod import_progress_tests;
+
+#[cfg(test)]
+mod vidage_sauvegarde_5973 {
+    use super::library_clear;
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire")
+    }
+    /// #5973 — « Vider la bibliothèque » sauvegarde la base AVANT de vider,
+    /// et la réponse dit où.
+    ///
+    /// Contre-épreuve dans le test : la playlist a bien perdu son titre dans
+    /// la base vivante (c'est la perte du fil 2171), et la copie l'a encore.
+    #[tokio::test]
+    async fn vider_la_bibliotheque_sauvegarde_d_abord_et_rend_le_chemin() {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let db_path = dir.path().join("tune.db");
+        let db_path = db_path.to_str().expect("chemin utf-8").to_string();
+        let etat = AppState::new(&db_path, 0, Default::default()).expect("état");
+        etat.sqlite()
+            .expect("SQLite")
+            .execute_batch(
+                "INSERT INTO tracks (id, title, file_path) VALUES (1, 'Titre', '/m/a.flac');
+                 INSERT INTO playlists (id, name) VALUES (1, 'Ma liste');
+                 INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (1, 1, 0);",
+            )
+            .expect("données");
+
+        let Json(rep) = library_clear(crate::auth::RequireAdmin, State(etat.clone())).await;
+
+        assert_eq!(rep["ok"], true, "{rep}");
+        assert_eq!(rep["deleted"], 1, "{rep}");
+        let chemin = rep["backup_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("la réponse doit donner le chemin de la sauvegarde : {rep}"));
+        assert_eq!(rep["backup"]["path"], chemin, "{rep}");
+        assert!(
+            rep["backup"]["filename"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("_avant_vidage.db")),
+            "{rep}"
+        );
+        assert!(
+            std::path::Path::new(chemin).is_file(),
+            "la sauvegarde annoncée doit exister : {chemin}"
+        );
+        let compter = |base: &str| -> i64 {
+            rusqlite::Connection::open(base)
+                .expect("ouverture")
+                .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
+                .expect("compte")
+        };
+        assert_eq!(
+            compter(&db_path),
+            0,
+            "contre-épreuve : le vidage efface le contenu des playlists"
+        );
+        assert_eq!(
+            compter(chemin),
+            1,
+            "la sauvegarde garde le contenu des playlists"
+        );
+    }
+    /// #5973 — une base en mémoire n'a rien à sauvegarder : le vidage passe
+    /// et la réponse le dit (`backup_path: null`).
+    #[tokio::test]
+    async fn vider_une_base_en_memoire_ne_sauvegarde_rien() {
+        let Json(rep) = library_clear(crate::auth::RequireAdmin, State(etat())).await;
+        assert_eq!(rep["ok"], true, "{rep}");
+        assert!(rep["backup_path"].is_null(), "{rep}");
+    }
+}

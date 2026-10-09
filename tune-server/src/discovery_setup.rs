@@ -77,6 +77,23 @@ pub(crate) fn scpd_rendering_control(
         .map(|p| resolve_control_url(&dev.host, dev.port, p))
 }
 
+/// #3967 — l'URL absolue du SCPD d'`AVTransport`, même source que
+/// [`scpd_rendering_control`].
+pub(crate) fn scpd_av_transport(
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+) -> Option<String> {
+    let urls = dev
+        .capabilities
+        .get("scpd_urls")
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
+        .unwrap_or_default();
+    urls.get("avtransport")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| resolve_control_url(&dev.host, dev.port, p))
+}
+
 pub(crate) fn resolve_control_url(host: &str, port: u16, control_url: &str) -> String {
     if control_url.starts_with("http://") || control_url.starts_with("https://") {
         control_url.to_string()
@@ -864,7 +881,8 @@ async fn handle_ssdp_discovered(
                 urls_evenements_dlna(&dev.host, dev.port, &evt_urls),
             )
             .with_upnp_silence(crate::config::resolve_upnp_silence(db, &dev.id))
-            .with_rendering_control_scpd(scpd_rendering_control(dev));
+            .with_rendering_control_scpd(scpd_rendering_control(dev))
+            .with_av_transport_scpd(scpd_av_transport(dev));
             let mut reg = outputs.lock().await;
             register_discovered_output(
                 &mut reg,

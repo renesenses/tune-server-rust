@@ -5,6 +5,8 @@
 //! ils chargent `docs/contrat-web.json`, appellent le vrai routeur Axum et
 //! confrontent la réponse à la carte commitée.
 
+#[path = "web_contracts/balayage_1897.rs"]
+mod balayage_1897;
 #[path = "web_contracts/history_1897.rs"]
 mod history_1897;
 #[path = "web_contracts/library_1897.rs"]
@@ -772,9 +774,8 @@ const FANTOMES_TOLERES: &[(&str, &str)] = &[
          ne le signale pas. Seule la variante a parametre \
          `/streaming/youtube/moods/{params}`, qu'appelle \
          `api.ts:getYoutubeMoodPlaylists`, n'a aucune route. Le gestionnaire de \
-         base rend `{\"moods\":[],\"message\":\"YouTube moods not yet \
-         implemented\"}` : c'est un TALON serveur a finir, pas un chemin faux \
-         cote client.",
+         base est un TALON qui rend une liste vide de categories (#1897) : \
+         c'est un talon serveur a finir, pas un chemin faux cote client.",
     ),
 ];
 

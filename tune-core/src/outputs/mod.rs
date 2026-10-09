@@ -20,10 +20,16 @@ pub mod chromecast;
 pub mod coreaudio_exclusive;
 pub mod didl;
 pub mod dlna;
+pub mod dlna_annonce_suivante;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
 pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
+/// Repli conservateur sur un refus de `SetAVTransportURI` (501/714/716),
+/// mémorisé par appareil.
+pub(crate) mod dlna_repli_set_uri;
+#[cfg(test)]
+mod dlna_repli_set_uri_tests;
 #[cfg(test)]
 mod dlna_test;
 pub mod hqplayer;
