@@ -257,10 +257,11 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
     }
 }
 
-/// Une locale que l'interface ne parle pas retombe sur le français, le défaut
-/// de l'application — jamais sur la clé brute ni sur du vide.
+/// Une locale que l'interface ne parle pas retombe sur l'anglais, le repli du
+/// serveur comme du client web — jamais sur le français, la clé brute ni du
+/// vide.
 #[tokio::test]
-async fn une_locale_inconnue_retombe_sur_le_francais() {
+async fn une_locale_inconnue_retombe_sur_l_anglais() {
     let app = app_gratuit().await;
     let (_, corps) = ecrire_put(
         &app,
@@ -272,8 +273,8 @@ async fn une_locale_inconnue_retombe_sur_le_francais() {
     let phrase = corps["message"].as_str().unwrap_or_default();
 
     assert!(
-        phrase.contains("nécessite Tune Premium"),
-        "repli français attendu : {corps}"
+        phrase.contains("requires Tune Premium"),
+        "repli anglais attendu : {corps}"
     );
     assert!(
         !phrase.contains("premium.required"),

@@ -89,6 +89,11 @@ struct StreamingFavoriteAdd {
     album: Option<String>,
     #[serde(alias = "cover_path", alias = "cover")]
     cover_url: Option<String>,
+    /// #5530 — le marquage « généré par IA » que le service donne à l'album
+    /// (Qobuz : `ai_generated` d'`album/get`), quand le client l'a. Absent :
+    /// rien n'est posé.
+    #[serde(default, alias = "album_ai_generated")]
+    ai_generated: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -506,7 +511,16 @@ async fn add_streaming_favorite(
         body.album.as_deref(),
         body.cover_url.as_deref(),
     ) {
-        Ok(_) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            if let Some(ia) = body.ai_generated
+                && let Err(e) =
+                    repo.poser_ia(id, &body.item_type, &body.service, &body.service_id, ia)
+            {
+                // Le favori est écrit ; seul le marquage manque.
+                tracing::warn!(erreur = %e, "favori_service_marquage_ia_impossible");
+            }
+            (StatusCode::CREATED, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }

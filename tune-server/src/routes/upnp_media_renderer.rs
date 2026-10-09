@@ -380,6 +380,7 @@ async fn avtransport_control(
                 );
 
                 if is_paused_same_uri {
+                    info!(zone_id, origine = "renderer", "resume_requested");
                     match state
                         .orchestrator
                         .resume(zone_id, device_id.as_deref())
@@ -437,6 +438,7 @@ async fn avtransport_control(
             }
         }
         RendererCommand::Pause => {
+            info!(zone_id, origine = "renderer", "pause_requested");
             match state
                 .orchestrator
                 .pause(zone_id, device_id.as_deref())

@@ -911,6 +911,17 @@ pub fn build_album_query(
             continue;
         }
 
+        // #5530 — « Généré par IA » : aucun album de la bibliothèque n'est
+        // marqué par un service, la réponse est constante (voir `regles_sql`).
+        // Un opérateur inconnu fait disparaître la règle, comme les autres
+        // critères de ce moteur.
+        if field == "ai_generated" {
+            if let Some(c) = crate::regles_sql::condition_marquage_ia_bibliotheque(op) {
+                conditions.push(c.to_string());
+            }
+            continue;
+        }
+
         // #5547 — la note de l'ALBUM pour le profil actif (`album_ratings`).
         if field == "rating" {
             if let Some(c) =

@@ -16,6 +16,7 @@ pub mod collaborative;
 pub mod confidentialite;
 pub mod config;
 pub mod config_backup;
+pub mod config_export;
 pub mod credentials_vault;
 pub mod dac_calibration;
 pub mod dashboard;
@@ -107,8 +108,86 @@ pub mod user_profiles;
 pub mod ytdlp;
 pub mod zones;
 
+/// Version d'une construction faite SANS `TUNE_VERSION` : construction locale,
+/// `docker build` du `Dockerfile` de développement, `cargo install` depuis les
+/// sources.
+///
+/// Le suffixe `-dev` n'est pas cosmétique. Les fichiers gardent la base
+/// `X.Y.Z` (convention A, `scripts/bump-all.sh`) et le suffixe de préversion
+/// vit sur le tag seul. Sans `TUNE_VERSION`, un binaire construit pendant le
+/// train `1.0.0-rcN` se disait donc `1.0.0` — et, en semver, `1.0.0` passe
+/// DEVANT `1.0.0-rc3` : la vérification de mise à jour, côté serveur
+/// ([`updater::select_release`]) comme côté client web, jugeait l'installation
+/// plus récente que toutes les RC et ne lui en proposait jamais aucune, ni même
+/// la `1.0.0` finale.
+///
+/// `X.Y.Z-dev` reste au-dessous de toute `X.Y.Z-rcN` et de la `X.Y.Z` finale,
+/// et garde la même base `X.Y.Z` que le client web embarqué : l'écran « À
+/// propos » ne crie pas à la dérive.
+const VERSION_SANS_TAG: &str = concat!(env!("CARGO_PKG_VERSION"), "-dev");
+
+/// `TUNE_VERSION` si la construction l'a reçu, non vide ; le repli sinon.
+///
+/// Le cas vide compte : un `ARG TUNE_VERSION` de Dockerfile sans valeur pose
+/// une variable VIDE, et `option_env!` rend alors `Some("")`.
+const fn choisir_version(tune_version: Option<&'static str>, repli: &'static str) -> &'static str {
+    match tune_version {
+        Some(v) if !v.is_empty() => v,
+        _ => repli,
+    }
+}
+
+/// La version du binaire. `release.yml` et `docker.yml` posent `TUNE_VERSION`
+/// depuis le tag (`1.0.0-rc2`) ; toute autre construction rend
+/// [`VERSION_SANS_TAG`].
 pub fn version() -> &'static str {
-    option_env!("TUNE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    choisir_version(option_env!("TUNE_VERSION"), VERSION_SANS_TAG)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::updater::is_newer;
+
+    const BASE: &str = env!("CARGO_PKG_VERSION");
+
+    #[test]
+    fn une_construction_sans_tag_ne_passe_devant_aucune_rc_de_sa_base() {
+        for n in 1..=12 {
+            let rc = format!("{BASE}-rc{n}");
+            assert!(
+                is_newer(&rc, VERSION_SANS_TAG),
+                "{rc} doit être proposée à une construction sans tag ({VERSION_SANS_TAG})"
+            );
+            assert!(
+                !is_newer(VERSION_SANS_TAG, &rc),
+                "{VERSION_SANS_TAG} ne doit pas se croire plus récente que {rc}"
+            );
+        }
+        assert!(
+            is_newer(BASE, VERSION_SANS_TAG),
+            "la {BASE} finale doit être proposée à {VERSION_SANS_TAG}"
+        );
+    }
+
+    #[test]
+    fn la_version_sans_tag_garde_la_base_du_workspace() {
+        assert_eq!(VERSION_SANS_TAG.split('-').next(), Some(BASE));
+        assert!(
+            VERSION_SANS_TAG.contains('-'),
+            "sans suffixe, une construction locale se dirait la finale"
+        );
+    }
+
+    #[test]
+    fn tune_version_prime_et_le_vide_retombe_sur_le_repli() {
+        assert_eq!(choisir_version(Some("1.0.0-rc3"), "x-dev"), "1.0.0-rc3");
+        assert_eq!(choisir_version(Some(""), "x-dev"), "x-dev");
+        assert_eq!(choisir_version(None, "x-dev"), "x-dev");
+        if option_env!("TUNE_VERSION").is_none_or(str::is_empty) {
+            assert_eq!(version(), VERSION_SANS_TAG);
+        }
+    }
 }
 
 pub fn rustc_version() -> &'static str {

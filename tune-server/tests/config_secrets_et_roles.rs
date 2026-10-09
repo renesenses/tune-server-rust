@@ -219,7 +219,7 @@ async fn export_sans_secrets_ne_laisse_rien_passer() {
     aucun_secret_dans(&corps, "/system/config/export");
     let v: Value = serde_json::from_str(&corps).unwrap();
     assert_eq!(
-        v["theme"].as_str(),
+        v["settings"]["theme"].as_str(),
         Some(THEME_ATTENDU),
         "une sauvegarde vide ne sert a rien : le reglage anodin reste"
     );
@@ -240,7 +240,7 @@ async fn export_avec_secrets_reste_complet_pour_l_administrateur() {
     assert_eq!(st, StatusCode::OK);
     let v: Value = serde_json::from_str(&corps).unwrap();
     assert_eq!(
-        v["jwt_secret"].as_str(),
+        v["settings"]["jwt_secret"].as_str(),
         Some(FAUX_JWT),
         "la sauvegarde complete doit rester complete"
     );

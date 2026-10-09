@@ -320,6 +320,12 @@ pub(super) async fn ecrire_balises(
             }
         }
     };
+    // « Écrire les modifications dans les fichiers audio » désactivé (le
+    // défaut) : l'aperçu (`dry_run`) reste permis — il n'ouvre aucun fichier en
+    // écriture —, l'écriture réelle est refusée.
+    if !corps.dry_run && !crate::routes::ecriture_fichiers::autorisee(&state) {
+        return crate::routes::ecriture_fichiers::refus("edition_balises");
+    }
     // La seconde demande ATTEND la première, puis la voit faite : son plan
     // est vide, elle n'écrit rien deux fois.
     let _verrou = ECRITURE.lock().await;

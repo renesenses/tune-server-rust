@@ -546,11 +546,26 @@ pub(crate) fn dossier_parent(chemin: &str) -> Option<&str> {
 ///
 /// Rend les dossiers les plus HAUTS qui qualifient — inutile de lister aussi
 /// leurs enfants, `sous_le_dossier` les couvre.
+///
+/// `racines` : ce que CE scan a parcouru — le dossier visé par un scan ciblé,
+/// toutes les racines sinon. Une piste hors de ce périmètre n'a pas été
+/// cherchée : son absence de `decouverts` ne dit rien de son montage. Sans ce
+/// filtre, un scan ciblé sur `/data/recordings/Qobuz` déclarait « vidés »
+/// `/data/music`, `/data/recordings/Tidal` et `/mnt` — 36 669 pistes qui
+/// n'avaient simplement pas été parcourues (.18, 05/10/2026). Les pistes
+/// restaient conservées, mais l'alarme `post_scan_sous_arbre_vide` et
+/// `protected_subtrees` mentaient, et une vraie alarme se serait noyée dans
+/// le bruit. Pour la même raison, un dossier rendu est toujours une racine du
+/// périmètre ou l'un de ses descendants, jamais un ancêtre (`/mnt` pour la
+/// racine `/mnt/recordings_usb`).
 pub(crate) fn sous_arbres_vides(
+    racines: &[String],
     existants: &[&str],
     decouverts: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
+
+    let dans_le_perimetre = |chemin: &str| racines.iter().any(|r| sous_le_dossier(chemin, r));
 
     // Dossiers qui présentent encore au moins un fichier : eux vont bien.
     let mut vivants: HashSet<&str> = HashSet::new();
@@ -567,7 +582,7 @@ pub(crate) fn sous_arbres_vides(
     // Pistes perdues par dossier, tous niveaux confondus.
     let mut perdues: HashMap<&str, usize> = HashMap::new();
     for p in existants {
-        if decouverts.contains(*p) {
+        if decouverts.contains(*p) || !dans_le_perimetre(p) {
             continue;
         }
         let mut cur = *p;
@@ -579,7 +594,9 @@ pub(crate) fn sous_arbres_vides(
 
     let mut candidats: Vec<&str> = perdues
         .into_iter()
-        .filter(|(d, n)| *n >= SEUIL_SOUS_ARBRE_VIDE && !vivants.contains(*d))
+        .filter(|(d, n)| {
+            *n >= SEUIL_SOUS_ARBRE_VIDE && !vivants.contains(*d) && dans_le_perimetre(d)
+        })
         .map(|(d, _)| d)
         .collect();
     // Du plus court au plus long, pour ne garder que les ancêtres.
@@ -592,6 +609,29 @@ pub(crate) fn sous_arbres_vides(
     }
     retenus.sort();
     retenus
+}
+
+/// [`sous_arbres_vides`] vu AVANT l'import : les pistes que la base connaît
+/// (locales et exemplaires) face à ce que le parcours a trouvé.
+///
+/// L'import d'un scan forcé relit la pochette de chaque album (`complet`) ;
+/// face à un montage imbriqué tombé, il voyait le fichier source « disparu »
+/// et retirait la pochette d'un album dont une partie des pistes vit hors du
+/// montage (suite de #5854). Il lui faut donc les sous-arbres protégés dès le
+/// départ, pas seulement à la purge.
+pub(crate) fn sous_arbres_vides_avant_import(
+    racines: &[String],
+    existants: &std::collections::HashMap<String, tune_core::db::track_repo::InfoFichier>,
+    copies: &CarteDesChemins,
+    decouverts: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let refs: Vec<&str> = existants
+        .iter()
+        .filter(|(_, info)| info.est_locale())
+        .map(|(chemin, _)| chemin.as_str())
+        .chain(copies.keys().map(String::as_str))
+        .collect();
+    sous_arbres_vides(racines, &refs, decouverts)
 }
 
 pub(crate) fn roots_gone_empty(
@@ -2078,6 +2118,12 @@ async fn spawn_library_scan_avec_lecteur(
             },
         )
         .with_force_artwork(force)
+        .avec_sous_arbres_proteges(sous_arbres_vides_avant_import(
+            &scan_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
@@ -2168,7 +2214,7 @@ async fn spawn_library_scan_avec_lecteur(
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
-                let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
+                let mut sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
                 if !is_pg {
                     // Se nommer : tout `write_tx` concurrent echouera tant que ce
                     // lot tient la connexion, et sans cette etiquette son message
@@ -2199,7 +2245,13 @@ async fn spawn_library_scan_avec_lecteur(
                     // Un écrivain (favori, édition, enrichissement…) attend que
                     // ce lot ferme sa transaction : lui céder la place entre deux
                     // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
-                    db.ceder_aux_ecrivains();
+                    // Ticket 190 : une écriture de file en attente de la porte
+                    // passe aussi (`ceder_le_lot`).
+                    crate::sqlite_write_gate::ceder_le_lot(
+                        db.as_ref(),
+                        &mut sqlite_write_guard,
+                        "scan:lot",
+                    );
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -2587,7 +2639,7 @@ async fn spawn_library_scan_avec_lecteur(
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            sous_arbres_proteges = sous_arbres_vides(&existing_refs, &discovered_paths);
+            sous_arbres_proteges = sous_arbres_vides(&scan_dirs, &existing_refs, &discovered_paths);
             let sous_arbres = &sous_arbres_proteges;
             if !sous_arbres.is_empty() {
                 tracing::error!(
@@ -2719,7 +2771,7 @@ async fn spawn_library_scan_avec_lecteur(
 
         // Backfill + album stats in a single transaction (SQLite only)
         let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
-        let sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
+        let mut sqlite_write_guard = (!is_pg).then(crate::sqlite_write_gate::scan_batch);
         if !is_pg {
             tune_core::db::tx_holder::declarer("scan:post-traitement");
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
@@ -2738,7 +2790,11 @@ async fn spawn_library_scan_avec_lecteur(
             }
             // Entre deux passes, céder la place à un écrivain qui attend la
             // fin de cette transaction (transaction_du_lot.rs).
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
@@ -2746,7 +2802,11 @@ async fn spawn_library_scan_avec_lecteur(
             ) {
                 tracing::warn!(error = %e, "post_scan_album_genres_backfill_failed");
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 &format!(
                     "UPDATE albums SET track_count = {}",
@@ -2756,7 +2816,11 @@ async fn spawn_library_scan_avec_lecteur(
             ) {
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if let Err(e) = db.execute(
                 &format!("UPDATE albums SET \
                  {}, \
@@ -2785,7 +2849,11 @@ async fn spawn_library_scan_avec_lecteur(
             // tracks; incremental scans keep the fill-only behaviour so values
             // persist between full scans. The EXISTS guard avoids nulling an
             // album genre when no track carries one.
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             if force {
                 // Pick the album genre by MAJORITY VOTE across its tracks, with a
                 // deterministic tie-break, instead of an arbitrary `LIMIT 1` track.
@@ -2821,7 +2889,11 @@ async fn spawn_library_scan_avec_lecteur(
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
                 }
             }
-            db.ceder_aux_ecrivains();
+            crate::sqlite_write_gate::ceder_le_lot(
+                db.as_ref(),
+                &mut sqlite_write_guard,
+                "scan:post-traitement",
+            );
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
             let orphan_albums = db.execute(
                 "DELETE FROM albums WHERE id IN (\
@@ -2859,6 +2931,9 @@ async fn spawn_library_scan_avec_lecteur(
         // album dont aucune piste n'a bougé n'était vu par personne.
         // « Répertoires » ne regarde que son dossier.
         let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        // Un montage IMBRIQUÉ tombé laisse sa racine répondre : `le_suivi_peut_conclure`
+        // ne le voit pas. Son sous-arbre n'a pas été vu, rien n'y est conclu.
+        let exclus_pochettes: Vec<String> = error_dirs.iter().chain(&sous_arbres_proteges).cloned().collect();
         // #5682 (fil 2115) — pas quand une racine manquait ou s'est vidée : un
         // partage pas encore monté faisait voir chaque fichier source
         // « disparu », et retirait les pochettes de pistes pourtant conservées.
@@ -2871,7 +2946,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &portee_pochettes,
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         } else if !scan_cancel_requested() {
@@ -3032,7 +3107,7 @@ async fn spawn_library_scan_avec_lecteur(
                 &db,
                 &cache_dir,
                 &[],
-                &error_dirs,
+                &exclus_pochettes,
                 force,
             );
         }
@@ -3061,6 +3136,13 @@ async fn spawn_library_scan_avec_lecteur(
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "post_scan_duplicate_albums_merge_failed"),
         }
+        // Un album réparti en dossiers frères aux noms libres, sans DISCNUMBER,
+        // et réuni sous un seul titre — par la fusion ci-dessus, ou au scan
+        // quand la séparation par dossier est coupée — avait toutes ses pistes
+        // au disque 1, numéros en double. Un disque par dossier, dans l'ordre
+        // naturel des noms, en base seulement. APRÈS la fusion des doublons,
+        // et à chaque scan : une piste relue au disque 1 reprend le sien.
+        tune_core::db::disques_par_dossier::passe_journalisee(&db, "apres_scan");
 
         // Backfill embedded cover art for local albums still missing a cover.
         // The incremental scan only extracts covers from files it re-processed;
@@ -3674,11 +3756,50 @@ pub(super) async fn library_clear(
     _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
 ) -> Json<Value> {
+    // 🔴 #5973 — sauvegarde automatique AVANT de vider.
+    //
+    // Le vidage efface les pistes, et par les `ON DELETE CASCADE` le contenu
+    // des playlists, les notes d'albums, les signets et les métadonnées ; les
+    // favoris et les étiquettes deviennent orphelins. Aucun scan ne les
+    // reconstruit (perte réelle chez un testeur, fil 2171). Le vidage lui-même
+    // est inchangé ; il est simplement précédé d'une copie de la base, dont le
+    // chemin est rendu au client.
+    //
+    // Si la copie échoue, on NE vide PAS : le client annonce une sauvegarde,
+    // vider sans elle serait mentir sur ce qui est récupérable.
+    //
+    // Pas de copie pour une base en mémoire (épreuves), ni sous PostgreSQL :
+    // la sauvegarde de fichier ne concerne que SQLite (voir `backup.rs`) ;
+    // sous PG, c'est `pg_dump` qu'il faut lancer avant de vider.
+    let backup = match state.db.as_ref() {
+        Some(db) => match tune_core::db_backup::create_safety_backup(db, "avant_vidage") {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "library_clear_refused_backup_failed");
+                return Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "automatic backup failed, the library was NOT cleared: {e}"
+                    ),
+                }));
+            }
+        },
+        _ => None,
+    };
     let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     match repo.delete_all() {
         Ok(count) => {
-            tracing::info!(tracks_deleted = count, "library_cleared");
-            Json(json!({"ok": true, "deleted": count}))
+            tracing::info!(
+                tracks_deleted = count,
+                backup = backup.as_ref().map(|b| b.path.as_str()).unwrap_or("-"),
+                "library_cleared"
+            );
+            Json(json!({
+                "ok": true,
+                "deleted": count,
+                "backup": backup,
+                "backup_path": backup.as_ref().map(|b| b.path.clone()),
+            }))
         }
         Err(e) => {
             tracing::warn!(error = %e, "library_clear_failed");
@@ -4091,7 +4212,7 @@ mod roots_gone_empty_tests {
         let trouvees: HashSet<String> = decouvertes.iter().cloned().collect();
 
         let racines_videes = roots_gone_empty(&racines, &refs, &trouvees);
-        let sous_arbres = sous_arbres_vides(&refs, &trouvees);
+        let sous_arbres = sous_arbres_vides(&racines, &refs, &trouvees);
 
         let (mut candidats, mut protegees, mut hors_perimetre) = (0usize, 0usize, 0usize);
         let examinees = en_base.len();
@@ -4308,7 +4429,7 @@ mod roots_gone_empty_tests {
         // Le garde par racine ne bronche pas :
         assert!(roots_gone_empty(&["/mnt/music".to_string()], &refs, &decouverts).is_empty());
         // Celui par sous-arbre, si :
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert!(
             v.iter()
                 .any(|d| d == "/mnt/music/nas/Jazz" || d == "/mnt/music/nas"),
@@ -4326,7 +4447,7 @@ mod roots_gone_empty_tests {
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/autre/ok.flac"]);
         assert!(
-            sous_arbres_vides(&refs, &decouverts).is_empty(),
+            sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts).is_empty(),
             "sous le seuil, on laisse nettoyer"
         );
     }
@@ -4338,11 +4459,92 @@ mod roots_gone_empty_tests {
         let chemins = perdues("/mnt/music/nas/Jazz", 200);
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/nas/Jazz/0000.flac"]);
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert!(
             !v.iter().any(|d| d == "/mnt/music/nas/Jazz"),
             "un dossier vivant ne se protege pas, obtenu {v:?}"
         );
+    }
+
+    /// La configuration du .18 au 05/10/2026 (base : `music_dirs` =
+    /// `/data/music`, `/data/recordings`, `/mnt/recordings_usb`,
+    /// `/home/bertrand/Music/DIVERS`), et un scan CIBLÉ sur
+    /// `/data/recordings/Qobuz`. Le parcours ne voit que Qobuz : tout le
+    /// reste de la base est absent de `decouverts` sans avoir été cherché.
+    fn base_du_18() -> (Vec<String>, Vec<String>) {
+        let mut en_base = perdues("/data/music/Jazz", 150);
+        en_base.extend(perdues("/data/recordings/Tidal/Album", 150));
+        en_base.extend(perdues("/mnt/recordings_usb/Rips", 150));
+        en_base.extend(perdues("/home/bertrand/Music/DIVERS", 13));
+        let qobuz = perdues("/data/recordings/Qobuz/Album", 150);
+        en_base.extend(qobuz.iter().cloned());
+        (en_base, qobuz)
+    }
+
+    #[test]
+    fn un_scan_cible_ne_declare_pas_vides_les_dossiers_qu_il_n_a_pas_parcourus() {
+        // Journal du .18, 05/10 19 h 09 : `post_scan_sous_arbre_vide
+        // dossiers=["/data/music", "/data/recordings/Tidal", "/mnt"]` après un
+        // scan ciblé sur Qobuz dont les 10 268 fichiers avaient TOUS été vus.
+        let (en_base, qobuz) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let decouverts: HashSet<String> = qobuz.into_iter().collect();
+        let cible = vec!["/data/recordings/Qobuz".to_string()];
+        let v = sous_arbres_vides(&cible, &refs, &decouverts);
+        assert!(
+            v.is_empty(),
+            "un scan ciblé ne juge que son dossier ; obtenu {v:?} — des dossiers \
+             jamais parcourus déclarés « vidés »"
+        );
+    }
+
+    #[test]
+    fn un_scan_cible_voit_encore_un_montage_imbrique_tombe_sous_sa_cible() {
+        // Le filtre ne doit pas éteindre le garde-fou là où il sert : sous la
+        // cible, un montage imbriqué qui tombe reste protégé.
+        let (en_base, qobuz) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let decouverts: HashSet<String> = qobuz.into_iter().collect();
+        let cible = vec!["/data/recordings".to_string()];
+        let v = sous_arbres_vides(&cible, &refs, &decouverts);
+        assert_eq!(v, vec!["/data/recordings/Tidal".to_string()]);
+        // Et la piste perdue y est CONSERVÉE.
+        assert_eq!(
+            verdict_purge(
+                "/data/recordings/Tidal/Album/0007.flac",
+                &cible,
+                &[],
+                &[],
+                &[],
+                &v,
+            ),
+            VerdictPurge::ProtegeIllisible
+        );
+    }
+
+    #[test]
+    fn un_dossier_protege_n_est_jamais_un_ancetre_des_racines() {
+        // Scan complet, `/mnt/recordings_usb` démonté mais point de montage
+        // lisible et vide : l'ancien code rendait `/mnt`, un dossier que
+        // personne n'a configuré.
+        let (en_base, _) = base_du_18();
+        let refs: Vec<&str> = en_base.iter().map(String::as_str).collect();
+        let racines: Vec<String> = [
+            "/data/music",
+            "/data/recordings",
+            "/mnt/recordings_usb",
+            "/home/bertrand/Music/DIVERS",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let decouverts: HashSet<String> = en_base
+            .iter()
+            .filter(|p| !p.starts_with("/mnt/"))
+            .cloned()
+            .collect();
+        let v = sous_arbres_vides(&racines, &refs, &decouverts);
+        assert_eq!(v, vec!["/mnt/recordings_usb".to_string()]);
     }
 
     #[test]
@@ -4354,7 +4556,7 @@ mod roots_gone_empty_tests {
         chemins.push("/mnt/music/local/ok.flac".to_string());
         let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
         let decouverts = set(&["/mnt/music/local/ok.flac"]);
-        let v = sous_arbres_vides(&refs, &decouverts);
+        let v = sous_arbres_vides(&["/mnt/music".to_string()], &refs, &decouverts);
         assert_eq!(v.len(), 1, "un seul ancetre attendu, obtenu {v:?}");
         assert_eq!(v[0], "/mnt/music/nas");
     }
@@ -5472,9 +5674,10 @@ mod scan_scheduler_cablage_tests {
             "témoin : le fichier lu doit être celui qui câble les passes de fond"
         );
         assert!(
-            background.contains("scan::spawn_scan_scheduler(state.clone(), config.auto_scan)"),
+            background.contains("scan::spawn_scan_scheduler(\n        state.clone(),\n        crate::auto_scan::scan_au_demarrage_voulu(config.auto_scan, &state.backend),"),
             "spawn_scan_scheduler doit être appelé depuis background.rs, en lui \
-             passant `config.auto_scan` — sans cet appel, la bascule « scan \
+             passant le scan de démarrage VOULU (réglage utilisateur, puis \
+             `config.auto_scan`) — sans cet appel, la bascule « scan \
              planifié » est sans effet (#2469)"
         );
     }
@@ -5728,3 +5931,77 @@ mod scan_delete_tests_2147;
 #[cfg(test)]
 #[path = "scan_import_progress_tests.rs"]
 mod import_progress_tests;
+
+#[cfg(test)]
+mod vidage_sauvegarde_5973 {
+    use super::library_clear;
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("AppState en mémoire")
+    }
+    /// #5973 — « Vider la bibliothèque » sauvegarde la base AVANT de vider,
+    /// et la réponse dit où.
+    ///
+    /// Contre-épreuve dans le test : la playlist a bien perdu son titre dans
+    /// la base vivante (c'est la perte du fil 2171), et la copie l'a encore.
+    #[tokio::test]
+    async fn vider_la_bibliotheque_sauvegarde_d_abord_et_rend_le_chemin() {
+        let dir = tempfile::tempdir().expect("dossier temporaire");
+        let db_path = dir.path().join("tune.db");
+        let db_path = db_path.to_str().expect("chemin utf-8").to_string();
+        let etat = AppState::new(&db_path, 0, Default::default()).expect("état");
+        etat.sqlite()
+            .expect("SQLite")
+            .execute_batch(
+                "INSERT INTO tracks (id, title, file_path) VALUES (1, 'Titre', '/m/a.flac');
+                 INSERT INTO playlists (id, name) VALUES (1, 'Ma liste');
+                 INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (1, 1, 0);",
+            )
+            .expect("données");
+
+        let Json(rep) = library_clear(crate::auth::RequireAdmin, State(etat.clone())).await;
+
+        assert_eq!(rep["ok"], true, "{rep}");
+        assert_eq!(rep["deleted"], 1, "{rep}");
+        let chemin = rep["backup_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("la réponse doit donner le chemin de la sauvegarde : {rep}"));
+        assert_eq!(rep["backup"]["path"], chemin, "{rep}");
+        assert!(
+            rep["backup"]["filename"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("_avant_vidage.db")),
+            "{rep}"
+        );
+        assert!(
+            std::path::Path::new(chemin).is_file(),
+            "la sauvegarde annoncée doit exister : {chemin}"
+        );
+        let compter = |base: &str| -> i64 {
+            rusqlite::Connection::open(base)
+                .expect("ouverture")
+                .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
+                .expect("compte")
+        };
+        assert_eq!(
+            compter(&db_path),
+            0,
+            "contre-épreuve : le vidage efface le contenu des playlists"
+        );
+        assert_eq!(
+            compter(chemin),
+            1,
+            "la sauvegarde garde le contenu des playlists"
+        );
+    }
+    /// #5973 — une base en mémoire n'a rien à sauvegarder : le vidage passe
+    /// et la réponse le dit (`backup_path: null`).
+    #[tokio::test]
+    async fn vider_une_base_en_memoire_ne_sauvegarde_rien() {
+        let Json(rep) = library_clear(crate::auth::RequireAdmin, State(etat())).await;
+        assert_eq!(rep["ok"], true, "{rep}");
+        assert!(rep["backup_path"].is_null(), "{rep}");
+    }
+}

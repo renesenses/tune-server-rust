@@ -210,10 +210,16 @@ impl StreamInfo {
     }
 }
 
+/// #5716 — ce que l'on fait du codec reconnu par la sonde d'une radio.
+pub type ObservateurDeCodec = Box<dyn FnOnce(&'static str) + Send>;
+
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
     detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
+    /// #5716 — appelé UNE fois, au premier codec de station que la sonde
+    /// reconnaît (voir [`Self::au_premier_codec_radio`]).
+    au_premier_codec: std::sync::Mutex<Option<ObservateurDeCodec>>,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Keeps the channel open until the session is removed, even after the
     /// decoder drops its tx. Without this, the HTTP stream ends as soon as
@@ -486,6 +492,29 @@ impl StreamSession {
             .detected_radio_source
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(source);
+        // #5716 — le premier codec CONNU part à l'observateur, une seule fois
+        // (une reconnexion republie la même sonde). Un format inconnu ne le
+        // consomme pas : la sonde suivante peut encore le donner.
+        if let Some(codec) = source.format {
+            let observateur = self
+                .au_premier_codec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(observateur) = observateur {
+                observateur(codec);
+            }
+        }
+    }
+
+    /// #5716 — `observateur` reçoit le codec de la station (`mp3`, `aac`,
+    /// `flac`…) dès que la sonde de décodage l'a reconnu. Il sert à retenir ce
+    /// codec dans `radio_stations`, où les stations livrées ont `codec = NULL`.
+    pub fn au_premier_codec_radio(&self, observateur: ObservateurDeCodec) {
+        *self
+            .au_premier_codec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(observateur);
     }
 
     fn effective_output_info(&self) -> StreamInfo {
@@ -531,6 +560,7 @@ impl StreamSession {
             id,
             info,
             detected_radio_source: std::sync::Mutex::new(None),
+            au_premier_codec: std::sync::Mutex::new(None),
             tx: Mutex::new(Some(tx)),
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),

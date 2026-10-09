@@ -605,3 +605,132 @@ async fn le_plafond_ferme_une_zone_morte_sur_une_piste_tres_longue() {
          devant, la zone ne reste pas ouverte indéfiniment"
     );
 }
+
+// ─────────── 4. fil 2125 (#5711) — l'horloge EFFACÉE ne tranche rien ───────────
+
+/// Durée d'arrêt du fil 2125 au moment des `flux_servi_en_entier_zone_non_coupee`
+/// relevés : bien au-delà de la borne plate de #4480 (120 s), bien en deçà du
+/// plafond de l'horloge (600 s). C'est la fenêtre où la zone morte restait
+/// « en lecture » à tort.
+const ARRET_FIL_2125_S: u64 = 300;
+
+#[test]
+fn une_horloge_de_piste_effacee_n_est_pas_une_horloge_a_zero_2125() {
+    assert!(
+        !decisions::horloge_de_piste_connue(None),
+        "`track_started_at` à `None` : l'horloge est inconnue, pas à zéro"
+    );
+    assert!(decisions::horloge_de_piste_connue(Some(Instant::now())));
+    let branche = branche_du_seuil_d_echec();
+    assert!(
+        branche.contains("decisions::horloge_de_piste_connue(ps.track_started_at)"),
+        "le bras doit vérifier que l'horloge de piste est connue avant de lui \
+         accorder la patience de #4661 (fil 2125)"
+    );
+}
+
+/// Fil 2125 — le fichier est chez le renderer EN ENTIER, le renderer s'est tu,
+/// et un bras gapless a EFFACÉ l'horloge de la piste. Avant le correctif,
+/// `wall_elapsed` valait 0, « toute la piste reste à jouer », et la zone
+/// restait en lecture jusqu'à 600 s d'arrêt. Elle doit être coupée par la
+/// borne ordinaire.
+#[tokio::test]
+async fn une_horloge_effacee_ne_garde_pas_une_zone_morte_2125() {
+    let mut b = Banc::scene(WALL_A_LA_COUPURE_4480_S, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.polls
+        .get_mut(&b.zone)
+        .expect("la zone du banc")
+        .track_started_at = None;
+    b.arret_de(ARRET_FIL_2125_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Stopped,
+        "horloge de piste effacée : rien ne prouve qu'il reste de la musique, \
+         la zone morte doit être coupée au lieu d'attendre le plafond de 600 s"
+    );
+}
+
+/// Témoin du banc précédent : MÊME scène, MÊME arrêt, seule l'horloge est
+/// connue (et loin de la fin). L'épargne de #4661 tient toujours — c'est donc
+/// bien l'horloge effacée, et elle seule, qui fait couper ci-dessus.
+#[tokio::test]
+async fn une_horloge_connue_garde_toujours_la_zone_2125() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.arret_de(ARRET_FIL_2125_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Playing,
+        "horloge connue à 100 s sur une piste de 281 s, fichier servi en \
+         entier : l'épargne de #4661 doit tenir"
+    );
+}
+
+// ─── 5. ticket 190 — un renderer qui sait rapporter sa position, resté à 0 ───
+
+/// Arrêt de l'ordre de celui du ticket 190 : au-delà du plancher de 30 s, en
+/// deçà des deux patiences.
+const ARRET_TICKET_190_S: u64 = 58;
+
+impl Banc {
+    /// Le renderer de la zone a déjà rapporté une position non nulle (la
+    /// preuve de #5522, posée par le bras `Playing` du sondeur).
+    fn renderer_prouve(&self) {
+        self.poller
+            .zones_a_position_prouvee
+            .lock()
+            .expect("verrou des zones prouvées")
+            .insert(self.zone);
+    }
+}
+
+#[test]
+fn a_l_arret_sans_avoir_joue_exige_la_preuve_et_une_position_nulle_190() {
+    assert!(decisions::renderer_a_l_arret_sans_avoir_joue(0, true));
+    assert!(
+        !decisions::renderer_a_l_arret_sans_avoir_joue(0, false),
+        "un renderer qui n'a jamais rapporté de position (le LHC de #4661) \
+         garde ses patiences"
+    );
+    assert!(!decisions::renderer_a_l_arret_sans_avoir_joue(1, true));
+}
+
+/// Ticket 190 — le fichier est servi en entier, l'horloge est CONNUE (et loin
+/// de la fin de la piste), le renderer a prouvé sur cette zone qu'il
+/// rapporte sa position, et il s'est dit arrêté sans avoir quitté 0. Rien ne
+/// sort de son tampon : la zone doit être coupée par la borne ordinaire, pas
+/// tenue « en lecture » jusqu'à la fin nominale de la piste.
+#[tokio::test]
+async fn un_renderer_prouve_reste_a_zero_ne_garde_pas_la_zone_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.renderer_prouve();
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Stopped,
+        "renderer qui rapporte sa position, resté à 0 puis arrêté : il n'a \
+         rien joué, la zone ne doit pas attendre la fin de la piste"
+    );
+}
+
+/// Témoin : MÊME scène, MÊME arrêt, renderer NON prouvé (il peut rendre 0 en
+/// permanence en jouant). L'épargne de #4661 tient.
+#[tokio::test]
+async fn un_renderer_non_prouve_garde_la_patience_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(b.etat().await, PlayState::Playing);
+}
+
+/// Témoin : renderer prouvé qui a JOUÉ cette piste (30 s atteintes), puis
+/// s'est dit arrêté. Sa musique peut encore sortir du tampon : l'épargne tient.
+#[tokio::test]
+async fn un_renderer_prouve_qui_a_joue_garde_la_patience_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.renderer_prouve();
+    b.polls
+        .get_mut(&b.zone)
+        .expect("la zone du banc")
+        .peak_position_ms = 30_000;
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(b.etat().await, PlayState::Playing);
+}

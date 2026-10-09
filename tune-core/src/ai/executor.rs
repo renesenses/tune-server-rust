@@ -115,6 +115,7 @@ impl ToolExecutor {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         // Queue remaining tracks
@@ -170,6 +171,7 @@ impl ToolExecutor {
             media_format: None,
             track_number: None,
             disc_number: None,
+            album_ref: None,
         };
 
         match self.orchestrator.play(req).await {
@@ -266,6 +268,11 @@ impl ToolExecutor {
     }
 
     async fn pause(&self) -> Value {
+        info!(
+            zone_id = self.zone_id,
+            origine = "assistant",
+            "pause_requested"
+        );
         let device_id = self.get_zone_device_id();
         match self
             .orchestrator
@@ -278,6 +285,11 @@ impl ToolExecutor {
     }
 
     async fn resume(&self) -> Value {
+        info!(
+            zone_id = self.zone_id,
+            origine = "assistant",
+            "resume_requested"
+        );
         let device_id = self.get_zone_device_id();
         match self
             .orchestrator

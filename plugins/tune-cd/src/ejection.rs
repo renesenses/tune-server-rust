@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::fournisseur::SOURCE;
 use crate::hote::HoteLecture;
@@ -30,6 +30,9 @@ pub struct Surveillant {
     /// #5065 — la source `cd` du registre commun, remise à jour à chaque
     /// changement de présence (insertion, éjection, lecteur débranché).
     publication: Option<Arc<PublicationSource>>,
+    /// Fil 2135 — l'éjection commandée (`POST /ejecter`) réveille la boucle :
+    /// la source passe à `vide` sans attendre la fin de l'intervalle.
+    reveil: Arc<Notify>,
 }
 
 impl Surveillant {
@@ -45,7 +48,13 @@ impl Surveillant {
             derniere: None,
             derniere_generation: None,
             publication: None,
+            reveil: Arc::default(),
         }
+    }
+
+    pub fn avec_reveil(mut self, reveil: Arc<Notify>) -> Self {
+        self.reveil = reveil;
+        self
     }
 
     pub fn avec_publication(mut self, publication: Arc<PublicationSource>) -> Self {
@@ -87,7 +96,8 @@ impl Surveillant {
     }
 
     /// La boucle de production : une seconde entre deux tours tant qu'une
-    /// zone joue le disque, trois sinon (seule l'insertion est alors à voir).
+    /// zone joue le disque, trois sinon (seule l'insertion est alors à voir),
+    /// ou aussitôt réveillée par une éjection commandée.
     pub async fn tourner(mut self) {
         loop {
             self.un_tour().await;
@@ -96,7 +106,10 @@ impl Surveillant {
             } else {
                 1
             };
-            tokio::time::sleep(Duration::from_secs(rythme)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(rythme)) => {}
+                _ = self.reveil.notified() => {}
+            }
         }
     }
 }

@@ -95,7 +95,11 @@ async fn le_releve_au_repos_porte_tous_ses_compteurs() {
         "traites",
         "identifies",
         "sans_correspondance",
+        // #4805 D — les albums auxquels aucun pressage sûr ne correspond.
+        "ambigus",
         "pistes_identifiees",
+        // #4805 D — les albums posés sans enregistrements (garde des titres).
+        "albums_sans_enregistrements",
     ] {
         assert_eq!(
             body[cle].as_i64(),

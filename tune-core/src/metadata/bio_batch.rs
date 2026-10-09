@@ -586,7 +586,7 @@ pub async fn batch_enrich_artist_bios_scoped(
     lang: &str,
     scope: Option<crate::metadata::enrich_scope::EnrichScope>,
 ) {
-    let lang = if lang.is_empty() { "fr" } else { lang };
+    let lang = if lang.is_empty() { "en" } else { lang };
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
     let mut artists = match artist_repo.list_without_bio() {
         Ok(a) => a,
@@ -743,7 +743,7 @@ pub async fn batch_enrich_album_bios_scoped(
     lang: &str,
     scope: Option<crate::metadata::enrich_scope::EnrichScope>,
 ) {
-    let lang = if lang.is_empty() { "fr" } else { lang };
+    let lang = if lang.is_empty() { "en" } else { lang };
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let mut albums = match album_repo.list_without_bio() {
         Ok(a) => a,

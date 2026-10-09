@@ -701,7 +701,12 @@ pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     for size in ["front-1200", "front-500"] {
         let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
         crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-        let Ok(resp) = client.get(&url).send().await else {
+        let Ok(resp) = client
+            .get(&url)
+            .send()
+            .await
+            .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        else {
             continue;
         };
         if resp.status().is_success() {
@@ -736,7 +741,12 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         .build()
         .ok()?;
     crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -769,7 +779,12 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         .build()
         .ok()?;
     crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1219,7 +1234,12 @@ async fn fetch_artist_image_musicbrainz_full(
 ) -> Option<Vec<u8>> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
     crate::http::fetch::MUSICBRAINZ.acquire("mb").await;
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .inspect(crate::metadata::musicbrainz_release::constater_reponse_musicbrainz)
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }

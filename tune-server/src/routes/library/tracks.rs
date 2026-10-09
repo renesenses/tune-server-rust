@@ -320,6 +320,95 @@ pub(super) struct TrackFilterQuery {
     /// Facette Collections : nom d'une collection manuelle ou intelligente.
     /// MONOVALUÉE — voir `TrackFilter::collection_ids`.
     pub collection: Option<String>,
+    /// tune-web-client#1716 — la PAGE TRIÉE de l'onglet Titres. Ces cinq
+    /// paramètres sont nouveaux : sans aucun d'eux, la réponse est celle
+    /// d'avant, au champ près (voir [`PageTriee::depuis`]).
+    ///
+    /// Clé de colonne du tableau (`title`, `artist`, `time`…), voir
+    /// `tune_core::db::track_repo::COLONNES_TRIABLES`.
+    pub sort: Option<String>,
+    /// `asc` (défaut) ou `desc`.
+    pub order: Option<String>,
+    /// Recherche de l'onglet Titres : titre OU artiste (≠ `q`, le texte
+    /// libre d'Oxygen).
+    pub search: Option<String>,
+    /// Clé de provenance : `local`, `upnp`, `upnp:<UDN>`, `qobuz`…
+    pub provenance: Option<String>,
+    /// `sources` : rendre aussi les comptes par provenance.
+    pub counts: Option<String>,
+}
+
+/// Ce que les paramètres de la page triée demandent, validé.
+struct PageTriee {
+    tri: Option<tune_core::db::track_repo::ColonneDeTri>,
+    descendant: bool,
+    recherche: Option<String>,
+    provenance: Option<String>,
+    avec_comptes: bool,
+}
+
+impl PageTriee {
+    /// `Ok(None)` quand AUCUN des nouveaux paramètres n'est posé : la route
+    /// suit alors son chemin d'avant, inchangé — c'est la promesse faite aux
+    /// anciens clients. Une valeur posée mais invalide rend 400, jamais
+    /// « paramètre ignoré » : un tri ignoré afficherait un ordre que l'en-tête
+    /// ne dit pas.
+    fn depuis(p: &TrackFilterQuery) -> Result<Option<Self>, AppError> {
+        let posee = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (sort, order, search, provenance, counts) = (
+            posee(&p.sort),
+            posee(&p.order),
+            posee(&p.search),
+            posee(&p.provenance),
+            posee(&p.counts),
+        );
+        if sort.is_none()
+            && order.is_none()
+            && search.is_none()
+            && provenance.is_none()
+            && counts.is_none()
+        {
+            return Ok(None);
+        }
+        let tri = match sort.as_deref() {
+            None => None,
+            Some(cle) => Some(
+                tune_core::db::track_repo::ColonneDeTri::depuis_cle(cle).ok_or_else(|| {
+                    AppError::bad_request(format!("parametre `sort` : colonne inconnue `{cle}`"))
+                })?,
+            ),
+        };
+        let descendant = match order.as_deref() {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(_) => {
+                return Err(AppError::bad_request(
+                    "parametre `order` : `asc` ou `desc` attendu",
+                ));
+            }
+        };
+        let avec_comptes = match counts.as_deref() {
+            None => false,
+            Some("sources") => true,
+            Some(_) => {
+                return Err(AppError::bad_request(
+                    "parametre `counts` : `sources` attendu",
+                ));
+            }
+        };
+        Ok(Some(Self {
+            tri,
+            descendant,
+            recherche: search,
+            provenance,
+            avec_comptes,
+        }))
+    }
 }
 
 pub(super) async fn list_tracks(
@@ -332,6 +421,7 @@ pub(super) async fn list_tracks(
     // se lit dans la chaîne BRUTE, que `serde_urlencoded` ne sait pas agréger —
     // et qu'il refuse même en double.
     let filter = track_filter_from_raw(raw.as_deref())?;
+    let page_triee = PageTriee::depuis(&p)?;
     // #5138 — TOUTES les lectures de cette route sont synchrones (rusqlite).
     // Posées sur un fil de l'exécuteur, les 7 à 9,7 s de la liste et du
     // compteur chez JeromeQ gelaient ce fil pour tout le reste du serveur :
@@ -340,8 +430,10 @@ pub(super) async fn list_tracks(
     // bloquants, comme la grille d'albums depuis #4800.
     let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
     let profile_id = profile.id();
-    match tokio::task::spawn_blocking(move || lire_la_page_de_pistes(&state, profile_id, p, filter))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        lire_la_page_de_pistes(&state, profile_id, p, filter, page_triee)
+    })
+    .await
     {
         Ok(corps) => Ok(Json(corps)),
         Err(e) => {
@@ -359,6 +451,7 @@ fn lire_la_page_de_pistes(
     profile_id: i64,
     p: TrackFilterQuery,
     mut filter: tune_core::db::facet_filter::TrackFilter,
+    page_triee: Option<PageTriee>,
 ) -> Value {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
@@ -382,6 +475,13 @@ fn lire_la_page_de_pistes(
 
     filter.collection_ids = scope.albums;
     filter.collection_track_ids = scope.tracks;
+
+    // tune-web-client#1716 — la page triée de l'onglet Titres. Elle ne
+    // s'ouvre QUE sur l'un des nouveaux paramètres : un ancien client ne les
+    // envoie pas et retrouve plus bas exactement la réponse d'avant.
+    if let Some(pt) = page_triee {
+        return lire_la_page_triee(state, profile_id, &repo, filter, pt, limit, offset);
+    }
 
     // ⚠️ `is_active()` doit rester le MIROIR EXACT des prédicats que
     // `list_filtered` va produire. S'il rend `true` sans qu'aucun prédicat ne
@@ -423,6 +523,58 @@ fn lire_la_page_de_pistes(
         };
         let items = joindre_dr_par_piste(state, profile_id, items);
         json!({"items": items, "total": total, "limit": limit, "offset": offset})
+    }
+}
+
+/// La page triée (tune-web-client#1716) : les champs d'avant (`items`,
+/// `total`, `limit`, `offset`), plus `sort` et `order` — l'ordre réellement
+/// appliqué, que le client lit aussi pour reconnaître un serveur qui sait
+/// paginer —, et sur `counts=sources` les comptes par provenance.
+fn lire_la_page_triee(
+    state: &AppState,
+    profile_id: i64,
+    repo: &TrackRepo,
+    filtre: tune_core::db::facet_filter::TrackFilter,
+    pt: PageTriee,
+    limit: i64,
+    offset: i64,
+) -> Value {
+    let demande = tune_core::db::track_repo::DemandeDePistes {
+        filtre,
+        recherche: pt.recherche,
+        provenance: pt.provenance,
+        tri: pt.tri,
+        descendant: pt.descendant,
+        limit,
+        offset,
+        avec_comptes: pt.avec_comptes,
+    };
+    let sort = pt.tri.map(|c| c.cle());
+    let order = if pt.descendant { "desc" } else { "asc" };
+    match repo.page_de_pistes(&demande) {
+        Ok(page) => {
+            let items = joindre_dr_par_piste(state, profile_id, page.pistes);
+            let mut corps = json!({
+                "items": items,
+                "total": page.total,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+                "order": order,
+            });
+            if let Some(c) = page.comptes {
+                let comptes: serde_json::Map<String, Value> =
+                    c.comptes.into_iter().map(|(k, n)| (k, json!(n))).collect();
+                corps["source_counts"] = Value::Object(comptes);
+                corps["total_all_sources"] = json!(c.total);
+            }
+            corps
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "list_tracks_page_triee_echec");
+            json!({"items": [], "total": 0, "limit": limit, "offset": offset,
+                   "sort": sort, "order": order})
+        }
     }
 }
 
@@ -663,6 +815,22 @@ pub(super) async fn stream_track_audio(
             Json(json!({
                 "error": "format_not_playable",
                 "message": motif,
+            })),
+        )
+            .into_response();
+    }
+    // #4378 — cette route sert le fichier TEL QUEL, et c'est l'URL que le
+    // serveur média UPnP publie à tout point de contrôle tiers. Un DSDIFF
+    // compressé DST n'y est pas du DSD : un renderer qui en lirait les trames
+    // comme des bits DSD rendrait du bruit. Refus nommé, comme l'ISO SACD ;
+    // les zones de Tune, elles, le décodent.
+    if !dans_une_image && tune_core::audio::dff::est_un_dff_dst(&file_path) {
+        tracing::info!(track_id = id, "track_audio_dst_jamais_servi_brut");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "format_not_playable",
+                "message": tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT,
             })),
         )
             .into_response();
@@ -918,6 +1086,32 @@ pub(super) async fn rescan_track(
         }
         None => (StatusCode::INTERNAL_SERVER_ERROR, "failed to read metadata").into_response(),
     }
+}
+
+/// `GET /library/tracks/{id}/tenues` — les champs de la piste corrigés à la
+/// main, que les analyses ne défont pas (`tune_core::db::champs_tenus`).
+pub(super) async fn champs_tenus_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let t = tune_core::db::champs_tenus::de_la_piste(&state.backend, id);
+    Json(json!({
+        "track_id": id,
+        "fields": t.as_ref().map(|t| t.noms()).unwrap_or_default(),
+    }))
+}
+
+/// `DELETE /library/tracks/{id}/tenues` — « Rétablir depuis le fichier » : la
+/// piste oublie ses champs tenus et relit tout de suite les balises de son
+/// fichier (même relecture que `POST …/rescan`).
+pub(super) async fn champs_tenus_retablir(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if let Err(e) = tune_core::db::champs_tenus::retablir(&state.backend, id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    rescan_track(State(state), Path(id)).await.into_response()
 }
 
 pub(super) async fn quick_fav_track(
@@ -1185,9 +1379,11 @@ pub(super) async fn identify_track(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    let api_key = match state.config.acoustid_api_key.as_deref() {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => {
+    // La même clé que la passe de lot (#4805) : le réglage en base, sinon la
+    // configuration.
+    let api_key = match super::identification_lot::acoustid::cle_acoustid(&state) {
+        Some(k) => k,
+        None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"})),
@@ -1575,7 +1771,12 @@ pub(super) async fn track_metadata_get(
 
     let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     match repo.get_all(id) {
-        Ok(meta) => Json(json!(meta)).into_response(),
+        Ok(mut meta) => {
+            // Mémoire interne des champs tenus, pas une balise : elle a sa
+            // route (`…/tenues`).
+            meta.remove(tune_core::db::champs_tenus::CLE);
+            Json(json!(meta)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1604,9 +1805,13 @@ pub(super) async fn track_metadata_put(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    // Write tags to file (best-effort, don't fail the request)
+    // Write tags to file (best-effort, don't fail the request) — seulement si
+    // « Écrire les modifications dans les fichiers audio » est coché
+    // (désactivé par défaut) : sinon la base seule est modifiée.
+    let ecrire_fichier = crate::routes::ecriture_fichiers::autorisee(&state);
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path
+    if ecrire_fichier
+        && let Some(ref path) = file_path
         && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
     {
         tracing::warn!(
@@ -1618,7 +1823,11 @@ pub(super) async fn track_metadata_put(
         file_write_error = Some(e);
     }
 
-    let mut resp = json!({"status": "ok", "fields": body.len()});
+    let mut resp = json!({
+        "status": "ok",
+        "fields": body.len(),
+        crate::routes::ecriture_fichiers::CHAMP_REPONSE: ecrire_fichier,
+    });
     if let Some(err) = file_write_error {
         resp["file_write_warning"] = json!(err);
     }
@@ -3196,6 +3405,59 @@ mod contrat_dlna_de_la_route_audio_3579 {
             .await
             .expect("corps");
         assert_eq!(&octets[..], b"0123456789");
+    }
+
+    /// Une piste dont le fichier est une copie d'un échantillon DSD du dépôt.
+    fn piste_dff(fixture: &str) -> (AppState, i64, tempfile::TempDir) {
+        let (state, id, dir) = piste("dff", "dff", 2_822_400, 1);
+        std::fs::copy(
+            format!(
+                "{}/../tune-core/tests/fixtures/dsd/{fixture}",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            dir.path().join("piste.dff"),
+        )
+        .expect("copie de l'échantillon DSD");
+        (state, id, dir)
+    }
+
+    /// 🔴 #4378 — un point de contrôle tiers qui pousse l'URL du serveur
+    /// média vers un renderer ne lui fait JAMAIS lire un DSDIFF DST brut.
+    /// Jumeau : le DFF en DSD non compressé, lui, part tel quel.
+    #[tokio::test]
+    async fn un_dff_dst_n_est_jamais_servi_brut() {
+        let (state, id, _dir) = piste_dff("ref_dsd64_stereo.dff");
+        let reponse = par_la_route(&state, id, "GET", &[]).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::OK,
+            "jumeau : un DFF en DSD brut se sert tel quel"
+        );
+
+        let (state, id, _dir) = piste_dff("dst_fate_dsd64_stereo.dff");
+        for methode in ["GET", "HEAD"] {
+            let reponse = par_la_route(&state, id, methode, &[]).await;
+            assert_eq!(
+                reponse.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{methode} : un DSDIFF DST ne doit pas partir brut vers un renderer"
+            );
+            let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .expect("corps");
+            assert!(
+                !octets.starts_with(b"FRM8"),
+                "{methode} : le corps est le fichier DST lui-même"
+            );
+            if methode == "GET" {
+                let corps: serde_json::Value = serde_json::from_slice(&octets).expect("JSON");
+                assert_eq!(corps["error"], "format_not_playable");
+                assert_eq!(
+                    corps["message"],
+                    tune_core::audio::dff::MOTIF_DST_JAMAIS_BRUT
+                );
+            }
+        }
     }
 }
 

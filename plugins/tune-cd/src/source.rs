@@ -239,6 +239,8 @@ mod tests {
             hote: hote.clone(),
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
+            reveil: Arc::default(),
+            extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
         let mut s = Surveillant::new(lecteur.clone(), hote.clone(), routes.zones.clone())
@@ -305,6 +307,7 @@ mod tests {
             backend: orch.db.clone(),
             orchestrator: orch.clone(),
             playback: orch.playback.clone(),
+            scan: None,
         });
         tune_core::plugin_sdk::TunePlugin::teardown(&mut greffon)
             .await
@@ -336,6 +339,8 @@ mod tests {
             hote: hote.clone(),
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
+            reveil: Arc::default(),
+            extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
         publication.publier_sans_lecteur();
@@ -379,6 +384,63 @@ mod tests {
         assert_eq!(changements(&mut rx), 1);
     }
 
+    /// Fil 2135 — de bout en bout : la surveillance de PRODUCTION
+    /// (`tourner`) a publié le disque ; `POST /ejecter` l'éjecte et la
+    /// réveille, si bien que la source passe à `vide` et que
+    /// `sources.changed` part aussitôt — bien avant les 3 s de son intervalle
+    /// sans lecture.
+    #[tokio::test]
+    async fn l_ejection_commandee_publie_la_source_vide_aussitot() {
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        let registre = Arc::new(RegistreSources::new());
+        registre.brancher_bus(bus);
+        let lecteur = Arc::new(LecteurSimule::new(toc_du_vecteur()));
+        let hote = Arc::new(HoteTemoin::default());
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+            reveil: Arc::default(),
+            extraction: None,
+        };
+        let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
+        let s = Surveillant::new(lecteur.clone(), hote, routes.zones.clone())
+            .avec_publication(publication)
+            .avec_reveil(routes.reveil.clone());
+        let boucle = tokio::spawn(s.tourner());
+
+        async fn attendre(
+            rx: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+        ) {
+            while rx.recv().await.unwrap().event_type != "sources.changed" {}
+        }
+        tokio::time::timeout(Duration::from_secs(2), attendre(&mut rx))
+            .await
+            .expect("premier tour : le disque publié");
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Disque);
+
+        let rep = crate::routes::router(routes)
+            .oneshot(
+                axum::http::Request::post("/ejecter")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(Duration::from_millis(1_500), attendre(&mut rx))
+            .await
+            .expect("sources.changed dès l'éjection, sans attendre l'intervalle");
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Vide);
+        assert_eq!(lecteur.ejections(), 1);
+        boucle.abort();
+    }
+
     /// Sans lecteur, la source est TOUJOURS listée (#5065, étape 3) :
     /// `non_pris_en_charge` si la plateforme n'a pas d'implémentation,
     /// `indisponible` sinon — jamais absente, et jamais jouable.
@@ -390,6 +452,8 @@ mod tests {
             hote: Arc::new(HoteTemoin::default()),
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
+            reveil: Arc::default(),
+            extraction: None,
         };
         PublicationSource::new(registre.clone(), &routes).publier_sans_lecteur();
         let l = registre.lister();

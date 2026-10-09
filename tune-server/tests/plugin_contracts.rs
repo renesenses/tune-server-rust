@@ -95,11 +95,11 @@ mod cd_catalogue_4863;
 #[cfg(feature = "cd")]
 #[path = "sources_physiques_5065.rs"]
 mod sources_physiques_5065;
-// #5051 — le greffon `entree-audio` hors catalogue (feature `entree-audio`,
-// dans `default`).
+// #5051 / #5296 — le greffon `entree-audio` au catalogue (feature
+// `entree-audio`, dans `default`) : proposé, installé par la route, actif.
 #[cfg(feature = "entree-audio")]
-#[path = "entree_audio_hors_catalogue_5051.rs"]
-mod entree_audio_hors_catalogue_5051;
+#[path = "entree_audio_catalogue_5296.rs"]
+mod entree_audio_catalogue_5296;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une

@@ -233,8 +233,8 @@ impl Banc {
     /// position demandée, puis `update_queue_info` avec le nouveau total.
     pub(super) async fn lire_ensuite(&self, indice_piste: usize, position: i64) {
         let depot = PlayQueueRepo::with_backend(self.db.clone());
-        depot
-            .insert_at(
+        let bilan = depot
+            .insert_at_bilan(
                 self.zone_id,
                 &[QueueInput::Local {
                     track_id: self.pistes[indice_piste],
@@ -244,6 +244,9 @@ impl Banc {
             .unwrap();
         let total = depot.count_all(self.zone_id).unwrap();
         let courante = self.playback.get_state(self.zone_id).await.queue_position;
+        // #5770 — comme la route : une insertion avant la piste en cours
+        // décale le curseur.
+        let courante = bilan.curseur_apres(courante, total - bilan.inserted() as i64);
         self.playback
             .update_queue_info(self.zone_id, courante, total)
             .await;
@@ -633,4 +636,51 @@ fn le_predicat_ne_conclut_rien_sans_les_deux_identifiants() {
     // absence — un « périmé » de trop fait payer un blanc à qui n'a rien
     // demandé.
     assert!(!decisions::gapless_arm_outdated(Some(7), None));
+}
+
+/// #5770 — « Lire à partir d'ici » remet les titres PRÉCÉDENTS en tête de
+/// file (`position: 0`) pendant que la piste cliquée joue, ici en pleine
+/// fenêtre d'armement.
+///
+/// Le curseur doit suivre la piste en cours. Sans quoi il désigne la ligne
+/// insérée : la « suivante » devient la piste en cours elle-même, le poller
+/// désarme la bonne piste et réarme celle qui joue — et « Précédent »
+/// rejoue la piste en cours au lieu de reculer.
+#[tokio::test]
+async fn insertion_avant_la_piste_en_cours_le_curseur_la_suit() {
+    let mut banc = Banc::monter().await;
+    banc.a(275_000).await;
+    banc.tic().await;
+    assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+
+    banc.lire_ensuite(3, 0).await;
+    assert_eq!(
+        banc.file_affichee().await,
+        vec![
+            INSEREE.to_string(),
+            COURANTE.to_string(),
+            ARMEE.to_string(),
+            SUITE.to_string()
+        ],
+        "l'insérée doit prendre la tête de file"
+    );
+    assert_eq!(
+        banc.ecran().await,
+        (1, COURANTE.to_string()),
+        "le curseur doit suivre la piste en cours, décalée d'un rang"
+    );
+
+    banc.a(276_000).await;
+    banc.tic().await;
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string()],
+        "la suivante n'a pas changé : rien à réarmer, et surtout pas la piste \
+         en cours"
+    );
+
+    banc.le_renderer_enchaine().await;
+    banc.tic().await;
+    assert_eq!(banc.ecran().await, (2, ARMEE.to_string()));
+    assert_eq!(banc.joue_par_le_renderer().await.as_deref(), Some(ARMEE));
 }

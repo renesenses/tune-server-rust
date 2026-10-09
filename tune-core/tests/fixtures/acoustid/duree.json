@@ -1,0 +1,156 @@
+{
+ "album": {
+  "titre": "Grand Large",
+  "artiste": "Les Vents Contraires"
+ },
+ "pistes": [
+  {
+   "track_id": 301,
+   "titre": "Grand Large",
+   "artiste": "Les Vents Contraires",
+   "duree_s": 201,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000024",
+      "score": 0.97,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000021",
+        "title": "Grand Large",
+        "duration": 412,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000001c",
+          "name": "Les Vents Contraires"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000001f",
+          "title": "Grand Large (version longue)",
+          "type": "Single",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-000000000020",
+            "country": "FR",
+            "date": {
+             "year": 2019
+            },
+            "medium_count": 1,
+            "track_count": 1,
+            "title": "Grand Large (version longue)"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "id": "a0c00000-0000-4000-8000-000000000025",
+      "score": 0.61,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000022",
+        "title": "Grand Large",
+        "duration": 203,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000001c",
+          "name": "Les Vents Contraires"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000001d",
+          "title": "Grand Large",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000001e",
+            "country": "FR",
+            "date": {
+             "year": 2018,
+             "month": 6,
+             "day": 1
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Grand Large"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-301"
+  },
+  {
+   "track_id": 302,
+   "titre": "Marée basse",
+   "artiste": "Les Vents Contraires",
+   "duree_s": 187,
+   "reponse": {
+    "status": "ok",
+    "results": [
+     {
+      "id": "a0c00000-0000-4000-8000-000000000026",
+      "score": 0.93,
+      "recordings": [
+       {
+        "id": "5ec00000-0000-4000-8000-000000000023",
+        "title": "Marée basse",
+        "duration": 186,
+        "artists": [
+         {
+          "id": "a7a00000-0000-4000-8000-00000000001c",
+          "name": "Les Vents Contraires"
+         }
+        ],
+        "releasegroups": [
+         {
+          "id": "96a00000-0000-4000-8000-00000000001d",
+          "title": "Grand Large",
+          "type": "Album",
+          "releases": [
+           {
+            "id": "7e100000-0000-4000-8000-00000000001e",
+            "country": "FR",
+            "date": {
+             "year": 2018,
+             "month": 6,
+             "day": 1
+            },
+            "medium_count": 1,
+            "track_count": 2,
+            "title": "Grand Large"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "empreinte": "AQAD-fixture-302"
+  }
+ ],
+ "attendu": {
+  "release_id": "7e100000-0000-4000-8000-00000000001e",
+  "release_group_id": "96a00000-0000-4000-8000-00000000001d",
+  "enregistrements": {
+   "301": "5ec00000-0000-4000-8000-000000000022",
+   "302": "5ec00000-0000-4000-8000-000000000023"
+  }
+ },
+ "verite": {
+  "301": "5ec00000-0000-4000-8000-000000000022",
+  "302": "5ec00000-0000-4000-8000-000000000023"
+ }
+}

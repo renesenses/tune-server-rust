@@ -957,13 +957,46 @@ fn schema_incomplet(e: &str) -> bool {
 fn cles_de_zone(id: i64) -> (String, [String; 4]) {
     (
         format!("zone_{id}_"),
-        [
-            format!("dac_profile_{id}"),
-            format!("room_profile_{id}"),
-            format!("ir_path_{id}"),
-            format!("upnp_renderer_udn_{id}"),
-        ],
+        CLES_DE_ZONE_SUFFIXEES.map(|prefixe| format!("{prefixe}{id}")),
     )
+}
+
+/// Les quatre clés de zone qui portent l'identifiant en SUFFIXE (voir
+/// [`cles_de_zone`]). Une seule liste, lue par le report des doublons et par
+/// l'export de configuration.
+const CLES_DE_ZONE_SUFFIXEES: [&str; 4] = [
+    "dac_profile_",
+    "room_profile_",
+    "ir_path_",
+    "upnp_renderer_udn_",
+];
+
+/// Le gabarit d'un réglage de zone rangé dans `settings` : l'identifiant de
+/// la zone et la clé où il est remplacé par `{id}` (`zone_7_crossfeed` →
+/// `(7, "zone_{id}_crossfeed")`, `dac_profile_7` → `(7, "dac_profile_{id}")`).
+/// `None` pour une clé qui n'appartient à aucune zone — `zone_groups`,
+/// `zone_auto_create` ou `room_profile_index` ne portent pas d'identifiant.
+///
+/// C'est ce qui permet à l'export de configuration de rattacher ces réglages
+/// à leur zone plutôt qu'à un numéro, qui ne désigne pas la même zone d'une
+/// machine à l'autre.
+pub fn gabarit_de_cle_de_zone(cle: &str) -> Option<(i64, String)> {
+    let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(reste) = cle.strip_prefix("zone_")
+        && let Some((id, quoi)) = reste.split_once('_')
+        && chiffres(id)
+        && !quoi.is_empty()
+    {
+        return Some((id.parse().ok()?, format!("zone_{{id}}_{quoi}")));
+    }
+    for prefixe in CLES_DE_ZONE_SUFFIXEES {
+        if let Some(id) = cle.strip_prefix(prefixe)
+            && chiffres(id)
+        {
+            return Some((id.parse().ok()?, format!("{prefixe}{{id}}")));
+        }
+    }
+    None
 }
 
 /// Reporte sur `cible` les réglages `settings` de `doublon` qu'elle n'a pas
@@ -1130,7 +1163,11 @@ impl ZoneRepo {
         // get_by_device_id) does NOT help here: the row exists, only the field is
         // stale, so the fallback never triggers. Mirror list()'s unconditional
         // strong read. A single zone by id is a tiny query.
-        let rows = self.db.query_many_strong(&sql, &params)?;
+        //
+        // #5871 — forte quand l'écrivain est libre, par le pool quand un
+        // autre fil le tient : une PATCH validée y est visible, et la
+        // préparation d'une lecture ne fait plus la queue derrière un scan.
+        let rows = self.db.query_many_frais(&sql, &params)?;
         Ok(rows.first().map(row_to_zone))
     }
 

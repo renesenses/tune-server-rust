@@ -192,8 +192,6 @@ dependencies = [
 [[package]]
 name = "asio-sys"
 version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "826194e1612938c9be09b78b58323fbb2e326de3d491b4230186cf6e832d8ded"
 dependencies = [
  "bindgen",
  "cc",
@@ -5263,14 +5261,18 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "libc",
+ "lofty",
  "reqwest",
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
  "tune-core",
+ "tune-http-types",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
@@ -5633,6 +5635,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "tune-bandcamp",
@@ -5678,10 +5681,12 @@ name = "tune-stream-http"
 version = "1.0.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "axum",
  "bytes",
  "futures-util",
  "reqwest",
+ "serde_json",
  "symphonia",
  "tokio",
  "tracing",

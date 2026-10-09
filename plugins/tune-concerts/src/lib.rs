@@ -134,7 +134,28 @@ pub const LOT: usize = 200;
 /// centaines de requêtes. Une troncature est TOUJOURS signalée dans le journal :
 /// un abonnement silencieusement amputé se lit comme « ce groupe ne joue nulle
 /// part » côté utilisateur.
-pub const PLAFOND: usize = 5_000;
+///
+/// # 15 000, et pourquoi le nuage le tient (relevé le 05/10/2026)
+///
+/// Il valait 5 000 : la bibliothèque de Tades (12 443 artistes) en perdait plus
+/// de la moitié (#5523). Ce que `site-mozaiklabs` accepte, lu dans son code :
+///
+/// - `POST /concerts/subscribe` : 200 artistes par appel (`artists => max:200`,
+///   d'où [`LOT`]), aucun plafond d'abonnements par instance, ni en base ni
+///   dans la route (un `updateOrInsert` par artiste) ;
+/// - le limiteur `premium` : 20 écritures par minute et par `instance_id`
+///   ([`ECRITURES_PAR_MINUTE`]), tenues par la [`Cadence`] (#5591). 75 lots
+///   partent en 74 × 3,5 s ≈ 4 min 19 s, une fois par jour ;
+/// - `GET /concerts/upcoming` relit TOUS les abonnements de l'instance dans un
+///   `whereIn` : un paramètre lié par artiste, sous la borne de 65 535 de
+///   PostgreSQL. C'est la seule limite dure par instance ; 15 000 en reste
+///   loin.
+///
+/// Ce que le plafond ne règle pas : la résolution des NOUVEAUX artistes côté
+/// nuage (`concerts:ingest`, 200 par heure, quota Ticketmaster de 5 000 appels
+/// par jour partagé par toutes les instances). Une grosse bibliothèque qui
+/// arrive est abonnée en entier tout de suite, mais résolue en plusieurs jours.
+pub const PLAFOND: usize = 15_000;
 
 /// Le plafond d'écriture du nuage : le limiteur `premium` de site-mozaiklabs
 /// (`AppServiceProvider`, `Limit::perMinute(20)` par `instance_id` sur tout
@@ -175,7 +196,8 @@ impl Cadence {
     ///
     /// 3,5 « secondes » entre deux lots : 60 / 20 = 3 s est la limite exacte,
     /// la demi-seconde de marge absorbe l'écart d'horloge avec la fenêtre du
-    /// nuage. 25 lots partent alors en 84 s au lieu de 31 s.
+    /// nuage. 25 lots partent alors en 84 s au lieu de 31 s ; les 75 lots
+    /// d'une bibliothèque au [`PLAFOND`], en 4 min 19 s.
     pub fn a_l_echelle(seconde: std::time::Duration) -> Self {
         Cadence {
             seconde,
@@ -773,14 +795,54 @@ fn refus_du_nuage(err: &CloudError, lecture: bool) -> Response {
 /// et le fait de base — « un artiste sans MBID part quand même » — redeviendrait
 /// invérifiable, c'est-à-dire effaçable en silence. C'est exactement ce que
 /// cette PR a failli faire.
+///
+/// # Qui est gardé quand la bibliothèque dépasse le plafond (#5523)
+///
+/// Les artistes étaient pris par `ORDER BY name` : au-delà de [`PLAFOND`], on
+/// gardait les 5 000 premiers noms de l'alphabet. Tades en a 12 443, et sa
+/// liste de concerts « s'arrête au F de Florent Pagny ». Ils sont désormais
+/// classés par **pertinence**, avec ce que la base expose déjà :
+///
+/// 1. les artistes mis en **favori** (`favorites`, `item_type = 'artist'`) ;
+/// 2. le **nombre d'écoutes** (`listen_history`, hors radio, rapproché par
+///    nom comme le fait le palmarès `top_artists`) ;
+/// 3. la **dernière écoute**, à nombre égal ;
+/// 4. le **nombre de pistes** de l'artiste dans la bibliothèque ;
+/// 5. le nom, en dernier recours — d'où l'ordre alphabétique inchangé sur une
+///    bibliothèque sans écoutes ni favoris, et sous le plafond.
+///
+/// Les quatre clés sont rendues non nulles (`COALESCE`) : SQLite classe les
+/// NUL en dernier dans un tri décroissant, PostgreSQL en premier. Sans cela,
+/// sur PostgreSQL, les artistes jamais écoutés passeraient devant les autres.
+/// Le plafond, relevé ensuite de 5 000 à 15 000 : voir [`PLAFOND`].
 pub fn artistes_de_la_bibliotheque(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     // `PLAFOND` est injecté plutôt qu'écrit en dur : si le `LIMIT` et le seuil
     // d'alerte divergeaient, la troncature redeviendrait silencieuse — le
     // défaut même que ce code corrige.
+    //
+    // Les écoutes sont jointes par NOM, donc dupliquées sur chaque ligne d'un
+    // même nom : `MAX`, pas `SUM`. Les pistes sont jointes par `artist_id`,
+    // propres à chaque ligne : là, `SUM` additionne les doublons du nom.
     let sql = format!(
-        "SELECT name, MAX(musicbrainz_id) FROM artists \
-         WHERE name IS NOT NULL AND name != '' \
-         GROUP BY name ORDER BY name \
+        "SELECT a.name, MAX(a.musicbrainz_id), \
+                MAX(CASE WHEN f.item_id IS NOT NULL THEN 1 ELSE 0 END) AS favori, \
+                COALESCE(MAX(e.ecoutes), 0) AS ecoutes, \
+                COALESCE(MAX(e.derniere), '') AS derniere, \
+                COALESCE(SUM(p.pistes), 0) AS pistes \
+         FROM artists a \
+         LEFT JOIN (SELECT DISTINCT item_id FROM favorites \
+                    WHERE item_type = 'artist') f ON f.item_id = a.id \
+         LEFT JOIN (SELECT artist_name, COUNT(*) AS ecoutes, \
+                           MAX(listened_at) AS derniere \
+                    FROM listen_history \
+                    WHERE artist_name IS NOT NULL AND source != 'radio' \
+                    GROUP BY artist_name) e ON e.artist_name = a.name \
+         LEFT JOIN (SELECT artist_id, COUNT(*) AS pistes FROM tracks \
+                    WHERE artist_id IS NOT NULL \
+                    GROUP BY artist_id) p ON p.artist_id = a.id \
+         WHERE a.name IS NOT NULL AND a.name != '' \
+         GROUP BY a.name \
+         ORDER BY favori DESC, ecoutes DESC, derniere DESC, pistes DESC, a.name \
          LIMIT {PLAFOND}"
     );
 
@@ -1673,13 +1735,13 @@ mod essais {
         }
     }
 
-    /// ⭐ #5591, la cadence : les 25 lots d'une bibliothèque au plafond restent
-    /// sous les 20 écritures par minute du nuage. Les nouveaux essais sont
-    /// coupés (`essais_par_lot = 1`) pour que seule la pause soit jugée :
-    /// avant le correctif, les 25 lots partaient d'affilée et les 5 derniers
-    /// recevaient un 429.
+    /// ⭐ #5591, la cadence : les lots d'une bibliothèque au plafond (75 lots
+    /// depuis que [`PLAFOND`] vaut 15 000) restent sous les 20 écritures par
+    /// minute du nuage. Les nouveaux essais sont coupés (`essais_par_lot = 1`)
+    /// pour que seule la pause soit jugée : avant le correctif, les lots
+    /// partaient d'affilée et tout envoi au-delà du 20e recevait un 429.
     #[tokio::test]
-    async fn vingt_cinq_lots_restent_sous_la_limite_d_ecriture_du_nuage() {
+    async fn les_lots_d_une_bibliotheque_au_plafond_restent_sous_la_limite_d_ecriture_du_nuage() {
         let seconde = std::time::Duration::from_millis(5);
         let banc = banc_avec(limiteur(seconde)).await;
         let cadence = Cadence {
@@ -1697,10 +1759,46 @@ mod essais {
         .await
         .unwrap();
 
-        assert_eq!(banc.recues().len(), 25, "5 000 artistes = 25 lots");
+        assert_eq!(
+            banc.recues().len(),
+            PLAFOND.div_ceil(LOT),
+            "{PLAFOND} artistes = {} lots",
+            PLAFOND.div_ceil(LOT)
+        );
         assert_eq!(
             total, PLAFOND,
             "aucun lot ne doit etre refuse par le limiteur du nuage"
+        );
+    }
+
+    /// #5591 et #5523 : la cadence tient quand le nombre d'artistes augmente.
+    /// La pause est posée ENTRE CHAQUE lot, pas calculée sur un total : 60 lots
+    /// (12 000 artistes, la taille de la bibliothèque de Tades) passent le
+    /// même limiteur sans un seul refus.
+    #[tokio::test]
+    async fn soixante_lots_restent_sous_la_limite_d_ecriture_du_nuage() {
+        let seconde = std::time::Duration::from_millis(5);
+        let banc = banc_avec(limiteur(seconde)).await;
+        let cadence = Cadence {
+            essais_par_lot: 1,
+            ..Cadence::a_l_echelle(seconde)
+        };
+
+        let total = envoyer_abonnements(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-1",
+            &artistes(12_000),
+            cadence,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(banc.recues().len(), 60, "12 000 artistes = 60 lots");
+        assert_eq!(
+            total, 12_000,
+            "aucun lot ne doit etre refuse par le limiteur du nuage, \
+             quel que soit le nombre de lots"
         );
     }
 
@@ -1726,10 +1824,43 @@ mod essais {
         .await
         .unwrap();
 
-        assert_eq!(total, PLAFOND, "les 25 lots doivent finir abonnes");
+        assert_eq!(total, PLAFOND, "tous les lots doivent finir abonnes");
         assert!(
             banc.recues().len() > 25,
             "le limiteur doit avoir refuse au moins un envoi, sinon ce test ne juge rien"
+        );
+    }
+
+    /// Le plafond tient la bibliothèque de Tades (12 443 artistes, #5523) et
+    /// reste sous la seule limite dure du nuage par instance : `GET
+    /// /concerts/upcoming` lie un paramètre par abonnement, et PostgreSQL n'en
+    /// accepte pas plus de 65 535 par requête.
+    #[test]
+    fn le_plafond_tient_tades_et_reste_sous_la_borne_du_nuage() {
+        const ARTISTES_DE_TADES: usize = 12_443;
+        const PARAMETRES_LIES_MAX_POSTGRES: usize = 65_535;
+        assert!(
+            PLAFOND >= ARTISTES_DE_TADES,
+            "{PLAFOND} < {ARTISTES_DE_TADES} : la bibliotheque de Tades serait encore tronquee"
+        );
+        assert!(
+            PLAFOND < PARAMETRES_LIES_MAX_POSTGRES,
+            "{PLAFOND} abonnements depasseraient les parametres lies de /upcoming"
+        );
+    }
+
+    /// Une synchronisation au plafond, à la cadence de production, tient en
+    /// moins de cinq minutes : la tâche quotidienne ne s'étire pas sur l'heure.
+    #[test]
+    fn une_synchronisation_au_plafond_tient_en_cinq_minutes() {
+        let c = Cadence::production();
+        let pauses = u32::try_from(PLAFOND.div_ceil(LOT) - 1).unwrap();
+        let duree = c.pause_entre_lots * pauses;
+        assert!(
+            duree < std::time::Duration::from_secs(5 * 60),
+            "{} lots espaces de {:?} = {duree:?}",
+            PLAFOND.div_ceil(LOT),
+            c.pause_entre_lots
         );
     }
 

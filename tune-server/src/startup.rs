@@ -412,6 +412,17 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // d'autre : un motif inconnu (masquage d'avant la migration 112) ou une
     // suppression par l'utilisateur n'est jamais touché.
     reparer_les_masquages_de_zones(state);
+    // Fil 2138 — une seule fois (marqueur dans `settings`) : une base dont le
+    // premier scan, avant #5748, a daté toutes les pistes à l'heure du scan
+    // est redatée par les fichiers. Hors du chemin du démarrage : la passe
+    // fait un `stat` par piste du premier scan, et un partage lent ne doit
+    // pas retenir le serveur. Une erreur se journalise, le démarrage continue.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
+        });
+    }
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
     recalculer_les_compilations(state);
@@ -420,6 +431,19 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     // « distinctes », que la passe consulte. Idempotente : sur une base déjà
     // passée, trois lectures et rien d'écrit.
     tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
+    // Fil 2094 — une seule fois (marqueur dans `settings`) : les coffrets
+    // composés avant que la composition pose les sous-titres de disque les
+    // reçoivent. APRÈS la passe, qui écrit elle aussi le marqueur `coffret`.
+    // Hors du chemin du démarrage : pour les coffrets sans titres retenus, la
+    // passe relit la balise ALBUM d'une piste par disque, et un partage lent
+    // ne doit pas retenir le serveur. Une erreur se journalise, le démarrage
+    // continue.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::coffrets_auto::rattrapage_journalise(&backend);
+        });
+    }
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -1665,6 +1689,107 @@ pub(crate) fn local_zone_action(
     }
 }
 
+/// Une sortie locale telle que la règle de la zone automatique la voit :
+/// son nom d'affichage, son endpoint (`alsa:hw:CARD=…`, `alsa:default`…) et
+/// la marque « sortie système » du backend.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SortieCandidate<'a> {
+    pub nom: &'a str,
+    pub endpoint_id: &'a str,
+    pub est_le_defaut: bool,
+}
+
+/// La sortie système est-elle un PCM ALSA logiciel (`default`, `sysdefault`,
+/// `pipewire`, `pulse`, `plughw`, `dmix`…) plutôt que le matériel ?
+///
+/// Sur ALSA, cpal rend toujours `default` comme sortie système (« Default
+/// Audio Device ») : un greffon `plug` → `dmix` ou PipeWire, à cadence fixe.
+/// Sur CoreAudio et WASAPI, la sortie système est un vrai périphérique : la
+/// question ne s'y pose pas, et la règle ne s'y applique pas.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn defaut_alsa_logiciel(endpoint_id: &str) -> bool {
+    use tune_core::outputs::pseudo_peripherique_alsa::{greffon_alsa, pcm_alsa};
+    let Some((hote, _)) = endpoint_id.split_once(':') else {
+        return false;
+    };
+    hote.eq_ignore_ascii_case("alsa")
+        && !greffon_alsa(pcm_alsa(endpoint_id)).eq_ignore_ascii_case("hw")
+}
+
+/// Rang d'un PCM matériel ALSA pour la zone automatique : plus petit = préféré.
+///
+/// 1. Une carte USB : un DAC branché exprès pour écouter.
+/// 2. Une sortie interne analogique.
+/// 3. Une sortie numérique (HDMI, DisplayPort, S/PDIF) : souvent reliée à un
+///    écran sans haut-parleurs, donc muette.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+fn rang_materiel(nom: &str) -> u8 {
+    let nom = nom.to_lowercase();
+    if nom.contains("usb") {
+        0
+    } else if [
+        "hdmi",
+        "displayport",
+        "iec958",
+        "s/pdif",
+        "spdif",
+        "digital",
+    ]
+    .iter()
+    .any(|motif| nom.contains(motif))
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// #5870 — le NOM de la sortie qui reçoit la zone locale automatique.
+///
+/// Avant, c'était toujours la sortie système du backend
+/// ([`first_system_default_name`]). Sur Linux, c'est le PCM ALSA `default` :
+/// un greffon (`dmix`, PipeWire) qui rééchantillonne tout à 48 kHz. Une
+/// installation neuve jouait donc sur un convertisseur alors qu'un DAC USB
+/// était branché, et le DAC restait bloqué à 48 kHz.
+///
+/// Règle :
+/// - sortie système absente : `None`, comme avant (aucun repli silencieux) ;
+/// - sortie système matérielle (CoreAudio, WASAPI, ASIO, ou un `hw:`) : elle ;
+/// - sortie système ALSA logicielle qui a DÉJÀ une zone (visible ou
+///   supprimée) : elle — une installation existante ne voit rien changer ;
+/// - sinon, le meilleur PCM `hw:` présent ([`rang_materiel`], puis l'endpoint
+///   le plus petit pour un ordre total) ; à défaut de `hw:`, la sortie système.
+///
+/// La sortie `default` reste enregistrée et proposée à la création manuelle :
+/// elle n'est seulement plus choisie d'office.
+#[cfg_attr(not(feature = "local-audio"), allow(dead_code))]
+pub(crate) fn sortie_de_la_zone_automatique<'a>(
+    sorties: &[SortieCandidate<'a>],
+    a_deja_une_zone: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    use tune_core::outputs::pseudo_peripherique_alsa::est_un_puits;
+    let defaut = sorties.iter().find(|s| s.est_le_defaut)?;
+    if !defaut_alsa_logiciel(defaut.endpoint_id) || a_deja_une_zone(defaut.nom) {
+        return Some(defaut.nom);
+    }
+    let materiel = sorties
+        .iter()
+        .filter(|s| {
+            s.endpoint_id
+                .split_once(':')
+                .is_some_and(|(hote, _)| hote.eq_ignore_ascii_case("alsa"))
+                && !defaut_alsa_logiciel(s.endpoint_id)
+                && !est_un_puits(s.endpoint_id, s.nom)
+        })
+        .min_by(|a, b| {
+            rang_materiel(a.nom)
+                .cmp(&rang_materiel(b.nom))
+                .then_with(|| a.endpoint_id.cmp(b.endpoint_id))
+        });
+    Some(materiel.map_or(defaut.nom, |s| s.nom))
+}
+
 // Enumerate output devices OFF the async runtime and under a hard timeout.
 //
 // Enumerating ASIO opens each driver to read its formats, and an ASIO driver
@@ -1894,12 +2019,39 @@ pub(crate) async fn enregistrer_les_sorties_locales(
     let auto_create = zone_repo.zone_auto_create_autorise();
     // Un backend est censé marquer une seule sortie par défaut. `find`
     // rend cette unicité vraie même s'il en renvoie plusieurs par erreur.
-    let system_default_device_id = first_system_default_name(
+    // #5870 — sur ALSA, la sortie système est le greffon `default` : la zone
+    // automatique vise plutôt le PCM matériel présent, sauf si `default` a
+    // déjà une zone (installation existante, rien ne change).
+    let sorties: Vec<SortieCandidate<'_>> = devices
+        .iter()
+        .map(|dev| SortieCandidate {
+            nom: dev.name.as_str(),
+            endpoint_id: dev.endpoint_id.as_str(),
+            est_le_defaut: dev.is_default,
+        })
+        .collect();
+    let defaut_systeme = first_system_default_name(
         devices
             .iter()
             .map(|dev| (dev.name.as_str(), dev.is_default)),
-    )
-    .map(|name| format!("local:{name}"));
+    );
+    let cible = sortie_de_la_zone_automatique(&sorties, |nom| {
+        zone_repo
+            .get_by_device_id(&format!("local:{nom}"))
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    if let (Some(defaut), Some(cible)) = (defaut_systeme, cible)
+        && defaut != cible
+    {
+        info!(
+            sortie_systeme = %defaut,
+            cible = %cible,
+            "local_audio_zone_auto_vise_le_materiel"
+        );
+    }
+    let system_default_device_id = cible.map(|name| format!("local:{name}"));
 
     for dev in devices {
         let device_id = format!("local:{}", dev.name);
@@ -2468,16 +2620,21 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
         let mut dernier = None;
         let mut gagnant = None;
         for dialecte in echelle {
-            let mut opts = format!("username={u},password={pass}");
-            if let Some(v) = dialecte {
-                opts.push_str(&format!(",vers={v}"));
-            }
-            // JAMAIS `opts` dans une trace : il porte le mot de passe.
+            // root : `mount.cifs` direct ; sinon l'assistant, via sudo, le
+            // mot de passe sur son entree (#3206). Un refus de sudo arrete
+            // l'echelle et part au journal avec la cause.
             let res = tokio::time::timeout(
                 crate::smb::ESSAI_TIMEOUT,
-                tokio::process::Command::new("mount.cifs")
-                    .args([&unc, &path, "-o", &opts])
-                    .output(),
+                crate::smb::commande_de_montage(
+                    crate::privilege::euid(),
+                    &crate::privilege::sudo(),
+                    &unc,
+                    &path,
+                    u,
+                    &pass,
+                    dialecte,
+                )
+                .lancer(),
             )
             .await;
             let arreter = match &res {
@@ -2485,9 +2642,9 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
                     gagnant = Some(crate::smb::etiquette(dialecte).to_string());
                     true
                 }
-                Ok(Ok(out)) => {
-                    crate::smb::est_refus_d_authentification(&String::from_utf8_lossy(&out.stderr))
-                }
+                // Un refus d'identifiants, ou un point deja occupe (EBUSY,
+                // fil 2145) : changer de dialecte n'y fera rien.
+                Ok(Ok(out)) => crate::smb::arrete_l_echelle(&String::from_utf8_lossy(&out.stderr)),
                 // mount.cifs absent ou non executable : changer de dialecte
                 // n'y fera rien.
                 Ok(Err(_)) => true,
@@ -2542,8 +2699,14 @@ async fn monter_un_partage(state: &AppState, p: &PartageEnregistre) -> IssueMont
 /// Un refus de `mount.cifs`/`mount_smbfs` : définitif s'il porte sur les
 /// identifiants (réessayer ne ferait que resservir la même réponse), sinon
 /// un nouvel essai peut réussir (#5682).
+///
+/// Un refus de sudo (service hors root sans règle sudoers, #3206) est
+/// définitif lui aussi : réessayer toutes les dix secondes ne ferait que
+/// remplir le journal du même refus.
 pub(crate) fn issue_d_un_refus(stderr: &str) -> IssueMontage {
-    if crate::smb::est_refus_d_authentification(stderr) {
+    if crate::smb::est_refus_d_authentification(stderr)
+        || crate::privilege::est_un_refus_d_elevation(stderr)
+    {
         IssueMontage::Definitif
     } else {
         IssueMontage::Echec
@@ -2591,8 +2754,20 @@ where
 /// puis, s'il finit par monter, un scan de la bibliothèque — celui du
 /// démarrage a trouvé sa racine absente et n'a rien pu en lire.
 async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
-    let monte =
-        reessayer_le_montage(|_| monter_un_partage(&state, &partage), tokio::time::sleep).await;
+    // Fil 2145 : un partage OUBLIE pendant les nouveaux essais (« Oublier ce
+    // partage ») ne doit pas etre remonte dans la minute qui suit. Chaque
+    // essai verifie donc que sa ligne existe encore.
+    let (etat, ce_partage) = (&state, &partage);
+    let monte = reessayer_le_montage(
+        move |_| async move {
+            if !ligne_de_partage_existe(etat, ce_partage.id) {
+                return IssueMontage::Definitif;
+            }
+            monter_un_partage(etat, ce_partage).await
+        },
+        tokio::time::sleep,
+    )
+    .await;
     let Some(essai) = monte else {
         warn!(
             host = %partage.host, share = %partage.share,
@@ -2604,7 +2779,9 @@ async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
         host = %partage.host, share = %partage.share, path = %partage.path, essai,
         "network_share_mounted_late (#5682)"
     );
-    if !state.config.auto_scan {
+    // Ce scan remplace celui du démarrage pour ce partage : il suit le même
+    // ordre de précédence (réglage utilisateur, puis `auto_scan`).
+    if !crate::auto_scan::scan_au_demarrage_voulu(state.config.auto_scan, &state.backend) {
         return;
     }
     // Le scan de démarrage peut encore tenir le droit de scanner : on attend
@@ -2617,6 +2794,22 @@ async fn retenter_en_fond(state: AppState, partage: PartageEnregistre) {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
     warn!(path = %partage.path, "scan_after_late_mount_skipped — un scan tenait le droit (#5682)");
+}
+
+/// La ligne `network_mounts` de ce partage existe-t-elle encore ? Sans id
+/// (ancienne ligne illisible), on ne sait pas : on continue comme avant.
+fn ligne_de_partage_existe(state: &AppState, id: Option<i64>) -> bool {
+    use tune_core::db::backend::ToSqlValue;
+    let Some(id) = id else { return true };
+    match state.backend.query_one(
+        "SELECT id FROM network_mounts WHERE id = ?",
+        &[&id as &dyn ToSqlValue],
+    ) {
+        Ok(ligne) => ligne.is_some(),
+        // Base momentanement illisible : ne pas abandonner un remontage
+        // pour autant.
+        Err(_) => true,
+    }
 }
 
 /// Ecrit le constat du dernier montage sur la ligne du partage.
@@ -3165,6 +3358,38 @@ mod restore_zone_volumes_tests {
         assert!(gain <= 1000, "gain de rendu {gain}/1000 : plafond franchi");
     }
 
+    /// #5695 — la graine d'une sortie locale sous PURE forcé : 100 %, SANS
+    /// trim, comme `Orchestrator::set_volume` et `arm_fixed_volume`. Un trim
+    /// de −1,6 dB faisait naître la sortie à 83 % alors que la zone promet le
+    /// plein volume.
+    #[cfg(feature = "local-audio")]
+    #[tokio::test]
+    async fn sous_pure_force_la_graine_locale_ignore_le_trim_5695() {
+        use std::sync::atomic::Ordering;
+        let (state, id) = state_with_zone(100.0, false);
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        reglages
+            .set(&format!("zone_{id}_gain_trim_db"), "-1.6")
+            .unwrap();
+        reglages
+            .set(
+                &format!("zone_{id}_audiophile"),
+                r#"{"enabled":true,"lock_volume":true}"#,
+            )
+            .unwrap();
+        let zone = ZoneRepo::with_backend(state.backend.clone())
+            .get_by_device_id("local:Test")
+            .unwrap()
+            .unwrap();
+        let sortie = tune_core::outputs::local::LocalOutput::new("Test".into());
+        ensemencer_le_volume_local(&state.backend, &zone, "local:Test", &sortie).await;
+        let gain = sortie.gain_de_rendu().load(Ordering::SeqCst);
+        assert_eq!(
+            gain, 1000,
+            "gain de rendu {gain}/1000 sous PURE forcé : le trim a été composé"
+        );
+    }
     /// #2886 — LE symptôme de l'issue : la zone se rallume MUETTE.
     ///
     /// `restore_zone_volumes` est le pont entre la colonne et le son après un
@@ -3292,6 +3517,150 @@ mod local_zone_creation_policy_tests {
     fn no_backend_default_means_no_automatic_candidate() {
         let devices = [("DAC A", false), ("DAC B", false)];
         assert_eq!(first_system_default_name(devices), None);
+    }
+
+    fn sortie<'a>(nom: &'a str, endpoint_id: &'a str, est_le_defaut: bool) -> SortieCandidate<'a> {
+        SortieCandidate {
+            nom,
+            endpoint_id,
+            est_le_defaut,
+        }
+    }
+
+    /// Le parc d'une installation Linux neuve avec un DAC USB, tel que
+    /// l'énumère ALSA : `default` (greffon), la carte interne et le DAC.
+    fn parc_linux_avec_dac_usb() -> Vec<SortieCandidate<'static>> {
+        vec![
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie(
+                "HDA Intel PCH, ALC897 Analog",
+                "alsa:hw:CARD=PCH,DEV=0",
+                false,
+            ),
+            sortie("HDA Intel PCH, HDMI 0", "alsa:hw:CARD=PCH,DEV=3", false),
+            sortie("USB DAC, USB Audio", "alsa:hw:CARD=DAC,DEV=0", false),
+            sortie(
+                "Discard all samples (playback) or generate zero samples (capture)",
+                "alsa:null",
+                false,
+            ),
+        ]
+    }
+
+    /// #5870 — installation neuve : la zone automatique vise le DAC USB, pas
+    /// le greffon `default` qui rééchantillonne à 48 kHz.
+    #[test]
+    fn installation_neuve_linux_vise_le_dac_usb_et_non_default() {
+        let parc = parc_linux_avec_dac_usb();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+    }
+
+    /// Sans DAC USB : la sortie analogique interne, jamais le HDMI.
+    #[test]
+    fn sans_usb_la_sortie_interne_passe_avant_le_hdmi() {
+        let parc: Vec<_> = parc_linux_avec_dac_usb()
+            .into_iter()
+            .filter(|s| !s.nom.contains("USB"))
+            .collect();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("HDA Intel PCH, ALC897 Analog")
+        );
+        let hdmi_seul = [
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie("HDA Intel PCH, HDMI 0", "alsa:hw:CARD=PCH,DEV=3", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&hdmi_seul, |_| false),
+            Some("HDA Intel PCH, HDMI 0"),
+            "un HDMI matériel reste préférable au greffon"
+        );
+    }
+
+    /// L'ordre d'énumération ne change pas le choix.
+    #[test]
+    fn le_choix_ne_depend_pas_de_l_ordre_d_enumeration() {
+        let mut parc = parc_linux_avec_dac_usb();
+        parc.reverse();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+    }
+
+    /// Installation existante : `default` a déjà sa zone (visible ou
+    /// supprimée). Rien ne change, aucune zone nouvelle sur le DAC.
+    #[test]
+    fn installation_existante_garde_la_zone_de_default() {
+        let parc = parc_linux_avec_dac_usb();
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |nom| nom == "Default Audio Device"),
+            Some("Default Audio Device")
+        );
+    }
+
+    /// Aucun PCM matériel (PipeWire seul, ou rien que le puits) : `default`
+    /// reste le secours.
+    #[test]
+    fn sans_materiel_default_reste_le_secours() {
+        let parc = [
+            sortie("Default Audio Device", "alsa:default", true),
+            sortie("PipeWire Sound Server", "alsa:pipewire", false),
+            sortie("Discard all samples", "alsa:null", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("Default Audio Device")
+        );
+    }
+
+    /// CoreAudio, WASAPI : la sortie système est un vrai périphérique, elle
+    /// garde la zone automatique comme avant.
+    #[test]
+    fn coreaudio_et_wasapi_gardent_la_sortie_systeme() {
+        let mac = [
+            sortie(
+                "MacBook Pro Speakers",
+                "coreaudio:BuiltInSpeakerDevice",
+                true,
+            ),
+            sortie("USB DAC", "coreaudio:AppleUSBAudioEngine:DAC", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&mac, |_| false),
+            Some("MacBook Pro Speakers")
+        );
+        let windows = [
+            sortie("Speakers", "wasapi:{0.0.0.00000000}.{a}", true),
+            sortie("Speakers (2)", "wasapi:{0.0.0.00000000}.{b}", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&windows, |_| false),
+            Some("Speakers")
+        );
+    }
+
+    /// Une sortie système ALSA déjà matérielle n'est pas déplacée, et
+    /// l'absence de sortie système ne fabrique pas de candidate.
+    #[test]
+    fn default_materiel_ou_absent_inchanges() {
+        let parc = [
+            sortie("USB DAC, USB Audio", "alsa:hw:CARD=DAC,DEV=0", true),
+            sortie("Autre DAC, USB Audio", "alsa:hw:CARD=AAA,DEV=0", false),
+        ];
+        assert_eq!(
+            sortie_de_la_zone_automatique(&parc, |_| false),
+            Some("USB DAC, USB Audio")
+        );
+        let sans_defaut = [sortie(
+            "USB DAC, USB Audio",
+            "alsa:hw:CARD=DAC,DEV=0",
+            false,
+        )];
+        assert_eq!(sortie_de_la_zone_automatique(&sans_defaut, |_| false), None);
     }
 }
 
@@ -3882,6 +4251,16 @@ mod nouveaux_essais_de_montage_tests_5682 {
         );
     }
 
+    /// #3206 : service sous `tune` sans règle sudoers — réessayer ne changera
+    /// rien, le refus est définitif.
+    #[test]
+    fn un_refus_de_sudo_n_est_pas_retente_3206() {
+        assert_eq!(
+            issue_d_un_refus("sudo: a password is required"),
+            IssueMontage::Definitif
+        );
+    }
+
     #[test]
     fn un_nas_eteint_n_est_pas_retente_sans_fin_5682() {
         let (r, essais, delais) = rejouer(&[]);
@@ -4080,5 +4459,39 @@ mod bascule_asio_a_chaud_5353_tests {
             bascule.contains("enregistrer_les_sorties_locales(state, asio).await"),
             "la bascule doit réutiliser le chemin d'enregistrement du démarrage"
         );
+    }
+}
+
+/// Fil 2145 : un partage oublié pendant ses nouveaux essais de montage ne doit
+/// pas être remonté. Chaque essai demande d'abord si sa ligne existe encore.
+#[cfg(test)]
+mod tests_oubli_2145 {
+    use super::ligne_de_partage_existe;
+    use tune_core::db::backend::ToSqlValue;
+
+    #[test]
+    fn un_partage_oublie_n_est_plus_retente() {
+        let etat = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let id = etat
+            .backend
+            .execute_returning_id(
+                "INSERT INTO network_mounts (mount_type, server, share, mount_path) \
+                 VALUES ('smb', '192.168.10.69', 'Music', '/mnt/192.168.10.69_Music')",
+                &[],
+            )
+            .unwrap();
+        assert!(ligne_de_partage_existe(&etat, Some(id)));
+        etat.backend
+            .execute(
+                "DELETE FROM network_mounts WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap();
+        assert!(
+            !ligne_de_partage_existe(&etat, Some(id)),
+            "la ligne oubliée doit arrêter les nouveaux essais"
+        );
+        // Sans identifiant, on ne sait pas : on continue comme avant.
+        assert!(ligne_de_partage_existe(&etat, None));
     }
 }

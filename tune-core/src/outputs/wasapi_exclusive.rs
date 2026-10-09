@@ -19,8 +19,10 @@ use super::local::{
     wasapi_aligned_duration_100ns, wasapi_init_decision,
 };
 #[cfg(target_os = "windows")]
+use super::masque_de_canaux_4357::negocier_format_et_masque;
+#[cfg(target_os = "windows")]
 use super::negociation_format_exclusif_3837::{
-    CandidatFormat, ResultatSonde, message_peripherique_occupe, negocier_format_exclusif,
+    CandidatFormat, ResultatSonde, message_peripherique_occupe,
 };
 #[cfg(target_os = "windows")]
 use super::reveil_en_retard_4357::{Reveil, SuiviDesReveils, microsecondes, tache_mmcss_utf16};
@@ -334,11 +336,16 @@ unsafe fn audio_client_buffer_size(audio_client: *mut std::ffi::c_void) -> Resul
 /// `wValidBitsPerSample` peuvent différer : un conteneur 32 bits portant
 /// 24 bits valides est ce que la plupart des interfaces d'enregistrement
 /// exposent en exclusif, et c'est bit à bit ce que Symphonia produit déjà.
+///
+/// #4357 — le masque de canaux vient de `masque_de_canaux_4357`, et non plus
+/// de `(1 << canaux) - 1`, qui donnait un « 7.1 large » (`0xFF`) refusé par
+/// les pilotes HDMI.
 #[cfg(target_os = "windows")]
 fn format_wave_du_candidat(
     candidat: CandidatFormat,
     channels: u32,
     sample_rate: u32,
+    masque: u32,
 ) -> ffi::WAVEFORMATEXTENSIBLE {
     let block_align = (channels as u16) * candidat.octets_par_echantillon();
     ffi::WAVEFORMATEXTENSIBLE {
@@ -352,11 +359,7 @@ fn format_wave_du_candidat(
             cbSize: 22,
         },
         Samples: candidat.bits_valides,
-        dwChannelMask: if channels == 2 {
-            0x3
-        } else {
-            (1u32 << channels) - 1
-        },
+        dwChannelMask: masque,
         SubFormat: ffi::KSDATAFORMAT_SUBTYPE_PCM,
     }
 }
@@ -378,11 +381,12 @@ unsafe fn sonder_format_exclusif(
     candidat: CandidatFormat,
     channels: u32,
     sample_rate: u32,
+    masque: u32,
 ) -> ResultatSonde {
     use std::ffi::c_void;
     use std::ptr;
 
-    let wfx = format_wave_du_candidat(candidat, channels, sample_rate);
+    let wfx = format_wave_du_candidat(candidat, channels, sample_rate, masque);
     type IsFormatFn = unsafe extern "system" fn(
         *mut c_void,
         u32,
@@ -429,6 +433,45 @@ unsafe fn sonder_format_exclusif(
     } else {
         ResultatSonde::Refuse { hr, propose }
     }
+}
+
+/// #4357 — le format du mixeur partagé de l'endpoint (`GetMixFormat`), en
+/// clair : canaux, cadence, profondeur et masque. Journalisé seulement quand
+/// l'exclusif refuse tout : c'est la configuration de haut-parleurs que
+/// Windows applique à cette sortie, ce qu'il faut comparer à la source.
+///
+/// # Safety
+/// `audio_client` doit être un `IAudioClient` valide.
+#[cfg(target_os = "windows")]
+unsafe fn format_du_mixeur(audio_client: *mut std::ffi::c_void) -> Option<String> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type GetMixFormatFn =
+        unsafe extern "system" fn(*mut c_void, *mut *mut ffi::WAVEFORMATEX) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const c_void) };
+    let get_mix_format: GetMixFormatFn = unsafe { std::mem::transmute(*vtable.add(8)) };
+    let mut format: *mut ffi::WAVEFORMATEX = ptr::null_mut();
+    let hr = unsafe { get_mix_format(audio_client, &mut format) };
+    if hr != ffi::S_OK || format.is_null() {
+        return None;
+    }
+    let entete: ffi::WAVEFORMATEX = unsafe { ptr::read_unaligned(format) };
+    let masque = if entete.wFormatTag == ffi::WAVE_FORMAT_EXTENSIBLE && entete.cbSize >= 22 {
+        let etendu: ffi::WAVEFORMATEXTENSIBLE =
+            unsafe { ptr::read_unaligned(format as *const ffi::WAVEFORMATEXTENSIBLE) };
+        let masque = etendu.dwChannelMask;
+        format!("0x{masque:X}")
+    } else {
+        "aucun".to_string()
+    };
+    unsafe { ffi::CoTaskMemFree(format as *mut c_void) };
+    let canaux = entete.nChannels;
+    let cadence = entete.nSamplesPerSec;
+    let bits = entete.wBitsPerSample;
+    Some(format!(
+        "{canaux}ch {cadence}Hz {bits} bits masque {masque}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -565,25 +608,48 @@ impl WasapiExclusiveOutput {
             // cadence et canaux INCHANGÉS, chaque essai n'étant qu'un
             // `IsFormatSupported`. Aucun repli vers le mode partagé, aucun
             // changement d'endpoint : la doctrine de #2233/#2125 tient.
+            //
+            // #4357 — et, pour chaque profondeur, le masque de canaux : celui
+            // de la source, puis son équivalent à positions identiques
+            // (5.1 arrière → 5.1 latéral). La stéréo garde son seul masque.
             let bit_depth_demande = bit_depth;
-            let negocie =
-                match negocier_format_exclusif(bit_depth, channels, sample_rate, |candidat| {
-                    sonder_format_exclusif(audio_client, candidat, channels, sample_rate)
-                }) {
-                    Ok(negocie) => negocie,
-                    Err(erreur) => {
-                        info!(
-                            sample_rate,
-                            bit_depth,
-                            channels,
-                            detail = %erreur,
-                            "wasapi_exclusive_format_not_supported"
-                        );
-                        release(audio_client);
-                        release(device);
-                        return Err(erreur);
-                    }
-                };
+            let retenu = match negocier_format_et_masque(
+                bit_depth,
+                channels,
+                sample_rate,
+                |candidat, masque| {
+                    sonder_format_exclusif(audio_client, candidat, channels, sample_rate, masque)
+                },
+            ) {
+                Ok(retenu) => retenu,
+                Err(erreur) => {
+                    let mixeur =
+                        format_du_mixeur(audio_client).unwrap_or_else(|| "illisible".to_string());
+                    info!(
+                        sample_rate,
+                        bit_depth,
+                        channels,
+                        format_du_mixeur = %mixeur,
+                        detail = %erreur,
+                        "wasapi_exclusive_format_not_supported"
+                    );
+                    release(audio_client);
+                    release(device);
+                    return Err(erreur);
+                }
+            };
+            let negocie = retenu.negocie;
+            let masque_canaux = retenu.masque;
+            if retenu.masques_refuses > 0 {
+                warn!(
+                    device = %resolved.name,
+                    sample_rate,
+                    channels,
+                    masque_retenu = %format!("0x{masque_canaux:X}"),
+                    masques_refuses = retenu.masques_refuses,
+                    "wasapi_exclusive_masque_replie"
+                );
+            }
             // Le conteneur retenu commande `pop_pcm_bytes` : c'est LUI, pas la
             // profondeur demandée, que le fil de rendu doit sérialiser.
             let bit_depth = u32::from(negocie.format.bits_conteneur);
@@ -599,7 +665,7 @@ impl WasapiExclusiveOutput {
                     "wasapi_exclusive_format_replie"
                 );
             }
-            let wfx = format_wave_du_candidat(negocie.format, channels, sample_rate);
+            let wfx = format_wave_du_candidat(negocie.format, channels, sample_rate, masque_canaux);
 
             // 6. Get device period for exclusive mode
             let mut default_period: REFERENCE_TIME = 0;
@@ -772,6 +838,7 @@ impl WasapiExclusiveOutput {
                 bit_depth_demande,
                 bits_valides = negocie.format.bits_valides,
                 channels,
+                masque_canaux = %format!("0x{masque_canaux:X}"),
                 buffer_frames = buffer_frame_count,
                 period_100ns = selected_period,
                 periode_par_defaut_100ns = default_period,

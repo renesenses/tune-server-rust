@@ -12,6 +12,10 @@
 //!   ([`super::crossfeed::CrossfeedProcessor`]), après le crossfeed intégré,
 //!   là où la sortie locale, les bras streaming et le relais réseau
 //!   appliquent déjà cet étage. Le mode PURE le désarme comme le reste ;
+//! - un étage tiers de la FAMILLE du crossfeed (identifiant `crossfeed-…`,
+//!   [`super::crossfeed::PREFIXE_FAMILLE_CROSSFEED`]) REMPLACE le crossfeed
+//!   intégré au lieu de s'y ajouter : demandé par la zone, il éteint le
+//!   crossfeed intégré, et le chemin du signal nomme l'étape d'après lui ;
 //! - drapeaux d'installation : les mêmes clés que les quatre emplacements,
 //!   `plugin_{id}_installed` et `plugin_{id}_enabled`, sans fenêtre legacy ni
 //!   migration ;
@@ -56,6 +60,31 @@ pub fn demande(settings: &SettingsRepo, id: &str) -> bool {
         && settings
             .get(&format!("plugin_{id}_enabled"))
             .is_ok_and(|v| v.as_deref() != Some("false"))
+}
+
+/// Le nom lisible d'un greffon natif tiers, tiré de son identifiant : chaque
+/// segment séparé par `-` prend une capitale (`mon-greffon` → `Mon Greffon`).
+/// Le manifeste ne porte pas de nom d'affichage ; l'identifiant est la seule
+/// chose que le greffon annonce à l'hôte.
+pub fn nom_affichable(id: &str) -> String {
+    id.split('-')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut lettres = segment.chars();
+            lettres
+                .next()
+                .map(|l| l.to_uppercase().chain(lettres).collect::<String>())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Le greffon natif tiers de la famille du crossfeed que la zone demande, s'il
+/// y en a un (voir `super::crossfeed::etage_tiers_qui_remplace_le_crossfeed`).
+pub fn greffon_de_crossfeed_de_la_zone(settings: &SettingsRepo, zone_id: i64) -> Option<String> {
+    super::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&etages_configures(settings, zone_id))
+        .map(str::to_string)
 }
 
 /// Le fournisseur natif DSP chargé pour ce greffon tiers, s'il y en a un et
@@ -174,6 +203,13 @@ mod tests {
         assert!(!actif(&s, "greffon-tiers"));
         assert!(etages_configures(&s, 1).is_empty());
         assert!(valider_reglage("greffon-tiers", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn le_nom_lisible_vient_de_l_identifiant() {
+        assert_eq!(nom_affichable("crossfeed-essai"), "Crossfeed Essai");
+        assert_eq!(nom_affichable("greffon"), "Greffon");
+        assert_eq!(nom_affichable("eq-2-bandes"), "Eq 2 Bandes");
     }
 
     #[test]

@@ -65,6 +65,108 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
     })
 }
 
+/// Une sauvegarde de sécurité : ce que [`create_backup`] rend, plus le chemin
+/// complet du fichier, à montrer à l'utilisateur.
+#[derive(Debug, Clone, Serialize)]
+pub struct SafetyBackup {
+    #[serde(flatten)]
+    pub info: BackupInfo,
+    pub path: String,
+}
+
+/// #5973 — copie cohérente de la base, prise JUSTE AVANT une opération qui
+/// efface des données de l'utilisateur (« Vider la bibliothèque »).
+///
+/// Le vidage efface les pistes, et avec elles, par les `ON DELETE CASCADE`, le
+/// contenu des playlists, les notes d'albums, les signets et les métadonnées ;
+/// les favoris et les étiquettes deviennent orphelins. Aucun scan ne les
+/// reconstruit : ce sont des saisies de l'utilisateur. Cette copie est le seul
+/// moyen de les retrouver.
+///
+/// `VACUUM INTO` passe par la connexion d'écriture : la copie est un instantané
+/// cohérent de la base vivante, journal (`-wal`) compris, sans fermer le pool
+/// ni recopier des fichiers en cours d'écriture. Elle atterrit dans le dossier
+/// `backups/` habituel, sous un nom qui dit pourquoi elle existe
+/// (`<base>_<horodatage>_<etiquette>.<ext>`) : elle figure donc dans la liste
+/// des sauvegardes et se restaure comme les autres. La rotation habituelle
+/// (cinq copies) s'applique.
+///
+/// Le dossier est déduit du fichier que la connexion a RÉELLEMENT ouvert
+/// (`pragma_database_list`), pas d'un chemin de configuration qui pourrait en
+/// différer. Une base en mémoire n'a pas de fichier : rien à sauvegarder,
+/// `Ok(None)`.
+pub fn create_safety_backup(
+    db: &crate::db::sqlite::SqliteDb,
+    label: &str,
+) -> Result<Option<SafetyBackup>, String> {
+    let db_path: String = db.read(|c| {
+        c.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |r| r.get(0),
+        )
+    })?;
+    if db_path.is_empty() {
+        return Ok(None);
+    }
+    let db_file = Path::new(&db_path);
+    let backup_dir = db_file
+        .parent()
+        .map(|p| p.join("backups"))
+        .ok_or_else(|| format!("invalid database path: {db_path}"))?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("create {}: {e}", backup_dir.display()))?;
+    let stem = db_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("invalid database path: {db_path}"))?;
+    let ext = db_file.extension().and_then(|e| e.to_str()).unwrap_or("db");
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    // `VACUUM INTO` refuse un fichier existant : deux vidages dans la même
+    // seconde prennent un suffixe plutôt que d'échouer.
+    let mut backup_name = format!("{stem}_{timestamp}_{label}.{ext}");
+    let mut n = 2;
+    while backup_dir.join(&backup_name).exists() {
+        backup_name = format!("{stem}_{timestamp}_{label}-{n}.{ext}");
+        n += 1;
+    }
+    let backup_path = backup_dir.join(&backup_name);
+    let dest = backup_path.to_string_lossy().into_owned();
+    if let Err(e) = db.execute("VACUUM INTO ?1", &[&dest]) {
+        let _ = fs::remove_file(&backup_path);
+        warn!(error = %e, path = %dest, "database_safety_backup_error");
+        return Err(format!("VACUUM INTO {dest}: {e}"));
+    }
+    let meta = fs::metadata(&backup_path).map_err(|e| format!("{dest}: {e}"))?;
+    info!(path = %dest, label, size = meta.len(), "database_safety_backup_created");
+    prune_backups(&backup_dir, stem, ext);
+    let created_at = meta
+        .modified()
+        .ok()
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_default();
+    let path = backup_path
+        .canonicalize()
+        .unwrap_or(backup_path)
+        .to_string_lossy()
+        .into_owned();
+    // `canonicalize` rend un chemin `\\?\C:\…` sous Windows : on montre le
+    // chemin ordinaire.
+    let path = path
+        .strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(path);
+    Ok(Some(SafetyBackup {
+        info: BackupInfo {
+            filename: backup_name,
+            size: meta.len(),
+            created_at,
+        },
+        path,
+    }))
+}
 pub fn list_backups(db_path: &str) -> Vec<BackupInfo> {
     let db_file = Path::new(db_path);
     let backup_dir = match db_file.parent() {
@@ -345,6 +447,74 @@ mod tests {
         assert!(!restore_backup("/tmp/test.db", "nonexistent_backup.db"));
     }
 
+    /// #5973 — la sauvegarde prise avant « Vider la bibliothèque » contient
+    /// bien ce que le vidage efface : le contenu des playlists.
+    ///
+    /// Contre-épreuve dans le test : la base vivante est VIDÉE après la copie
+    /// (comme le fait la route), et l'on vérifie que la playlist y a bien perdu
+    /// son titre — sinon retrouver le titre dans la copie ne prouverait rien.
+    #[test]
+    fn la_sauvegarde_avant_vidage_garde_le_contenu_des_playlists() {
+        use crate::db::sqlite::SqliteDb;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        let db_path = db_path.to_str().unwrap();
+        let db = SqliteDb::open(db_path).unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO tracks (id, title, file_path) VALUES (1, 'Titre', '/m/a.flac');
+             INSERT INTO playlists (id, name) VALUES (1, 'Ma liste');
+             INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (1, 1, 0);",
+        )
+        .unwrap();
+
+        let sauvegarde = create_safety_backup(&db, "avant_vidage")
+            .unwrap()
+            .expect("une base sur disque doit être sauvegardée");
+        assert!(
+            sauvegarde.info.filename.starts_with("tune_")
+                && sauvegarde.info.filename.ends_with("_avant_vidage.db"),
+            "{}",
+            sauvegarde.info.filename
+        );
+        assert!(Path::new(&sauvegarde.path).is_file(), "{}", sauvegarde.path);
+        // Elle figure dans la liste des sauvegardes, donc se restaure.
+        assert!(
+            list_backups(db_path)
+                .iter()
+                .any(|b| b.filename == sauvegarde.info.filename)
+        );
+
+        // Le vidage, tel que la route l'appelle.
+        let repo = crate::db::track_repo::TrackRepo::new(db);
+        repo.delete_all().unwrap();
+        let compter = |chemin: &str| -> i64 {
+            rusqlite::Connection::open(chemin)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            compter(db_path),
+            0,
+            "contre-épreuve : le vidage efface bien le contenu des playlists"
+        );
+        assert_eq!(
+            compter(&sauvegarde.path),
+            1,
+            "la sauvegarde doit garder le contenu des playlists"
+        );
+
+        // Deux sauvegardes dans la même seconde ne s'écrasent pas.
+        let db2 = SqliteDb::open(db_path).unwrap();
+        let a = create_safety_backup(&db2, "x").unwrap().unwrap();
+        let b = create_safety_backup(&db2, "x").unwrap().unwrap();
+        assert_ne!(a.info.filename, b.info.filename);
+        // Une base en mémoire n'a pas de fichier : rien à sauvegarder.
+        let memoire = SqliteDb::open_in_memory().unwrap();
+        assert!(create_safety_backup(&memoire, "x").unwrap().is_none());
+    }
     #[test]
     fn create_and_list_backup() {
         let dir = tempfile::tempdir().unwrap();

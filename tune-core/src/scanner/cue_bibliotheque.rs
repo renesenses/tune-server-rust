@@ -625,8 +625,13 @@ fn ecrire_album_avec(
     // dossier ne décrit plus l'album entier), ni sur un titre qu'il a
     // lui-même tenu (`edition_manuelle`, la règle de
     // `AlbumRepo::realigner_sur_les_balises`).
+    //
+    // Fil 2094 — ni sur un coffret AUTOMATIQUE : ses disques sont tenus et
+    // restent dans le coffret à la relecture, la passe ne le reforme donc
+    // plus, et ne lui rendrait plus son titre.
     let titre_tenu = |id: i64| {
         tenues.albums_disposes().contains(&id)
+            || tenues.est_un_coffret_auto(id)
             || tenues_meta
                 .champs_edites_a_la_main(id)
                 .unwrap_or_default()

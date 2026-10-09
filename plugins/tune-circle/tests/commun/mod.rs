@@ -168,6 +168,11 @@ pub struct Faux {
     pub recuperables: Vec<Value>,
     /// Les `DELETE /recoverable-playlists/{id}` reçus.
     pub renonciations: Vec<String>,
+    /// Ajout groupé : tant que > 0, le prochain ajout trouve la playlist
+    /// changée par un autre membre (version + 1) et rend 409.
+    pub conflits_a_simuler: usize,
+    /// Ajout groupé : après ce nombre d'ajouts acceptés, le cloud rend 429.
+    pub ajouts_avant_refus: Option<usize>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -245,6 +250,8 @@ impl Faux {
             if_match_recus: Vec::new(),
             recuperables: vec![recuperable_initiale()],
             renonciations: Vec::new(),
+            conflits_a_simuler: 0,
+            ajouts_avant_refus: None,
         }
     }
 
@@ -1084,15 +1091,44 @@ async fn ajouter_a_la_playlist(
     f.ecritures_de_playlist
         .push(("POST /playlists/{id}/items".into(), v.clone()));
     let version = version_recue(&mut f, &v, &h);
+    if f.ajouts_avant_refus == Some(0) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "message": "Too Many Attempts." })),
+        )
+            .into_response();
+    }
+    let simuler = f.conflits_a_simuler > 0;
+    if simuler {
+        f.conflits_a_simuler -= 1;
+    }
     let Some(p) = playlist_de(&mut f, &id) else {
         return introuvable();
     };
+    if simuler {
+        p["version"] = json!(p["version"].as_i64().unwrap() + 1);
+    }
     if p["version"] != version {
         return conflit(p);
     }
     let Some(items) = v["items"].as_array().filter(|i| !i.is_empty()) else {
         return validation("items", "The items field is required.");
     };
+    // Les plafonds du vrai cloud (`CirclePlaylist::MAX_ITEMS_PER_REQUEST`,
+    // `MAX_ITEMS`, site-mozaiklabs#236) : 100 par requête, 2 000 au total.
+    if items.len() > 100 {
+        return validation(
+            "items",
+            "The items field must not have more than 100 items.",
+        );
+    }
+    if p["items"].as_array().unwrap().len() + items.len() > 2000 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "playlist_too_large" })),
+        )
+            .into_response();
+    }
     // Liste blanche : une clé inconnue (chemin, URL, source_id…) = 422, rien
     // n'est écrit.
     for item in items {
@@ -1115,7 +1151,11 @@ async fn ajouter_a_la_playlist(
         p["items"].as_array_mut().unwrap().push(ligne);
     }
     p["version"] = json!(p["version"].as_i64().unwrap() + 1);
-    avec_etag(p)
+    let rendu = avec_etag(p);
+    if let Some(n) = f.ajouts_avant_refus.as_mut() {
+        *n -= 1;
+    }
+    rendu
 }
 
 async fn retirer_de_la_playlist(

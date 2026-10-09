@@ -565,7 +565,10 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
     let players = list_players_cli(&lms_host_str, lms_port)?;
 
     if players.is_empty() {
-        tracing::info!(host = %lms_host_str, port = lms_port, "squeezebox_discover: no players found on LMS");
+        // `debug` : le sondeur passe ici chaque minute, et c'est lui qui dit,
+        // une seule fois, que le LMS ne connaît aucun lecteur
+        // (`recensement_squeezebox_a_annoncer`).
+        tracing::debug!(host = %lms_host_str, port = lms_port, "squeezebox_discover: no players found on LMS");
         return Ok(vec![]);
     }
 

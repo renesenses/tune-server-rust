@@ -41,6 +41,14 @@ pub struct StreamingFavorite {
     /// `None` sur une base dont la migration 104 / PG 067 n'a rien trouvé à
     /// reprendre ; le client retombe alors sur `created_at`.
     pub first_seen_at: Option<String>,
+    /// Le service marque-t-il ce contenu comme GÉNÉRÉ PAR IA ? (#5530)
+    ///
+    /// Pour un favori ALBUM, le marquage de l'album ; pour un favori PISTE,
+    /// celui de son album (Qobuz marque l'album, pas la piste). `None` =
+    /// inconnu : ligne d'avant la migration 118, ou service qui ne dit rien.
+    /// Absent du JSON dans ce cas, pour que la forme rendue ne change pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_generated: Option<bool>,
 }
 
 /// Engine-agnostic SQL builders.
@@ -142,6 +150,65 @@ pub mod sql {
         )
     }
 
+    /// Pose la référence d'album sur un favori qui n'en a pas — et SEULEMENT
+    /// là (fil 2121, migration 114). Même garde que
+    /// [`premiere_vue_si_absente`] : sans effet sur une ligne déjà renseignée.
+    pub fn completer_album_ref<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET album_ref = {} \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+               AND album_ref IS NULL",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+        )
+    }
+
+    /// Pose le marquage IA d'UN favori (#5530) — réécrit : c'est un fait de
+    /// catalogue que le service peut corriger, pas une préférence locale.
+    pub fn poser_ia<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET ai_generated = {} \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+        )
+    }
+
+    /// Pose le marquage IA d'un ALBUM de service sur tous les favoris qui le
+    /// désignent, quel que soit le profil (#5530) : le favori album lui-même,
+    /// et les favoris pistes dont la référence d'album (`album_ref`) le nomme.
+    pub fn marquer_album_ia<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET ai_generated = {} \
+             WHERE service = {} \
+               AND ((item_type = 'album' AND service_id = {}) \
+                 OR (item_type = 'track' AND album_ref = {})) \
+               AND (ai_generated IS NULL OR ai_generated != {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+        )
+    }
+
+    pub fn album_ref<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT album_ref FROM streaming_favorites \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+        )
+    }
+
     pub fn remove<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM streaming_favorites \
@@ -167,7 +234,9 @@ pub mod sql {
     // `first_seen_at` vient APRÈS `created_at` et AVANT `position` dans la
     // requête au rang : les deux listes sont lues par INDICE de colonne, et
     // l'insérer ailleurs décalerait silencieusement le rang manuel.
-    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at \
+    // `ai_generated` (#5530) suit `first_seen_at`, à l'indice 11 dans les
+    // DEUX listes ; `position` passe donc en 12.
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated \
          FROM streaming_favorites";
 
     pub fn list_all<D: SqlDialect>(d: &D) -> String {
@@ -190,7 +259,7 @@ pub mod sql {
     /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
     /// n'est lue que par le tri manuel et n'entre JAMAIS dans
     /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
-    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, position \
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, position \
          FROM streaming_favorites";
 
     pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
@@ -296,7 +365,93 @@ impl StreamingFavoritesRepo {
             &cover_url,
         ];
         self.db.execute(&sql, &params)?;
+        self.completer_reference_d_album(pid, item_type, service, service_id);
         Ok(())
+    }
+
+    /// Fil 2121 — un favori Bandcamp reçoit la référence d'album (l'adresse de
+    /// la page) que la file ou l'historique connaissent déjà pour cette piste.
+    ///
+    /// Le client n'envoie que `service_id`, et pour Bandcamp c'est une URL de
+    /// flux qui expirera : sans la page, le favori ne pourrait plus jamais être
+    /// resigné. Ne fait rien pour les autres services, ni quand la page n'est connue nulle
+    /// part : le favori reste alors comme avant la migration 114. Une erreur
+    /// de base ici n'annule pas l'ajout — le favori est écrit, seule la
+    /// référence manque.
+    fn completer_reference_d_album(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+    ) {
+        // `bandcamp`, ou la clé locale `__bandcamp__` que le client web pose
+        // sur les vignettes de l'onglet Bandcamp (voir `favorites_identity`).
+        if !service.contains("bandcamp") {
+            return;
+        }
+        let Some(page) = super::reference_d_album::reference_d_album_bandcamp(&self.db, service_id)
+        else {
+            return;
+        };
+        let sql = self.dialect_sql(sql::completer_album_ref, sql::completer_album_ref);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 5] = [&page, &profile_id, &item_type, &service, &service_id];
+        let _ = self.db.execute(&sql, &params);
+    }
+
+    /// Pose le marquage IA d'un favori (#5530). Sans effet si le favori
+    /// n'existe pas.
+    pub fn poser_ia(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+        ia: bool,
+    ) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::poser_ia, sql::poser_ia);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let valeur = marquage_ia_ecrit(ia);
+        let params: [&dyn ToSqlValue; 5] =
+            [&valeur, &profile_id, &item_type, &service, &service_id];
+        self.db.execute(&sql, &params).map(|_| ())
+    }
+
+    /// Pose le marquage IA d'un ALBUM de service sur tous les favoris qui le
+    /// désignent, tous profils confondus (#5530) : l'album en favori, et les
+    /// pistes favorites dont `album_ref` le nomme. Rend le nombre de lignes
+    /// changées, quand le moteur le dit.
+    pub fn marquer_album_ia(
+        &self,
+        service: &str,
+        album_id: &str,
+        ia: bool,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(sql::marquer_album_ia, sql::marquer_album_ia);
+        let valeur = marquage_ia_ecrit(ia);
+        let params: [&dyn ToSqlValue; 5] = [&valeur, &service, &album_id, &album_id, &valeur];
+        self.db.execute(&sql, &params)
+    }
+
+    /// La référence d'album rangée avec ce favori (fil 2121), ou `None`.
+    pub fn reference_d_album(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+    ) -> Result<Option<String>, String> {
+        let sql = self.dialect_sql(sql::album_ref, sql::album_ref);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 4] = [&profile_id, &item_type, &service, &service_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
     /// Ajoute un favori avec la date que le SERVICE lui donne (`created_at`,
@@ -335,6 +490,7 @@ impl StreamingFavoritesRepo {
             &date,
         ];
         self.db.execute(&sql, &params)?;
+        self.completer_reference_d_album(pid, item_type, service, service_id);
         Ok(())
     }
 
@@ -463,9 +619,10 @@ impl StreamingFavoritesRepo {
                 self.db.query_many(&sql, &params)?
             };
             favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
-                // 11 et non 10 : `first_seen_at` s'est glissé entre
-                // `created_at` et `position` dans SELECT_COLS_POUR_RANG.
-                r.get(11).and_then(|v| v.as_i64())
+                // 12 et non 10 : `first_seen_at` puis `ai_generated` (#5530)
+                // se sont glissés entre `created_at` et `position` dans
+                // SELECT_COLS_POUR_RANG.
+                r.get(12).and_then(|v| v.as_i64())
             });
             return Ok(rows.iter().map(row_to_streaming_favorite).collect());
         }
@@ -546,6 +703,26 @@ fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
         cover_url: cols.get(8).and_then(|v| v.as_string()),
         created_at: cols.get(9).and_then(|v| v.as_string()),
         first_seen_at: cols.get(10).and_then(|v| v.as_string()),
+        ai_generated: cols
+            .get(11)
+            .and_then(|v| v.as_string())
+            .and_then(|v| marquage_ia_lu(&v)),
+    }
+}
+
+/// La valeur rangée dans `streaming_favorites.ai_generated` (#5530).
+///
+/// TEXT des deux côtés (voir la migration 118) : `'1'` marqué, `'0'` non.
+pub(crate) fn marquage_ia_ecrit(ia: bool) -> &'static str {
+    if ia { "1" } else { "0" }
+}
+
+/// La lecture inverse ; toute autre valeur vaut « inconnu ».
+fn marquage_ia_lu(v: &str) -> Option<bool> {
+    match v.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -559,6 +736,58 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         StreamingFavoritesRepo::new(db)
+    }
+
+    /// #5530 — le marquage IA d'un album se range sur le favori album ET sur
+    /// les pistes favorites dont la référence d'album le nomme, pour tous les
+    /// profils ; une autre piste, un autre service, n'y gagnent rien.
+    #[test]
+    fn le_marquage_ia_d_un_album_atteint_ses_favoris_5530() {
+        let repo = fresh_repo();
+        repo.add(1, "album", "qobuz", "tj9je5zd70wsc", None, None, None, None)
+            .unwrap();
+        repo.add(2, "album", "qobuz", "tj9je5zd70wsc", None, None, None, None)
+            .unwrap();
+        repo.add(1, "track", "qobuz", "71", None, None, None, None)
+            .unwrap();
+        repo.add(1, "track", "qobuz", "72", None, None, None, None)
+            .unwrap();
+        repo.add(1, "album", "tidal", "tj9je5zd70wsc", None, None, None, None)
+            .unwrap();
+        repo.db
+            .execute(
+                "UPDATE streaming_favorites SET album_ref = 'tj9je5zd70wsc' WHERE service_id = '71'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            repo.marquer_album_ia("qobuz", "tj9je5zd70wsc", true)
+                .unwrap(),
+            3
+        );
+        // Rejoué : rien ne change, rien n'est réécrit.
+        assert_eq!(
+            repo.marquer_album_ia("qobuz", "tj9je5zd70wsc", true)
+                .unwrap(),
+            0
+        );
+        let ia = |p: i64, t: &str, svc: &str, id: &str| {
+            repo.list(p, Some(t))
+                .unwrap()
+                .into_iter()
+                .find(|f| f.service == svc && f.service_id == id)
+                .unwrap()
+                .ai_generated
+        };
+        assert_eq!(ia(1, "album", "qobuz", "tj9je5zd70wsc"), Some(true));
+        assert_eq!(ia(2, "album", "qobuz", "tj9je5zd70wsc"), Some(true));
+        assert_eq!(ia(1, "track", "qobuz", "71"), Some(true));
+        assert_eq!(ia(1, "track", "qobuz", "72"), None);
+        assert_eq!(ia(1, "album", "tidal", "tj9je5zd70wsc"), None);
+        // Le service corrige : on le suit.
+        repo.poser_ia(1, "album", "qobuz", "tj9je5zd70wsc", false)
+            .unwrap();
+        assert_eq!(ia(1, "album", "qobuz", "tj9je5zd70wsc"), Some(false));
     }
 
     #[test]
@@ -780,7 +1009,7 @@ mod tests {
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
         assert!(
             sql::list_by_type_pour_rang(&SqliteDialect)
-                .contains("created_at, first_seen_at, position")
+                .contains("created_at, first_seen_at, ai_generated, position")
         );
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }

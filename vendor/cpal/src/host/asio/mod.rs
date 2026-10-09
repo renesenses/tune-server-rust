@@ -19,6 +19,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod device;
+// Tune (#5643): pure helpers of the native DSD output path.
+pub(crate) mod dsd;
 mod stream;
 
 /// Global ASIO instance shared across all Host instances.
