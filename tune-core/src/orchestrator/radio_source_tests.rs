@@ -169,3 +169,109 @@ async fn radio_4346_flac_probe_keeps_original_resolution_5336() {
     assert_eq!(wire.sample_rate, 96_000);
     assert_eq!(wire.bit_depth, 16);
 }
+
+/// #5716 — de bout en bout : la sonde RÉELLE d'une station MP3 servie en
+/// local remplit le codec de la station qui n'en avait pas, par l'observateur
+/// que `decoder_la_radio_en_wav` et `servir_la_radio_au_reseau` posent sur
+/// leur session. Une station au codec déjà connu le garde.
+#[tokio::test]
+async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
+    use crate::db::backend::DbBackend;
+    use crate::db::radio_repo::{RadioRepo, RadioStation};
+    let bytes: &'static [u8] = include_bytes!("../../tests/fixtures/test.mp3");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/{file}",
+        axum::routing::get(move || async move {
+            ([("content-type", "application/octet-stream")], bytes)
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let sqlite = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    sqlite.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&sqlite).unwrap();
+    let db: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(sqlite);
+    let repo = RadioRepo::with_backend(db.clone());
+    let station = |url: &str, codec: Option<&str>| RadioStation {
+        id: None,
+        name: url.into(),
+        url: url.into(),
+        homepage: None,
+        logo_url: None,
+        country: None,
+        language: None,
+        genre: None,
+        codec: codec.map(Into::into),
+        bitrate: None,
+        is_favorite: false,
+        last_played: None,
+        play_count: 0,
+    };
+    let sans_codec_url = format!("{base}/sans-codec.mp3");
+    let connue_url = format!("{base}/connue.mp3");
+    let sans_codec = repo.create(&station(&sans_codec_url, None)).unwrap();
+    let connue = repo.create(&station(&connue_url, Some("AAC"))).unwrap();
+
+    for url in [sans_codec_url.clone(), connue_url.clone()] {
+        let streamer = AudioStreamer::new(8080);
+        let (id, tx, data_ready, session) = streamer
+            .create_radio_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44_100,
+                    bit_depth: 16,
+                    channels: 2,
+                    ..Default::default()
+                },
+                8,
+            )
+            .await;
+        retenir_le_codec_de_la_station(&db, &session, Some(&url));
+        let preparee = tokio::task::spawn_blocking(move || {
+            let sonde = sonder_la_station(&url).unwrap();
+            let mut etat = EtatRadio {
+                first_chunk_sent: false,
+                pcm_buf: Vec::new(),
+                chunk_size: 32768,
+                reconnects: 0,
+                dropped_at: None,
+                expected_format: None,
+                radio_eq: None,
+                eq_de_depart_pose: false,
+            };
+            let rt = tokio::runtime::Handle::current();
+            let canaux = CanauxRadio {
+                tx: &tx,
+                data_ready: &data_ready,
+                session: &session,
+                eq_profile: &None,
+                en_vol: &None,
+                levels_tx: &None,
+                rt: &rt,
+                strict_bitperfect: false,
+                sortie_locale: false,
+            };
+            preparer_la_sortie(&mut etat, &url, &canaux, &sonde).is_ok()
+        })
+        .await
+        .unwrap();
+        assert!(preparee);
+        streamer.remove_session(&id).await;
+    }
+    server.abort();
+
+    let codec = |id| repo.get(id).unwrap().unwrap().codec;
+    assert_eq!(
+        codec(sans_codec).as_deref(),
+        Some("MP3"),
+        "#5716 : la station sans codec doit retenir le codec que la sonde a reconnu"
+    );
+    assert_eq!(
+        codec(connue).as_deref(),
+        Some("AAC"),
+        "un codec déjà connu n'est pas remplacé par la sonde"
+    );
+}

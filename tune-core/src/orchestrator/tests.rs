@@ -710,6 +710,93 @@ async fn le_cretemetre_suit_le_gain_de_la_sortie() {
     assert_eq!(rendu_gain_db, 0.0);
 }
 
+/// #4384 — « preamp +6 dB, pas de changement » : à volume plein, le produit
+/// volume × ReplayGain est raboté à l'unité, et le niveau publié ne bougeait
+/// pas sans que rien ne dise pourquoi. `playback.audio_levels` porte
+/// désormais le gain DEMANDÉ avant rabot et un drapeau de rabot, sur une
+/// sortie locale seulement.
+///
+/// Garde de COMPORTEMENT sur la chaîne réelle (forwarder cadencé → bus) :
+///   * +6 dB demandés (volume plein, facteur ×2) ⇒ `output_gain_requested_db`
+///     ≈ +6, `output_gain_limited` vrai ;
+///   * volume 50 %, facteur ×1 ⇒ ≈ −6 dB demandés, pas de rabot ;
+///   * la part de compensation portée par l'égaliseur (16 bits hauts) ne
+///     change pas le produit demandé ;
+///   * DoP ou aucune sortie locale ⇒ champs ABSENTS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_niveaux_disent_le_gain_demande_et_le_rabot_a_l_unite_4384() {
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    async fn publier(
+        zone_id: i64,
+        demande: Option<crate::playback::GainDemande>,
+    ) -> serde_json::Value {
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        if let Some(d) = demande {
+            playback.brancher_le_gain_demande(zone_id, d);
+        }
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let pcm = vec![0u8; 512 * 4];
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!reste.is_zero(), "aucun playback.audio_levels publié");
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => return ev.data,
+                Ok(Ok(_)) => {}
+                autre => panic!("bus muet : {autre:?}"),
+            }
+        }
+    }
+    let demande = |volume: u32, facteur: u32, dop: bool| crate::playback::GainDemande {
+        volume_utilisateur: Arc::new(AtomicU32::new(volume)),
+        facteur_de_rendu: Arc::new(AtomicU32::new(facteur)),
+        dop: Arc::new(AtomicBool::new(dop)),
+    };
+
+    let rabote = publier(987_670, Some(demande(1000, 2000, false))).await;
+    let db = rabote["output_gain_requested_db"]
+        .as_f64()
+        .expect("output_gain_requested_db sur une sortie locale");
+    assert!((db - 6.02).abs() < 0.05, "+6 dB demandés, lu {db}");
+    assert_eq!(
+        rabote["output_gain_limited"], true,
+        "+6 dB à volume plein : le rabot mord"
+    );
+
+    let bas = publier(987_671, Some(demande(500, 1000, false))).await;
+    let db = bas["output_gain_requested_db"].as_f64().expect("champ");
+    assert!((db + 6.02).abs() < 0.05, "−6 dB demandés, lu {db}");
+    assert_eq!(bas["output_gain_limited"], false);
+
+    // Facteur ×2 dont ×1,5 porté par l'égaliseur : le produit demandé reste ×2.
+    let porte = publier(987_672, Some(demande(1000, (1500 << 16) | 2000, false))).await;
+    let db = porte["output_gain_requested_db"].as_f64().expect("champ");
+    assert!(
+        (db - 6.02).abs() < 0.05,
+        "la part portée ne compte pas, lu {db}"
+    );
+
+    for (zone_id, d) in [(987_673, Some(demande(1000, 2000, true))), (987_674, None)] {
+        let v = publier(zone_id, d).await;
+        assert!(v.get("output_gain_requested_db").is_none(), "{v}");
+        assert!(v.get("output_gain_limited").is_none(), "{v}");
+    }
+}
+
 /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
 /// passe à la suivante, au lieu de publier son PCM sur l'horloge de la
 /// nouvelle. C'est ce que garantit l'épinglage de la génération au moment
@@ -9157,6 +9244,81 @@ async fn la_portee_de_la_bascule_pure_distingue_la_relance_de_la_piste_suivante_
     assert_eq!(portee, PorteeDuReglage::RienNeJoue);
     assert_eq!(portee.code(), "not_playing");
 }
+/// #5683 — une bascule PURE est ANNONCÉE au client (`zone.updated`), quelle
+/// que soit sa portée. Seul le bras « flux conservé » l'annonçait ; ailleurs,
+/// le panneau « Chemin du signal » gardait l'étape ReplayGain d'avant la
+/// bascule jusqu'au premier geste de volume, dont l'événement relisait
+/// `/zones` — d'où « l'étape suit le curseur, pas PURE » (GgB, fil 1797).
+#[tokio::test]
+async fn toute_bascule_pure_annonce_la_zone_au_client_5683() {
+    use crate::orchestrator::PorteeDuReglage;
+
+    fn annoncee(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+        zone_id: i64,
+    ) -> bool {
+        let mut vue = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event_type == "zone.updated" && ev.data["zone_id"] == zone_id {
+                vue = true;
+            }
+        }
+        vue
+    }
+
+    // Relance : zone réseau dont le flux porte un égaliseur.
+    let (mut orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-relance")).await;
+    let bus = Arc::new(EventBus::new());
+    orch.event_bus = Some(bus.clone());
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 42_000).await;
+    let mut rx = bus.subscribe();
+    regler_pure(&orch, zone_id, true);
+    assert_eq!(
+        orch.apply_audiophile_change_portee(zone_id).await,
+        PorteeDuReglage::Relance
+    );
+    assert!(
+        annoncee(&mut rx, zone_id),
+        "bascule PURE avec relance du flux : aucune annonce `zone.updated`, le \
+         panneau garde l'état d'avant la bascule"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    // Piste suivante : zone navigateur, position inconnue.
+    let (mut orch2, zone2, _dir2) = zone_qui_joue_un_flac(Some("browser"), None).await;
+    let bus2 = Arc::new(EventBus::new());
+    orch2.event_bus = Some(bus2.clone());
+    let orch2 = Arc::new(orch2);
+    armer_un_egaliseur_audible(&orch2, zone2);
+    let mut rx2 = bus2.subscribe();
+    regler_pure(&orch2, zone2, true);
+    assert_eq!(
+        orch2.apply_audiophile_change_portee(zone2).await,
+        PorteeDuReglage::PisteSuivante
+    );
+    assert!(
+        annoncee(&mut rx2, zone2),
+        "bascule PURE portée à la piste suivante : aucune annonce `zone.updated`"
+    );
+
+    // Flux conservé : l'annonce d'avant reste là.
+    let (mut orch3, zone3, _dir3) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-5683-nu")).await;
+    let bus3 = Arc::new(EventBus::new());
+    orch3.event_bus = Some(bus3.clone());
+    let orch3 = Arc::new(orch3);
+    let mut rx3 = bus3.subscribe();
+    regler_pure(&orch3, zone3, true);
+    assert_eq!(
+        orch3.apply_audiophile_change_portee(zone3).await,
+        PorteeDuReglage::Immediate
+    );
+    assert!(annoncee(&mut rx3, zone3));
+}
+
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision

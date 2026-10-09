@@ -47,6 +47,9 @@ pub(crate) enum Famille {
     RefPlaylist,
     Favori,
     Etiquette,
+    /// Un marquage du SERVICE, oui ou non, sans valeur à saisir — #5530,
+    /// « généré par IA » (Qobuz).
+    Marquage,
 }
 
 impl Famille {
@@ -71,6 +74,9 @@ impl Famille {
             Famille::RefCollection | Famille::RefPlaylist => &["in", "not_in"],
             Famille::Favori | Famille::Etiquette => &["is", "is_not"],
             Famille::Compte => &[">=", ">", "<", "=", "between"],
+            // « non » d'abord : c'est la règle demandée (« pas d'IA »), et
+            // l'éditeur part sur le premier opérateur.
+            Famille::Marquage => &["is_false", "is_true"],
         }
     }
 }
@@ -136,6 +142,11 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("in_playlist", Famille::RefPlaylist),
     deux("favorite", Famille::Favori),
     deux("tag", Famille::Etiquette),
+    // #5530 — « Généré par IA » : le marquage que Qobuz pose sur un ALBUM
+    // (`album/get` → `ai_generated`). Dans une playlist, celui de l'album de
+    // la piste. Seuls les contenus de SERVICE le portent : une piste de la
+    // bibliothèque n'est jamais marquée.
+    deux("ai_generated", Famille::Marquage),
     // --- Propres aux PISTES ---
     Critere {
         collection: None,
@@ -184,6 +195,7 @@ pub(crate) mod tests {
             (Famille::RefCollection | Famille::RefPlaylist, _) => json!("classic:1"),
             (Famille::Favori, _) => json!("track"),
             (Famille::Etiquette, _) => json!("7"),
+            (Famille::Marquage, _) => Value::Null,
             (Famille::Texte | Famille::Vide, _) => json!("x"),
         }
     }
@@ -409,14 +421,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : vingt-huit définitions, dont vingt-six aux
-    /// collections. Si ce nombre bouge, `smartRegles.ts` doit bouger aussi.
+    /// Le compte du client : vingt-neuf définitions, dont vingt-sept aux
+    /// collections (#5530 : « Généré par IA »). Si ce nombre bouge,
+    /// `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 28);
+        assert_eq!(CRITERES.len(), 29);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            26
+            27
         );
     }
 

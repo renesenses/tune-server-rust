@@ -391,6 +391,54 @@ impl DsdToPcmStreamer {
         }
     }
 
+    /// Un convertisseur qui REPREND le flux à la position DSD absolue
+    /// `position` (en échantillons par canal), au lieu de le prendre au début.
+    ///
+    /// Il rend, à partir de [`Self::prochaine_sortie`], EXACTEMENT les sorties
+    /// qu'aurait rendues [`Self::new`] nourri depuis le premier bit : la sortie
+    /// `n` ne lit que les bits de sa fenêtre FIR, et la première sortie retenue
+    /// est la première dont la fenêtre entière commence à `position` ou après.
+    /// Mêmes produits, même ordre de sommation, même bourrage de fin : au bit
+    /// près (`streamer_repris_identique_au_bit_au_flux_entier`).
+    ///
+    /// C'est ce qui permet à un décodage borné d'un DSF ou d'un DFF de partir
+    /// du bloc qui précède sa fenêtre, au lieu de convertir tout ce qui la
+    /// précède : l'analyse par segments de 30 s re-décodait la piste depuis
+    /// son début à CHAQUE segment — un coût quadratique en temps, et une
+    /// mémoire qui croissait avec la position du segment (plafond-analyse).
+    pub fn a_partir_de(
+        dsd_rate: u32,
+        target_rate: u32,
+        channels: usize,
+        lsb_first: bool,
+        position: usize,
+    ) -> Self {
+        let mut s = Self::new(dsd_rate, target_rate, channels, lsb_first);
+        if position == 0 {
+            return s;
+        }
+        let d = s.decimation_ratio;
+        let demi = s.filter_coeffs.len() / 2;
+        // Plus petit n tel que n·D + D/2 − L/2 ≥ position.
+        let premiere = (position + demi).saturating_sub(d / 2).div_ceil(d);
+        s.hist = vec![Vec::new(); channels];
+        s.hist_base = position as isize;
+        s.total_dsd_samples = position;
+        s.output_sample_idx = premiere;
+        s
+    }
+
+    /// Indice (par canal) de la prochaine sortie que rendra ce convertisseur.
+    pub fn prochaine_sortie(&self) -> usize {
+        self.output_sample_idx
+    }
+
+    /// Position DSD absolue (par canal) du premier bit dont a besoin la
+    /// sortie `n` — négative quand sa fenêtre déborde avant le début du flux.
+    pub fn premier_bit_de_la_sortie(&self, n: usize) -> isize {
+        self.debut_fenetre(n)
+    }
+
     /// Position absolue du premier tap de la sortie `n`.
     fn debut_fenetre(&self, n: usize) -> isize {
         (n * self.decimation_ratio + self.decimation_ratio / 2) as isize
@@ -1127,6 +1175,55 @@ mod tests {
             sortie, reference,
             "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : le découpage en blocs ne doit rien changer"
         );
+    }
+
+    /// plafond-analyse — un convertisseur REPRIS à une position quelconque
+    /// rend, à partir de sa première sortie, le même PCM au bit près que le
+    /// flux converti depuis son début.
+    fn verifier_reprise(dsd_rate: u32, pcm_rate: u32, channels: usize, lsb: bool) {
+        let octets_par_canal = 6000usize;
+        let data = dsd_lcg(octets_par_canal * channels, 0xb209 ^ dsd_rate);
+        let mut entier = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+        let mut reference = entier.feed(&data);
+        reference.extend_from_slice(&entier.flush());
+
+        // Début, juste après, milieu non aligné, près de la fin, au-delà.
+        for octet in [0usize, 1, 3, 37, 512, 2999, 5990, 6000] {
+            let position = octet * 8;
+            let mut repris =
+                DsdToPcmStreamer::a_partir_de(dsd_rate, pcm_rate, channels, lsb, position);
+            let premiere = repris.prochaine_sortie();
+            assert!(
+                repris.premier_bit_de_la_sortie(premiere) >= position as isize || position == 0,
+                "la première sortie ne doit lire aucun bit avant la reprise"
+            );
+            let mut sortie = Vec::new();
+            for bloc in data[octet * channels..].chunks(1234 * channels) {
+                sortie.extend_from_slice(&repris.feed(bloc));
+            }
+            sortie.extend_from_slice(&repris.flush());
+            let debut = (premiere * channels * 3).min(reference.len());
+            assert_eq!(
+                sortie,
+                reference[debut..],
+                "{dsd_rate}->{pcm_rate} {channels} canal(aux) : reprise à l'octet {octet} (sortie {premiere})"
+            );
+            if octet > 0 && octet < octets_par_canal {
+                // La reprise ne perd rien qu'elle aurait pu rendre : la sortie
+                // précédente lisait forcément un bit d'avant la reprise.
+                assert!(premiere > 0);
+                assert!(repris.premier_bit_de_la_sortie(premiere - 1) < position as isize);
+            }
+        }
+    }
+
+    #[test]
+    fn streamer_repris_identique_au_bit_au_flux_entier() {
+        verifier_reprise(2_822_400, 176_400, 2, true);
+        verifier_reprise(2_822_400, 88_200, 1, false);
+        verifier_reprise(5_644_800, 352_800, 2, false);
+        verifier_reprise(11_289_600, 352_800, 2, true);
+        verifier_reprise(22_579_200, 44_100, 2, true);
     }
 
     #[test]

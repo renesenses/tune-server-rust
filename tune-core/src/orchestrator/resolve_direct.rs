@@ -825,6 +825,15 @@ impl PlaybackOrchestrator {
         }
         // ------------------------------------------------------------------
 
+        // Fil 2062 / #5550 — un serveur UPnP qui n'annonce aucune durée (la
+        // Freebox) : on la lit dans les en-têtes du flux, et seulement alors.
+        // Une durée connue passe telle quelle, sans une requête de plus.
+        let duration_ms = if source == "upnp" {
+            self.duree_d_une_piste_upnp(req, audio_url).await
+        } else {
+            duration_ms
+        };
+
         // La sortie locale applique déjà l'EQ dans son callback : le refaire
         // ici colorerait le signal deux fois. OAAT, DLNA et navigateur
         // consomment en revanche le WAV construit par ce décodeur ; le profil
@@ -996,6 +1005,7 @@ impl PlaybackOrchestrator {
 
         let (session_id, tx, data_ready, session) =
             self.streamer.create_radio_session(wav_info, 256).await;
+        retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
         // #4407 — OAAT consomme le WAV égalisé par Tune : un changement
         // d'égaliseur s'y relève en vol. La sortie locale égalise elle-même.
         let en_vol = (!is_local_output).then(|| {
@@ -1795,6 +1805,7 @@ impl PlaybackOrchestrator {
             };
             let (session_id, tx, data_ready, session) =
                 self.streamer.create_radio_session(wav_info, 256).await;
+            retenir_le_codec_de_la_station(&self.db, &session, req.source_id.as_deref());
             info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
             // #4407 — le poste de relève : un changement d'égaliseur est posé
             // dans CE flux au paquet suivant, sans nouvelle session UPnP.

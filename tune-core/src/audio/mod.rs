@@ -15,6 +15,7 @@ pub mod channels;
 pub mod compensation_reseau;
 pub mod convolver;
 pub mod crete_de_sortie;
+pub mod crete_vraie;
 pub mod crossfeed;
 pub mod dash_growth;
 pub mod decode;
@@ -41,6 +42,8 @@ pub mod dsf;
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
 mod dsf_http_progressif_tests;
+/// Fil 2062 — la durée d'un flux distant lue dans ses en-têtes.
+pub mod duree_des_entetes;
 pub mod ecretage;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;

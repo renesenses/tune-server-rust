@@ -313,7 +313,13 @@ pub async fn ensemencer_le_volume_local(
     sortie: &dyn crate::outputs::OutputTarget,
 ) {
     let trim_db = zone.id.map_or(0.0, |id| gain_trim_db_enregistre(db, id));
-    let stored = volume_de_graine(zone.volume, zone.fixed_volume, trim_db);
+    // #5695 — PURE verrouillé : 100 % sans trim, comme `set_volume` et
+    // `arm_fixed_volume`. Un trim de −1,6 dB faisait naître la sortie à 83 %.
+    let pure_force = zone.id.is_some_and(|id| {
+        crate::audio::audiophile::zone_enabled(db, id)
+            && crate::audio::audiophile::volume_lock_enabled(db, id)
+    });
+    let stored = volume_de_graine(zone.volume, zone.fixed_volume || pure_force, trim_db);
     if let Err(e) = crate::outputs::OutputTarget::set_volume(sortie, stored).await {
         warn!(device_id = %device_id, error = %e, "local_output_volume_seed_failed");
     } else {

@@ -352,6 +352,12 @@ def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool, b
         # à la déclaration exportée suivante : sans cette borne, une fonction
         # sans appel s'attribuerait la route de sa voisine.
         apres = api_ts[debut + len(corps) + 1 :]
+        # `Promise<{ … }[]>` : la liste s'écrit APRÈS l'accolade fermante, pas
+        # en tête comme `Array<{`. Sans ce suffixe, `/converter/presets` était
+        # cartographiée comme un objet alors que le client et le serveur
+        # parlent tous deux d'un tableau (#1897) — le banc ne pouvait que la
+        # déclarer divergente à tort, ou se taire sur ses éléments.
+        liste = bool(m.group("liste")) or re.match(r"\}\s*\[\s*\]", apres) is not None
         fin = apres.find("\nexport ")
         if fin != -1:
             apres = apres[:fin]
@@ -370,7 +376,7 @@ def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool, b
             route,
             m_meth.group(1).upper() if m_meth else "GET",
             corps,
-            bool(m.group("liste")),
+            liste,
             url is not None,
         ))
     return trouves
@@ -516,6 +522,10 @@ def self_test() -> int:
         return fetchJSON(`${BASE}/converter/jobs/${jobId}`, { method: 'DELETE' });
       }
 
+      export function presetsConv(): Promise<{ id: string; label: string }[]> {
+        return fetchJSON(`${BASE}/converter/presets`);
+      }
+
       export function opaque(): Promise<{ [k: string]: unknown }> {
         return fetchJSON(`${BASE}/sans/champ`);
       }
@@ -578,6 +588,15 @@ def self_test() -> int:
     elif annul[0]["methode"] != "DELETE":
         echecs.append(f"la méthode de la seconde forme est fausse : {annul[0]['methode']}")
 
+    # `Promise<{ … }[]>` — le suffixe de liste suit l'accolade fermante (#1897).
+    presets = par_route.get("/converter/presets")
+    if presets is None:
+        echecs.append("un retour de fonction `{ … }[]` n'est pas cartographié")
+    elif not presets["liste"]:
+        echecs.append("un retour de fonction `{ … }[]` n'est pas marqué comme liste")
+    elif presets["champs_obligatoires"] != ["id", "label"]:
+        echecs.append(f"champs d'un retour `{{ … }}[]` mal lus : {presets['champs_obligatoires']}")
+
     if "/sans/champ" in par_route:
         echecs.append("un type sans champ de premier niveau est cartographié comme un contrat")
     elif not any(nr.get("route") == "/sans/champ" for nr in non_resolus):
@@ -615,10 +634,10 @@ def self_test() -> int:
             print(f"  ✗ {e}")
         print("SELF-TEST: ÉCHEC")
         return 1
-    print("SELF-TEST: ok — 17 garanties (déclaration générique ignorée, type nommé, "
+    print("SELF-TEST: ok — 18 garanties (déclaration générique ignorée, type nommé, "
           "optionnels, liste, paramètre d'URL, type en ligne, import en ligne, route "
           "à parenthèses, méthode HTTP, les deux non-résolutions, et les quatre du "
-          "type porté par l'annotation de retour, correction nominale)")
+          "type porté par l'annotation de retour, liste en suffixe `{ … }[]`, correction nominale)")
     return 0
 
 

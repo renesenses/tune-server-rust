@@ -416,6 +416,15 @@ pub struct TrackImporter {
     /// Lignes album déjà reprises sous « Various Artists » pendant ce scan
     /// (#3232) : la reprise se fait UNE fois, pas à chaque piste du dossier.
     albums_reclasses: HashSet<i64>,
+    /// #5616 — albums dont le type de sortie de la balise a déjà été proposé
+    /// pendant ce scan : un seul `UPDATE` par album, pas un par piste.
+    types_de_sortie_poses: HashSet<i64>,
+    /// Section « Live » — même marque pour les types SECONDAIRES de la balise.
+    types_secondaires_poses: HashSet<i64>,
+    /// #5837 — les lignes album déjà tenues par une clé de `album_cache`
+    /// pendant ce scan. Une ligne reprise pour une clé ne l'est jamais pour
+    /// une autre : ce serait fondre deux parutions en une.
+    albums_en_cache: HashSet<i64>,
     /// `(dossier, album)` dont la décision « compilation » a déjà été
     /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
     /// écrirait la même ligne huit cents fois.
@@ -468,6 +477,10 @@ pub struct TrackImporter {
     /// `Some` dans un lot de scan : le travail de pochette mis de côté par
     /// `import`, fait après le `COMMIT` (#5202). `None` : fait sur-le-champ.
     pochettes_differees: Option<Vec<PochetteAFaire>>,
+    /// Sous-arbres d'un montage imbriqué tombé, vus avant l'import (suite de
+    /// #5854). Une pochette dont le fichier source vit dessous n'est ni
+    /// relue ni retirée : ce sous-arbre n'a pas été vu.
+    sous_arbres_proteges: Vec<String>,
 }
 
 /// Ce que la pochette d'une piste importée doit savoir d'elle (#5202).
@@ -555,6 +568,9 @@ impl TrackImporter {
             dir_album_artist: HashMap::new(),
             preuves,
             albums_reclasses: HashSet::new(),
+            types_de_sortie_poses: HashSet::new(),
+            types_secondaires_poses: HashSet::new(),
+            albums_en_cache: HashSet::new(),
             decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
@@ -564,6 +580,7 @@ impl TrackImporter {
             force_artwork: false,
             tenues,
             pochettes_differees: None,
+            sous_arbres_proteges: Vec::new(),
         }
     }
 
@@ -690,6 +707,32 @@ impl TrackImporter {
     pub fn with_force_artwork(mut self, force: bool) -> Self {
         self.force_artwork = force;
         self
+    }
+
+    /// Voir [`TrackImporter::sous_arbres_proteges`].
+    #[must_use]
+    pub fn avec_sous_arbres_proteges(mut self, sous_arbres: Vec<String>) -> Self {
+        self.sous_arbres_proteges = sous_arbres;
+        self
+    }
+
+    /// La pochette de l'album vient-elle d'un fichier situé sous un
+    /// sous-arbre protégé ? Rien n'y est conclu : elle est gardée telle
+    /// quelle.
+    fn pochette_sous_un_sous_arbre_protege(&self, album_id: i64) -> bool {
+        if self.sous_arbres_proteges.is_empty() {
+            return false;
+        }
+        self.album_repo
+            .etat_pochette(album_id)
+            .ok()
+            .flatten()
+            .and_then(|e| e.fichier)
+            .is_some_and(|f| {
+                self.sous_arbres_proteges
+                    .iter()
+                    .any(|d| crate::routes::system::scan::sous_le_dossier(&f, d))
+            })
     }
 
     /// Number of album covers extracted so far (for the scan report).
@@ -842,6 +885,72 @@ impl TrackImporter {
             .collect();
     }
 
+    /// #5837 (fil 2153) — la ligne album que ce fichier occupe DÉJÀ, quand
+    /// seul son artiste d'album a changé de résolution depuis le scan qui l'a
+    /// posée.
+    ///
+    /// Sans cette reprise, la clé `(titre, artiste, année, MBID)` ne retrouve
+    /// pas la ligne d'origine — elle porte l'ancien artiste, par exemple
+    /// l'artiste d'album vide ou générique d'une compilation désormais rangée
+    /// sous « Various Artists » — et `get_or_create_for_folder_with_track` en
+    /// crée une NOUVELLE. L'ancienne garde titre, pochette et année, perd
+    /// toutes ses pistes, et reste dans la grille jusqu'à la purge des
+    /// orphelins de FIN de scan : des heures sur une grande bibliothèque, et
+    /// une fiche « 0 piste », sans artiste, pour qui l'ouvre entre-temps.
+    /// L'album changeait aussi d'identifiant.
+    ///
+    /// La voie par dossier fait déjà cette reprise (`find_id_by_folder`) ; elle
+    /// manque quand `quality_split` est coupé et quand la ligne n'a pas de
+    /// `folder_path` (base ancienne ou migrée). La reprise ne vaut que si :
+    ///
+    /// - le titre est le même (sans la casse), et l'année et le MBID de
+    ///   release ne se contredisent pas ;
+    /// - l'artiste diffère — sinon la voie normale retrouve la ligne seule, et
+    ///   coffrets, miroirs et compilations éparpillées gardent leurs règles ;
+    /// - la ligne n'appartient pas à un AUTRE dossier quand le dossier fait
+    ///   l'identité (`quality_split`) ;
+    /// - aucune autre clé ne la tient déjà pendant ce scan ;
+    /// - son artiste n'est pas tenu à la main (C3) : alors rien ne change.
+    fn album_du_fichier_a_reprendre(&mut self, chemin: &str, cle: &CleDAlbum) -> Option<Album> {
+        let (dossier, titre, artiste, annee, mbid) = cle;
+        let mut ancien = self.album_repo.album_du_fichier(chemin).ok().flatten()?;
+        let id = ancien.id?;
+        fn contredit<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            matches!((a, b), (Some(x), Some(y)) if x != y)
+        }
+        if ancien.artist_id == Some(*artiste)
+            || ancien.title.to_lowercase() != titre.to_lowercase()
+            || contredit(&ancien.year, annee)
+            || contredit(&ancien.musicbrainz_release_id, mbid)
+            || self.albums_en_cache.contains(&id)
+        {
+            return None;
+        }
+        if !dossier.is_empty()
+            && let Ok(Some(f)) = self.album_repo.folder_path_of(id)
+            && f != *dossier
+        {
+            return None;
+        }
+        // `false` : l'artiste est tenu à la main, la ligne ne bouge pas.
+        if !self
+            .album_repo
+            .realigner_sur_les_balises(id, None, Some(*artiste))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        tracing::info!(
+            album_id = id,
+            album = %titre,
+            ancien_artiste_id = ?ancien.artist_id,
+            nouvel_artiste_id = artiste,
+            "album_repris_sous_son_nouvel_artiste"
+        );
+        ancien.artist_id = Some(*artiste);
+        Some(ancien)
+    }
+
     /// Resolve artist + album, extract album cover / artist image as a side
     /// effect, and build the `Track` row. Returns `None` when the file has no
     /// metadata. `id` is left `None`; the caller sets it for the update path.
@@ -915,6 +1024,14 @@ impl TrackImporter {
             }
         };
 
+        // Suite de #5854 — la pochette tirée d'un fichier sous un montage
+        // imbriqué tombé est gardée : l'album est tenu pour tranché.
+        if let Some(aid) = album_id
+            && !self.albums_with_cover.contains(&aid)
+            && self.pochette_sous_un_sous_arbre_protege(aid)
+        {
+            self.albums_with_cover.insert(aid);
+        }
         if let Some(aid) = album_id
             && !self.albums_with_cover.contains(&aid)
         {
@@ -1586,6 +1703,15 @@ impl TrackImporter {
                     );
                 }
                 Some(c)
+            } else if let Some(reprise) = self.album_du_fichier_a_reprendre(&sf.path, key) {
+                // #5837 — la ligne que ce fichier occupe déjà, reprise sous
+                // son nouvel artiste : voir `album_du_fichier_a_reprendre`.
+                let a = Arc::new(reprise);
+                if let Some(id) = a.id {
+                    self.albums_en_cache.insert(id);
+                }
+                self.album_cache.insert(key.clone(), Arc::clone(&a));
+                Some(a)
             } else {
                 let result = self.album_repo.get_or_create_for_folder_with_track(
                     &key.0,
@@ -1624,6 +1750,9 @@ impl TrackImporter {
                             file = %sf.path,
                             "BUG_album_artist_mismatch"
                         );
+                    }
+                    if let Some(id) = a.id {
+                        self.albums_en_cache.insert(id);
                     }
                     self.album_cache.insert(key.clone(), Arc::clone(a));
                 }
@@ -1699,6 +1828,34 @@ impl TrackImporter {
                     meta.original_date.as_deref(),
                 )
                 .ok();
+        }
+
+        // #5616 — le type de sortie de la balise (`RELEASETYPE` et ses
+        // variantes) remplit `albums.release_type` s'il est VIDE : un type
+        // déjà connu (MusicBrainz, service, édition manuelle) n'est jamais
+        // écrasé. Explicite, il prime ensuite sur la règle pistes et durée.
+        if let (Some(aid), Some(type_de_sortie)) = (album_id, meta.release_type.as_deref())
+            && self.types_de_sortie_poses.insert(aid)
+        {
+            if let Err(e) = self
+                .album_repo
+                .poser_type_de_sortie_si_vide(aid, type_de_sortie)
+            {
+                tracing::warn!(album_id = aid, error = %e, "type_de_sortie_balise_non_pose");
+            }
+        }
+        // Section « Live » — les types SECONDAIRES de la même balise (`live`,
+        // `remix`…) remplissent `albums.release_secondary_types` s'il est
+        // VIDE, sous la même règle : une valeur connue n'est jamais écrasée.
+        if let (Some(aid), Some(secondaires)) = (album_id, meta.release_secondary_types.as_deref())
+            && self.types_secondaires_poses.insert(aid)
+        {
+            if let Err(e) = self
+                .album_repo
+                .poser_types_secondaires_si_vides(aid, secondaires)
+            {
+                tracing::warn!(album_id = aid, error = %e, "types_secondaires_balise_non_poses");
+            }
         }
 
         // #5202 — la pochette (jaquette, image du dossier, image d'artiste)
@@ -2028,6 +2185,135 @@ mod tests {
             "un album ordinaire du même scan ne doit pas être marqué : « {} »",
             temoin.title
         );
+    }
+
+    /// #5616 — le type lu dans la balise du fichier atteint `albums.release_type`
+    /// quand la colonne est vide, et n'écrase JAMAIS un type déjà connu.
+    #[test]
+    fn le_type_de_la_balise_remplit_le_type_de_sortie_vide_5616() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+
+        let fichier = |dossier: &str, n: u32, rt: Option<&str>| {
+            let d = tmp.path().join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut f = sf(&d.join(format!("0{n}.flac")).to_string_lossy());
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{dossier} {n}")),
+                artist: Some("Fabien M".into()),
+                album: Some(dossier.to_string()),
+                album_artist: Some("Fabien M".into()),
+                track_number: Some(n),
+                release_type: rt.map(String::from),
+                ..Default::default()
+            });
+            f
+        };
+        let importer = |lot: &[ScannedFile]| {
+            let mut imp = TrackImporter::new(
+                backend.clone(),
+                true,
+                tmp.path().to_path_buf(),
+                PorteeDuScan::TOUT,
+            );
+            imp.begin_batch(lot);
+            lot.iter()
+                .map(|f| imp.import(f).expect("import").1.expect("un album"))
+                .collect::<Vec<i64>>()
+        };
+
+        // Premier scan : la 1re piste sans balise, la 2e avec `ep`.
+        let lot = vec![
+            fichier("Un EP", 1, None),
+            fichier("Un EP", 2, Some("ep")),
+            fichier("Sans balise", 1, None),
+        ];
+        let ids = importer(&lot);
+        let type_de = |id: i64| albums.get(id).unwrap().unwrap().release_type;
+        assert_eq!(type_de(ids[0]).as_deref(), Some("ep"));
+        assert_eq!(type_de(ids[2]), None, "sans balise, rien n'est inventé");
+
+        // Un type déjà connu (MusicBrainz, édition) n'est pas écrasé.
+        albums.definir_type_de_sortie(ids[0], "album").unwrap();
+        importer(&lot);
+        assert_eq!(type_de(ids[0]).as_deref(), Some("album"));
+    }
+
+    /// Section « Live » — les types secondaires de la balise atteignent
+    /// `albums.release_secondary_types` quand la colonne est vide, et
+    /// n'écrasent JAMAIS une valeur déjà connue.
+    #[test]
+    fn les_types_secondaires_de_la_balise_remplissent_la_colonne_vide() {
+        use std::sync::Arc;
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let albums = AlbumRepo::with_backend(backend.clone());
+
+        let fichier = |dossier: &str, n: u32, secondaires: Option<&str>| {
+            let d = tmp.path().join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut f = sf(&d.join(format!("0{n}.flac")).to_string_lossy());
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{dossier} {n}")),
+                artist: Some("Neil Young".into()),
+                album: Some(dossier.to_string()),
+                album_artist: Some("Neil Young".into()),
+                track_number: Some(n),
+                release_type: Some("album".into()),
+                release_secondary_types: secondaires.map(String::from),
+                ..Default::default()
+            });
+            f
+        };
+        let importer = |lot: &[ScannedFile]| {
+            let mut imp = TrackImporter::new(
+                backend.clone(),
+                true,
+                tmp.path().to_path_buf(),
+                PorteeDuScan::TOUT,
+            );
+            imp.begin_batch(lot);
+            lot.iter()
+                .map(|f| imp.import(f).expect("import").1.expect("un album"))
+                .collect::<Vec<i64>>()
+        };
+        let types_de = |id: i64| {
+            albums
+                .types_secondaires_par_album(&[id])
+                .unwrap()
+                .remove(&id)
+        };
+
+        let lot = vec![
+            fichier("Live Rust", 1, None),
+            fichier("Live Rust", 2, Some("live")),
+            fichier("Harvest", 1, None),
+        ];
+        let ids = importer(&lot);
+        assert_eq!(types_de(ids[0]), Some(vec!["live".to_string()]));
+        assert_eq!(types_de(ids[2]), None, "sans balise, rien n'est inventé");
+
+        // Une valeur déjà connue n'est pas écrasée par un scan suivant.
+        assert!(
+            !albums
+                .poser_types_secondaires_si_vides(ids[0], "remix")
+                .unwrap()
+        );
+        let relu = vec![fichier("Live Rust", 1, Some("compilation"))];
+        importer(&relu);
+        assert_eq!(types_de(ids[0]), Some(vec!["live".to_string()]));
     }
 
     #[test]

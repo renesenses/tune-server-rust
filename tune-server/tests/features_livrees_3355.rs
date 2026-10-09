@@ -85,20 +85,13 @@ const HORS_PORTE: &[(&str, &str, &str)] = &[
     // lien, et la ligne musl reprend `local-audio`. Mesure sur Shrek le
     // 19/09/2026 : binaire sans NEEDED ni interpreteur, `snd_pcm_open`
     // present. Un garde-fou de release lit ce symbole dans l'ELF publie.
-    (
-        "local-audio",
-        "docker.yml / Build tune-server (amd64, native)",
-        "L'image d'execution (Dockerfile.dist) ne porte pas libasound2. MESURE \
-         sur l'image publiee `renesenses/tune:v0.9.141`, couche \
-         `app/tune-server` : `grep -c cpal` rend 0. Constat, pas arbitrage \
-         (#3355).",
-    ),
-    (
-        "local-audio",
-        "docker.yml / Build tune-server (arm64, cross)",
-        "Meme image d'execution sans libasound2, et en plus la compilation \
-         croisee sans en-tetes ALSA pour la cible (#3355).",
-    ),
+    // Les deux exemptions `docker.yml / Build tune-server (amd64, native)` et
+    // `(arm64, cross)` ont ete LEVEES par #5968. Leur raison etait fausse :
+    // Dockerfile.dist installe libasound2 depuis 720671707 (13/07), et Cross.toml
+    // pose les en-tetes ALSA de la cible aarch64-unknown-linux-gnu depuis #3613.
+    // Sans `local-audio`, l'image publiait `supported_audio_backends: []` et ne
+    // pouvait atteindre aucun DAC USB (Fedora 44, fil 2172). Une etape de
+    // docker.yml lit `libasound.so` en NEEDED dans les deux binaires.
 ];
 
 /// Les fonctionnalites listees par `--features` dans une commande deja

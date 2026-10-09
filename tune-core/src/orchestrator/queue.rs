@@ -284,7 +284,7 @@ impl PlaybackOrchestrator {
             // worth caching — a direct proxy stream isn't transcoded.
             let stream_data = {
                 let registry = services.lock().await;
-                let Some(svc) = registry.get(&source) else {
+                let Some(svc) = registry.get_actif(&source).await else {
                     return;
                 };
                 let svc = svc.read().await;
@@ -1110,7 +1110,7 @@ impl PlaybackOrchestrator {
                         preference_de_qualite(&db, zone_id).service_token(&source);
                     let resolved = {
                         let registry = services.lock().await;
-                        let Some(svc) = registry.get(&source) else {
+                        let Some(svc) = registry.get_actif(&source).await else {
                             return;
                         };
                         let svc = svc.clone();

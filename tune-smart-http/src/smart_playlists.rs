@@ -421,7 +421,17 @@ pub(crate) fn build_smart_query_rapport(
         // historique d'écoute, date du fichier, crédits. #5547 : les trois
         // derniers venaient des collections, qui les traduisent à l'album ;
         // ici, à la PISTE.
-        let cond = if field == "rating" {
+        let cond = if field == "ai_generated" {
+            // #5530 — aucun fichier local n'est marqué par un service : la
+            // réponse est constante (voir `regles_sql`).
+            match regles_sql::condition_marquage_ia_bibliotheque(op) {
+                Some(c) => c.to_string(),
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
+        } else if field == "rating" {
             // #5547 — la note de l'album de la piste, pour le profil actif.
             match regles_sql::condition_note("t.album_id", op, value_raw, ctx.profile_id) {
                 Some(c) => c,

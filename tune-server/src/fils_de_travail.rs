@@ -42,6 +42,11 @@ pub fn construire_le_moteur() -> tokio::runtime::Runtime {
     eprintln!("tune-server: {fils} fils de travail ({processeurs} processeur(s))");
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(fils)
+        // #5677 : chaque fil de travail date son dernier réveil, pour que le
+        // relevé d'un gel dise lesquels étaient pris, et depuis quand.
+        .on_thread_park(crate::gel_executeur::travailleurs::au_garage)
+        .on_thread_unpark(crate::gel_executeur::travailleurs::au_reveil)
+        .on_thread_stop(crate::gel_executeur::travailleurs::a_l_arret)
         .enable_all()
         .build()
         .expect("construction du moteur tokio")

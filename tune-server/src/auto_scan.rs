@@ -559,6 +559,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 ecartes: &files_ecartes,
             },
         )
+        .avec_sous_arbres_proteges(crate::routes::system::scan::sous_arbres_vides_avant_import(
+            &music_dirs,
+            &existing_tracks,
+            &existing_copies,
+            &discovered_paths,
+        ))
         .avec_pochettes_differees();
         // #5202 — les métadonnées étendues se relisent AVANT la transaction du
         // lot, chaque fichier sous délai, comme dans le scan manuel.
@@ -647,7 +653,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
                 let is_sqlite = db.engine() == tune_core::db::engine::Engine::Sqlite;
-                let sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
+                let mut sqlite_write_guard = is_sqlite.then(crate::sqlite_write_gate::scan_batch);
                 if is_sqlite && db.execute("BEGIN IMMEDIATE", &[]).is_ok() {
                     // Se nommer : tout `write_tx` concurrent echouera tant
                     // que ce lot tient la connexion, et sans cette
@@ -661,7 +667,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     // Un écrivain (favori, édition, enrichissement…) attend que
                     // ce lot ferme sa transaction : lui céder la place entre deux
                     // fichiers, plutôt qu'à la fin du lot (transaction_du_lot.rs).
-                    db.ceder_aux_ecrivains();
+                    // Ticket 190 : une écriture de file en attente de la porte
+                    // passe aussi (`ceder_le_lot`).
+                    crate::sqlite_write_gate::ceder_le_lot(
+                        db.as_ref(),
+                        &mut sqlite_write_guard,
+                        "scan:auto",
+                    );
                     if let Some(unsupported) = &sf.unsupported {
                         tracing::info!(
                             path = %sf.path,
@@ -972,6 +984,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // made it into the discovered set).
         // Hissé hors du bloc pour la réconciliation des favoris (#1943).
         let mut racines_videes: Vec<String> = Vec::new();
+        // Hissé pour la passe des pochettes : un montage imbriqué tombé laisse
+        // sa racine répondre, et ce qu'il contient n'est pas jugé.
+        let mut sous_arbres: Vec<String> = Vec::new();
         // Le scan automatique purge lui aussi (voir `pruned` plus bas), et il
         // émet lui aussi `library.scan.completed`. Son rapport ne portait
         // AUCUN compteur de purge : le bandeau annonçait donc « 0 supprimés »
@@ -1014,8 +1029,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
             // `missing_dirs`, ni `error_dirs`, ni `emptied_roots` ne le voient,
             // et tout le sous-arbre partait sans un mot (#1943).
-            let sous_arbres =
-                crate::routes::system::scan::sous_arbres_vides(&existing_refs, &discovered_paths);
+            sous_arbres = crate::routes::system::scan::sous_arbres_vides(
+                &music_dirs,
+                &existing_refs,
+                &discovered_paths,
+            );
             if !sous_arbres.is_empty() {
                 tracing::error!(
                     dossiers = ?sous_arbres,
@@ -1166,6 +1184,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         // #5034 — APRÈS la purge : même confrontation des pochettes à leur
         // fichier source que le scan manuel.
+        let exclus_pochettes: Vec<String> =
+            error_dirs.iter().chain(&sous_arbres).cloned().collect();
         // #5682 (fil 2115) — seulement si les racines ont répondu. Le NAS en
         // retard au démarrage faisait voir chaque fichier source « disparu » :
         // les pistes étaient conservées, mais les pochettes retirées.
@@ -1178,7 +1198,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 &db,
                 &cache_dir,
                 &[],
-                &error_dirs,
+                &exclus_pochettes,
                 false,
             );
         } else {
@@ -1283,7 +1303,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     &db,
                     &cache_dir,
                     &[],
-                    &error_dirs,
+                    &exclus_pochettes,
                     false,
                 );
             }
@@ -1461,6 +1481,56 @@ fn scan_de_demarrage_arrete(event_bus: &EventBus, etape: &str) {
 /// forcée a arrêté un scan : il reprend alors en incrémental
 /// (`file_needs_scan` saute les fichiers inchangés).
 pub fn scan_au_demarrage(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let voulu = scan_au_demarrage_voulu(auto_scan, db);
+    if voulu != auto_scan {
+        info!(
+            voulu,
+            deploiement = auto_scan,
+            "auto_scan_regle_par_l_utilisateur — le réglage « library_scan_on_startup » prime sur la configuration de déploiement"
+        );
+    }
+    scan_au_demarrage_ou_reprise(voulu, db)
+}
+
+/// Réglage utilisateur « Analyser la bibliothèque au démarrage »
+/// (Réglages › Bibliothèque), rangé dans la table `settings`.
+///
+/// Ordre de précédence, du plus fort au plus faible :
+///
+/// 1. ce réglage, s'il a été posé (`"true"` ou `"false"`) ;
+/// 2. sinon la configuration de déploiement : `TUNE_AUTO_SCAN`, ou
+///    `auto_scan` dans `tune.toml` (`config.auto_scan`) ;
+/// 3. sinon `false`, le défaut du binaire.
+///
+/// Une installation où personne n'a touché à l'interrupteur n'a pas la ligne :
+/// elle garde donc exactement le comportement de sa configuration. La valeur
+/// est lue au démarrage ; la changer prend effet au démarrage suivant.
+pub const CLE_SCAN_AU_DEMARRAGE: &str = "library_scan_on_startup";
+
+/// Le choix de l'utilisateur, lu dans la valeur brute de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `None` : pas de choix lisible, la configuration
+/// de déploiement décide.
+pub fn choix_utilisateur_scan_au_demarrage(brut: Option<&str>) -> Option<bool> {
+    let texte = brut?.trim().trim_matches('"').trim().to_ascii_lowercase();
+    match texte.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Le scan de démarrage voulu, selon l'ordre de précédence de
+/// [`CLE_SCAN_AU_DEMARRAGE`]. `auto_scan` est la valeur de déploiement.
+pub fn scan_au_demarrage_voulu(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
+    let brut = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(CLE_SCAN_AU_DEMARRAGE)
+        .ok()
+        .flatten();
+    choix_utilisateur_scan_au_demarrage(brut.as_deref()).unwrap_or(auto_scan)
+}
+
+/// Le scan voulu, ou la reprise d'un scan arrêté par une mise à jour (#5531).
+fn scan_au_demarrage_ou_reprise(auto_scan: bool, db: &Arc<dyn DbBackend>) -> bool {
     if auto_scan {
         return true;
     }
@@ -3325,6 +3395,16 @@ pub fn spawn_file_watcher(
     if music_dirs.is_empty() {
         return;
     }
+    // Fil 2148 (#5792) — le délai des sondes de partage réseau, réglable.
+    tune_core::scanner::watcher::regler_intervalle_reseau(
+        tune_core::scanner::watcher::resolve_network_poll_interval(
+            settings
+                .get(tune_core::scanner::watcher::NETWORK_POLL_INTERVAL_KEY)
+                .ok()
+                .flatten()
+                .as_deref(),
+        ),
+    );
 
     // Le surveillant supprime des lignes de `tracks` : il passe par le MÊME
     // arbitrage que la purge de fin de scan (#1943), dans
@@ -3502,6 +3582,10 @@ mod scan_realigne_tests_4896;
 mod scan_metadonnees_etendues_tests_5043;
 
 #[cfg(test)]
+#[path = "conservation_replaygain_tests_5597.rs"]
+mod conservation_replaygain_tests_5597;
+
+#[cfg(test)]
 #[path = "surveillant_pendant_un_lot_de_scan_tests.rs"]
 mod surveillant_pendant_un_lot_de_scan_tests;
 
@@ -3550,6 +3634,10 @@ mod compteur_demarrage_tests_5371;
 mod coffret_manuel_scan_tests_5319;
 
 #[cfg(test)]
+#[path = "champs_tenus_scan_tests.rs"]
+mod champs_tenus_scan_tests;
+
+#[cfg(test)]
 #[path = "arret_du_scan_de_demarrage_tests_5552.rs"]
 mod arret_du_scan_de_demarrage_tests_5552;
 
@@ -3564,6 +3652,14 @@ mod date_arrondie_tests_5552;
 #[cfg(test)]
 #[path = "surveillant_annonces_tests_2134.rs"]
 mod surveillant_annonces_tests_2134;
+
+#[cfg(test)]
+#[path = "coffret_auto_relu_tests_2094.rs"]
+mod coffret_auto_relu_tests_2094;
+
+#[cfg(test)]
+#[path = "scan_au_demarrage_reglage_tests.rs"]
+mod scan_au_demarrage_reglage_tests;
 
 #[cfg(test)]
 #[path = "surveillant_artiste_generique_tests_1881.rs"]

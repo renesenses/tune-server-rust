@@ -37,7 +37,7 @@ COPY tune-bridge/Cargo.toml tune-bridge/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     echo 'fn main() {}' > tune-cli/src/main.rs && \
     touch tune-core/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
-    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,audio-embedding 2>/dev/null || true && \
+    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst 2>/dev/null || true && \
     rm -rf tune-core/src tune-server/src tune-cli/src
 
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
@@ -58,11 +58,19 @@ COPY tune-server/ tune-server/
 COPY tune-cli/ tune-cli/
 COPY tune-ffi/ tune-ffi/
 COPY tune-bridge/ tune-bridge/
+# Version affichée par le binaire : `tune_core::version()` lit TUNE_VERSION À LA
+# COMPILATION. Sans lui, l'image se dit `X.Y.Z-dev` (jamais `X.Y.Z` tout court,
+# qui passerait devant les RC du même numéro et bloquerait la mise à jour).
+# Pour une image d'une version précise :
+#   docker build --build-arg TUNE_VERSION=1.0.0-rc3 .
+# Posé ICI, après le cache des dépendances : le changer ne recompile que Tune.
+ARG TUNE_VERSION=
+ENV TUNE_VERSION=${TUNE_VERSION}
 # Même jeu de features que .github/workflows/docker.yml : une image construite
 # depuis ce Dockerfile sans audio-embedding renvoyait available:false et l'entrée
 # Ambiance disparaissait de l'UI sans aucun message (#19 de la revue 2026-08-15).
 RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
-    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,audio-embedding && \
+    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst && \
     strip target/release/tune-server
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
@@ -75,10 +83,17 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
+# In `audio` for a USB DAC passed with `--device /dev/snd` (#5968). The
+# entrypoint also keeps the HOST group of /dev/snd when it differs
+# (Fedora: 63), and any `--group-add`.
 RUN groupadd -g 1000 tune && \
-    useradd -u 1000 -g tune -m -s /bin/false tune
+    useradd -u 1000 -g tune -G audio -m -s /bin/false tune
 
 WORKDIR /app
+
+# Entrypoint: drops root, honours PUID/PGID (see the end of this file).
+COPY packaging/docker/entrypoint.sh /usr/local/bin/tune-entrypoint
+RUN chmod 755 /usr/local/bin/tune-entrypoint
 
 COPY --from=builder /build/target/release/tune-server /app/tune-server
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
@@ -108,6 +123,9 @@ VOLUME ["/data", "/music"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:8888/api/v1/system/stats || exit 1
 
-USER tune
-
-ENTRYPOINT ["/app/tune-server"]
+# No `USER tune`: the entrypoint starts as root only to drop to `tune`
+# (uid/gid 1000) at once — or, when PUID/PGID are given, to re-number `tune`
+# and give it /data first (packaging/docker/entrypoint.sh). The server itself
+# never runs as root. `docker run --user ...` still works: the entrypoint then
+# starts the server directly.
+ENTRYPOINT ["/usr/local/bin/tune-entrypoint"]

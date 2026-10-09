@@ -664,3 +664,73 @@ async fn une_horloge_connue_garde_toujours_la_zone_2125() {
          entier : l'épargne de #4661 doit tenir"
     );
 }
+
+// ─── 5. ticket 190 — un renderer qui sait rapporter sa position, resté à 0 ───
+
+/// Arrêt de l'ordre de celui du ticket 190 : au-delà du plancher de 30 s, en
+/// deçà des deux patiences.
+const ARRET_TICKET_190_S: u64 = 58;
+
+impl Banc {
+    /// Le renderer de la zone a déjà rapporté une position non nulle (la
+    /// preuve de #5522, posée par le bras `Playing` du sondeur).
+    fn renderer_prouve(&self) {
+        self.poller
+            .zones_a_position_prouvee
+            .lock()
+            .expect("verrou des zones prouvées")
+            .insert(self.zone);
+    }
+}
+
+#[test]
+fn a_l_arret_sans_avoir_joue_exige_la_preuve_et_une_position_nulle_190() {
+    assert!(decisions::renderer_a_l_arret_sans_avoir_joue(0, true));
+    assert!(
+        !decisions::renderer_a_l_arret_sans_avoir_joue(0, false),
+        "un renderer qui n'a jamais rapporté de position (le LHC de #4661) \
+         garde ses patiences"
+    );
+    assert!(!decisions::renderer_a_l_arret_sans_avoir_joue(1, true));
+}
+
+/// Ticket 190 — le fichier est servi en entier, l'horloge est CONNUE (et loin
+/// de la fin de la piste), le renderer a prouvé sur cette zone qu'il
+/// rapporte sa position, et il s'est dit arrêté sans avoir quitté 0. Rien ne
+/// sort de son tampon : la zone doit être coupée par la borne ordinaire, pas
+/// tenue « en lecture » jusqu'à la fin nominale de la piste.
+#[tokio::test]
+async fn un_renderer_prouve_reste_a_zero_ne_garde_pas_la_zone_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.renderer_prouve();
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(
+        b.etat().await,
+        PlayState::Stopped,
+        "renderer qui rapporte sa position, resté à 0 puis arrêté : il n'a \
+         rien joué, la zone ne doit pas attendre la fin de la piste"
+    );
+}
+
+/// Témoin : MÊME scène, MÊME arrêt, renderer NON prouvé (il peut rendre 0 en
+/// permanence en jouant). L'épargne de #4661 tient.
+#[tokio::test]
+async fn un_renderer_non_prouve_garde_la_patience_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(b.etat().await, PlayState::Playing);
+}
+
+/// Témoin : renderer prouvé qui a JOUÉ cette piste (30 s atteintes), puis
+/// s'est dit arrêté. Sa musique peut encore sortir du tampon : l'épargne tient.
+#[tokio::test]
+async fn un_renderer_prouve_qui_a_joue_garde_la_patience_190() {
+    let mut b = Banc::scene(100, OCTETS_SERVIS, DUREE_PISTE_MS).await;
+    b.renderer_prouve();
+    b.polls
+        .get_mut(&b.zone)
+        .expect("la zone du banc")
+        .peak_position_ms = 30_000;
+    b.arret_de(ARRET_TICKET_190_S).await;
+    assert_eq!(b.etat().await, PlayState::Playing);
+}

@@ -144,6 +144,19 @@ impl PositionPoller {
                 .await
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            if !zone.fixed_volume {
+                self.volume_pure_concilie(zone_id, zone.volume / 100.0, status.volume)
+                    .await;
+            }
+            // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
+            // le dire au journal, une fois par épisode.
+            if !zone.fixed_volume
+                && !in_startup_grace
+                && !in_volume_grace
+                && status.state == TransportState::Playing
+            {
+                self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
+            }
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -157,7 +170,9 @@ impl PositionPoller {
                 // actually moved since the last poll (see decisions::
                 // should_adopt_device_volume), so a stale default (Fabien's
                 // Devialet stuck at 50%) can't overwrite the saved volume.
-                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
+                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol)
+                    && !self.volume_pure_reimpose(zone_id, status.volume).await
+                {
                     self.playback.set_volume(zone_id, status.volume).await;
                     // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
                     // tombait a 0 sous 0,01 lineaire (-40 dB).
@@ -1118,6 +1133,14 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    if !zone_fixed_volume {
+                        self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
+                            .await;
+                    }
+                    // #5662 — un renderer à 100 % ignoré est dit une fois.
+                    if !zone_fixed_volume && !in_vol_grace {
+                        self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+                    }
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
@@ -1129,6 +1152,7 @@ impl PositionPoller {
                             status.volume,
                             zone_state.volume,
                         )
+                        && !self.volume_pure_reimpose(zone_id, status.volume).await
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
                         // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
@@ -1458,6 +1482,14 @@ impl PositionPoller {
             let in_vol_grace2 = zone_state
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            if !zone_fixed_volume {
+                self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
+                    .await;
+            }
+            // #5662 — un renderer à 100 % ignoré est dit une fois.
+            if !zone_fixed_volume && !in_vol_grace2 {
+                self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+            }
             if !zone_fixed_volume
                 && !in_vol_grace2
                 && status.volume > 0.001
@@ -1467,6 +1499,7 @@ impl PositionPoller {
                     status.volume,
                     zone_state.volume,
                 )
+                && !self.volume_pure_reimpose(zone_id, status.volume).await
             {
                 self.playback.set_volume(zone_id, status.volume).await;
                 // #2886 — `as i32` TRONQUAIT : le volume adopte du renderer
@@ -1538,18 +1571,41 @@ impl PositionPoller {
                 } else {
                     // #4382 — ce que le renderer fait pendant la fenêtre, au
                     // journal de terrain. Lecture seule, avant la décision.
-                    self.echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
+                    let next_ignore = self
+                        .echantillonner_la_surveillance(zone_id, &device_id, adoption, &status)
                         .await;
                     let age_secs = adoption.depuis.elapsed().as_secs();
+                    // #5411 — le rejeu de la piste finie, AVÉRÉ seulement :
+                    // URI de la piste finie, position revenue près de zéro,
+                    // et rien de soutenu tiré du flux adopté.
+                    let octets_depuis = decisions::octets_depuis_adoption(
+                        self.orchestrator.streamer_bytes_sent(&adoption.flux).await,
+                        adoption.octets_a_l_adoption,
+                    );
+                    let debit = decisions::debit_soutenu(
+                        octets_depuis,
+                        adoption.depuis.elapsed().as_millis() as u64,
+                    );
+                    let rejeu_avere = decisions::rejeu_de_la_piste_finie_avere(
+                        status.current_uri.as_deref(),
+                        adoption.flux_fini.as_deref(),
+                        &adoption.flux,
+                        status.position_ms,
+                        adoption.position_figee_ms,
+                        debit,
+                    );
                     match decisions::suite_de_l_adoption(
                         status.position_ms,
                         adoption.position_figee_ms,
                         status.current_uri.as_deref(),
                         &adoption.flux,
+                        rejeu_avere,
                         // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
                         status.state == TransportState::Stopped,
                         age_secs,
-                        adoption.delai_secs,
+                        // #4382 — le transport a dit « `Next` ignoré » : plus
+                        // rien à attendre, le délai tombe à zéro.
+                        if next_ignore { 0 } else { adoption.delai_secs },
                     ) {
                         decisions::SuiteAdoption::EnAttente => {}
                         decisions::SuiteAdoption::Confirmee => {
@@ -1573,6 +1629,10 @@ impl PositionPoller {
                                 uri = ?status.current_uri,
                                 preuve = ?adoption.preuve,
                                 stream_id = %adoption.flux,
+                                flux_fini = ?adoption.flux_fini,
+                                rejeu_avere,
+                                debit_soutenu = debit,
+                                octets_depuis_adoption = ?octets_depuis,
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
@@ -1622,6 +1682,25 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.duration_ms as u64)
                 .unwrap_or(0);
+            // Fil 2062 / #5550 — une piste UPnP partie sans durée (ni DIDL, ni
+            // en-têtes lisibles) prend celle que la sortie rapporte : le
+            // `TrackDuration` du renderer, ou la durée mesurée par le décodeur
+            // de la sortie locale.
+            let track_duration_ms = match decisions::duree_rapportee_a_adopter(
+                zone_state.now_playing.as_ref().map(|np| np.source.as_str()),
+                track_duration_ms,
+                status.duration_ms,
+                ps.gapless_sent,
+            ) {
+                Some(duree) => {
+                    info!(zone_id, duration_ms = duree, "upnp_duree_rapportee_adoptee");
+                    self.playback
+                        .adopter_la_duree_rapportee(zone_id, duree as i64)
+                        .await;
+                    duree
+                }
+                None => track_duration_ms,
+            };
 
             // Helper: has enough of the track been played?
             // When track_duration is known: peak_position_ms >= 80% of duration.
@@ -1688,9 +1767,29 @@ impl PositionPoller {
                     );
                 }
             }
-            let mut position_reset =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent)
-                    || chute_retenue;
+            // #3967 — une chute de position ne prouve un passage que si le
+            // TRANSPORT joue. Un renderer qui a acquitté `SetNext` puis s'est
+            // ARRÊTÉ rapporte lui aussi « 0 » : prise pour un enchaînement,
+            // cette chute avançait l'écran sur la suivante sans aucun `Play`,
+            // et la zone restait muette, affichée en lecture. Hors `Playing`,
+            // la chute est DIFFÉRÉE : la position d'avant est gardée, et le
+            // sondage suivant tranche — `Playing` près de zéro, c'était un
+            // passage (adopté sans relance) ; toujours arrêté, la branche
+            // `Stopped` retombe sur l'enchaînement par `Play`.
+            let chute_brute =
+                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            let chute_differee =
+                decisions::chute_a_differer_hors_lecture(chute_brute, status.state);
+            if chute_differee {
+                info!(
+                    zone_id,
+                    prev_pos = ps.last_position_ms,
+                    new_pos = status.position_ms,
+                    etat = ?status.state,
+                    "gapless_chute_differee_transport_hors_lecture"
+                );
+            }
+            let mut position_reset = (chute_brute && !chute_differee) || chute_retenue;
             // Suppress this metadata-only advance fallback for outputs that don't
             // do internal gapless (Chromecast, slimproto, exclusive local): for
             // them a position drop to 0 means the track ENDED (device IDLE /
@@ -1723,7 +1822,9 @@ impl PositionPoller {
                     }
                 }
             }
-            ps.last_position_ms = status.position_ms;
+            if !chute_differee {
+                ps.last_position_ms = status.position_ms;
+            }
 
             if position_reset {
                 if !played_enough {
@@ -1787,15 +1888,30 @@ impl PositionPoller {
                         .position_a_avancer(zone_id, zone_state, arme_avant)
                         .await
                     {
+                        // #5411 — lu AVANT l'avance, qui fait adopter le flux
+                        // armé à la zone.
+                        let rejeu = self
+                            .rejeu_de_la_piste_finie(
+                                zone_id,
+                                zone_state,
+                                &status,
+                                track_duration_ms,
+                            )
+                            .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
-                        if let Err(e) = self
+                        let avance = self
                             .orchestrator
                             .advance_queue_metadata(zone_id, next_pos)
-                            .await
-                        {
+                            .await;
+                        if let Err(e) = &avance {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
                         ps.gapless_cooldown = 4;
+                        // Surveiller une avance qui n'a pas eu lieu relancerait
+                        // la piste finie.
+                        if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                            ps.adoption_horloge = Some(surveillance);
+                        }
                         // The identity-keyed latch re-arms by itself on the new
                         // track; clearing it here additionally covers gapless
                         // repeat-one, where the advanced track has the same
@@ -2357,11 +2473,26 @@ impl PositionPoller {
                                     };
                                 let avance_audio_ms =
                                     fsm::avance_audio_ms(audio_servi_ms, ps.peak_position_ms);
-                                let famine_etablie = fsm::famine_etablie_malgre_l_avance(
-                                    avance_audio_ms,
-                                    ps.premier_arret_a.map(|t| t.elapsed()),
-                                    AVANCE_AUDIO_BORNE_HAUTE_SECS,
-                                );
+                                // Ticket 190 — un renderer qui sait rapporter
+                                // sa position et n'a jamais quitté 0 sur cette
+                                // piste n'a rien en train de jouer : aucune des
+                                // deux patiences ci-dessous ne s'applique.
+                                let a_l_arret_sans_avoir_joue =
+                                    decisions::renderer_a_l_arret_sans_avoir_joue(
+                                        ps.peak_position_ms,
+                                        device_id.starts_with("local:")
+                                            || self
+                                                .zones_a_position_prouvee
+                                                .lock()
+                                                .map(|z| z.contains(&zone_id))
+                                                .unwrap_or(false),
+                                    );
+                                let famine_etablie = a_l_arret_sans_avoir_joue
+                                    || fsm::famine_etablie_malgre_l_avance(
+                                        avance_audio_ms,
+                                        ps.premier_arret_a.map(|t| t.elapsed()),
+                                        AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                    );
                                 fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
                                 // 🔴 #4661 — la borne de #4480 est PLATE :
@@ -2411,6 +2542,7 @@ impl PositionPoller {
                                 let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
                                     flux_servi_en_entier,
                                     horloge_de_piste_connue
+                                        && !a_l_arret_sans_avoir_joue
                                         && decisions::tampon_du_renderer_peut_encore_jouer(
                                             wall_elapsed,
                                             track_duration_ms,
@@ -2673,15 +2805,27 @@ impl PositionPoller {
                         if let Some(next_pos) =
                             Self::prochaine_position_jouable(&self.db, zone_id, zone_state)
                         {
+                            // #5411 — même lecture qu'à la retombée de position.
+                            let rejeu = self
+                                .rejeu_de_la_piste_finie(
+                                    zone_id,
+                                    zone_state,
+                                    &status,
+                                    track_duration_ms,
+                                )
+                                .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            if let Err(e) = self
+                            let avance = self
                                 .orchestrator
                                 .advance_queue_metadata(zone_id, next_pos)
-                                .await
-                            {
+                                .await;
+                            if let Err(e) = &avance {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
                             ps.gapless_cooldown = 4;
+                            if let (Ok(()), Some(surveillance)) = (avance, rejeu) {
+                                ps.adoption_horloge = Some(surveillance);
+                            }
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
@@ -2891,6 +3035,17 @@ impl PositionPoller {
                             status.position_ms,
                         )
                     } {
+                        // #5970 — la fin estimée de la piste en cours, prise
+                        // AVANT les lectures de la base qui suivent : c'est
+                        // elle qui borne la préparation de la suivante.
+                        let fin_estimee = Instant::now()
+                            + Duration::from_millis(
+                                decisions::sane_current_duration(
+                                    status.duration_ms,
+                                    track_duration_ms,
+                                )
+                                .saturating_sub(status.position_ms),
+                            );
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -2912,14 +3067,32 @@ impl PositionPoller {
                             // Fireface, 55 wasted Qobuz downloads/min). Mark
                             // gapless_sent so we stop retrying; the natural-end
                             // fallback advances/repeats the queue.
-                            let can_internal_gapless = {
+                            let (can_internal_gapless, annonce) = {
                                 let outputs = self.outputs.lock().await;
                                 match outputs.get(&device_id) {
-                                    Some(arc) => arc.lock().await.supports_internal_gapless(),
-                                    None => true,
+                                    Some(arc) => {
+                                        let sortie = arc.lock().await;
+                                        (
+                                            sortie.supports_internal_gapless(),
+                                            sortie.annonce_la_suivante().await,
+                                        )
+                                    }
+                                    None => (true, AnnonceSuivante::Inconnue),
                                 }
                             };
-                            if !can_internal_gapless {
+                            if annonce == AnnonceSuivante::NonAnnoncee {
+                                // #3967 — l'appareil n'annonce pas
+                                // `SetNextAVTransportURI` : rien n'est posé,
+                                // `gapless_sent` reste faux, et la fin de piste
+                                // enchaîne aussitôt comme pour un renderer qui
+                                // refuse — sans attendre une transition qui ne
+                                // viendra pas. Une ligne par piste, pas par
+                                // sondage.
+                                if ps.suivante_non_annoncee_signalee != Some(ps.track_generation) {
+                                    info!(zone_id, "gapless_non_arme_setnext_non_annonce");
+                                    ps.suivante_non_annoncee_signalee = Some(ps.track_generation);
+                                }
+                            } else if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
                                 // Le drapeau est pose pour cesser de re-tenter,
@@ -2939,7 +3112,23 @@ impl PositionPoller {
                                 // (spin 1 Hz, #2394). handle_track_end jouera la
                                 // piste explicitement en fin de morceau.
                             } else {
-                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                // #5970 — la préparation est bornée (voir
+                                // `armer_le_flux_suivant`) ; sa durée est dite
+                                // au journal dès qu'elle dépasse le seuil.
+                                let t_prep = Instant::now();
+                                let preparation = self
+                                    .prepare_gapless(zone_id, zone_state, &device_id, fin_estimee)
+                                    .await;
+                                let prep_ms = t_prep.elapsed().as_millis() as u64;
+                                if prep_ms >= decisions::PREPARATION_GAPLESS_LENTE_MS {
+                                    info!(
+                                        zone_id,
+                                        prep_ms,
+                                        issue = ?preparation,
+                                        "gapless_preparation_lente"
+                                    );
+                                }
+                                match preparation {
                                     GaplessPrep::Armed(arme, tenue) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
@@ -2953,7 +3142,11 @@ impl PositionPoller {
                                         ps.suivante_preparee = tenue;
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
-                                    GaplessPrep::DsdNextSkipped => {
+                                    // #5970 — une préparation abandonnée
+                                    // se verrouille comme un DSD : pas de
+                                    // nouvel essai pour cette position, la
+                                    // fin de piste joue la suivante.
+                                    GaplessPrep::DsdNextSkipped | GaplessPrep::Abandonnee => {
                                         ps.gapless_dsd_skip_pos = Self::prochaine_position_jouable(
                                             &self.db, zone_id, zone_state,
                                         );
@@ -3162,6 +3355,7 @@ impl PositionPoller {
                                 flux_arme.as_deref(),
                                 enchainement,
                             )
+                            && !self.next_deja_ignore(zone_id, &device_id)
                             && self.demander_la_bascule(zone_id, &device_id).await
                         {
                             decisions::EnchainementArme::Bascule
@@ -3596,9 +3790,32 @@ impl PositionPoller {
                                     error = %e,
                                     "renderer_cale_reprise_saut_echoue"
                                 );
-                                self.orchestrator
-                                    .stop(zone_id, device_id_ref.as_deref())
-                                    .await;
+                                // Décision du 05/10 : un saut REFUSÉ par
+                                // l'appareil laisse la piste jouer depuis son
+                                // début, avec un message non fatal ; tout
+                                // autre échec coupe la zone, comme avant.
+                                if self
+                                    .orchestrator
+                                    .conclure_saut_de_reprise_echoue(
+                                        zone_id,
+                                        device_id_ref.as_deref(),
+                                        position_ms,
+                                        &e,
+                                    )
+                                    .await
+                                {
+                                    // Une seule tentative : la reprise compte
+                                    // pour la lecture RELANCÉE, un nouveau
+                                    // décrochage coupera la zone.
+                                    let generation =
+                                        self.playback.get_state(zone_id).await.track_generation;
+                                    if let Some(r) =
+                                        self.reprises_renderer_cale.lock().await.get_mut(&zone_id)
+                                    {
+                                        r.generation = generation;
+                                        r.cible_ms = position_ms;
+                                    }
+                                }
                             }
                         },
                         Err(e) => {

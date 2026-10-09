@@ -783,7 +783,18 @@ impl PlaybackOrchestrator {
         };
         let np = self.composer_le_now_playing(&req, &resolved, &habillage);
 
-        self.playback.play(req.zone_id, np).await;
+        // Ticket 134 — la session REMPLACÉE se lit au moment du remplacement,
+        // pas au départ de cette lecture : une autre lecture a pu s'intercaler
+        // entre les deux, et sa session n'aurait alors été fermée par personne
+        // (voir `sessions_a_fermer_apres_remplacement`).
+        let flux_remplace = self
+            .playback
+            .play_en_rendant_le_flux_remplace(req.zone_id, np)
+            .await;
+        let sessions_a_fermer = sessions_a_fermer_apres_remplacement(
+            old_stream_id.as_deref(),
+            flux_remplace.as_deref(),
+        );
 
         // Persist play state for auto-resume after server restart
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
@@ -810,8 +821,10 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
-        if !is_local && let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
+        if !is_local {
+            for sid in &sessions_a_fermer {
+                self.streamer.remove_session(sid).await;
+            }
         }
 
         let (output_sent, output_error) = self
@@ -822,8 +835,10 @@ impl PlaybackOrchestrator {
 
         // For local outputs, clean up the old stream now that play_url() has
         // called stop() and the old audio thread is no longer reading.
-        if is_local && let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
+        if is_local {
+            for sid in &sessions_a_fermer {
+                self.streamer.remove_session(sid).await;
+            }
         }
 
         self.annoncer_apres_la_sortie(
@@ -1794,6 +1809,11 @@ impl PlaybackOrchestrator {
                     // crête publiée est celle des échantillons envoyés au DAC.
                     self.playback
                         .brancher_les_cretes_de_sortie(zone_id, local_output.cretes_de_sortie());
+                    // #4384 — et ce qu'elle demande AVANT le rabot à l'unité :
+                    // l'écran peut alors dire « +6 dB demandés, limités à
+                    // 0 dB » au lieu d'un préampli qui ne fait rien.
+                    self.playback
+                        .brancher_le_gain_demande(zone_id, local_output.gain_demande());
                     return;
                 }
             }
@@ -2648,6 +2668,107 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Le message de l'interface pour un `Seek` que l'appareil a REFUSÉ
+    /// (tête [`crate::outputs::dlna::SEEK_REFUSE_PREFIX`]), `None` pour tout
+    /// autre échec : ceux-là gardent la seule réponse HTTP, comme avant.
+    pub fn message_deplacement_refuse(error: &OutputCommandError) -> Option<String> {
+        let detail = Self::detail_du_refus_de_seek(error)?;
+        Some(format!(
+            "L'appareil a refusé le déplacement dans la piste ({detail}). \
+             La lecture continue à sa position actuelle."
+        ))
+    }
+
+    /// Dire à TOUTES les télécommandes qu'un déplacement demandé par
+    /// l'utilisateur a été refusé par l'appareil.
+    ///
+    /// Même canal que [`Self::dire_piste_non_demarree`] —
+    /// `zone.playback_error` — mais `fatal: false` : la zone JOUE toujours,
+    /// seule la position demandée n'a pas été prise. Appelé par la route du
+    /// geste utilisateur seulement ; les sauts automatiques (reprise,
+    /// transfert, renderer calé) se contentent du journal.
+    pub fn dire_deplacement_refuse(&self, zone_id: i64, error: &OutputCommandError) {
+        let Some(message) = Self::message_deplacement_refuse(error) else {
+            return;
+        };
+        warn!(zone_id, error = %error, "seek_refuse_par_le_renderer");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": false,
+                }),
+            );
+        }
+    }
+
+    /// Le saut de la reprise après décrochage (#4645, fil 2125) a ÉCHOUÉ :
+    /// faut-il couper la zone ?
+    ///
+    /// Décision de Bertrand (05/10) : si l'appareil a REFUSÉ le `Seek`
+    /// (tête [`crate::outputs::dlna::SEEK_REFUSE_PREFIX`]), la zone ne
+    /// s'arrête PAS. La piste vient d'être relancée par `play_from_queue` :
+    /// elle continue depuis son début, et toutes les télécommandes reçoivent
+    /// un `zone.playback_error` NON fatal qui le dit. Une seule tentative :
+    /// rien n'est renvoyé ici, et le sondeur compte la reprise comme faite
+    /// pour cette lecture de piste.
+    ///
+    /// Tout autre échec (sortie sans capacité `Seek`, sortie disparue,
+    /// timeout) garde l'ancienne conduite : arrêt de la zone.
+    ///
+    /// Rend `true` quand la zone continue.
+    pub async fn conclure_saut_de_reprise_echoue(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        position_ms: u64,
+        error: &OutputCommandError,
+    ) -> bool {
+        let Some(detail) = Self::detail_du_refus_de_seek(error) else {
+            self.stop(zone_id, device_id).await;
+            return false;
+        };
+        let secondes = position_ms / 1000;
+        let message = format!(
+            "L'appareil a refusé la reprise à la position {}:{:02} ({detail}). \
+             La piste continue depuis son début.",
+            secondes / 60,
+            secondes % 60
+        );
+        warn!(
+            zone_id,
+            position_ms,
+            error = %error,
+            "renderer_cale_reprise_refusee_lecture_depuis_le_debut"
+        );
+        if let Some(ref bus) = self.event_bus {
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": message,
+                    "fatal": false,
+                }),
+            );
+        }
+        true
+    }
+
+    /// Le détail d'un refus de `Seek` par l'appareil (code UPnP et sens),
+    /// `None` pour tout autre échec.
+    fn detail_du_refus_de_seek(error: &OutputCommandError) -> Option<&str> {
+        let OutputCommandError::Failed { message, .. } = error else {
+            return None;
+        };
+        Some(
+            message
+                .strip_prefix(crate::outputs::dlna::SEEK_REFUSE_PREFIX)?
+                .trim(),
+        )
+    }
+
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
         self.resume_with_session_error_message(zone_id, device_id, message_session_perdue)
             .await
@@ -3444,3 +3565,34 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
+/// sortie basculée sur la sienne.
+///
+/// Deux sources, dans cet ordre :
+///
+/// * `notee_au_depart` : la session en cours quand `play_inner` a commencé,
+///   comme avant ;
+/// * `remplacee` : celle que `now_playing` portait AU MOMENT où cette lecture
+///   l'a remplacé ([`crate::playback::PlaybackManager::play_en_rendant_le_flux_remplace`]).
+///
+/// Elles diffèrent quand une autre lecture s'est intercalée : trois
+/// « suivant » rapprochés, la deuxième lecture remplace la première, la
+/// troisième remplace la deuxième — mais la troisième avait noté la PREMIÈRE
+/// à son départ. Seule, la note du départ laissait la session de la deuxième
+/// ouverte, son décodeur bloqué sur un canal que plus personne ne lit.
+pub(crate) fn sessions_a_fermer_apres_remplacement(
+    notee_au_depart: Option<&str>,
+    remplacee: Option<&str>,
+) -> Vec<String> {
+    let mut sessions: Vec<String> = notee_au_depart.map(str::to_owned).into_iter().collect();
+    if let Some(r) = remplacee
+        && notee_au_depart != Some(r)
+    {
+        sessions.push(r.to_owned());
+    }
+    sessions
+}
+
+#[cfg(test)]
+mod session_remplacee_ticket_134;

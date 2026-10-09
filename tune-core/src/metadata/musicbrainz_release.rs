@@ -1,5 +1,10 @@
 //! MusicBrainz release lookup.
 //!
+//! D'après MetaRust, de Xavier Joly (code offert à Tune le 05/10/2026) : la
+//! comparaison « compacte » des titres ([`normalize_compact`]) et l'idée de
+//! garder le suffixe d'édition pour choisir ([`editions_du_titre`]). La règle
+//! de choix elle-même vit dans [`super::choix_de_pressage`].
+//!
 //! Two shapes of question, because they need opposite queries:
 //!
 //! * "which release is this, exactly?" — [`lookup_release`] narrows the search
@@ -155,6 +160,27 @@ pub struct MBTrack {
     /// Set only when the track credits someone other than the release artist —
     /// the useful case being a compilation.
     pub artist: Option<String>,
+    /// Les artistes crédités sur la piste, un par entrée, avec leur MBID
+    /// (#4805, étape B). `#[serde(skip)]` : ce champ ne sert qu'à rattacher
+    /// les artistes en base, et n'entre pas dans les réponses JSON qui
+    /// sérialisent déjà les pistes (`/ingest/release-tracks`).
+    #[serde(skip)]
+    pub artist_credits: Vec<CreditArtiste>,
+}
+
+/// Un artiste crédité par MusicBrainz, réduit à ce qui sert à le rattacher à
+/// une fiche locale (#4805, étape B).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreditArtiste {
+    /// Le MBID de l'artiste (`artist-credit[].artist.id`).
+    pub mbid: String,
+    /// Le nom de la fiche MusicBrainz (`artist.name`).
+    pub nom: String,
+    /// Le nom sous lequel il est crédité ici (`artist-credit[].name`), qui
+    /// peut différer : « Karajan » pour « Herbert von Karajan ».
+    pub nom_credite: String,
+    /// Le nom de tri de la fiche (`artist.sort-name`), « Beatles, The ».
+    pub nom_de_tri: String,
 }
 
 /// A release with its track listing.
@@ -170,9 +196,15 @@ pub struct MBReleaseDetail {
     pub catalog_number: Option<String>,
     pub disc_count: u32,
     pub tracks: Vec<MBTrack>,
+    /// Les artistes crédités sur le pressage, avec leur MBID (#4805, étape B).
+    /// Même raison que [`MBTrack::artist_credits`] pour le `#[serde(skip)]`.
+    #[serde(skip)]
+    pub artist_credits: Vec<CreditArtiste>,
 }
 
-fn normalize(s: &str) -> String {
+/// Casse, ponctuation et espaces neutralisés. Partagée avec la passe AcoustID
+/// (`acoustid_picard`), pour qu'un titre se compare de la même façon partout.
+pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
@@ -182,11 +214,32 @@ fn normalize(s: &str) -> String {
         .join(" ")
 }
 
+/// [`normalize`] sans espaces : « Mind State » et « Mindstate » sont le même
+/// titre. Repris de MetaRust (`normalize_title_compact`).
+pub(crate) fn normalize_compact(s: &str) -> String {
+    normalize(s)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// [`normalize`], diacritiques retirés : `Dvořák` et `Dvorak` se comparent
+/// égaux. Sert au départage par compositeur, où les deux graphies coexistent
+/// (la balise écrit l'une, MusicBrainz crédite l'autre).
+pub(crate) fn normalize_sans_diacritiques(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let plie: String = s
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect();
+    normalize(&plie)
+}
+
 fn year_from_date(date: Option<&str>) -> Option<u32> {
     date?.get(0..4)?.parse().ok()
 }
 
-fn str_field(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key)
         .and_then(|x| x.as_str())
         .map(str::trim)
@@ -197,7 +250,7 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
 /// Join an `artist-credit` array into a display string, honouring the
 /// join phrases so "Queen & David Bowie" does not come out as "Queen David
 /// Bowie".
-fn artist_credit(v: &Value) -> String {
+pub(crate) fn artist_credit(v: &Value) -> String {
     let Some(credits) = v.get("artist-credit").and_then(|c| c.as_array()) else {
         return String::new();
     };
@@ -221,16 +274,46 @@ fn artist_credit(v: &Value) -> String {
     out.trim().to_string()
 }
 
+/// Les entrées d'un tableau `artist-credit` qui portent un MBID (#4805,
+/// étape B). Une entrée sans `artist.id` ne rattache rien et n'est pas rendue.
+pub fn credits_d_artiste(v: &Value) -> Vec<CreditArtiste> {
+    let Some(credits) = v.get("artist-credit").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    credits
+        .iter()
+        .filter_map(|credit| {
+            let artiste = credit.get("artist")?;
+            let mbid = str_field(artiste, "id")?;
+            Some(CreditArtiste {
+                mbid,
+                nom: str_field(artiste, "name").unwrap_or_default(),
+                nom_credite: str_field(credit, "name").unwrap_or_default(),
+                nom_de_tri: str_field(artiste, "sort-name").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 /// Does this search hit plausibly refer to what we asked for?
 ///
 /// MusicBrainz happily returns loosely-related releases; without this a search
 /// for one album offers up the artist's whole discography as "candidates".
-fn plausible(rel_title: &str, rel_artist: &str, want_title: &str, want_artist: &str) -> bool {
+pub(crate) fn plausible(
+    rel_title: &str,
+    rel_artist: &str,
+    want_title: &str,
+    want_artist: &str,
+) -> bool {
     let norm_title = normalize(want_title);
     let norm_rel_title = normalize(rel_title);
+    // Idée : MetaRust — les titres se comparent aussi sans espaces, « Mind
+    // State » contre « Mindstate ». Égalité seulement : l'inclusion compacte
+    // serait trop lâche (« heart of noise » contient « artofnoise »).
     if norm_rel_title != norm_title
         && !norm_title.contains(&norm_rel_title)
         && !norm_rel_title.contains(&norm_title)
+        && normalize_compact(rel_title) != normalize_compact(want_title)
     {
         return false;
     }
@@ -395,6 +478,14 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
                         .and_then(|l| l.as_u64())
                 });
                 let credited = artist_credit(track);
+                // Le crédit de la PISTE d'abord ; celui de l'enregistrement à
+                // défaut, que certaines réponses sont seules à porter.
+                let mut artist_credits = credits_d_artiste(track);
+                if artist_credits.is_empty() {
+                    if let Some(r) = recording {
+                        artist_credits = credits_d_artiste(r);
+                    }
+                }
 
                 tracks.push(MBTrack {
                     position: track
@@ -412,6 +503,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
                     } else {
                         Some(credited)
                     },
+                    artist_credits,
                 });
             }
         }
@@ -428,6 +520,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
         catalog_number,
         disc_count: media.map(|m| m.len() as u32).unwrap_or(0),
         tracks,
+        artist_credits: credits_d_artiste(data),
     })
 }
 
@@ -470,6 +563,7 @@ async fn mb_get(path: &str, params: &[(&str, String)]) -> Result<Value, RefusMus
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
         .map_err(|e| {
             debug!(path = path, error = %e, "mb_request_transport_error");
             RefusMusicBrainz::Transport
@@ -485,6 +579,45 @@ async fn mb_get(path: &str, params: &[(&str, String)]) -> Result<Value, RefusMus
     })
 }
 
+/// Le transport de production d'une RECHERCHE `/release?query=` pour le choix
+/// automatique ([`super::choix_de_pressage::identifier_le_pressage`]). Même
+/// User-Agent, même base que [`lookup_release_candidates`]. N'attend pas le
+/// créneau : le choix appelle [`rate_limit_delay`] entre deux requêtes.
+pub async fn rechercher_sur_musicbrainz(
+    requete: String,
+    fetch: usize,
+) -> Result<Value, RefusMusicBrainz> {
+    mb_get(
+        "release",
+        &[
+            ("query", requete),
+            ("limit", fetch.to_string()),
+            ("fmt", "json".to_string()),
+        ],
+    )
+    .await
+}
+
+/// Le transport de production d'une LECTURE `/{chemin}?inc=…` pour le choix
+/// automatique. `Ok(None)` : MusicBrainz ne connaît pas cet identifiant (`404`,
+/// ou `400` pour un identifiant mal formé) — un résultat, qui ne reviendra pas.
+/// `Err` : il n'a pas répondu (#4991).
+pub async fn lire_sur_musicbrainz(
+    chemin: String,
+    inc: &'static str,
+) -> Result<Option<Value>, RefusMusicBrainz> {
+    match mb_get(
+        &chemin,
+        &[("inc", inc.to_string()), ("fmt", "json".to_string())],
+    )
+    .await
+    {
+        Ok(v) => Ok(Some(v)),
+        Err(RefusMusicBrainz::Statut(404 | 400)) => Ok(None),
+        Err(refus) => Err(refus),
+    }
+}
+
 /// Best-guess identification: narrow the query with everything we know and
 /// return a hit only if MusicBrainz is confident.
 pub async fn lookup_release(
@@ -494,8 +627,8 @@ pub async fn lookup_release(
     year: Option<i32>,
 ) -> Option<MBReleaseMatch> {
     let mut query_parts = vec![
-        format!("release:\"{title}\""),
-        format!("artist:\"{artist}\""),
+        format!("release:\"{}\"", echapper_phrase_lucene(title)),
+        format!("artist:\"{}\"", echapper_phrase_lucene(artist)),
     ];
     if let Some(tc) = track_count {
         query_parts.push(format!("tracks:{tc}"));
@@ -556,19 +689,8 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
 
     // 1. Parenthèse ou crochet FINAL dont le contenu porte un marqueur de
     //    pressage. `(Live at Montreux)` s'en va ; `(Part 2)` reste.
-    for (ouvre, ferme) in [('(', ')'), ('[', ']')] {
-        if !t.ends_with(ferme) {
-            continue;
-        }
-        let Some(pos) = t.rfind(ouvre) else { continue };
-        let contenu = &t[pos + ouvre.len_utf8()..t.len() - ferme.len_utf8()];
-        if !contient_un_marqueur(contenu) {
-            continue;
-        }
-        let reste = t[..pos].trim_end();
-        if !reste.is_empty() {
-            return Some(reste.to_string());
-        }
+    if let Some((reste, _)) = suffixe_d_edition(t) {
+        return Some(reste.to_string());
     }
 
     // 2. `, Disc 1` / ` - CD 2` / `, Disque 3` en fin de titre. Le découpage
@@ -601,6 +723,61 @@ fn retire_un_suffixe(titre: &str) -> Option<String> {
     }
 
     None
+}
+
+/// La parenthèse ou le crochet FINAL de `t` quand son contenu porte un
+/// marqueur de [`MARQUEURS_DE_SUFFIXE`] : `(reste, contenu)`.
+///
+/// Une seule règle pour deux usages, et une seule liste de marqueurs (DRY) :
+/// [`retire_un_suffixe`] jette le contenu pour la REQUÊTE, et
+/// [`editions_du_titre`] le garde pour CHOISIR l'édition. Idée : MetaRust
+/// (`split_edition_suffix`), qui prenait toute parenthèse sauf « feat. » ;
+/// ici, seulement ce qui porte un marqueur de pressage — `(Short Stories)` est
+/// un sous-titre, pas une édition.
+fn suffixe_d_edition(t: &str) -> Option<(&str, &str)> {
+    let t = t.trim_end();
+    for (ouvre, ferme) in [('(', ')'), ('[', ']')] {
+        if !t.ends_with(ferme) {
+            continue;
+        }
+        let Some(pos) = t.rfind(ouvre) else { continue };
+        let contenu = t[pos + ouvre.len_utf8()..t.len() - ferme.len_utf8()].trim();
+        if !contient_un_marqueur(contenu) {
+            continue;
+        }
+        let bas = contenu.to_lowercase();
+        if bas.starts_with("feat") || bas.starts_with("ft.") || bas.starts_with("with ") {
+            continue;
+        }
+        let reste = t[..pos].trim_end();
+        if !reste.is_empty() {
+            return Some((reste, contenu));
+        }
+    }
+    None
+}
+
+/// Les suffixes d'édition d'un titre local, du dernier au premier :
+/// `Buhloone Mindstate (30th Anniversary)` → `["30th Anniversary"]`.
+///
+/// [`titre_de_requete`] les retire pour que la recherche aboutisse ; c'était
+/// perdre l'information qui distingue l'édition. Les garder permet de
+/// départager les candidats ([`super::choix_de_pressage`]) contre leur
+/// `disambiguation` ou leur titre, sans requête de plus.
+pub fn editions_du_titre(titre: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut courant = titre.trim();
+    // Borné comme `titre_de_requete` : `Album (Remastered) (Deluxe)`.
+    for _ in 0..4 {
+        match suffixe_d_edition(courant) {
+            Some((reste, contenu)) => {
+                out.push(contenu.to_string());
+                courant = reste;
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// Le titre à envoyer à la RECHERCHE MusicBrainz, quand celui de la bibliothèque
@@ -637,6 +814,319 @@ pub fn titre_de_requete(titre: &str) -> Option<String> {
         return None;
     }
     Some(courant.to_string())
+}
+
+/// Les noms de compositeurs qui, placés EN TÊTE d'un titre d'album
+/// (`Beethoven: Symphony No. 9`, `Chopin - Nocturnes`), font échouer la
+/// recherche MusicBrainz (#4805).
+///
+/// Le style des balises classiques met le compositeur devant l'œuvre ; celui
+/// de MusicBrainz le met dans le crédit d'artiste (`Beethoven; Berliner
+/// Philharmoniker, Herbert von Karajan`) et titre l'œuvre seule (`Symphony
+/// no. 9`). La requête Lucene cherche la phrase entière du titre : un seul mot
+/// de trop, et elle rend zéro pressage. Vérifié le 05/10/2026 contre
+/// MusicBrainz : `release:"Beethoven: Symphony No. 9" AND artist:"Herbert von
+/// Karajan"` → 0 ; sans le préfixe → 22.
+///
+/// Comparés au DERNIER mot du préfixe normalisé (`J.S. Bach` → `bach`,
+/// `Ludwig van Beethoven` → `beethoven`), avec et sans diacritiques. La liste
+/// ne sert qu'à reconnaître un préfixe : elle ne décide d'aucune identification,
+/// [`plausible`] juge toujours l'artiste.
+const COMPOSITEURS_EN_PREFIXE: &[&str] = &[
+    "albeniz",
+    "albéniz",
+    "albinoni",
+    "bach",
+    "bartok",
+    "bartók",
+    "beethoven",
+    "bellini",
+    "berlioz",
+    "bernstein",
+    "bizet",
+    "borodin",
+    "brahms",
+    "britten",
+    "bruch",
+    "bruckner",
+    "buxtehude",
+    "byrd",
+    "charpentier",
+    "chopin",
+    "copland",
+    "corelli",
+    "couperin",
+    "debussy",
+    "delius",
+    "donizetti",
+    "dowland",
+    "dukas",
+    "dvorak",
+    "dvořák",
+    "elgar",
+    "falla",
+    "faure",
+    "fauré",
+    "franck",
+    "gershwin",
+    "glazunov",
+    "glinka",
+    "gluck",
+    "gorecki",
+    "górecki",
+    "gounod",
+    "granados",
+    "grieg",
+    "handel",
+    "händel",
+    "haendel",
+    "haydn",
+    "hindemith",
+    "holst",
+    "honegger",
+    "janacek",
+    "janáček",
+    "liszt",
+    "lully",
+    "mahler",
+    "massenet",
+    "mendelssohn",
+    "messiaen",
+    "monteverdi",
+    "mozart",
+    "mussorgsky",
+    "moussorgski",
+    "offenbach",
+    "orff",
+    "paganini",
+    "pärt",
+    "pergolesi",
+    "poulenc",
+    "prokofiev",
+    "prokofieff",
+    "puccini",
+    "purcell",
+    "rachmaninov",
+    "rachmaninoff",
+    "rameau",
+    "ravel",
+    "respighi",
+    "rimskykorsakov",
+    "rossini",
+    "saintsaens",
+    "saintsaëns",
+    "satie",
+    "scarlatti",
+    "schoenberg",
+    "schönberg",
+    "schubert",
+    "schumann",
+    "schutz",
+    "schütz",
+    "scriabin",
+    "shostakovich",
+    "chostakovitch",
+    "sibelius",
+    "smetana",
+    "stravinsky",
+    "strawinsky",
+    "tchaikovsky",
+    "tchaïkovski",
+    "tchaikovski",
+    "telemann",
+    "verdi",
+    "vivaldi",
+    "wagner",
+    "weber",
+];
+
+/// `mot` (sans diacritiques, comme le rend [`normalize_sans_diacritiques`])
+/// est-il le nom d'un compositeur de [`COMPOSITEURS_EN_PREFIXE`] ? Sert au veto
+/// du compositeur de `choix_de_pressage` (#4805, étape D).
+pub(crate) fn est_un_compositeur_connu(mot: &str) -> bool {
+    !mot.is_empty()
+        && COMPOSITEURS_EN_PREFIXE
+            .iter()
+            .any(|c| normalize_sans_diacritiques(c) == mot)
+}
+
+/// Les séparateurs entre un préfixe (artiste, compositeur) et le titre.
+const SEPARATEURS_DE_PREFIXE: &[&str] = &[": ", " - ", " – ", " — "];
+
+/// Retire UN préfixe de tête — `Pink Floyd - The Wall`, `Beethoven: Symphony
+/// No. 9` — quand ce préfixe est l'ARTISTE interrogé ou un compositeur connu.
+///
+/// Un préfixe quelconque reste en place : `Smash the System: Singles and More`
+/// ou `Back To Mine - Talvin Singh` sont des titres entiers. Rend `None` quand
+/// il n'y a rien à retirer.
+fn retire_un_prefixe(titre: &str, artiste: &str) -> Option<String> {
+    let (pos, sep) = SEPARATEURS_DE_PREFIXE
+        .iter()
+        .filter_map(|s| titre.find(s).map(|p| (p, *s)))
+        .min_by_key(|(p, _)| *p)?;
+    let prefixe = normalize(&titre[..pos]);
+    let reste = titre[pos + sep.len()..].trim();
+    if prefixe.is_empty() || reste.is_empty() {
+        return None;
+    }
+    let artiste = normalize(artiste);
+    let est_l_artiste = !artiste.is_empty() && prefixe == artiste;
+    // Un compositeur se nomme en un à quatre mots : au-delà, c'est une phrase.
+    let mots: Vec<&str> = prefixe.split_whitespace().collect();
+    let est_un_compositeur = mots.len() <= 4
+        && mots
+            .last()
+            .is_some_and(|dernier| COMPOSITEURS_EN_PREFIXE.contains(dernier));
+    if est_l_artiste || est_un_compositeur {
+        Some(reste.to_string())
+    } else {
+        None
+    }
+}
+
+/// Le compositeur placé EN TÊTE d'un titre local (`Beethoven: Symphony No. 9`
+/// → `beethoven`), s'il est dans [`COMPOSITEURS_EN_PREFIXE`] ; même règle que
+/// [`retire_un_prefixe`]. Rendu sans diacritiques, pour se comparer à un
+/// crédit MusicBrainz qui écrit `Antonín Dvořák` quand la balise écrit
+/// `Dvorak`.
+pub fn compositeur_en_prefixe(titre: &str) -> Option<String> {
+    let (pos, _) = SEPARATEURS_DE_PREFIXE
+        .iter()
+        .filter_map(|s| titre.find(s).map(|p| (p, *s)))
+        .min_by_key(|(p, _)| *p)?;
+    let prefixe = normalize(&titre[..pos]);
+    let mots: Vec<&str> = prefixe.split_whitespace().collect();
+    let dernier = mots.last()?;
+    if mots.len() <= 4 && COMPOSITEURS_EN_PREFIXE.contains(dernier) {
+        Some(normalize_sans_diacritiques(dernier))
+    } else {
+        None
+    }
+}
+
+/// [`titre_de_requete`], plus le préfixe de tête quand c'est l'artiste
+/// interrogé ou un compositeur (#4805).
+///
+/// Deux formes de balises que la recherche par phrase ne retrouve pas :
+/// `Artiste - Album` (le nom du dossier recopié dans la balise d'album) et
+/// `Compositeur: Œuvre` (le style des balises classiques). Comme pour les
+/// suffixes, seule la REQUÊTE change : la donnée stockée n'est jamais
+/// réécrite.
+pub fn titre_de_requete_pour(titre: &str, artiste: &str) -> Option<String> {
+    let mut courant = titre.trim().to_string();
+    for _ in 0..6 {
+        match retire_un_suffixe(&courant).or_else(|| retire_un_prefixe(&courant, artiste)) {
+            Some(plus_court) => courant = plus_court,
+            None => break,
+        }
+    }
+    let courant = courant.trim();
+    if courant.is_empty() || courant == titre.trim() {
+        return None;
+    }
+    Some(courant.to_string())
+}
+
+/// Les artistes d'album qui désignent une COMPILATION sous un autre nom que
+/// celui de MusicBrainz, `Various Artists` (#4805). Normalisés par
+/// [`normalize`]. `Various` seul est absent : Lucene le retrouve déjà dans
+/// `Various Artists`.
+const ALIAS_DE_COMPILATION: &[&str] = &[
+    "va",
+    "v a",
+    "various artist",
+    "artistes divers",
+    "artistes variés",
+    "artistes varies",
+    "divers",
+    "divers artistes",
+    "multi artistes",
+    "multiartistes",
+    "compilation",
+    "verschiedene",
+    "verschiedene interpreten",
+    "varios artistas",
+    "vários artistas",
+    "artisti vari",
+];
+
+/// Les artistes qui n'en sont pas : ce que pose un logiciel d'extraction ou
+/// notre scanner quand la balise manque (#4805). Normalisés par [`normalize`].
+const ARTISTES_FICTIFS: &[&str] = &[
+    "unknown",
+    "unknown artist",
+    "artiste inconnu",
+    "inconnu",
+    "no artist",
+    "sans artiste",
+    "unbekannter künstler",
+    "artista desconocido",
+];
+
+/// `true` pour un artiste qui n'en est pas (`Unknown Artist`, chaîne vide…).
+pub fn est_un_artiste_fictif(nom: &str) -> bool {
+    let n = normalize(nom);
+    n.is_empty() || ARTISTES_FICTIFS.contains(&n.as_str())
+}
+
+/// L'artiste à mettre dans la requête MusicBrainz d'un album (#4805).
+///
+/// - un alias de compilation (`VA`, `Artistes divers`…) devient `Various
+///   Artists`, le nom sous lequel MusicBrainz crédite les compilations ;
+/// - un artiste fictif (`Unknown Artist`, `Artiste inconnu`…) cède la place à
+///   celui des pistes, quand elles en portent un vrai ;
+/// - sinon, l'artiste de l'album tel quel, à défaut celui des pistes.
+///
+/// Ne change que la REQUÊTE. Quand rien de mieux n'est connu, l'artiste
+/// d'origine est rendu tel quel : la recherche se comporte alors comme avant.
+pub fn artiste_de_requete(artiste_album: Option<&str>, artiste_pistes: Option<&str>) -> String {
+    let canonique = |nom: &str| -> String {
+        if ALIAS_DE_COMPILATION.contains(&normalize(nom).as_str()) {
+            "Various Artists".to_string()
+        } else {
+            nom.trim().to_string()
+        }
+    };
+    match (artiste_album, artiste_pistes) {
+        (Some(a), _) if !est_un_artiste_fictif(a) => canonique(a),
+        (_, Some(p)) if !est_un_artiste_fictif(p) => canonique(p),
+        (Some(a), _) => a.trim().to_string(),
+        (None, Some(p)) => p.trim().to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Échappe une PHRASE Lucene, le texte placé entre guillemets.
+///
+/// 🔴 Entre guillemets, deux caractères seulement ont un sens pour l'analyseur
+/// de MusicBrainz : le guillemet, qui ferme la phrase, et la barre oblique
+/// inverse, qui échappe. `12" Mixes` donnait `release:"12" Mixes"` : la phrase
+/// s'arrêtait à `12`, `Mixes"` devenait un terme libre suivi d'un guillemet
+/// orphelin, et la requête échouait ou ramenait n'importe quoi. Les autres
+/// caractères spéciaux (`:`, `-`, `(`, `!`…) sont littéraux DANS une phrase :
+/// les échapper aussi ne changerait rien à la recherche, mais changerait la
+/// requête envoyée — et le banc #4805, qui rejoue des réponses indexées par
+/// requête, ne serait plus rejouable.
+pub(crate) fn echapper_phrase_lucene(texte: &str) -> String {
+    let mut out = String::with_capacity(texte.len());
+    for c in texte.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// La requête Lucene d'une recherche de pressage : la phrase du titre, et
+/// celle de l'artiste quand il est connu. Chaque phrase est échappée
+/// ([`echapper_phrase_lucene`]).
+pub(crate) fn requete_lucene(titre: &str, artiste: &str) -> String {
+    let mut query_parts = vec![format!("release:\"{}\"", echapper_phrase_lucene(titre))];
+    if !artiste.trim().is_empty() {
+        query_parts.push(format!("artist:\"{}\"", echapper_phrase_lucene(artiste)));
+    }
+    query_parts.join(" AND ")
 }
 
 /// Every plausible release for an album, for the user to choose from.
@@ -731,6 +1221,38 @@ async fn recherche_de_pressages<F, Fut>(
     artist: &str,
     track_hint: Option<u32>,
     limit: usize,
+    interroger: F,
+) -> RechercheDePressages
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, RefusMusicBrainz>>,
+{
+    // Ask for more than we show: the plausibility filter drops some, and
+    // MusicBrainz mixes in loosely-related releases.
+    let fetch = (limit * 3).clamp(10, 100);
+    let mut recherche =
+        recherche_de_pressages_complete(title, artist, track_hint, fetch, interroger).await;
+    recherche.candidats.truncate(limit);
+    debug!(
+        count = recherche.candidats.len(),
+        title = title,
+        "mb_release_candidates_found"
+    );
+    recherche
+}
+
+/// [`recherche_de_pressages`] **sans la troncature** : tous les pressages
+/// plausibles parmi les `fetch` demandés, classés.
+///
+/// Le choix automatique ([`super::choix_de_pressage`]) en a besoin : pour
+/// juger qu'un candidat est « nettement devant », il faut voir le suivant, et
+/// la liste tronquée à cinq le cachait souvent derrière quatre pressages du
+/// même album. Même requête, même nombre de requêtes.
+pub(crate) async fn recherche_de_pressages_complete<F, Fut>(
+    title: &str,
+    artist: &str,
+    track_hint: Option<u32>,
+    fetch: usize,
     mut interroger: F,
 ) -> RechercheDePressages
 where
@@ -742,20 +1264,10 @@ where
         return RechercheDePressages::repondue(Vec::new());
     }
 
-    // Ask for more than we show: the plausibility filter drops some, and
-    // MusicBrainz mixes in loosely-related releases.
-    let fetch = (limit * 3).clamp(10, 100);
-
     // La requête Lucene. `interroge` porte le titre ENVOYÉ à MusicBrainz ; le
-    // tri de plausibilité, lui, juge toujours contre `title`, celui de la
+    // tri de plausibilité juge d'abord contre `title`, celui de la
     // bibliothèque.
-    let requete = |interroge: &str| -> String {
-        let mut query_parts = vec![format!("release:\"{interroge}\"")];
-        if !artist.trim().is_empty() {
-            query_parts.push(format!("artist:\"{artist}\""));
-        }
-        query_parts.join(" AND ")
-    };
+    let requete = |interroge: &str| -> String { requete_lucene(interroge, artist) };
 
     let mut candidates = match interroger(requete(title), fetch).await {
         Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
@@ -772,9 +1284,11 @@ where
     // Second essai, et seulement sur échec : le titre débarrassé de son suffixe
     // de pressage. Mesuré à +15,4 points sur le .18 (#4805). Le coût — une
     // requête de 1,1 s — n'est payé que par le tiers d'albums qui a échoué, et
-    // pas du tout quand il n'y a rien à retirer.
+    // pas du tout quand il n'y a rien à retirer. Depuis le 05/10/2026, le
+    // préfixe de tête s'en va aussi quand c'est l'artiste ou un compositeur
+    // (`Pink Floyd - The Wall`, `Beethoven: Symphony No. 9`).
     let second_essai = if candidates.is_empty() {
-        titre_de_requete(title)
+        titre_de_requete_pour(title, artist)
     } else {
         None
     };
@@ -786,7 +1300,17 @@ where
         );
         rate_limit_delay().await;
         candidates = match interroger(requete(&nettoye), fetch).await {
-            Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
+            // Plausible face au titre d'origine d'abord. À défaut, face au
+            // titre interrogé : un préfixe retiré n'est plus inclus dans le
+            // pressage (`Bach: Goldberg Variations` face à `The Goldberg
+            // Variations`), alors que l'œuvre et l'artiste, eux, concordent.
+            Ok(data) => {
+                let mut trouves = parse_search_results(&data, title, artist);
+                if trouves.is_empty() {
+                    trouves = parse_search_results(&data, &nettoye, artist);
+                }
+                rank_candidates(trouves, track_hint)
+            }
             Err(refus) => {
                 debug!(title = title, refus = %refus, "mb_release_candidates_refus");
                 return RechercheDePressages::refusee(refus);
@@ -794,16 +1318,18 @@ where
         };
     }
 
-    candidates.truncate(limit);
-    debug!(
-        count = candidates.len(),
-        title = title,
-        "mb_release_candidates_found"
-    );
     RechercheDePressages::repondue(candidates)
 }
 
+/// Les `inc` que lit [`parse_release_detail`] : pistes, artistes crédités,
+/// labels.
+pub const INC_DETAIL_RELEASE: &str = "recordings+artist-credits+labels";
+
 /// Fetch a chosen release with its track listing.
+///
+/// Sans base : une requête à chaque appel. Les appelants qui ont une base
+/// passent par [`lookup_release_detail_gardee`], qui garde la réponse pour la
+/// passe des crédits.
 pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> {
     if release_id.trim().is_empty() {
         return None;
@@ -811,13 +1337,28 @@ pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> 
     let data = mb_get(
         &format!("release/{release_id}"),
         &[
-            ("inc", "recordings+artist-credits+labels".to_string()),
+            ("inc", INC_DETAIL_RELEASE.to_string()),
             ("fmt", "json".to_string()),
         ],
     )
     .await
     .ok()?;
     parse_release_detail(&data)
+}
+
+/// Le détail d'un pressage, lu dans la base s'il y est, sinon demandé UNE fois
+/// avec [`INC_RELEASE_COMPLET`] et gardé (#4805, idée 3 de MetaRust). La passe
+/// des crédits trouvera ensuite la réponse en base et ne refera pas la
+/// requête. Attend le créneau MusicBrainz lui-même, et seulement s'il part sur
+/// le réseau.
+pub async fn lookup_release_detail_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+) -> Option<MBReleaseDetail> {
+    match lire_release_gardee(backend, release_id, INC_DETAIL_RELEASE).await {
+        LectureRelease::Lue(data) => parse_release_detail(&data),
+        LectureRelease::Inconnue | LectureRelease::Panne(_) => None,
+    }
 }
 
 /// Le TYPE DE SORTIE d'un groupe de sortie MusicBrainz (#4767).
@@ -870,6 +1411,15 @@ pub async fn rate_limit_delay() {
         .await;
 }
 
+/// Rend compte d'une réponse MusicBrainz au limiteur partagé (#4805, 4 bis) :
+/// un `503`/`429` double l'intervalle de la clé [`CLE_LIMITEUR_MUSICBRAINZ`]
+/// (jusqu'à 5 s) en respectant `Retry-After`, un succès le ramène à 1 s.
+/// S'emploie juste après le `send`, souvent en `.inspect(...)` sur le
+/// `Result`.
+pub fn constater_reponse_musicbrainz(reponse: &reqwest::Response) {
+    crate::http::fetch::MUSICBRAINZ.constater_reponse(CLE_LIMITEUR_MUSICBRAINZ, reponse);
+}
+
 /// Issue d'une lecture de release pour la passe des crédits (#4767).
 ///
 /// Trois cas, parce que l'appelant ne fait pas la même chose : une réponse
@@ -890,10 +1440,132 @@ pub enum LectureRelease {
 pub const INC_CREDITS_RELEASE: &str =
     "recordings+artist-credits+recording-level-rels+work-rels+work-level-rels+artist-rels";
 
+/// Ce que l'identification demande désormais d'un coup : les crédits ET les
+/// labels (#4805, idée 3 de MetaRust). Couvre [`INC_DETAIL_RELEASE`] comme
+/// [`INC_CREDITS_RELEASE`] : la réponse gardée sert aux deux.
+pub const INC_RELEASE_COMPLET: &str =
+    "recordings+artist-credits+labels+recording-level-rels+work-rels+work-level-rels+artist-rels";
+
 /// Lit une release avec toutes ses relations de crédits (#4767). N'attend PAS
 /// le créneau : l'appelant appelle [`rate_limit_delay`] juste avant.
 pub async fn lookup_release_credits(release_id: &str) -> LectureRelease {
     lire_release(release_id, INC_CREDITS_RELEASE, 30).await
+}
+
+/// Une lecture `/release/{id}` avec les `inc` donnés, sans base. N'attend PAS
+/// le créneau : c'est le transport des coutures `*_par`.
+pub async fn lire_release_brute(release_id: &str, inc: &str) -> LectureRelease {
+    lire_release(release_id, inc, 30).await
+}
+
+/// D'où vient une release lue par [`lire_release_gardee_par`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Réponse gardée en base : aucune requête.
+    Base,
+    /// Demandée à MusicBrainz (et gardée si elle a été lue).
+    Reseau,
+}
+
+/// Une release, lue d'abord dans `musicbrainz_release_cache`, sinon demandée
+/// par `interroger` avec [`INC_RELEASE_COMPLET`] et gardée.
+///
+/// `inc_requis` dit ce que l'appelant LIT : une réponse gardée qui ne le
+/// couvre pas, ou périmée, ne sert pas. `interroger` reçoit l'identifiant et
+/// les `inc` à demander ; il porte le transport ET l'attente du créneau
+/// MusicBrainz — ainsi une lecture en base ne réserve aucun créneau.
+///
+/// La couture existe pour que l'économie se compte sans réseau (banc #4805).
+pub async fn lire_release_gardee_par<F, Fut>(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+    inc_requis: &str,
+    interroger: F,
+) -> (LectureRelease, Provenance)
+where
+    F: FnOnce(String, &'static str) -> Fut,
+    Fut: std::future::Future<Output = LectureRelease>,
+{
+    use super::musicbrainz_release_cache as cache;
+    let id = release_id.trim();
+    if id.is_empty() {
+        return (LectureRelease::Inconnue, Provenance::Base);
+    }
+    if let Some(v) = cache::lire(backend, id, inc_requis, chrono::Utc::now()) {
+        debug!(release_id = id, "mb_release_cache_hit");
+        return (LectureRelease::Lue(v), Provenance::Base);
+    }
+    let lecture = interroger(id.to_string(), INC_RELEASE_COMPLET).await;
+    if let LectureRelease::Lue(v) = &lecture {
+        cache::ecrire(backend, id, INC_RELEASE_COMPLET, v, chrono::Utc::now());
+    }
+    (lecture, Provenance::Reseau)
+}
+
+/// [`lire_release_gardee_par`] sur le vrai transport : créneau MusicBrainz
+/// partagé, puis une requête, seulement si la base n'a pas la réponse.
+pub async fn lire_release_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    release_id: &str,
+    inc_requis: &str,
+) -> LectureRelease {
+    lire_release_gardee_par(backend, release_id, inc_requis, |id, inc| async move {
+        rate_limit_delay().await;
+        lire_release_brute(&id, inc).await
+    })
+    .await
+    .0
+}
+
+/// La LECTURE du choix d'édition (#4805 D), adossée à la release gardée en
+/// base (#4805, idée 3) : une lecture `release/{id}` est d'abord cherchée dans
+/// `musicbrainz_release_cache` ; sinon elle part sur le réseau avec
+/// [`INC_RELEASE_COMPLET`] ET les `inc` demandés, et la réponse est gardée —
+/// la passe des crédits la relira sans requête. Les autres chemins
+/// (`recording/{id}`) passent tels quels par `interroger`.
+///
+/// `interroger(chemin, inc)` est le transport : [`lire_sur_musicbrainz`] en
+/// production. La couture sert aux tests, sans réseau.
+pub async fn lire_sur_musicbrainz_gardee_par<F, Fut>(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    chemin: String,
+    inc: &'static str,
+    interroger: F,
+) -> Result<Option<Value>, RefusMusicBrainz>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>, RefusMusicBrainz>>,
+{
+    use super::musicbrainz_release_cache as cache;
+    let Some(id) = chemin.strip_prefix("release/").map(str::trim) else {
+        return interroger(chemin, inc.to_string()).await;
+    };
+    if let Some(v) = cache::lire(backend, id, inc, chrono::Utc::now()) {
+        debug!(release_id = id, "mb_release_cache_hit_choix");
+        return Ok(Some(v));
+    }
+    let inc_reseau = cache::inc_canonique(&format!("{INC_RELEASE_COMPLET}+{inc}"));
+    let lecture = interroger(chemin.clone(), inc_reseau.clone()).await;
+    if let Ok(Some(v)) = &lecture {
+        cache::ecrire(backend, id, &inc_reseau, v, chrono::Utc::now());
+    }
+    lecture
+}
+
+/// [`lire_sur_musicbrainz_gardee_par`] sur le vrai transport.
+pub async fn lire_sur_musicbrainz_gardee(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    chemin: String,
+    inc: &'static str,
+) -> Result<Option<Value>, RefusMusicBrainz> {
+    lire_sur_musicbrainz_gardee_par(backend, chemin, inc, |chemin, inc| async move {
+        match mb_get(&chemin, &[("inc", inc), ("fmt", "json".to_string())]).await {
+            Ok(v) => Ok(Some(v)),
+            Err(RefusMusicBrainz::Statut(404 | 400)) => Ok(None),
+            Err(refus) => Err(refus),
+        }
+    })
+    .await
 }
 
 /// Lit les SEULS labels d'une release connue par son MBID (#4836) : la passe
@@ -925,6 +1597,7 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
         .timeout(std::time::Duration::from_secs(delai_s))
         .send()
         .await
+        .inspect(constater_reponse_musicbrainz)
     {
         Ok(r) => r,
         Err(e) => return LectureRelease::Panne(e.to_string()),
@@ -941,6 +1614,16 @@ async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelea
         Err(e) => LectureRelease::Panne(e.to_string()),
     }
 }
+
+// Banc « une seule requête de release par album » (#4805, idée 3 de MetaRust).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_release_en_base.rs"]
+mod banc_release_en_base;
+
+// Banc « couverture des crédits des albums identifiés » (#4805, étape E).
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_credits_4805.rs"]
+mod banc_credits_4805;
 
 #[cfg(test)]
 mod tests {
@@ -960,6 +1643,103 @@ mod tests {
         assert_eq!(
             titre_de_requete("GROẞE Werke - CD 3").as_deref(),
             Some("GROẞE Werke")
+        );
+    }
+
+    /// 🔴 Un guillemet dans le titre (« 12" Mixes ») fermait la phrase Lucene :
+    /// `release:"12" Mixes"`. Il est désormais échappé, la barre oblique
+    /// inverse aussi ; le reste est littéral dans une phrase.
+    #[test]
+    fn requete_lucene_echappe_le_guillemet_d_un_titre() {
+        assert_eq!(
+            requete_lucene("12\" Mixes", "Kraftwerk"),
+            r#"release:"12\" Mixes" AND artist:"Kraftwerk""#
+        );
+        assert_eq!(
+            requete_lucene(r"AC\DC Live", r#"Le "Groupe""#),
+            r#"release:"AC\\DC Live" AND artist:"Le \"Groupe\"""#
+        );
+        // Inchangé pour un titre sans guillemet : le banc #4805 rejoue des
+        // réponses indexées par requête.
+        assert_eq!(
+            requete_lucene("Beethoven: Symphony No. 9", "Herbert von Karajan"),
+            r#"release:"Beethoven: Symphony No. 9" AND artist:"Herbert von Karajan""#
+        );
+        // Une phrase échappée ne contient plus aucun guillemet nu.
+        let q = requete_lucene("12\" Mixes", "");
+        let nus = q
+            .char_indices()
+            .filter(|(i, c)| *c == '"' && !q[..*i].ends_with('\\'))
+            .count();
+        assert_eq!(
+            nus, 2,
+            "seuls les deux guillemets de la phrase restent nus : {q}"
+        );
+    }
+
+    /// La recherche réellement envoyée par `lookup_release_candidates` passe
+    /// par la même échappée.
+    #[tokio::test(start_paused = true)]
+    async fn la_recherche_envoie_le_guillemet_echappe() {
+        let vues = std::cell::RefCell::new(Vec::new());
+        recherche_de_pressages("12\" Mixes", "Kraftwerk", None, 5, |requete, _| {
+            vues.borrow_mut().push(requete);
+            std::future::ready(Ok(json!({ "releases": [] })))
+        })
+        .await;
+        assert_eq!(
+            vues.borrow().first().map(String::as_str),
+            Some(r#"release:"12\" Mixes" AND artist:"Kraftwerk""#)
+        );
+    }
+
+    #[test]
+    fn les_suffixes_d_edition_sont_gardes_pour_choisir() {
+        assert_eq!(
+            editions_du_titre("Buhloone Mindstate (30th Anniversary)"),
+            vec!["30th Anniversary".to_string()]
+        );
+        assert_eq!(
+            editions_du_titre("Album (Remastered) [Deluxe Edition]"),
+            vec!["Deluxe Edition".to_string(), "Remastered".to_string()]
+        );
+        // Un sous-titre n'est pas une édition (même liste de marqueurs que
+        // `titre_de_requete`).
+        assert!(editions_du_titre("Beyond the Missouri Sky (Short Stories)").is_empty());
+        assert!(editions_du_titre("Song (feat. Live Band)").is_empty());
+        // `titre_de_requete` retire toujours ce qu'il retirait.
+        assert_eq!(
+            titre_de_requete("Album (Remastered) [Deluxe Edition]").as_deref(),
+            Some("Album")
+        );
+    }
+
+    #[test]
+    fn le_compositeur_en_tete_de_titre() {
+        assert_eq!(
+            compositeur_en_prefixe("Beethoven: Symphony No. 9").as_deref(),
+            Some("beethoven")
+        );
+        assert_eq!(
+            compositeur_en_prefixe("Antonín Dvořák - Symphony No. 9").as_deref(),
+            Some("dvorak")
+        );
+        assert_eq!(compositeur_en_prefixe("Pink Floyd - The Wall"), None);
+        assert_eq!(compositeur_en_prefixe("Symphony No. 9"), None);
+    }
+
+    #[test]
+    fn les_titres_se_comparent_aussi_sans_espaces() {
+        assert!(plausible(
+            "Buhloone Mind State",
+            "De La Soul",
+            "Buhloone Mindstate",
+            "De La Soul"
+        ));
+        assert_eq!(normalize_compact("Mind State!"), "mindstate");
+        assert_eq!(
+            normalize_sans_diacritiques("Antonín Dvořák"),
+            "antonin dvorak"
         );
     }
 
@@ -1665,4 +2445,212 @@ mod tests {
         assert!(!recherche.service_refuse());
         assert!(recherche.candidats.is_empty());
     }
+
+    // -- #4805, 05/10/2026 : préfixe de tête et artiste de requête --
+
+    /// Les deux formes de préfixe que la recherche par phrase ne retrouve pas.
+    #[test]
+    fn titre_de_requete_pour_retire_le_prefixe_d_artiste_ou_de_compositeur() {
+        for (brut, artiste, attendu) in [
+            ("Pink Floyd - The Wall", "Pink Floyd", "The Wall"),
+            (
+                "Beethoven: Symphony No. 9",
+                "Herbert von Karajan",
+                "Symphony No. 9",
+            ),
+            ("Chopin - Nocturnes", "Maria João Pires", "Nocturnes"),
+            (
+                "J.S. Bach: Goldberg Variations",
+                "Glenn Gould",
+                "Goldberg Variations",
+            ),
+            (
+                "Saint-Saëns – Carnaval des animaux",
+                "Martha Argerich",
+                "Carnaval des animaux",
+            ),
+            // Préfixe ET suffixe, dans les deux ordres possibles de retrait.
+            ("Pink Floyd - Animals (Remastered)", "Pink Floyd", "Animals"),
+        ] {
+            assert_eq!(
+                titre_de_requete_pour(brut, artiste).as_deref(),
+                Some(attendu),
+                "le préfixe de « {brut} » n'a pas été retiré"
+            );
+        }
+    }
+
+    /// Un préfixe qui n'est ni l'artiste ni un compositeur fait partie du
+    /// titre : `Smash the System: Singles and More` reste entier.
+    #[test]
+    fn titre_de_requete_pour_garde_un_prefixe_qui_fait_partie_du_titre() {
+        for (propre, artiste) in [
+            ("Smash the System: Singles and More", "Saint Etienne"),
+            ("Back To Mine - Talvin Singh", "Talvin Singh"),
+            (
+                "The Best of Miles Davis & John Coltrane: 1955-1961",
+                "Miles Davis",
+            ),
+            ("Kind of Blue", "Miles Davis"),
+            ("Pink Floyd -", "Pink Floyd"),
+        ] {
+            assert_eq!(
+                titre_de_requete_pour(propre, artiste),
+                None,
+                "« {propre} » a été amputé alors que son préfixe fait partie du titre"
+            );
+        }
+    }
+
+    /// Sans préfixe, le comportement de #4805 (suffixes) est inchangé.
+    #[test]
+    fn titre_de_requete_pour_garde_le_nettoyage_des_suffixes() {
+        assert_eq!(
+            titre_de_requete_pour("Somethin' Else (192kHz/24bit)", "Cannonball Adderley")
+                .as_deref(),
+            Some("Somethin' Else")
+        );
+        assert_eq!(
+            titre_de_requete_pour(
+                "Radio Nova - La boite Jaune - 1992, Disc 12",
+                "Various Artists"
+            )
+            .as_deref(),
+            Some("Radio Nova - La boite Jaune - 1992")
+        );
+    }
+
+    #[test]
+    fn artiste_de_requete_nomme_les_compilations_comme_musicbrainz() {
+        for alias in [
+            "VA",
+            "V.A.",
+            "Artistes divers",
+            "Varios Artistas",
+            "Compilation",
+        ] {
+            assert_eq!(
+                artiste_de_requete(Some(alias), None),
+                "Various Artists",
+                "{alias}"
+            );
+        }
+        assert_eq!(
+            artiste_de_requete(Some("Various Artists"), None),
+            "Various Artists"
+        );
+        // Un vrai nom n'est jamais réécrit, même court.
+        assert_eq!(artiste_de_requete(Some("Air"), None), "Air");
+        assert_eq!(artiste_de_requete(Some("Divers Gens"), None), "Divers Gens");
+    }
+
+    #[test]
+    fn artiste_de_requete_prefere_l_artiste_des_pistes_a_un_artiste_fictif() {
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), Some("Air")),
+            "Air"
+        );
+        assert_eq!(
+            artiste_de_requete(Some("Artiste inconnu"), Some("Björk")),
+            "Björk"
+        );
+        assert_eq!(artiste_de_requete(Some(""), Some("Air")), "Air");
+        assert_eq!(artiste_de_requete(None, Some("VA")), "Various Artists");
+        // Rien de mieux : l'artiste d'origine, comme avant.
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), Some("Unknown Artist")),
+            "Unknown Artist"
+        );
+        assert_eq!(
+            artiste_de_requete(Some("Unknown Artist"), None),
+            "Unknown Artist"
+        );
+        assert_eq!(artiste_de_requete(None, None), "");
+        // Un vrai artiste d'album n'est jamais remplacé par celui des pistes.
+        assert_eq!(
+            artiste_de_requete(Some("Miles Davis"), Some("John Coltrane")),
+            "Miles Davis"
+        );
+    }
+
+    /// Le préfixe retiré, le pressage de MusicBrainz n'est plus inclus dans le
+    /// titre d'origine (`The Goldberg Variations` face à `Bach: Goldberg
+    /// Variations`). Le second essai juge alors contre le titre interrogé.
+    #[tokio::test(start_paused = true)]
+    async fn le_second_essai_juge_aussi_contre_le_titre_interroge() {
+        let requetes = std::cell::RefCell::new(Vec::<String>::new());
+        let recherche = recherche_de_pressages(
+            "Bach: Goldberg Variations",
+            "Glenn Gould",
+            Some(32),
+            5,
+            |requete, _fetch| {
+                requetes.borrow_mut().push(requete.clone());
+                let premier = requetes.borrow().len() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Ok(reponse_avec_un_pressage(
+                            "The Goldberg Variations",
+                            "Bach; Glenn Gould",
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            requetes.borrow().last().map(String::as_str),
+            Some("release:\"Goldberg Variations\" AND artist:\"Glenn Gould\"")
+        );
+        assert_eq!(
+            recherche.candidats.len(),
+            1,
+            "le pressage de l'œuvre a été écarté"
+        );
+    }
+
+    /// Et l'artiste reste jugé : un autre interprète de la même œuvre ne passe
+    /// pas, même au second essai.
+    #[tokio::test(start_paused = true)]
+    async fn le_second_essai_juge_toujours_l_artiste() {
+        let appels = std::cell::Cell::new(0usize);
+        let recherche = recherche_de_pressages(
+            "Bach: Goldberg Variations",
+            "Glenn Gould",
+            Some(32),
+            5,
+            |_requete, _fetch| {
+                appels.set(appels.get() + 1);
+                let premier = appels.get() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Ok(reponse_avec_un_pressage(
+                            "Goldberg Variations",
+                            "Bach; András Schiff",
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(appels.get(), 2);
+        assert!(recherche.candidats.is_empty());
+    }
 }
+
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_4805.rs"]
+mod banc_4805;
+
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_choix.rs"]
+mod banc_choix;
+
+#[cfg(test)]
+#[path = "musicbrainz_release_banc_precision.rs"]
+mod banc_precision;

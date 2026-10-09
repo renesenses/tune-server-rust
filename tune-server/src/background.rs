@@ -42,7 +42,11 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
-    spawn_memory_diagnostics(state.outputs.clone(), state.streamer.clone());
+    spawn_memory_diagnostics(
+        state.outputs.clone(),
+        state.streamer.clone(),
+        state.backend.clone(),
+    );
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
@@ -65,7 +69,14 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
     // un réglage que plus personne ne relisait. Un test de câblage garde la
     // ligne.
-    crate::routes::system::scan::spawn_scan_scheduler(state.clone(), config.auto_scan);
+    //
+    // Le drapeau dit « un scan de démarrage a été voulu » : il suit donc le
+    // même ordre de précédence que `bootstrap` (réglage utilisateur, puis
+    // `config.auto_scan`), par la même fonction.
+    crate::routes::system::scan::spawn_scan_scheduler(
+        state.clone(),
+        crate::auto_scan::scan_au_demarrage_voulu(config.auto_scan, &state.backend),
+    );
     // Vérificateur périodique de mises à jour (#3217). Même défaut que la ligne
     // ci-dessus, et même remède : `UpdateChecker::spawn_periodic` n'avait qu'UNE
     // occurrence dans tout le dépôt — sa définition — et `TUNE_AUTO_UPDATE`
@@ -701,8 +712,21 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                                     &desc.event_sub_urls(),
                                 ),
                             )
-                            .with_upnp_silence(
-                                crate::config::resolve_upnp_silence(&state.backend, &d.id),
+                            .with_upnp_silence(crate::config::resolve_upnp_silence(
+                                &state.backend,
+                                &d.id,
+                            ))
+                            // #5793 — plage de volume et canaux lus dans le SCPD.
+                            .with_rendering_control_scpd(
+                                desc.scpd_urls().get("renderingcontrol").map(|p| {
+                                    crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
+                                }),
+                            )
+                            // #3967 — l'annonce de `SetNextAVTransportURI`.
+                            .with_av_transport_scpd(
+                                desc.scpd_urls().get("avtransport").map(|p| {
+                                    crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
+                                }),
                             );
                             outputs.register(Box::new(dlna));
                             registered += 1;
@@ -943,6 +967,27 @@ pub fn journaliser_succes_hqplayer(
     }
 }
 
+/// Le recensement LMS mérite-t-il une ligne de journal ce tour-ci ?
+///
+/// Le sondeur interroge le LMS chaque minute, et chaque tour écrivait sa ligne
+/// `INFO` : `squeezebox_discover: no players found on LMS` quand le LMS ne
+/// connaissait aucun lecteur, `squeezebox_poll_discovered` quand il en
+/// connaissait. Chez un testeur dont le LMS tournait sur la machine même, sans
+/// lecteur branché, c'était 133 lignes sur les 1 000 d'un export de
+/// diagnostic, toutes identiques, qui repoussaient hors de la fenêtre les
+/// lignes utiles.
+///
+/// Le recensement reste utile — c'est lui qui fait apparaître un lecteur
+/// branché en moins d'une minute —, seule sa trace change : elle n'est écrite
+/// qu'à la première réponse du LMS et à chaque **changement** du nombre de
+/// lecteurs. `dernier` vaut `None` tant que le LMS n'a pas répondu, ou après
+/// un échec : son retour est alors annoncé à nouveau.
+pub fn recensement_squeezebox_a_annoncer(dernier: &mut Option<usize>, lecteurs: usize) -> bool {
+    let change = *dernier != Some(lecteurs);
+    *dernier = Some(lecteurs);
+    change
+}
+
 fn spawn_squeezebox_poller(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -957,6 +1002,9 @@ fn spawn_squeezebox_poller(state: &AppState) {
         // Cadence partagée avec le sondeur HQPlayer : voir
         // `prochain_intervalle_sondage` (60 s de base, 600 s de plancher).
         let mut interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+        // Dernier nombre de lecteurs annoncé : voir
+        // `recensement_squeezebox_a_annoncer`.
+        let mut dernier_recensement: Option<usize> = None;
         loop {
             let settings =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -976,14 +1024,27 @@ fn spawn_squeezebox_poller(state: &AppState) {
             if enabled && !host.is_empty() {
                 match crate::routes::squeezebox::discover_and_register(&state).await {
                     Ok(players) => {
-                        if !players.is_empty() {
-                            info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
+                        if recensement_squeezebox_a_annoncer(
+                            &mut dernier_recensement,
+                            players.len(),
+                        ) {
+                            if players.is_empty() {
+                                info!(
+                                    lms = %host,
+                                    "squeezebox_poll_no_players — le LMS répond mais ne connaît \
+                                     aucun lecteur ; ce message ne se répète pas tant que rien \
+                                     ne change"
+                                );
+                            } else {
+                                info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
+                            }
                         }
                         // Reachable → back to normal cadence.
                         interval_secs = prochain_intervalle_sondage(interval_secs, false);
                     }
                     Err(e) => {
                         interval_secs = prochain_intervalle_sondage(interval_secs, true);
+                        dernier_recensement = None;
                         tracing::debug!(
                             error = %e,
                             lms = %host,
@@ -996,6 +1057,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
                 // Integration off / no host configured — idle at base cadence so
                 // a freshly configured host is picked up promptly.
                 interval_secs = SONDAGE_INTERVALLE_BASE_SECS;
+                dernier_recensement = None;
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
@@ -2524,11 +2586,16 @@ fn spawn_replaygain_analysis(state: &AppState) {
     // lui dépose le bus, comme il le fait pour l'orchestrateur.
     tune_core::audio::replaygain::progression::brancher_le_bus(state.event_bus.clone());
     tune_core::audio::replaygain::spawn(state.backend.clone());
+    // #5882 — une remesure demandée avant un arrêt reprend où elle en était.
+    tune_core::audio::replaygain::remesure::reprendre_si_demandee(state.backend.clone());
     // #5168 — le rattrapage des rapports `foo_dr.txt`, sans décodage. Il vit
     // sous la carte « Plage dynamique », donc à côté de la cascade qui la
     // porte ; il ne dépend PAS de l'interrupteur d'analyse : lire un rapport
     // ne décode rien, exactement comme le scan qui le lit déjà.
     tune_core::taches_de_fond::rapports_dr::spawn(state.backend.clone());
+    // #5594 — la clé du signal PCM des FLAC (`tracks.audio_pcm_key`), lue
+    // dans l'en-tête : rien n'est décodé, rien n'est écrit dans les fichiers.
+    tune_core::taches_de_fond::cle_pcm::spawn(state.backend.clone());
 }
 
 /// #2172 — le rattrapage des paroles.
@@ -2585,14 +2652,24 @@ fn spawn_cloud_library_sync(state: &AppState) {
 /// - `rss_delta_mb` : la croissance depuis le démarrage du serveur. Un seul
 ///   relevé ne dit rien ; c'est l'écart qui parle, et le lire dans la ligne
 ///   évite d'avoir à retrouver la première.
+/// - `rss_anon_mb`, `rss_file_mb`, `rss_shmem_mb` : la ventilation du RSS
+///   lue dans `/proc/self/status` ([`crate::releve_memoire`]). Le tas (anonyme)
+///   et les fichiers projetés (la base) ne se diagnostiquent pas pareil ; un
+///   champ que le noyau ne publie pas est absent de la ligne.
 ///
 /// Ce n'est PAS un correctif. Le ticket demande explicitement trois mesures du
 /// testeur avant de coder, parce qu'une fuite de lecture et une fuite de tâche
 /// de fond n'ont pas le même correctif. Ceci rend le prochain relevé
 /// exploitable, rien de plus.
+///
+/// Après le relevé, et sans sortie locale en lecture, la mémoire libre que garde
+/// l'allocateur est rendue au système ([`crate::memoire_a_froid`]) : mesuré
+/// sur Shrek, 94 % du tas résident au repos était de la mémoire libre, et le
+/// relevé ne redescendait jamais.
 fn spawn_memory_diagnostics(
     outputs: Arc<tokio::sync::Mutex<OutputRegistry>>,
     streamer: Arc<tune_core::http::streamer::AudioStreamer>,
+    backend: Arc<dyn tune_core::db::backend::DbBackend>,
 ) {
     tokio::spawn(async move {
         // Le relevé lui-même n'existe que sur Linux (`/proc/self/statm`) : la
@@ -2616,18 +2693,58 @@ fn spawn_memory_diagnostics(
                 // Signé : un relevé sous la valeur de départ est une information
                 // (mémoire rendue), pas un débordement à cacher.
                 let rss_delta_mb = rss_mb as i64 - base as i64;
+                // Ventilation du RSS : un champ indisponible est omis de la
+                // ligne, jamais remplacé par un zéro.
+                let detail = crate::releve_memoire::lire().await;
                 info!(
                     rss_mb,
                     rss_delta_mb,
+                    rss_anon_mb = detail.anon_mb,
+                    rss_file_mb = detail.file_mb,
+                    rss_shmem_mb = detail.shmem_mb,
                     outputs_count = count,
                     stream_sessions,
                     "memory_diagnostics"
                 );
             }
+            purger_a_froid(&backend).await;
             let _ = (&outputs, &streamer); // keep alive on non-linux
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+/// Rend au système la mémoire libre gardée par l'allocateur, si aucune sortie
+/// locale ne joue (fil 2167). Hors du fil asynchrone : le parcours des arènes prend quelques
+/// dizaines de millisecondes au pire.
+async fn purger_a_froid(backend: &Arc<dyn tune_core::db::backend::DbBackend>) {
+    // Hors glibc, rien à rendre : ne pas payer la requête des zones.
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return;
+    }
+    let backend = backend.clone();
+    let mesure = tokio::task::spawn_blocking(move || {
+        // Fil 2167 — seule une sortie LOCALE en lecture retient la purge : une
+        // zone réseau qui joue sans arrêt ne la bloque plus pour toujours.
+        let locale = crate::memoire_a_froid::une_sortie_locale_joue(&backend);
+        if !crate::memoire_a_froid::purge_permise(locale) {
+            return None;
+        }
+        let avant = crate::memoire_a_froid::rss_mb();
+        let debut = std::time::Instant::now();
+        let rendu = crate::memoire_a_froid::rendre_la_memoire_liberee();
+        let apres = crate::memoire_a_froid::rss_mb();
+        Some((avant, apres, rendu, debut.elapsed()))
+    })
+    .await;
+    if let Ok(Some((Some(avant), Some(apres), true, duree))) = mesure {
+        info!(
+            rss_avant_mb = avant,
+            rss_apres_mb = apres,
+            duree_ms = duree.as_millis() as u64,
+            "memoire_rendue_a_froid"
+        );
+    }
 }
 
 /// Periodically re-enumerate local audio devices to detect USB DACs that were
@@ -4832,5 +4949,38 @@ mod compteurs_ssdp_du_demarrage_5226 {
             "les compteurs des renderers doivent rester lisibles et DISTINCTS \
              de celui des serveurs.\nligne : {ligne}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recensement_squeezebox_silencieux_tests {
+    use super::recensement_squeezebox_a_annoncer;
+
+    /// Une heure de LMS sans lecteur, puis un lecteur branché, puis débranché :
+    /// trois lignes, pas soixante-deux.
+    #[test]
+    fn le_recensement_ne_se_dit_qu_a_chaque_changement() {
+        let mut dernier = None;
+        let mut tours: Vec<usize> = vec![0; 60];
+        tours.push(1);
+        tours.push(1);
+        tours.push(0);
+        let annonces: Vec<usize> = tours
+            .iter()
+            .copied()
+            .filter(|n| recensement_squeezebox_a_annoncer(&mut dernier, *n))
+            .collect();
+        assert_eq!(annonces, vec![0, 1, 0]);
+    }
+
+    /// Après un échec, le sondeur remet `dernier` à `None` : le retour du LMS
+    /// est annoncé, même avec le même nombre de lecteurs qu'avant la panne.
+    #[test]
+    fn le_retour_apres_une_panne_est_annonce() {
+        let mut dernier = None;
+        assert!(recensement_squeezebox_a_annoncer(&mut dernier, 2));
+        assert!(!recensement_squeezebox_a_annoncer(&mut dernier, 2));
+        dernier = None;
+        assert!(recensement_squeezebox_a_annoncer(&mut dernier, 2));
     }
 }
