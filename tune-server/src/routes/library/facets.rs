@@ -600,7 +600,8 @@ fn build_facet_conditions(
         // lui, `q=cafe` comptait sans « Café » mais la liste le rendait (#1864).
         //
         // #5192 — la rédaction PARTAGÉE avec `list_filtered` : titre, artiste,
-        // album, label et termes de chemin, comme le navigateur.
+        // album, label, termes de chemin et compositeur (fil 1684), comme le
+        // navigateur.
         let (c, valeurs) = tune_core::db::facet_filter::condition_texte_libre(&mut ph, query);
         conds.push(c);
         params.extend(valeurs);

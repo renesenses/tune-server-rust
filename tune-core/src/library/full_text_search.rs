@@ -1374,10 +1374,10 @@ mod tests {
             "INSERT INTO artists (id, name) VALUES (1, 'Gustav Mahler'), (2, 'Pink Floyd');\
              INSERT INTO albums (id, title, artist_id) VALUES \
                (1, 'Symphonie n°1', 1), (2, 'Wish You Were Here', 2);\
-             INSERT INTO tracks (id, title, album_id, artist_id, file_path, source) VALUES \
-               (1, 'Langsam, schleppend', 1, 1, '/music/Classique/Mahler_Kondrashin/01-Langsam.flac', 'local'),\
-               (2, 'Mahler Kondrashin, l''entretien', NULL, NULL, '/music/Radio/entretien.flac', 'local'),\
-               (3, 'Have A Cigar', 2, 2, '/music/Pink Floyd - Wish You Were Here/03 - Have A Cigar.flac', 'local');",
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path, source, composer) VALUES \
+               (1, 'Langsam, schleppend', 1, 1, '/music/Classique/Mahler_Kondrashin/01-Langsam.flac', 'local', NULL),\
+               (2, 'Mahler Kondrashin, l''entretien', NULL, NULL, '/music/Radio/entretien.flac', 'local', NULL),\
+               (3, 'Have A Cigar', 2, 2, '/music/Pink Floyd - Wish You Were Here/03 - Have A Cigar.flac', 'local', 'Roger Watérs');",
         )
         .execute(&pool)
         .await
@@ -1417,6 +1417,11 @@ mod tests {
         assert_eq!(liste("mahler kondrashin"), 2);
         assert_eq!(liste("Langsam"), 1);
         assert_eq!(liste("mahler_kondrashin"), 0, "`_` littéral");
+        // Fil 1684 : le compositeur, casse et accents repliés, sixième champ
+        // — les marqueurs `$n` suivent jusqu'au bout.
+        assert_eq!(liste("roger waters"), 1, "compositeur");
+        assert_eq!(liste("WATÉRS"), 1, "compositeur, casse et accent");
+        assert_eq!(liste("stravinsky"), 0, "témoin du compositeur");
         let (tires, total) = repo
             .random_ids_in_folder(1, "/music/Classique", Some("kondrashin"), 10)
             .unwrap();
