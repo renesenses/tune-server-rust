@@ -409,3 +409,39 @@ fn temoin_de_duree_5138() {
         "pire durée {pire:?} ≥ {SEUIL:?} sur ≈ 35 000 pistes : la lecture paraîtrait en `slow_query` (#5138)"
     );
 }
+
+/// #5977 — `sql_pistes_ecartees_par_le_socle` (le socle résolu UNE fois par
+/// le rail des facettes) écarte EXACTEMENT les pistes que les deux replis de
+/// la liste écartent, sur le banc complet : doubles distants, copies MP3,
+/// copie FLAC de même qualité, original 16 bits battu par une copie 24 bits.
+#[test]
+fn le_socle_resolu_ecarte_exactement_ce_que_la_liste_replie() {
+    let dossier = tempfile::tempdir().unwrap();
+    let (db, banc) = banc_fichier(&dossier, 100);
+    let ids = |sql: &str| -> std::collections::BTreeSet<i64> {
+        db.query_many(sql, &[])
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect()
+    };
+    let resolu = ids(&super::facet_filter::sql_pistes_ecartees_par_le_socle(
+        Engine::Sqlite,
+    ));
+    let par_la_liste = ids(&format!(
+        "SELECT t.id FROM tracks t WHERE NOT ({} AND {})",
+        pistes_album_distant_double_exclu(Engine::Sqlite),
+        copie_de_moindre_qualite_exclue()
+    ));
+    assert_eq!(resolu, par_la_liste);
+    for id in &banc.ecartees {
+        assert!(resolu.contains(id), "copie {id} non écartée");
+    }
+    for id in banc.meilleures.iter().chain(&banc.sans_album) {
+        assert!(!resolu.contains(id), "piste {id} écartée à tort");
+    }
+    assert!(
+        resolu.len() > banc.ecartees.len(),
+        "les pistes des albums distants doublés en font partie"
+    );
+}

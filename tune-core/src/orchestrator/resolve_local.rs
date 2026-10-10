@@ -3564,8 +3564,12 @@ impl PlaybackOrchestrator {
                     tokio::spawn(async move {
                         // Passthrough : le décodage pour niveaux part de 0.
                         let cadence = playback.clone();
-                        let levels_tx =
-                            spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0);
+                        // #3818 — le forwarder dit ce qu'il consomme : le
+                        // frein ne s'appuie plus sur la seule position
+                        // rapportée, qui peut rester figée.
+                        let (levels_tx, consomme_ms) = spawn_paced_levels_forwarder_mesure(
+                            bus, playback, zone_id, play_seq, 0,
+                        );
                         // Décodage EN FLUX, pas en une fois. `decode_to_pcm`
                         // matérialisait la piste entière en mémoire avant
                         // d'émettre la moindre fenêtre : ~1,9 Go pour un
@@ -3599,7 +3603,7 @@ impl PlaybackOrchestrator {
                         // exactement le chemin de cette population-là. On
                         // freine donc SANS toucher à ce qui est décodé.
                         let (sink_tx, relais_tx) =
-                            spawn_braked_levels_sink(cadence, zone_id, levels_tx);
+                            spawn_braked_levels_sink(cadence, zone_id, levels_tx, consomme_ms);
                         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
                         let result = tokio::task::spawn_blocking(move || {
                             crate::audio::decode::decode_to_pcm_streaming_with_levels(

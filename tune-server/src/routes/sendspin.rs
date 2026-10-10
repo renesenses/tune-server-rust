@@ -55,7 +55,9 @@ mod contexte;
 pub(crate) mod operateur;
 mod pilote;
 mod sessions;
+mod zones;
 pub use contexte::ContexteSendspin;
+pub use zones::RaccordZones;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -301,23 +303,57 @@ async fn conduire_chiffre(
         vu_a: registre::maintenant(),
     });
 
-    // 7. `server/activate` avec une liste d'activites VIDE. Ni lecture ni
-    //    appairage : S2-a ne revendique rien. Ce message est neanmoins du : sans
-    //    lui, l'enceinte abandonne la connexion provisoire au bout de 30 s.
-    let activate = messages::Enveloppe::nouvelle(
-        messages::TYPE_SERVER_ACTIVATE,
-        messages::ServerActivate {
-            activities: Vec::new(),
-            active_roles: None,
-        },
-    );
-    let texte = serde_json::to_string(&activate)
-        .map_err(|e| ErreurSendspin::MessageIllisible(format!("server/activate : {e}")))?;
-    envoyer_json_chiffre(&mut socket, &mut transport, &texte).await?;
+    // 7. `server/activate`. Sans lui, l'enceinte abandonne la connexion
+    //    provisoire au bout de 30 s. Aucune activite n'est declaree ici.
+    //    S2-c : une session APPAIREE (PSK longue duree, cle reconnue) dont le
+    //    hello annonce `player@v1` et un format que Tune sait produire recoit
+    //    le role actif, suivi du `group/update` que la specification exige.
+    //    Toute autre session reste sans role : ni la Sentinelle publique ni
+    //    une PSK d'appairage n'authentifient le pair.
+    let mut lecteur = lecteur_admissible(&infos, &client_hello);
+    match lecteur.as_mut() {
+        Some(session) => {
+            for sortie in session.activation_initiale() {
+                pilote::emettre_hors_boucle(&mut socket, &mut transport, sortie).await?;
+            }
+            info!(client_id = %infos.client_id, "sendspin_role_lecteur_active");
+        }
+        None => {
+            let activate = messages::Enveloppe::nouvelle(
+                messages::TYPE_SERVER_ACTIVATE,
+                messages::ServerActivate {
+                    activities: Vec::new(),
+                    active_roles: None,
+                },
+            );
+            let texte = serde_json::to_string(&activate)
+                .map_err(|e| ErreurSendspin::MessageIllisible(format!("server/activate : {e}")))?;
+            envoyer_json_chiffre(&mut socket, &mut transport, &texte).await?;
+        }
+    }
     info!(client_id = %infos.client_id, "sendspin_server_activate_envoye");
 
-    // S2-b garde le canal chiffre pour les commandes operateur.
-    pilote::conduire(socket, transport, infos, client_hello, contexte).await
+    // S2-b garde le canal chiffre pour les commandes operateur ; S2-c y
+    // ajoute le role `player@v1`.
+    pilote::conduire(socket, transport, infos, client_hello, contexte, lecteur).await
+}
+
+/// Le role `player@v1` ne s'active que sur une session authentifiee par une
+/// PSK longue duree reconnue. La table d'activation de la specification
+/// l'autorise aussi sous la Sentinelle quand le client a ouvert l'acces non
+/// appaire ; Tune ne le fait pas dans cette version (question ecrite dans la
+/// PR #3326).
+pub(crate) fn lecteur_admissible(
+    infos: &tune_core::sendspin::poignee::InfosPair,
+    hello: &messages::ClientHello,
+) -> Option<tune_core::sendspin::lecteur::SessionLecteur> {
+    if infos.categorie_psk != tune_core::sendspin::psk::CategoriePsk::LongueDuree
+        || infos.identifiant_perdu
+    {
+        return None;
+    }
+    let nom = hello.name.as_deref().unwrap_or("Sendspin");
+    tune_core::sendspin::lecteur::SessionLecteur::admettre(&infos.client_id, nom, hello)
 }
 
 /// Le **mode de transition** : un `client/hello` en clair comme premier message.
