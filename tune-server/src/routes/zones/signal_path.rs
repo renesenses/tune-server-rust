@@ -523,6 +523,13 @@ pub(super) fn dsd_resolution_label(sample_rate: i32) -> String {
     )
 }
 
+/// « DSD64 over PCM (DoP) » — l'étage de sortie d'un DSD emballé en DoP
+/// (#2029). Le libellé est celui que le testeur a demandé : les chiffres du
+/// porteur PCM (176,4 kHz / 24 bits pour un DSD64) faisaient croire à une
+/// conversion en PCM.
+pub(super) fn dop_stage_label(sample_rate: i32) -> String {
+    format!("{} over PCM (DoP)", dsd_family_name(sample_rate))
+}
 /// Ces chiffres décrivent-ils du DSD ? 1 bit, ou une cadence en MHz.
 ///
 /// Aucun PCM n'atteint le mégahertz (768 kHz est le maximum du marché) et
@@ -1185,12 +1192,28 @@ fn assembler_les_etapes(
         // Garde-fou #1315 : le nom du conteneur est deviné, les chiffres sont
         // mesurés. Une résolution DSD ne peut donc pas sortir d'ici sous un
         // nom de conteneur PCM, quelle que soit la cible de transcodage.
-        let out_desc = output_stage_label(output_format_name, out_sample_rate, out_bit_depth);
+        //
+        // #2029 (fil 2107, Didier, ASIO vers un SMSL SU-8) — un DSD qui part
+        // EN DoP se lisait « DSD64 2.8 MHz → DSD64 176kHz/24bit », comme une
+        // décimation en PCM. Le DoP emballe les bits DSD dans des trames PCM
+        // sans les toucher : l'étage le dit, et reste bit-perfect. Lu sur
+        // `dop_active`, que la sortie DÉTECTE sur les octets — jamais sur
+        // `dsd_mode`, qui dit ce qui a été demandé (#1595).
+        let dop_sur_le_fil =
+            is_dsd && ps.dop_active && !is_dsd_resolution(out_sample_rate, out_bit_depth);
+        let out_desc = if dop_sur_le_fil {
+            dop_stage_label(sample_rate)
+        } else {
+            output_stage_label(output_format_name, out_sample_rate, out_bit_depth)
+        };
         let mut etape = json!({
             "name": "Transcoder",
             "description": format!("{source_desc} \u{2192} {out_desc}"),
-            "bit_perfect": transcode_lossless,
+            "bit_perfect": transcode_lossless || dop_sur_le_fil,
         });
+        if dop_sur_le_fil {
+            etape["code"] = json!("dop");
+        }
         marquer_codec_inconnu(&mut etape);
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
