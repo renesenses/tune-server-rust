@@ -161,7 +161,7 @@ fn jouer(serveur: &ServeurMultimediaFactice, dac: &Peripherique) -> Lecture {
     let trames_decodees = temoin.trames();
 
     let sortie = FormatOuvert::new(cfg.sample_rate, cfg.channels);
-    let conforme = conformer_la_piste_decodee(echantillons, dec_sr, dec_ch, sortie);
+    let conforme = conformer_la_piste_decodee(echantillons, dec_sr, dec_ch, sortie, None, None);
     let mut puits = CaptureOutput::ouvert(sortie);
     assert!(puits.ecrire(&conforme));
 

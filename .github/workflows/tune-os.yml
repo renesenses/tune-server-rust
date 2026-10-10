@@ -98,6 +98,7 @@ jobs:
         run: |
           docker run --rm --privileged -v "$PWD":/repo -w /repo -v /dev:/dev \
             -e TUNE_TARBALL_PATH="$TUNE_TARBALL_PATH" \
+            -e TUNE_OS_WORK_DIR=/tmp/tune-os-build \
             debian:bookworm bash -ec '
               # PAS de `sudo` ici : on est root dans un `debian:bookworm` nu,
               # qui ne contient pas sudo. Chaque ligne `sudo ...` echouerait en

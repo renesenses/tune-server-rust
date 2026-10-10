@@ -52,7 +52,7 @@ use serde_json::{Value, json};
 
 use crate::appariement::{self, Candidat, Raison};
 use crate::hote::Hote;
-use crate::snapshots::{LOCAL, PisteSnap, Snapshots, ajouter, lire_playlist};
+use crate::snapshots::{PisteSnap, Snapshots, ajouter, lire_playlist};
 
 /// Cadence minimale d'un lien, en minutes. En deçà, on écrirait chez un
 /// service plus souvent qu'aucun humain ne retouche une playlist.
@@ -825,33 +825,14 @@ impl<'h, H: Hote + ?Sized> Liens<'h, H> {
     /// Apparier une piste CHEZ l'extrémité `vers`, avec la règle des trois
     /// critères (titre + artiste + durée à ±3 s) de la tranche 2.
     fn apparier(&self, vers: &Extremite, p: &PisteSnap) -> Result<Candidat, Raison> {
-        let local = vers.service == LOCAL;
-        let reponse = if local {
-            self.hote
-                .library_match_track(&p.titre, &p.artiste, &p.isrc, p.duree_ms)
-        } else {
-            self.hote.streaming_match_track(
-                &vers.service,
-                &p.titre,
-                &p.artiste,
-                &p.isrc,
-                p.duree_ms,
-            )
-        }
-        .map_err(|message| Raison::ServiceEnErreur { message })?;
-        let mut candidat = appariement::candidat_de_la_reponse(&reponse);
-        if local && let Some(c) = candidat.as_mut() {
-            // En bibliothèque, l'identifiant qui compte est `track_id` ;
-            // `source_id` y désigne, s'il existe, l'origine streaming.
-            if let Some(n) = reponse
-                .get("matched")
-                .and_then(|m| m.get("track_id"))
-                .and_then(Value::as_i64)
-            {
-                c.id = n.to_string();
-            }
-        }
-        appariement::juger(p.duree_ms, candidat)
+        appariement::apparier_chez(
+            self.hote,
+            &vers.service,
+            &p.titre,
+            &p.artiste,
+            &p.isrc,
+            p.duree_ms,
+        )
     }
 
     fn completer_extremite(&self, e: &Extremite) -> Result<Extremite, String> {

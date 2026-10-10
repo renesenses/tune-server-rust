@@ -129,18 +129,11 @@ pub(crate) fn titres_equivalents(a: &str, b: &str) -> bool {
 /// noyau que s'ils portent exactement les mêmes mots dans le même ordre ;
 /// « Somebody » reste étranger à « Somebody To Love », et « Parts 1-5 » à
 /// « Parts 6-9 ».
-pub(crate) fn noyau_de_titre(titre: &str) -> String {
-    titre
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|jeton| !jeton.is_empty())
-        .map(|jeton| match jeton.to_lowercase().as_str() {
-            "pts" => "parts".to_string(),
-            "pt" => "part".to_string(),
-            autre => autre.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+///
+/// La définition vit dans `tune-core` depuis #2264 : le regroupement des
+/// versions (`library::groupes_versions`) lit un titre de la même façon que
+/// leur proposition, sans copie.
+pub(crate) use tune_core::library::groupes_versions::noyau_de_titre;
 
 /// Le titre sans son DERNIER suffixe d'édition — « X, Pts. 1-5 (Live) »
 /// devient « X, Pts. 1-5 ». `None` quand il n'y a rien à retirer.
@@ -494,7 +487,8 @@ pub(crate) fn versions_locales(
     // une constante, part dans le texte de la requete.
     let sql = format!(
         "SELECT t.id, al.id, al.title, al.cover_path, t.duration_ms, t.format, al.year, \
-                t.title, t.isrc, COALESCE(ar2.name, ar.name) \
+                t.title, t.isrc, COALESCE(ar2.name, ar.name), \
+                t.musicbrainz_recording_id, t.sample_rate, t.bit_depth, t.source \
          FROM tracks t \
          JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -560,6 +554,14 @@ pub(crate) fn versions_locales(
                 // l'ecran n'ait pas deux formes a traiter. Les deux tables
                 // etaient jointes pour rapprocher, jamais selectionnees.
                 "artist_name": cols.get(9).and_then(|v| v.as_string()),
+                // #2264 — ce que le REGROUPEMENT lit (`routes::versions_groupes`) :
+                // l'identité d'enregistrement et la qualité. Ajoutés, jamais
+                // renommés : l'écran d'aujourd'hui les ignore.
+                "isrc": isrc,
+                "musicbrainz_recording_id": cols.get(10).and_then(|v| v.as_string()),
+                "sample_rate": cols.get(11).and_then(|v| v.as_i64()),
+                "bit_depth": cols.get(12).and_then(|v| v.as_i64()),
+                "source": cols.get(13).and_then(|v| v.as_string()),
                 "score": score,
             })
         })
@@ -599,14 +601,17 @@ where
     });
 }
 
-/// Les services interroges pour les versions d'un morceau.
-///
-/// Ecrite UNE fois : `/home/other-versions` s'en sert pour savoir s'il vaut la
-/// peine de lire son vivier d'ecoutes avant d'appeler
-/// [`versions_streaming`]. Deux listes qui derivent l'une de l'autre feraient
-/// lire l'historique pour rien, ou pire, le sauteraient alors qu'un service
-/// repond.
-pub(crate) const SERVICES_VERSIONS: [&str; 4] = ["qobuz", "tidal", "deezer", "spotify"];
+// Les services interroges pour les versions d'un morceau.
+//
+// Ecrite UNE fois : `/home/other-versions` s'en sert pour savoir s'il vaut la
+// peine de lire son vivier d'ecoutes avant d'appeler
+// [`versions_streaming`]. Deux listes qui derivent l'une de l'autre feraient
+// lire l'historique pour rien, ou pire, le sauteraient alors qu'un service
+// repond.
+//
+// #2264 — la liste vit dans `tune-core` : la règle de lecture interroge les
+// MÊMES services que l'écran.
+pub(crate) use tune_core::library::groupes_versions::SERVICES_DE_VERSIONS as SERVICES_VERSIONS;
 
 /// Les versions et reprises d'un morceau DISPONIBLES EN STREAMING.
 ///
@@ -707,6 +712,11 @@ pub(crate) async fn versions_streaming(
                     // peut ni expliquer ni reproduire.
                     "duration_ms": duree,
                     "isrc": isrc,
+                    // #2264 — la qualité annoncée et la disponibilité, telles
+                    // que le service les rend : le regroupement choisit la
+                    // version jouée avec elles.
+                    "quality": piste["quality"],
+                    "available": piste["disponible"],
                     "score": score_version(
                         reference,
                         Signaux { titre: t, isrc, duree_ms: duree, annee: None },

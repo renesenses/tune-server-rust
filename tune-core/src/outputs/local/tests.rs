@@ -682,6 +682,26 @@ fn dop_reports_both_safety_bypasses_and_keeps_native_bits() {
     assert!(status.reasons.is_empty());
 }
 
+/// #4176 — PURE allumé sur une zone sans aucun traitement armé : le contrat
+/// dit qu'il n'y avait RIEN à contourner (Jean Valjean, fil 1798 : 17 bascules,
+/// `reasons=[]` des deux côtés, aucun changement visible).
+#[test]
+fn pure_sans_traitement_arme_dit_qu_il_n_y_a_rien_a_contourner() {
+    let status = runtime_contract(true, false, 1000, None, true);
+    assert!(status.bit_perfect);
+    assert_eq!(status.dsp, OutputDspState::PureSansObjet);
+    assert!(status.reasons.is_empty());
+}
+
+/// #4176 — témoin : avec un égaliseur armé, PURE contourne vraiment, et le
+/// contrat le dit toujours.
+#[test]
+fn pure_avec_un_egaliseur_arme_le_contourne_toujours() {
+    let status = runtime_contract(true, false, 1000, Some(test_eq()), true);
+    assert!(status.bit_perfect);
+    assert_eq!(status.dsp, OutputDspState::BypassedPure);
+}
+
 #[test]
 fn producer_verdict_cannot_be_upgraded_by_a_later_state_snapshot() {
     let slot = std::sync::Mutex::new(None);
@@ -2762,6 +2782,8 @@ impl DspDeLaRouteFlottanteWindows {
                 crossfeed: &self.crossfeed,
                 pure_bypass: &self.pure_bypass,
                 mono_downmix: &self.mono_downmix,
+                reaffectation: &crate::outputs::local::reaffectation::SANS_REAFFECTATION,
+                disposition: &crate::outputs::local::SANS_DISPOSITION,
                 dop_active: &self.dop_active,
                 volume: &self.volume,
                 user_volume: &self.user_volume,
@@ -2968,6 +2990,8 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
         crossfeed: &baseline_crossfeed,
         pure_bypass: &baseline_pure,
         mono_downmix: &baseline_mono,
+        reaffectation: &crate::outputs::local::reaffectation::SANS_REAFFECTATION,
+        disposition: &crate::outputs::local::SANS_DISPOSITION,
         dop_active: &baseline_dop,
         volume: &baseline_volume,
         user_volume: &baseline_user,
@@ -2999,6 +3023,8 @@ fn local_pcm_processing_is_identical_across_the_header_boundary() {
         crossfeed: &split_crossfeed,
         pure_bypass: &split_pure,
         mono_downmix: &split_mono,
+        reaffectation: &crate::outputs::local::reaffectation::SANS_REAFFECTATION,
+        disposition: &crate::outputs::local::SANS_DISPOSITION,
         dop_active: &split_dop,
         volume: &split_volume,
         user_volume: &split_user,
@@ -3042,6 +3068,8 @@ fn local_pcm_processing_quarantines_dop_before_volume_dsp_and_ring() {
         crossfeed: &crossfeed,
         pure_bypass: &pure,
         mono_downmix: &mono,
+        reaffectation: &crate::outputs::local::reaffectation::SANS_REAFFECTATION,
+        disposition: &crate::outputs::local::SANS_DISPOSITION,
         dop_active: &dop_active,
         volume: &volume,
         user_volume: &user,

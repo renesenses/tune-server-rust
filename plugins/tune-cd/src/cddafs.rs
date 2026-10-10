@@ -1278,7 +1278,7 @@ pub(crate) mod tests {
         let toc = petite_toc();
         let v = faux_volume("fournisseur", &toc);
         let l: Arc<dyn LecteurDisque> = Arc::new(LecteurVolume::sur_dossier(v.to_path_buf()));
-        let f = FournisseurCd { lecteur: l };
+        let f = FournisseurCd::direct(l);
         let mut flux = f.ouvrir(&source_id(&disc_id(&toc), 2), 0).unwrap();
         assert_eq!(flux.octets, 191 * OCTETS_PAR_SECTEUR as u64);
         let mut tout = Vec::new();

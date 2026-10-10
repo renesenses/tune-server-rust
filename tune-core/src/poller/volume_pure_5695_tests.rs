@@ -24,11 +24,11 @@ use tokio::sync::Mutex;
 const APPAREIL: &str = "dlna-my-devialet";
 const DUREE_MS: u64 = 600_000;
 
-struct Banc {
+pub(super) struct Banc {
     poller: PositionPoller,
     db: Arc<dyn crate::db::backend::DbBackend>,
     outputs: Arc<Mutex<OutputRegistry>>,
-    zone_id: i64,
+    pub(super) zone_id: i64,
     poll_states: HashMap<i64, ZonePollState>,
     idle: HashMap<i64, IdlePollBackoff>,
     position_ms: u64,
@@ -38,7 +38,7 @@ struct Banc {
 impl Banc {
     /// Une zone DLNA qui joue, volume 100 % en base et en mémoire, PURE
     /// verrouillé ou non.
-    async fn monter(pure_verrouille: bool) -> Self {
+    pub(super) async fn monter(pure_verrouille: bool) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
@@ -123,7 +123,7 @@ impl Banc {
     /// Le volume de l'appareil, changé hors de Tune (télécommande,
     /// application du fabricant). Rend le nombre de commandes déjà comptées,
     /// pour que ce geste-ci ne soit pas pris pour une commande de Tune.
-    async fn appareil_a(&self, volume: f64) -> usize {
+    pub(super) async fn appareil_a(&self, volume: f64) -> usize {
         self.avec_mock(async |m| {
             m.set_volume(volume).await.unwrap();
             m.volume_call_count().await
@@ -137,7 +137,7 @@ impl Banc {
     }
 
     /// Un tour de la vraie boucle, l'appareil en lecture qui avance.
-    async fn tic(&mut self) {
+    pub(super) async fn tic(&mut self) {
         self.position_ms += 1_000;
         let position = self.position_ms;
         self.avec_mock(async |m| {
@@ -152,7 +152,7 @@ impl Banc {
     }
 
     /// La zone à `pour_cent` en base ET en mémoire, sans grâce de volume.
-    async fn zone_a(&self, pour_cent: f64) {
+    pub(super) async fn zone_a(&self, pour_cent: f64) {
         ZoneRepo::with_backend(self.db.clone())
             .update_volume(self.zone_id, pour_cent)
             .unwrap();
@@ -162,7 +162,7 @@ impl Banc {
             .await;
     }
 
-    fn volume_en_base(&self) -> f64 {
+    pub(super) fn volume_en_base(&self) -> f64 {
         ZoneRepo::with_backend(self.db.clone())
             .get(self.zone_id)
             .unwrap()
