@@ -945,39 +945,104 @@ mod tests {
         );
     }
 
-    /// Le lanceur du paquet RESTE le parent du serveur : `exec` sans `&`.
-    /// Orphelin, le serveur n'est plus rattaché à l'app et macOS lui refuse le
-    /// réseau local, clé de #4949 ou non (#5141).
-    #[test]
-    fn le_lanceur_du_paquet_reste_parent_du_serveur() {
+    /// Le heredoc du lanceur AppleScript dans `release.yml`, indentation YAML
+    /// retirée.
+    fn lanceur_du_paquet() -> String {
         let release = include_str!("../../../../.github/workflows/release.yml");
         let debut = release
             .find("cat > /tmp/tune-launcher.applescript")
             .expect("heredoc du lanceur introuvable dans release.yml");
+        let debut = debut + release[debut..].find('\n').expect("ligne du heredoc") + 1;
         let fin = debut
             + release[debut..]
                 .find("\n          ASCRIPT\n")
                 .expect("fin du heredoc du lanceur introuvable");
-        let lanceur = &release[debut..fin];
-        let lancement: Vec<&str> = lanceur
+        release[debut..fin]
             .lines()
-            .filter(|l| l.contains("serverBin &") && l.contains("do shell script"))
+            .map(|l| l.strip_prefix("          ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Le lanceur du paquet RESTE le parent du serveur (#5141) : orphelin, le
+    /// serveur n'est plus rattaché à l'app et macOS lui refuse le réseau local,
+    /// clé de #4949 ou non. Depuis #6076, il le lance par NSTask (enfant
+    /// direct, sans bloquer l'applet) au lieu d'un `do shell script "exec …"`.
+    #[test]
+    fn le_lanceur_du_paquet_reste_parent_du_serveur() {
+        let lanceur = lanceur_du_paquet();
+        assert!(
+            lanceur.contains("current application's NSTask's alloc()'s init()")
+                && lanceur.contains("serveur's |launch|()"),
+            "le serveur doit être lancé par NSTask, enfant de l'applet"
+        );
+        let par_le_shell: Vec<&str> = lanceur
+            .lines()
+            .filter(|l| l.contains("do shell script") && l.contains("tune-server\""))
             .collect();
-        assert_eq!(
-            lancement.len(),
-            1,
-            "une seule ligne lance le serveur : {lancement:?}"
-        );
-        let ligne = lancement[0];
         assert!(
-            ligne.contains("exec \" & serverBin"),
-            "le serveur doit être lancé par `exec` : {ligne}"
-        );
-        assert!(
-            !ligne.trim_end().ends_with("2>&1 &\""),
-            "le serveur ne doit plus partir en arrière-plan : {ligne}"
+            par_le_shell.is_empty(),
+            "le serveur ne doit plus passer par `do shell script` (arrière-plan = orphelin, \
+             `exec` = applet sourd) : {par_le_shell:?}"
         );
         assert!(lanceur.contains("TUNE_RELANCE_APRES_MAJ"));
+    }
+
+    /// #6076 — Tune déjà lancé, un nouveau double-clic envoie « reopen » à
+    /// l'applet : il doit y répondre (applet stay-open, boucle d'évènements
+    /// libre), et l'onglet attend que le port réponde au lieu d'un `sleep 2`.
+    #[test]
+    fn le_lanceur_repond_au_double_clic_suivant_6076() {
+        let lanceur = lanceur_du_paquet();
+        let reopen = lanceur
+            .split("on reopen")
+            .nth(1)
+            .and_then(|r| r.split("end reopen").next())
+            .expect("le lanceur doit avoir un gestionnaire `on reopen` (#6076)");
+        assert!(
+            reopen.contains("ouvrirTune()"),
+            "on reopen doit rouvrir l'onglet : {reopen}"
+        );
+        assert!(lanceur.contains("on idle") && lanceur.contains("on quit"));
+        assert!(
+            !lanceur.contains("sleep 2;"),
+            "l'onglet ne doit plus s'ouvrir après un délai fixe (#6076)"
+        );
+        assert!(
+            lanceur.contains("/usr/bin/curl -s -o /dev/null --max-time 1"),
+            "l'ouverture de l'onglet attend que le port réponde (#6076)"
+        );
+        let release = include_str!("../../../../.github/workflows/release.yml");
+        assert!(
+            release.contains("osacompile -s -o \"$APP/Contents/MacOS/Tune Server.app\""),
+            "l'applet doit être compilé stay-open (`osacompile -s`)"
+        );
+        assert!(
+            release.contains("<key>OSAAppletStayOpen</key><true/>"),
+            "l'Info.plist réécrit doit garder OSAAppletStayOpen, sinon l'applet sort après `on run`"
+        );
+    }
+
+    /// #6076 — le lanceur COMPILE : `osacompile` sur le heredoc extrait de
+    /// `release.yml` (le pont AppleScriptObjC compris). macOS seulement.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn le_lanceur_du_paquet_compile_6076() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("lanceur.applescript");
+        std::fs::write(&source, lanceur_du_paquet()).unwrap();
+        let out = Command::new("/usr/bin/osacompile")
+            .arg("-s")
+            .arg("-o")
+            .arg(dir.path().join("Lanceur.app"))
+            .arg(&source)
+            .output()
+            .expect("osacompile");
+        assert!(
+            out.status.success(),
+            "osacompile : {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Câblage : la réparation au démarrage est LANCÉE, pas seulement écrite.
