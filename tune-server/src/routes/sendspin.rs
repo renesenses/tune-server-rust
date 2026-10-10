@@ -52,6 +52,7 @@
 //! connexion), et elles appartiennent à Bertrand.
 
 mod contexte;
+pub(crate) mod exclusions;
 pub(crate) mod operateur;
 mod pilote;
 pub(crate) mod prise;
@@ -225,6 +226,15 @@ async fn conduire_chiffre(
         Ok(id) => id,
         Err(raison) => return refuser_init(&mut socket, raison).await,
     };
+    sortantes::noter_client_id(&id);
+    // Liste d'exclusion : une enceinte qu'un autre serveur garde n'est pas
+    // disputée. Refus silencieux (aucun server/init), comme tout échec de la
+    // poignée de main hors `server/error` d'init.
+    if contexte.est_exclu(&[&id]) {
+        info!(client_id = %id, "sendspin_enceinte_exclue_refusee");
+        let _ = socket.send(Message::Close(None)).await;
+        return Err(ErreurSendspin::EtatInattendu("enceinte exclue"));
+    }
     let (identite, psk) = contexte.selectionner(&id).await?;
     let mut poignee = PoigneeServeur::accueillir_avec_psk(&identite, &client_init_texte, &psk)?;
     let client_id = poignee.client_id().to_string();

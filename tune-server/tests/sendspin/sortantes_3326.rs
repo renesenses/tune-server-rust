@@ -107,3 +107,118 @@ async fn i3326_sortante_recompose_apres_coupure_mais_pas_apres_user_request() {
         "apres user_request, Tune ne recompose pas"
     );
 }
+
+// --- Liste d'exclusion (décision de Bertrand du 10/10/2026) -------------------
+
+async fn exclure(b: &Banc, id: &str, exclu: bool) -> Value {
+    let r = reqwest::Client::new()
+        .put(format!(
+            "http://{}/api/v1/devices/sendspin/exclusions/{id}",
+            b.adresse
+        ))
+        .json(&json!({ "excluded": exclu }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "PUT exclusion : {}", r.status());
+    r.json().await.unwrap()
+}
+
+async fn liste(b: &Banc) -> Value {
+    reqwest::get(format!("http://{}/api/v1/devices/sendspin", b.adresse))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// `client/init` envoyé : rend la réponse du serveur, ou `None` s'il ferme.
+async fn reponse_au_client_init(mut ws: Socket, id: &Identite) -> Option<String> {
+    let init = json!({"type":"client/init","payload":{"client_id":id.id(),"version":1,"suite":Suite::ChaChaPoly.nom()}});
+    ws.send(Message::Text(init.to_string().into())).await.ok()?;
+    match tokio::time::timeout(ATTENTE, ws.next()).await.ok()? {
+        Some(Ok(Message::Text(t))) => Some(t.to_string()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn i3326_exclusion_une_enceinte_exclue_qui_compose_est_refusee() {
+    let id = Identite::generer();
+    let lt = PskPair::pour_pair(&id.id(), [91; 32], CategoriePsk::LongueDuree).unwrap();
+    let b = Banc::nouveau(&[(&id, &lt)]).await;
+    let v = exclure(&b, &id.id(), true).await;
+    assert_eq!(v["list"], json!([id.id()]));
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/sendspin", b.adresse))
+        .await
+        .unwrap();
+    assert_eq!(
+        reponse_au_client_init(ws, &id).await,
+        None,
+        "une enceinte exclue ne recoit pas meme server/init"
+    );
+    assert!(b.sortie_absente(&id.id()).await);
+    // Réadmise : la même enceinte devient une zone.
+    exclure(&b, &id.id(), false).await;
+    let (mut p, activation) = Pair::ouvrir(&b, &id, &lt, support_pcm16()).await;
+    assert_eq!(activation["payload"]["active_roles"], json!(["player@v1"]));
+    assert_eq!(p.json().await["type"], "group/update");
+}
+
+#[tokio::test]
+async fn i3326_exclusion_tune_ne_compose_pas_vers_une_annonce_exclue() {
+    let b = Banc::nouveau(&[]).await;
+    let (ecoute, port) = enceinte_qui_ecoute().await;
+    let annonce = tune_core::discovery::sendspin::appareil_annonce(
+        "127.0.0.1",
+        port,
+        Some("/sendspin"),
+        None,
+    );
+    exclure(&b, &annonce.id, true).await;
+    let _scanner = annoncer(&b, port).await;
+    assert!(
+        accepter(&ecoute, 6).await.is_none(),
+        "annonce exclue : Tune ne compose pas"
+    );
+    let l = liste(&b).await;
+    assert_eq!(l["players"][0]["excluded"], true, "{l}");
+    exclure(&b, &annonce.id, false).await;
+    assert!(
+        accepter(&ecoute, 8).await.is_some(),
+        "readmise : Tune compose de nouveau"
+    );
+}
+
+#[tokio::test]
+async fn i3326_exclusion_par_client_id_ferme_la_session_et_ne_recompose_plus() {
+    let id = Identite::generer();
+    let b = Banc::nouveau(&[]).await;
+    let (ecoute, port) = enceinte_qui_ecoute().await;
+    let _scanner = annoncer(&b, port).await;
+    let ws = accepter(&ecoute, 10).await.expect("Tune compose");
+    let (mut p, _) = Pair::mener(ws, &id, &PskPair::sentinelle(), support_pcm16()).await;
+    // Le client_id appris à la composition apparaît sur l'annonce.
+    let l = liste(&b).await;
+    assert_eq!(l["players"][0]["client_id"], id.id(), "{l}");
+    assert_eq!(l["players"][0]["excluded"], false);
+    exclure(&b, &id.id(), true).await;
+    let fermee = tokio::time::timeout(ATTENTE, async {
+        loop {
+            match p.ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(fermee.is_ok(), "la session de l'enceinte exclue est close");
+    assert!(
+        accepter(&ecoute, 8).await.is_none(),
+        "exclue par client_id : Tune ne recompose plus"
+    );
+    let l = liste(&b).await;
+    assert_eq!(l["players"][0]["excluded"], true, "{l}");
+    assert_eq!(l["excluded"], json!([id.id()]));
+}

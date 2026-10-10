@@ -44,6 +44,13 @@ pub const DELAI_CONNEXION: Duration = Duration::from_secs(10);
 
 tokio::task_local! {
     static AU_REVOIR: Arc<Mutex<Option<String>>>;
+    static LIEN: (String, ContexteSendspin);
+}
+
+/// Le `client/init` lu sur une prise sortante dit à quelle enceinte l'URL
+/// mène ; sans effet sur une prise entrante.
+pub(super) fn noter_client_id(id: &str) {
+    let _ = LIEN.try_with(|(url, contexte)| contexte.noter_compose(url, id));
 }
 
 /// Le pilote note la raison du `client/goodbye` reçu ; sans effet hors d'une
@@ -120,12 +127,16 @@ pub async fn composer(url: &str, mode: ModeTransition, contexte: ContexteSendspi
     };
     tracing::info!(url, "sendspin_sortante_ouverte");
     let raison = Arc::new(Mutex::new(None));
-    let resultat = AU_REVOIR
+    let resultat = LIEN
         .scope(
-            raison.clone(),
-            super::conduire(Prise::Sortante(Box::new(ws)), mode, contexte),
+            (url.to_owned(), contexte.clone()),
+            AU_REVOIR.scope(
+                raison.clone(),
+                super::conduire(Prise::Sortante(Box::new(ws)), mode, contexte.clone()),
+            ),
         )
         .await;
+
     let raison = raison
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -163,8 +174,22 @@ pub async fn boucle(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         drop(etat);
+        let exclusions = contexte.exclusions();
         let annonces: Vec<String> = match actuel {
-            Some(s) => s.devices().await.iter().filter_map(url_d_annonce).collect(),
+            Some(s) => s
+                .devices()
+                .await
+                .iter()
+                .filter_map(|d| {
+                    let url = url_d_annonce(d)?;
+                    // Exclue par son annonce, ou par le client_id appris à une
+                    // composition précédente : Tune n'y compose plus.
+                    let client = contexte.client_du_lien(&url);
+                    let exclue = exclusions.contains(&d.id)
+                        || client.as_ref().is_some_and(|c| exclusions.contains(c));
+                    (!exclue).then_some(url)
+                })
+                .collect(),
             None => Vec::new(),
         };
         // Une annonce disparue efface son historique : son retour la recompose.

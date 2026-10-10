@@ -397,7 +397,8 @@ pub fn router_with_plugins(
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
     let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
-        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state))
+        .avec_reglages(state.backend.clone());
     // #3326 — connexions initiées par le serveur : Tune compose vers les
     // enceintes `_sendspin._tcp` que le scanner mDNS a trouvées.
     sendspin::sortantes::lancer(
