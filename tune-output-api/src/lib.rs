@@ -983,6 +983,13 @@ pub enum OutputDspState {
     Inactive,
     Applied,
     BypassedPure,
+    /// #4176 — PURE est allumé, mais aucun traitement (égaliseur,
+    /// convolveur, crossfeed, repli mono) n'était armé : il n'avait RIEN à
+    /// contourner. Sans cet état, le panneau disait « DSP contourné par
+    /// PURE » d'un côté et rien de l'autre, sur un chemin identique — le
+    /// testeur basculait 17 fois sans rien voir changer (Jean Valjean, fil
+    /// 1798, WASAPI exclusif).
+    PureSansObjet,
     BypassedDop,
     Unknown,
 }

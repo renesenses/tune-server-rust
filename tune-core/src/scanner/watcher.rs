@@ -734,7 +734,9 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                 for path in &event.paths {
                     // #5073 — la feuille CUE aussi : c'est elle qui découpe
                     // son FLAC, et `auto_scan` relit alors son dossier.
-                    if (is_audio_file(path) || est_une_feuille_cue(path))
+                    // #5299 — l'image `.iso` aussi : `auto_scan` en déplie
+                    // les fichiers audio.
+                    if (is_audio_file(path) || est_une_feuille_cue(path) || est_une_image_iso(path))
                         && !super::is_tune_temp_file(path)
                     {
                         let _ = event_tx.send(FileChange {
@@ -771,6 +773,7 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
             for path in &event.paths {
                 if is_audio_file(path)
                     || est_une_feuille_cue(path)
+                    || est_une_image_iso(path)
                     || super::is_tune_temp_file(path)
                 {
                     continue;
@@ -862,7 +865,8 @@ fn evenement_de_dossier(genre: &EventKind, chemin: &Path) -> Option<ChangeType> 
     }
 }
 
-/// #4896 — les fichiers audio d'un dossier apparu, à toute profondeur : un
+/// #4896 — les fichiers audio d'un dossier apparu, à toute profondeur, et
+/// ses images `.iso` (#5299) : un
 /// dossier renommé ou déplacé n'amène aucun événement pour son contenu. Les
 /// liens symboliques de DOSSIER ne sont pas suivis (une boucle ne se parcourt
 /// pas) ; un fichier illisible est simplement absent de la liste.
@@ -880,7 +884,9 @@ pub fn fichiers_audio_sous(dossier: &Path) -> Vec<String> {
             let chemin = entree.path();
             if genre.is_dir() {
                 a_lire.push(chemin);
-            } else if is_audio_file(&chemin) && !super::is_tune_temp_file(&chemin) {
+            } else if (is_audio_file(&chemin) || est_une_image_iso(&chemin))
+                && !super::is_tune_temp_file(&chemin)
+            {
                 trouves.push(chemin.to_string_lossy().to_string());
             }
         }
@@ -1193,6 +1199,14 @@ pub fn est_une_feuille_cue(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+}
+
+/// #5299 — une image `.iso` (toute casse). Le surveillant la relaie comme un
+/// fichier : `auto_scan` déplie une image de DONNÉES en ses fichiers audio,
+/// sous leur chemin virtuel (`image.iso!/dossier/piste.flac`). Une image SACD
+/// n'est pas dépliée là : elle attend le scan, comme avant.
+pub fn est_une_image_iso(path: &Path) -> bool {
+    crate::audio::iso9660::est_extension_iso(path)
 }
 
 fn is_audio_file(path: &Path) -> bool {

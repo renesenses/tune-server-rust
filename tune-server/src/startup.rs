@@ -27,6 +27,10 @@ pub(crate) enum AsioWarmDecision {
     SkippedByEnv,
     /// Un balayage précédent a emporté le processus : on ne recommence pas.
     SkippedAfterCrash,
+    /// #4556 — le témoin a été laissé par une AUTRE version de Tune : on
+    /// retente une fois. Le balayage repose le témoin à la version courante ;
+    /// s'il emporte encore le processus, le démarrage suivant le saute.
+    RetenteApresMiseAJour,
 }
 
 /// État exposé aux diagnostics et à l'interface.
@@ -67,14 +71,53 @@ pub(crate) enum AsioWarmRearm {
 /// de trente lancements d'affilée).
 ///
 /// Le témoin transforme cette panne définitive en panne d'un seul démarrage.
+///
+/// #4556 — mais il ne doit pas être ÉTERNEL. Un plantage d'énumération, même
+/// unique, coupait ASIO pour toujours : le DAC SMSL SU-1 de Marco Polo (fil
+/// 1852) restait introuvable sous son nom ASIO, mise à jour après mise à jour,
+/// et sa zone refusée en `zone_output_unavailable` alors que Windows le voyait.
+/// Le témoin porte désormais la version qui l'a posé ; une autre version
+/// (ou un témoin d'avant ce correctif, sans version) retente une fois.
 pub(crate) fn asio_warm_decision(sentinel: &Path, disabled_by_env: bool) -> AsioWarmDecision {
+    asio_warm_decision_pour(sentinel, disabled_by_env, tune_core::version())
+}
+
+/// [`asio_warm_decision`], la version injectée (testable).
+pub(crate) fn asio_warm_decision_pour(
+    sentinel: &Path,
+    disabled_by_env: bool,
+    version: &str,
+) -> AsioWarmDecision {
     if disabled_by_env {
         return AsioWarmDecision::SkippedByEnv;
     }
     if sentinel.exists() {
-        return AsioWarmDecision::SkippedAfterCrash;
+        if version_du_temoin_asio(sentinel).as_deref() == Some(version) {
+            return AsioWarmDecision::SkippedAfterCrash;
+        }
+        return AsioWarmDecision::RetenteApresMiseAJour;
     }
     AsioWarmDecision::Run
+}
+
+/// Préfixe de la ligne qui porte la version dans le témoin ASIO (#4556).
+const ASIO_WARM_SENTINEL_VERSION: &str = "version=";
+
+/// Le contenu du témoin déposé avant l'énumération, version comprise.
+fn contenu_du_temoin_asio(version: &str) -> String {
+    format!("asio warm scan in progress\n{ASIO_WARM_SENTINEL_VERSION}{version}\n")
+}
+
+/// La version écrite dans le témoin, `None` pour un témoin d'avant #4556.
+fn version_du_temoin_asio(sentinel: &Path) -> Option<String> {
+    std::fs::read_to_string(sentinel)
+        .ok()?
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix(ASIO_WARM_SENTINEL_VERSION)
+                .map(|v| v.trim().to_string())
+        })
 }
 
 /// Chemin du témoin : à côté du journal, donc `%LOCALAPPDATA%\TuneServer` sous
@@ -309,7 +352,9 @@ fn spawn_asio_warm_scan() {
         // #5353 — EnCours AVANT de lancer le fil, pour la même raison que la
         // porte ci-dessous : l'énumération de démarrage ne doit pas profiter
         // du délai de démarrage du fil pour conclure « rien à attendre ».
-        AsioWarmDecision::Run => noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours),
+        AsioWarmDecision::Run | AsioWarmDecision::RetenteApresMiseAJour => {
+            noter_le_prechauffage_asio(EtatPrechauffageAsio::EnCours)
+        }
         AsioWarmDecision::SkippedByEnv => {
             tune_core::outputs::local::block_asio_device_enumeration(
                 tune_core::outputs::asio_blocage_4556::MotifDeBlocage::ParEnvironnement,
@@ -339,7 +384,15 @@ fn spawn_asio_warm_scan() {
                  machine's ASIO drivers is faulty. Delete this file to try again."
             );
         }
-        AsioWarmDecision::Run => {
+        AsioWarmDecision::Run | AsioWarmDecision::RetenteApresMiseAJour => {
+            if decision == AsioWarmDecision::RetenteApresMiseAJour {
+                info!(
+                    sentinel = %sentinel.display(),
+                    version = tune_core::version(),
+                    "asio_warm_scan_retried_after_update — le témoin de plantage vient d'une autre \
+                     version de Tune : une seule nouvelle tentative (#4556)"
+                );
+            }
             // #5353 — `Termine` à la sortie de ce bras, panique comprise.
             let _fin = FinDuPrechauffageAsio;
             if let Some(dir) = sentinel.parent() {
@@ -347,7 +400,8 @@ fn spawn_asio_warm_scan() {
             }
             // Déposé AVANT l'énumération : si un pilote emporte le processus,
             // le fichier reste et le démarrage suivant saute le balayage.
-            let armed = std::fs::write(&sentinel, "asio warm scan in progress\n").is_ok();
+            let armed =
+                std::fs::write(&sentinel, contenu_du_temoin_asio(tune_core::version())).is_ok();
             info!(armed, "asio_warm_scan_started");
 
             let devices = tune_core::outputs::local::list_asio_devices();
@@ -680,6 +734,18 @@ fn deduplicate_zones(state: &AppState) {
         Ok(_) => {}
         Err(e) => {
             tracing::warn!(error = %e, "zone_dedup_failed");
+        }
+    }
+    // #3067 — une zone navigateur héritée ne porte plus le nom de la zone
+    // locale du même poste (« Cet ordinateur » à côté de « This Computer »).
+    match zone_repo.distinguer_zones_navigateur_generiques() {
+        Ok(renommees) => {
+            for (zone_id, nom) in renommees {
+                info!(zone_id, name = %nom, "zone_navigateur_generique_renommee");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "zone_navigateur_generique_renommage_echoue");
         }
     }
     // Add a unique index on output_device_id (idempotent) so duplicate zones
@@ -3685,10 +3751,62 @@ mod asio_warm_scan_tests {
     fn sentinel_from_a_crashed_boot_skips_the_scan() {
         let dir = tempfile::tempdir().unwrap();
         let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
-        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+        // #4556 — le témoin porte la version qui l'a posé : ici, celle-ci.
+        std::fs::write(&sentinel, contenu_du_temoin_asio(tune_core::version())).unwrap();
         assert_eq!(
             asio_warm_decision(&sentinel, false),
             AsioWarmDecision::SkippedAfterCrash
+        );
+    }
+
+    /// #4556 — un témoin posé par une AUTRE version ne coupe plus ASIO pour
+    /// toujours : la nouvelle version retente une fois (Marco Polo, fil 1852 :
+    /// DAC SMSL SU-1 introuvable sous son nom ASIO, mise à jour après mise à
+    /// jour). C'est le test qui ÉCHOUE contre le coupe-circuit éternel.
+    #[test]
+    fn un_temoin_d_une_autre_version_retente_une_fois() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, contenu_du_temoin_asio("1.0.0-rc3")).unwrap();
+        assert_eq!(
+            asio_warm_decision_pour(&sentinel, false, "1.0.0-rc4"),
+            AsioWarmDecision::RetenteApresMiseAJour
+        );
+        // Même version : le coupe-circuit tient, comme avant (#1283).
+        assert_eq!(
+            asio_warm_decision_pour(&sentinel, false, "1.0.0-rc3"),
+            AsioWarmDecision::SkippedAfterCrash
+        );
+        // L'environnement prime toujours.
+        assert_eq!(
+            asio_warm_decision_pour(&sentinel, true, "1.0.0-rc4"),
+            AsioWarmDecision::SkippedByEnv
+        );
+    }
+
+    /// #4556 — le témoin d'avant ce correctif n'a pas de version : c'est
+    /// exactement celui qui bloque les machines de terrain. Il retente une fois.
+    #[test]
+    fn un_temoin_sans_version_retente_une_fois() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, "asio warm scan in progress\n").unwrap();
+        assert_eq!(version_du_temoin_asio(&sentinel), None);
+        assert_eq!(
+            asio_warm_decision_pour(&sentinel, false, "1.0.0-rc4"),
+            AsioWarmDecision::RetenteApresMiseAJour
+        );
+    }
+
+    /// #4556 — la version écrite est celle qu'on relit.
+    #[test]
+    fn le_temoin_relit_la_version_qu_il_porte() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join(ASIO_WARM_SENTINEL);
+        std::fs::write(&sentinel, contenu_du_temoin_asio("1.0.0-rc4")).unwrap();
+        assert_eq!(
+            version_du_temoin_asio(&sentinel).as_deref(),
+            Some("1.0.0-rc4")
         );
     }
 

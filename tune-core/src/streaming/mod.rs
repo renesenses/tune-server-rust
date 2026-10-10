@@ -20,6 +20,7 @@ pub mod traits;
 /// La vignette d'un podcast mise en cache à l'abonnement (#5214).
 pub mod vignette_podcast;
 pub mod youtube;
+pub mod youtube_decouverte;
 
 pub use registry::ServiceRegistry;
 pub use traits::*;

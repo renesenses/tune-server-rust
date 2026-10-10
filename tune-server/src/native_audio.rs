@@ -288,7 +288,7 @@ pub(crate) async fn install_package(
 /// compris, exige le Premium.
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
-        "equalizer" => tune_core::license::Feature::DspEq,
+        "equalizer" | "channel-remap" => tune_core::license::Feature::DspEq,
         "crossfeed" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,

@@ -36,6 +36,9 @@ base64 = "0.22"
 lofty = { workspace = true }
 tune-http-types = { path = "../../tune-http-types" }
 uuid = { workspace = true }
+# #6043 — le repli disque du chargement en mémoire : un fichier temporaire
+# ANONYME, que le système supprime à sa fermeture (déjà dans le graphe).
+tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -49,5 +52,3 @@ windows-sys = { version = "0.61", features = ["Win32_Devices_Cdrom", "Win32_Foun
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-# #2466 — une bibliothèque jetable pour les fichiers extraits.
-tempfile = "3"

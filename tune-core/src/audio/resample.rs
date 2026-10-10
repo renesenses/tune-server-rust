@@ -118,9 +118,36 @@ pub fn parametres_sinc(from_sr: u32, to_sr: u32) -> SincInterpolationParameters 
     SincInterpolationParameters {
         sinc_len,
         f_cutoff: calculate_cutoff(sinc_len, FENETRE),
-        interpolation: SincInterpolationType::Linear,
+        interpolation: interpolation_sinc(from_sr, to_sr),
         oversampling_factor: SUR_ECHANTILLONNAGE,
         window: FENETRE,
+    }
+}
+
+/// #4754 — l'interpolation ENTRE les phases de la table sinc : Cubique dès
+/// qu'elle sert, Linéaire là où elle ne sert pas.
+///
+/// Mesuré par le banc de #4813 (T10, contre la référence indépendante) :
+/// Cubique gagne 27 dB d'erreur sur un balayage (−107 → −135 dB) sur tous les
+/// rapports liés au 44,1 kHz, et 18 à 26 dB de réjection des images sur les
+/// montées depuis 44,1 kHz, sans toucher à la bande ni à la table. Il coûte
+/// ×1,20 à ×1,65 de processeur.
+///
+/// Les instants de sortie tombent à `n · from/to` échantillons d'entrée, dont
+/// la partie fractionnaire a pour dénominateur `to / pgcd(from, to)`. Quand ce
+/// dénominateur divise le nombre de phases, chaque instant tombe PILE sur une
+/// phase de la table : il n'y a rien à interpoler, Cubique rend exactement ce
+/// que rend Linéaire (96 → 48 : écart de 0,000 dB sur toutes les mesures du
+/// banc) et ne ferait que coûter. Ces rapports-là restent en Linéaire.
+pub fn interpolation_sinc(from_sr: u32, to_sr: u32) -> SincInterpolationType {
+    if from_sr == 0 || to_sr == 0 {
+        return SincInterpolationType::Linear;
+    }
+    let denominateur = (to_sr / pgcd(from_sr, to_sr)) as usize;
+    if SUR_ECHANTILLONNAGE % denominateur == 0 {
+        SincInterpolationType::Linear
+    } else {
+        SincInterpolationType::Cubic
     }
 }
 
@@ -619,6 +646,44 @@ mod tests {
     const PRODUCT_PCM_SAMPLE_RATES: [u32; 8] = [
         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
     ];
+
+    /// #4754 : Cubique partout où les instants de sortie tombent ENTRE deux
+    /// phases de la table, Linéaire là où ils tombent pile dessus.
+    #[test]
+    fn l_interpolation_est_cubique_des_qu_elle_sert() {
+        use rubato::SincInterpolationType::{Cubic, Linear};
+        let cubique = [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (44_100, 96_000),
+            (44_100, 192_000),
+            (176_400, 48_000),
+            (192_000, 44_100),
+            (88_200, 96_000),
+        ];
+        for (de, vers) in cubique {
+            assert!(
+                matches!(parametres_sinc(de, vers).interpolation, Cubic),
+                "{de} → {vers} : les instants tombent entre les phases, Cubique attendu"
+            );
+        }
+        let lineaire = [
+            (96_000, 48_000),
+            (48_000, 96_000),
+            (44_100, 88_200),
+            (88_200, 44_100),
+            (48_000, 192_000),
+            (192_000, 48_000),
+            (176_400, 44_100),
+        ];
+        for (de, vers) in lineaire {
+            assert!(
+                matches!(parametres_sinc(de, vers).interpolation, Linear),
+                "{de} → {vers} : les instants tombent pile sur la table, Cubique \
+                 ne ferait que coûter"
+            );
+        }
+    }
 
     /// D1 de T10 (#2218) : le noyau se choisit sur la CADENCE LA PLUS BASSE,
     /// pas sur le rapport.

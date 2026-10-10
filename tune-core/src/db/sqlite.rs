@@ -22,6 +22,16 @@ const READ_POOL_SIZE: usize = 3;
 /// l'écrivain sont UNE SEULE connexion : l'écrivain la rend sans passer par
 /// [`LectureEmpruntee`], donc sans signal.
 const REVEIL_ATTENTE_LECTURE: Duration = Duration::from_millis(10);
+/// #4681 — au-delà, un fil de fond qui attend la réserve de lecture passe
+/// quand même : la réserve donne la PRIORITÉ à la lecture, elle n'affame pas
+/// une passe.
+const ATTENTE_MAX_RESERVE: Duration = Duration::from_millis(500);
+thread_local! {
+    /// Combien de connexions de lecture le fil courant tient. Un fil qui en
+    /// tient déjà une n'est pas plafonné : il pourrait attendre un fil de fond
+    /// qui l'attend lui-même (emprunts imbriqués).
+    static LECTURES_TENUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Signal « une connexion de lecture vient d'être rendue ».
 type Liberation = (Mutex<()>, Condvar);
@@ -33,11 +43,25 @@ pub struct SqliteDb {
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
+    /// #4681 — connexions de lecture tenues par des fils de fond pendant la
+    /// lecture, pour la réserve (voir [`Self::read_connection`]).
+    lectures_de_fond: Arc<AtomicUsize>,
     /// Le repli du WAL tourne hors de la connexion d'écriture tant que ce
     /// jeton vit ; `None` en mémoire, hors WAL, ou si le replieur n'a pas pu
     /// s'ouvrir (voir [`crate::db::replieur_wal`]).
     _replieur_wal: Option<crate::db::replieur_wal::Vigie>,
+    /// #5993 — une connexion qui n'écrit JAMAIS, pour lire
+    /// `PRAGMA data_version` : la valeur change dès qu'une AUTRE connexion
+    /// (l'écrivain, un replieur, un `sqlite3` externe) valide une écriture.
+    /// `None` en mémoire, ou si elle n'a pas pu s'ouvrir.
+    observateur: Option<Arc<Mutex<Connection>>>,
+    /// Identifiant de CETTE ouverture : deux bases ouvertes dans le même
+    /// processus ne partagent jamais un jeton.
+    instance: u64,
 }
+
+/// Compteur des ouvertures de base du processus (voir [`SqliteDb::instance`]).
+static OUVERTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Une connexion de lecture EMPRUNTÉE au pool (#4800).
 ///
@@ -51,6 +75,8 @@ pub struct LectureEmpruntee<'a> {
     garde: Option<MutexGuard<'a, Connection>>,
     liberation: &'a Liberation,
     attente: Duration,
+    /// La place de fond tenue par cet emprunt, rendue au `drop` (#4681).
+    place_de_fond: Option<&'a AtomicUsize>,
 }
 
 impl LectureEmpruntee<'_> {
@@ -78,6 +104,10 @@ impl Drop for LectureEmpruntee<'_> {
         // qu'un lecteur entre son dernier essai et sa mise en attente ne rate
         // pas ce réveil.
         self.garde.take();
+        if let Some(places) = self.place_de_fond.take() {
+            places.fetch_sub(1, Ordering::AcqRel);
+        }
+        LECTURES_TENUES.with(|c| c.set(c.get().saturating_sub(1)));
         let _verrou = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
         self.liberation.1.notify_one();
     }
@@ -294,7 +324,12 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            lectures_de_fond: Arc::new(AtomicUsize::new(0)),
             _replieur_wal: replieur_wal,
+            observateur: Connection::open_with_flags(path, read_flags)
+                .ok()
+                .map(|c| Arc::new(Mutex::new(c))),
+            instance: OUVERTURES.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -314,8 +349,25 @@ impl SqliteDb {
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
+            lectures_de_fond: Arc::new(AtomicUsize::new(0)),
             _replieur_wal: None,
+            observateur: None,
+            instance: OUVERTURES.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// #5993 — un jeton qui CHANGE à chaque écriture validée, quelle que soit
+    /// la connexion qui l'a faite : `(instance, PRAGMA data_version)` lu sur
+    /// une connexion qui n'écrit jamais. Un résultat mis en cache sous un
+    /// jeton reste juste tant que le jeton relu est le même. `None` en
+    /// mémoire (une seule connexion, qui écrit elle-même) ou en cas d'erreur :
+    /// pas de cache.
+    pub fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        let conn = self.observateur.as_ref()?.lock().ok()?;
+        let version: i64 = conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .ok()?;
+        Some((self.instance, version))
     }
 
     /// La connexion d'écriture. `connection().lock()` rend une garde qui se
@@ -338,9 +390,24 @@ impl SqliteDb {
     ///
     /// Aucune libre : on attend la première RENDUE (signal de
     /// [`LectureEmpruntee`]), avec [`REVEIL_ATTENTE_LECTURE`] en filet.
+    ///
+    /// #4681 — la lecture passe d'abord : pendant qu'une zone joue, un fil
+    /// de FOND (voir [`crate::taches_de_fond::priorite::politique`]) ne tient
+    /// pas plus de `n - sqlite_reserved_readers` connexions avec les autres
+    /// fils de fond. La connexion réservée reste libre pour la file, l'état
+    /// des zones et l'API. L'attente de la réserve est bornée
+    /// ([`ATTENTE_MAX_RESERVE`]) et comptée au relevé des freins.
     pub fn read_connection(&self) -> LectureEmpruntee<'_> {
         let depart = self.read_counter.fetch_add(1, Ordering::Relaxed);
         let n = self.read_pool.len();
+        let place_de_fond =
+            match crate::taches_de_fond::priorite::politique::plafond_des_lectures_de_fond(n) {
+                Some(plafond) if LECTURES_TENUES.with(|c| c.get()) == 0 => {
+                    self.prendre_une_place_de_fond(plafond)
+                }
+                _ => None,
+            };
+        LECTURES_TENUES.with(|c| c.set(c.get() + 1));
         let premiere_libre = || {
             (0..n).find_map(|k| match self.read_pool[(depart + k) % n].try_lock() {
                 Ok(garde) => Some(garde),
@@ -355,6 +422,7 @@ impl SqliteDb {
             garde: Some(garde),
             liberation: self.liberation.as_ref(),
             attente,
+            place_de_fond,
         };
         // Chemin rapide, sans toucher au signal.
         if let Some(garde) = premiere_libre() {
@@ -379,6 +447,47 @@ impl SqliteDb {
                     .0;
             }
         })
+    }
+
+    /// Prendre une place de lecture de fond sous `plafond` (#4681). Attend au
+    /// plus [`ATTENTE_MAX_RESERVE`] ; au-delà, passe SANS place (`None`) :
+    /// la priorité, pas la famine.
+    fn prendre_une_place_de_fond(&self, plafond: usize) -> Option<&AtomicUsize> {
+        let places = self.lectures_de_fond.as_ref();
+        let essayer = || {
+            let mut actuel = places.load(Ordering::Acquire);
+            loop {
+                if actuel >= plafond {
+                    return false;
+                }
+                match places.compare_exchange_weak(
+                    actuel,
+                    actuel + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(v) => actuel = v,
+                }
+            }
+        };
+        if essayer() {
+            return Some(places);
+        }
+        let debut = Instant::now();
+        let prise = attendre_hors_executeur(|| {
+            loop {
+                if essayer() {
+                    return true;
+                }
+                if debut.elapsed() >= ATTENTE_MAX_RESERVE {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        crate::taches_de_fond::priorite::politique::noter_lecture_differee(debut.elapsed());
+        prise.then_some(places)
     }
 
     pub fn execute(
@@ -484,7 +593,11 @@ impl Clone for SqliteDb {
             read_pool: self.read_pool.clone(),
             read_counter: self.read_counter.clone(),
             liberation: self.liberation.clone(),
+            lectures_de_fond: self.lectures_de_fond.clone(),
             _replieur_wal: self._replieur_wal.clone(),
+            // Même base, même jeton : le clone partage l'observateur.
+            observateur: self.observateur.clone(),
+            instance: self.instance,
         }
     }
 }
