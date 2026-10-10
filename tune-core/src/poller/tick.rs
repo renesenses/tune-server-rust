@@ -148,6 +148,15 @@ impl PositionPoller {
                 self.volume_pure_concilie(zone_id, zone.volume / 100.0, status.volume)
                     .await;
             }
+            // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
+            // le dire au journal, une fois par épisode.
+            if !zone.fixed_volume
+                && !in_startup_grace
+                && !in_volume_grace
+                && status.state == TransportState::Playing
+            {
+                self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
+            }
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -1128,6 +1137,10 @@ impl PositionPoller {
                         self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                             .await;
                     }
+                    // #5662 — un renderer à 100 % ignoré est dit une fois.
+                    if !zone_fixed_volume && !in_vol_grace {
+                        self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+                    }
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
@@ -1472,6 +1485,10 @@ impl PositionPoller {
             if !zone_fixed_volume {
                 self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                     .await;
+            }
+            // #5662 — un renderer à 100 % ignoré est dit une fois.
+            if !zone_fixed_volume && !in_vol_grace2 {
+                self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
             }
             if !zone_fixed_volume
                 && !in_vol_grace2
@@ -3018,6 +3035,17 @@ impl PositionPoller {
                             status.position_ms,
                         )
                     } {
+                        // #5970 — la fin estimée de la piste en cours, prise
+                        // AVANT les lectures de la base qui suivent : c'est
+                        // elle qui borne la préparation de la suivante.
+                        let fin_estimee = Instant::now()
+                            + Duration::from_millis(
+                                decisions::sane_current_duration(
+                                    status.duration_ms,
+                                    track_duration_ms,
+                                )
+                                .saturating_sub(status.position_ms),
+                            );
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -3084,7 +3112,23 @@ impl PositionPoller {
                                 // (spin 1 Hz, #2394). handle_track_end jouera la
                                 // piste explicitement en fin de morceau.
                             } else {
-                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                // #5970 — la préparation est bornée (voir
+                                // `armer_le_flux_suivant`) ; sa durée est dite
+                                // au journal dès qu'elle dépasse le seuil.
+                                let t_prep = Instant::now();
+                                let preparation = self
+                                    .prepare_gapless(zone_id, zone_state, &device_id, fin_estimee)
+                                    .await;
+                                let prep_ms = t_prep.elapsed().as_millis() as u64;
+                                if prep_ms >= decisions::PREPARATION_GAPLESS_LENTE_MS {
+                                    info!(
+                                        zone_id,
+                                        prep_ms,
+                                        issue = ?preparation,
+                                        "gapless_preparation_lente"
+                                    );
+                                }
+                                match preparation {
                                     GaplessPrep::Armed(arme, tenue) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
@@ -3098,7 +3142,11 @@ impl PositionPoller {
                                         ps.suivante_preparee = tenue;
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
-                                    GaplessPrep::DsdNextSkipped => {
+                                    // #5970 — une préparation abandonnée
+                                    // se verrouille comme un DSD : pas de
+                                    // nouvel essai pour cette position, la
+                                    // fin de piste joue la suivante.
+                                    GaplessPrep::DsdNextSkipped | GaplessPrep::Abandonnee => {
                                         ps.gapless_dsd_skip_pos = Self::prochaine_position_jouable(
                                             &self.db, zone_id, zone_state,
                                         );

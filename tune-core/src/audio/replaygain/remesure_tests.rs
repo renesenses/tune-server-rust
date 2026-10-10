@@ -68,6 +68,12 @@ fn mesure_de_tune(repo: &TrackMetadataRepo, id: i64) {
     repo.set(id, "rg_track_gain", "-6.50 dB").unwrap();
     repo.set(id, "rg_track_peak", "0.455000").unwrap();
     repo.set(id, "rg_track_true_peak", "0.507412").unwrap();
+    repo.set(
+        id,
+        super::super::TRUE_PEAK_ALGO_KEY,
+        super::super::TRUE_PEAK_ALGO,
+    )
+    .unwrap();
     repo.set(id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS).unwrap();
     repo.set(id, "rg_analyzed", "1700000000").unwrap();
     repo.set(id, "dr_track", "10").unwrap();
@@ -107,6 +113,7 @@ fn le_lot_rend_a_la_passe_les_seules_mesures_d_avant_le_correctif() {
             "rg_track_true_peak",
             TRACK_SOURCE_KEY,
             RG_ALGO_KEY,
+            super::super::TRUE_PEAK_ALGO_KEY,
             "rg_analyzed",
         ] {
             assert!(!m.contains_key(cle), "piste {id} garde {cle} : {m:?}");

@@ -2488,50 +2488,118 @@ impl PlaybackOrchestrator {
         } else {
             volume_avec_trim(volume, gain_trim_db_enregistre(&self.db, zone_id))
         };
-        if let Some(did) = device_id {
-            let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
-                OutputCommandError::failed(
-                    OutputCommand::SetVolume,
-                    format!("output {did} is not registered"),
-                )
-            })?;
-            info!(
+        let Some(did) = device_id else {
+            info!(zone_id, volume, "set_volume_no_device_id");
+            self.playback.set_volume(zone_id, volume).await;
+            self.playback.mark_volume_changed(zone_id).await;
+            ZoneRepo::with_backend(self.db.clone())
+                // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
+                // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
+                .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+            return Ok(());
+        };
+        let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
+            OutputCommandError::failed(
+                OutputCommand::SetVolume,
+                format!("output {did} is not registered"),
+            )
+        })?;
+        // #5662 — une commande de volume à la fois par sortie, et seule la
+        // dernière valeur attend son tour (voir `volume_coalescent`).
+        let file = self.volume_coalesceur.file(did, zone_id);
+        // Capacité absente : refus AVANT toute mutation, comme avant. Si une
+        // commande de volume est déjà en vol sur cette file, elle a passé ce
+        // contrôle : ne pas attendre le verrou de la sortie qu'elle tient.
+        if !file.etat.lock().await.en_vol {
+            output
+                .lock()
+                .await
+                .capabilities()
+                .require(OutputCommand::SetVolume)?;
+        }
+        // La demande prend son numéro, et l'état en mémoire comme l'évènement
+        // suivent tout de suite, dans l'ordre d'arrivée.
+        let ticket = {
+            let mut etat = file.etat.lock().await;
+            if etat.confirme.is_none() {
+                etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
+            }
+            etat.dernier_ticket += 1;
+            self.playback.set_volume(zone_id, volume).await;
+            self.playback.mark_volume_changed(zone_id).await;
+            etat.dernier_ticket
+        };
+        // Les demandes plus anciennes qui attendent se savent remplacées.
+        file.reveil.notify_waiters();
+        if !file.attendre_son_tour(ticket).await {
+            debug!(
                 zone_id,
                 volume,
-                device_volume,
-                pure_force,
                 device_id = did,
-                "device_set_volume_sending"
+                "device_set_volume_coalesced"
             );
-            if let Err(error) = output.lock().await.checked_set_volume(device_volume).await {
-                warn!(zone_id, error = %error, "device_set_volume_failed");
-                if let Some(ref bus) = self.event_bus {
-                    bus.emit(
-                        "zone.playback_error",
-                        serde_json::json!({
-                            "zone_id": zone_id,
-                            "error": error.to_string(),
-                        }),
-                    );
-                }
-                return Err(error);
-            }
-        } else {
-            info!(zone_id, volume, "set_volume_no_device_id");
+            return Ok(());
         }
-
-        // Le backend a accepté la commande : seulement maintenant les deux
-        // copies internes et la base peuvent annoncer la nouvelle valeur.
-        self.playback.set_volume(zone_id, volume).await;
-        self.playback.mark_volume_changed(zone_id).await;
-        ZoneRepo::with_backend(self.db.clone())
-            // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
-            // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
-            .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
-            .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-        Ok(())
+        info!(
+            zone_id,
+            volume,
+            device_volume,
+            pure_force,
+            device_id = did,
+            "device_set_volume_sending"
+        );
+        let resultat = output.lock().await.checked_set_volume(device_volume).await;
+        let issue = {
+            let mut etat = file.etat.lock().await;
+            etat.en_vol = false;
+            let plus_recent = etat.dernier_ticket != ticket;
+            match resultat {
+                Ok(()) => {
+                    let lever_l_erreur = std::mem::take(&mut etat.echec_depuis_succes);
+                    etat.confirme = if plus_recent { Some(volume) } else { None };
+                    if lever_l_erreur && !plus_recent {
+                        // Un refus antérieur de la rafale a figé le curseur
+                        // côté client : la valeur acceptée le libère.
+                        self.playback.set_volume(zone_id, volume).await;
+                    }
+                    self.playback.mark_volume_changed(zone_id).await;
+                    ZoneRepo::with_backend(self.db.clone())
+                        // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
+                        // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
+                        .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                        .map_err(|message| {
+                            OutputCommandError::failed(OutputCommand::SetVolume, message)
+                        })
+                }
+                Err(error) => {
+                    warn!(zone_id, error = %error, "device_set_volume_failed");
+                    etat.echec_depuis_succes = true;
+                    if !plus_recent {
+                        // Rien de plus récent n'attend : la mémoire revient à
+                        // ce que l'appareil a accepté en dernier, AVANT
+                        // l'évènement d'erreur (un client lève le blocage du
+                        // curseur sur `playback.volume`).
+                        let retabli = etat.confirme.take().unwrap_or(volume);
+                        self.playback.set_volume(zone_id, retabli).await;
+                    }
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        };
+        // La sortie est libre : la demande la plus récente peut partir.
+        file.reveil.notify_waiters();
+        issue
     }
-
     /// Arme le volume fixe : commande le plein volume au périphérique, **une
     /// seule fois** (#2395).
     ///

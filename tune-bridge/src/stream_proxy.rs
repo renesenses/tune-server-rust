@@ -13,7 +13,7 @@ use crate::state::{CorpsRelaye, PendingResponse, RelayState};
 pub async fn proxy_stream(
     State(state): State<Arc<RelayState>>,
     Path((server_id, stream_path)): Path<(String, String)>,
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
     let conn = match state.servers.get(&server_id) {
@@ -27,12 +27,8 @@ pub async fn proxy_stream(
     // etait lu ; le lecteur audio du navigateur, lui, ne peut PAS poser
     // d'en-tete sur la source d'une balise <audio>, d'ou le parametre de
     // requete accepte ici.
-    let jeton = crate::api_proxy::extraire_jeton(&headers).or_else(|| {
-        query
-            .get("token")
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-    });
+    let jeton = crate::api_proxy::extraire_jeton(&headers)
+        .or_else(|| crate::api_proxy::jeton_de_requete(uri.query()));
     let auth_ok = jeton
         .as_deref()
         .map(|t| state.server_for_token(t).as_deref() == Some(&*server_id))

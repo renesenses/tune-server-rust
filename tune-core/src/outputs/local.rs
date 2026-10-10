@@ -7220,7 +7220,7 @@ impl PromotionDuFilDeRendu {
 /// La ligne de journal du ticket : obtenu ou refusé, et pourquoi. Une fois par
 /// fil de rendu, avant que la porte de préchargement ne laisse passer le son.
 fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::OrdonnancementTempsReel) {
-    use crate::audio::ordonnancement_rt::OrdonnancementTempsReel;
+    use crate::audio::ordonnancement_rt::{OrdonnancementTempsReel, RepliNice};
     // Une ligne par verdict et par processus : chaque réouverture du flux crée
     // un fil de rendu neuf, qui ne doit pas répéter la même ligne.
     if !crate::audio::ordonnancement_rt::premiere_fois(issue) {
@@ -7242,11 +7242,26 @@ fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::Ordonna
             priority,
             rlimit_rtprio,
             cause,
+            fallback: RepliNice::Obtenu { nice, rlimit_nice },
+        } => info!(
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            cause = %cause,
+            nice,
+            rlimit_nice = ?rlimit_nice,
+            "local_audio_realtime_scheduling — SCHED_FIFO refusé, le fil de rendu reste en SCHED_OTHER à nice {nice} (#3206)"
+        ),
+        OrdonnancementTempsReel::Refuse {
+            priority,
+            rlimit_rtprio,
+            cause,
+            fallback,
         } => warn!(
             priority,
             rlimit_rtprio = ?rlimit_rtprio,
             cause = %cause,
-            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER (#3206)"
+            fallback = ?fallback,
+            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER, nice inchangé (#3206)"
         ),
         OrdonnancementTempsReel::Desactive => info!(
             "local_audio_realtime_scheduling — TUNE_AUDIO_RT_PRIORITY=0 : rien demandé, le fil de rendu reste en SCHED_OTHER (#3206)"

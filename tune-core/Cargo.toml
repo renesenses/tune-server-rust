@@ -230,6 +230,13 @@ path = "tests/cle_pcm_5594.rs"
 name = "dr_sans_replaygain_5246"
 path = "tests/dr_sans_replaygain_5246.rs"
 
+# #2713 — rattrapage des crêtes vraies d'avant l'annexe 2 de BS.1770, joué par
+# la cascade de fond. Binaire seul : pause, priorité à la lecture et verrou
+# d'analyse sont des états de PROCESSUS.
+[[test]]
+name = "crete_vraie_rattrapage_2713"
+path = "tests/crete_vraie_rattrapage_2713.rs"
+
 # `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
 # tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
 # que tune_core, déjà construit (#2213).
@@ -704,3 +711,16 @@ path = "tests/ecrire_balises_edition_tranche4.rs"
 name = "clap_hors_async_5138"
 path = "tests/clap_hors_async_5138.rs"
 required-features = ["audio-embedding"]
+
+# Fuite mémoire CLAP du .18 (08/10, 12,2 Go en trois jours) : le modèle n'est
+# chargé que s'il reste des pistes, et relâché à la fin du balayage.
+# `autotests = false` : sans cette cible, ces témoins ne seraient jamais compilés.
+[[test]]
+name = "clap_fuite_rechargement_rc4"
+path = "tests/clap_fuite_rechargement_rc4.rs"
+required-features = ["audio-embedding"]
+
+# La conversion WAV 24 bits progressive contre `flac -d` (zone 10 du .18, 08/10).
+[[test]]
+name = "wav24_chaine_progressive_b209bf"
+path = "tests/wav24_chaine_progressive_b209bf.rs"

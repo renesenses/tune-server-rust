@@ -180,7 +180,7 @@ fn response(
     } else {
         (
             "text/html; charset=utf-8",
-            html_body(phase, current, detail.as_deref()),
+            html_body(path, phase, current, detail.as_deref()),
         )
     };
 
@@ -272,7 +272,23 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-fn html_body(phase: &str, current: Option<&str>, detail: Option<&str>) -> String {
+/// L'URL que le repli `<meta refresh>` recharge : le chemin demandé, à
+/// condition qu'il soit un chemin local ordinaire ; `/` sinon.
+///
+/// Le fragment (`#settings`) n'arrive jamais au serveur : cette URL n'en porte
+/// donc pas, et c'est voulu (#5972, voir `html_body`). Un chemin qui commence
+/// par `//` serait lu par le navigateur comme une autre origine : on le
+/// refuse, comme tout caractère hors d'un jeu sûr (`\` compris).
+fn refresh_target(path: &str) -> &str {
+    let sur = path.starts_with('/')
+        && !path.starts_with("//")
+        && path.len() <= 512
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-._~%?=&+".contains(&b));
+    if sur { path } else { "/" }
+}
+fn html_body(path: &str, phase: &str, current: Option<&str>, detail: Option<&str>) -> String {
     // Une migration en cours dit mieux que quiconque ce qui se passe ; sinon,
     // la phrase propre à l'étape.
     let detail = detail.unwrap_or_else(|| phase_detail(phase));
@@ -285,9 +301,24 @@ fn html_body(phase: &str, current: Option<&str>, detail: Option<&str>) -> String
         }
         _ => String::new(),
     };
+    // 🔴 #5972 — la page doit se RECHARGER, pas sauter à une ancre.
+    //
+    // Un `<meta http-equiv="refresh" content="3">` sans URL navigue vers
+    // l'URL du document. Quand elle porte un fragment (`/#settings` : le
+    // client web route par fragment), le standard HTML en fait une simple
+    // navigation de fragment — rien n'est rechargé, et la page restait figée
+    // jusqu'à F5 (Windows, fil 2179, ticket 241).
+    //
+    // Le rechargement passe donc par `location.reload()`, qui recharge
+    // vraiment le document ET garde le fragment : une fois Tune debout,
+    // l'utilisateur retrouve l'écran qu'il avait. Le `<meta refresh>` reste
+    // en repli (script bloqué ou désactivé), plus tard, et vers une URL
+    // EXPLICITE sans fragment — une vraie navigation, au prix de la vue.
+    let target = escape_html(refresh_target(path));
     format!(
         "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\">\
-         <meta http-equiv=\"refresh\" content=\"3\">\
+         <script>setTimeout(function(){{location.reload()}},3000)</script>\
+         <meta http-equiv=\"refresh\" content=\"6;url={target}\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>Tune démarre…</title>\
          <style>body{{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;\
@@ -406,6 +437,50 @@ mod tests {
         assert_eq!(declared, body.len());
     }
 
+    /// #5972 — la page doit se recharger VRAIMENT, même quand l'adresse
+    /// porte un fragment (`/#settings`).
+    ///
+    /// Un `<meta refresh>` sans URL devient, sur une adresse à fragment, une
+    /// simple navigation d'ancre : la page restait figée jusqu'à F5. Le
+    /// rechargement passe donc par `location.reload()` (qui garde le
+    /// fragment), et le repli `<meta refresh>` vise une URL explicite, sans
+    /// fragment, qui ne peut pas désigner une autre origine.
+    #[test]
+    fn la_page_d_attente_se_recharge_aussi_sur_une_adresse_a_fragment() {
+        let raw = response("/", "base de données", None, None);
+        let body = raw.split("\r\n\r\n").nth(1).expect("corps absent");
+        assert!(
+            body.contains("<script>setTimeout(function(){location.reload()},3000)</script>"),
+            "le rechargement doit passer par location.reload() : {body}"
+        );
+        assert!(
+            body.contains("<meta http-equiv=\"refresh\" content=\"6;url=/\">"),
+            "le repli doit viser une URL explicite : {body}"
+        );
+        assert!(
+            !body.contains("content=\"3\">"),
+            "plus de rafraîchissement sans URL, qui saute à l'ancre : {body}"
+        );
+        // Le repli recharge le chemin demandé s'il est ordinaire…
+        let page = html_body("/index.html?x=1", "démarrage", None, None);
+        assert!(page.contains("content=\"6;url=/index.html?x=1\""), "{page}");
+        // … et retombe sur `/` pour tout ce qui pourrait sortir de l'origine
+        // ou casser l'attribut.
+        for douteux in [
+            "//exemple.org/x",
+            "/\\exemple.org",
+            "/a\"onload=\"x",
+            "/a<b>",
+            "http://exemple.org/",
+            "",
+        ] {
+            let page = html_body(douteux, "démarrage", None, None);
+            assert!(
+                page.contains("content=\"6;url=/\""),
+                "{douteux:?} doit retomber sur / : {page}"
+            );
+        }
+    }
     /// Les étapes que `bootstrap.rs` pose réellement, dans l'ordre.
     const ETAPES: [&str; 8] = [
         "démarrage",
@@ -424,7 +499,7 @@ mod tests {
     fn chaque_etape_dit_ce_quelle_fait_et_la_bibliotheque_seulement_pour_la_base() {
         let mut phrases = std::collections::HashSet::new();
         for etape in ETAPES {
-            let page = html_body(etape, None, None);
+            let page = html_body("/", etape, None, None);
             assert!(
                 page.contains(&format!("Étape en cours : {etape}.")),
                 "{page}"
@@ -443,35 +518,35 @@ mod tests {
             );
         }
         assert!(
-            html_body("greffons", None, None).contains("greffons"),
+            html_body("/", "greffons", None, None).contains("greffons"),
             "la phrase des greffons doit parler des greffons"
         );
         // Une étape inconnue (ajoutée sans phrase) ne ment pas non plus.
-        let inconnue = html_body("étape future", None, None);
+        let inconnue = html_body("/", "étape future", None, None);
         assert!(!inconnue.contains("bibliothèque"), "{inconnue}");
     }
 
     /// #5370 — pendant « greffons », la page nomme le greffon en cours.
     #[test]
     fn la_page_nomme_le_greffon_en_cours_de_chargement() {
-        let page = html_body("greffons", Some("tune-diretta"), None);
+        let page = html_body("/", "greffons", Some("tune-diretta"), None);
         assert!(
             page.contains("Greffon en cours de chargement : tune-diretta."),
             "{page}"
         );
         // Le nom vient parfois d'un manifeste wasm : il est échappé.
-        let page = html_body("greffons", Some("<b>x</b>"), None);
+        let page = html_body("/", "greffons", Some("<b>x</b>"), None);
         assert!(page.contains("&lt;b&gt;x&lt;/b&gt;"), "{page}");
         assert!(!page.contains("<b>x</b>"), "{page}");
         // Hors de l'étape des greffons, rien n'est nommé.
-        let page = html_body("découverte réseau", Some("tune-diretta"), None);
+        let page = html_body("/", "découverte réseau", Some("tune-diretta"), None);
         assert!(!page.contains("tune-diretta"), "{page}");
     }
 
     /// Une migration en cours garde la main sur l'explication.
     #[test]
     fn une_migration_en_cours_remplace_la_phrase_de_l_etape() {
-        let page = html_body("base de données", None, Some("Mise à niveau 5/12"));
+        let page = html_body("/", "base de données", None, Some("Mise à niveau 5/12"));
         assert!(page.contains("Mise à niveau 5/12"), "{page}");
         assert!(!page.contains(phase_detail("base de données")), "{page}");
     }

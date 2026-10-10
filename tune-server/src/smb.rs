@@ -73,6 +73,108 @@ pub fn options_de_montage(user: &str, pass: &str, dialecte: Option<&str>) -> Str
     opts
 }
 
+/// La commande d'UN essai de montage Linux, selon le compte du service (#3206).
+///
+/// - root : `mount.cifs <unc> <point> -o <options>`, comme toujours ;
+/// - autre compte : `sudo -n tune-os-privilege smb-mount <unc> <point>
+///   <utilisateur> <dialecte>`, le mot de passe sur l'entrée standard. C'est
+///   l'assistant qui compose les options, avec les MÊMES que
+///   [`options_de_montage`] plus `uid`/`gid` du compte appelant et
+///   `nosuid,nodev,noexec`.
+///
+/// Les deux appelants (route interactive, remontage au démarrage) passent par
+/// ici pour la même raison que l'échelle : ce qui monte d'un côté doit monter
+/// de l'autre.
+pub fn commande_de_montage(
+    euid: u32,
+    sudo: &str,
+    unc: &str,
+    point: &str,
+    user: &str,
+    pass: &str,
+    dialecte: Option<&str>,
+) -> crate::privilege::Commande {
+    use crate::privilege::Commande;
+    if euid == 0 {
+        let opts = options_de_montage(user, pass, dialecte);
+        Commande::directe("mount.cifs", &[unc, point, "-o", &opts])
+    } else {
+        Commande::par_l_assistant(sudo, "smb-mount", &[unc, point, user, etiquette(dialecte)])
+            .avec_entree(pass)
+    }
+}
+
+/// La commande de démontage d'un partage, selon le compte du service.
+pub fn commande_de_demontage(euid: u32, sudo: &str, point: &str) -> crate::privilege::Commande {
+    use crate::privilege::Commande;
+    if euid == 0 {
+        Commande::directe("umount", &[point])
+    } else {
+        Commande::par_l_assistant(sudo, "smb-umount", &[point])
+    }
+}
+
+#[cfg(test)]
+mod commande_de_montage_tests {
+    use super::*;
+    use crate::privilege::{ASSISTANT, SUDO};
+
+    #[test]
+    fn en_root_rien_ne_change() {
+        let c = commande_de_montage(0, SUDO, "//nas/m", "/mnt/nas_m", "u", "p", Some("2.0"));
+        assert_eq!(c.programme, "mount.cifs");
+        assert_eq!(
+            c.args,
+            vec![
+                "//nas/m",
+                "/mnt/nas_m",
+                "-o",
+                "username=u,password=p,iocharset=utf8,vers=2.0"
+            ]
+        );
+        assert_eq!(c.entree, None);
+        let d = commande_de_demontage(0, SUDO, "/mnt/nas_m");
+        assert_eq!(
+            (d.programme.as_str(), d.args.clone()),
+            ("umount", vec!["/mnt/nas_m".to_string()])
+        );
+    }
+
+    #[test]
+    fn hors_root_l_assistant_recoit_le_mot_de_passe_sur_l_entree() {
+        for dialecte in DIALECTES {
+            let c =
+                commande_de_montage(1000, SUDO, "//nas/m", "/mnt/nas_m", "u", "p@ss,1", dialecte);
+            assert_eq!(c.programme, SUDO);
+            assert_eq!(
+                c.args,
+                vec![
+                    "-n",
+                    ASSISTANT,
+                    "smb-mount",
+                    "//nas/m",
+                    "/mnt/nas_m",
+                    "u",
+                    etiquette(dialecte)
+                ]
+            );
+            assert!(
+                !c.args.iter().any(|a| a.contains("p@ss")),
+                "le mot de passe ne doit pas passer en argument (sudo journalise la ligne)"
+            );
+            assert_eq!(c.entree.as_deref(), Some("p@ss,1"));
+        }
+        let d = commande_de_demontage(1000, SUDO, "/mnt/nas_m");
+        assert_eq!(d.args, vec!["-n", ASSISTANT, "smb-umount", "/mnt/nas_m"]);
+    }
+
+    /// Un refus de sudo ne se répare pas en changeant de dialecte.
+    #[test]
+    fn un_refus_de_sudo_arrete_l_echelle() {
+        assert!(arrete_l_echelle("sudo: a password is required"));
+    }
+}
+
 #[cfg(test)]
 mod options_de_montage_tests {
     use super::options_de_montage;
@@ -152,8 +254,12 @@ pub fn est_deja_monte(stderr: &str) -> bool {
 /// d'identifiants, et un point de montage deja occupe (fil 2145). Les deux
 /// appelants — la route interactive et le remontage au demarrage — passent par
 /// ici, pour ne pas diverger (voir l'en-tete du module).
+///
+/// Un refus de sudo (service hors root sans regle sudoers, #3206) non plus.
 pub fn arrete_l_echelle(stderr: &str) -> bool {
-    est_refus_d_authentification(stderr) || est_deja_monte(stderr)
+    est_refus_d_authentification(stderr)
+        || est_deja_monte(stderr)
+        || crate::privilege::est_un_refus_d_elevation(stderr)
 }
 
 /// Defaire les echappements octaux de `/proc/self/mounts` (`\040` pour une
