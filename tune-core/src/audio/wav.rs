@@ -108,6 +108,9 @@ pub fn build_wav_header_with_duration(
     bit_depth: u16,
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
+    // Forum #2189 — durée nulle = durée inconnue : `data = 0` déclarait un
+    // WAV vide, que le renderer refermait sans jouer.
+    let duration_ms = duration_ms.filter(|d| *d > 0);
     if wav_stream_needs_indeterminate_length(channels, sample_rate, bit_depth, duration_ms) {
         return build_wav_header_streaming(channels, sample_rate, bit_depth);
     }
@@ -306,6 +309,18 @@ mod tests {
         let h = build_wav_header_with_duration(2, 44100, 16, None);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
         assert_eq!(data_size, UNKNOWN_DATA_SIZE);
+    }
+
+    /// Forum #2189 — une durée nulle (base sans durée) écrivait `data = 0` :
+    /// un WAV qui se déclare vide. Elle doit valoir « inconnue ».
+    #[test]
+    fn wav_header_duree_nulle_vaut_duree_inconnue_2189() {
+        let h = build_wav_header_with_duration(2, 176_400, 24, Some(0));
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        assert_eq!(
+            data_size, UNKNOWN_DATA_SIZE,
+            "durée 0 : l'en-tête déclarait un chunk data de {data_size} octets"
+        );
     }
 
     #[test]

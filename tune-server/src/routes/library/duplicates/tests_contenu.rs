@@ -136,3 +136,68 @@ async fn les_doublons_par_contenu_reunissent_deux_encodages_et_ignorent_le_reste
     assert_eq!(par_contenu[0]["tracks"][1]["format"], "aac");
     assert!(corps["total"].as_u64().unwrap() >= 1);
 }
+
+/// #5976 — Xandria, *Sacrificium* (fil 2183) : le disque bonus reprend les
+/// douze titres en « (Instrumental) ». Même mixage sans la voix, même durée à
+/// la seconde, même première minute : l'empreinte les confond. La route ne
+/// doit plus proposer « Nightfall » et « Nightfall (Instrumental) » comme le
+/// même enregistrement — « Garder A » retirerait l'instrumental.
+#[tokio::test]
+async fn un_titre_et_son_instrumental_ne_sont_pas_le_meme_enregistrement() {
+    let (app, state) = serveur();
+    state
+        .backend
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Xandria')", &[])
+        .unwrap();
+    let son = empreinte_texte(&signal(&[220.0, 330.0, 440.0], 30.0, 0.8));
+    piste(
+        &state,
+        20,
+        "Nightfall",
+        "/m/sacrificium/CD1/03 Nightfall.flac",
+        "flac",
+        Some(&son),
+    );
+    piste(
+        &state,
+        21,
+        "Nightfall (Instrumental)",
+        "/m/sacrificium/CD2/04 Nightfall (Instrumental).flac",
+        "flac",
+        Some(&son),
+    );
+    piste(
+        &state,
+        22,
+        "Stardust - Live",
+        "/m/live/stardust.flac",
+        "flac",
+        Some(&son),
+    );
+
+    let reponse = app
+        .oneshot(
+            Request::get("/api/v1/library/duplicates")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let corps: Value = serde_json::from_slice(&octets).unwrap();
+    assert_eq!(
+        corps["duplicates"]["by_content"].as_array().map(Vec::len),
+        Some(0),
+        "aucun groupe « même enregistrement » entre un titre et son instrumental : {corps}"
+    );
+    assert!(
+        !corps["paires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["critere"] == "contenu_identique"),
+        "aucune paire contenu_identique : {corps}"
+    );
+}

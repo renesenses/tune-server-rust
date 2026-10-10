@@ -868,7 +868,8 @@ CREATE TABLE IF NOT EXISTS album_ratings (
 
 CREATE TABLE IF NOT EXISTS file_first_seen (
     file_path TEXT PRIMARY KEY,
-    first_seen_at DOUBLE PRECISION NOT NULL
+    first_seen_at DOUBLE PRECISION NOT NULL,
+    created_at DOUBLE PRECISION
 );
 
 CREATE TABLE IF NOT EXISTS streaming_auth (

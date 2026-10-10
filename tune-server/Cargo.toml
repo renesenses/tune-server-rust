@@ -200,6 +200,12 @@ path = "tests/memoire_a_froid.rs"
 name = "sendspin_point_d_acces_s2a"
 path = "tests/sendspin_point_d_acces_s2a.rs"
 
+# Le lien d'accès à distance (pont), servi à l'administrateur seul.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "pont_lien_d_acces"
+path = "tests/pont_lien_d_acces.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -272,6 +278,14 @@ path = "tests/titres_de_service_bannis_4806.rs"
 [[test]]
 name = "pistes_bibliotheque_lentes_5138"
 path = "tests/pistes_bibliotheque_lentes_5138.rs"
+
+# tune-web-client#1716 — l'onglet Titres paginé côté serveur : tri, recherche,
+# provenance et comptes par la route montée, et la réponse d'avant intacte
+# sans les nouveaux paramètres. `autotests = false` : sans cette cible,
+# jamais compilé.
+[[test]]
+name = "titres_pagines_serveur_1716"
+path = "tests/titres_pagines_serveur_1716.rs"
 
 # #5438 — un clic sur une collection intelligente ne coupe pas le flux : le
 # vrai routeur sur une vraie socket, 58 359 pistes, 4 fils d'exécuteur.
@@ -504,6 +518,12 @@ path = "tests/pg_group_by_strict_historique.rs"
 [[test]]
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
+
+# #5402 — le tri des ajouts recents par date de creation. `autotests = false` :
+# sans cette cible, jamais compile.
+[[test]]
+name = "ajouts_recents_tri_creation_5402"
+path = "tests/ajouts_recents_tri_creation_5402.rs"
 
 # #2901 (suite) — le plafond de la file d'attente est un reglage, et ses bornes
 # se ferment a l'ECRITURE : `PATCH /system/config` refuse une valeur hors

@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::home_queries;
+use tune_core::db::home_queries::TriAjouts;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -52,6 +53,23 @@ struct RecentlyAddedParams {
     limit: Option<i64>,
     /// Largeur de la fenetre en jours. Absent ⇒ [`FENETRE_JOURS_DEFAUT`].
     days: Option<i64>,
+    /// `modification` (defaut, le tri historique) ou `creation` (#5402).
+    /// Toute autre valeur : 400.
+    tri: Option<String>,
+}
+
+/// Le tri demande, ou le refus qui dit les valeurs admises (#5402). Absent ⇒
+/// le tri historique : un client deja deploye ne voit rien changer.
+fn tri_demande(tri: Option<&str>) -> Result<TriAjouts, AppError> {
+    match tri {
+        None => Ok(TriAjouts::default()),
+        Some(v) => TriAjouts::depuis_parametre(v).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "tri={v} inconnu : les ajouts recents se trient par `modification` \
+                 (defaut) ou par `creation`"
+            ))
+        }),
+    }
 }
 
 /// La fenetre servie quand le client n'en demande aucune.
@@ -1788,7 +1806,8 @@ async fn recently_added(
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
     let depuis = borne_basse_de_fenetre(p.days)?;
-    let items = fetch_recently_added(&state, limit, depuis)?;
+    let tri = tri_demande(p.tri.as_deref())?;
+    let items = fetch_recently_added_par(&state, limit, depuis, tri)?;
     Ok(Json(json!(items)))
 }
 
@@ -1803,8 +1822,9 @@ async fn recently_added_summary(
     Query(p): Query<RecentlyAddedParams>,
 ) -> Result<Json<Value>, AppError> {
     let depuis = borne_basse_de_fenetre(p.days)?;
+    let tri = tri_demande(p.tri.as_deref())?;
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added_totaux(engine);
+    let sql = home_queries::recently_added_totaux_par(engine, tri);
     let params: [&dyn ToSqlValue; 1] = [&depuis];
     let rows = state
         .backend
@@ -1822,6 +1842,13 @@ async fn recently_added_summary(
         // valeurs que l'ecran affiche telle quelle (« 5 h 55 min »), et la
         // division n'a pas a etre refaite par chaque client.
         "duration_seconds": duree_ms / 1000,
+        // #5402 — le tri servi, et les pistes de la fenetre sans date de
+        // creation (NFS, SMB, Docker, ou scannees avant la colonne). En tri
+        // par creation, celles-la sont rangees par leur date d'ajout : l'ecran
+        // le dit. La presence de `tri` dit aussi au client que le serveur
+        // connait le parametre.
+        "tri": tri.nom(),
+        "tracks_without_creation_date": nombre(3),
     })))
 }
 
@@ -1838,8 +1865,19 @@ async fn recently_added_summary(
 /// de [`borne_basse_de_fenetre`], qui l'a deja bornee. Elle etait auparavant
 /// recalculee ici a 7 jours en dur, hors d'atteinte de tout appelant (#3039).
 fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec<Value>, AppError> {
+    fetch_recently_added_par(state, limit, depuis, TriAjouts::default())
+}
+
+/// [`fetch_recently_added`] pour le tri choisi (#5402). `added_at` porte alors
+/// la date de ce tri.
+fn fetch_recently_added_par(
+    state: &AppState,
+    limit: i64,
+    depuis: f64,
+    tri: TriAjouts,
+) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
-    let sql = home_queries::recently_added(engine);
+    let sql = home_queries::recently_added_par(engine, tri);
     let params: [&dyn ToSqlValue; 2] = [&depuis, &limit];
     let rows = state
         .backend
@@ -2086,6 +2124,132 @@ async fn new_in_library(
     Ok(Json(json!(items)))
 }
 
+/// La requete LOCALE d'« Autres versions » : les pistes de la bibliotheque qui
+/// sont une autre version d'une des dernieres ecoutes. `limit` est deja borne
+/// par l'appelant.
+fn sql_autres_versions_locales(limit: i64) -> String {
+    // Le vivier d'ecoutes examine. Large devant `limit` : beaucoup de morceaux
+    // n'ont aucune autre version, il en faut donc bien plus que de groupes
+    // souhaites pour en remplir quelques-uns.
+    const ECOUTES_EXAMINEES: usize = 200;
+
+    // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
+    // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
+    // SQLite et PostgreSQL.
+    // Le rapprochement lui-meme est ecrit UNE fois, dans
+    // `routes::versions` : la route par piste (#2372) applique exactement
+    // la meme regle a un vivier different.
+    let predicat = crate::routes::versions::predicat_rapprochement(
+        "lh.title",
+        "lh.artist_name",
+        "lh.album_title",
+    );
+    // ── Pourquoi un `GROUP BY` et non le `SELECT DISTINCT` d'avant (#3181) ──
+    //
+    // La forme precedente triait sur `lh.listened_at` SANS le selectionner :
+    // PostgreSQL la refuse — « for SELECT DISTINCT, ORDER BY expressions must
+    // appear in select list » — et la section partait VIDE chez tout
+    // utilisateur PG, l'echec avale par `ou_defaut_journalise`.
+    //
+    // Ajouter `listened_at` a la liste de selection aurait rendu la requete
+    // legale et le resultat FAUX : le `DISTINCT` ne dedoublonnait plus la meme
+    // chose. Il ne portait de fait que sur (titre, artiste, album, `t.id`) —
+    // les quatre autres colonnes sont fonctionnellement determinees par
+    // `t.id` — et son role etait d'effondrer les REECOUTES du meme morceau,
+    // qui ne different que par `listened_at`. Le rendre distinct fait
+    // reapparaitre une ligne par ecoute : mesure sur trois lignes d'historique
+    // dont deux reecoutes, 3 lignes au lieu de 2, la meme version listee deux
+    // fois, et le `LIMIT` mange par les repetitions.
+    //
+    // Le dedoublonnage descend donc dans le vivier, AVANT la jointure, avec le
+    // patron deja utilise seize lignes plus bas par `sql_recentes` :
+    // `GROUP BY` sur les trois colonnes du `DISTINCT`, `MAX(listened_at)` pour
+    // la cle de tri. Meme ensemble qu'avant sur les deux moteurs, et plus
+    // aucun `DISTINCT` a satisfaire — `lh` est unique sur ses trois colonnes,
+    // `t.id` est unique, et `al`/`ar`/`ar2` se joignent par cle primaire.
+    //
+    // `MAX(listened_at)` est ici la DERNIERE ecoute (chaine ISO-8601, cf.
+    // ci-dessus) : c'est ce que « les dernieres ecoutes » veut dire, et c'est
+    // desormais defini, la ou le `DISTINCT` laissait le moteur choisir
+    // n'importe laquelle des valeurs effondrees.
+    //
+    // `t.id` en second critere de tri n'est pas un ornement : une meme ecoute
+    // se deplie en PLUSIEURS versions qui partagent toutes son `listened_at`,
+    // donc sans departage l'ordre de ces lignes — et ce que le `LIMIT`
+    // retient — depend du plan de chaque moteur. C'est la condition pour que
+    // SQLite et PostgreSQL rendent le meme ensemble DANS LE MEME ORDRE.
+    //
+    // ── Pourquoi plus de `CROSS JOIN tracks` (essai par le pont, 09/10/2026) ──
+    //
+    // La forme precedente comparait chaque ecoute du vivier a CHAQUE piste de
+    // la bibliotheque, par un predicat de chaines qu'aucun index ne sert : 200
+    // ecoutes × 96 519 pistes sur le .18, soit 24 a 32 s par appel
+    // (`slow_query` du journal), au-dela des 30 s du relais du pont. Et trois
+    // appels concurrents tenaient les trois connexions de lecture du pool : le
+    // reste attendait jusqu'a 9 s.
+    //
+    // Le predicat exige l'egalite d'ARTISTE (`COALESCE(ar2.name, ar.name)`,
+    // insensible a la casse). Une piste ne peut donc etre retenue que si son
+    // artiste de piste, ou a defaut celui de son album, porte le nom ecoute.
+    // `cand` ne garde que ces pistes-la, par deux chemins indexes :
+    //
+    // - `tracks.artist_id` (index `idx_tracks_artist_title`) ;
+    // - `albums.artist_id` puis `tracks.album_id`
+    //   (index `idx_tracks_album_disc_track`).
+    //
+    // C'est un SUR-ensemble de ce que le predicat accepte, et le predicat est
+    // reapplique tel quel au-dessus : l'ensemble rendu et son ordre sont ceux
+    // d'avant (garde `la_requete_locale_rend_exactement_ce_que_rendait_le_balayage`).
+    // Un seul ecart, assume : une ecoute dont l'artiste est la chaine VIDE ne
+    // rapproche plus les pistes sans aucun artiste — un faux rapprochement.
+    //
+    // ⚠️ Les `CROSS JOIN … WHERE` ne sont pas un style : c'est la seule
+    // ecriture qui FIXE l'ordre des tables dans SQLite — ecoutes, puis
+    // artistes, puis pistes par index. Avec des `JOIN … ON`, le planificateur
+    // partait de `tracks` (balayage complet par un index couvrant) et filtrait
+    // ensuite par artiste : 1,8 a 2,3 s mesurees sur une base de la taille du
+    // .18, au lieu de quelques millisecondes. PostgreSQL traite les deux
+    // formes de la meme facon. Le `DISTINCT` de `ma` l'empeche d'etre fondu
+    // dans la requete englobante : il est calcule une fois (au plus 200
+    // lignes), puis joint.
+    //
+    // `ma` lit `artists` UNE fois (quelques milliers de lignes) au lieu d'une
+    // fois par ecoute. `UNION` (et non `UNION ALL`) : une piste dont l'artiste
+    // de piste et celui d'album portent le meme nom sort des deux chemins.
+    // `WITH` et `UNION` ont le meme contrat dans SQLite et PostgreSQL.
+    format!(
+        "WITH lh0 AS ( \
+           SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
+           FROM (SELECT title, artist_name, album_title, listened_at \
+                 FROM listen_history \
+                 WHERE artist_name IS NOT NULL \
+                 ORDER BY listened_at DESC \
+                 LIMIT {ECOUTES_EXAMINEES}) le \
+           GROUP BY title, artist_name, album_title), \
+         ma AS ( \
+           SELECT DISTINCT id, LOWER(name) AS nom FROM artists \
+           WHERE LOWER(name) IN (SELECT LOWER(artist_name) FROM lh0)), \
+         cand AS ( \
+           SELECT lh0.title, lh0.artist_name, lh0.album_title, lh0.listened_at, ct.id AS track_id \
+           FROM lh0 CROSS JOIN ma CROSS JOIN tracks ct \
+           WHERE ma.nom = LOWER(lh0.artist_name) AND ct.artist_id = ma.id \
+           UNION \
+           SELECT lh0.title, lh0.artist_name, lh0.album_title, lh0.listened_at, ct.id \
+           FROM lh0 CROSS JOIN ma CROSS JOIN albums ca CROSS JOIN tracks ct \
+           WHERE ma.nom = LOWER(lh0.artist_name) AND ca.artist_id = ma.id AND ct.album_id = ca.id) \
+        SELECT lh.title, lh.artist_name, lh.album_title, \
+                t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
+        FROM cand lh \
+        CROSS JOIN tracks t \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
+        LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+        WHERE t.id = lh.track_id AND {predicat} \
+        ORDER BY lh.listened_at DESC, t.id \
+        LIMIT {limit}"
+    )
+}
+
 /// Les ecoutes recentes examinees pour la recherche STREAMING. Chacune coute
 /// une recherche par service connecte (moins le cache) : ce nombre est le
 /// budget reseau de la section, pas un choix d'affichage.
@@ -2164,74 +2328,7 @@ async fn other_versions(
     // Plafond borne cote serveur : ce nombre part dans le SQL, il ne doit pas
     // venir tel quel de l'URL.
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
-    // Le vivier d'ecoutes examine. Large devant `limit` : beaucoup de morceaux
-    // n'ont aucune autre version, il en faut donc bien plus que de groupes
-    // souhaites pour en remplir quelques-uns.
-    const ECOUTES_EXAMINEES: usize = 200;
-
-    // `listened_at` est ordonne comme chaine (ISO-8601), donc `ORDER BY` suffit
-    // pour prendre les dernieres : aucun cast de date, donc aucun ecart entre
-    // SQLite et PostgreSQL.
-    // Le rapprochement lui-meme est ecrit UNE fois, dans
-    // `routes::versions` : la route par piste (#2372) applique exactement
-    // la meme regle a un vivier different.
-    let predicat = crate::routes::versions::predicat_rapprochement(
-        "lh.title",
-        "lh.artist_name",
-        "lh.album_title",
-    );
-    // ── Pourquoi un `GROUP BY` et non le `SELECT DISTINCT` d'avant (#3181) ──
-    //
-    // La forme precedente triait sur `lh.listened_at` SANS le selectionner :
-    // PostgreSQL la refuse — « for SELECT DISTINCT, ORDER BY expressions must
-    // appear in select list » — et la section partait VIDE chez tout
-    // utilisateur PG, l'echec avale par `ou_defaut_journalise`.
-    //
-    // Ajouter `listened_at` a la liste de selection aurait rendu la requete
-    // legale et le resultat FAUX : le `DISTINCT` ne dedoublonnait plus la meme
-    // chose. Il ne portait de fait que sur (titre, artiste, album, `t.id`) —
-    // les quatre autres colonnes sont fonctionnellement determinees par
-    // `t.id` — et son role etait d'effondrer les REECOUTES du meme morceau,
-    // qui ne different que par `listened_at`. Le rendre distinct fait
-    // reapparaitre une ligne par ecoute : mesure sur trois lignes d'historique
-    // dont deux reecoutes, 3 lignes au lieu de 2, la meme version listee deux
-    // fois, et le `LIMIT` mange par les repetitions.
-    //
-    // Le dedoublonnage descend donc dans le vivier, AVANT la jointure, avec le
-    // patron deja utilise seize lignes plus bas par `sql_recentes` :
-    // `GROUP BY` sur les trois colonnes du `DISTINCT`, `MAX(listened_at)` pour
-    // la cle de tri. Meme ensemble qu'avant sur les deux moteurs, et plus
-    // aucun `DISTINCT` a satisfaire — `lh` est unique sur ses trois colonnes,
-    // `t.id` est unique, et `al`/`ar`/`ar2` se joignent par cle primaire.
-    //
-    // `MAX(listened_at)` est ici la DERNIERE ecoute (chaine ISO-8601, cf.
-    // ci-dessus) : c'est ce que « les dernieres ecoutes » veut dire, et c'est
-    // desormais defini, la ou le `DISTINCT` laissait le moteur choisir
-    // n'importe laquelle des valeurs effondrees.
-    //
-    // `t.id` en second critere de tri n'est pas un ornement : une meme ecoute
-    // se deplie en PLUSIEURS versions qui partagent toutes son `listened_at`,
-    // donc sans departage l'ordre de ces lignes — et ce que le `LIMIT`
-    // retient — depend du plan de chaque moteur. C'est la condition pour que
-    // SQLite et PostgreSQL rendent le meme ensemble DANS LE MEME ORDRE.
-    let sql = format!(
-        "SELECT lh.title, lh.artist_name, lh.album_title, \
-                t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
-        FROM (SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
-              FROM (SELECT title, artist_name, album_title, listened_at \
-                    FROM listen_history \
-                    WHERE artist_name IS NOT NULL \
-                    ORDER BY listened_at DESC \
-                    LIMIT {ECOUTES_EXAMINEES}) le \
-              GROUP BY title, artist_name, album_title) lh \
-        CROSS JOIN tracks t \
-        JOIN albums al ON t.album_id = al.id \
-        LEFT JOIN artists ar ON al.artist_id = ar.id \
-        LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
-        WHERE {predicat} \
-        ORDER BY lh.listened_at DESC, t.id \
-        LIMIT {limit}"
-    );
+    let sql = sql_autres_versions_locales(limit);
 
     // Une piste ecoutee, ses autres versions : on regroupe cote serveur pour
     // que l'ecran n'ait pas a le refaire (et a le refaire differemment sur
@@ -3419,5 +3516,188 @@ mod tests_borne_2130 {
             executer_dans_la_borne(|| 7, Duration::from_secs(5)),
             Some(7)
         );
+    }
+}
+
+/// « Autres versions » sur une GROSSE bibliotheque (essai par le pont du
+/// 09/10/2026, serveur .18 en v1.0.0-rc3).
+///
+/// La requete locale faisait un `CROSS JOIN tracks` : chaque ecoute du vivier
+/// (jusqu'a 200) etait comparee a CHAQUE piste de la bibliotheque, par un
+/// predicat de chaines (`LOWER`, `TRIM`, `SUBSTR`) qu'aucun index ne sert.
+/// Sur le .18 (9 335 albums, 96 519 pistes, 2 697 artistes), le journal
+/// relevait `slow_query ms=24198` a `ms=32566` pour cette seule requete — au-dela
+/// des 30 s du relais du pont (504) — et `attente_ms=9076` pour une requete
+/// voisine : trois appels concurrents tiennent les trois connexions de lecture
+/// du pool SQLite, et tout le reste fait la queue.
+#[cfg(test)]
+mod tests_autres_versions_grosse_bibliotheque {
+    use super::*;
+
+    /// L'ANCIENNE requete, mot pour mot : la reference de l'equivalence. Le
+    /// correctif ne doit changer QUE le chemin, jamais ce qui est rendu.
+    fn sql_balayage_de_reference(limit: i64) -> String {
+        let predicat = crate::routes::versions::predicat_rapprochement(
+            "lh.title",
+            "lh.artist_name",
+            "lh.album_title",
+        );
+        format!(
+            "SELECT lh.title, lh.artist_name, lh.album_title, \
+                    t.id, al.id, al.title, al.cover_path, t.duration_ms, t.title \
+            FROM (SELECT title, artist_name, album_title, MAX(listened_at) AS listened_at \
+                  FROM (SELECT title, artist_name, album_title, listened_at \
+                        FROM listen_history \
+                        WHERE artist_name IS NOT NULL \
+                        ORDER BY listened_at DESC \
+                        LIMIT 200) le \
+                  GROUP BY title, artist_name, album_title) lh \
+            CROSS JOIN tracks t \
+            JOIN albums al ON t.album_id = al.id \
+            LEFT JOIN artists ar ON al.artist_id = ar.id \
+            LEFT JOIN artists ar2 ON t.artist_id = ar2.id \
+            WHERE {predicat} \
+            ORDER BY lh.listened_at DESC, t.id \
+            LIMIT {limit}"
+        )
+    }
+
+    /// Une bibliotheque generee : `artistes` artistes, `albums` albums,
+    /// `pistes` pistes, `ecoutes` ecoutes. Les titres se repetent d'un album a
+    /// l'autre (`Titre k` pour la k-ieme piste de chaque album, une sur sept en « (Live) ») pour que le
+    /// rapprochement trouve vraiment des versions — sinon la mesure ne
+    /// mesurerait qu'une requete vide.
+    fn bibliotheque(state: &AppState, artistes: i64, albums: i64, pistes: i64, ecoutes: i64) {
+        let sql = format!(
+            "BEGIN; \
+             INSERT INTO artists (id, name) \
+               WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {artistes}) \
+               SELECT n, 'Artiste ' || n FROM c; \
+             INSERT INTO albums (id, title, artist_id) \
+               WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {albums}) \
+               SELECT n, 'Album ' || n, 1 + (n % {artistes}) FROM c; \
+             INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, file_path) \
+               WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {pistes}) \
+               SELECT n, \
+                      'Titre ' || (n / {albums}) || CASE WHEN n % 7 = 0 THEN ' (Live)' ELSE '' END, \
+                      1 + (n % {albums}), \
+                      CASE WHEN n % 11 = 0 THEN NULL ELSE 1 + ((1 + (n % {albums})) % {artistes}) END, \
+                      200000 + n, '/gen/' || n || '.flac' \
+               FROM c; \
+             INSERT INTO listen_history (title, artist_name, album_title, listened_at) \
+               WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {ecoutes}) \
+               SELECT t.title, CASE WHEN c.n % 5 = 0 THEN UPPER(ar.name) ELSE ar.name END, al.title, \
+                      strftime('%Y-%m-%dT%H:%M:%SZ', '2026-09-01', '+' || c.n || ' minutes') \
+               FROM c JOIN tracks t ON t.id = 1 + ((c.n * 37) % {pistes}) \
+               JOIN albums al ON al.id = t.album_id \
+               JOIN artists ar ON ar.id = al.artist_id; \
+             COMMIT;"
+        );
+        state
+            .backend
+            .execute_batch(&sql)
+            .expect("bibliotheque generee");
+    }
+
+    fn plan(state: &AppState, sql: &str) -> Vec<String> {
+        state
+            .backend
+            .query_many(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
+            .expect("plan")
+            .into_iter()
+            .filter_map(|cols| cols.get(3).and_then(|v| v.as_string()))
+            .collect()
+    }
+
+    /// 🔴 Le garde structurel, deterministe : la table des pistes n'est plus
+    /// BALAYEE. Les pistes candidates se cherchent par l'artiste (index
+    /// `artist_id` / `album_id`), une ecoute ne voit plus que celles de son
+    /// artiste.
+    #[tokio::test]
+    async fn la_requete_locale_ne_balaye_plus_la_table_des_pistes() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque(&state, 300, 1_000, 10_000, 300);
+        let lignes = plan(&state, &sql_autres_versions_locales(20));
+        let balayages: Vec<&String> = lignes
+            .iter()
+            .filter(|d| {
+                // `t` : la piste rendue ; `ct` : les pistes candidates. Un
+                // balayage par index COUVRANT reste un balayage complet.
+                ["SCAN t", "SCAN ct", "SCAN tracks"]
+                    .iter()
+                    .any(|m| d.as_str() == *m || d.starts_with(&format!("{m} ")))
+            })
+            .collect();
+        assert!(
+            balayages.is_empty(),
+            "la table des pistes est encore balayee : {balayages:?}\nplan complet : {lignes:#?}"
+        );
+    }
+
+    /// Le correctif ne change que le CHEMIN : sur une bibliotheque qui couvre
+    /// les cas du predicat (artiste de piste, artiste d'album seul, casse,
+    /// suffixe d'edition, compilation), la nouvelle requete rend EXACTEMENT les
+    /// lignes de l'ancienne, dans le meme ordre.
+    #[tokio::test]
+    async fn la_requete_locale_rend_exactement_ce_que_rendait_le_balayage() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque(&state, 40, 150, 2_000, 400);
+        let b = &state.backend;
+        // Les cas de bord du predicat, au-dessus du volume genere.
+        b.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (9001, 'Kate Bush'), (9002, 'Artistes divers'); \
+             INSERT INTO albums (id, title, artist_id) VALUES \
+               (9101, 'Hit Collection', 9002), (9102, 'Before The Dawn', 9001), \
+               (9103, 'Sans artiste de piste', 9001), (9104, 'Album orphelin', NULL); \
+             INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, file_path) VALUES \
+               (9201, 'Running Up That Hill (A Deal With God)', 9102, 9001, 1, '/e1'), \
+               (9202, 'Running Up That Hill', 9101, 9001, 1, '/e2'), \
+               (9203, 'running up that hill - 2018 Remaster', 9103, NULL, 1, '/e3'), \
+               (9204, 'Running Up That Hill', 9104, NULL, 1, '/e4'), \
+               (9205, 'Running Up That Hill [Live]', 9101, 9002, 1, '/e5'); \
+             INSERT INTO listen_history (title, artist_name, album_title, listened_at) VALUES \
+               ('Running Up that Hill', 'KATE BUSH', 'Hit Collection', '2026-12-01T00:00:00Z'), \
+               ('Running Up That Hill', 'Artistes divers', 'Before The Dawn', '2026-12-01T00:01:00Z');",
+        )
+        .unwrap();
+        for limit in [1, 20, 100] {
+            let attendu = b
+                .query_many(&sql_balayage_de_reference(limit), &[])
+                .unwrap();
+            let obtenu = b
+                .query_many(&sql_autres_versions_locales(limit), &[])
+                .unwrap();
+            assert!(!attendu.is_empty(), "le banc doit trouver des versions");
+            assert_eq!(
+                format!("{obtenu:?}"),
+                format!("{attendu:?}"),
+                "limit={limit} : la nouvelle requete ne rend pas les memes lignes"
+            );
+        }
+    }
+
+    /// La mesure, a la taille du .18. Ignoree par defaut (elle genere 96 000
+    /// pistes) : `cargo test -p tune-server --release -- --ignored
+    /// autres_versions_a_la_taille_du_18 --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn autres_versions_a_la_taille_du_18() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        bibliotheque(&state, 2_697, 9_335, 96_519, 2_160);
+        for ligne in plan(&state, &sql_autres_versions_locales(20)) {
+            eprintln!("PLAN {ligne}");
+        }
+        let debut = std::time::Instant::now();
+        let lignes = state
+            .backend
+            .query_many(&sql_autres_versions_locales(20), &[])
+            .unwrap();
+        let duree = debut.elapsed();
+        eprintln!(
+            "MESURE autres-versions : {} lignes en {duree:?}",
+            lignes.len()
+        );
+        assert!(!lignes.is_empty());
+        assert!(duree < std::time::Duration::from_secs(1), "{duree:?}");
     }
 }

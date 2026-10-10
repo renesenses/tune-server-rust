@@ -357,13 +357,10 @@ struct LoudnessAccumulator {
     block_powers: Vec<f64>,
     /// Running linear sample peak on the *un-weighted* samples.
     peak: f64,
-    /// Running linear TRUE peak (inter-sample, 4×) on the un-weighted
-    /// samples — Catmull-Rom interpolation, see [`Self::true_peak_feed`].
-    true_peak: f64,
-    /// Per-channel history of the last 3 raw samples, so the interpolation
-    /// stays continuous across `feed` calls (same guarantee as the
-    /// K-weighting filter state).
-    tp_hist: Vec<[f64; 3]>,
+    /// Crête vraie (ITU-R BS.1770, annexe 2) sur les échantillons NON
+    /// pondérés — voir [`super::crete_vraie`] (#2713). Son histoire traverse
+    /// les appels `feed`, comme l'état du filtre de pondération K.
+    crete_vraie: super::crete_vraie::CreteVraie,
     total_frames: usize,
 }
 
@@ -382,36 +379,9 @@ impl LoudnessAccumulator {
                 .collect(),
             block_powers: Vec::new(),
             peak: 0.0,
-            true_peak: 0.0,
-            tp_hist: vec![[0.0; 3]; channels],
+            crete_vraie: super::crete_vraie::CreteVraie::new(sample_rate, channels),
             total_frames: 0,
         }
-    }
-
-    /// True peak inter-échantillons (#1694) : suréchantillonnage 4× par
-    /// interpolation Catmull-Rom, évaluée entre les deux derniers
-    /// échantillons du canal. Assez proche de l'interpolateur BS.1770-4 pour
-    /// l'usage (plafond `prevent_clipping`), et peu coûteux dans
-    /// l'accumulateur déjà streaming — pas de FIR polyphase ni de tampon.
-    ///
-    /// L'histoire par canal traverse les appels `feed`, donc le résultat est
-    /// invariant au découpage, comme le reste de l'accumulateur. Les 3
-    /// zéros initiaux équivalent à un amorçage sur du silence : aucun over ne
-    /// peut s'y inventer.
-    fn true_peak_feed(&mut self, c: usize, raw: f64) {
-        let [p0, p1, p2] = self.tp_hist[c];
-        let p3 = raw;
-        // Catmull-Rom entre p1 et p2, évalué en t = 1/4, 1/2, 3/4.
-        let a = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
-        let b = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
-        let cc = p2 - p0;
-        let d = 2.0 * p1;
-        for t in [0.25f64, 0.5, 0.75] {
-            let v = 0.5 * (((a * t + b) * t + cc) * t + d);
-            self.true_peak = self.true_peak.max(v.abs());
-        }
-        self.true_peak = self.true_peak.max(raw.abs());
-        self.tp_hist[c] = [p1, p2, p3];
     }
 
     /// Feed interleaved normalized samples. Emits every complete 400 ms block
@@ -422,11 +392,11 @@ impl LoudnessAccumulator {
             return;
         }
         let frames = interleaved.len() / self.channels;
+        self.crete_vraie.nourrir(interleaved);
         for f in 0..frames {
             for c in 0..self.channels {
                 let raw = interleaved[f * self.channels + c];
                 self.peak = self.peak.max(raw.abs());
-                self.true_peak_feed(c, raw);
                 let (s1, s2) = &mut self.filters[c];
                 self.bufs[c].push_back(s2.process(s1.process(raw)));
             }
@@ -450,15 +420,15 @@ impl LoudnessAccumulator {
     }
 
     /// Integrated loudness (LUFS, rounded to 0.1) + sample peak (clamped to
-    /// 1.0) + TRUE peak (4×, volontairement NON borné à 1.0 : les overs
-    /// inter-échantillons au-dessus de 0 dBFS sont précisément l'information
-    /// que `prevent_clipping` doit voir, #1694). `None` for silence /
+    /// 1.0) + TRUE peak (BS.1770 annexe 2, #2713 ; volontairement NON borné
+    /// à 1.0 : les overs inter-échantillons au-dessus de 0 dBFS sont
+    /// précisément l'information que `prevent_clipping` doit voir, #1694). `None` for silence /
     /// below-threshold / empty input.
     fn finish(self) -> Option<(f64, f64, f64)> {
         let peak = self.peak.min(1.0);
         // Le vrai pic englobe le sample peak par construction (chaque
         // échantillon brut y participe) ; on le republie tel quel.
-        let true_peak = self.true_peak;
+        let true_peak = self.crete_vraie.crete();
 
         // Too short for even one 400 ms block: simple loudness over all samples
         // (nothing was drained, so the buffers still hold the whole signal).
@@ -696,6 +666,10 @@ pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEm
 struct MesureEnCours {
     acc: Option<LoudnessAccumulator>,
     dr: Option<DrAccumulator>,
+    /// #2713 — mesure de la SEULE crête vraie ([`mesurer_la_crete_vraie`]) :
+    /// ni sonie ni plage dynamique, seulement `crete`.
+    crete_seule: bool,
+    crete: Option<super::crete_vraie::CreteVraie>,
 }
 
 /// Ce qu'a donné UN segment de la mesure.
@@ -729,14 +703,15 @@ impl MesureEnCours {
             .iter()
             .map(|&s| s as f64 / scale)
             .collect();
-        self.acc
-            .get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
-            .feed(&samples);
-        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
-        // dynamique ne coûte que son arithmétique.
-        self.dr
-            .get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
-            .feed(&samples);
+        if self.crete_seule {
+            // Les MÊMES échantillons que la mesure complète : la crête rendue
+            // est celle de `mesurer_intensite_et_plage`, au bit près.
+            self.crete
+                .get_or_insert_with(|| super::crete_vraie::CreteVraie::new(sample_rate, channels))
+                .nourrir(&samples);
+        } else {
+            self.nourrir_les_accumulateurs(&samples, sample_rate, channels);
+        }
 
         // A segment shorter than requested means we reached the end. Advance the
         // seek by the actual decoded duration so segments stay contiguous even if
@@ -746,6 +721,18 @@ impl MesureEnCours {
             return Segment::Fin;
         }
         Segment::Suite(frames as f64 / sample_rate as f64)
+    }
+
+    /// Sonie, pics et plage dynamique d'un segment déjà normalisé.
+    fn nourrir_les_accumulateurs(&mut self, samples: &[f64], sample_rate: usize, channels: usize) {
+        self.acc
+            .get_or_insert_with(|| LoudnessAccumulator::new(sample_rate, channels))
+            .feed(samples);
+        // LES MÊMES échantillons, déjà décodés et déjà normalisés : la plage
+        // dynamique ne coûte que son arithmétique.
+        self.dr
+            .get_or_insert_with(|| DrAccumulator::new(sample_rate, channels))
+            .feed(samples);
     }
 
     fn finir(self) -> Option<(f64, f64, f64, Option<u32>)> {
@@ -778,8 +765,43 @@ impl MesureEnCours {
 /// la passe peut céder à la lecture (#2495) reste le segment.
 async fn mesurer_a_partir_de(
     file_path: &str,
-    mut premier: Option<super::decode::DecodedAudio>,
+    premier: Option<super::decode::DecodedAudio>,
 ) -> Option<(f64, f64, f64, Option<u32>)> {
+    let mesure = parcourir_les_segments(file_path, premier, MesureEnCours::default()).await?;
+    tokio::task::spawn_blocking(move || mesure.finir())
+        .await
+        .ok()?
+}
+
+/// La SEULE crête vraie d'un fichier (#2713), linéaire : la valeur que
+/// [`mesurer_intensite_et_plage`] rendrait en troisième position, au bit près
+/// — mêmes segments, mêmes échantillons, même accumulateur — sans la sonie ni
+/// la plage dynamique.
+///
+/// Sert au rattrapage des crêtes mesurées par l'ancien algorithme : les gains
+/// déjà calculés restent valides, seul le pic est à refaire. `None` pour un
+/// fichier illisible, vide ou muet.
+pub async fn mesurer_la_crete_vraie(file_path: &str) -> Option<f64> {
+    let mesure = parcourir_les_segments(
+        file_path,
+        None,
+        MesureEnCours {
+            crete_seule: true,
+            ..MesureEnCours::default()
+        },
+    )
+    .await?;
+    let crete = mesure.crete?.crete();
+    (crete > 0.0).then_some(crete)
+}
+
+/// Décoder le fichier segment par segment et nourrir `mesure`. `None` si un
+/// segment ne se décode pas ou si la tâche est interrompue.
+async fn parcourir_les_segments(
+    file_path: &str,
+    mut premier: Option<super::decode::DecodedAudio>,
+    mut mesure: MesureEnCours,
+) -> Option<MesureEnCours> {
     // Analyse in bounded time segments and stream them through the accumulator,
     // so memory never scales with track length. Decoding a whole long 24/192
     // track into RAM cost several GB and OOM-killed the server in a crash-loop
@@ -793,7 +815,6 @@ async fn mesurer_a_partir_de(
     // — it only fires on a non-progressing decoder.
     const MAX_ANALYSIS_SECONDS: f64 = 24.0 * 3600.0;
 
-    let mut mesure = MesureEnCours::default();
     let mut seek = 0.0_f64;
 
     loop {
@@ -824,10 +845,7 @@ async fn mesurer_a_partir_de(
             Segment::Suite(avance) => seek += avance,
         }
     }
-
-    tokio::task::spawn_blocking(move || mesure.finir())
-        .await
-        .ok()?
+    Some(mesure)
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,15 +1526,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #1694 — true peak inter-échantillons (4×, Catmull-Rom)
+    // #1694 — true peak inter-échantillons ; BS.1770 annexe 2 depuis #2713
     // -----------------------------------------------------------------------
 
     /// Le cas d'école de l'over inter-échantillons : une sinusoïde à fs/4
     /// déphasée de π/4 n'est échantillonnée QUE sur ±0,707 alors que le
     /// signal continu culmine à 1,0. Le sample peak la sous-estime de 3 dB ;
-    /// le true peak 4× doit voir l'essentiel de la crête manquée
-    /// (Catmull-Rom en retrouve ~0,88 — pas un sinc, et c'est assumé :
-    /// l'usage est le plafond `prevent_clipping`, pas la métrologie).
+    /// le true peak doit retrouver la crête manquée, à 0,1 dB près depuis
+    /// #2713 (l'ancien Catmull-Rom 4× n'en retrouvait que ~0,88, −1,1 dB).
+    /// La conformité détaillée est gardée par `crete_vraie_tests.rs`.
     #[test]
     fn true_peak_sees_the_inter_sample_over_that_sample_peak_misses() {
         let sr = 48_000usize;
@@ -1541,8 +1559,8 @@ mod tests {
             "sample peak {peak}"
         );
         assert!(
-            true_peak > 0.85,
-            "le true peak doit dépasser nettement le sample peak : {true_peak}"
+            true_peak > 10f64.powf(-0.1 / 20.0),
+            "le true peak doit retrouver la crête à 0,1 dB près : {true_peak}"
         );
         assert!(
             true_peak >= peak,
@@ -2257,6 +2275,41 @@ mod tests {
                 "{nom} : vrai pic de la passe {:.6}, {:.6} d'un seul tenant",
                 passe.2,
                 verite.2
+            );
+            // #2713 — la mesure de la SEULE crête vraie, celle du rattrapage,
+            // rend la troisième valeur de la mesure complète au bit près.
+            let seule = mesurer_la_crete_vraie(f.to_str().unwrap())
+                .await
+                .unwrap_or_else(|| panic!("{nom} : crête seule attendue"));
+            assert_eq!(seule.to_bits(), tp.to_bits(), "{nom} : {seule} != {tp}");
+        }
+    }
+
+    /// #2713 — le DSD converti en PCM (176,4 kHz pour du DSD64, donc 4×) et le
+    /// multicanal (5.1, ramené en stéréo par le décodage de l'analyse comme
+    /// pour la sonie) : la crête seule du rattrapage est celle de la mesure
+    /// complète, au bit près, et englobe le pic d'échantillon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn la_crete_vraie_du_dsd_et_du_multicanal() {
+        let dossier = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsd");
+        for nom in [
+            "ref_dsd64_stereo.dsf",
+            "ref_dsd64_stereo.dff",
+            "ref_dsd64_5v1.dff",
+        ] {
+            let f = dossier.join(nom);
+            let f = f.to_str().unwrap();
+            let (_lufs, pic, tp, _dr) = mesurer_intensite_et_plage(f)
+                .await
+                .unwrap_or_else(|| panic!("{nom} : mesure attendue"));
+            let seule = mesurer_la_crete_vraie(f)
+                .await
+                .unwrap_or_else(|| panic!("{nom} : crête seule attendue"));
+            eprintln!("{nom} : pic {pic:.6}, crête vraie {tp:.6}");
+            assert_eq!(seule.to_bits(), tp.to_bits(), "{nom} : {seule} != {tp}");
+            assert!(
+                tp.is_finite() && tp >= pic && tp > 0.0,
+                "{nom} : {tp} < {pic}"
             );
         }
     }

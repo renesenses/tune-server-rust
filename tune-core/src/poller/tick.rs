@@ -148,6 +148,15 @@ impl PositionPoller {
                 self.volume_pure_concilie(zone_id, zone.volume / 100.0, status.volume)
                     .await;
             }
+            // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
+            // le dire au journal, une fois par épisode.
+            if !zone.fixed_volume
+                && !in_startup_grace
+                && !in_volume_grace
+                && status.state == TransportState::Playing
+            {
+                self.volume_100_ignore_constate(zone_id, zone.volume / 100.0, status.volume);
+            }
             if !zone.fixed_volume
                 && !in_startup_grace
                 && !in_volume_grace
@@ -171,6 +180,13 @@ impl PositionPoller {
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_pct)
                         .ok();
+                    // #6008 — l'adoption se dit au journal.
+                    volume_adopte_6008::journaliser_volume_adopte(
+                        zone_id,
+                        &device_id,
+                        db_vol,
+                        status.volume,
+                    );
                 }
                 // Remember what the renderer reported so the next tick can
                 // detect a genuine change.
@@ -1128,6 +1144,10 @@ impl PositionPoller {
                         self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                             .await;
                     }
+                    // #5662 — un renderer à 100 % ignoré est dit une fois.
+                    if !zone_fixed_volume && !in_vol_grace {
+                        self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+                    }
                     // Edge-triggered like the main volume-sync path, so a radio
                     // renderer reporting a stale default can't keep resetting the
                     // saved volume (Fabien's Devialet Salon reverting to 50).
@@ -1149,6 +1169,13 @@ impl PositionPoller {
                         crate::db::zone_repo::ZoneRepo::with_backend(db)
                             .update_volume(zone_id, vol_pct)
                             .ok();
+                        // #6008 — l'adoption se dit au journal.
+                        volume_adopte_6008::journaliser_volume_adopte(
+                            zone_id,
+                            &device_id,
+                            zone_state.volume,
+                            status.volume,
+                        );
                     }
                     ps.last_device_volume = Some(status.volume);
                 }
@@ -1473,6 +1500,10 @@ impl PositionPoller {
                 self.volume_pure_concilie(zone_id, zone_state.volume, status.volume)
                     .await;
             }
+            // #5662 — un renderer à 100 % ignoré est dit une fois.
+            if !zone_fixed_volume && !in_vol_grace2 {
+                self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
+            }
             if !zone_fixed_volume
                 && !in_vol_grace2
                 && status.volume > 0.001
@@ -1492,6 +1523,13 @@ impl PositionPoller {
                 crate::db::zone_repo::ZoneRepo::with_backend(db)
                     .update_volume(zone_id, vol_pct)
                     .ok();
+                // #6008 — l'adoption se dit au journal.
+                volume_adopte_6008::journaliser_volume_adopte(
+                    zone_id,
+                    &device_id,
+                    zone_state.volume,
+                    status.volume,
+                );
             }
             // Edge-triggered like the stopped/radio paths: record the reported
             // volume so a renderer stuck at a persistent default (HiFi Rose
@@ -1750,9 +1788,29 @@ impl PositionPoller {
                     );
                 }
             }
-            let mut position_reset =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent)
-                    || chute_retenue;
+            // #3967 — une chute de position ne prouve un passage que si le
+            // TRANSPORT joue. Un renderer qui a acquitté `SetNext` puis s'est
+            // ARRÊTÉ rapporte lui aussi « 0 » : prise pour un enchaînement,
+            // cette chute avançait l'écran sur la suivante sans aucun `Play`,
+            // et la zone restait muette, affichée en lecture. Hors `Playing`,
+            // la chute est DIFFÉRÉE : la position d'avant est gardée, et le
+            // sondage suivant tranche — `Playing` près de zéro, c'était un
+            // passage (adopté sans relance) ; toujours arrêté, la branche
+            // `Stopped` retombe sur l'enchaînement par `Play`.
+            let chute_brute =
+                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            let chute_differee =
+                decisions::chute_a_differer_hors_lecture(chute_brute, status.state);
+            if chute_differee {
+                info!(
+                    zone_id,
+                    prev_pos = ps.last_position_ms,
+                    new_pos = status.position_ms,
+                    etat = ?status.state,
+                    "gapless_chute_differee_transport_hors_lecture"
+                );
+            }
+            let mut position_reset = (chute_brute && !chute_differee) || chute_retenue;
             // Suppress this metadata-only advance fallback for outputs that don't
             // do internal gapless (Chromecast, slimproto, exclusive local): for
             // them a position drop to 0 means the track ENDED (device IDLE /
@@ -1785,7 +1843,9 @@ impl PositionPoller {
                     }
                 }
             }
-            ps.last_position_ms = status.position_ms;
+            if !chute_differee {
+                ps.last_position_ms = status.position_ms;
+            }
 
             if position_reset {
                 if !played_enough {
@@ -2996,6 +3056,17 @@ impl PositionPoller {
                             status.position_ms,
                         )
                     } {
+                        // #5970 — la fin estimée de la piste en cours, prise
+                        // AVANT les lectures de la base qui suivent : c'est
+                        // elle qui borne la préparation de la suivante.
+                        let fin_estimee = Instant::now()
+                            + Duration::from_millis(
+                                decisions::sane_current_duration(
+                                    status.duration_ms,
+                                    track_duration_ms,
+                                )
+                                .saturating_sub(status.position_ms),
+                            );
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -3017,14 +3088,32 @@ impl PositionPoller {
                             // Fireface, 55 wasted Qobuz downloads/min). Mark
                             // gapless_sent so we stop retrying; the natural-end
                             // fallback advances/repeats the queue.
-                            let can_internal_gapless = {
+                            let (can_internal_gapless, annonce) = {
                                 let outputs = self.outputs.lock().await;
                                 match outputs.get(&device_id) {
-                                    Some(arc) => arc.lock().await.supports_internal_gapless(),
-                                    None => true,
+                                    Some(arc) => {
+                                        let sortie = arc.lock().await;
+                                        (
+                                            sortie.supports_internal_gapless(),
+                                            sortie.annonce_la_suivante().await,
+                                        )
+                                    }
+                                    None => (true, AnnonceSuivante::Inconnue),
                                 }
                             };
-                            if !can_internal_gapless {
+                            if annonce == AnnonceSuivante::NonAnnoncee {
+                                // #3967 — l'appareil n'annonce pas
+                                // `SetNextAVTransportURI` : rien n'est posé,
+                                // `gapless_sent` reste faux, et la fin de piste
+                                // enchaîne aussitôt comme pour un renderer qui
+                                // refuse — sans attendre une transition qui ne
+                                // viendra pas. Une ligne par piste, pas par
+                                // sondage.
+                                if ps.suivante_non_annoncee_signalee != Some(ps.track_generation) {
+                                    info!(zone_id, "gapless_non_arme_setnext_non_annonce");
+                                    ps.suivante_non_annoncee_signalee = Some(ps.track_generation);
+                                }
+                            } else if !can_internal_gapless {
                                 info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
                                 // Le drapeau est pose pour cesser de re-tenter,
@@ -3044,7 +3133,23 @@ impl PositionPoller {
                                 // (spin 1 Hz, #2394). handle_track_end jouera la
                                 // piste explicitement en fin de morceau.
                             } else {
-                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                // #5970 — la préparation est bornée (voir
+                                // `armer_le_flux_suivant`) ; sa durée est dite
+                                // au journal dès qu'elle dépasse le seuil.
+                                let t_prep = Instant::now();
+                                let preparation = self
+                                    .prepare_gapless(zone_id, zone_state, &device_id, fin_estimee)
+                                    .await;
+                                let prep_ms = t_prep.elapsed().as_millis() as u64;
+                                if prep_ms >= decisions::PREPARATION_GAPLESS_LENTE_MS {
+                                    info!(
+                                        zone_id,
+                                        prep_ms,
+                                        issue = ?preparation,
+                                        "gapless_preparation_lente"
+                                    );
+                                }
+                                match preparation {
                                     GaplessPrep::Armed(arme, tenue) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
@@ -3058,7 +3163,11 @@ impl PositionPoller {
                                         ps.suivante_preparee = tenue;
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
-                                    GaplessPrep::DsdNextSkipped => {
+                                    // #5970 — une préparation abandonnée
+                                    // se verrouille comme un DSD : pas de
+                                    // nouvel essai pour cette position, la
+                                    // fin de piste joue la suivante.
+                                    GaplessPrep::DsdNextSkipped | GaplessPrep::Abandonnee => {
                                         ps.gapless_dsd_skip_pos = Self::prochaine_position_jouable(
                                             &self.db, zone_id, zone_state,
                                         );
