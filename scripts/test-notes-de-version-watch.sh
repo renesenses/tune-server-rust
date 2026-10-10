@@ -331,6 +331,52 @@ ajouter_fil "$RACINE/finale/fils.json" "Tune v1.0.0-rc1 — Notes de version" di
 jouer finale
 verifier "etat de sortie 1 (le fil de la rc1 n'annonce pas la 1.0.0)" "1" "$ETAT"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. #4811 : le fil de la rc2 s'intitule « Tune 1.0.0-rc2 est disponible »
+#    (fil 2144), sans « v » ni « Notes de version ». Il annonce la rc2, et elle
+#    seule : pas la 1.0.0 finale. Un fil de bug qui dit « est disponible » en
+#    cours de phrase n'annonce rien.
+# ─────────────────────────────────────────────────────────────────────────────
+RELEASES_RC2='[
+ {"tagName":"v1.0.0-rc2","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:40:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]'
+
+echo
+echo "8. la v1.0.0-rc2 et le fil « Tune 1.0.0-rc2 est disponible » — elle a son fil"
+for genre in discussion announcement; do
+  printf '%s' "$RELEASES_RC2" | poser_decor "disponible_$genre"
+  ajouter_fil "$RACINE/disponible_$genre/fils.json" "Tune 1.0.0-rc2 est disponible" "$genre"
+  jouer "disponible_$genre"
+  verifier "etat de sortie 0 (fil de type $genre)" "0" "$ETAT"
+done
+
+echo
+echo "8b. la forme avec « v » : « Tune v1.0.0-rc2 est disponible » — elle a son fil"
+printf '%s' "$RELEASES_RC2" | poser_decor disponible_v
+ajouter_fil "$RACINE/disponible_v/fils.json" "Tune v1.0.0-rc2 est disponible" discussion
+jouer disponible_v
+verifier "etat de sortie 0" "0" "$ETAT"
+
+echo
+echo "8c. la v1.0.0 finale et le seul fil « Tune 1.0.0-rc2 est disponible » — la 1.0.0 est accusee"
+printf '%s' '[
+ {"tagName":"v1.0.0","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:45:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]' | poser_decor disponible_finale
+ajouter_fil "$RACINE/disponible_finale/fils.json" "Tune 1.0.0-rc2 est disponible" discussion
+jouer disponible_finale
+verifier "etat de sortie 1 (le fil de la rc2 n'annonce pas la 1.0.0)" "1" "$ETAT"
+
+echo
+echo "8d. un fil de bug « La 1.0.0-rc2 est disponible mais muette » — il n'annonce rien"
+printf '%s' "$RELEASES_RC2" | poser_decor disponible_bavard
+ajouter_fil "$RACINE/disponible_bavard/fils.json" "La 1.0.0-rc2 est disponible mais muette sur mon DAC" bug
+jouer disponible_bavard
+verifier "etat de sortie 1 (aucun fil de notes)" "1" "$ETAT"
+N=$(printf '%s' "$SORTIE" | grep -c '^| `v1\.0\.0-rc2` |')
+verifier "la v1.0.0-rc2 est accusee" "1" "$N"
+
 echo
 if [ "$rate" -eq 0 ]; then
   echo "Contre-epreuve #4461 : tout est vert."

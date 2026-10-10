@@ -133,7 +133,10 @@ impl StreamInfo {
         if let Some(taille) = self.file_size.filter(|_| self.format == "wav") {
             return Some(taille);
         }
-        let dur = self.duration_ms?;
+        // Forum #2189 — une durée NULLE est une durée inconnue (base qui n'a
+        // pas su la lire), jamais une piste vide : sans ce filtre, le renderer
+        // recevait `Content-Length: 44`, l'en-tête seul, et restait à 0:00.
+        let dur = self.duration_ms.filter(|d| *d > 0)?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
@@ -2627,6 +2630,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.wav_content_length(), None);
+    }
+
+    /// Forum #2189 (DMP-A6, 1.0.0-rc3) : une piste dont la base ignore la
+    /// durée (`duration_ms = 0`, DSD128 converti en WAV 176,4/24) annonçait
+    /// `Content-Length: 44` — l'en-tête seul, zéro octet d'audio. Le renderer
+    /// lisait l'en-tête, refermait, réessayait, puis restait à 0:00, la piste
+    /// affichée. Une durée nulle est une durée INCONNUE, pas une piste vide.
+    #[test]
+    fn une_duree_nulle_n_annonce_pas_un_wav_vide_2189() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 176_400,
+            bit_depth: 24,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            info.wav_content_length(),
+            None,
+            "durée 0 : la longueur doit rester inconnue (flux chunké), jamais 44 octets"
+        );
     }
 
     #[test]

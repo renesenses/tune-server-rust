@@ -642,9 +642,12 @@ CREATE TABLE IF NOT EXISTS track_credits (
 -- DELETE FROM tracks/albums (ids reassigned in walk order), which would reset
 -- any timestamp there. This side table is never purged by delete_all, so the
 -- date-added sort survives a full rescan. Populated INSERT-OR-IGNORE at scan.
+-- `created_at` (#5402, migration 120) : the file's btime when the filesystem
+-- gives one, NULL otherwise; refreshed by every scan pass that reads one.
 CREATE TABLE IF NOT EXISTS file_first_seen (
     file_path TEXT PRIMARY KEY,
-    first_seen_at REAL NOT NULL
+    first_seen_at REAL NOT NULL,
+    created_at REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);

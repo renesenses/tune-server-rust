@@ -105,6 +105,13 @@ pub async fn run_with(opts: RunOptions) {
     if crate::tune_os_password::premier_acces_requested(std::env::args().skip(1)) {
         std::process::exit(crate::tune_os_password::run_premier_acces());
     }
+    // #3206 — mot de passe oublié du compte `tune`, depuis la console
+    // physique : l'assistant de l'image vérifie le terminal, puis appelle ce
+    // mode en root. Même politique que le premier accès.
+    #[cfg(target_os = "linux")]
+    if crate::tune_os_password::reinitialisation_requested(std::env::args().skip(1)) {
+        std::process::exit(crate::tune_os_password::run_reinitialisation());
+    }
 
     // On Windows, catch panics early and log to file so users can report crashes
     // instead of seeing "tune-server.exe has stopped working" with no info.
@@ -494,6 +501,11 @@ pub async fn run_with(opts: RunOptions) {
     // Create shared OpenHome event listener
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
+
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716) survivent au redémarrage : la mémoire est
+    // branchée sur la base AVANT la découverte, qui les relit.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
 
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);

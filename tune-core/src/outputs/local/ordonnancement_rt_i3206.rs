@@ -72,11 +72,17 @@ fn l_etat_sort_dans_le_statut_serialise() {
         priority: 70,
         rlimit_rtprio: Some(0),
         cause: "Operation not permitted".into(),
+        fallback: crate::audio::ordonnancement_rt::RepliNice::Obtenu {
+            nice: -11,
+            rlimit_nice: Some(31),
+        },
     });
     let json = serde_json::to_value(active_backend_status("auto")).unwrap();
     assert_eq!(json["realtime"]["state"], "refuse", "{json}");
     assert_eq!(json["realtime"]["priority"], 70);
     assert_eq!(json["realtime"]["cause"], "Operation not permitted");
+    assert_eq!(json["realtime"]["fallback"]["state"], "obtenu", "{json}");
+    assert_eq!(json["realtime"]["fallback"]["nice"], -11);
 
     let mut sans = backend_status(None, None, "auto");
     sans.realtime = None;

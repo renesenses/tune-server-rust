@@ -26,8 +26,8 @@ use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
-    OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    SuivantePreparee, TransformationsReelles, TransportState,
+    AnnonceSuivante, OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus,
+    OutputTarget, SuivantePreparee, TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -570,6 +570,9 @@ pub struct PositionPoller {
     /// une fois (voir `volume_pure_concilie`). Une zone en sort dès qu'elle
     /// est vue hors verrou, pour que le prochain armement soit rattrapé.
     volumes_pure_concilies: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #5662 — zones dont le renderer annonce 100 % sans que Tune l'adopte :
+    /// l'épisode est dit une fois (`volume_100_ignore_constate`).
+    volumes_100_ignores: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 /// Une reprise automatique après décrochage du renderer (#4645), telle que
@@ -613,6 +616,7 @@ impl PositionPoller {
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_pure_reimposes: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_pure_concilies: std::sync::Mutex::new(std::collections::HashSet::new()),
+            volumes_100_ignores: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1018,6 +1022,14 @@ mod demarrage_fige_5522_tests;
 mod volume_pure_5695;
 #[cfg(test)]
 mod volume_pure_5695_tests;
+
+/// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
+mod volume_100_ignore_5662;
+/// #6008 — l'adoption du volume du renderer est dite au journal.
+mod volume_adopte_6008;
+/// #6008 — son banc, sur le vrai sondeur.
+#[cfg(test)]
+mod volume_adopte_6008_tests;
 
 #[cfg(test)]
 mod tests;

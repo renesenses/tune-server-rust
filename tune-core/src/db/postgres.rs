@@ -44,7 +44,7 @@ use crate::db::engine::{Engine, PostgresDialect};
 // and took the whole batch down with it — `pg_ensure_tables_failed`, once
 // per boot. A table that fails must never block the next one.
 pub(crate) const ENSURE_TABLES: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
             id BIGINT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq'),\
@@ -301,6 +301,10 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
     // des favoris de service nomment la colonne. NULL = inconnu.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
+    // #5402 — date de création d'un fichier (PG 084). Ici AUSSI : une base
+    // de bascule ne rejoue pas la 084, et le scan comme le tri « par
+    // création » nomment la colonne. DOUBLE PRECISION comme `first_seen_at`.
+    "ALTER TABLE file_first_seen ADD COLUMN IF NOT EXISTS created_at DOUBLE PRECISION",
     // #5594 — clé du signal PCM des FLAC et son témoin de lecture (PG 083).
     // Ici AUSSI : une base de bascule ne rejoue pas la 083, et la passe
     // `taches_de_fond::cle_pcm` nomme les deux colonnes. TEXT des deux côtés,

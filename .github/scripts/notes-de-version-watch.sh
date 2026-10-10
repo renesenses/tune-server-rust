@@ -251,10 +251,23 @@ tous = fils.get("threads", [])
 # « Bertrand » selon le fil. Un fil de bug est de type `bug` et titre
 # « v0.9.166: … » ; une discussion qui cite la version en cours de phrase
 # n'ouvre pas par « Tune v » : ni l'un ni l'autre n'annonce.
+#
+# Troisieme forme (#4811) : « Tune 1.0.0-rc2 est disponible » (fil 2144), sans
+# « v » ni « Notes de version ». La sonde l'accusait d'absence. Ce titre
+# n'annonce qu'une version : il compte quel que soit le type du fil. Le titre
+# doit OUVRIR par « Tune <version> est disponible », « v » facultatif ; un fil
+# de bug « La 1.0.0-rc2 est disponible mais muette » ne passe pas.
+EST_DISPONIBLE = re.compile(
+    r"\s*Tune v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?\s+est disponible\b",
+    re.IGNORECASE)
+
+
 def fil_de_notes(t):
     if t.get("type") == "release":
         return True
     titre = t.get("title") or ""
+    if EST_DISPONIBLE.match(titre) is not None:
+        return True
     return t.get("type") == "discussion" and (
         re.match(r"\s*Tune v\d+\.\d+\.\d+", titre) is not None
         or re.search(r"notes de version", titre, re.IGNORECASE) is not None)

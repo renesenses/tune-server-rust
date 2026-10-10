@@ -37,7 +37,7 @@ COPY tune-bridge/Cargo.toml tune-bridge/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     echo 'fn main() {}' > tune-cli/src/main.rs && \
     touch tune-core/src/lib.rs tune-server/src/lib.rs tune-ffi/src/lib.rs tune-bridge/src/lib.rs && \
-    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst 2>/dev/null || true && \
+    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst 2>/dev/null || true && \
     rm -rf tune-core/src tune-server/src tune-cli/src
 
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
@@ -70,7 +70,7 @@ ENV TUNE_VERSION=${TUNE_VERSION}
 # depuis ce Dockerfile sans audio-embedding renvoyait available:false et l'entrée
 # Ambiance disparaissait de l'UI sans aucun message (#19 de la revue 2026-08-15).
 RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
-    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst && \
+    cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,local-audio,bandcamp,dj,karaoke,plugins-wasm,audio-embedding,dst && \
     strip target/release/tune-server
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────
@@ -83,8 +83,11 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
+# In `audio` for a USB DAC passed with `--device /dev/snd` (#5968). The
+# entrypoint also keeps the HOST group of /dev/snd when it differs
+# (Fedora: 63), and any `--group-add`.
 RUN groupadd -g 1000 tune && \
-    useradd -u 1000 -g tune -m -s /bin/false tune
+    useradd -u 1000 -g tune -G audio -m -s /bin/false tune
 
 WORKDIR /app
 
