@@ -1043,6 +1043,108 @@ fn update_release_payload(
     })
 }
 
+/// Message rendu par `/update/check` quand ce build porte `.no-auto-update`
+/// (#6068) : une version plus récente existe, mais ce serveur refusera de
+/// l'installer lui-même (`update_install` rend alors `status: "blocked"`).
+const NO_AUTO_UPDATE_HINT: &str = "Automatic updates are disabled on this build (.no-auto-update file next to the binary). Rebuild from source or install the new release manually.";
+
+/// Ce build a-t-il désactivé la mise à jour automatique ? Le fichier
+/// `.no-auto-update` posé à côté de l'exécutable — **le même test** que la
+/// garde de `update_install` (#6068).
+fn mise_a_jour_auto_desactivee(exe: Option<&std::path::Path>) -> bool {
+    exe.and_then(|p| p.parent())
+        .is_some_and(|dir| dir.join(".no-auto-update").exists())
+}
+
+/// #6068 — `/update/check` annonçait `installable: true` sur un build portant
+/// `.no-auto-update`, puis l'installation était refusée. On dit la vérité dès
+/// la vérification. `update_available` reste tel quel : la version plus
+/// récente existe bien. Une installation Homebrew garde son propre conseil.
+fn appliquer_mise_a_jour_auto_desactivee(payload: &mut Value, desactivee: bool) {
+    if !desactivee || payload.get("installable") != Some(&Value::Bool(true)) {
+        return;
+    }
+    payload["installable"] = json!(false);
+    payload["install_hint"] = json!(NO_AUTO_UPDATE_HINT);
+    payload["installation_manager"] = json!("manual");
+    payload["install_blocked_reason"] = json!("no_auto_update");
+}
+
+#[cfg(test)]
+mod no_auto_update_tests_6068 {
+    use super::{appliquer_mise_a_jour_auto_desactivee, mise_a_jour_auto_desactivee};
+    use serde_json::json;
+
+    fn charge_utile() -> serde_json::Value {
+        json!({"update_available": true, "installable": true, "install_hint": null,
+               "installation_manager": null})
+    }
+
+    #[test]
+    fn le_fichier_no_auto_update_a_cote_du_binaire_rend_non_installable_6068() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe = dir.path().join("tune-server");
+        std::fs::write(&exe, b"").unwrap();
+        assert!(!mise_a_jour_auto_desactivee(Some(&exe)), "fichier absent");
+        std::fs::write(dir.path().join(".no-auto-update"), b"").unwrap();
+        let desactivee = mise_a_jour_auto_desactivee(Some(&exe));
+        assert!(desactivee, "fichier présent");
+
+        let mut p = charge_utile();
+        appliquer_mise_a_jour_auto_desactivee(&mut p, desactivee);
+        assert_eq!(p["installable"], false, "{p}");
+        assert_eq!(
+            p["update_available"], true,
+            "la version plus récente existe"
+        );
+        assert_eq!(p["installation_manager"], "manual");
+        assert_eq!(p["install_blocked_reason"], "no_auto_update");
+        assert!(
+            p["install_hint"]
+                .as_str()
+                .is_some_and(|h| h.contains(".no-auto-update"))
+        );
+    }
+
+    #[test]
+    fn sans_le_fichier_rien_ne_change_6068() {
+        let mut p = charge_utile();
+        appliquer_mise_a_jour_auto_desactivee(&mut p, false);
+        assert_eq!(p, charge_utile());
+        assert!(!mise_a_jour_auto_desactivee(None));
+    }
+
+    #[test]
+    fn homebrew_garde_son_conseil_6068() {
+        let mut p = json!({"installable": false, "install_hint": "brew upgrade",
+                           "installation_manager": "homebrew"});
+        appliquer_mise_a_jour_auto_desactivee(&mut p, true);
+        assert_eq!(p["install_hint"], "brew upgrade");
+        assert_eq!(p["installation_manager"], "homebrew");
+    }
+
+    /// La route elle-même applique le blocage sur ses DEUX réponses de succès
+    /// (release trouvée, déjà à jour) : garde de branchement, comptée hors
+    /// définition.
+    #[test]
+    fn update_check_branche_le_blocage_sur_ses_deux_reponses_6068() {
+        let src = include_str!("update.rs");
+        let debut = src
+            .rfind("pub(super) async fn update_check(")
+            .expect("update_check");
+        let corps = &src[debut..];
+        let fin = corps.find("\n}\n").expect("fin de update_check");
+        let corps = &corps[..fin];
+        assert_eq!(
+            corps
+                .matches("appliquer_mise_a_jour_auto_desactivee(&mut")
+                .count(),
+            2,
+            "update_check doit appliquer .no-auto-update à ses deux réponses"
+        );
+    }
+}
+
 #[cfg(test)]
 mod update_availability_tests {
     use super::{HomebrewInstallation, UpdateBlame, find_archive_asset, update_release_payload};
@@ -2303,14 +2405,19 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
         .as_ref()
         .is_some_and(|install| !homebrew_version_matches(&install.cellar_version, current));
 
+    // #6068 — même test que la garde de `update_install`.
+    let auto_desactivee = mise_a_jour_auto_desactivee(std::env::current_exe().ok().as_deref());
+
     match checker.check().await {
         Ok(Some(release)) => {
             let mut payload = update_release_payload(current, &release, homebrew.as_ref());
             payload["channel"] = json!(setting);
             payload["effective_channel"] = json!(effective);
+            appliquer_mise_a_jour_auto_desactivee(&mut payload, auto_desactivee);
             Json(payload)
         }
-        Ok(None) => Json(json!({
+        Ok(None) => {
+            let mut payload = json!({
             "current": current,
             "latest": current,
             "update_available": false,
@@ -2324,7 +2431,10 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
             "installation_version_mismatch": installation_version_mismatch,
             "channel": setting,
             "effective_channel": effective,
-        })),
+            });
+            appliquer_mise_a_jour_auto_desactivee(&mut payload, auto_desactivee);
+            Json(payload)
+        }
         Err(e) => {
             warn!(error = %e, "update_check_failed");
             Json(json!({
