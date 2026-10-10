@@ -273,6 +273,7 @@ fn entree(source: &str, titre: &str, duree_ms: i64) -> QueueInput {
         track_number: Some(3),
         disc_number: Some(1),
         album_ref: None,
+        artist_ref: None,
     }
 }
 

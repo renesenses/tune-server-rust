@@ -868,6 +868,9 @@ CREATE TABLE IF NOT EXISTS zones (
 -- Jumelle de la migration SQLite 114 et de la PG 078. Commentaire HORS du
 -- CREATE : un commentaire entre deux colonnes casse `ALTER TABLE … DROP
 -- COLUMN` de SQLite (« incomplete input »).
+-- `artist_ref` : l'artiste chez le service (`StreamTrack.artist_id`), pour
+-- « Aller à l'artiste » depuis la file (#6079). Jumelle de la migration
+-- SQLite 122 et de la PG 086.
 CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
@@ -883,7 +886,8 @@ CREATE TABLE IF NOT EXISTS queue_items (
     duration_ms INTEGER DEFAULT 0,
     track_number INTEGER,
     disc_number INTEGER,
-    album_ref TEXT
+    album_ref TEXT,
+    artist_ref TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);

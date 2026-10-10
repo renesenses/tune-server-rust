@@ -364,6 +364,10 @@ impl HostContext for AppStateHost {
                     track_number: t.get("track_number").and_then(Value::as_i64),
                     disc_number: t.get("disc_number").and_then(Value::as_i64),
                     album_ref: t.get("album_ref").and_then(Value::as_str).map(String::from),
+                    artist_ref: t
+                        .get("artist_ref")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 });
             }
         }

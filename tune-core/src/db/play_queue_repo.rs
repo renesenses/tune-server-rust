@@ -141,7 +141,7 @@ pub mod sql {
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref, artist_ref) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -153,13 +153,14 @@ pub mod sql {
             d.placeholder(9),
             d.placeholder(10),
             d.placeholder(11),
-            d.placeholder(12)
+            d.placeholder(12),
+            d.placeholder(13)
         )
     }
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number, album_ref FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number, album_ref, artist_ref FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
             d.placeholder(1)
         )
     }
@@ -209,7 +210,7 @@ pub mod sql {
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
                 COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
-                q.track_number, q.disc_number, q.album_ref, t.album_id, t.artist_id \
+                q.track_number, q.disc_number, q.album_ref, t.album_id, t.artist_id, q.artist_ref \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
          LEFT JOIN albums al ON t.album_id = al.id \
@@ -432,6 +433,16 @@ pub struct QueueEntry {
     /// `GET /zones/{id}/queue` le pose lui-même.
     #[serde(default, skip_serializing)]
     pub artist_id: Option<i64>,
+    /// L'identifiant de l'ARTISTE chez son service (`StreamTrack.artist_id`),
+    /// pistes de service seulement — migration 122 / PG 086 (#6079). NULL pour
+    /// les lignes antérieures, les pistes locales, et toute entrée dont ni le
+    /// client ni le service ne l'ont donné.
+    ///
+    /// Hors de la sérialisation, comme `album_ref` : `GET /zones/{id}/queue`
+    /// le pose lui-même sous `artist_id_service`
+    /// ([`QueueEntry::artist_id_service`]).
+    #[serde(default, skip_serializing)]
+    pub artist_ref: Option<String>,
 }
 
 impl QueueEntry {
@@ -452,6 +463,24 @@ impl QueueEntry {
             return None;
         }
         self.album_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    }
+
+    /// L'identifiant de l'artiste CHEZ SON SERVICE, pour une ligne de service
+    /// qui l'a reçu à l'enfilage (`artist_ref`, migration 122, #6079) ; `None`
+    /// pour une ligne locale, et pour une référence absente ou vide.
+    ///
+    /// C'est le champ `artist_id_service` des lignes de `GET /zones/{id}/queue`.
+    /// Sans lui, « Aller à l'artiste » depuis la file cherchait l'artiste par
+    /// son NOM : un homonyme, ou un nom écrit autrement chez le service, menait
+    /// à une autre fiche (FabienM, Tune Remote Android).
+    pub fn artist_id_service(&self) -> Option<&str> {
+        if self.is_local() {
+            return None;
+        }
+        self.artist_ref
             .as_deref()
             .map(str::trim)
             .filter(|r| !r.is_empty())
@@ -477,6 +506,9 @@ pub enum QueueInput {
         /// Référence d'album du service (`StreamTrack.album_id`), quand la
         /// source l'a donnée — voir [`QueueEntry::album_ref`].
         album_ref: Option<String>,
+        /// Identifiant de l'artiste chez le service (`StreamTrack.artist_id`),
+        /// quand la source l'a donné — voir [`QueueEntry::artist_ref`] (#6079).
+        artist_ref: Option<String>,
     },
 }
 
@@ -1143,8 +1175,9 @@ impl PlayQueueRepo {
                         track_number,
                         disc_number,
                         album_ref,
+                        artist_ref,
                     } => {
-                        let p: [&dyn ToSqlValue; 12] = [
+                        let p: [&dyn ToSqlValue; 13] = [
                             &zone_id,
                             &pos,
                             source_id,
@@ -1157,6 +1190,7 @@ impl PlayQueueRepo {
                             track_number,
                             disc_number,
                             album_ref,
+                            artist_ref,
                         ];
                         tx.execute(&insert_streaming_sql, &p)?;
                         retenus.push(i);
@@ -1340,6 +1374,20 @@ impl PlayQueueRepo {
         tracks: &[StreamingQueueItem],
         album_refs: &[Option<String>],
     ) -> Result<(), String> {
+        self.set_streaming_queue_avec_references(zone_id, tracks, album_refs, &[])
+    }
+
+    /// Comme [`Self::set_streaming_queue_avec_albums`], avec AUSSI l'artiste
+    /// de chaque piste chez son service (`StreamTrack.artist_id`, migration
+    /// 122, #6079) : `artist_refs[i]` va à `tracks[i]`, une liste plus courte
+    /// (ou vide) laisse NULL aux pistes restantes.
+    pub fn set_streaming_queue_avec_references(
+        &self,
+        zone_id: i64,
+        tracks: &[StreamingQueueItem],
+        album_refs: &[Option<String>],
+        artist_refs: &[Option<String>],
+    ) -> Result<(), String> {
         let delete_local_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
@@ -1364,7 +1412,8 @@ impl PlayQueueRepo {
             {
                 let pos = i as i64;
                 let album_ref: Option<&str> = album_refs.get(i).and_then(|r| r.as_deref());
-                let p: [&dyn ToSqlValue; 12] = [
+                let artist_ref: Option<&str> = artist_refs.get(i).and_then(|r| r.as_deref());
+                let p: [&dyn ToSqlValue; 13] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1377,6 +1426,7 @@ impl PlayQueueRepo {
                     track_no,
                     disc_no,
                     &album_ref,
+                    &artist_ref,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1444,7 +1494,8 @@ impl PlayQueueRepo {
                 let pos = current_count + i as i64;
                 // La forme en n-uplet ne porte pas de référence d'album.
                 let album_ref: Option<&str> = None;
-                let p: [&dyn ToSqlValue; 12] = [
+                let artist_ref: Option<&str> = None;
+                let p: [&dyn ToSqlValue; 13] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1457,6 +1508,7 @@ impl PlayQueueRepo {
                     track_no,
                     disc_no,
                     &album_ref,
+                    &artist_ref,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1483,6 +1535,7 @@ impl PlayQueueRepo {
                     "track_number": cols.get(8).and_then(|v| v.as_i64()),
                     "disc_number": cols.get(9).and_then(|v| v.as_i64()),
                     "album_ref": cols.get(10).and_then(|v| v.as_string()),
+                    "artist_ref": cols.get(11).and_then(|v| v.as_string()),
                 })
             })
             .collect();
@@ -1529,7 +1582,7 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     }
 }
 
-/// Maps a row from `sql::unified_select_base()` (21 columns) to a QueueEntry.
+/// Maps a row from `sql::unified_select_base()` (22 columns) to a QueueEntry.
 fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
     QueueEntry {
         id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1553,6 +1606,7 @@ fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
         album_ref: cols.get(18).and_then(|v| v.as_string()),
         album_id: cols.get(19).and_then(|v| v.as_i64()),
         artist_id: cols.get(20).and_then(|v| v.as_i64()),
+        artist_ref: cols.get(21).and_then(|v| v.as_string()),
     }
 }
 
@@ -1979,11 +2033,12 @@ mod tests {
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
         assert!(
             sql::insert_streaming(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)")
+                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
         );
         // The new per-album numbering columns must ride along the streaming insert.
         assert!(sql::insert_streaming(&s).contains("track_number"));
         assert!(sql::insert_streaming(&s).contains("disc_number"));
+        assert!(sql::insert_streaming(&s).contains("artist_ref"));
         assert!(sql::get_queue(&s).contains("queue_items"));
         assert!(sql::select_streaming(&s).contains("track_id IS NULL"));
     }
@@ -2050,7 +2105,78 @@ mod tests {
             track_number: None,
             disc_number: None,
             album_ref: None,
+            artist_ref: None,
         }
+    }
+
+    /// #6079 — l'artiste d'une piste de service CHEZ SON SERVICE entre en file
+    /// et en ressort (`artist_ref`, migration 122), par les deux écritures
+    /// (entrées unifiées, liste de pistes d'un album) et les deux lectures
+    /// (`get_ordered` et la vue streaming du transfert de zone). Une ligne
+    /// locale n'en invente aucun.
+    #[test]
+    fn l_artiste_de_service_entre_en_file_et_en_ressort_6079() {
+        let db = test_db();
+        let mut t = Track::new("Locale".into());
+        t.file_path = Some("/locale.flac".into());
+        let tid = TrackRepo::new(db.clone()).create(&t).unwrap();
+        let repo = PlayQueueRepo::new(db);
+        let mut avec = streaming("q1", "Avec");
+        if let QueueInput::Streaming {
+            album_ref,
+            artist_ref,
+            ..
+        } = &mut avec
+        {
+            *album_ref = Some("q-alb-7".into());
+            *artist_ref = Some("q-art-9".into());
+        }
+        repo.append(1, &[avec, streaming("q2", "Sans"), local(tid)])
+            .unwrap();
+        let file = repo.get_ordered(1).unwrap();
+        assert_eq!(file[0].artist_id_service(), Some("q-art-9"));
+        assert_eq!(file[0].album_id_service(), Some("q-alb-7"));
+        assert_eq!(
+            file[1].artist_id_service(),
+            None,
+            "sans artiste donné, NULL"
+        );
+        assert_eq!(
+            file[2].artist_id_service(),
+            None,
+            "une ligne locale n'en a pas"
+        );
+        let vue = repo.get_streaming_queue(1).unwrap();
+        assert_eq!(vue[0]["artist_ref"].as_str(), Some("q-art-9"));
+        assert!(vue[1]["artist_ref"].is_null());
+
+        let piste = |id: &str| {
+            (
+                id.to_string(),
+                format!("Titre {id}"),
+                "Artiste".to_string(),
+                None,
+                None,
+                1_000i64,
+                Some("tidal".to_string()),
+                None,
+                None,
+            )
+        };
+        repo.set_streaming_queue_avec_references(
+            1,
+            &[piste("a"), piste("b")],
+            &[Some("t-alb".into()), Some("t-alb".into())],
+            &[Some("t-art-a".into())],
+        )
+        .unwrap();
+        let artistes: Vec<Option<String>> = repo
+            .get_ordered(1)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.artist_ref)
+            .collect();
+        assert_eq!(artistes, vec![Some("t-art-a".to_string()), None]);
     }
 
     /// Fil 2121 — la référence d'album d'une piste de service entre en file

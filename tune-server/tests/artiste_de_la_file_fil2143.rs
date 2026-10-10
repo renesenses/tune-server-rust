@@ -6,8 +6,8 @@
 //! ligne porte désormais deux clefs additives, toujours présentes :
 //!
 //! - `artist_id` : l'entier de bibliothèque d'une ligne locale ;
-//! - `artist_id_service` : l'artiste chez le service. `queue_items` ne le
-//!   garde pas (seule la référence d'album l'est, migration 114) : `null`.
+//! - `artist_id_service` : l'artiste chez le service, gardé avec la ligne
+//!   depuis la migration 122 (`artist_ref`, #6079) ; `null` s'il est inconnu.
 //!
 //! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
 //! par sa strophe `[[test]]` dans `tune-server/Cargo.toml`.
@@ -66,6 +66,7 @@ async fn chaque_ligne_de_file_designe_son_artiste() {
                     track_number: Some(3),
                     disc_number: None,
                     album_ref: Some("q-alb-7".into()),
+                    artist_ref: Some("q-art-9".into()),
                 },
                 QueueInput::Local {
                     track_id: sans_artiste,
@@ -99,10 +100,10 @@ async fn chaque_ligne_de_file_designe_son_artiste() {
     );
     assert_eq!(lignes[0]["artist_id_service"], Value::Null);
 
-    // La ligne de service : aucun entier de bibliothèque inventé, et pas
-    // d'artiste de service, que la file ne garde pas.
+    // La ligne de service : aucun entier de bibliothèque inventé, et son
+    // artiste CHEZ LE SERVICE (#6079).
     assert_eq!(lignes[1]["artist_id"], Value::Null);
-    assert_eq!(lignes[1]["artist_id_service"], Value::Null);
+    assert_eq!(lignes[1]["artist_id_service"], "q-art-9");
 
     // Une piste locale sans artiste : rien n'est inventé.
     assert_eq!(lignes[2]["artist_id"], Value::Null);

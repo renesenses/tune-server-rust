@@ -1014,6 +1014,58 @@ pub(crate) fn reference_d_album_de_la_demande(
         .or_else(|| reference_rangee_bandcamp(state, source, source_id))
 }
 
+/// La plus longue valeur d'identifiant de service acceptée d'un client. Un
+/// identifiant Qobuz, Tidal, Deezer, Spotify ou YouTube tient en quelques
+/// dizaines de caractères ; au-delà, ce n'en est pas un.
+const LONGUEUR_MAX_IDENTIFIANT_DE_SERVICE: usize = 256;
+
+/// Un identifiant d'album ou d'artiste CHEZ SON SERVICE, envoyé par un client
+/// ou rendu par le service, s'il est exploitable (#6079).
+///
+/// Il finit en base (`queue_items.album_ref` / `artist_ref`) puis repart vers
+/// les clients sous `album_id_service` / `artist_id_service`. On n'y laisse
+/// donc entrer qu'un jeton : non vide une fois rogné, sans blanc ni caractère
+/// de contrôle, et de longueur raisonnable. `None` pour tout le reste.
+pub(crate) fn identifiant_de_service_sur(brut: Option<&str>) -> Option<String> {
+    let id = brut?.trim();
+    if id.is_empty()
+        || id.len() > LONGUEUR_MAX_IDENTIFIANT_DE_SERVICE
+        || id.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// L'album CHEZ LE SERVICE à ranger avec une piste demandée SEULE
+/// (`POST /zones/{id}/play`, `POST /zones/{id}/queue/add`), quelle que soit sa
+/// source — #6079.
+///
+/// - Bandcamp : la règle de sûreté de [`reference_d_album_de_la_demande`],
+///   inchangée — seule une page `https://*.bandcamp.com/…` entre, qu'elle
+///   vienne de `album_ref` ou de `album_id_service`.
+/// - Toute autre source : l'`album_id_service` du client, s'il est
+///   exploitable ([`identifiant_de_service_sur`]). Le champ `album_ref`, lui,
+///   reste réservé à la page Bandcamp : une page posée sur une ligne Qobuz
+///   n'entre pas (contre-épreuve de `album_de_la_file_fil2143.rs`).
+///
+/// `None` quand le client ne l'a pas donné : l'appelant le demande alors au
+/// service (`completer_references_de_service`).
+pub(crate) fn album_de_service_de_la_demande(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    album_ref: Option<&str>,
+    album_id_service: Option<&str>,
+) -> Option<String> {
+    if source == "bandcamp" {
+        return page_d_album_bandcamp_sure(album_ref)
+            .or_else(|| page_d_album_bandcamp_sure(album_id_service))
+            .or_else(|| reference_rangee_bandcamp(state, source, source_id));
+    }
+    identifiant_de_service_sur(album_id_service)
+}
+
 /// La référence d'album de la ligne de file qui JOUE, si c'est bien elle.
 ///
 /// La ligne doit porter la même source et le même identifiant que la piste en
