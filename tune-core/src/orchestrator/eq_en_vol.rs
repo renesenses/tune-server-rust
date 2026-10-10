@@ -18,7 +18,7 @@
 //! derrière son mutex. Ce poste de relève est le point de rendez-vous : la
 //! route y dépose le nouveau profil, le porteur le relève au bloc suivant et
 //! passe par [`EqProcessor::prendre_la_releve`] (#5215) — héritage des
-//! filtres, et fondu enchaîné de 200 ms quand le niveau bouge.
+//! filtres, et fondu enchaîné de 300 ms quand le niveau bouge.
 //!
 //! Le fichier pré-transcodé (FLAC ré-encodé, `transcoder_vers_fichier`) n'a
 //! PAS de poste : ses octets sont écrits, servis avec `Content-Length`, en
@@ -225,17 +225,27 @@ mod tests {
             "prémisse : cet égaliseur change le niveau du sinus"
         );
 
-        // Coupure en vol : fondu vers le sec, puis identité exacte.
+        // Coupure en vol (#5215, décision du 10/10) : la courbe s'efface,
+        // le préampli reste. Fondu fini, le relais rend le sinus au niveau
+        // du préampli, et le neutre qui le porte reste monté.
+        let preampli = crate::audio::eq::EqProcessor::new(&profil(), SR, 2)
+            .preamp_db(0)
+            .expect("préampli chiffré");
+        assert!(preampli < -1.0, "prémisse : réserve de {preampli} dB");
         poste.poser(None);
         passer(&mut dsp, &mut position, 8, bloc, &mut servi);
         let avant = position;
         let apres = passer(&mut dsp, &mut position, 2, bloc, &mut servi);
-        assert_eq!(
-            apres,
-            sinus(avant + bloc, bloc),
-            "égaliseur coupé, fondu fini : le relais rend le signal sec, à l'octet près"
+        let ecart_db = 20.0 * (rms(&apres) / rms(&sinus(avant + bloc, bloc))).log10();
+        assert!(
+            (ecart_db - preampli).abs() < 0.1,
+            "égaliseur coupé, fondu fini : le relais garde le préampli \
+             ({ecart_db:+.2} dB pour {preampli:+.2} dB)"
         );
-        assert!(dsp.eq.is_none(), "plus rien ne doit rester monté");
+        assert!(
+            dsp.eq.as_ref().is_some_and(|e| e.est_neutre()),
+            "le préampli gardé reste porté par un égaliseur neutre"
+        );
 
         // Aucune marche sur tout le flux : le plus grand saut d'un
         // échantillon au suivant reste celui d'un sinus, pas d'une coupure.

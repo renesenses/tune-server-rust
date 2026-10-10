@@ -3316,8 +3316,8 @@ fn apply_local_dsp(
     if let Ok(mut e) = eq.lock() {
         if let Some(ref mut p) = *e {
             p.process_interleaved(samples);
-            // #5215 — l'égaliseur coupé a fini de fondre vers le sec : on le
-            // retire, la chaîne redevient exactement celle d'un EQ absent.
+            // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
+            // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
             if p.est_neutre_au_repos() {
                 *e = None;
             }
