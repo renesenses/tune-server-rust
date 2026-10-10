@@ -1375,6 +1375,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/stop", post(stop))
         .route("/{id}/next", post(next))
         .route("/{id}/previous", post(previous))
+        // #6066 — le lecteur d'une zone navigateur dit qu'il joue : c'est la
+        // seule preuve d'écoute qui ne soit pas une sonde de plage.
+        .route(
+            "/{id}/browser-playing",
+            post(lecture_navigateur::signaler_lecture_navigateur),
+        )
         .route("/{id}/seek", post(seek))
         .route("/{id}/volume", post(set_volume))
         .route("/{id}/shuffle", post(toggle_shuffle))
@@ -1485,6 +1491,8 @@ mod refus_entier_negatif_3966;
 #[cfg(test)]
 mod saut_hors_file_4283;
 
+#[path = "playback/lecture_navigateur.rs"]
+mod lecture_navigateur;
 /// #5395 — la radio artiste à la demande.
 mod radio_artiste;
 
