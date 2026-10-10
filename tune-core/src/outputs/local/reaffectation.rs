@@ -101,10 +101,11 @@ mod tests {
                 [1.0 + base, 2.0 + base, 0.0, 0.0, 3.0 + base, 4.0 + base]
             );
         }
-        // DoP ou PURE : la matrice n'est pas appliquée, l'adaptation d'avant reste.
+        // DoP ou PURE : la matrice n'est pas appliquée, l'adaptation par défaut
+        // reste (celle de #6057, qui route par position).
         let brut = adapter_les_canaux(&creneau, quad.clone(), 4, 6, true);
         assert!(!creneau.appliquee());
-        assert_eq!(&brut[..6], &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+        assert_eq!(brut, super::super::adapt_channels(&quad, 4, 6));
         // Rien de posé et mêmes canaux : le tampon ressort tel quel.
         let vide = CreneauReaffectation::vide();
         assert_eq!(adapter_les_canaux(&vide, quad.clone(), 4, 4, false), quad);
@@ -139,6 +140,7 @@ mod tests {
                 pure_bypass: &pure,
                 mono_downmix: &mono,
                 reaffectation: &creneau,
+                disposition: &crate::outputs::local::SANS_DISPOSITION,
                 dop_active: &dop,
                 volume: &volume,
                 user_volume: &user_volume,
@@ -162,9 +164,9 @@ mod tests {
         assert!(etage.dsp_actif(), "la matrice est un traitement du signal");
         dop.store(true, Ordering::Relaxed);
         assert_eq!(
-            etage.convertir(quad),
-            [0.125, 0.25, 0.375, 0.5, 0.0, 0.0],
-            "un porteur DoP n'est jamais réaffecté"
+            etage.convertir(quad.clone()),
+            super::super::adapt_channels(&quad, 4, 6),
+            "un porteur DoP n'est jamais réaffecté : l'adaptation par défaut reste"
         );
         assert!(!creneau.appliquee());
     }

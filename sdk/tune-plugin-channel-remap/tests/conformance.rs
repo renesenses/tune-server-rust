@@ -88,7 +88,12 @@ fn echange_gauche_droite_au_bit_pres_en_s24_par_le_sdk() {
         ctx(),
     )
     .unwrap();
-    for (avant, apres) in origine.chunks_exact(6).zip(octets.chunks_exact(6)) {
+    for (avant, apres) in origine
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .zip(octets.as_chunks::<6>().0)
+    {
         assert_eq!(
             &apres[..3],
             &avant[3..],

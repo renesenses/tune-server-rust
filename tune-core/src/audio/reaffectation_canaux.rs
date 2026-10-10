@@ -215,20 +215,20 @@ mod tests {
         v.iter().skip(c).step_by(n).copied().collect()
     }
 
-    /// Le défaut que le greffon corrige, mesuré sur l'adaptation par défaut :
-    /// un 4.0 vers 6 voies met BL/BR sur FC/LFE, vers 2 voies les perd.
+    /// L'adaptation par défaut, depuis #6057, route un 4.0 par POSITION : vers
+    /// 6 voies, BL/BR arrivent sur BL/BR (plus sur FC/LFE) ; vers 2 voies,
+    /// l'arrière est replié de son côté au lieu d'être perdu. Le greffon reste
+    /// utile pour tout routage qui n'est pas celui-là.
     #[test]
-    fn adaptation_par_defaut_d_un_4_0_deplace_ou_perd_l_arriere() {
+    fn adaptation_par_defaut_d_un_4_0_route_l_arriere_par_position() {
         let entree = quad();
         let six = crate::audio::channels::adapt_channels_f32(&entree, 4, 6).unwrap();
-        assert_eq!(canal(&six, 6, 2), canal(&entree, 4, 2), "BL tombe sur FC");
-        assert_eq!(canal(&six, 6, 3), canal(&entree, 4, 3), "BR tombe sur LFE");
-        assert!(
-            canal(&six, 6, 4).iter().all(|x| *x == 0.0),
-            "BL du 5.1 vide"
-        );
+        assert_eq!(canal(&six, 6, 4), canal(&entree, 4, 2), "BL sur BL");
+        assert_eq!(canal(&six, 6, 5), canal(&entree, 4, 3), "BR sur BR");
+        assert!(canal(&six, 6, 2).iter().all(|x| *x == 0.0), "FC muet");
+        assert!(canal(&six, 6, 3).iter().all(|x| *x == 0.0), "LFE muet");
         let deux = crate::audio::channels::adapt_channels_f32(&entree, 4, 2).unwrap();
-        assert_eq!(deux, canal_paire(&entree), "4 → 2 ne garde que FL/FR");
+        assert_ne!(deux, canal_paire(&entree), "4 → 2 ne perd plus l'arrière");
     }
 
     fn canal_paire(v: &[f32]) -> Vec<f32> {

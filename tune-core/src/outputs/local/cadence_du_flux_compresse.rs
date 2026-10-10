@@ -125,9 +125,19 @@ pub(super) fn conformer_la_piste_decodee(
     source_ch: u16,
     sortie: FormatOuvert,
     reaffectation: Option<(&super::CreneauReaffectation, bool)>,
+    disposition: Option<&crate::audio::disposition_canaux::Disposition>,
 ) -> Vec<f32> {
     let mut samples = samples;
-    if let Some((creneau, intouchable)) = reaffectation {
+    // #6044 — la matrice de la zone prime ; à défaut, #6057 — la disposition
+    // déclarée par le fichier, quand elle a été lue ; à défaut, l'adaptation
+    // par défaut.
+    let matrice_applicable = reaffectation.is_some_and(|(creneau, intouchable)| {
+        !intouchable && creneau.pour(source_ch, sortie.canaux).is_some()
+    });
+    let declaree = disposition.filter(|d| d.canaux() == source_ch);
+    if let (Some((creneau, intouchable)), true) =
+        (reaffectation, matrice_applicable || declaree.is_none())
+    {
         samples = super::reaffectation::adapter_les_canaux(
             creneau,
             samples,
@@ -135,6 +145,11 @@ pub(super) fn conformer_la_piste_decodee(
             sortie.canaux,
             intouchable,
         );
+    } else if let Some(d) = declaree {
+        if let Some((creneau, _)) = reaffectation {
+            creneau.noter(false);
+        }
+        samples = super::adapt_channels_disposee(&samples, source_ch, sortie.canaux, d);
     } else if source_ch != sortie.canaux {
         samples = adapt_channels(&samples, source_ch, sortie.canaux);
     }

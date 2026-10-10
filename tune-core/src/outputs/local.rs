@@ -471,6 +471,16 @@ use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 mod periode;
 /// #6044 — la réaffectation des canaux (greffon `channel-remap`).
 mod reaffectation;
+
+/// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
+/// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit
+/// l'ordre par défaut.
+pub(crate) type CreneauDisposition =
+    std::sync::Mutex<Option<Arc<crate::audio::disposition_canaux::Disposition>>>;
+
+/// Le créneau vide des étages montés hors d'une `LocalOutput` (témoins).
+#[cfg(test)]
+pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
 pub(crate) use reaffectation::CreneauReaffectation;
 
@@ -700,6 +710,8 @@ pub struct LocalOutput {
     /// (`zone_{id}_channel_remap` ou la règle de l'album), appliquée à
     /// l'adaptation source → périphérique. Vide par défaut et en PURE.
     reaffectation: Arc<CreneauReaffectation>,
+    /// #6057 — la disposition déclarée par le fichier de la piste en cours.
+    disposition: Arc<CreneauDisposition>,
     /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
     /// pause, à la reprise et à l'arrêt (#1590).
     ///
@@ -1170,6 +1182,7 @@ impl LocalOutput {
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
+            disposition: Arc::new(std::sync::Mutex::new(None)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
             // exactement comme avant #1590.
@@ -1496,6 +1509,18 @@ impl LocalOutput {
     /// #6044 — le dernier bloc converti est-il passé par la matrice ?
     pub fn reaffectation_appliquee(&self) -> bool {
         self.reaffectation.appliquee()
+    }
+
+    /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
+    /// (`None` : l'ordre par défaut, comme avant). Lue à chaque bloc par
+    /// l'étage de conversion.
+    pub fn set_disposition_source(
+        &self,
+        disposition: Option<Arc<crate::audio::disposition_canaux::Disposition>>,
+    ) {
+        if let Ok(mut d) = self.disposition.lock() {
+            *d = disposition;
+        }
     }
 
     /// Le repli mono est-il armé sur cette sortie ?
@@ -2548,6 +2573,8 @@ struct LocalPcmProcessor<'a> {
     mono_downmix: &'a AtomicBool,
     /// #6044 — la réaffectation des canaux, lue par `convertir`.
     reaffectation: &'a CreneauReaffectation,
+    /// #6057 — la disposition déclarée, lue par `convertir`.
+    disposition: &'a CreneauDisposition,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -3947,8 +3974,18 @@ impl EtageDeConversion<'_> {
                 .pour(self.spec.canaux(), self.sortie.canaux)
         };
         self.pcm.reaffectation.noter(matrice.is_some());
+        // #6057 — sans matrice, la disposition que le fichier DÉCLARE route
+        // chaque voie par sa position, même à nombre de canaux égal. Jamais sur
+        // un porteur DoP : ce sont des octets à livrer tels quels.
+        let declaree = if matrice.is_some() || self.pcm.dop_active.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.pcm.disposition.lock().ok().and_then(|d| d.clone())
+        };
         if let Some(m) = matrice {
             mots = m.appliquer_f32(&mots);
+        } else if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
+            mots = adapt_channels_disposee(&mots, self.spec.canaux(), self.sortie.canaux, &d);
         } else if self.needs_channel_adapt() {
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
@@ -4893,6 +4930,7 @@ impl OutputTarget for LocalOutput {
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
+        let disposition = self.disposition.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
@@ -5578,6 +5616,7 @@ impl OutputTarget for LocalOutput {
                     dec_ch,
                     FormatOuvert::new(output_sr, output_ch),
                     Some((&reaffectation, pure_bypass.load(Ordering::Relaxed))),
+                    disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
 
                 // Pre-fill the ring buffer before starting the cpal stream.
@@ -5827,6 +5866,7 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     reaffectation: reaffectation.clone(),
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5451 — le bras consomme la réserve et enchaîne à
                     // format égal, sans rouvrir le périphérique.
@@ -5881,6 +5921,7 @@ impl OutputTarget for LocalOutput {
                     pure_bypass,
                     mono_downmix,
                     reaffectation: reaffectation.clone(),
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5204 — la route native consomme la réserve et enchaîne
                     // à format égal, sans refermer le pilote.
@@ -6101,6 +6142,7 @@ impl OutputTarget for LocalOutput {
                     pure_bypass: &pure_bypass,
                     mono_downmix: &mono_downmix,
                     reaffectation: &reaffectation,
+                    disposition: &disposition,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -7635,3 +7677,7 @@ mod empreinte_asio_f70496;
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
 mod transformations_reelles_de_l_etage_ref6b;
+
+/// #6057 — l'étage route par la disposition déclarée par le fichier.
+#[cfg(test)]
+mod disposition_declaree_tests;
