@@ -15,9 +15,11 @@
 //! après normalisation, atténuation par sortie, recopie au bit près ou
 //! mélange). L'écran l'affiche tel quel.
 //!
-//! Droits : aucun pour l'instant. Gratuit ou Premium est une décision de
-//! Bertrand (#6044) ; la garde, le cas échéant, se pose ici comme celle du
-//! crossfeed (`premium_guard::require_premium_localise`).
+//! Droits : GRATUIT (décision de Bertrand du 10/10/2026), mais FACULTATIF
+//! comme l'égaliseur : le greffon `channel-remap` s'installe depuis le
+//! catalogue (`POST /plugins/channel-remap/install`, droit `dsp_eq`). Lire est
+//! libre ; écrire exige le greffon installé et activé (409
+//! `plugin_unavailable` sinon), et l'hôte ne l'applique qu'installé.
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -161,6 +163,11 @@ async fn ecrire_zone(
     Path(id): Path<i64>,
     Json(corps): Json<Value>,
 ) -> Response {
+    // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
+    // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
+    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+        return r;
+    }
     let reglage = match valider(corps) {
         Ok(r) => r,
         Err(r) => return r,
@@ -203,6 +210,11 @@ async fn ecrire_album(
     Path(id): Path<i64>,
     Json(corps): Json<Value>,
 ) -> Response {
+    // Greffon facultatif (gratuit) : écrire exige qu'il soit installé et
+    // activé, comme l'égaliseur (`PUT /zones/{id}/dsp`).
+    if let Err(r) = crate::premium_audio_plugins::require_installed(&state, rc::ID_GREFFON) {
+        return r;
+    }
     let reglage = match valider(corps) {
         Ok(r) => r,
         Err(r) => return r,

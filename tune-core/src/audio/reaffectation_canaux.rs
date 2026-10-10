@@ -42,6 +42,9 @@ pub use tune_plugin_channel_remap::{
     PREREGLAGES, identite, noms_des_canaux, prereglage,
 };
 
+/// L'identifiant du greffon au catalogue.
+pub const ID_GREFFON: &str = "channel-remap";
+
 /// La clé du réglage d'une zone.
 pub fn cle_de_zone(zone_id: i64) -> String {
     format!("zone_{zone_id}_channel_remap")
@@ -151,6 +154,10 @@ pub fn regle_effective_with(
         return None;
     }
     let settings = SettingsRepo::with_backend(db.clone());
+    // Greffon facultatif et gratuit : sans installation, rien ne s'applique.
+    if !crate::audio::premium_plugins::enabled(&settings, ID_GREFFON) {
+        return None;
+    }
     resoudre(
         lire(&settings, &cle_de_zone(zone_id)),
         album_id.and_then(|a| lire(&settings, &cle_d_album(a))),

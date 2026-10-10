@@ -7,8 +7,13 @@ use tune_core::outputs::traits::{AudioSpec, FormatOuvert};
 
 fn etat_avec(zone: i64, reglage: Option<rc::ChannelRemapSettings>) -> crate::state::AppState {
     let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    tune_core::audio::premium_plugins::migrate(&settings).unwrap();
+    settings
+        .set("plugin_channel-remap_installed", "true")
+        .unwrap();
     if let Some(r) = reglage {
-        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        settings
             .set(&rc::cle_de_zone(zone), &serde_json::to_string(&r).unwrap())
             .unwrap();
     }
@@ -45,6 +50,15 @@ fn rien_a_annoncer_quand_l_etage_ne_l_applique_pas() {
     // Aucun réglage.
     let vide = etat_avec(7, None);
     assert!(zone_reaffectation_step(&vide.backend, 7, "local", None, Some(&reel(4, 6))).is_none());
+}
+
+#[test]
+fn greffon_desinstalle_rien_n_est_annonce() {
+    let state = etat_avec(7, rc::prereglage("quad_to_5_1"));
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_channel-remap_installed", "false")
+        .unwrap();
+    assert!(zone_reaffectation_step(&state.backend, 7, "local", None, Some(&reel(4, 6))).is_none());
 }
 
 #[test]
