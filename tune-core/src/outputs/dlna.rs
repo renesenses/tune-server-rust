@@ -71,11 +71,45 @@ fn faute_commande_soap(response: &str) -> bool {
     }
 }
 
+/// #6017 — le code d'une faute UPnP, lu par NOM LOCAL comme
+/// [`faute_commande_soap`] : `<errorCode>`, mais aussi `<u:errorCode>` ou
+/// `<errorCode xmlns="…">`. `extract_tag` ne voit que la forme nue ; le Yamaha
+/// R-N2000A du fil 2194 répondait par une faute dont le code restait
+/// « inconnu ».
+pub(crate) fn code_de_faute_upnp(response: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(response);
+    let mut dans_le_code = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) if e.local_name().as_ref() == b"errorCode" => {
+                dans_le_code = true;
+            }
+            Ok(quick_xml::events::Event::Text(t)) if dans_le_code => {
+                let texte = t.decode().ok()?.trim().to_string();
+                return (!texte.is_empty()).then_some(texte);
+            }
+            Ok(quick_xml::events::Event::End(_)) if dans_le_code => return None,
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Un extrait du corps d'une faute, pour le journal : sans lui, un code
+/// illisible ne laisse aucune trace de ce que l'appareil a répondu (#6017).
+fn extrait_de_faute(response: &str) -> String {
+    response
+        .chars()
+        .take(400)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
 fn acquitter_commande_soap(action: &str, response: String) -> Result<(), String> {
     if faute_commande_soap(&response) {
         Err(format!(
             "{action} rejected: SOAP fault (UPnP code {})",
-            extract_tag(&response, "errorCode")
+            code_de_faute_upnp(&response)
                 .as_deref()
                 .unwrap_or("unknown")
         ))
@@ -177,7 +211,7 @@ pub const SEEK_REFUSE_PREFIX: &str = "seek refusé par le renderer:";
 /// L'erreur rendue par `DlnaOutput::seek` pour une faute SOAP : la tête
 /// [`SEEK_REFUSE_PREFIX`], puis le code UPnP et son sens.
 pub(crate) fn refus_de_seek(response: &str) -> String {
-    let code = extract_tag(response, "errorCode");
+    let code = code_de_faute_upnp(response);
     let motif = match code.as_deref().map(str::trim) {
         Some("701") => "transition impossible pour l'instant",
         Some("710") => "mode de déplacement non pris en charge",
@@ -1918,7 +1952,7 @@ impl DlnaOutput {
                 Ok(response) if faute_commande_soap(response) => {
                     warn!(device = %self.name, device_id = %self.device_id, action,
                         command_id, elapsed_ms, outcome = "soap_fault",
-                        upnp_code = extract_tag(response, "errorCode").as_deref().unwrap_or("unknown"),
+                        upnp_code = code_de_faute_upnp(response).as_deref().unwrap_or("unknown"),
                         "dlna_command_finished");
                 }
                 Ok(_) => {
@@ -2888,7 +2922,8 @@ impl OutputTarget for DlnaOutput {
             warn!(
                 device = %self.name,
                 position_ms,
-                upnp_code = extract_tag(&response, "errorCode").as_deref().unwrap_or("unknown"),
+                upnp_code = code_de_faute_upnp(&response).as_deref().unwrap_or("unknown"),
+                corps = %extrait_de_faute(&response),
                 "dlna_seek_refuse"
             );
             return Err(refus);
@@ -4280,6 +4315,23 @@ mod tests {
     /// 501 Action Failed — le refus pour lequel le barème Stop+Play a été écrit
     /// (Revox S100). Il ne doit RIEN changer de son comportement.
     const FAUTE_501: &str = "<UPnPError><errorCode>501</errorCode><errorDescription>Action Failed</errorDescription></UPnPError>";
+
+    /// #6017 — un code préfixé ou porteur d'un attribut se lit par nom local :
+    /// le refus de Seek ne doit plus afficher « code UPnP inconnu ».
+    #[test]
+    fn le_code_de_faute_se_lit_par_nom_local() {
+        let prefixe = "<s:Fault><detail><u:UPnPError xmlns:u=\"urn:schemas-upnp-org:control-1-0\">\
+                       <u:errorCode>710</u:errorCode></u:UPnPError></detail></s:Fault>";
+        assert_eq!(code_de_faute_upnp(prefixe).as_deref(), Some("710"));
+        let attribut = "<UPnPError><errorCode xmlns=\"urn:x\"> 711 </errorCode></UPnPError>";
+        assert_eq!(code_de_faute_upnp(attribut).as_deref(), Some("711"));
+        assert_eq!(code_de_faute_upnp(FAUTE_701).as_deref(), Some("701"));
+        assert_eq!(code_de_faute_upnp("<s:Fault/>"), None);
+        assert_eq!(
+            refus_de_seek(prefixe),
+            format!("{SEEK_REFUSE_PREFIX} code UPnP 710 (mode de déplacement non pris en charge)")
+        );
+    }
 
     #[test]
     fn le_701_se_reconnait_au_code_comme_au_libelle() {

@@ -3563,8 +3563,35 @@ impl PlaybackOrchestrator {
                 zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
             let is_oaat_output = zone_output_type.as_deref() == Some("oaat");
             let has_track = state.now_playing.is_some();
+            // #6017 (Cyrille, fil 2194, Yamaha R-N2000A) — une piste de la
+            // BIBLIOTHÈQUE convertie à la volée (AAC → WAV) est servie par un
+            // canal, sans `Range`, et la DIDL annonce `DLNA.ORG_OP=00`. Un
+            // `Seek` SOAP nu y est refusé à bon droit par le renderer (« code
+            // UPnP inconnu »). On recrée donc le flux À la position, comme
+            // pour une sortie locale et comme le transfert (#4442).
+            let bibliotheque_sans_range_sur_reseau = is_network
+                && match state.now_playing.as_ref() {
+                    Some(np) if np.source == "local" => match np.stream_id {
+                        Some(ref sid) => !self.streamer.is_seekable_session(sid).await,
+                        None => false,
+                    },
+                    _ => false,
+                };
 
-            if (is_local_output || is_oaat_output) && has_track {
+            if bibliotheque_sans_range_sur_reseau {
+                info!(
+                    zone_id,
+                    position_ms, "seek_bibliotheque_sans_range_recreation_du_flux"
+                );
+                if let Err(e) = self
+                    .replay_zone_at_position(zone_id, position_ms, "seek")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_bibliotheque_sans_range_echouee");
+                    self.playback.seek(zone_id, original_position_ms).await;
+                    return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                }
+            } else if (is_local_output || is_oaat_output) && has_track {
                 info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                 match self
                     .replay_zone_at_position(zone_id, position_ms, "seek")
