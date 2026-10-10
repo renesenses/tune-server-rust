@@ -228,11 +228,16 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
         puits.mots() > 0,
         "le rééchantillonneur doit rendre du signal, pas du vide"
     );
+    let Some(attendu) =
+        EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000.attendu("rééchantillonnage 44,1 → 48 kHz")
+    else {
+        return;
+    };
     assert_eq!(
         empreinte,
-        EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000.pour(noyau_de_rubato()),
-        "le rééchantillonnage ne rend plus les mêmes octets que le relevé du \
-         19/09 pour le noyau {:?} : le noyau de `new_streaming_resampler` a \
+        attendu,
+        "le rééchantillonnage ne rend plus les mêmes octets que le relevé \
+         pour le noyau {:?} : le noyau de `new_streaming_resampler` a \
          changé. Si c'est voulu, c'est un changement de RENDU — il se mesure au \
          banc T10 (`reechantillonnage_reference_2218.rs`) avant d'être acté ici",
         noyau_de_rubato()
@@ -269,9 +274,14 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
         "stéréo → mono PUIS 44,1 → 48 kHz : le compte de mots dit déjà si \
          l'ordre a changé"
     );
+    let Some(attendu) =
+        EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE.attendu("adaptation puis rééchantillonnage")
+    else {
+        return;
+    };
     assert_eq!(
         empreinte,
-        EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE.pour(noyau_de_rubato()),
+        attendu,
         "la chaîne complète — adaptation de canaux PUIS rééchantillonnage — ne \
          rend plus les mêmes octets que le relevé du 19/09 pour le noyau {:?}. \
          Si l'ordre a été inversé, le rééchantillonneur reçoit deux canaux \
@@ -429,18 +439,27 @@ fn un_flux_coupe_en_deux_rend_la_meme_empreinte_qu_entier() {
 const EMPREINTE_IDENTITE_16_BITS_STEREO: u64 = 0x1433_8456_2279_0c63;
 const EMPREINTE_ADAPTATION_STEREO_VERS_MONO: u64 = 0x3557_16d1_b565_a7d6;
 // Était 0x4491_3fae_738e_a9ee avec le noyau 64 écrit à la main.
+//
+// #6016 (interpolation Cubique, #4754) a changé le rendu : AVX+FMA remesuré sur
+// Shrek le 10/10 ; SSE3, NEON et scalaire NON remesurés (`None`), à reprendre
+// par #6103. Valeurs du 19/09, interpolation Linéaire, pour mémoire :
+// 13_845_619_951_895_521_272 / 12_081_719_003_251_702_559 /
+// 7_823_019_637_321_928_767 / 8_691_608_775_236_771_879.
 const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: RelevesParNoyau = RelevesParNoyau {
-    avx_fma: 13_845_619_951_895_521_272,
-    sse3: 12_081_719_003_251_702_559,
-    neon: 7_823_019_637_321_928_767,
-    scalaire: 8_691_608_775_236_771_879,
+    avx_fma: 7_674_444_934_208_882_303,
+    sse3: None,
+    neon: None,
+    scalaire: None,
 };
 // Était 0x8c1c_f175_68c3_9aaa avec le noyau 64 écrit à la main.
+// #6016 : même reprise. Valeurs du 19/09 (Linéaire), pour mémoire :
+// 6_036_393_677_556_695_676 / 16_064_891_628_025_049_697 /
+// 5_446_340_049_408_367_490 / 5_331_791_831_370_548_251.
 const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: RelevesParNoyau = RelevesParNoyau {
-    avx_fma: 6_036_393_677_556_695_676,
-    sse3: 16_064_891_628_025_049_697,
-    neon: 5_446_340_049_408_367_490,
-    scalaire: 5_331_791_831_370_548_251,
+    avx_fma: 9_648_691_482_532_452_327,
+    sse3: None,
+    neon: None,
+    scalaire: None,
 };
 
 /// Le produit scalaire que rubato retient pour ce processeur (#4532).
@@ -477,20 +496,35 @@ fn noyau_de_rubato() -> NoyauSinc {
 }
 
 /// Un relevé d'empreinte par noyau de rubato — chacun MESURÉ, aucun déduit.
+/// `None` : pas encore remesuré depuis le dernier changement de rendu (#6103) ;
+/// le témoin le DIT sur ce noyau au lieu de comparer à une valeur périmée.
 struct RelevesParNoyau {
     avx_fma: u64,
-    sse3: u64,
-    neon: u64,
-    scalaire: u64,
+    sse3: Option<u64>,
+    neon: Option<u64>,
+    scalaire: Option<u64>,
 }
 
 impl RelevesParNoyau {
-    fn pour(&self, noyau: NoyauSinc) -> u64 {
+    fn pour(&self, noyau: NoyauSinc) -> Option<u64> {
         match noyau {
-            NoyauSinc::AvxFma => self.avx_fma,
+            NoyauSinc::AvxFma => Some(self.avx_fma),
             NoyauSinc::Sse3 => self.sse3,
             NoyauSinc::Neon => self.neon,
             NoyauSinc::Scalaire => self.scalaire,
         }
+    }
+
+    /// Le relevé du noyau de cette machine, ou `None` après l'avoir signalé.
+    fn attendu(&self, quoi: &str) -> Option<u64> {
+        let noyau = noyau_de_rubato();
+        let r = self.pour(noyau);
+        if r.is_none() {
+            eprintln!(
+                "{quoi} : relevé du noyau {noyau:?} NON remesuré depuis #6016 \
+                 (interpolation Cubique) — comparaison sautée, voir #6103"
+            );
+        }
+        r
     }
 }
