@@ -171,6 +171,44 @@ mod tests {
         assert!(!creneau.appliquee());
     }
 
+    /// #4969 — la sonde que lisent les niveaux décrit ce que l'étage fait :
+    /// la matrice posée, sauf en PURE et en DoP ; rien hors lecture.
+    #[test]
+    fn la_sonde_des_canaux_suit_la_matrice_posee_sur_la_sortie() {
+        use crate::outputs::traits::{
+            AudioSpec, FormatOuvert, ProfondeurPcm, TransformationsReelles,
+        };
+        let sortie = super::super::LocalOutput::new_with_exclusive("témoin".into(), false);
+        let sonde = sortie.sonde_des_canaux();
+        assert!(sonde().is_none(), "hors lecture, aucune carte");
+        if let Ok(mut t) = sortie.transformations_reelles.lock() {
+            *t = Some(TransformationsReelles::nouvelles(
+                AudioSpec::nouvelle(48_000, ProfondeurPcm::Entier24, 2).expect("spec"),
+                FormatOuvert::new(48_000, 2),
+                false,
+            ));
+        }
+        let carte = sonde().expect("carte en lecture");
+        assert!(carte.est_identite());
+        sortie.set_reaffectation(
+            Matrice::du_reglage_arme(&prereglage("swap_lr").unwrap()).map(Arc::new),
+        );
+        let carte = sonde().expect("carte");
+        assert_eq!(carte.coefficient(0, 1), 1.0, "FL reçoit FR");
+        assert_eq!(carte.coefficient(1, 0), 1.0, "FR reçoit FL");
+        sortie.pure_bypass.store(true, Ordering::Relaxed);
+        assert!(
+            sonde().expect("carte").est_identite(),
+            "PURE : pas de matrice"
+        );
+        sortie.pure_bypass.store(false, Ordering::Relaxed);
+        sortie.dop_active.store(true, Ordering::Relaxed);
+        assert!(
+            sonde().expect("carte").est_identite(),
+            "DoP : pas de matrice"
+        );
+    }
+
     #[test]
     fn echange_gauche_droite_sans_changer_le_nombre_de_canaux() {
         let creneau = CreneauReaffectation::vide();

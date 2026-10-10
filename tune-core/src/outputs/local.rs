@@ -1089,6 +1089,39 @@ impl LocalOutput {
         }
     }
 
+    /// #4969 — la sonde de la carte des canaux de cette sortie : ce que son
+    /// adaptation des canaux fait de chaque canal de la source, pour la
+    /// piste en cours. Ses propres `Arc` (format entré et ouvert, matrice de
+    /// réaffectation, disposition déclarée, DoP, PURE), relus à chaque appel,
+    /// et la MÊME décision que `EtageDeConversion::convertir`
+    /// ([`adaptation_retenue`]). `None` hors lecture.
+    pub fn sonde_des_canaux(&self) -> crate::audio::carte_des_canaux::SondeDesCanaux {
+        let transformations = self.transformations_reelles.clone();
+        let reaffectation = self.reaffectation.clone();
+        let disposition = self.disposition.clone();
+        let dop = self.dop_active.clone();
+        let pure = self.pure_bypass.clone();
+        Arc::new(move || {
+            let t = transformations.lock().ok().and_then(|t| *t)?;
+            let (source, sortie) = (t.entree().canaux(), t.ouvert().canaux);
+            let (matrice, declaree) =
+                adaptation_retenue(&reaffectation, &disposition, source, sortie, &dop, &pure);
+            crate::audio::carte_des_canaux::CarteDesCanaux::depuis_adaptation(
+                source,
+                sortie,
+                |impulsions| {
+                    crate::audio::carte_des_canaux::adapter_vers_la_sortie(
+                        impulsions,
+                        source,
+                        sortie,
+                        matrice.as_deref(),
+                        declaree.as_deref(),
+                    )
+                },
+            )
+        })
+    }
+
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         Self::with_options(device_name, exclusive_mode, "auto")
@@ -4046,32 +4079,34 @@ impl EtageDeConversion<'_> {
 
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
-        // #6044 — la matrice de réaffectation, quand elle va de la source à la
-        // sortie, REMPLACE l'adaptation par défaut. Jamais sur un porteur DoP
-        // ni en PURE : ce sont des octets à livrer tels quels.
-        let intouchable = self.pcm.dop_active.load(Ordering::Relaxed)
-            || self.pcm.pure_bypass.load(Ordering::Relaxed);
-        let matrice = if intouchable {
-            None
-        } else {
-            self.pcm
-                .reaffectation
-                .pour(self.spec.canaux(), self.sortie.canaux)
-        };
+        let (source, sortie) = (self.spec.canaux(), self.sortie.canaux);
+        let (matrice, declaree) = adaptation_retenue(
+            self.pcm.reaffectation,
+            self.pcm.disposition,
+            source,
+            sortie,
+            self.pcm.dop_active,
+            self.pcm.pure_bypass,
+        );
         self.pcm.reaffectation.noter(matrice.is_some());
-        // #6057 — sans matrice, la disposition que le fichier DÉCLARE route
-        // chaque voie par sa position, même à nombre de canaux égal. Jamais sur
-        // un porteur DoP : ce sont des octets à livrer tels quels.
-        let declaree = if matrice.is_some() || self.pcm.dop_active.load(Ordering::Relaxed) {
-            None
-        } else {
-            self.pcm.disposition.lock().ok().and_then(|d| d.clone())
-        };
-        if let Some(m) = matrice {
-            mots = m.appliquer_f32(&mots);
-        } else if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
-            mots = adapt_channels_disposee(&mots, self.spec.canaux(), self.sortie.canaux, &d);
+        if matrice.is_some() || declaree.is_some() {
+            // #4969 — la fonction même dont la carte des canaux mesure la
+            // réponse (`LocalOutput::sonde_des_canaux`).
+            mots = crate::audio::carte_des_canaux::adapter_vers_la_sortie(
+                &mots,
+                source,
+                sortie,
+                matrice.as_deref(),
+                declaree.as_deref(),
+            )
+            .unwrap_or_else(|error| {
+                warn!(from_ch = source, to_ch = sortie, error = %error, "local_channel_adaptation_rejected");
+                Vec::new()
+            });
         } else if self.needs_channel_adapt() {
+            // Sans matrice ni disposition déclarée, `adapter_vers_la_sortie`
+            // se réduit à `adapt_channels_f32` : c'est l'appel en ligne que les
+            // gardes #3233 et REF-7 lisent ici, même refus en silence.
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
         if self.needs_resample {
@@ -4306,6 +4341,44 @@ pub(super) trait Etage {
 
     /// Ce que cet étage fait RÉELLEMENT au signal, à cet instant.
     fn transformations(&self) -> TransformationsReelles;
+}
+
+/// Ce que l'adaptation des canaux retient pour un bloc : la matrice de
+/// réaffectation (#6044), quand elle va de la source à la sortie — jamais sur
+/// un porteur DoP ni en PURE, ce sont des octets à livrer tels quels ; à
+/// défaut, la disposition que le fichier DÉCLARE (#6057), qui route chaque
+/// voie par sa position même à nombre de canaux égal — jamais sur un porteur
+/// DoP. Une seule décision pour l'étage (`convertir`) et pour la carte des
+/// canaux que lisent les niveaux (#4969).
+type AdaptationRetenue = (
+    Option<Arc<crate::audio::reaffectation_canaux::Matrice>>,
+    Option<Arc<crate::audio::disposition_canaux::Disposition>>,
+);
+
+fn adaptation_retenue(
+    reaffectation: &CreneauReaffectation,
+    disposition: &CreneauDisposition,
+    source: u16,
+    sortie: u16,
+    dop_active: &AtomicBool,
+    pure_bypass: &AtomicBool,
+) -> AdaptationRetenue {
+    let dop = dop_active.load(Ordering::Relaxed);
+    let matrice = if dop || pure_bypass.load(Ordering::Relaxed) {
+        None
+    } else {
+        reaffectation.pour(source, sortie)
+    };
+    let declaree = if matrice.is_some() || dop {
+        None
+    } else {
+        disposition
+            .lock()
+            .ok()
+            .and_then(|d| d.clone())
+            .filter(|d| d.canaux() == source)
+    };
+    (matrice, declaree)
 }
 
 /// REF-6b (#2219) — pose dans le créneau de `LocalOutput` ce que l'étage fait

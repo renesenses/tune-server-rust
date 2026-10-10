@@ -9,6 +9,9 @@ pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 
 pub mod bitperfect_strict;
+/// #4969 — la carte des canaux de SORTIE (réaffectation, disposition,
+/// adaptation), mesurée par impulsions : les niveaux par canal la suivent.
+pub mod carte_des_canaux;
 pub mod channels;
 /// #5071 — la compensation de niveau cuite dans le flux réseau, bornée à la
 /// crête (jamais d'écrêtage).
