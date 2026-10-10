@@ -2405,11 +2405,9 @@ pub(super) async fn browse_dirs(
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip hidden dirs and system dirs
-            if name.starts_with('.')
-                || name == "$RECYCLE.BIN"
-                || name == "System Volume Information"
-            {
+            // Skip hidden dirs and system dirs (corbeilles de NAS comprises,
+            // casse ignorée : fil forum 2207).
+            if name.starts_with('.') || tune_core::scanner::dossier_systeme_ignore(&name) {
                 continue;
             }
             // Les arbres système disparaissent aussi de la LISTE, pas seulement
