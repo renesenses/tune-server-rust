@@ -1806,6 +1806,19 @@ impl AudioStreamer {
         Some(info.seek_ms.unwrap_or(0) + octets.saturating_mul(1_000) / nominal)
     }
 
+    /// #6066 — débit nominal de la session, en octets par seconde, tel que
+    /// le flux le SERT (voir [`StreamInfo::debit_nominal_octets_par_seconde`]).
+    /// `None` : session inconnue ou débit incalculable. Contrairement à
+    /// [`Self::stream_audio_servi_ms`], la radio n'est pas exclue : la
+    /// question est « combien d'audio ces octets portent-ils », pas « où en
+    /// est la lecture ».
+    pub async fn stream_debit_nominal(&self, stream_id: &str) -> Option<u64> {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() }?;
+        session
+            .effective_output_info()
+            .debit_nominal_octets_par_seconde()
+    }
+
     /// Reprendre les sessions mortes — sur leur SILENCE, pas sur leur âge.
     ///
     /// Une session qui débite des octets est vivante quel que soit son âge.

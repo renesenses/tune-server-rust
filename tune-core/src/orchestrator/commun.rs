@@ -621,14 +621,15 @@ impl PlaybackOrchestrator {
     /// avec les données du démarrage — `record_history` en particulier, qu'un
     /// observateur extérieur ne peut pas reconstituer.
     ///
-    /// La preuve est celle dont `output_reach` se sert déjà pour dire
-    /// « browser_unattended » (`tune-server/src/routes/zones.rs`) : des octets
-    /// réellement partis sur la session de flux. Aucune détection nouvelle.
+    /// La preuve (#6066) : la parole du lecteur de la zone
+    /// ([`Self::signaler_lecture_navigateur`]), ou, pour un client qui ne sait
+    /// pas encore la donner, une durée d'audio réellement servie
+    /// (`confirmation_navigateur_6066::octets_prouvent_une_ecoute`). Un octet
+    /// tiré ne suffit plus : une sonde de plage en tire deux et ne joue rien.
     ///
-    /// Le délai vaut au plus un tick de poller (~1 s) après le premier octet
-    /// tiré : la règle de durée minimale de Last.fm porte sur le scrobble
-    /// définitif (50 % / 4 min, côté poller), pas sur « en écoute », et une
-    /// seconde ne coûte aucune écoute légitime.
+    /// La règle de durée minimale de Last.fm porte sur le scrobble définitif
+    /// (50 % / 4 min, côté poller), pas sur « en écoute » : quelques secondes
+    /// d'audio servie ne coûtent aucune écoute légitime.
     ///
     /// Rend `true` quand l'annonce vient de partir.
     pub async fn confirmer_lecture_navigateur(&self, zone_id: i64, stream_id: &str) -> bool {
@@ -643,13 +644,33 @@ impl PlaybackOrchestrator {
             }
         }
 
-        let tire = self
-            .streamer
-            .stream_bytes_sent(stream_id)
-            .await
-            .is_some_and(|n| n > 0);
-        if !tire {
-            return false;
+        // #6066 — la preuve. D'abord la parole du lecteur de la zone
+        // (`signaler_lecture_navigateur`) ; à défaut, et seulement pour une
+        // zone dont le lecteur ne sait pas encore parler, une durée d'audio
+        // réellement servie. Plus jamais « un octet » : une sonde de plage
+        // AVPlayer (`bytes=0-1`) en tire deux, et rien ne joue.
+        let (dit_par_le_lecteur, repli_permis) = {
+            let Ok(mut confirmations) = self.confirmations_du_lecteur.lock() else {
+                return false;
+            };
+            (
+                confirmations.prendre(zone_id, stream_id),
+                confirmations.repli_permis(zone_id),
+            )
+        };
+        if !dit_par_le_lecteur {
+            if !repli_permis {
+                return false;
+            }
+            let octets = self
+                .streamer
+                .stream_bytes_sent(stream_id)
+                .await
+                .unwrap_or(0);
+            let debit = self.streamer.stream_debit_nominal(stream_id).await;
+            if !super::confirmation_navigateur_6066::octets_prouvent_une_ecoute(octets, debit) {
+                return false;
+            }
         }
 
         // Retirer AVANT d'annoncer : le verrou « une seule fois » est le retrait
@@ -720,6 +741,46 @@ impl PlaybackOrchestrator {
         }
 
         true
+    }
+
+    /// #6066 — le LECTEUR d'une zone navigateur dit qu'il joue `stream_id`,
+    /// à `position_ms` de son horloge de lecture.
+    ///
+    /// C'est la preuve que `confirmer_lecture_navigateur` attend : seule une
+    /// position strictement positive confirme (un lecteur qui n'a pas avancé
+    /// n'a rien fait entendre), et seulement pour le flux dont l'annonce est
+    /// en attente sur CETTE zone. Dès qu'un lecteur a parlé pour une zone, le
+    /// repli par les octets se tait pour elle.
+    ///
+    /// L'appelant (la route) vérifie que la zone est une zone navigateur.
+    pub async fn signaler_lecture_navigateur(
+        &self,
+        zone_id: i64,
+        stream_id: &str,
+        position_ms: i64,
+    ) -> super::SignalDuLecteur {
+        use super::SignalDuLecteur;
+        let joue = position_ms > 0;
+        let en_attente = self
+            .annonces_navigateur
+            .lock()
+            .ok()
+            .and_then(|a| a.get(&zone_id).map(|a| a.stream_id == stream_id))
+            .unwrap_or(false);
+        if let Ok(mut confirmations) = self.confirmations_du_lecteur.lock() {
+            confirmations.noter(zone_id, stream_id, joue && en_attente);
+        }
+        if !en_attente {
+            return SignalDuLecteur::RienEnAttente;
+        }
+        if !joue {
+            return SignalDuLecteur::PasEncoreDeLecture;
+        }
+        if self.confirmer_lecture_navigateur(zone_id, stream_id).await {
+            SignalDuLecteur::Confirmee
+        } else {
+            SignalDuLecteur::RienEnAttente
+        }
     }
 
     /// Quelles sorties le repli de `stop` a le droit de toucher.

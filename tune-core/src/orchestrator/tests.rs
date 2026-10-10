@@ -7070,6 +7070,136 @@ async fn zone_navigateur_l_arret_annule_l_annonce_en_attente() {
     assert_eq!(lignes_historique(&orch), 0);
 }
 
+// ------------------------------------------------------------------
+// #6066 — la preuve de lecture d'une zone navigateur n'est plus « un octet ».
+// ------------------------------------------------------------------
+
+async fn zone_navigateur_en_attente(
+    orch: &PlaybackOrchestrator,
+    fichier: &std::path::Path,
+    octets: u64,
+) -> (i64, String) {
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Ce téléphone", Some("browser"), None)
+        .unwrap();
+    let sid = session_navigateur(orch, fichier, octets).await;
+    orch.annonces_navigateur
+        .lock()
+        .unwrap()
+        .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+    (zone_id, sid)
+}
+
+/// Le cas du terrain : AVPlayer sonde `Range: bytes=0-1`, deux octets
+/// partent, la réponse est rejetée, rien ne joue. Le journal disait pourtant
+/// `browser_playback_confirmed_announcing` et l'historique s'écrivait.
+#[tokio::test]
+async fn zone_navigateur_une_sonde_de_plage_ne_confirme_rien_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 2).await;
+
+    assert!(
+        !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+        "#6066 : deux octets tirés par une sonde de plage ont suffi à dire \
+         « en écoute » alors que rien ne jouait"
+    );
+    assert_eq!(
+        lignes_historique(&orch),
+        0,
+        "#6066 : une sonde de plage a écrit une ligne d'historique"
+    );
+    assert!(
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .contains_key(&zone_id),
+        "l'annonce reste en attente : le lecteur peut encore démarrer"
+    );
+}
+
+/// La parole du lecteur : position nulle → rien ; position qui avance → la
+/// confirmation part, une fois, sans attendre le tick du sondeur.
+#[tokio::test]
+async fn zone_navigateur_le_lecteur_qui_joue_confirme_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 2).await;
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 0).await,
+        crate::orchestrator::SignalDuLecteur::PasEncoreDeLecture,
+        "un lecteur à 0 ms n'a rien fait entendre"
+    );
+    assert_eq!(lignes_historique(&orch), 0);
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 1_500).await,
+        crate::orchestrator::SignalDuLecteur::Confirmee,
+        "le lecteur de la zone dit jouer ce flux : l'annonce part"
+    );
+    assert_eq!(lignes_historique(&orch), 1);
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 2_500).await,
+        crate::orchestrator::SignalDuLecteur::RienEnAttente,
+        "une écoute, une annonce : le signal suivant ne doublonne pas"
+    );
+    assert_eq!(lignes_historique(&orch), 1);
+}
+
+/// Un lecteur qui a parlé fait taire le repli par les octets pour SA zone :
+/// un préchargement ou un autre client qui tire 64 Kio ne confirme plus à
+/// sa place.
+#[tokio::test]
+async fn zone_navigateur_apres_la_parole_du_lecteur_les_octets_ne_suffisent_plus_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 0).await;
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 0).await,
+        crate::orchestrator::SignalDuLecteur::PasEncoreDeLecture
+    );
+    {
+        let sessions = orch.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions
+            .get(&sid)
+            .unwrap()
+            .bytes_sent
+            .store(1 << 20, std::sync::atomic::Ordering::Relaxed);
+    }
+    assert!(
+        !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+        "ce lecteur sait dire quand il joue : des octets tirés ne parlent \
+         pas à sa place"
+    );
+    assert_eq!(lignes_historique(&orch), 0);
+}
+
+/// La parole d'un lecteur sur un AUTRE flux que celui en attente (lecture
+/// remplacée entre-temps) ne libère rien.
+#[tokio::test]
+async fn zone_navigateur_un_signal_sur_un_flux_perime_ne_confirme_rien_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, _sid) = zone_navigateur_en_attente(&orch, &f, 0).await;
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, "flux-d-avant", 30_000)
+            .await,
+        crate::orchestrator::SignalDuLecteur::RienEnAttente
+    );
+    assert_eq!(lignes_historique(&orch), 0);
+}
+
 #[tokio::test]
 async fn test_resolve_cover_url_passthrough() {
     let orch = test_orchestrator();
