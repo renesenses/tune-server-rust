@@ -77,6 +77,10 @@ use crate::routes::{
 pub const SOURCE: &str = "circle";
 /// Le pont dit que le serveur du contact n'est pas connecté.
 pub const CODE_PROPRIETAIRE_ETEINT: &str = "circle.owner_offline";
+/// L'écoute chez un contact est fermée sur ce serveur (réglage local
+/// [`tune_core::cloud::CLE_ECOUTE_DE_CERCLE`], fermé par défaut : décision
+/// produit du 10/10).
+pub const CODE_ECOUTE_FERMEE: &str = "circle.listen_disabled";
 /// `zone_id` absent ou non entier.
 pub const CODE_ZONE_INVALIDE: &str = "circle.invalid_zone";
 /// `track_ids` vide, trop long, ou pas une liste d'entiers ; `album_id` absent.
@@ -301,6 +305,12 @@ impl Ecoute {
     }
 
     /// Un billet pour `(user_id, track_id)`, sondé auprès du pont.
+    /// Le réglage local [`tune_core::cloud::CLE_ECOUTE_DE_CERCLE`], relu à
+    /// chaque demande.
+    pub fn ecoute_ouverte(&self) -> bool {
+        tune_core::cloud::ecoute_de_cercle_ouverte(&self.relais.reglages())
+    }
+
     async fn billet(&self, user_id: &str, track_id: &Value) -> Billet {
         let envoi = json!({ "track_id": track_id });
         let issue = self
@@ -391,6 +401,11 @@ fn chiffres(v: &Value) -> Option<String> {
 #[async_trait]
 impl FournisseurDUrl for Ecoute {
     async fn url(&self, zone_id: i64, source_id: &str) -> Result<UrlFournie, RefusDUrl> {
+        // Interrupteur fermé : aucune ligne `circle` ne se résout plus, même
+        // posée avant la fermeture, et le cloud n'est pas appelé.
+        if !self.ecoute_ouverte() {
+            return Err(RefusDUrl::ArretDeLaFile("listen_disabled".into()));
+        }
         let Some((user_id, track_id)) = lire_la_reference(source_id) else {
             return Err(RefusDUrl::Piste("reference".into()));
         };
@@ -534,6 +549,11 @@ async fn ecouter(
     // compte est un entier (site-mozaiklabs#233), tout le reste est inconnu.
     if !identifiant_valide(&user_id) || !que_des_chiffres(&user_id) {
         return introuvable();
+    }
+    // Interrupteur fermé (le défaut) : ni billet, ni sonde, ni file.
+    if !ecoute.ecoute_ouverte() {
+        info!("circle_ecoute_refusee_ecoute_fermee");
+        return refus(StatusCode::NOT_FOUND, json!({ "code": CODE_ECOUTE_FERMEE }));
     }
     let demande = serde_json::from_slice::<Value>(&corps).unwrap_or(Value::Null);
     let Some(zone_id) = zone_id_de(&demande) else {
