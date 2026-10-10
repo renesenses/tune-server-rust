@@ -2267,6 +2267,18 @@ impl PlaybackOrchestrator {
             .await
             .now_playing
             .and_then(|np| np.stream_id);
+        // #6059 — un flux natif qui commence DÉJÀ à la position : un `Seek`
+        // par-dessus le décalerait d'autant (et le renderer l'ignore).
+        if let Some(depart_ms) = stream_id
+            .as_deref()
+            .and_then(crate::outputs::dlna_depart_natif::depart_de_session)
+        {
+            info!(
+                zone_id,
+                position_ms, depart_ms, "seek_natif_flux_deja_a_la_position"
+            );
+            return;
+        }
         let session_is_range_seekable = match stream_id {
             Some(ref sid) => self.streamer.is_seekable_session(sid).await,
             None => false,
@@ -3541,6 +3553,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
+                // #6059 — un renderer profilé « Seek inopérant » (Yamaha
+                // R-N2000A) : le flux natif est relancé à la position.
+                if let Some(resultat) = self
+                    .deplacer_en_flux_natif_6059(zone_id, did, position_ms, state)
+                    .await
+                {
+                    if let Err(e) = resultat {
+                        warn!(zone_id, error = %e, "seek_natif_echoue");
+                        self.playback.seek(zone_id, original_position_ms).await;
+                        return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                    }
+                    return Ok(());
+                }
                 let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                     OutputCommandError::failed(
                         OutputCommand::Seek,
@@ -3548,6 +3573,21 @@ impl PlaybackOrchestrator {
                     )
                 })?;
                 output.lock().await.checked_seek(position_ms).await?;
+                // #6059 — un fichier natif sur une zone DLNA : le sondeur
+                // vérifiera que le renderer a bien exécuté ce `Seek`.
+                if zone_output_type.as_deref() == Some("dlna")
+                    && let Some(np) = state.now_playing.as_ref()
+                    && np.source == "local"
+                    && let Some(sid) = np.stream_id.as_deref()
+                    && self.fichier_natif_de_session(sid).await.is_some()
+                {
+                    super::seek_natif_6059::noter_seek_envoye(
+                        zone_id,
+                        did,
+                        original_position_ms.max(0) as u64,
+                        position_ms,
+                    );
+                }
             }
         }
         Ok(())

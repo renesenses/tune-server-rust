@@ -78,7 +78,10 @@ async fn get_status_with_signal_path_bounded(
 > {
     let poll = async {
         let output = output_arc.lock().await;
-        let status = output.get_status().await?;
+        let mut status = output.get_status().await?;
+        // #6059 — un flux natif relancé à la position : le renderer compte
+        // depuis le début de CE flux, on le rapporte à la piste.
+        crate::outputs::dlna_depart_natif::corriger_le_statut(output.device_id(), &mut status);
         let progress = if status.realtime {
             None
         } else {

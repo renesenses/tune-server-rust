@@ -22,6 +22,8 @@ pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
+/// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
+pub mod depart_natif;
 pub mod dff;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).

@@ -1724,6 +1724,10 @@ mod relance_ytdlp_4366;
 mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
+// #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
+pub(crate) mod seek_natif_6059;
+#[cfg(test)]
+mod seek_natif_6059_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
