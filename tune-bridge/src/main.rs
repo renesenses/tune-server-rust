@@ -2,6 +2,8 @@ mod api_proxy;
 mod circle;
 mod licence;
 mod protocol;
+#[cfg(test)]
+mod relais_par_url_tests;
 mod state;
 mod stream_proxy;
 mod web_ui;
@@ -70,7 +72,19 @@ async fn main() {
     let app = web_ui::monter(app);
     let app = app
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        // Traces HTTP avec l'URI MASQUEE : `/stream/relay`, `/ws/client` et
+        // les lectures relayees portent le jeton de pont en `?token=`, et la
+        // trace par defaut de tower-http ecrirait l'URI en clair.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |requete: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %requete.method(),
+                    uri = %api_proxy::uri_masquee(requete.uri()),
+                    version = ?requete.version(),
+                )
+            },
+        ))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");

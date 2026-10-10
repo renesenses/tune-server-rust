@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -13,7 +13,8 @@ pub async fn proxy_api(
     State(state): State<Arc<RelayState>>,
     Path((server_id, path)): Path<(String, String)>,
     headers: HeaderMap,
-    method: axum::http::Method,
+    method: Method,
+    uri: Uri,
     body: axum::body::Bytes,
 ) -> Response {
     // Validate server exists
@@ -34,31 +35,29 @@ pub async fn proxy_api(
     // `X-Bridge-Token` separe les deux. L'ancienne forme reste acceptee : la
     // premiere version de tune-remote l'utilise, et casser un client deja
     // livre pour une question de propriete serait mal echange.
-    let token = extraire_jeton(&headers);
-    match token.as_deref() {
-        Some(t) if state.server_for_token(t).as_deref() == Some(&server_id) => {}
+    //
+    // A defaut d'en-tete, une LECTURE (GET, HEAD) peut porter le jeton dans
+    // l'URL, `?token=` ou `?bridge_token=` : un `<img src>`, un `<a href>` de
+    // telechargement ou une navigation n'ont aucun moyen de poser un en-tete
+    // — c'est deja la regle de `/stream/relay` pour la balise `<audio>`.
+    // Jamais pour une ecriture : un lien piege ne doit pas pouvoir agir.
+    let token = extraire_jeton(&headers).or_else(|| {
+        matches!(method, Method::GET | Method::HEAD)
+            .then(|| jeton_de_requete(uri.query()))
+            .flatten()
+    });
+    let token = match token {
+        Some(t) if state.server_for_token(&t).as_deref() == Some(&server_id) => t,
         _ => return StatusCode::UNAUTHORIZED.into_response(),
-    }
+    };
+    // Le jeton ne doit JAMAIS atteindre le serveur (journaux d'acces,
+    // historiques) : on retire les parametres qui le portent, et eux seuls.
+    let requete = requete_sans_jeton(uri.query(), &token);
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Build relay headers (forward relevant ones)
-    let mut relay_headers = serde_json::Map::new();
-    for (name, value) in headers.iter() {
-        let key = name.as_str();
-        if matches!(key, "content-type" | "accept" | "authorization" | "range")
-            && let Ok(v) = value.to_str()
-        {
-            // Ne PAS transmettre un `Authorization` qui porte le jeton de
-            // pont : il ne concerne que le relais, et le serveur y
-            // chercherait un `Bearer`. Un vrai `Bearer` destine au serveur
-            // passe, lui, sans y toucher.
-            if key == "authorization" && porte_un_jeton_de_pont(v) {
-                continue;
-            }
-            relay_headers.insert(key.to_string(), serde_json::Value::String(v.to_string()));
-        }
-    }
+    let relay_headers = entetes_a_relayer(&headers);
 
     let body_str = if body.is_empty() {
         None
@@ -70,7 +69,10 @@ pub async fn proxy_api(
         "type": "relay.request",
         "id": request_id,
         "method": method.as_str(),
-        "path": format!("/api/v1/{path}"),
+        "path": match requete {
+            Some(q) => format!("/api/v1/{path}?{q}"),
+            None => format!("/api/v1/{path}"),
+        },
         "headers": relay_headers,
         "body": body_str,
     });
@@ -102,6 +104,126 @@ pub async fn proxy_api(
             StatusCode::GATEWAY_TIMEOUT.into_response()
         }
     }
+}
+
+/// En-tetes du navigateur transmis au serveur — liste BLANCHE.
+///
+/// - `content-type`, `accept` : la negociation de base ;
+/// - `authorization` : le `Bearer` du compte Tune (voir plus bas) ;
+/// - `range`, `if-range` : lecture partielle ;
+/// - `if-none-match`, `if-modified-since`, `cache-control` : les validateurs
+///   de cache, sans lesquels chaque pochette repart en entier ;
+/// - `x-tune-profile` : le profil actif. Sans lui, le serveur rend favoris et
+///   historique du profil par defaut a tout le monde.
+///
+/// Ni `cookie` (la session du navigateur vise le domaine du pont, pas le
+/// serveur), ni `x-bridge-token` (il ne concerne que le relais).
+pub const ENTETES_RELAYES: [&str; 9] = [
+    "content-type",
+    "accept",
+    "authorization",
+    "range",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
+    "cache-control",
+    "x-tune-profile",
+];
+
+/// Les en-tetes de la requete du navigateur a transmettre au serveur.
+pub fn entetes_a_relayer(headers: &HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+    let mut relayes = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str();
+        if !ENTETES_RELAYES.contains(&key) {
+            continue;
+        }
+        let Ok(v) = value.to_str() else { continue };
+        // Ne PAS transmettre un `Authorization` qui porte le jeton de pont :
+        // il ne concerne que le relais, et le serveur y chercherait un
+        // `Bearer`. Un vrai `Bearer` destine au serveur passe, lui, sans y
+        // toucher.
+        if key == "authorization" && porte_un_jeton_de_pont(v) {
+            continue;
+        }
+        relayes.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+    }
+    relayes
+}
+
+/// Noms des parametres d'URL qui peuvent porter le jeton de pont.
+pub const PARAMETRES_DU_JETON: [&str; 2] = ["token", "bridge_token"];
+
+/// Jeton de pont lu dans la chaine de requete (`token=` ou `bridge_token=`).
+pub fn jeton_de_requete(requete: Option<&str>) -> Option<String> {
+    requete?
+        .split('&')
+        .filter_map(|paire| paire.split_once('='))
+        .filter(|(nom, _)| PARAMETRES_DU_JETON.contains(nom))
+        .map(|(_, valeur)| decoder_pourcent(valeur).trim().to_string())
+        .find(|t| !t.is_empty())
+}
+
+/// La chaine de requete sans les parametres qui portent `jeton`.
+///
+/// Seuls les parametres dont la VALEUR est le jeton de pont sont retires : un
+/// `?token=` qui appartient au serveur passe intact. Les autres paires sont
+/// recopiees telles quelles, sans re-encodage. `None` quand il ne reste rien.
+pub fn requete_sans_jeton(requete: Option<&str>, jeton: &str) -> Option<String> {
+    let reste: Vec<&str> = requete?
+        .split('&')
+        .filter(|paire| !paire.is_empty())
+        .filter(|paire| match paire.split_once('=') {
+            Some((nom, valeur)) => {
+                !(PARAMETRES_DU_JETON.contains(&nom) && decoder_pourcent(valeur).trim() == jeton)
+            }
+            None => true,
+        })
+        .collect();
+    (!reste.is_empty()).then(|| reste.join("&"))
+}
+
+/// L'URI telle qu'elle peut paraitre dans un journal : la valeur de tout
+/// parametre `token` / `bridge_token` est masquee. Le jeton de pont ouvre
+/// l'acces complet a un serveur ; il n'a rien a faire dans des traces.
+pub fn uri_masquee(uri: &Uri) -> String {
+    let Some(requete) = uri.query() else {
+        return uri.path().to_string();
+    };
+    let masquee: Vec<String> = requete
+        .split('&')
+        .map(|paire| match paire.split_once('=') {
+            Some((nom, _)) if PARAMETRES_DU_JETON.contains(&nom) => format!("{nom}=***"),
+            _ => paire.to_string(),
+        })
+        .collect();
+    format!("{}?{}", uri.path(), masquee.join("&"))
+}
+
+/// Decodage `application/x-www-form-urlencoded` d'une valeur : `+` et `%XX`.
+/// Une sequence invalide est gardee telle quelle.
+fn decoder_pourcent(valeur: &str) -> String {
+    let octets = valeur.as_bytes();
+    let mut sortie = Vec::with_capacity(octets.len());
+    let mut i = 0;
+    while i < octets.len() {
+        match octets[i] {
+            b'+' => sortie.push(b' '),
+            b'%' if i + 2 < octets.len() => {
+                let hex = std::str::from_utf8(&octets[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(o) => {
+                        sortie.push(o);
+                        i += 2;
+                    }
+                    None => sortie.push(b'%'),
+                }
+            }
+            o => sortie.push(o),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&sortie).into_owned()
 }
 
 /// En-tete dedie au jeton de pont.
@@ -213,5 +335,54 @@ mod jeton_de_pont_tests {
     #[test]
     fn sans_rien_aucun_jeton() {
         assert_eq!(extraire_jeton(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn le_jeton_se_lit_dans_lurl_sous_ses_deux_noms() {
+        assert_eq!(
+            jeton_de_requete(Some("size=3&token=abc")).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            jeton_de_requete(Some("bridge_token=a%2Bb")).as_deref(),
+            Some("a+b")
+        );
+        assert_eq!(jeton_de_requete(Some("token=")), None);
+        assert_eq!(jeton_de_requete(Some("tokens=abc")), None);
+        assert_eq!(jeton_de_requete(None), None);
+    }
+
+    #[test]
+    fn seul_le_parametre_qui_porte_le_jeton_est_retire() {
+        assert_eq!(
+            requete_sans_jeton(Some("size=3&token=abc&v=%20x"), "abc").as_deref(),
+            Some("size=3&v=%20x")
+        );
+        assert_eq!(requete_sans_jeton(Some("bridge_token=abc"), "abc"), None);
+        assert_eq!(
+            requete_sans_jeton(Some("token=autre"), "abc").as_deref(),
+            Some("token=autre")
+        );
+        assert_eq!(requete_sans_jeton(None, "abc"), None);
+    }
+
+    /// Le jeton de pont n'apparait dans AUCUNE trace, sous aucun de ses noms.
+    #[test]
+    fn le_jeton_est_masque_dans_les_traces() {
+        let uri: Uri =
+            "/api/relay/srv/library/artwork/a.jpg?size=3&token=SECRET&bridge_token=SECRET"
+                .parse()
+                .unwrap();
+        let trace = uri_masquee(&uri);
+        assert!(
+            !trace.contains("SECRET"),
+            "jeton en clair dans la trace : {trace}"
+        );
+        assert_eq!(
+            trace,
+            "/api/relay/srv/library/artwork/a.jpg?size=3&token=***&bridge_token=***"
+        );
+        let flux: Uri = "/stream/relay/srv/abc?token=SECRET".parse().unwrap();
+        assert_eq!(uri_masquee(&flux), "/stream/relay/srv/abc?token=***");
     }
 }

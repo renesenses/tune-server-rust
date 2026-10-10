@@ -37,7 +37,18 @@ pub struct SqliteDb {
     /// jeton vit ; `None` en mémoire, hors WAL, ou si le replieur n'a pas pu
     /// s'ouvrir (voir [`crate::db::replieur_wal`]).
     _replieur_wal: Option<crate::db::replieur_wal::Vigie>,
+    /// #5993 — une connexion qui n'écrit JAMAIS, pour lire
+    /// `PRAGMA data_version` : la valeur change dès qu'une AUTRE connexion
+    /// (l'écrivain, un replieur, un `sqlite3` externe) valide une écriture.
+    /// `None` en mémoire, ou si elle n'a pas pu s'ouvrir.
+    observateur: Option<Arc<Mutex<Connection>>>,
+    /// Identifiant de CETTE ouverture : deux bases ouvertes dans le même
+    /// processus ne partagent jamais un jeton.
+    instance: u64,
 }
+
+/// Compteur des ouvertures de base du processus (voir [`SqliteDb::instance`]).
+static OUVERTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Une connexion de lecture EMPRUNTÉE au pool (#4800).
 ///
@@ -295,6 +306,10 @@ impl SqliteDb {
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
             _replieur_wal: replieur_wal,
+            observateur: Connection::open_with_flags(path, read_flags)
+                .ok()
+                .map(|c| Arc::new(Mutex::new(c))),
+            instance: OUVERTURES.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -315,7 +330,23 @@ impl SqliteDb {
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
             _replieur_wal: None,
+            observateur: None,
+            instance: OUVERTURES.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// #5993 — un jeton qui CHANGE à chaque écriture validée, quelle que soit
+    /// la connexion qui l'a faite : `(instance, PRAGMA data_version)` lu sur
+    /// une connexion qui n'écrit jamais. Un résultat mis en cache sous un
+    /// jeton reste juste tant que le jeton relu est le même. `None` en
+    /// mémoire (une seule connexion, qui écrit elle-même) ou en cas d'erreur :
+    /// pas de cache.
+    pub fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        let conn = self.observateur.as_ref()?.lock().ok()?;
+        let version: i64 = conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .ok()?;
+        Some((self.instance, version))
     }
 
     /// La connexion d'écriture. `connection().lock()` rend une garde qui se
@@ -485,6 +516,9 @@ impl Clone for SqliteDb {
             read_counter: self.read_counter.clone(),
             liberation: self.liberation.clone(),
             _replieur_wal: self._replieur_wal.clone(),
+            // Même base, même jeton : le clone partage l'observateur.
+            observateur: self.observateur.clone(),
+            instance: self.instance,
         }
     }
 }
