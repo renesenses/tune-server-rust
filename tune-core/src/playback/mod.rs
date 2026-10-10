@@ -26,8 +26,9 @@ pub mod radio_artiste;
 // toute lecture du code confirmait ce récit — alors que le seul chemin que
 // l'utilisateur atteint est la route `POST /zones/{id}/crossfade`, fermée par
 // #2689 : elle refuse l'activation par un 501 `crossfade_unavailable` et force
-// la préférence persistée à `false`. Le fondu enchaîné n'existe donc sous
-// AUCUNE forme, pas même la mauvaise.
+// la préférence persistée à `false`. Le fondu enchaîné n'existait donc sous
+// AUCUNE forme, pas même la mauvaise. Depuis, le vrai fondu est branché sur la
+// sortie locale (`audio::fondu_enchaine::PuitsDeFondu`, #2211).
 //
 // L'arbitrage de Bertrand du 02/09/2026 sur #2211 est explicite : le vrai
 // fondu enchaîné mélangera deux flux décodés dans le moteur audio, sur la

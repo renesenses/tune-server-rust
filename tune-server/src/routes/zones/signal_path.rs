@@ -1511,6 +1511,19 @@ fn assembler_les_etapes(
         }));
     }
 
+    // Étape « Fondu enchaîné » (#2211) — la sortie locale la DÉCLARE pendant
+    // le recouvrement, et lui seul : hors de là le moteur laisse passer les
+    // mots inchangés. Deux pistes additionnées sous enveloppe : plus rien
+    // n'est bit-perfect pendant ces secondes-là, et l'écran le dit.
+    if reel.is_some_and(|t| t.fondu_enchaine()) {
+        steps.push(json!({
+            "name": "Fondu enchaîné",
+            "code": "crossfade",
+            "description": "Deux pistes superposées le temps du fondu enchaîné",
+            "bit_perfect": false,
+        }));
+    }
+
     // #4573 — la réduction de canaux du chemin RÉSEAU, dite à l'écran.
     //
     // Ce panneau était FERMÉ à ce que fait une zone non locale : la sonde
@@ -1673,8 +1686,8 @@ fn rendre_les_verdicts(
     // le verdict, quoi que les réglages aient prédit ; leur absence ne le
     // relève jamais — la sortie n'observe pas ce que fait l'orchestrateur
     // en amont (ReplayGain, repli mono, transcodage).
-    let transformation_reelle_declaree =
-        transformations_reelles.is_some_and(|reel| reel.dsp_actif() || reel.adaptation_canaux());
+    let transformation_reelle_declaree = transformations_reelles
+        .is_some_and(|reel| reel.dsp_actif() || reel.adaptation_canaux() || reel.fondu_enchaine());
 
     // Overall bit-perfect: lossless source + no transcoding + no DSP + no
     // resampling + no ReplayGain. Volume is excluded — it's a user preference,

@@ -872,6 +872,21 @@ pub trait StreamingService: Send + Sync {
         true
     }
 
+    /// Les favoris de ce service sont-ils tenus en MIROIR par Tune ?
+    ///
+    /// Go de Bertrand du 08/10/2026 (fil 2186, FabienM ; #5997) : pour un
+    /// service en miroir, la vérité est CHEZ LE SERVICE. Un cœur posé ou
+    /// retiré dans Tune y est propagé par le serveur, un favori posé ou retiré
+    /// dans l'application du service apparaît ou disparaît dans Favoris au
+    /// rafraîchissement, et ces favoris sont communs à tous les profils —
+    /// voir [`crate::streaming::favorites_mirror`].
+    ///
+    /// `false` par défaut : un service hors miroir garde des favoris propres à
+    /// chaque profil, exactement comme avant.
+    fn favoris_miroir(&self) -> bool {
+        false
+    }
+
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err(TuneError::Unsupported("not supported".into()))

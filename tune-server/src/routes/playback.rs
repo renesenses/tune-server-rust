@@ -389,7 +389,15 @@ pub(crate) fn entrees_de_file(
                 duration_ms: s.duration_ms.unwrap_or(0),
                 track_number: None,
                 disc_number: None,
-                album_ref: None,
+                // #6079 — l'album du titre chez son service, que la playlist
+                // garde : « Aller à l'album » depuis la file. Pour Bandcamp,
+                // seule une page sûre entre (le serveur l'ouvre lui-même).
+                album_ref: if s.source == "bandcamp" {
+                    crate::routes::zones::page_d_album_bandcamp_sure(s.album_source_id.as_deref())
+                } else {
+                    crate::routes::zones::identifiant_de_service_sur(s.album_source_id.as_deref())
+                },
+                artist_ref: None,
             },
         })
         .collect()
@@ -877,10 +885,15 @@ fn avertissements_de_lecture(
 ///
 /// `Err(motif)` dit pourquoi l'album n'a pas pu servir ; l'appelant garde
 /// alors la file d'un seul titre, comme avant.
+///
+/// #6079 — `fiche_lue` reçoit la fiche du titre dès qu'elle a été lue, même
+/// quand l'album échoue ensuite : la file d'un seul titre y prend l'album et
+/// l'artiste CHEZ LE SERVICE, sans seconde requête.
 async fn album_du_titre_de_service(
     state: &AppState,
     source: &str,
     source_id: &str,
+    fiche_lue: &mut Option<tune_core::streaming::traits::StreamTrack>,
 ) -> Result<
     (
         String,
@@ -902,6 +915,7 @@ async fn album_du_titre_de_service(
             .get_track(source_id)
             .await
             .map_err(|e| format!("titre_illisible: {e}"))?;
+        *fiche_lue = Some(titre.clone());
         let album_id = titre
             .album_id
             .filter(|a| !a.trim().is_empty())
@@ -979,6 +993,13 @@ struct PlayRequest {
     /// (`track_id`, ou `source` + `source_id`).
     #[serde(default)]
     explicit_version: bool,
+    /// #6079 : l'album et l'artiste d'un titre de service lancé SEUL, CHEZ
+    /// SON SERVICE (`StreamTrack.album_id` / `artist_id`), quand le client
+    /// les connaît. Rangés avec la ligne de file
+    /// (`zones::album_de_service_de_la_demande`) ; à défaut, le serveur les
+    /// demande au service une fois la lecture partie.
+    album_id_service: Option<String>,
+    artist_id_service: Option<String>,
 }
 
 /// Les cinq natures d'objet que l'auditeur peut demander, telles que FabienM
@@ -1327,6 +1348,10 @@ struct QueueAddRequest {
     /// Web#1923, web#1924 : la page de l'album du titre Bandcamp seul
     /// (`source` + `source_id`). Même règle que `PlayRequest.album_ref`.
     album_ref: Option<String>,
+    /// #6079 : l'album et l'artiste du titre seul CHEZ SON SERVICE. Même
+    /// règle que `PlayRequest.album_id_service`.
+    album_id_service: Option<String>,
+    artist_id_service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1342,6 +1367,9 @@ struct StreamingTrackItem {
     disc_number: Option<i64>,
     /// La page de l'album de cette ligne, pour une piste Bandcamp.
     album_ref: Option<String>,
+    /// #6079 : l'album et l'artiste de cette ligne CHEZ SON SERVICE.
+    album_id_service: Option<String>,
+    artist_id_service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2198,6 +2226,9 @@ async fn play(
     // aussi. Le contexte de session posé au-dessus reste celui du geste.
     let mut body = body;
     let mut pistes_de_l_album: Option<Vec<tune_core::streaming::traits::StreamTrack>> = None;
+    // #6079 — la fiche du titre lue pour chercher son album, gardée pour la
+    // file d'un seul titre si l'album n'a pas pu servir.
+    let mut fiche_du_titre: Option<tune_core::streaming::traits::StreamTrack> = None;
     if let (Some(source), Some(source_id)) = (body.source.clone(), body.source_id.clone())
         && body.track_id.is_none()
         && body.track_ids.is_none()
@@ -2213,7 +2244,8 @@ async fn play(
             source_id.as_str(),
         );
         if deja == FileDejaChargee::RemplacerParCeTitre {
-            match album_du_titre_de_service(&state, &source, &source_id).await {
+            match album_du_titre_de_service(&state, &source, &source_id, &mut fiche_du_titre).await
+            {
                 Ok((album_id, pistes, index)) => {
                     info!(
                         zone_id,
@@ -2336,9 +2368,15 @@ async fn play(
         // la page qui permettra de resigner l'URL de flux quand elle expirera
         // (fil 2121).
         let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
-        if let Err(e) =
-            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
-        {
+        // #6079 — l'artiste de chaque piste chez le service, déjà dans la
+        // réponse du service : aucune requête de plus.
+        let artist_refs: Vec<Option<String>> = tracks.iter().map(|t| t.artist_id.clone()).collect();
+        if let Err(e) = queue_repo.set_streaming_queue_avec_references(
+            zone_id,
+            &queue_items,
+            &album_refs,
+            &artist_refs,
+        ) {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
         // #5372 — la branche prise et la longueur de la file, en INFO : sans
@@ -2494,9 +2532,15 @@ async fn play(
         // la page qui permettra de resigner l'URL de flux quand elle expirera
         // (fil 2121).
         let album_refs: Vec<Option<String>> = tracks.iter().map(|t| t.album_id.clone()).collect();
-        if let Err(e) =
-            queue_repo.set_streaming_queue_avec_albums(zone_id, &queue_items, &album_refs)
-        {
+        // #6079 — l'artiste de chaque piste chez le service, déjà dans la
+        // réponse du service : aucune requête de plus.
+        let artist_refs: Vec<Option<String>> = tracks.iter().map(|t| t.artist_id.clone()).collect();
+        if let Err(e) = queue_repo.set_streaming_queue_avec_references(
+            zone_id,
+            &queue_items,
+            &album_refs,
+            &artist_refs,
+        ) {
             warn!(zone_id, error = %e, "set_streaming_queue_failed");
         }
         state
@@ -2601,6 +2645,34 @@ async fn play(
             &source_id_val,
             body.album_ref.as_deref(),
         );
+        // #6079 — l'album et l'artiste CHEZ LE SERVICE pour la ligne de file :
+        // ceux du client, sinon ceux d'une fiche déjà lue.
+        let album_de_la_ligne = crate::routes::zones::album_de_service_de_la_demande(
+            &state,
+            source_for_q.as_deref().unwrap_or(""),
+            &source_id_val,
+            body.album_ref.as_deref(),
+            body.album_id_service.as_deref(),
+        )
+        .or(meta.album_id_service);
+        let artiste_de_la_ligne =
+            crate::routes::zones::identifiant_de_service_sur(body.artist_id_service.as_deref())
+                .or(meta.artist_id_service);
+        // La fiche lue plus haut pour chercher l'album (#5372) : aucune requête
+        // de plus. Bandcamp exclu — sa règle de page sûre a déjà parlé.
+        let fiche = fiche_du_titre
+            .as_ref()
+            .filter(|_| source_for_q.as_deref() != Some("bandcamp"));
+        let album_de_la_ligne = album_de_la_ligne.or_else(|| {
+            fiche.and_then(|t| {
+                crate::routes::zones::identifiant_de_service_sur(t.album_id.as_deref())
+            })
+        });
+        let artiste_de_la_ligne = artiste_de_la_ligne.or_else(|| {
+            fiche.and_then(|t| {
+                crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
+            })
+        });
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -2659,6 +2731,8 @@ async fn play(
                         persist_queue_async(&state, zone_id);
                     }
                     FileDejaChargee::RemplacerParCeTitre => {
+                        let (album_ref_ligne, artist_ref_ligne) =
+                            (album_de_la_ligne, artiste_de_la_ligne);
                         // Not queued yet — make this single streaming track the queue.
                         queue_repo.clear(zone_id).ok();
                         if let Err(e) = queue_repo.append(
@@ -2668,7 +2742,9 @@ async fn play(
                                 // Web#1926 : un titre Bandcamp seul garde la
                                 // page de son album, envoyée par le client ou
                                 // déjà connue de Tune, pour « Aller à l'album ».
-                                album_ref: album_ref_val,
+                                // #6079 : toute autre source, son album chez
+                                // le service.
+                                album_ref: album_ref_ligne,
                                 source_id: source_id_val,
                                 title: title_val,
                                 artist: artist_val,
@@ -2677,6 +2753,7 @@ async fn play(
                                 duration_ms: duration_val,
                                 track_number: meta.track_number,
                                 disc_number: meta.disc_number,
+                                artist_ref: artist_ref_ligne,
                             }],
                         ) {
                             warn!(zone_id, error = %e, "queue_append_single_streaming_failed");
@@ -4139,14 +4216,12 @@ async fn get_queue(
                 // modèle : `artist_id` (entier de bibliothèque) pour une ligne
                 // locale, `artist_id_service` pour une ligne de service. Deux
                 // clefs ADDITIVES, toujours présentes, `null` quand rien n'est
-                // connu. ⚠️ `queue_items` ne garde pas l'artiste CHEZ LE
-                // SERVICE (seul `album_ref` l'est, migration 114) : la clef de
-                // service vaut donc `null` aujourd'hui, et le client retombe,
-                // pour une ligne de service, sur la recherche par nom
-                // (`destinationArtiste`). La remplir demande une colonne
-                // `artist_ref` et sa migration, hors de ce correctif.
+                // connu. #6079 : l'artiste CHEZ LE SERVICE est gardé avec la
+                // ligne depuis la migration 123 (`queue_items.artist_ref`) ;
+                // avant, la clef valait `null` en dur et le client cherchait
+                // l'artiste par son NOM — un homonyme menait ailleurs.
                 obj.insert("artist_id".into(), json!(e.artist_id));
-                obj.insert("artist_id_service".into(), Value::Null);
+                obj.insert("artist_id_service".into(), json!(e.artist_id_service()));
             }
             let suivant = entries.get(idx + 1);
             let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
@@ -4207,6 +4282,11 @@ struct StreamingQueueMeta {
     duration_ms: i64,
     track_number: Option<i64>,
     disc_number: Option<i64>,
+    /// #6079 — l'album et l'artiste CHEZ LE SERVICE, quand la fiche du
+    /// service a été lue (titre absent du client). `None` sur le chemin
+    /// rapide : aucune requête n'y part.
+    album_id_service: Option<String>,
+    artist_id_service: Option<String>,
     /// #4261 — pourquoi le titre est « Unknown », quand il l'est : le service
     /// n'est pas enregistré, ou sa réponse a échoué (motif du service). `None`
     /// quand les métadonnées sont celles du client ou du service. La réponse
@@ -4242,6 +4322,8 @@ async fn resolve_streaming_queue_meta(
             duration_ms: duration_ms.unwrap_or(0),
             track_number,
             disc_number,
+            album_id_service: None,
+            artist_id_service: None,
             non_resolu: None,
         };
     }
@@ -4268,6 +4350,12 @@ async fn resolve_streaming_queue_meta(
                         // when it sent one.
                         track_number: track_number.or(t.track_number.map(i64::from)),
                         disc_number: disc_number.or(t.disc_number.map(i64::from)),
+                        album_id_service: crate::routes::zones::identifiant_de_service_sur(
+                            t.album_id.as_deref(),
+                        ),
+                        artist_id_service: crate::routes::zones::identifiant_de_service_sur(
+                            t.artist_id.as_deref(),
+                        ),
                         non_resolu: None,
                     };
                 }
@@ -4302,7 +4390,69 @@ async fn resolve_streaming_queue_meta(
         duration_ms: 0,
         track_number,
         disc_number,
+        album_id_service: None,
+        artist_id_service: None,
         non_resolu: Some(non_resolu),
+    }
+}
+
+/// Le plus long qu'on attende la fiche d'un titre pour compléter ses
+/// identifiants de service (#6079). Au-delà, la ligne entre sans eux : un
+/// service lent ne doit pas retenir un ajout en file.
+const DELAI_FICHE_POUR_LES_REFERENCES: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #6079 — complète l'album et l'artiste CHEZ LE SERVICE d'un titre enfilé
+/// SEUL, quand ni le client ni la fiche déjà lue ne les ont donnés.
+///
+/// Le cas de FabienM : un titre Qobuz ajouté depuis une recherche, un favori
+/// ou l'historique. Les clients n'envoient que le titre, l'artiste et l'album
+/// en TEXTE ; la ligne de file n'avait donc ni `album_id_service` ni
+/// `artist_id_service`, et « Aller à l'album / à l'artiste » cherchait par le
+/// nom. Une seule requête `get_track`, bornée par
+/// [`DELAI_FICHE_POUR_LES_REFERENCES`], et seulement si une référence manque :
+/// un client qui les envoie ne coûte rien de plus. Jamais pour Bandcamp, qui
+/// refuse la fiche d'une piste seule. Un échec laisse les références telles
+/// quelles — la ligne entre quand même.
+async fn completer_references_de_service(
+    state: &AppState,
+    source: &str,
+    source_id: &str,
+    album: Option<String>,
+    artiste: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if (album.is_some() && artiste.is_some()) || source == "bandcamp" {
+        return (album, artiste);
+    }
+    // Le service SANS garder le registre verrouillé pendant la requête.
+    let Some(svc) = state.services.lock().await.get(source) else {
+        return (album, artiste);
+    };
+    let svc = svc.read().await;
+    match tokio::time::timeout(DELAI_FICHE_POUR_LES_REFERENCES, svc.get_track(source_id)).await {
+        Ok(Ok(t)) => (
+            album.or_else(|| {
+                crate::routes::zones::identifiant_de_service_sur(t.album_id.as_deref())
+            }),
+            artiste.or_else(|| {
+                crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
+            }),
+        ),
+        Ok(Err(e)) => {
+            tracing::debug!(
+                source,
+                source_id,
+                error = %e,
+                "file_references_de_service_fiche_refusee_6079"
+            );
+            (album, artiste)
+        }
+        Err(_) => {
+            warn!(
+                source,
+                source_id, "file_references_de_service_fiche_trop_lente_6079"
+            );
+            (album, artiste)
+        }
     }
 }
 
@@ -4444,13 +4594,29 @@ async fn queue_add(
                 "error": motif,
             }));
         }
+        // #6079 — l'album et l'artiste CHEZ LE SERVICE : ceux du client,
+        // sinon ceux de la fiche déjà lue, sinon une fiche demandée au service.
+        let album_demande = crate::routes::zones::album_de_service_de_la_demande(
+            &state,
+            source,
+            source_id,
+            body.album_ref.as_deref(),
+            body.album_id_service.as_deref(),
+        )
+        .or(meta.album_id_service);
+        let artiste_demande =
+            crate::routes::zones::identifiant_de_service_sur(body.artist_id_service.as_deref())
+                .or(meta.artist_id_service);
+        let (album_ref, artist_ref) = completer_references_de_service(
+            &state,
+            source,
+            source_id,
+            album_demande,
+            artiste_demande,
+        )
+        .await;
         inputs.push(QueueInput::Streaming {
-            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
-                &state,
-                source,
-                source_id,
-                body.album_ref.as_deref(),
-            ),
+            album_ref,
             source: source.clone(),
             source_id: source_id.clone(),
             title: meta.title,
@@ -4460,6 +4626,7 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
+            artist_ref,
         });
     }
 
@@ -4485,13 +4652,18 @@ async fn queue_add(
                 "error": motif,
             }));
         }
+        // #6079 — ceux du client, sinon ceux de la fiche déjà lue. Pas de
+        // fiche demandée en plus ici : un lot de trente titres coûterait
+        // trente requêtes. Un client qui veut ses lignes complètes les envoie.
         inputs.push(QueueInput::Streaming {
-            album_ref: crate::routes::zones::reference_d_album_de_la_demande(
+            album_ref: crate::routes::zones::album_de_service_de_la_demande(
                 &state,
                 &item.source,
                 &item.source_id,
                 item.album_ref.as_deref(),
-            ),
+                item.album_id_service.as_deref(),
+            )
+            .or(meta.album_id_service),
             source: item.source.clone(),
             source_id: item.source_id.clone(),
             title: meta.title,
@@ -4501,6 +4673,10 @@ async fn queue_add(
             duration_ms: meta.duration_ms,
             track_number: meta.track_number,
             disc_number: meta.disc_number,
+            artist_ref: crate::routes::zones::identifiant_de_service_sur(
+                item.artist_id_service.as_deref(),
+            )
+            .or(meta.artist_id_service),
         });
     }
 
@@ -5342,41 +5518,138 @@ async fn set_eq(
 
 #[derive(Deserialize)]
 struct CrossfadeSettings {
-    enabled: bool,
+    /// #2211 — durée du fondu enchaîné en secondes, de 0 à 12 ; `0` =
+    /// désactivé.
+    #[serde(default)]
     duration: Option<f64>,
+    /// Compatibilité avec l'ancien contrat : `enabled: false` vaut
+    /// `duration: 0`. `enabled: true` sans durée est refusé.
+    #[serde(default)]
+    enabled: Option<bool>,
 }
 
-/// Read the persisted crossfade settings for a zone.
-///
-/// Crossfade is not applied by the playback engine: report the capability as
-/// unavailable and never echo a stale persisted preference as if it were live.
-async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let requested_enabled = settings
-        .get(&format!("crossfade_enabled:{zone_id}"))
-        .ok()
-        .flatten()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let duration = settings
-        .get(&format!("crossfade_duration:{zone_id}"))
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(3.0);
-    Json(json!({
-        "available": false,
-        "enabled": false,
-        "requested_enabled": requested_enabled,
-        "duration": duration,
-    }))
+/// Pourquoi un réglage de fondu est refusé.
+#[derive(Debug, Clone, PartialEq)]
+enum RefusDuFondu {
+    ZoneInconnue,
+    /// Durée absente, négative, au-delà de 12 s ou non finie.
+    DureeInvalide,
+    /// La zone ne sort pas sur la carte son locale : le fondu n'y existe pas.
+    SortieNonLocale(String),
+    /// Zone locale en mode exclusif (WASAPI exclusif, ASIO, CoreAudio
+    /// exclusif) : ces bras enchaînent sans blanc mais ne fondent pas.
+    Exclusif,
 }
 
-fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
-    if body.enabled {
-        return Err("crossfade_unavailable");
+impl RefusDuFondu {
+    fn reponse(&self) -> axum::response::Response {
+        let (statut, code, message) = match self {
+            Self::ZoneInconnue => (
+                StatusCode::NOT_FOUND,
+                "zone_not_found",
+                "Zone inconnue.".to_string(),
+            ),
+            Self::DureeInvalide => (
+                StatusCode::BAD_REQUEST,
+                "crossfade_duration_invalid",
+                format!(
+                    "La durée du fondu enchaîné va de 0 à {} secondes (0 = désactivé).",
+                    tune_core::audio::fondu_enchaine::DUREE_MAX_S
+                ),
+            ),
+            Self::SortieNonLocale(type_de_sortie) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "crossfade_unavailable_for_output",
+                format!(
+                    "Le fondu enchaîné n'est disponible que sur une sortie locale (carte son de \
+                     cette machine). Cette zone sort sur « {type_de_sortie} » : l'enchaînement y \
+                     reste sans blanc (gapless)."
+                ),
+            ),
+            Self::Exclusif => (
+                StatusCode::NOT_IMPLEMENTED,
+                "crossfade_unavailable_exclusive",
+                "Le fondu enchaîné est indisponible en mode exclusif (WASAPI exclusif, ASIO, \
+                 CoreAudio exclusif) : cette sortie enchaîne les pistes sans blanc, mais ne les \
+                 superpose pas."
+                    .to_string(),
+            ),
+        };
+        (statut, Json(json!({"error": code, "message": message}))).into_response()
     }
-    Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
+}
+
+/// #2211 — la règle de la route, sans base ni réseau. `type_de_sortie` :
+/// celui de la zone, `None` si elle n'existe pas. `exclusive` : la sortie
+/// locale vivante joue par un bras exclusif (`None` : pas de sortie vivante,
+/// rien ne s'y oppose). Désactiver (`0`) est permis partout ; activer exige
+/// une sortie locale qui ne soit pas en mode exclusif.
+fn valider_le_reglage_de_fondu(
+    body: &CrossfadeSettings,
+    type_de_sortie: Option<&str>,
+    exclusive: Option<bool>,
+) -> Result<f64, RefusDuFondu> {
+    let Some(type_de_sortie) = type_de_sortie else {
+        return Err(RefusDuFondu::ZoneInconnue);
+    };
+    let demandee = if body.enabled == Some(false) {
+        0.0
+    } else {
+        body.duration.ok_or(RefusDuFondu::DureeInvalide)?
+    };
+    let duree = tune_core::audio::fondu_de_zone::duree_valide(demandee)
+        .ok_or(RefusDuFondu::DureeInvalide)?;
+    if duree > 0.0 && type_de_sortie != "local" {
+        return Err(RefusDuFondu::SortieNonLocale(type_de_sortie.to_string()));
+    }
+    if duree > 0.0 && exclusive == Some(true) {
+        return Err(RefusDuFondu::Exclusif);
+    }
+    Ok(duree)
+}
+
+/// Le type de sortie d'une zone (`local` par défaut, comme le chemin du
+/// signal), `None` si la zone n'existe pas.
+fn type_de_sortie_de_la_zone(state: &AppState, zone_id: i64) -> Option<String> {
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .map(|z| z.output_type.unwrap_or_else(|| "local".to_string()))
+}
+
+/// #2211 — le réglage de fondu enchaîné d'une zone. `available` : la zone
+/// sort sur la carte son locale, seul endroit où le fondu existe.
+async fn get_crossfade(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> axum::response::Response {
+    let Some(type_de_sortie) = type_de_sortie_de_la_zone(&state, zone_id) else {
+        return RefusDuFondu::ZoneInconnue.reponse();
+    };
+    let locale = type_de_sortie == "local";
+    let exclusive = if locale {
+        state.orchestrator.zone_locale_exclusive(zone_id).await == Some(true)
+    } else {
+        false
+    };
+    let disponible = locale && !exclusive;
+    let duree = if disponible {
+        tune_core::audio::fondu_de_zone::duree_reglee_s(&state.backend, zone_id)
+    } else {
+        0.0
+    };
+    Json(json!({
+        "zone_id": zone_id,
+        "available": disponible,
+        "output_type": type_de_sortie,
+        // Zone locale en mode exclusif : le réglage est refusé, l'écran le grise.
+        "exclusive": exclusive,
+        "enabled": duree > 0.0,
+        "duration": duree,
+        "max_duration": tune_core::audio::fondu_enchaine::DUREE_MAX_S,
+    }))
+    .into_response()
 }
 
 async fn set_crossfade(
@@ -5384,32 +5657,17 @@ async fn set_crossfade(
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
 ) -> impl IntoResponse {
-    let duration = match validate_crossfade_update(&body) {
-        Ok(duration) => duration,
-        Err(code) => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(json!({
-                    "error": code,
-                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
-                })),
-            )
-                .into_response();
-        }
+    let type_de_sortie = type_de_sortie_de_la_zone(&state, zone_id);
+    let exclusive = state.orchestrator.zone_locale_exclusive(zone_id).await;
+    let duree = match valider_le_reglage_de_fondu(&body, type_de_sortie.as_deref(), exclusive) {
+        Ok(duree) => duree,
+        Err(refus) => return refus.reponse(),
     };
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
-        error!(zone_id, %error, "crossfade_disable_persist_failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "crossfade_persist_failed"})),
-        )
-            .into_response();
-    }
     if let Err(error) = settings.set(
-        &format!("crossfade_duration:{zone_id}"),
-        &duration.to_string(),
+        &tune_core::audio::fondu_de_zone::cle_de_duree(zone_id),
+        &duree.to_string(),
     ) {
         error!(zone_id, %error, "crossfade_duration_persist_failed");
         return (
@@ -5418,11 +5676,21 @@ async fn set_crossfade(
         )
             .into_response();
     }
+    // La valeur vaut à la PROCHAINE frontière entre deux pistes : jamais au
+    // milieu d'une piste.
+    let sortie_vivante = state
+        .orchestrator
+        .refresh_zone_fondu_enchaine(zone_id)
+        .await;
     Json(json!({
         "zone_id": zone_id,
-        "available": false,
-        "crossfade_enabled": false,
-        "crossfade_duration": duration,
+        "available": true,
+        "crossfade_enabled": duree > 0.0,
+        "crossfade_duration": duree,
+        // `null` : aucune sortie locale vivante, la prochaine lecture posera
+        // la valeur. Un bras exclusif a déjà été refusé plus haut.
+        "applies_on_this_output": sortie_vivante,
+        "portee": "next_track",
     }))
     .into_response()
 }
@@ -5522,9 +5790,17 @@ async fn do_transfer(
             .iter()
             .map(|item| item["album_ref"].as_str().map(String::from))
             .collect();
-        if let Err(e) =
-            queue_repo.set_streaming_queue_avec_albums(target_zone, &tracks, &album_refs)
-        {
+        // #6079 — l'artiste chez le service suit aussi la piste.
+        let artist_refs: Vec<Option<String>> = streaming_items
+            .iter()
+            .map(|item| item["artist_ref"].as_str().map(String::from))
+            .collect();
+        if let Err(e) = queue_repo.set_streaming_queue_avec_references(
+            target_zone,
+            &tracks,
+            &album_refs,
+            &artist_refs,
+        ) {
             warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
         }
     }
@@ -6895,6 +7171,7 @@ mod contrat_suivant_radio_tests {
                 track_number: None,
                 disc_number: None,
                 album_ref: None,
+                artist_ref: None,
             })
             .collect();
         PlayQueueRepo::with_backend(state.backend.clone())
@@ -7570,6 +7847,7 @@ mod file_deja_chargee_2569 {
             album_ref: None,
             album_id: None,
             artist_id: None,
+            artist_ref: None,
         }
     }
 
@@ -7865,38 +8143,109 @@ mod tests_contexte_de_lecture {
 }
 
 #[cfg(test)]
-mod tests_crossfade_indisponible {
-    use super::{CrossfadeSettings, validate_crossfade_update};
+mod tests_reglage_du_fondu_2211 {
+    use super::{CrossfadeSettings, RefusDuFondu, valider_le_reglage_de_fondu};
 
-    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
-    /// n'en tient compte est un faux succès. L'activation doit échouer avant
-    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    fn duree(d: f64) -> CrossfadeSettings {
+        CrossfadeSettings {
+            duration: Some(d),
+            enabled: None,
+        }
+    }
+
+    /// #2211 — une zone LOCALE accepte une durée de 0 à 12 s.
     #[test]
-    fn activer_le_faux_crossfade_est_refuse() {
-        let body = CrossfadeSettings {
-            enabled: true,
-            duration: Some(5.0),
-        };
-
+    fn une_zone_locale_accepte_le_fondu() {
         assert_eq!(
-            validate_crossfade_update(&body),
-            Err("crossfade_unavailable")
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), None),
+            Ok(5.0)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(12.0), Some("local"), None),
+            Ok(12.0)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), None),
+            Ok(0.0)
+        );
+    }
+
+    /// Les autres sorties gardent un refus franc et motivé — contre-épreuve
+    /// du témoin précédent : la même durée, sur une zone DLNA.
+    #[test]
+    fn les_autres_sorties_refusent_le_fondu_et_disent_pourquoi() {
+        for sortie in ["dlna", "airplay", "chromecast", "oaat", "bluos"] {
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(5.0), Some(sortie), None),
+                Err(RefusDuFondu::SortieNonLocale(sortie.to_string())),
+                "{sortie}"
+            );
+            // Désactiver reste possible partout.
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(0.0), Some(sortie), None),
+                Ok(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn une_duree_hors_bornes_est_refusee_pas_bornee_en_silence() {
+        for d in [-1.0, 12.5, 99.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(d), Some("local"), None),
+                Err(RefusDuFondu::DureeInvalide),
+                "{d}"
+            );
+        }
+        let sans_duree = CrossfadeSettings {
+            duration: None,
+            enabled: Some(true),
+        };
+        assert_eq!(
+            valider_le_reglage_de_fondu(&sans_duree, Some("local"), None),
+            Err(RefusDuFondu::DureeInvalide)
+        );
+    }
+
+    /// L'ancien contrat (`enabled: false`) désactive, quelle que soit la durée.
+    #[test]
+    fn l_ancien_contrat_desactive() {
+        let ancien = CrossfadeSettings {
+            duration: Some(5.0),
+            enabled: Some(false),
+        };
+        assert_eq!(
+            valider_le_reglage_de_fondu(&ancien, Some("dlna"), None),
+            Ok(0.0)
+        );
+    }
+
+    /// Décision du 07/10 : une zone locale en mode EXCLUSIF (WASAPI exclusif,
+    /// ASIO, CoreAudio exclusif) refuse le fondu, avec son motif. Contre-
+    /// épreuve : la même zone en mode partagé l'accepte.
+    #[test]
+    fn une_zone_locale_exclusive_refuse_le_fondu() {
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(true)),
+            Err(RefusDuFondu::Exclusif)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(false)),
+            Ok(5.0)
+        );
+        // Désactiver reste possible en exclusif.
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), Some(true)),
+            Ok(0.0)
         );
     }
 
     #[test]
-    fn desactiver_reste_possible_et_borne_la_preference_de_duree() {
-        let too_long = CrossfadeSettings {
-            enabled: false,
-            duration: Some(99.0),
-        };
-        let default = CrossfadeSettings {
-            enabled: false,
-            duration: None,
-        };
-
-        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
-        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
+    fn une_zone_inconnue_est_refusee() {
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(3.0), None, None),
+            Err(RefusDuFondu::ZoneInconnue)
+        );
     }
 }
 
@@ -8181,6 +8530,7 @@ mod vider_la_file_arrete_le_peripherique_3669 {
                     track_number: None,
                     disc_number: None,
                     album_ref: None,
+                    artist_ref: None,
                 }],
             )
             .expect("mise en file");
@@ -8308,6 +8658,7 @@ mod vider_la_suite_4169 {
             track_number: None,
             disc_number: None,
             album_ref: None,
+            artist_ref: None,
         }
     }
 
@@ -9072,6 +9423,7 @@ mod precedent_aleatoire_tests {
                 track_number: None,
                 disc_number: None,
                 album_ref: None,
+                artist_ref: None,
             })
             .collect();
         PlayQueueRepo::with_backend(state.backend.clone())
@@ -9170,6 +9522,7 @@ mod precedent_zone_navigateur_tests {
                 track_number: None,
                 disc_number: None,
                 album_ref: None,
+                artist_ref: None,
             })
             .collect();
         PlayQueueRepo::with_backend(state.backend.clone())

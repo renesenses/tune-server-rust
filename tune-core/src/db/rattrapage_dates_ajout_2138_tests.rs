@@ -212,22 +212,26 @@ fn seuil_de_detection_2138() {
     assert_eq!(mesurer_le_bloc(&[]), None);
 }
 
-/// Le bloc s'étend de proche en proche, par écarts de moins de dix minutes,
-/// sans dépasser 72 h, et part de la date la PLUS ANCIENNE.
+/// Le bloc est la fenêtre de 72 h qui porte le plus de pistes (fil 2203).
 #[test]
 fn bloc_du_premier_scan_2138() {
     // Un scan de cinq heures, un lot toutes les cinq minutes, puis un ajout
-    // le lendemain.
+    // quatre jours plus tard, hors de la fenêtre de 72 h.
     let mut dates: Vec<f64> = (0..60).map(|i| FIGEE + i as f64 * 300.0).collect();
-    dates.push(FIGEE + 86_400.0);
+    dates.push(FIGEE + 4.0 * 86_400.0);
     dates.reverse();
     assert_eq!(
         mesurer_le_bloc(&dates),
         Some((FIGEE, FIGEE + 59.0 * 300.0, 60))
     );
-    // Un trou de plus de dix minutes ferme le bloc.
+    // Un trou de plus de dix minutes ne ferme plus le bloc (fil 2203) ;
+    // seule la fenêtre de 72 h le borne.
     assert_eq!(
         mesurer_le_bloc(&[FIGEE, FIGEE + 601.0]),
+        Some((FIGEE, FIGEE + 601.0, 2))
+    );
+    assert_eq!(
+        mesurer_le_bloc(&[FIGEE, FIGEE + 73.0 * 3600.0]),
         Some((FIGEE, FIGEE, 1))
     );
     // Dates invalides ignorées.
@@ -235,6 +239,89 @@ fn bloc_du_premier_scan_2138() {
         mesurer_le_bloc(&[f64::NAN, 0.0, -5.0, FIGEE]),
         Some((FIGEE, FIGEE, 1))
     );
+}
+
+/// Fil 2203 — le premier scan fait en PLUSIEURS FOIS (scan interrompu puis
+/// repris, serveur officiel puis `tune-server-diretta`, dossier ajouté plus
+/// tard), et quelques pistes datées bien avant lui. Le bloc est la fenêtre
+/// de 72 h qui porte le plus de pistes : ni la date la plus ancienne, ni un
+/// trou de dix minutes ne le coupent.
+#[test]
+fn bloc_d_un_premier_scan_en_plusieurs_fois_2203() {
+    let mut dates: Vec<f64> = vec![FIGEE - 400.0 * 86_400.0, FIGEE - 90.0 * 86_400.0];
+    // Première session : 20 lots, un toutes les 30 s.
+    dates.extend((0..20).map(|i| FIGEE + i as f64 * 30.0));
+    // Reprise trois heures plus tard : 20 lots encore.
+    dates.extend((0..20).map(|i| FIGEE + 3.0 * 3600.0 + i as f64 * 30.0));
+    // Un ajout un mois après.
+    dates.push(APRES);
+    assert_eq!(
+        mesurer_le_bloc(&dates),
+        Some((FIGEE, FIGEE + 3.0 * 3600.0 + 19.0 * 30.0, 40))
+    );
+}
+
+/// Fil 2203 — la base de Patatorz : premier scan en deux sessions, deux
+/// pistes datées bien avant, et le marqueur `non_figee` déjà posé par la
+/// passe de la rc3. La passe se rejoue une fois et redate les deux sessions.
+fn scenario_premier_scan_en_deux_fois_deja_marque(db: Arc<dyn DbBackend>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut au_scan = Vec::new();
+    for i in 0..40u64 {
+        let mtime = 1_500_000_000 + i * 86_400;
+        let c = fichier(dir.path(), &format!("s-{i:02}.flac"), mtime);
+        let session = if i < 20 { 0.0 } else { 3.0 * 3600.0 };
+        piste(
+            &db,
+            &c,
+            FIGEE + session + (i % 20) as f64 * 30.0,
+            Some(mtime as f64),
+        );
+        au_scan.push((c, mtime as f64));
+    }
+    let mut anciennes = Vec::new();
+    for i in 0..2u64 {
+        let ajout = FIGEE - (90.0 + i as f64) * 86_400.0;
+        let c = fichier(dir.path(), &format!("ancienne-{i}.flac"), 1_100_000_000);
+        piste(&db, &c, ajout, Some(1_100_000_000.0));
+        anciennes.push((c, ajout));
+    }
+    // Le marqueur que la passe de la rc3 a posé sur cette base.
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .set(CLE_RATTRAPAGE_DATES_AJOUT_2138, "non_figee")
+        .unwrap();
+
+    let issue = rattraper_les_dates_d_ajout(&db).unwrap();
+    let Issue::Corrigee(bilan) = issue else {
+        panic!("premier scan en deux fois non redaté : {issue:?}");
+    };
+    assert_eq!(
+        (bilan.pistes, bilan.dans_le_bloc, bilan.corrigees),
+        (42, 40, 40)
+    );
+    for (c, mtime) in &au_scan {
+        assert_eq!(date_d_ajout(&db, c), *mtime, "piste du premier scan : {c}");
+    }
+    for (c, ajout) in &anciennes {
+        assert_eq!(date_d_ajout(&db, c), *ajout, "hors du bloc : intacte");
+    }
+    assert_eq!(rattraper_les_dates_d_ajout(&db).unwrap(), Issue::DejaFaite);
+}
+
+#[test]
+fn sqlite_premier_scan_en_deux_fois_deja_marque_2203() {
+    scenario_premier_scan_en_deux_fois_deja_marque(sqlite());
+}
+
+/// Une base NORMALE déjà vue par la passe de la rc3 (`non_figee`) est
+/// réexaminée une fois, laissée intacte, puis plus jamais relue.
+#[test]
+fn base_normale_deja_marquee_reexaminee_une_fois_2203() {
+    let db = sqlite();
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .set(CLE_RATTRAPAGE_DATES_AJOUT_2138, "non_figee")
+        .unwrap();
+    scenario_base_normale(db);
 }
 
 #[test]

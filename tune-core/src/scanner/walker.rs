@@ -437,17 +437,11 @@ pub use crate::audio::support::LIBRARY_AUDIO_EXTENSIONS as SUPPORTED_EXTENSIONS;
 /// presence explains a missing album better than anything else.
 pub use crate::audio::support::KNOWN_UNREAD_AUDIO_EXTENSIONS as KNOWN_UNREAD_AUDIO;
 
-const SKIP_DIRS: &[&str] = &[
-    "duplicates",
-    ".tune",
-    ".Spotlight-V100",
-    ".Trashes",
-    "@eaDir",
-    "#recycle",
-    ".DS_Store",
-    "$RECYCLE.BIN",
-    "System Volume Information",
-];
+/// Dossiers propres à Tune que le parcours n'ouvre pas. Les corbeilles et
+/// dossiers système (NAS, Windows, macOS) relèvent de
+/// [`crate::scanner::dossier_systeme_ignore`], seule liste partagée avec le
+/// surveillant et l'estimation (fil forum 2207).
+const SKIP_DIRS: &[&str] = &["duplicates", ".tune"];
 
 /// Normalize a directory path for cross-platform compatibility.
 ///
@@ -1381,6 +1375,7 @@ pub fn list_audio_files_avec_arret(
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
                     !skip_set.contains(name.as_ref())
+                        && !crate::scanner::dossier_systeme_ignore(&name)
                 } else {
                     true
                 }
@@ -3653,9 +3648,52 @@ mod tests {
 
     #[test]
     fn skip_dirs_list() {
-        assert!(SKIP_DIRS.contains(&".DS_Store"));
-        assert!(SKIP_DIRS.contains(&"@eaDir"));
-        assert!(SKIP_DIRS.contains(&"$RECYCLE.BIN"));
+        assert!(SKIP_DIRS.contains(&"duplicates"));
+        assert!(crate::scanner::dossier_systeme_ignore(".DS_Store"));
+        assert!(crate::scanner::dossier_systeme_ignore("@eaDir"));
+        assert!(crate::scanner::dossier_systeme_ignore("$RECYCLE.BIN"));
+    }
+
+    /// Fil forum 2207 (GgB, partage SMB monté sous /mnt) — le scan indexait le
+    /// contenu de `.recycle`, la corbeille de Samba vfs_recycle. Les autres
+    /// corbeilles et dossiers système de NAS, quelle que soit leur casse,
+    /// doivent être écartés de même.
+    #[test]
+    fn le_scan_ignore_les_corbeilles_et_dossiers_systeme_des_nas_2207() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_corbeilles_2207");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Artiste/Album")).unwrap();
+        std::fs::write(base.join("Artiste/Album/01.flac"), b"fixture").unwrap();
+        let corbeilles = [
+            ".recycle",
+            ".Recycle",
+            "#recycle",
+            "#Recycle",
+            "@eaDir",
+            "@EADIR",
+            ".Trash",
+            ".Trashes",
+            ".Trash-1000",
+            "$RECYCLE.BIN",
+            "$Recycle.Bin",
+            "System Volume Information",
+            "system volume information",
+        ];
+        for corbeille in corbeilles {
+            let d = base.join("Artiste").join(corbeille).join("Album");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("02.flac"), b"fixture").unwrap();
+        }
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            result.files.len(),
+            1,
+            "🔴 fil 2207 — des corbeilles de NAS sont indexées : {:?}",
+            result.files
+        );
+        assert!(result.files[0].ends_with("01.flac"));
     }
 
     #[test]

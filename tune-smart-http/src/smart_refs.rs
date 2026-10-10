@@ -302,21 +302,43 @@ fn favorites_sub(profile_id: i64, item_type: &str) -> String {
 
 /// Sous-requête des PISTES favorites d'un profil : favoris locaux (table
 /// `favorites`) + pistes locales correspondant à un favori STREAMING du même
-/// profil (titre + artiste normalisés). Un favori Qobuz/Tidal dont on possède
-/// la copie locale compte ainsi comme favori dans les règles — avant, seule
-/// la table locale était vue (point 6, revue 2026-08-15). Le rapprochement
-/// est volontairement exact-normalisé (lower/trim) : en SQL portable
-/// SQLite/PG, pas de fuzzy — un titre orthographié différemment ne matche
-/// pas, c'est assumé.
+/// profil. Un favori Qobuz/Tidal dont on possède la copie locale compte ainsi
+/// comme favori dans les règles — avant, seule la table locale était vue
+/// (point 6, revue 2026-08-15). En SQL portable SQLite/PG, pas de fuzzy : un
+/// titre orthographié différemment ne matche pas, c'est assumé.
+///
+/// # À quelle précision (#5997, forum #2127 — Didier)
+///
+/// Le miroir des favoris de service (#5997) en amène bien plus qu'avant, et
+/// le seul titre + artiste marquait TOUTES les éditions d'un titre : un
+/// favori posé sur la réédition récente chez Qobuz marquait l'édition plus
+/// ancienne de la bibliothèque. Le rapprochement est donc resserré, par ordre
+/// de force :
+///
+/// 1. **ISRC** — quand le favori ET la piste locale en portent un, ils se
+///    rapprochent si et seulement si les ISRC sont égaux (casse ignorée). Une
+///    réédition qui a reçu un ISRC neuf ne marque plus l'ancienne ;
+/// 2. sinon **titre + artiste + album** — quand le favori connaît son album
+///    (Qobuz et Tidal le donnent, en reprise comme au cœur), l'album local
+///    doit porter le même titre ;
+/// 3. sinon (favori sans album), titre + artiste, comme avant.
+///
+/// La durée n'est pas retenue : la table des favoris n'en garde pas, et deux
+/// éditions diffèrent souvent de moins d'une seconde.
 fn track_favorites_sub(profile_id: i64) -> String {
     format!(
         "{local} UNION SELECT t9.id FROM tracks t9 \
          LEFT JOIN artists ar9 ON t9.artist_id = ar9.id \
+         LEFT JOIN albums al9 ON t9.album_id = al9.id \
          JOIN streaming_favorites sf9 ON sf9.profile_id = {profile_id} \
          AND sf9.item_type = 'track' \
          AND sf9.title IS NOT NULL \
          AND lower(trim(t9.title)) = lower(trim(sf9.title)) \
-         AND lower(trim(coalesce(ar9.name, ''))) = lower(trim(coalesce(sf9.artist, '')))",
+         AND lower(trim(coalesce(ar9.name, ''))) = lower(trim(coalesce(sf9.artist, ''))) \
+         AND (CASE WHEN coalesce(trim(sf9.isrc), '') <> '' AND coalesce(trim(t9.isrc), '') <> '' \
+                   THEN upper(trim(sf9.isrc)) = upper(trim(t9.isrc)) \
+                   ELSE (coalesce(trim(sf9.album), '') = '' \
+                         OR lower(trim(coalesce(al9.title, ''))) = lower(trim(sf9.album))) END)",
         local = favorites_sub(profile_id, "track")
     )
 }
@@ -759,6 +781,65 @@ mod tests {
             "{cond}"
         );
         assert!(cond.starts_with("t.id IN ("), "{cond}");
+    }
+
+    /// #5997, forum #2127 (Didier) — un titre mis en favori sur une édition
+    /// RÉCENTE chez Qobuz ne marque plus l'édition PLUS ANCIENNE de la
+    /// bibliothèque : l'album (puis l'ISRC, quand les deux côtés en ont un)
+    /// départage. Sans album ni ISRC, le rapprochement d'avant tient.
+    #[test]
+    fn un_favori_de_reedition_ne_marque_pas_l_ancienne_edition_2127() {
+        use tune_core::db::backend::DbBackend;
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO artists (id, name) VALUES (1, 'The Beatles');
+                 INSERT INTO albums (id, title, artist_id, year) VALUES
+                     (10, 'Abbey Road', 1, 1969),
+                     (11, 'Abbey Road (Remastered 2019)', 1, 2019);
+                 INSERT INTO tracks (id, title, album_id, artist_id, file_path, isrc) VALUES
+                     (100, 'Come Together', 10, 1, '/m/1969.flac', 'GBAYE0601690'),
+                     (101, 'Come Together', 11, 1, '/m/2019.flac', 'GBUM71903894');
+                 -- Profil 1 : favori Qobuz de la réédition, avec son album.
+                 -- Profil 2 : même titre, sans album, mais avec l'ISRC 2019.
+                 -- Profil 3 : ni album ni ISRC (favori d'avant la rc4).
+                 INSERT INTO streaming_favorites
+                     (profile_id, item_type, service, service_id, title, artist, album, isrc) VALUES
+                     (1, 'track', 'qobuz', 'q1', 'Come Together', 'The Beatles', 'Abbey Road (Remastered 2019)', NULL),
+                     (2, 'track', 'qobuz', 'q1', 'Come Together', 'The Beatles', NULL, 'gbum71903894'),
+                     (3, 'track', 'qobuz', 'q1', 'Come Together', 'The Beatles', NULL, NULL);",
+            )
+            .expect("données");
+        let pistes = |pid: i64| -> Vec<i64> {
+            let sql = format!(
+                "SELECT t.id FROM tracks t WHERE t.id IN ({}) ORDER BY t.id",
+                track_favorites_sub(pid)
+            );
+            db.query_many(&sql, &[])
+                .expect("requête")
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect()
+        };
+        assert_eq!(
+            pistes(1),
+            vec![101],
+            "l'album ne départage pas les deux éditions"
+        );
+        assert_eq!(
+            pistes(2),
+            vec![101],
+            "l'ISRC ne départage pas les deux éditions"
+        );
+        assert_eq!(
+            pistes(3),
+            vec![100, 101],
+            "sans album ni ISRC, le rapprochement d'avant doit tenir"
+        );
     }
 
     #[test]

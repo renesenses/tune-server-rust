@@ -200,6 +200,7 @@ fn de_service(source: &str, source_id: &str, album_ref: Option<&str>) -> QueueIn
         track_number: Some(2),
         disc_number: None,
         album_ref: album_ref.map(String::from),
+        artist_ref: None,
     }
 }
 
@@ -613,8 +614,11 @@ async fn une_page_douteuse_ou_etrangere_n_est_pas_rangee() {
         .await;
         assert!(status.is_success(), "ajout en file : {status} {corps}");
     }
+    // #6079 : la ligne Qobuz porte désormais l'album que QOBUZ donne
+    // (`q-alb-7`, sa fiche du titre) — jamais la page Bandcamp posée par le
+    // client dans `album_ref`.
     assert_eq!(
         references_en_file(&state, zid),
-        vec![None, None, None, None]
+        vec![None, None, None, Some("q-alb-7".to_string())]
     );
 }
