@@ -23,6 +23,11 @@ services:
       # TUNE_BRIDGE_SERVICE_TOKEN cote site. AUCUN repli : sans lui, aucune
       # ecoute de contact n'est servie (503, circle_ecoute_fermee au demarrage).
       - TUNE_BRIDGE_SERVICE_TOKEN=${TUNE_BRIDGE_SERVICE_TOKEN:-}
+      # Ecoute chez un contact : FERMEE (decision produit du 10/10). Ce
+      # n'est PAS le jeton ci-dessus qui l'ouvre : seul `1`/`true`/`on`/`yes`
+      # ici le ferait. Fermee, `/stream/circle/{ticket}` rend 404 sans appeler
+      # le cloud. Le relais du proprietaire (`/stream/relay`) n'en depend pas.
+      - TUNE_BRIDGE_CIRCLE_LISTEN=0
       # Surchargeable pour une recette ; par defaut https://mozaiklabs.fr
       - TUNE_CLOUD_BASE_URL=${TUNE_CLOUD_BASE_URL:-}
     ports:

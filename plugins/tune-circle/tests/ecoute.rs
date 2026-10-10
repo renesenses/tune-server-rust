@@ -177,7 +177,18 @@ impl HoteLecture for Hote {
     }
 }
 
+/// Réglages d'un serveur dont l'interrupteur d'écoute est OUVERT : les tests
+/// du chemin d'écoute.
 fn reglages(base: &str, connecte: bool) -> Arc<dyn DbBackend> {
+    let backend = reglages_ferme(base, connecte);
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::cloud::CLE_ECOUTE_DE_CERCLE, "true")
+        .unwrap();
+    backend
+}
+
+/// Réglages par défaut : interrupteur d'écoute absent, donc fermé.
+fn reglages_ferme(base: &str, connecte: bool) -> Arc<dyn DbBackend> {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     tune_core::db::migrations::run_migrations(&db).unwrap();
@@ -703,4 +714,36 @@ async fn une_autre_erreur_n_est_pas_une_fin_de_partage() {
             .is_none()
     );
     assert_eq!(etat.lock().unwrap().sondes.len(), sondes_avant + 1);
+}
+
+// Interrupteur fermé (décision produit du 10/10) ---------------------------------
+
+/// Interrupteur local absent (le défaut) : `POST …/listen` rend 404
+/// `circle.listen_disabled`, AUCUN appel au cloud ni au pont, aucune file
+/// posée ; une ligne déjà en file ne se résout plus et arrête la file.
+#[tokio::test]
+async fn interrupteur_ferme_aucune_ecoute_de_contact() {
+    let (base, etat) = demarrer().await;
+    let hote = Arc::new(Hote::default());
+    let ecoute = Arc::new(Ecoute::new(
+        Arc::new(Relais::new(reglages_ferme(&base, true))),
+        None,
+        None,
+        Some(hote.clone() as Arc<dyn HoteLecture>),
+    ));
+    let app = tune_circle::ecoute::router(ecoute.clone());
+
+    for corps in [une_piste("42"), un_album(json!([1, 2]))] {
+        let r = appel(&app, "/contacts/7/listen", corps).await;
+        assert_eq!(r.statut, StatusCode::NOT_FOUND);
+        assert_eq!(r.json()["code"], "circle.listen_disabled");
+    }
+    let e = ecoute.url(ZONE, "7:42").await.unwrap_err();
+    assert!(e.en_message().contains(MOTIF_ARRET_DE_LA_FILE), "{e:?}");
+
+    assert!(hote.files.lock().unwrap().is_empty(), "aucune file posee");
+    let f = etat.lock().unwrap();
+    assert!(f.listens.is_empty(), "le cloud a ete appele");
+    assert!(f.albums.is_empty(), "le cloud a ete appele");
+    assert!(f.sondes.is_empty(), "le pont a ete appele");
 }

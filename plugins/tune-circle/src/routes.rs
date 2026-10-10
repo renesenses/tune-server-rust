@@ -695,6 +695,10 @@ async fn etat_de_la_copie_en_ligne(State(etat): State<Arc<EtatDeLaCopie>>) -> Re
         "active": active,
         "last_sync": date_de_synchro(reglages.get("cloud_library_last_sync").ok().flatten()),
         "pending": library_sync::pending_count(etat.relais.backend()),
+        // T4 : l'écoute chez un contact est-elle ouverte sur ce serveur ?
+        // Fermée par défaut (décision produit du 10/10) : l'écran masque
+        // alors tout bouton « écouter ». Le partage de playlists n'en dépend pas.
+        "listen_enabled": tune_core::cloud::ecoute_de_cercle_ouverte(&reglages),
     }))
     .into_response()
 }

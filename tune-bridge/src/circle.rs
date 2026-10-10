@@ -29,6 +29,7 @@
 //!
 //! | Cas | Statut | `code` |
 //! |---|---|---|
+//! | interrupteur `TUNE_BRIDGE_CIRCLE_LISTEN` fermé (le défaut), sans appel au cloud | 404 | `not_found` |
 //! | billet refusé par le cloud, illisible, ou réponse du cloud incohérente | 404 | `not_found` |
 //! | serveur du contact non connecté au pont | 503 | `owner_offline` |
 //! | cloud injoignable, en panne, ou pont sans jeton de service | 503 | `cloud_unavailable` |
@@ -58,6 +59,14 @@ pub const CODE_CLOUD_INDISPONIBLE: &str = "cloud_unavailable";
 
 /// Type du message émis vers le serveur du contact.
 pub const MESSAGE_FLUX_DE_CERCLE: &str = "relay.circle_stream_request";
+
+/// L'interrupteur de l'écoute chez un contact, FERMÉ par défaut (décision
+/// produit du 10/10). Indépendant du jeton de service : poser
+/// [`JETON_DE_VERIFICATION_ENV`] (pour le contrôle de licence, par exemple)
+/// ne rouvre rien. Seules les valeurs `1`, `true`, `on` ou `yes` l'ouvrent.
+/// Fermé, `/stream/circle/{ticket}` rend 404 `not_found` sans appeler le
+/// cloud.
+pub const INTERRUPTEUR_ENV: &str = "TUNE_BRIDGE_CIRCLE_LISTEN";
 
 /// Jeton de service PROPRE au relais pour `POST /listen/verify`
 /// (site-mozaiklabs#237), distinct de `TUNE_CLOUD_SERVICE_TOKEN`.
@@ -91,6 +100,19 @@ pub struct Billets {
     client: reqwest::Client,
     base: String,
     jeton: Option<String>,
+    /// [`INTERRUPTEUR_ENV`] : `false` tant qu'on ne l'ouvre pas explicitement.
+    ouverte: bool,
+}
+
+/// `1`, `true`, `on`, `yes` (sans casse) : ouvert. Tout le reste, absence
+/// comprise : fermé.
+fn interrupteur_ouvert(valeur: Option<&str>) -> bool {
+    valeur.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 impl Billets {
@@ -114,7 +136,14 @@ impl Billets {
                 JETON_DE_VERIFICATION_ENV
             );
         }
-        Arc::new(Self::nouveau(&base, jeton))
+        let ouverte = interrupteur_ouvert(std::env::var(INTERRUPTEUR_ENV).ok().as_deref());
+        if !ouverte {
+            warn!(
+                "circle_ecoute_fermee — {} n'est pas ouvert : aucune ecoute de contact ne sera servie",
+                INTERRUPTEUR_ENV
+            );
+        }
+        Arc::new(Self::nouveau(&base, jeton).avec_ecoute(ouverte))
     }
 
     pub fn nouveau(base: &str, jeton: Option<String>) -> Self {
@@ -125,7 +154,20 @@ impl Billets {
                 .unwrap_or_default(),
             base: base.trim_end_matches('/').to_string(),
             jeton,
+            ouverte: false,
         }
+    }
+
+    /// Ouvre (ou ferme) l'écoute de contact. [`Billets::nouveau`] la laisse
+    /// fermée.
+    pub fn avec_ecoute(mut self, ouverte: bool) -> Self {
+        self.ouverte = ouverte;
+        self
+    }
+
+    /// L'écoute de contact est-elle ouverte sur ce pont ?
+    pub fn ecoute_ouverte(&self) -> bool {
+        self.ouverte
     }
 
     /// `POST {base}/api/v1/circle/listen/verify` `{ "ticket" }`, avec le jeton
@@ -251,6 +293,11 @@ pub async fn flux_de_cercle(
     headers: HeaderMap,
 ) -> Response {
     let debut = Instant::now();
+    // Interrupteur fermé (le défaut) : la route n'existe pas, et le cloud
+    // n'est pas appelé. Indépendant du jeton de service.
+    if !state.billets.ecoute_ouverte() {
+        return refus(StatusCode::NOT_FOUND, CODE_REFUSE);
+    }
     if !billet_plausible(&billet) {
         return refus(StatusCode::NOT_FOUND, CODE_REFUSE);
     }
@@ -403,7 +450,15 @@ mod tests {
 
     fn pont(base: &str, jeton: Option<&str>) -> Arc<RelayState> {
         Arc::new(RelayState {
-            billets: Arc::new(Billets::nouveau(base, jeton.map(String::from))),
+            billets: Arc::new(Billets::nouveau(base, jeton.map(String::from)).avec_ecoute(true)),
+            ..RelayState::new()
+        })
+    }
+
+    /// Un pont AVEC jeton de service mais interrupteur fermé.
+    fn pont_ferme(base: &str) -> Arc<RelayState> {
+        Arc::new(RelayState {
+            billets: Arc::new(Billets::nouveau(base, Some(JETON_DE_SERVICE.into()))),
             ..RelayState::new()
         })
     }
@@ -732,6 +787,42 @@ mod tests {
         }
         rien_n_est_parti(&mut rx);
         assert!(cloud.lock().unwrap().appels.is_empty());
+    }
+
+    /// Décision produit du 10/10 : interrupteur fermé (le défaut), un billet
+    /// que le cloud accepterait rend 404 `not_found`, le cloud n'est PAS
+    /// appelé et rien ne part vers le serveur du contact — même avec le jeton
+    /// de service posé.
+    #[tokio::test]
+    async fn interrupteur_ferme_rend_404_sans_appeler_le_cloud() {
+        let (base, cloud) = faux_cloud(vec![accord("srv", serde_json::json!("42"))]).await;
+        let state = pont_ferme(&base);
+        let mut rx = serveur_connecte(&state);
+
+        let r = appeler_sans_emission(&state, BILLET, HeaderMap::new(), &mut rx).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&corps(r).await).unwrap();
+        assert_eq!(v["code"], CODE_REFUSE);
+        rien_n_est_parti(&mut rx);
+        assert!(cloud.lock().unwrap().appels.is_empty());
+    }
+
+    #[test]
+    fn l_interrupteur_est_ferme_par_defaut_et_ne_s_ouvre_qu_explicitement() {
+        assert!(!Billets::nouveau("http://x", Some("j".into())).ecoute_ouverte());
+        for ferme in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("non"),
+        ] {
+            assert!(!interrupteur_ouvert(ferme), "{ferme:?}");
+        }
+        for ouvert in ["1", "true", "TRUE", " on ", "yes"] {
+            assert!(interrupteur_ouvert(Some(ouvert)), "{ouvert:?}");
+        }
     }
 
     #[test]

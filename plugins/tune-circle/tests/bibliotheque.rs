@@ -572,7 +572,7 @@ async fn l_etat_de_la_copie_en_ligne_est_local() {
     assert_eq!(
         r.json(),
         json!({ "server_id": SERVEUR_DU_COMPTE, "premium": false, "active": false,
-                "last_sync": null, "pending": pending })
+                "last_sync": null, "pending": pending, "listen_enabled": false })
     );
     assert_eq!(faux.etat.lock().unwrap().appels, 0, "aucun appel au cloud");
 
@@ -584,7 +584,17 @@ async fn l_etat_de_la_copie_en_ligne_est_local() {
     assert_eq!(
         r.json(),
         json!({ "server_id": SERVEUR_DU_COMPTE, "premium": false, "active": true,
-                "last_sync": "2026-09-21T14:13:20+00:00", "pending": pending })
+                "last_sync": "2026-09-21T14:13:20+00:00", "pending": pending,
+                "listen_enabled": false })
+    );
+
+    // L'écoute chez un contact : fermée par défaut (décision produit du
+    // 10/10), ouverte par le seul réglage local explicite.
+    s.set(tune_core::cloud::CLE_ECOUTE_DE_CERCLE, "true")
+        .unwrap();
+    assert_eq!(
+        appel(&app, "GET", "/library-sync", None).await.json()["listen_enabled"],
+        json!(true)
     );
 
     // Sans session SSO, rien ne peut partir : inactive.

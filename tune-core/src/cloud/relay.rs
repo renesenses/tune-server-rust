@@ -342,7 +342,8 @@ impl RelayClient {
     ///   par la connexion authentifiée au pont (le seul canal qui porte ce
     ///   message). Ce serveur ne garde rien du cercle.
     /// * **Le propriétaire garde la main** : greffon `circle` désinstallé ou
-    ///   désactivé → 404, sans appel local.
+    ///   désactivé, ou réglage [`super::CLE_ECOUTE_DE_CERCLE`] qui ne vaut pas
+    ///   `true` (le défaut) → 404, sans appel local.
     /// * **Même chemin de morceaux** que `relay.stream_request`, `Range`
     ///   compris : le fichier d'origine, octet pour octet (bit-perfect).
     /// * **Journal** : piste, statut, octets, durée. Ni identité, ni billet —
@@ -358,17 +359,19 @@ impl RelayClient {
             .and_then(|r| r.as_str())
             .map(|s| s.to_string());
 
-        let permis = self
-            .reglages
-            .as_ref()
-            .is_some_and(|b| greffon_circle_actif(&SettingsRepo::with_backend(b.clone())));
+        // Greffon actif ET interrupteur local ouvert (fermé par défaut,
+        // décision produit du 10/10). Relus à chaque demande.
+        let permis = self.reglages.as_ref().is_some_and(|b| {
+            let reglages = SettingsRepo::with_backend(b.clone());
+            greffon_circle_actif(&reglages) && super::ecoute_de_cercle_ouverte(&reglages)
+        });
         let track_id = track_id_de_cercle(v.get("track_id"));
 
         let (Some(track_id), true) = (track_id, permis) else {
             if permis {
                 warn!("circle_ecoute_track_id_refuse");
             } else {
-                info!("circle_ecoute_refusee_greffon_inactif");
+                info!("circle_ecoute_refusee_greffon_inactif_ou_ecoute_fermee");
             }
             let refus = serde_json::json!({
                 "type": "relay.stream_start",
@@ -919,7 +922,17 @@ mod flux_de_cercle_tests {
         (port, journal)
     }
 
+    /// Greffon tel que demandé, interrupteur d'écoute OUVERT : les tests du
+    /// chemin servi.
     fn base(installe: Option<&str>, active: Option<&str>) -> Arc<dyn DbBackend> {
+        base_avec_interrupteur(installe, active, Some("true"))
+    }
+
+    fn base_avec_interrupteur(
+        installe: Option<&str>,
+        active: Option<&str>,
+        ecoute: Option<&str>,
+    ) -> Arc<dyn DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
@@ -930,6 +943,9 @@ mod flux_de_cercle_tests {
         }
         if let Some(v) = active {
             s.set("plugin_circle_enabled", v).unwrap();
+        }
+        if let Some(v) = ecoute {
+            s.set(crate::cloud::CLE_ECOUTE_DE_CERCLE, v).unwrap();
         }
         backend
     }
@@ -1074,6 +1090,26 @@ mod flux_de_cercle_tests {
             c.handle_message(&demande(serde_json::json!("42"), None))
                 .await;
             assert_eq!(json(&trame(&mut rx).await)["status"], 404);
+        }
+        assert!(journal.lock().unwrap().is_empty());
+    }
+
+    /// Décision produit du 10/10 : greffon actif mais interrupteur d'écoute
+    /// absent (le défaut), `false` ou autre chose que `true` → 404, aucun
+    /// appel local. Le propriétaire dit non chez lui, quoi que fasse le pont.
+    #[tokio::test]
+    async fn interrupteur_d_ecoute_ferme_rien_n_est_servi() {
+        let (port, journal) = serveur_local().await;
+        for ecoute in [None, Some("false"), Some(""), Some("1")] {
+            let reglages = base_avec_interrupteur(Some("true"), None, ecoute);
+            let (c, mut rx) = client(port, Some(reglages)).await;
+            c.handle_message(&demande(serde_json::json!("42"), None))
+                .await;
+            assert_eq!(
+                json(&trame(&mut rx).await)["status"],
+                404,
+                "interrupteur {ecoute:?}"
+            );
         }
         assert!(journal.lock().unwrap().is_empty());
     }
