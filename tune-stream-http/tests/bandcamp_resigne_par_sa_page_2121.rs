@@ -305,6 +305,7 @@ impl Banc {
             track_number: Some(2),
             disc_number: None,
             album_ref: album_ref.map(String::from),
+            artist_ref: None,
         }
     }
 

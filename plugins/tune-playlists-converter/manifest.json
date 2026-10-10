@@ -1,7 +1,7 @@
 {
   "id": "playlists-converter",
   "name": "Playlists converter",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Transférer une playlist d'un service à un autre, à l'identique et par lot, avec aperçu obligatoire avant toute écriture ; copie datée avant chaque transfert et retour en arrière sans suppression ; liens de synchronisation qui n'écrivent que des ajouts",
   "author": "MozAIk Labs",
   "entry_point": "main.wasm",
