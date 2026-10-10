@@ -618,6 +618,12 @@ path = "tests/journal_perte_flac_2218.rs"
 [[test]]
 name = "fondu_enchaine_superpose_deux_pistes_2211"
 path = "tests/fondu_enchaine_superpose_deux_pistes_2211.rs"
+# #2211 — le raccordement du fondu à la sortie locale : le puits de fondu,
+# la règle de frontière (PURE, strict, DoP, live, sans blanc) et le banc de
+# l'enveloppe sur des échantillons. Sans cible `[[test]]`, jamais compilé.
+[[test]]
+name = "fondu_enchaine_sortie_locale_2211"
+path = "tests/fondu_enchaine_sortie_locale_2211.rs"
 # #4023 — HQPlayer natif : le `Play` qui suivait le `PlaylistAdd` n'arrivait
 # jamais. Le témoin monte un faux HQPlayer sur une socket locale et lit les
 # octets réellement écrits par un `play_media` : une SEULE déclaration XML par

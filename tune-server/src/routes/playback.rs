@@ -5518,41 +5518,138 @@ async fn set_eq(
 
 #[derive(Deserialize)]
 struct CrossfadeSettings {
-    enabled: bool,
+    /// #2211 — durée du fondu enchaîné en secondes, de 0 à 12 ; `0` =
+    /// désactivé.
+    #[serde(default)]
     duration: Option<f64>,
+    /// Compatibilité avec l'ancien contrat : `enabled: false` vaut
+    /// `duration: 0`. `enabled: true` sans durée est refusé.
+    #[serde(default)]
+    enabled: Option<bool>,
 }
 
-/// Read the persisted crossfade settings for a zone.
-///
-/// Crossfade is not applied by the playback engine: report the capability as
-/// unavailable and never echo a stale persisted preference as if it were live.
-async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let requested_enabled = settings
-        .get(&format!("crossfade_enabled:{zone_id}"))
-        .ok()
-        .flatten()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let duration = settings
-        .get(&format!("crossfade_duration:{zone_id}"))
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(3.0);
-    Json(json!({
-        "available": false,
-        "enabled": false,
-        "requested_enabled": requested_enabled,
-        "duration": duration,
-    }))
+/// Pourquoi un réglage de fondu est refusé.
+#[derive(Debug, Clone, PartialEq)]
+enum RefusDuFondu {
+    ZoneInconnue,
+    /// Durée absente, négative, au-delà de 12 s ou non finie.
+    DureeInvalide,
+    /// La zone ne sort pas sur la carte son locale : le fondu n'y existe pas.
+    SortieNonLocale(String),
+    /// Zone locale en mode exclusif (WASAPI exclusif, ASIO, CoreAudio
+    /// exclusif) : ces bras enchaînent sans blanc mais ne fondent pas.
+    Exclusif,
 }
 
-fn validate_crossfade_update(body: &CrossfadeSettings) -> Result<f64, &'static str> {
-    if body.enabled {
-        return Err("crossfade_unavailable");
+impl RefusDuFondu {
+    fn reponse(&self) -> axum::response::Response {
+        let (statut, code, message) = match self {
+            Self::ZoneInconnue => (
+                StatusCode::NOT_FOUND,
+                "zone_not_found",
+                "Zone inconnue.".to_string(),
+            ),
+            Self::DureeInvalide => (
+                StatusCode::BAD_REQUEST,
+                "crossfade_duration_invalid",
+                format!(
+                    "La durée du fondu enchaîné va de 0 à {} secondes (0 = désactivé).",
+                    tune_core::audio::fondu_enchaine::DUREE_MAX_S
+                ),
+            ),
+            Self::SortieNonLocale(type_de_sortie) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "crossfade_unavailable_for_output",
+                format!(
+                    "Le fondu enchaîné n'est disponible que sur une sortie locale (carte son de \
+                     cette machine). Cette zone sort sur « {type_de_sortie} » : l'enchaînement y \
+                     reste sans blanc (gapless)."
+                ),
+            ),
+            Self::Exclusif => (
+                StatusCode::NOT_IMPLEMENTED,
+                "crossfade_unavailable_exclusive",
+                "Le fondu enchaîné est indisponible en mode exclusif (WASAPI exclusif, ASIO, \
+                 CoreAudio exclusif) : cette sortie enchaîne les pistes sans blanc, mais ne les \
+                 superpose pas."
+                    .to_string(),
+            ),
+        };
+        (statut, Json(json!({"error": code, "message": message}))).into_response()
     }
-    Ok(body.duration.unwrap_or(3.0).clamp(1.0, 12.0))
+}
+
+/// #2211 — la règle de la route, sans base ni réseau. `type_de_sortie` :
+/// celui de la zone, `None` si elle n'existe pas. `exclusive` : la sortie
+/// locale vivante joue par un bras exclusif (`None` : pas de sortie vivante,
+/// rien ne s'y oppose). Désactiver (`0`) est permis partout ; activer exige
+/// une sortie locale qui ne soit pas en mode exclusif.
+fn valider_le_reglage_de_fondu(
+    body: &CrossfadeSettings,
+    type_de_sortie: Option<&str>,
+    exclusive: Option<bool>,
+) -> Result<f64, RefusDuFondu> {
+    let Some(type_de_sortie) = type_de_sortie else {
+        return Err(RefusDuFondu::ZoneInconnue);
+    };
+    let demandee = if body.enabled == Some(false) {
+        0.0
+    } else {
+        body.duration.ok_or(RefusDuFondu::DureeInvalide)?
+    };
+    let duree = tune_core::audio::fondu_de_zone::duree_valide(demandee)
+        .ok_or(RefusDuFondu::DureeInvalide)?;
+    if duree > 0.0 && type_de_sortie != "local" {
+        return Err(RefusDuFondu::SortieNonLocale(type_de_sortie.to_string()));
+    }
+    if duree > 0.0 && exclusive == Some(true) {
+        return Err(RefusDuFondu::Exclusif);
+    }
+    Ok(duree)
+}
+
+/// Le type de sortie d'une zone (`local` par défaut, comme le chemin du
+/// signal), `None` si la zone n'existe pas.
+fn type_de_sortie_de_la_zone(state: &AppState, zone_id: i64) -> Option<String> {
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .map(|z| z.output_type.unwrap_or_else(|| "local".to_string()))
+}
+
+/// #2211 — le réglage de fondu enchaîné d'une zone. `available` : la zone
+/// sort sur la carte son locale, seul endroit où le fondu existe.
+async fn get_crossfade(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> axum::response::Response {
+    let Some(type_de_sortie) = type_de_sortie_de_la_zone(&state, zone_id) else {
+        return RefusDuFondu::ZoneInconnue.reponse();
+    };
+    let locale = type_de_sortie == "local";
+    let exclusive = if locale {
+        state.orchestrator.zone_locale_exclusive(zone_id).await == Some(true)
+    } else {
+        false
+    };
+    let disponible = locale && !exclusive;
+    let duree = if disponible {
+        tune_core::audio::fondu_de_zone::duree_reglee_s(&state.backend, zone_id)
+    } else {
+        0.0
+    };
+    Json(json!({
+        "zone_id": zone_id,
+        "available": disponible,
+        "output_type": type_de_sortie,
+        // Zone locale en mode exclusif : le réglage est refusé, l'écran le grise.
+        "exclusive": exclusive,
+        "enabled": duree > 0.0,
+        "duration": duree,
+        "max_duration": tune_core::audio::fondu_enchaine::DUREE_MAX_S,
+    }))
+    .into_response()
 }
 
 async fn set_crossfade(
@@ -5560,32 +5657,17 @@ async fn set_crossfade(
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
 ) -> impl IntoResponse {
-    let duration = match validate_crossfade_update(&body) {
-        Ok(duration) => duration,
-        Err(code) => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(json!({
-                    "error": code,
-                    "message": "Le fondu enchaîné exige un mixer PCM à deux pistes et n'est pas encore disponible.",
-                })),
-            )
-                .into_response();
-        }
+    let type_de_sortie = type_de_sortie_de_la_zone(&state, zone_id);
+    let exclusive = state.orchestrator.zone_locale_exclusive(zone_id).await;
+    let duree = match valider_le_reglage_de_fondu(&body, type_de_sortie.as_deref(), exclusive) {
+        Ok(duree) => duree,
+        Err(refus) => return refus.reponse(),
     };
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Err(error) = settings.set(&format!("crossfade_enabled:{zone_id}"), "false") {
-        error!(zone_id, %error, "crossfade_disable_persist_failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "crossfade_persist_failed"})),
-        )
-            .into_response();
-    }
     if let Err(error) = settings.set(
-        &format!("crossfade_duration:{zone_id}"),
-        &duration.to_string(),
+        &tune_core::audio::fondu_de_zone::cle_de_duree(zone_id),
+        &duree.to_string(),
     ) {
         error!(zone_id, %error, "crossfade_duration_persist_failed");
         return (
@@ -5594,11 +5676,21 @@ async fn set_crossfade(
         )
             .into_response();
     }
+    // La valeur vaut à la PROCHAINE frontière entre deux pistes : jamais au
+    // milieu d'une piste.
+    let sortie_vivante = state
+        .orchestrator
+        .refresh_zone_fondu_enchaine(zone_id)
+        .await;
     Json(json!({
         "zone_id": zone_id,
-        "available": false,
-        "crossfade_enabled": false,
-        "crossfade_duration": duration,
+        "available": true,
+        "crossfade_enabled": duree > 0.0,
+        "crossfade_duration": duree,
+        // `null` : aucune sortie locale vivante, la prochaine lecture posera
+        // la valeur. Un bras exclusif a déjà été refusé plus haut.
+        "applies_on_this_output": sortie_vivante,
+        "portee": "next_track",
     }))
     .into_response()
 }
@@ -8051,38 +8143,109 @@ mod tests_contexte_de_lecture {
 }
 
 #[cfg(test)]
-mod tests_crossfade_indisponible {
-    use super::{CrossfadeSettings, validate_crossfade_update};
+mod tests_reglage_du_fondu_2211 {
+    use super::{CrossfadeSettings, RefusDuFondu, valider_le_reglage_de_fondu};
 
-    /// #2211 — une API qui persiste `enabled=true` alors qu'aucun producteur
-    /// n'en tient compte est un faux succès. L'activation doit échouer avant
-    /// toute écriture jusqu'à l'arrivée d'un vrai mixer à deux pistes.
+    fn duree(d: f64) -> CrossfadeSettings {
+        CrossfadeSettings {
+            duration: Some(d),
+            enabled: None,
+        }
+    }
+
+    /// #2211 — une zone LOCALE accepte une durée de 0 à 12 s.
     #[test]
-    fn activer_le_faux_crossfade_est_refuse() {
-        let body = CrossfadeSettings {
-            enabled: true,
-            duration: Some(5.0),
-        };
-
+    fn une_zone_locale_accepte_le_fondu() {
         assert_eq!(
-            validate_crossfade_update(&body),
-            Err("crossfade_unavailable")
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), None),
+            Ok(5.0)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(12.0), Some("local"), None),
+            Ok(12.0)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), None),
+            Ok(0.0)
+        );
+    }
+
+    /// Les autres sorties gardent un refus franc et motivé — contre-épreuve
+    /// du témoin précédent : la même durée, sur une zone DLNA.
+    #[test]
+    fn les_autres_sorties_refusent_le_fondu_et_disent_pourquoi() {
+        for sortie in ["dlna", "airplay", "chromecast", "oaat", "bluos"] {
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(5.0), Some(sortie), None),
+                Err(RefusDuFondu::SortieNonLocale(sortie.to_string())),
+                "{sortie}"
+            );
+            // Désactiver reste possible partout.
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(0.0), Some(sortie), None),
+                Ok(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn une_duree_hors_bornes_est_refusee_pas_bornee_en_silence() {
+        for d in [-1.0, 12.5, 99.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                valider_le_reglage_de_fondu(&duree(d), Some("local"), None),
+                Err(RefusDuFondu::DureeInvalide),
+                "{d}"
+            );
+        }
+        let sans_duree = CrossfadeSettings {
+            duration: None,
+            enabled: Some(true),
+        };
+        assert_eq!(
+            valider_le_reglage_de_fondu(&sans_duree, Some("local"), None),
+            Err(RefusDuFondu::DureeInvalide)
+        );
+    }
+
+    /// L'ancien contrat (`enabled: false`) désactive, quelle que soit la durée.
+    #[test]
+    fn l_ancien_contrat_desactive() {
+        let ancien = CrossfadeSettings {
+            duration: Some(5.0),
+            enabled: Some(false),
+        };
+        assert_eq!(
+            valider_le_reglage_de_fondu(&ancien, Some("dlna"), None),
+            Ok(0.0)
+        );
+    }
+
+    /// Décision du 07/10 : une zone locale en mode EXCLUSIF (WASAPI exclusif,
+    /// ASIO, CoreAudio exclusif) refuse le fondu, avec son motif. Contre-
+    /// épreuve : la même zone en mode partagé l'accepte.
+    #[test]
+    fn une_zone_locale_exclusive_refuse_le_fondu() {
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(true)),
+            Err(RefusDuFondu::Exclusif)
+        );
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(5.0), Some("local"), Some(false)),
+            Ok(5.0)
+        );
+        // Désactiver reste possible en exclusif.
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(0.0), Some("local"), Some(true)),
+            Ok(0.0)
         );
     }
 
     #[test]
-    fn desactiver_reste_possible_et_borne_la_preference_de_duree() {
-        let too_long = CrossfadeSettings {
-            enabled: false,
-            duration: Some(99.0),
-        };
-        let default = CrossfadeSettings {
-            enabled: false,
-            duration: None,
-        };
-
-        assert_eq!(validate_crossfade_update(&too_long), Ok(12.0));
-        assert_eq!(validate_crossfade_update(&default), Ok(3.0));
+    fn une_zone_inconnue_est_refusee() {
+        assert_eq!(
+            valider_le_reglage_de_fondu(&duree(3.0), None, None),
+            Err(RefusDuFondu::ZoneInconnue)
+        );
     }
 }
 

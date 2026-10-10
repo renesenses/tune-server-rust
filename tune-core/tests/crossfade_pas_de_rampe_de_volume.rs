@@ -14,6 +14,8 @@
 //! - le seul chemin que l'utilisateur atteint est la route
 //!   `POST /zones/{id}/crossfade`, fermée par #2689 : 501
 //!   `crossfade_unavailable`, préférence persistée forcée à `false`.
+//!   Depuis le raccordement de #2211, elle s'ouvre aux zones LOCALES : le
+//!   fondu y superpose deux flux PCM (`audio::fondu_enchaine::PuitsDeFondu`).
 //!
 //! L'arbitrage de Bertrand du 02/09/2026 est explicite : le vrai fondu
 //! enchaîné mélangera deux flux décodés dans le moteur audio, sur la sortie
@@ -126,9 +128,8 @@ fn aucun_gestionnaire_de_fondu_par_le_volume_ne_revient() {
          matérielle, c'est le volume PERSISTANT de la zone, et jamais deux \
          flux mélangés. L'arbitrage du 02/09/2026 est que le volume matériel \
          ne doit plus être touché : un vrai fondu enchaîné superpose deux flux \
-         PCM décodés sur la sortie locale. Tant qu'il n'existe pas, la route \
-         reste fermée (501 `crossfade_unavailable`, #2689) — mieux vaut une \
-         option absente qu'une option qui ment."
+         PCM décodés sur la sortie locale — c'est `audio::fondu_enchaine`, \
+         branché sur la boucle gapless de la sortie locale depuis #2211."
     );
 }
 

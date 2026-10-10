@@ -1556,6 +1556,11 @@ impl PlaybackOrchestrator {
             // geste, et une zone qui en sort doit la retrouver — sans attendre
             // la piste suivante.
             local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+            // #2211 — même raison pour le fondu : une zone qui ENTRE en PURE ne
+            // doit plus fondre à la prochaine frontière.
+            local_output.set_fondu_enchaine_ms(crate::audio::fondu_de_zone::duree_appliquee_ms(
+                &self.db, zone_id,
+            ));
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -2345,6 +2350,78 @@ impl PlaybackOrchestrator {
                 "zone_mono_downmix_refreshed_live"
             );
             true
+        }
+    }
+
+    /// #2211 — reposer la durée de fondu enchaîné de la zone sur la sortie
+    /// locale vivante. Elle vaut à la PROCHAINE frontière : jamais au milieu
+    /// d'une piste, où armer une réserve creuserait l'anneau.
+    ///
+    /// `None` : aucune sortie locale vivante pour cette zone (la prochaine
+    /// lecture posera la valeur). `Some(sait_fondre)` : la valeur est posée, et
+    /// `sait_fondre` dit si ce bras de lecture fond (chemin partagé) ou s'il
+    /// enchaîne seulement en gapless (bras exclusifs).
+    /// #2211 — la sortie locale vivante de la zone joue-t-elle par un bras
+    /// EXCLUSIF (WASAPI exclusif, ASIO, CoreAudio exclusif) ? Ces bras
+    /// enchaînent sans blanc mais ne fondent pas : la route refuse alors le
+    /// réglage. `None` : aucune sortie locale vivante pour cette zone.
+    pub async fn zone_locale_exclusive(&self, zone_id: i64) -> Option<bool> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)?;
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            let local_output = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            Some(!local_output.sait_fondre())
+        }
+    }
+
+    pub async fn refresh_zone_fondu_enchaine(&self, zone_id: i64) -> Option<bool> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)?;
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            let local_output = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            let ms = crate::audio::fondu_de_zone::duree_appliquee_ms(&self.db, zone_id);
+            local_output.set_fondu_enchaine_ms(ms);
+            let sait_fondre = local_output.sait_fondre();
+            info!(
+                zone_id,
+                device_id = %device_id,
+                fondu_ms = ms,
+                sait_fondre,
+                "zone_fondu_enchaine_refreshed_live"
+            );
+            Some(sait_fondre)
         }
     }
 
