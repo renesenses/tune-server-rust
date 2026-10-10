@@ -1346,6 +1346,22 @@ impl PositionPoller {
                 continue;
             }
 
+            // #6059 — un `Seek` acquitté mais IGNORÉ (Yamaha R-N2000A, fichier
+            // natif) : l'appareil est profilé, et le flux natif est relancé à
+            // la position que l'utilisateur voulait.
+            if let Some(position) =
+                crate::orchestrator::seek_natif_6059::constater(zone_id, &status)
+            {
+                if let Err(e) = self
+                    .orchestrator
+                    .replay_zone_at_position(zone_id, position, "seek_ignore_6059")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_natif_rattrapage_echoue");
+                }
+                continue;
+            }
+
             // Check whether we're in the seek grace period: after a seek the
             // in-memory position is authoritative and the output may still
             // report the old (pre-seek) position until the stream restarts.

@@ -2207,6 +2207,8 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        // #6059 — le départ que porte l'URL (flux natif relancé à la position).
+        super::dlna_depart_natif::noter_url_posee(&self.device_id, media.url);
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.

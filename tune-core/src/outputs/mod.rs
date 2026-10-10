@@ -23,6 +23,8 @@ pub mod dlna;
 pub mod dlna_annonce_suivante;
 pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
+/// #6059 — position d'un flux natif relancé au milieu de la piste.
+pub mod dlna_depart_natif;
 pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
 /// Repli conservateur sur un refus de `SetAVTransportURI` (501/714/716),

@@ -744,6 +744,14 @@ impl PlaybackOrchestrator {
         let stream_url = self
             .streamer
             .get_stream_url(&session_id, &server_ip, &out_ext);
+        // #6059 — un flux natif qui commence à la position le dit dans son
+        // URL : la sortie DLNA rapporte ensuite la position du renderer à la
+        // piste (`outputs::dlna_depart_natif`).
+        let depart_natif_ms = crate::outputs::dlna_depart_natif::depart_de_session(&session_id);
+        let stream_url = match depart_natif_ms {
+            Some(d) => crate::outputs::dlna_depart_natif::url_avec_depart(&stream_url, d),
+            None => stream_url,
+        };
 
         // For a transcoded WAV/LPCM stream served with an exact byte length
         // (the file-transcode path pre-encodes the whole WAV, so file_size is
@@ -799,7 +807,9 @@ impl PlaybackOrchestrator {
             // ends at real EOF). Fall back to the scanned duration if the probe
             // fails, so a NAS timeout never blanks the duration entirely.
             let probed_secs = crate::audio::analyzer::get_duration(&file_path).await.ok();
-            Some(passthrough_didl_duration_ms(probed_secs, track.duration_ms))
+            let duree = passthrough_didl_duration_ms(probed_secs, track.duration_ms);
+            // #6059 — la DIDL décrit le flux SERVI : ce qui reste après le départ.
+            Some(duree - depart_natif_ms.unwrap_or(0).min(duree.max(0) as u64) as i64)
         } else {
             Some(track.duration_ms)
         };
@@ -3440,11 +3450,28 @@ impl PlaybackOrchestrator {
             // l'en-tête puis les trames, pas le fichier : `res@size` et
             // Content-Length doivent dire ces octets-là (même raison que
             // #1132 juste au-dessus).
-            let passthrough_file_size = conteneur_flac_neuf
+            // #6059 — renderer profilé « Seek inopérant » (Yamaha R-N2000A) et
+            // relecture à une position : le flux NATIF commence à la trame (ou
+            // au bloc) de cette position, sous un en-tête réécrit. Pas sur le
+            // conteneur FLAC neuf de #4800, qui a déjà sa propre carte.
+            let depart_natif = if is_network_output && conteneur_flac_neuf.is_none() {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()));
+                self.preparer_depart_natif_6059(did, req.seek_ms, file_path)
+                    .await
+            } else {
+                None
+            };
+            let passthrough_file_size = depart_natif
                 .as_ref()
-                .map(|m| m.total)
+                .map(|d| d.carte.total)
+                .or(conteneur_flac_neuf.as_ref().map(|m| m.total))
                 .or(passthrough_disk_size)
                 .or_else(|| track_file_size.map(|s| s as u64));
+            let duree_servie_ms = (track_duration_ms as u64)
+                .saturating_sub(depart_natif.as_ref().map_or(0, |d| d.depart_ms));
 
             let info = StreamInfo {
                 format: fmt.clone(),
@@ -3453,7 +3480,7 @@ impl PlaybackOrchestrator {
                 bit_depth,
                 channels,
                 file_size: passthrough_file_size,
-                duration_ms: Some(track_duration_ms as u64),
+                duration_ms: Some(duree_servie_ms),
                 ..Default::default()
             };
 
@@ -3461,6 +3488,10 @@ impl PlaybackOrchestrator {
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
+            if let Some(d) = depart_natif {
+                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, d.depart_ms);
+                self.streamer.set_faststart(&session_id, d.carte).await;
+            }
 
             // #4800 — FLAC de l'enregistreur (`Lavf` sans MD5, #4350) vers le
             // réseau : servi tel quel sous son en-tête neuf. La carte est la

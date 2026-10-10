@@ -25,6 +25,8 @@ pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
+/// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
+pub mod depart_natif;
 pub mod dff;
 /// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
 /// DFF) et le routage par position vers la sortie.
