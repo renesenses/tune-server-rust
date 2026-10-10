@@ -146,7 +146,24 @@ horodater juste et envoyer assez tôt.
 | Noise `KKpsk2`, deux suites, mode de transition en clair (fermé par défaut) | livré (S2-a) | `tune-core/src/sendspin/{poignee,transport,transition}.rs` |
 | Appairage CPace, PSK longue durée persistées, commandes opérateur | livré (S2-b) | `tune-core/src/sendspin/{appairage,pake,magasin}.rs` |
 | Fragmentation | livré | `tune-core/src/sendspin/transport/fragmentation.rs` |
+| **Connexions initiées par le serveur** (Tune compose vers les `_sendspin._tcp` découverts) | **PR empilée** | `tune-server/src/routes/sendspin/{sortantes,prise}.rs` |
 | **Rôle `player@v1` et sortie (zone) Sendspin** | **cette PR** | `tune-core/src/sendspin/{lecteur,horloge}.rs`, `tune-core/src/outputs/sendspin.rs`, `tune-core/src/audio/encoder.rs` (`EncodeurTramesFlac`), `tune-server/src/routes/sendspin/{pilote,zones}.rs` |
+
+### Connexions initiées par le serveur
+
+Le mode recommandé par la spécification, celui des enceintes qui s'annoncent
+et attendent (Voice PE, ESPHome). Une boucle lancée avec le routeur relit
+toutes les 2 s les annonces `_sendspin._tcp` du scanner mDNS et compose
+`ws://<hôte>:<port><path>` vers chaque enceinte sans session. La suite est la
+même session serveur que pour une connexion entrante (même code, via une
+« prise » commune) : `client/init` de l'enceinte, Tune initiateur Noise,
+appairage par la route opérateur, rôle `player@v1` et zone pour une enceinte
+appairée. Reconnexion selon `client/goodbye` : coupure ou `restart` →
+recomposition (2 s, doublé jusqu'à 60 s) ; `concurrent_attempt` → 60 s ;
+`another_server`, `shutdown`, `user_request`, `unauthorized`,
+`pairing_required`, `unpaired` → pas avant 10 min, ou au retour de l'annonce.
+Une seule boucle par état de serveur. `MdnsScanner::annoncer` permet
+d'annoncer une adresse à la main (réseau sans multicast, bancs).
 
 ### Le rôle `player@v1`
 
@@ -208,12 +225,8 @@ horodater juste et envoyer assez tôt.
   un flux en cours, et la porte de sortie de l'issue (deux enceintes du même
   type synchrones sur la durée d'un album). Chaque enceinte a aujourd'hui son
   groupe solo.
-- **Connexions initiées par le serveur** : Tune parcourt déjà
-  `_sendspin._tcp` mais ne compose pas vers ces enceintes. C'est le mode
-  recommandé par la spécification ; il faut un client WebSocket qui mène la
-  même séquence serveur.
-- **Accès non appairé** : la spécification permet `playback` sous Sentinelle
-  quand l'enceinte l'autorise. Tune ne l'utilise pas (question ouverte).
+- **Accès non appairé** : refusé par décision (09/10/2026) ; seules les
+  enceintes appairées deviennent des zones.
 - `set_output_delay`, Opus (facultatif), les rôles `metadata`, `artwork`,
   `controller`, `visualizer`.
 - **Source HTTP** : une URL distante est téléchargée en entier avant le

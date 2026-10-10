@@ -471,6 +471,23 @@ async fn diffuser(
                 }
                 let trames = (n / octets_trame) as u64;
                 let donnees = codec.encoder(tampon.drain(..n).collect())?;
+                if trames_total == 0 {
+                    // Premier morceau d'une ligne de temps neuve : « servers MUST
+                    // schedule the first audio timestamp far enough in the
+                    // future ». L'avance a été comptée au lancement ; ouvrir le
+                    // fichier et décoder le premier bloc a pu en manger une
+                    // part (mesuré sous charge : 94 ms de retard chez
+                    // aiosendspin). La ligne de temps part donc de maintenant.
+                    let au_plus_tot = maintenant_us() + avance;
+                    if base_us < au_plus_tot {
+                        let decalage = au_plus_tot - base_us;
+                        base_us = au_plus_tot;
+                        let mut d = verrou(diffusion);
+                        if let Some(s) = d.segments.first_mut() {
+                            s.debut_us += decalage;
+                        }
+                    }
+                }
                 let ts = base_us + duree_us(trames_base, rate);
                 let duree = duree_us(trames_base + trames, rate) - duree_us(trames_base, rate);
                 attendre_jusqu_a(ts - avance - HORIZON_US).await;

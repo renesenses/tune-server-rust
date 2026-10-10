@@ -5,7 +5,7 @@ use crate::auth::RequireAdmin;
 use crate::state::AppState;
 use axum::extract::{DefaultBodyLimit, Path};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +21,8 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/sendspin/{client_id}/pair/code", post(code))
         .route("/sendspin/{client_id}/credentials", delete(revoquer))
+        .route("/sendspin/exclusions", get(lister_exclusions))
+        .route("/sendspin/exclusions/{id}", put(exclure))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 type Erreur = (StatusCode, Json<Value>);
@@ -153,4 +155,56 @@ async fn revoquer(
         .await
         .map(|retire| Json(json!({"revoked":retire})))
         .map_err(|_| erreur(ErreurCommande::Indisponible))
+}
+
+/// `GET /devices/sendspin/exclusions` — les enceintes que Tune ne contacte pas.
+async fn lister_exclusions(
+    _: RequireAdmin,
+    Extension(c): Extension<ContexteSendspin>,
+) -> Json<Value> {
+    Json(json!({"excluded": c.exclusions()}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Exclusion {
+    excluded: bool,
+}
+
+/// `PUT /devices/sendspin/exclusions/{id}` `{"excluded": bool}` — exclut (ou
+/// réadmet) une enceinte, par `client_id` ou par identifiant d'annonce mDNS.
+/// Une session en cours avec elle est close aussitôt.
+async fn exclure(
+    _: RequireAdmin,
+    Path(id): Path<String>,
+    Extension(c): Extension<ContexteSendspin>,
+    Json(e): Json<Exclusion>,
+) -> Result<Json<Value>, Erreur> {
+    use super::exclusions as x;
+    if !x::identifiant_valide(&id) {
+        return Err(erreur(ErreurCommande::Invalide("identifiant invalide")));
+    }
+    let Some(db) = c.reglages().cloned() else {
+        return Err(erreur(ErreurCommande::Indisponible));
+    };
+    let mut liste = x::lire(&db);
+    let change = if e.excluded {
+        if liste.len() >= x::NOMBRE_MAX && !liste.contains(&id) {
+            return Err(erreur(ErreurCommande::Invalide("liste d'exclusion pleine")));
+        }
+        liste.insert(id.clone())
+    } else {
+        liste.remove(&id)
+    };
+    if change {
+        x::ecrire(&db, &liste).map_err(|_| erreur(ErreurCommande::Indisponible))?;
+    }
+    if e.excluded {
+        // L'enceinte est peut-être déjà en session : elle la quitte.
+        c.sessions().revoquer(&id);
+    }
+    tracing::info!(id = %id, excluded = e.excluded, "sendspin_exclusion_modifiee");
+    Ok(Json(
+        json!({"id": id, "excluded": e.excluded, "list": liste}),
+    ))
 }

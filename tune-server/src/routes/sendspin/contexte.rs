@@ -11,6 +11,12 @@ struct Interieur {
     dossier: PathBuf,
     sessions: super::sessions::Sessions,
     zones: Option<super::zones::RaccordZones>,
+    /// Les réglages (liste d'exclusion) ; `None` dans les témoins du seul
+    /// protocole : rien n'est alors exclu.
+    reglages: Option<Arc<dyn tune_core::db::backend::DbBackend>>,
+    /// URL composée → `client_id` appris à son `client/init` : l'annonce mDNS
+    /// ne porte aucune identité, la session si.
+    composes: Mutex<std::collections::HashMap<String, String>>,
     magasin: OnceLock<Result<Mutex<MagasinAppairage>, String>>,
 }
 
@@ -23,6 +29,8 @@ impl ContexteSendspin {
             dossier,
             sessions: super::sessions::Sessions::default(),
             zones: None,
+            reglages: None,
+            composes: Mutex::new(std::collections::HashMap::new()),
             magasin: OnceLock::new(),
         }))
     }
@@ -41,6 +49,45 @@ impl ContexteSendspin {
 
     pub(super) fn zones(&self) -> Option<&super::zones::RaccordZones> {
         self.0.zones.as_ref()
+    }
+
+    /// Branche les réglages : la liste d'exclusion devient effective.
+    #[must_use]
+    pub fn avec_reglages(mut self, db: Arc<dyn tune_core::db::backend::DbBackend>) -> Self {
+        match Arc::get_mut(&mut self.0) {
+            Some(interieur) => interieur.reglages = Some(db),
+            None => tracing::warn!("sendspin_reglages_non_branches_contexte_partage"),
+        }
+        self
+    }
+
+    pub(super) fn reglages(&self) -> Option<&Arc<dyn tune_core::db::backend::DbBackend>> {
+        self.0.reglages.as_ref()
+    }
+
+    /// La liste d'exclusion en vigueur (vide sans réglages).
+    pub(crate) fn exclusions(&self) -> std::collections::BTreeSet<String> {
+        self.0
+            .reglages
+            .as_ref()
+            .map(super::exclusions::lire)
+            .unwrap_or_default()
+    }
+
+    /// L'un de ces identifiants est-il exclu ?
+    pub(super) fn est_exclu(&self, ids: &[&str]) -> bool {
+        let liste = self.exclusions();
+        ids.iter().any(|id| liste.contains(*id))
+    }
+
+    pub(super) fn noter_compose(&self, url: &str, client_id: &str) {
+        if let Ok(mut m) = self.0.composes.lock() {
+            m.insert(url.to_owned(), client_id.to_owned());
+        }
+    }
+
+    pub(crate) fn client_du_lien(&self, url: &str) -> Option<String> {
+        self.0.composes.lock().ok()?.get(url).cloned()
     }
 
     /// Suit le chemin de donnees deja resolu par TuneConfig, y compris quand

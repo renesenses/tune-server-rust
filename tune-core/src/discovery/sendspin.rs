@@ -125,6 +125,33 @@ impl Annonce {
     }
 }
 
+/// Un lecteur `_sendspin._tcp` tel que le scanner mDNS l'aurait résolu :
+/// pour une annonce manuelle ([`crate::discovery::mdns::MdnsScanner::annoncer`])
+/// et les bancs, qui n'ont pas de multicast.
+pub fn appareil_annonce(
+    hote: &str,
+    port: u16,
+    chemin: Option<&str>,
+    nom: Option<&str>,
+) -> DiscoveredDevice {
+    let annonce = Annonce::depuis_txt(chemin, nom);
+    DiscoveredDevice {
+        id: format!("sendspin:{hote}:{port}"),
+        name: annonce.nom.clone().unwrap_or_else(|| "Sendspin".into()),
+        device_type: crate::discovery::device::OutputType::Sendspin,
+        host: hote.to_owned(),
+        port,
+        available: true,
+        capabilities: annonce.capacites(),
+        manufacturer: None,
+        model: None,
+        location: None,
+        airplay_version: None,
+        mac_address: None,
+        stable_id: None,
+    }
+}
+
 fn normalise(valeur: Option<&str>) -> Option<String> {
     valeur
         .map(str::trim)

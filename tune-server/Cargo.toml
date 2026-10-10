@@ -130,6 +130,10 @@ jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 unicode-normalization = { workspace = true }
 futures-util = { workspace = true }
+# #3326 — connexions Sendspin initiées par le serveur : Tune compose en
+# WebSocket vers l'enceinte. Version déjà dans Cargo.lock (tune-core,
+# `cloud-relay`) : aucune caisse nouvelle.
+tokio-tungstenite = "0.26"
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 time = { workspace = true }

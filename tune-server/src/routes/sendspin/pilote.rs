@@ -2,11 +2,12 @@
 //! S2-c : ordres de la sortie `player@v1` (flux, morceaux, commandes) et
 //! `client/state`, sur la meme boucle — un seul ecrivain par connexion.
 use super::ContexteSendspin;
+use super::prise::Prise as WebSocket;
 use super::sessions::{
     Commande, ErreurCommande, Inscription, Soumission, decrire_methodes, methodes,
 };
 use super::zones::GardeDepart;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::Message;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -229,7 +230,19 @@ impl Pilote {
                         return Err(sequence("payload chiffre non objet"));
                     }
                     match message.type_message.as_str() {
-                        "client/goodbye" => return Ok(()),
+                        "client/goodbye" => {
+                            // La raison décide de la reconnexion d'une prise
+                            // sortante (`client/goodbye`, spécification).
+                            let raison = message
+                                .payload
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            tracing::info!(client_id = %self.infos.client_id, raison, "sendspin_client_goodbye");
+                            super::sortantes::noter_au_revoir(raison);
+                            return Ok(());
+                        }
                         "client/time" => {
                             let t = message
                                 .payload
