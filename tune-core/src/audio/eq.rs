@@ -252,6 +252,45 @@ impl EqProcessor {
         matches!(self.engine, Engine::Neutre)
     }
 
+    /// #5215 (décision de Bertrand du 10/10, seconde partie) — tant que
+    /// l'égaliseur reste COUPÉ, le préampli gardé vaut pour TOUTES les pistes
+    /// suivantes, sans saut. Rend, pour la piste qui commence, un neutre qui
+    /// porte le même gain, sans fondu (début de piste : rien à fondre). `None`
+    /// quand `self` n'est pas un neutre qui garde un préampli.
+    ///
+    /// Un gain identique sur tous les canaux (le cas d'un préampli) est rangé
+    /// en un seul coefficient : il vaut alors quel que soit le nombre de
+    /// canaux de la piste suivante. Le neutre ne filtre rien : son taux ne
+    /// sert à rien, celui de la piste coupée est repris tel quel.
+    pub fn reporter_le_preampli_garde(&self) -> Option<Self> {
+        let (sample_rate, channels) = (self.sample_rate, self.channels);
+        if !self.est_neutre() {
+            return None;
+        }
+        let gains = self.gain_garde.as_ref()?;
+        let premier = *gains.first()?;
+        let gains = if gains.iter().all(|g| (g - premier).abs() < 1e-7) {
+            vec![premier]
+        } else if usize::from(channels.max(1)) == gains.len() {
+            gains.clone()
+        } else {
+            // Canaux différents et gains inégaux : on garde la moyenne plutôt
+            // que de décaler les canaux.
+            vec![gains.iter().sum::<f32>() / gains.len() as f32]
+        };
+        Some(Self {
+            engine: Engine::Neutre,
+            sample_rate,
+            channels,
+            fondu: None,
+            compensation: 1.0,
+            gain_moyen_db: 0.0,
+            gain_garde: Some(gains),
+            clipping: Default::default(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
     /// #5215 — égaliseur coupé dont le fondu est fini ET qui ne garde aucun
     /// préampli : identité exacte, à retirer de la chaîne. Un neutre qui
     /// garde un préampli reste monté : il porte le niveau (décision du 10/10).

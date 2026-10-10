@@ -1188,7 +1188,18 @@ impl LocalOutput {
     /// two tracks takes effect on the next one.
     pub fn set_eq(&self, mut eq: Option<super::super::audio::eq::EqProcessor>) {
         self.faire_porter_la_compensation(&mut eq);
-        *self.eq.lock().unwrap() = eq;
+        {
+            let mut emplacement = self.eq.lock().unwrap();
+            // #5215 (décision du 10/10) — l'égaliseur reste coupé : le
+            // préampli gardé à la coupure vaut aussi pour cette piste, sans
+            // retour à 0 dB. Jamais sous PURE, qui ne doit rien laisser monté.
+            if eq.is_none() && !self.pure_bypass.load(Ordering::Relaxed) {
+                eq = emplacement
+                    .as_ref()
+                    .and_then(|p| p.reporter_le_preampli_garde());
+            }
+            *emplacement = eq;
+        }
         self.recalculer_la_compensation();
     }
 

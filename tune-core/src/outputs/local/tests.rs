@@ -4155,6 +4155,66 @@ fn couper_l_egaliseur_en_vol_garde_le_niveau_du_preampli_5215() {
     );
 }
 
+/// Décision de Bertrand du 10/10, seconde partie : tant que l'égaliseur reste
+/// COUPÉ, le préampli gardé vaut pour TOUTES les pistes suivantes, sans saut.
+/// Le début de piste passe par `set_eq(None)` (l'EQ de la zone est coupé) :
+/// avant, il retirait le neutre et le niveau remontait d'un coup à 0 dB.
+#[test]
+fn le_preampli_garde_vaut_pour_les_pistes_suivantes_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -10.0,
+        "prémisse : grosse réserve ({preampli} dB)"
+    );
+    sortie.set_eq(Some(eq));
+    let attendu = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32;
+
+    let mut trame = 0;
+    let mut signal = jouer_5215(&sortie, &mut trame, 20);
+    sortie.replace_eq_live(None);
+    signal.extend(jouer_5215(&sortie, &mut trame, 60));
+    // Deux pistes suivantes, l'égaliseur toujours coupé.
+    for piste in 1..=2 {
+        sortie.set_eq(None);
+        let debut = signal.len();
+        signal.extend(jouer_5215(&sortie, &mut trame, 30));
+        let crete = crete_5215(&signal[debut..]);
+        assert!(
+            (crete / attendu - 1.0).abs() < 0.012,
+            "piste suivante n°{piste}, égaliseur coupé : crête {crete}, attendu {attendu} \
+             (le préampli {preampli:.2} dB gardé doit valoir pour les pistes suivantes, \
+             décision du 10/10)"
+        );
+    }
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "un saut de {marche} entre deux échantillons au changement de piste (seuil {MARCHE_MAX_5215})"
+    );
+    assert!(!sortie.has_eq(), "l'égaliseur ne compte pas comme actif");
+}
+
+/// Sous PURE, rien ne reste monté : le préampli gardé n'est pas reporté.
+#[test]
+fn sous_pure_le_preampli_garde_n_est_pas_reporte_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_eq(Some(egaliseur_a_preampli_negatif_5215()));
+    let mut trame = 0;
+    jouer_5215(&sortie, &mut trame, 5);
+    sortie.replace_eq_live(None);
+    jouer_5215(&sortie, &mut trame, 60);
+    sortie.pure_bypass.store(true, Ordering::Relaxed);
+    sortie.set_eq(None);
+    assert!(
+        sortie.eq.lock().unwrap().is_none(),
+        "PURE : le neutre qui garde le préampli a été reporté sur la piste suivante"
+    );
+}
+
 /// Un égaliseur sans préampli (aucune bande qui pousse) : la coupure finie,
 /// rien ne reste monté — la chaîne redevient celle d'un EQ absent.
 #[test]
