@@ -2084,6 +2084,14 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #6057 — la disposition des canaux que le FICHIER déclare
+                    // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
+                    // voie par sa position. Rien en PURE : chemin intouché.
+                    local_output.set_disposition_source(if zone_audiophile {
+                        None
+                    } else {
+                        self.disposition_declaree(track_id, media.file_path)
+                    });
                     // Rampe anti-« ploc » à la pause / reprise / arrêt (#1590),
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.

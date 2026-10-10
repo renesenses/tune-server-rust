@@ -2342,6 +2342,26 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #6057 — la disposition des canaux que déclare le fichier de la piste,
+    /// quand elle diffère de l'ordre par défaut ; `None` sinon (le
+    /// comportement par défaut suffit). Le chemin vient du média résolu, à
+    /// défaut de la ligne `tracks`.
+    pub fn disposition_declaree(
+        &self,
+        track_id: Option<i64>,
+        file_path: Option<&str>,
+    ) -> Option<std::sync::Arc<crate::audio::disposition_canaux::Disposition>> {
+        let chemin = file_path.map(str::to_string).or_else(|| {
+            crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .get(track_id?)
+                .ok()
+                .flatten()?
+                .file_path
+        })?;
+        crate::audio::disposition_canaux::declaree_hors_defaut(std::path::Path::new(&chemin))
+            .map(std::sync::Arc::new)
+    }
+
     pub async fn set_volume(
         &self,
         zone_id: i64,

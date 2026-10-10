@@ -101,6 +101,8 @@ pub(super) struct EntreesCoreAudio {
         Arc<std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>>,
     pub(super) pure_bypass: Arc<AtomicBool>,
     pub(super) mono_downmix: Arc<AtomicBool>,
+    /// #6057 — la disposition déclarée par le fichier.
+    pub(super) disposition: Arc<super::CreneauDisposition>,
     pub(super) dop_active: Arc<AtomicBool>,
     /// #5451 — la réserve de `set_next_media`, que le bras consomme pour
     /// enchaîner à format égal sans rouvrir le périphérique, et ce qu'il
@@ -382,6 +384,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         crossfeed,
         pure_bypass,
         mono_downmix,
+        disposition,
         dop_active,
         next_media,
         chain_exhausted,
@@ -490,6 +493,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
             crossfeed: &crossfeed,
             pure_bypass: &pure_bypass,
             mono_downmix: &mono_downmix,
+            disposition: &disposition,
             dop_active: &dop_active,
             volume: &volume,
             user_volume: &user_volume_ref,

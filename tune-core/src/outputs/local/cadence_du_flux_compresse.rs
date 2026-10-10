@@ -120,9 +120,13 @@ pub(super) fn conformer_la_piste_decodee(
     source_sr: u32,
     source_ch: u16,
     sortie: FormatOuvert,
+    disposition: Option<&crate::audio::disposition_canaux::Disposition>,
 ) -> Vec<f32> {
     let mut samples = samples;
-    if source_ch != sortie.canaux {
+    // #6057 — la disposition déclarée par le fichier, quand elle a été lue.
+    if let Some(d) = disposition.filter(|d| d.canaux() == source_ch) {
+        samples = super::adapt_channels_disposee(&samples, source_ch, sortie.canaux, d);
+    } else if source_ch != sortie.canaux {
         samples = adapt_channels(&samples, source_ch, sortie.canaux);
     }
     if source_sr != sortie.cadence {

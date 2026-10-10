@@ -469,6 +469,16 @@ use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
 mod periode;
+
+/// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
+/// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit
+/// l'ordre par défaut.
+pub(crate) type CreneauDisposition =
+    std::sync::Mutex<Option<Arc<crate::audio::disposition_canaux::Disposition>>>;
+
+/// Le créneau vide des étages montés hors d'une `LocalOutput` (témoins).
+#[cfg(test)]
+pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
 
 // ---------------------------------------------------------------------------
@@ -693,6 +703,8 @@ pub struct LocalOutput {
     /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
     /// signal » affiche l'étape « Mono » et le verdict tombe.
     mono_downmix: Arc<AtomicBool>,
+    /// #6057 — la disposition déclarée par le fichier de la piste en cours.
+    disposition: Arc<CreneauDisposition>,
     /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
     /// pause, à la reprise et à l'arrêt (#1590).
     ///
@@ -1162,6 +1174,7 @@ impl LocalOutput {
             pure_bypass: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
+            disposition: Arc::new(std::sync::Mutex::new(None)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
             // exactement comme avant #1590.
@@ -1468,6 +1481,18 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
+    /// (`None` : l'ordre par défaut, comme avant). Lue à chaque bloc par
+    /// l'étage de conversion.
+    pub fn set_disposition_source(
+        &self,
+        disposition: Option<Arc<crate::audio::disposition_canaux::Disposition>>,
+    ) {
+        if let Ok(mut d) = self.disposition.lock() {
+            *d = disposition;
+        }
     }
 
     /// Le repli mono est-il armé sur cette sortie ?
@@ -2518,6 +2543,8 @@ struct LocalPcmProcessor<'a> {
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
     mono_downmix: &'a AtomicBool,
+    /// #6057 — la disposition déclarée, lue par `convertir`.
+    disposition: &'a CreneauDisposition,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -3920,7 +3947,17 @@ impl EtageDeConversion<'_> {
 
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
-        if self.needs_channel_adapt() {
+        // #6057 — la disposition que le fichier DÉCLARE route chaque voie par
+        // sa position, même à nombre de canaux égal. Jamais sur un porteur
+        // DoP : ce sont des octets à livrer tels quels.
+        let declaree = if self.pcm.dop_active.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.pcm.disposition.lock().ok().and_then(|d| d.clone())
+        };
+        if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
+            mots = adapt_channels_disposee(&mots, self.spec.canaux(), self.sortie.canaux, &d);
+        } else if self.needs_channel_adapt() {
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
         if self.needs_resample {
@@ -4857,6 +4894,7 @@ impl OutputTarget for LocalOutput {
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
+        let disposition = self.disposition.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
@@ -5541,6 +5579,7 @@ impl OutputTarget for LocalOutput {
                     dec_sr,
                     dec_ch,
                     FormatOuvert::new(output_sr, output_ch),
+                    disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
 
                 // Pre-fill the ring buffer before starting the cpal stream.
@@ -5789,6 +5828,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5451 — le bras consomme la réserve et enchaîne à
                     // format égal, sans rouvrir le périphérique.
@@ -5842,6 +5882,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5204 — la route native consomme la réserve et enchaîne
                     // à format égal, sans refermer le pilote.
@@ -6061,6 +6102,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
                     mono_downmix: &mono_downmix,
+                    disposition: &disposition,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -7595,3 +7637,7 @@ mod empreinte_asio_f70496;
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
 mod transformations_reelles_de_l_etage_ref6b;
+
+/// #6057 — l'étage route par la disposition déclarée par le fichier.
+#[cfg(test)]
+mod disposition_declaree_tests;
