@@ -488,6 +488,25 @@ fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
     );
 }
 
+/// #4176 — PURE allumé, rien d'armé : l'étape DSP le dit en clair au lieu
+/// d'annoncer « DSP contourné par PURE » sur un chemin déjà intact.
+#[test]
+fn pure_sans_objet_est_dit_dans_l_etape_dsp() {
+    let (zone, mut ps, backend) = local_runtime_zone(100.0, OutputVolumeState::Unity, Vec::new());
+    if let Some(runtime) = ps.output_signal_path.as_mut() {
+        runtime.bit_perfect = true;
+        runtime.dsp = OutputDspState::PureSansObjet;
+    }
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("PURE actif : aucun traitement armé, rien à contourner")
+    );
+}
+
 /// Monte une zone locale Windows dont la sonde a publié `reasons`.
 fn local_runtime_zone(
     volume_percent: f64,
