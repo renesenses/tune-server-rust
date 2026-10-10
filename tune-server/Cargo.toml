@@ -1540,3 +1540,10 @@ path = "tests/credits_apres_identification_4805.rs"
 [[test]]
 name = "insertion_avant_la_piste_en_cours_5770"
 path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
+
+# Liens et sauvegardes de `/playlist-manager` : alias dépréciés (en-tête
+# `Deprecation`) pendant une version, doublons du greffon « Playlists
+# converter ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "playlist_manager_alias_deprecies"
+path = "tests/playlist_manager_alias_deprecies.rs"

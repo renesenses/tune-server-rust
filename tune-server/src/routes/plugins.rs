@@ -44,6 +44,37 @@ pub fn router() -> Router<AppState> {
     router
 }
 
+/// Les routes d'un greffon premium qui restent GRATUITES, décidées par l'hôte
+/// (la licence est l'affaire de l'hôte, jamais du greffon — RFC §3.5).
+///
+/// Décision de Bertrand (08/10/2026, #5966) : les sauvegardes de playlists de
+/// l'écran v2 restent gratuites. Elles passent désormais par les copies
+/// datées du greffon « Playlists converter » ; les liens de synchronisation
+/// et le transfert entre services restent Premium.
+#[cfg(feature = "plugins-wasm")]
+const ROUTES_GRATUITES: &[(&str, &str, &str)] = &[
+    ("playlists-converter", "POST", "/snapshot"),
+    ("playlists-converter", "GET", "/snapshots"),
+    ("playlists-converter", "GET", "/snapshot"),
+    (
+        "playlists-converter",
+        "POST",
+        "/snapshot/restauration/apercu",
+    ),
+    ("playlists-converter", "POST", "/snapshot/restauration"),
+];
+
+/// Cette route d'un greffon premium est-elle gratuite ? Correspondance
+/// EXACTE de la méthode et du chemin : un préfixe ouvrirait aussi les routes
+/// qu'un greffon ajouterait plus tard sous le même nom.
+#[cfg(feature = "plugins-wasm")]
+fn route_gratuite(greffon: &str, methode: &str, chemin: &str) -> bool {
+    let chemin = chemin.trim_end_matches('/');
+    ROUTES_GRATUITES
+        .iter()
+        .any(|(g, m, c)| *g == greffon && m.eq_ignore_ascii_case(methode) && *c == chemin)
+}
+
 /// Dispatch an HTTP request to a loaded wasm plugin (P2, RFC §3.5).
 ///
 /// Packages the request as `{method, path, query, body}` JSON, runs the plugin
@@ -54,6 +85,7 @@ pub fn router() -> Router<AppState> {
 #[cfg(feature = "plugins-wasm")]
 async fn wasm_dispatch(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     method: axum::http::Method,
     Path((id, subpath)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
@@ -77,7 +109,8 @@ async fn wasm_dispatch(
 
     // Premium gate BEFORE dispatch: the host owns licensing, not the plugin
     // (RFC §3.5). Reuse the same guard the native premium routes use.
-    if loaded.manifest.premium {
+    let chemin = format!("/{subpath}");
+    if loaded.manifest.premium && !route_gratuite(&id, method.as_str(), &chemin) {
         if let Err(resp) = crate::premium_guard::require_premium(
             &state.license,
             tune_core::license::Feature::PluginMarketplace,
@@ -93,56 +126,104 @@ async fn wasm_dispatch(
     } else {
         serde_json::from_slice(&body).unwrap_or(Value::Null)
     };
-    let req = json!({
-        "method": method.as_str(),
-        "path": format!("/{subpath}"),
-        "query": query.unwrap_or_default(),
-        "body": body_json,
-    });
-    let req_str = req.to_string();
+    match appeler_greffon_wasm(
+        &state,
+        &id,
+        method.as_str(),
+        &chemin,
+        &query.unwrap_or_default(),
+        body_json,
+        // `X-Profile-Id` de l'appelant (décision du 08/10/2026, #5966) : une
+        // playlist locale lue ou créée par le greffon l'est sous le profil de
+        // celui qui agit, comme pour `/playlist-manager/transfer` (#4741).
+        Some(profile.id()),
+    )
+    .await
+    {
+        Ok((status, corps)) => (status, Json(corps)).into_response(),
+        Err((status, corps)) => (status, Json(corps)).into_response(),
+    }
+}
+
+/// Appeler une route d'un greffon wasm CHARGÉ, depuis le serveur lui-même.
+///
+/// Le corps de [`wasm_dispatch`], sans la garde premium — qui reste l'affaire
+/// de l'appelant : c'est une décision de route, pas de transport. Sert aussi
+/// aux routes historiques que #4741 fait passer par le greffon « Playlists
+/// converter », seul moteur de transfert de playlists du serveur.
+///
+/// `profil` : le profil au nom duquel le greffon agit pendant CET appel (voir
+/// [`crate::plugins_host::avec_profil_de_l_appel`]). `None` garde la règle
+/// d'avant : le réglage global `active_profile_id`.
+///
+/// `Ok((statut, corps))` : la réponse du greffon, quel que soit son statut.
+/// `Err((statut, corps))` : le greffon n'a pas pu répondre (absent, en panne,
+/// réponse illisible).
+#[cfg(feature = "plugins-wasm")]
+pub(crate) async fn appeler_greffon_wasm(
+    state: &AppState,
+    id: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: Value,
+    profil: Option<i64>,
+) -> Result<(StatusCode, Value), (StatusCode, Value)> {
+    let present = state
+        .wasm_plugins
+        .get()
+        .is_some_and(|registry| registry.get(id).is_some());
+    if !present {
+        return Err((
+            StatusCode::NOT_FOUND,
+            json!({ "error": "plugin not found", "id": id }),
+        ));
+    }
+
+    let req_str = json!({
+        "method": method,
+        "path": path,
+        "query": query,
+        "body": body,
+    })
+    .to_string();
 
     // The wasm call (and every host-function it triggers) runs on a blocking
     // thread: the Store isn't Sync — serialise per plugin via its Mutex — and
     // the host's async capabilities `block_on` the runtime, which is only sound
     // off a runtime worker.
     let wasm_plugins = state.wasm_plugins.clone();
-    let plugin_id = id.clone();
+    let plugin_id = id.to_string();
     let call = tokio::task::spawn_blocking(move || {
         let registry = wasm_plugins.get().expect("registry present");
         let loaded = registry.get(&plugin_id).expect("plugin present");
         let mut plugin = loaded.plugin.blocking_lock();
-        plugin.handle_route(&req_str)
+        crate::plugins_host::avec_profil_de_l_appel(profil, || plugin.handle_route(&req_str))
     })
     .await;
 
     let resp_str = match call {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return (
+            return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "plugin_error", "message": e })),
-            )
-                .into_response();
+                json!({ "error": "plugin_error", "message": e }),
+            ));
         }
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "plugin_task_failed", "message": e.to_string() })),
-            )
-                .into_response();
+                json!({ "error": "plugin_task_failed", "message": e.to_string() }),
+            ));
         }
     };
 
-    let parsed: Value = match serde_json::from_str(&resp_str) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "plugin_bad_response", "message": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let parsed: Value = serde_json::from_str(&resp_str).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": "plugin_bad_response", "message": e.to_string() }),
+        )
+    })?;
 
     let status = parsed
         .get("status")
@@ -150,8 +231,7 @@ async fn wasm_dispatch(
         .and_then(|c| u16::try_from(c).ok())
         .and_then(|c| StatusCode::from_u16(c).ok())
         .unwrap_or(StatusCode::OK);
-    let out_body = parsed.get("body").cloned().unwrap_or(Value::Null);
-    (status, Json(out_body)).into_response()
+    Ok((status, parsed.get("body").cloned().unwrap_or(Value::Null)))
 }
 
 /// Les fiches héritées de la clef de réglages `plugins`, débarrassées de

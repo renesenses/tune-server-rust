@@ -45,6 +45,7 @@ fn le_transfert_prend_un_snapshot_avant_le_premier_ajout() {
             cible_service: "qobuz".into(),
             playlists: vec!["pl-1".into()],
             suffixe_nom: None,
+            nom_cible: None,
         })
         .unwrap();
     let lot = moteur.transferer(&lot.lot_id, true).unwrap();
@@ -90,6 +91,7 @@ fn sans_snapshot_rien_n_est_verse() {
             cible_service: "qobuz".into(),
             playlists: vec!["pl-1".into()],
             suffixe_nom: None,
+            nom_cible: None,
         })
         .unwrap();
     // Un lot écrit AVANT #4718 : cible déjà créée, aucun snapshot, et la
@@ -302,21 +304,73 @@ fn la_restauration_ne_fait_jamais_plus_que_l_apercu() {
     assert_eq!(hote.ajouts(), vec![("pl-1".into(), vec!["s-2".into()])]);
 }
 
-/// Le mode « recréer » crée une NOUVELLE playlist et laisse l'ancienne.
+/// Le mode « recréer » crée une NOUVELLE playlist DANS TUNE et laisse
+/// l'ancienne (décision de Bertrand, 08/10/2026) : les pistes du snapshot pris
+/// chez TIDAL sont appariées dans la bibliothèque, celles qui n'y sont pas
+/// sortent en introuvables, et RIEN n'est écrit chez le service.
 #[test]
-fn recreer_cree_une_nouvelle_playlist_et_laisse_l_ancienne() {
+fn recreer_recree_la_playlist_dans_tune_et_n_ecrit_rien_chez_le_service() {
     let (hote, id) = banc_retouche();
+    let hote = hote
+        .avec_verdict_chez(
+            "local",
+            "Imagine",
+            Verdict::exact(Piste::new("41", "Imagine", "John Lennon", 183_500)),
+        )
+        .avec_verdict_chez(
+            "local",
+            "Fragile",
+            Verdict::exact(Piste::new("43", "Fragile", "Sting", 232_000)),
+        );
     let s = Snapshots::new(&hote);
     let (plan, _, a_retirer) = s.apercu_restauration(&id, mode::RECREER).unwrap();
     assert!(a_retirer.is_empty());
+    assert_eq!(plan.cible_service.as_deref(), Some("local"));
+    assert_eq!(plan.a_rajouter_ids, vec!["41", "43"]);
+    assert_eq!(plan.introuvables_ids, vec!["s-2"]);
+    assert_eq!(s.introuvables(&plan)[0].titre, "Come Together");
+    assert!(
+        plan.avertissement.contains("dans Tune"),
+        "{}",
+        plan.avertissement
+    );
+
     let (fait, _) = s.restaurer(&plan.plan_id, true).unwrap();
+    assert_eq!(fait.etat, "termine");
     assert_eq!(
         hote.creations(),
-        vec![("cible-1".into(), "Nuit blanche".into())]
+        vec![("1001".into(), "Nuit blanche".into())],
+        "une playlist LOCALE (identifiant entier) est créée, aucune chez le service"
     );
-    assert_eq!(fait.playlist_recreee_id.as_deref(), Some("cible-1"));
-    assert_eq!(hote.ids_de("cible-1"), vec!["s-1", "s-2", "s-3"]);
+    assert_eq!(fait.playlist_recreee_id.as_deref(), Some("1001"));
+    assert_eq!(hote.ids_de("1001"), vec!["41", "43"]);
+    assert_eq!(
+        hote.ajouts(),
+        vec![("1001".into(), vec!["41".into(), "43".into()])]
+    );
     assert_eq!(hote.ids_de("pl-1"), vec!["s-1", "s-3", "s-4"], "intacte");
+}
+
+/// Un snapshot de la bibliothèque se recrée dans la bibliothèque, à
+/// l'identique : ses identifiants sont déjà ceux de Tune.
+#[test]
+fn recreer_une_playlist_locale_reprend_ses_pistes() {
+    let hote = HoteDeBanc::new().avec_playlist(
+        "7",
+        "Ma sélection",
+        vec![
+            Piste::new("12", "Imagine", "John Lennon", 183_000),
+            Piste::new("13", "Fragile", "Sting", 232_000),
+        ],
+    );
+    let s = Snapshots::new(&hote);
+    let id = s.prendre("local", "7", None, "manuel").unwrap().snapshot_id;
+    let (plan, _, _) = s.apercu_restauration(&id, mode::RECREER).unwrap();
+    assert!(plan.introuvables_ids.is_empty());
+    let (fait, _) = s.restaurer(&plan.plan_id, true).unwrap();
+    let cible = fait.playlist_recreee_id.unwrap();
+    assert_eq!(hote.ids_de(&cible), vec!["12", "13"]);
+    assert_eq!(hote.ids_de("7"), vec!["12", "13"], "intacte");
 }
 
 /// Une playlist LOCALE se garde et se complète par ses identifiants entiers.

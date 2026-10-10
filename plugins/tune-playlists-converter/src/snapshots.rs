@@ -13,8 +13,14 @@
 //!   qui en ont disparu, et on **liste** celles qui y sont en trop
 //!   (`a_retirer_par_vous`) : c'est à l'utilisateur de les retirer lui-même,
 //!   depuis l'application du service. Tune ne le fait jamais à sa place ;
-//! * mode `recreer` — on **crée une nouvelle playlist** avec le nom et les
-//!   pistes du snapshot. L'ancienne n'est pas touchée.
+//! * mode `recreer` — on **crée une nouvelle playlist DANS TUNE** (la
+//!   bibliothèque) avec le nom et les pistes du snapshot. L'ancienne n'est pas
+//!   touchée. Décision de Bertrand (08/10/2026) : une restauration recrée la
+//!   playlist dans Tune ; l'export vers un service reste une action à part
+//!   (le transfert). Les pistes d'un snapshot pris chez un service sont donc
+//!   APPARIÉES dans la bibliothèque, par la règle du transfert
+//!   ([`crate::appariement::apparier_chez`]) ; celles qui n'y sont pas sortent
+//!   en `introuvables`, et rien n'est écrit chez le service.
 //!
 //! Comme tout ce qui écrit chez un service, un retour en arrière passe par un
 //! **aperçu** (`plan`) puis un **accord** explicite. Et il prend lui-même un
@@ -46,6 +52,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::appariement::apparier_chez;
 use crate::hote::Hote;
 
 /// Nombre de snapshots gardés PAR PLAYLIST. Le onzième réécrit le premier.
@@ -58,8 +65,8 @@ pub const PISTES_PAR_PAGE: usize = 400;
 /// Nombre de plans de restauration gardés (anneau, tous confondus).
 pub const RETENTION_PLANS: u64 = 20;
 
-/// Paquet d'ajout, comme pour le transfert (#4717) : le lot d'ajout de TIDAL.
-const TAILLE_PAQUET: usize = 100;
+// Paquet d'ajout : le MÊME que le transfert (#4717), le lot d'ajout de TIDAL.
+use crate::moteur::TAILLE_PAQUET;
 
 const COMPTEUR_PLAYLISTS: &str = "compteur_playlists_snap";
 const PREFIXE_REGISTRE: &str = "snap_pl:";
@@ -123,7 +130,8 @@ struct Registre {
 pub mod mode {
     /// Rajouter ce qui manque, lister ce qui est en trop.
     pub const COMPLETER: &str = "completer";
-    /// Créer une nouvelle playlist depuis le snapshot.
+    /// Créer une nouvelle playlist DANS TUNE (la bibliothèque) depuis le
+    /// snapshot, quel que soit le service d'origine.
     pub const RECREER: &str = "recreer";
 }
 
@@ -159,6 +167,16 @@ pub struct PlanRestauration {
     #[serde(default)]
     pub erreur: Option<String>,
     pub avertissement: String,
+    /// Où le plan écrit : `local` pour un plan `recreer` (la playlist est
+    /// recréée dans Tune). `None` : plan d'une version antérieure, qui
+    /// écrivait chez le service du snapshot — il est exécuté tel qu'il a été
+    /// accordé.
+    #[serde(default)]
+    pub cible_service: Option<String>,
+    /// Mode `recreer` d'un snapshot de service : les pistes du snapshot que la
+    /// bibliothèque n'a pas (identifiants chez le service).
+    #[serde(default)]
+    pub introuvables_ids: Vec<String>,
 }
 
 /// Lire une piste rendue par l'hôte, locale ou de service.
@@ -514,11 +532,29 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
         let snap = self.lire(snapshot_id)?;
         let e = &snap.entete;
 
+        let mut introuvables_ids = Vec::new();
         let (a_rajouter, a_retirer, deja) = if mode_demande == mode::COMPLETER {
             let (_, courantes) = lire_playlist(self.hote, &e.service, &e.playlist_id)?;
             comparer(&snap.pistes, &courantes)
-        } else {
+        } else if e.service == LOCAL {
             (sans_doublon(&snap.pistes), Vec::new(), 0)
+        } else {
+            // Recréer DANS TUNE une playlist de service : chaque piste est
+            // cherchée dans la bibliothèque, par la règle du transfert.
+            let mut trouvees = Vec::new();
+            for p in sans_doublon(&snap.pistes) {
+                match apparier_chez(self.hote, LOCAL, &p.titre, &p.artiste, &p.isrc, p.duree_ms) {
+                    Ok(c) => trouvees.push(PisteSnap {
+                        id: c.id,
+                        titre: c.titre,
+                        artiste: c.artiste,
+                        duree_ms: c.duree_ms,
+                        isrc: p.isrc,
+                    }),
+                    Err(_) => introuvables_ids.push(p.id),
+                }
+            }
+            (sans_doublon(&trouvees), Vec::new(), 0)
         };
 
         let n = self.compteur(COMPTEUR_PLANS)? + 1;
@@ -540,6 +576,8 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
             snapshot_avant_restauration: None,
             erreur: None,
             avertissement: avertissement(mode_demande, a_retirer.len()),
+            cible_service: (mode_demande == mode::RECREER).then(|| LOCAL.to_string()),
+            introuvables_ids,
         };
         self.ecrire_plan(&plan)?;
         Ok((plan, a_rajouter, a_retirer))
@@ -601,12 +639,18 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
                 self.ecrire_plan(&plan)
             })
         } else {
+            // Un plan d'avant le 08/10 n'a pas de cible : il écrit chez le
+            // service du snapshot, comme il a été accordé.
+            let service_cible = plan
+                .cible_service
+                .clone()
+                .unwrap_or_else(|| plan.service.clone());
             let cible = match plan.playlist_recreee_id.clone() {
                 Some(id) => id,
                 None => {
                     let id = creer(
                         self.hote,
-                        &plan.service,
+                        &service_cible,
                         &plan.nom,
                         Some("Restauré par Tune depuis un snapshot"),
                     )?;
@@ -623,8 +667,7 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
                 .filter(|id| !plan.rajoutees.contains(id))
                 .cloned()
                 .collect();
-            let service = plan.service.clone();
-            ajouter(self.hote, &service, &cible, &restant, |paquet| {
+            ajouter(self.hote, &service_cible, &cible, &restant, |paquet| {
                 plan.rajoutees.extend(paquet.iter().cloned());
                 self.ecrire_plan(&plan)
             })
@@ -640,6 +683,21 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
         plan.avertissement = avertissement(&plan.mode, plan.a_retirer_par_vous_ids.len());
         self.ecrire_plan(&plan)?;
         Ok((plan, a_retirer))
+    }
+
+    /// Le détail lisible des pistes qu'un plan `recreer` n'a pas trouvées
+    /// dans la bibliothèque, lu dans son snapshot.
+    pub fn introuvables(&self, plan: &PlanRestauration) -> Vec<PisteSnap> {
+        if plan.introuvables_ids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(snap) = self.lire(&plan.snapshot_id) else {
+            return Vec::new();
+        };
+        sans_doublon(&snap.pistes)
+            .into_iter()
+            .filter(|p| plan.introuvables_ids.contains(&p.id))
+            .collect()
     }
 
     pub fn lire_plan(&self, plan_id: &str) -> Result<PlanRestauration, String> {
@@ -771,9 +829,9 @@ fn sans_doublon(pistes: &[PisteSnap]) -> Vec<PisteSnap> {
 
 fn avertissement(mode_plan: &str, a_retirer: usize) -> String {
     if mode_plan == mode::RECREER {
-        return "Une NOUVELLE playlist sera créée avec le contenu du snapshot. \
-                L'ancienne n'est ni modifiée ni supprimée : Tune ne supprime jamais rien \
-                chez un service."
+        return "Une NOUVELLE playlist sera créée dans Tune avec le contenu du snapshot. \
+                L'ancienne n'est ni modifiée ni supprimée, et rien n'est écrit chez un \
+                service : pour y envoyer la playlist, utilisez le transfert."
             .into();
     }
     if a_retirer == 0 {
