@@ -38,6 +38,7 @@ fn convertir(
             pure_bypass: &pure,
             mono_downmix: &mono,
             disposition: &creneau,
+            reaffectation: &crate::outputs::local::reaffectation::SANS_REAFFECTATION,
             dop_active: &dop_active,
             volume: &v,
             user_volume: &uv,

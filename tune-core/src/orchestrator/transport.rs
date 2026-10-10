@@ -2084,6 +2084,16 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #6044 — la réaffectation des canaux : la règle de l'album
+                    // prime sur celle de la zone, et aucune ne s'applique en
+                    // PURE (`regle_effective_with` le vérifie). Les canaux de
+                    // la source sont ceux du flux résolu, sinon ceux de la
+                    // piste en base.
+                    local_output.set_reaffectation(self.reaffectation_de_la_piste(
+                        zone_id,
+                        track_id,
+                        media.channels,
+                    ));
                     // #6057 — la disposition des canaux que le FICHIER déclare
                     // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
                     // voie par sa position. Rien en PURE : chemin intouché.

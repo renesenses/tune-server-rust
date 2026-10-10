@@ -469,6 +469,8 @@ use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
 mod periode;
+/// #6044 — la réaffectation des canaux (greffon `channel-remap`).
+mod reaffectation;
 
 /// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
 /// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit
@@ -480,6 +482,7 @@ pub(crate) type CreneauDisposition =
 #[cfg(test)]
 pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
+pub(crate) use reaffectation::CreneauReaffectation;
 
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
@@ -703,6 +706,10 @@ pub struct LocalOutput {
     /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
     /// signal » affiche l'étape « Mono » et le verdict tombe.
     mono_downmix: Arc<AtomicBool>,
+    /// #6044 — la matrice de réaffectation des canaux posée pour la piste
+    /// (`zone_{id}_channel_remap` ou la règle de l'album), appliquée à
+    /// l'adaptation source → périphérique. Vide par défaut et en PURE.
+    reaffectation: Arc<CreneauReaffectation>,
     /// #6057 — la disposition déclarée par le fichier de la piste en cours.
     disposition: Arc<CreneauDisposition>,
     /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
@@ -1174,6 +1181,7 @@ impl LocalOutput {
             pure_bypass: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
+            reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
@@ -1481,6 +1489,26 @@ impl LocalOutput {
     /// ne peut pas claquer.
     pub fn set_mono_downmix(&self, mono: bool) {
         self.mono_downmix.store(mono, Ordering::Relaxed);
+    }
+
+    /// #6044 — poser (ou retirer) la matrice de réaffectation des canaux de
+    /// la zone qui joue. Comme le repli mono, sans état : un remplacement en
+    /// pleine lecture prend effet au bloc suivant.
+    pub fn set_reaffectation(
+        &self,
+        matrice: Option<Arc<crate::audio::reaffectation_canaux::Matrice>>,
+    ) {
+        self.reaffectation.poser(matrice);
+    }
+
+    /// #6044 — une matrice est-elle posée sur cette sortie ?
+    pub fn has_reaffectation(&self) -> bool {
+        self.reaffectation.posee()
+    }
+
+    /// #6044 — le dernier bloc converti est-il passé par la matrice ?
+    pub fn reaffectation_appliquee(&self) -> bool {
+        self.reaffectation.appliquee()
     }
 
     /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
@@ -2543,6 +2571,8 @@ struct LocalPcmProcessor<'a> {
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
     mono_downmix: &'a AtomicBool,
+    /// #6044 — la réaffectation des canaux, lue par `convertir`.
+    reaffectation: &'a CreneauReaffectation,
     /// #6057 — la disposition déclarée, lue par `convertir`.
     disposition: &'a CreneauDisposition,
     dop_active: &'a AtomicBool,
@@ -3947,15 +3977,30 @@ impl EtageDeConversion<'_> {
 
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
-        // #6057 — la disposition que le fichier DÉCLARE route chaque voie par
-        // sa position, même à nombre de canaux égal. Jamais sur un porteur
-        // DoP : ce sont des octets à livrer tels quels.
-        let declaree = if self.pcm.dop_active.load(Ordering::Relaxed) {
+        // #6044 — la matrice de réaffectation, quand elle va de la source à la
+        // sortie, REMPLACE l'adaptation par défaut. Jamais sur un porteur DoP
+        // ni en PURE : ce sont des octets à livrer tels quels.
+        let intouchable = self.pcm.dop_active.load(Ordering::Relaxed)
+            || self.pcm.pure_bypass.load(Ordering::Relaxed);
+        let matrice = if intouchable {
+            None
+        } else {
+            self.pcm
+                .reaffectation
+                .pour(self.spec.canaux(), self.sortie.canaux)
+        };
+        self.pcm.reaffectation.noter(matrice.is_some());
+        // #6057 — sans matrice, la disposition que le fichier DÉCLARE route
+        // chaque voie par sa position, même à nombre de canaux égal. Jamais sur
+        // un porteur DoP : ce sont des octets à livrer tels quels.
+        let declaree = if matrice.is_some() || self.pcm.dop_active.load(Ordering::Relaxed) {
             None
         } else {
             self.pcm.disposition.lock().ok().and_then(|d| d.clone())
         };
-        if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
+        if let Some(m) = matrice {
+            mots = m.appliquer_f32(&mots);
+        } else if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
             mots = adapt_channels_disposee(&mots, self.spec.canaux(), self.sortie.canaux, &d);
         } else if self.needs_channel_adapt() {
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
@@ -3985,7 +4030,13 @@ impl EtageDeConversion<'_> {
             self.pcm.convolver,
             self.pcm.crossfeed,
             self.pcm.mono_downmix,
-        )
+        ) || (!self.pcm.dop_active.load(Ordering::Relaxed)
+            && !self.pcm.pure_bypass.load(Ordering::Relaxed)
+            && self
+                .pcm
+                .reaffectation
+                .pour(self.spec.canaux(), self.sortie.canaux)
+                .is_some())
     }
 
     /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
@@ -4894,6 +4945,7 @@ impl OutputTarget for LocalOutput {
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
+        let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
@@ -5579,6 +5631,7 @@ impl OutputTarget for LocalOutput {
                     dec_sr,
                     dec_ch,
                     FormatOuvert::new(output_sr, output_ch),
+                    Some((&reaffectation, pure_bypass.load(Ordering::Relaxed))),
                     disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
 
@@ -5828,6 +5881,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    reaffectation: reaffectation.clone(),
                     disposition: disposition.clone(),
                     dop_active,
                     // #5451 — le bras consomme la réserve et enchaîne à
@@ -5882,6 +5936,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    reaffectation: reaffectation.clone(),
                     disposition: disposition.clone(),
                     dop_active,
                     // #5204 — la route native consomme la réserve et enchaîne
@@ -6102,6 +6157,7 @@ impl OutputTarget for LocalOutput {
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
                     mono_downmix: &mono_downmix,
+                    reaffectation: &reaffectation,
                     disposition: &disposition,
                     dop_active: &dop_active,
                     volume: &volume,

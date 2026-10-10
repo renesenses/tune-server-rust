@@ -115,16 +115,40 @@ pub(super) fn journaliser_la_cadence_du_flux_compresse(
 /// Met la piste décodée (après DSP) au format réellement ouvert : canaux,
 /// puis cadence. Piste entière en mémoire : `rubato_resample_track` retire le
 /// délai de groupe du sinc et rend exactement `round(trames × ratio)` (#2246).
+///
+/// #6044 — `reaffectation` : la matrice de la zone, quand elle correspond à la
+/// source et à la sortie, remplace l'adaptation par défaut (`None` ou PURE :
+/// l'adaptation d'avant, inchangée).
 pub(super) fn conformer_la_piste_decodee(
     samples: Vec<f32>,
     source_sr: u32,
     source_ch: u16,
     sortie: FormatOuvert,
+    reaffectation: Option<(&super::CreneauReaffectation, bool)>,
     disposition: Option<&crate::audio::disposition_canaux::Disposition>,
 ) -> Vec<f32> {
     let mut samples = samples;
-    // #6057 — la disposition déclarée par le fichier, quand elle a été lue.
-    if let Some(d) = disposition.filter(|d| d.canaux() == source_ch) {
+    // #6044 — la matrice de la zone prime ; à défaut, #6057 — la disposition
+    // déclarée par le fichier, quand elle a été lue ; à défaut, l'adaptation
+    // par défaut.
+    let matrice_applicable = reaffectation.is_some_and(|(creneau, intouchable)| {
+        !intouchable && creneau.pour(source_ch, sortie.canaux).is_some()
+    });
+    let declaree = disposition.filter(|d| d.canaux() == source_ch);
+    if let (Some((creneau, intouchable)), true) =
+        (reaffectation, matrice_applicable || declaree.is_none())
+    {
+        samples = super::reaffectation::adapter_les_canaux(
+            creneau,
+            samples,
+            source_ch,
+            sortie.canaux,
+            intouchable,
+        );
+    } else if let Some(d) = declaree {
+        if let Some((creneau, _)) = reaffectation {
+            creneau.noter(false);
+        }
         samples = super::adapt_channels_disposee(&samples, source_ch, sortie.canaux, d);
     } else if source_ch != sortie.canaux {
         samples = adapt_channels(&samples, source_ch, sortie.canaux);
