@@ -705,3 +705,16 @@ path = "tests/ecrire_balises_edition_tranche4.rs"
 name = "clap_hors_async_5138"
 path = "tests/clap_hors_async_5138.rs"
 required-features = ["audio-embedding"]
+
+# Fuite mémoire CLAP du .18 (08/10, 12,2 Go en trois jours) : le modèle n'est
+# chargé que s'il reste des pistes, et relâché à la fin du balayage.
+# `autotests = false` : sans cette cible, ces témoins ne seraient jamais compilés.
+[[test]]
+name = "clap_fuite_rechargement_rc4"
+path = "tests/clap_fuite_rechargement_rc4.rs"
+required-features = ["audio-embedding"]
+
+# La conversion WAV 24 bits progressive contre `flac -d` (zone 10 du .18, 08/10).
+[[test]]
+name = "wav24_chaine_progressive_b209bf"
+path = "tests/wav24_chaine_progressive_b209bf.rs"

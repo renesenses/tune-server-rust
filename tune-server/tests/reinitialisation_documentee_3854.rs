@@ -137,15 +137,21 @@ fn le_desinstalleur_windows_laisse_toujours_les_donnees_comme_le_dit_la_procedur
     );
 }
 
-/// Le seul geste de remise à zéro offert à l'utilisateur n'efface que les
-/// pistes — et le document doit continuer à le dire, tant que c'est vrai.
+/// Le seul geste de remise à zéro offert à l'utilisateur ne touche ni aux
+/// réglages ni aux comptes — et le document doit continuer à le dire, tant que
+/// c'est vrai.
 ///
-/// `TrackRepo::delete_all()` ne touche ni `settings`, ni les comptes, ni les
-/// listes de lecture, ni les collections. Laisser croire l'inverse enverrait un
-/// testeur « repartir de zéro » avec ses vieux réglages intacts, puis rouvrir un
-/// fil pour dire que ça n'a pas marché.
+/// `TrackRepo::delete_all()` n'écrit ni dans `settings`, ni dans les comptes,
+/// ni dans les définitions des listes de lecture, ni dans les collections.
+/// Laisser croire l'inverse enverrait un testeur « repartir de zéro » avec ses
+/// vieux réglages intacts, puis rouvrir un fil pour dire que ça n'a pas marché.
+///
+/// #5973 — mais il n'efface pas QUE les pistes : par les `ON DELETE CASCADE`,
+/// le contenu des playlists, les notes et les signets partent avec elles
+/// (perte réelle, fil 2171). L'ancienne phrase « **Rien d'autre.** » disait le
+/// contraire ; le document doit désormais nommer la cascade.
 #[test]
-fn vider_la_bibliotheque_n_efface_toujours_que_les_pistes() {
+fn vider_la_bibliotheque_ne_touche_ni_reglages_ni_comptes_et_le_document_dit_la_cascade() {
     let repo = lire("tune-core/src/db/track_repo.rs");
     // ⚠️ La signature COMPLÈTE, pas `pub fn delete_all(`. Le même fichier porte,
     //    240 lignes plus haut, un `pub fn delete_all() -> &'static str` du module
@@ -184,9 +190,14 @@ fn vider_la_bibliotheque_n_efface_toujours_que_les_pistes() {
     }
     let doc = lire(DOC);
     assert!(
-        doc.contains("**Rien d'autre.**"),
-        "{DOC} ne dit plus que « Vider la bibliothèque » n'efface rien d'autre que \
-         les pistes. C'est la seule phrase qui empêche un testeur de croire que ce \
-         bouton le ramène à une installation neuve."
+        doc.contains("**Rien d'autre** n'est effacé : réglages, comptes"),
+        "{DOC} ne dit plus que « Vider la bibliothèque » laisse les réglages et les \
+         comptes. C'est la phrase qui empêche un testeur de croire que ce bouton le \
+         ramène à une installation neuve."
+    );
+    assert!(
+        doc.contains("par cascade") && doc.contains("le contenu local des playlists"),
+        "{DOC} ne dit plus que le vidage efface, par cascade, le contenu des \
+         playlists (#5973) : le document mentirait sur une opération DESTRUCTIVE."
     );
 }
