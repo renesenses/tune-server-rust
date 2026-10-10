@@ -499,6 +499,37 @@ pub(super) fn zone_mono_downmix_step(
         .then(|| "Sortie mono : (G + D) / 2 sur les deux voies".to_string())
 }
 
+/// #6044 — la zone réaffecte-t-elle les canaux de la piste en cours, et si
+/// oui, que dire ?
+///
+/// Même règle que l'orchestrateur (`reaffectation_de_la_piste` : la règle de
+/// l'album prime, puis celle de la zone, jamais en PURE), restreinte aux
+/// sorties LOCALES, seules à l'appliquer. Quand la sortie a déclaré ce
+/// qu'elle a ouvert (REF-6b), la matrice doit en produire exactement le
+/// nombre de voies : sinon l'étage a gardé l'adaptation par défaut, et
+/// l'annoncer serait décrire un traitement qui n'a pas lieu.
+pub(super) fn zone_reaffectation_step(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    output_type: &str,
+    track_id: Option<i64>,
+    reel: Option<&TransformationsReelles>,
+) -> Option<String> {
+    use tune_core::audio::reaffectation_canaux as rc;
+    if output_type != "local" {
+        return None;
+    }
+    let (album_id, canaux_en_base) = track_id
+        .map(|tid| rc::album_et_canaux_de_la_piste(backend, tid))
+        .unwrap_or((None, None));
+    let canaux_source = reel.map(|r| r.entree().canaux()).or(canaux_en_base);
+    let regle = rc::regle_effective_with(backend, zone_id, album_id, canaux_source)?;
+    if reel.is_some_and(|r| r.ouvert().canaux != regle.matrice.sorties()) {
+        return None;
+    }
+    Some(regle.description())
+}
+
 /// La famille DSD que désigne une cadence brute (2,8 MHz → DSD64, etc.).
 ///
 /// Une seule table pour la ligne Source et pour l'étage de sortie : elles
@@ -727,8 +758,15 @@ pub(super) fn build_signal_path(
     // mesuré le publie, et `None` laisse chaque verdict à sa déduction.
     let transformations_reelles = ps.transformations_reelles.as_ref();
 
-    let traitements =
+    let mut traitements =
         relever_les_traitements(backend, zone, np, output_type, runtime_signal_path, wire);
+    traitements.reaffectation_step = zone_reaffectation_step(
+        backend,
+        zone.id.unwrap_or(0),
+        output_type,
+        np.track_id,
+        transformations_reelles,
+    );
     let forcages = decider_les_forcages(
         zone,
         backend,
@@ -1038,6 +1076,7 @@ fn assembler_les_etapes(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        reaffectation_step,
         compensation_reseau_db,
         crossfeed_du_flux,
         ui_volume,
@@ -1457,6 +1496,21 @@ fn assembler_les_etapes(
         }));
     }
 
+    // Étape « Réaffectation des canaux » (#6044) — à l'adaptation source →
+    // périphérique, après tout le DSP : c'est là que l'étage de conversion
+    // l'applique. `bit_perfect: false` même pour une simple recopie (échange
+    // gauche/droite, 4.0 → 5.1) : les échantillons sont intacts, mais ils ne
+    // sortent plus sur la voie que le fichier leur donne. L'utilisateur qui
+    // l'a demandé doit voir ce qu'il échange.
+    if let Some(desc) = &reaffectation_step {
+        steps.push(json!({
+            "name": "Réaffectation des canaux",
+            "code": "channel_remap",
+            "description": desc,
+            "bit_perfect": false,
+        }));
+    }
+
     // #4573 — la réduction de canaux du chemin RÉSEAU, dite à l'écran.
     //
     // Ce panneau était FERMÉ à ce que fait une zone non locale : la sonde
@@ -1587,6 +1641,8 @@ fn rendre_les_verdicts(
     let dsp_applique = forcages.dsp_applique;
     let replaygain_step = traitements.replaygain_step.as_ref();
     let mono_downmix_step = traitements.mono_downmix_step.as_deref();
+    // #6044 — une matrice de canaux réécrit l'affectation des voies.
+    let reaffectation_active = traitements.reaffectation_step.is_some();
     // #5071 — sauf sur un DSD servi brut : rien n'y est cuit.
     let compensation_reseau =
         traitements.compensation_reseau_db.is_some() && !forcages.dsp_contourne_par_le_dsd;
@@ -1647,6 +1703,7 @@ fn rendre_les_verdicts(
         && !transformation_reelle_declaree
         && !replaygain_altere
         && mono_downmix_step.is_none()
+        && !reaffectation_active
         && !compensation_reseau
         && !crossfeed_du_flux;
 
@@ -2200,6 +2257,10 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
+    /// #6044 — la réaffectation des canaux de la sortie locale, décrite.
+    /// Posée après `relever_les_traitements`, qui ne voit pas les
+    /// transformations déclarées par la sortie.
+    reaffectation_step: Option<String>,
     /// #5071 — la compensation de niveau cuite dans le flux RÉSEAU, en dB,
     /// telle que la session la publie (`StreamInfo::compensation_db`, #5146).
     /// `None` sans session, ou quand le flux n'en porte pas : sortie locale
@@ -2289,6 +2350,7 @@ fn relever_les_traitements(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        reaffectation_step: None,
         compensation_reseau_db,
         crossfeed_du_flux,
         ui_volume,

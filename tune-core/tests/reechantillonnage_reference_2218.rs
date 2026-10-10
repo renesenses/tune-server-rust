@@ -61,8 +61,8 @@ use std::sync::OnceLock;
 
 use rubato::Resampler;
 use tune_core::audio::resample::{
-    alignement_de_piste, new_streaming_resampler, parametres_sinc, rubato_resample_chunk,
-    rubato_resample_track,
+    alignement_de_piste, interpolation_sinc, new_streaming_resampler, parametres_sinc,
+    rubato_resample_chunk, rubato_resample_track,
 };
 
 // ───────────────────────────── la référence ─────────────────────────────
@@ -467,6 +467,13 @@ struct Attendu {
 }
 
 // D3 (#4079) : RMS remesures apres correction de la somme de normalisation.
+//
+// #4754 : l'interpolation entre phases passe en Cubique partout où elle sert
+// (`interpolation_sinc`). Le balayage gagne 8 à 28 dB, la réjection des
+// montées depuis 44,1 kHz 18 à 26 dB ; le sinus fixe perd jusqu'à 2 dB sur
+// les descentes depuis 176,4 et 192 kHz, sous le plancher d'un mot de 24 bits.
+// 96 → 48 reste en Linéaire : rien n'y change. Chiffres de #4813, remesurés
+// par ces témoins sur Shrek le 09/10/2026.
 // Reference, tolerances et seuil audiophile restent inchanges.
 const ATTENDU: [Attendu; 7] = [
     // 44,1 → 48 kHz — AVANT le correctif D1 : −10,31 dB à 20 kHz, bande
@@ -475,13 +482,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0026,
         pre_roll: 53,
         a_retirer: 196,
-        err_sinus_db: -135.7,
+        err_sinus_db: -135.6, // Linéaire avant #4754 : -135.7
         err_sinus_brute_db: -69.5,
-        thd_n_db: -136.8,
-        err_balayage_db: -107.2,
+        thd_n_db: -136.1,        // Linéaire avant #4754 : -136.8
+        err_balayage_db: -134.6, // Linéaire avant #4754 : -107.2
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -109.9,
+        rejection_db: -127.5, // Linéaire avant #4754 : -109.9
         bord_debut_db: -63.5,
         bord_fin_db: -63.9,
         delai_annonce: 139,
@@ -494,13 +501,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0027,
         pre_roll: 155,
         a_retirer: 259,
-        err_sinus_db: -137.7,
+        err_sinus_db: -137.1, // Linéaire avant #4754 : -137.7
         err_sinus_brute_db: -68.4,
-        thd_n_db: -138.2,
-        err_balayage_db: -108.7,
+        thd_n_db: -137.1,        // Linéaire avant #4754 : -138.2
+        err_balayage_db: -135.8, // Linéaire avant #4754 : -108.7
         gain_20k_db: 0.0,
         bande_hz: 20_700.0,
-        rejection_db: -122.6,
+        rejection_db: -122.5, // Linéaire avant #4754 : -122.6
         bord_debut_db: -65.3,
         bord_fin_db: -65.6,
         delai_annonce: 117,
@@ -513,13 +520,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0017,
         pre_roll: 36,
         a_retirer: 356,
-        err_sinus_db: -135.4,
+        err_sinus_db: -135.2, // Linéaire avant #4754 : -135.4
         err_sinus_brute_db: -79.1,
-        thd_n_db: -136.1,
-        err_balayage_db: -107.1,
+        thd_n_db: -135.6,        // Linéaire avant #4754 : -136.1
+        err_balayage_db: -134.6, // Linéaire avant #4754 : -107.1
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -107.4,
+        rejection_db: -132.9, // Linéaire avant #4754 : -107.4
         bord_debut_db: -60.6,
         bord_fin_db: -60.8,
         delai_annonce: 278,
@@ -553,13 +560,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0034,
         pre_roll: 36,
         a_retirer: 713,
-        err_sinus_db: -135.3,
+        err_sinus_db: -135.0, // Linéaire avant #4754 : -135.3
         err_sinus_brute_db: -79.1,
-        thd_n_db: -135.9,
-        err_balayage_db: -107.2,
+        thd_n_db: -135.5,        // Linéaire avant #4754 : -135.9
+        err_balayage_db: -134.4, // Linéaire avant #4754 : -107.2
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -107.5,
+        rejection_db: -133.0, // Linéaire avant #4754 : -107.5
         bord_debut_db: -60.9,
         bord_fin_db: -61.1,
         delai_annonce: 557,
@@ -574,13 +581,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0011,
         pre_roll: 19,
         a_retirer: 39,
-        err_sinus_db: -143.4,
+        err_sinus_db: -141.7, // Linéaire avant #4754 : -143.4
         err_sinus_brute_db: -77.1,
-        thd_n_db: -144.5,
-        err_balayage_db: -130.0,
+        thd_n_db: -142.9,        // Linéaire avant #4754 : -144.5
+        err_balayage_db: -138.6, // Linéaire avant #4754 : -130.0
         gain_20k_db: 0.0,
         bande_hz: 21_150.0,
-        rejection_db: -144.3,
+        rejection_db: -143.6, // Linéaire avant #4754 : -144.3
         bord_debut_db: -76.9,
         bord_fin_db: -77.1,
         delai_annonce: 34,
@@ -593,13 +600,13 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0007,
         pre_roll: 27,
         a_retirer: 64,
-        err_sinus_db: -144.5,
+        err_sinus_db: -142.5, // Linéaire avant #4754 : -144.5
         err_sinus_brute_db: -80.5,
-        thd_n_db: -144.6,
-        err_balayage_db: -132.0,
+        thd_n_db: -142.6,        // Linéaire avant #4754 : -144.6
+        err_balayage_db: -140.1, // Linéaire avant #4754 : -132.0
         gain_20k_db: 0.0,
         bande_hz: 20_600.0,
-        rejection_db: -145.8,
+        rejection_db: -145.1, // Linéaire avant #4754 : -145.8
         bord_debut_db: -74.4,
         bord_fin_db: -74.7,
         delai_annonce: 58,
@@ -1451,14 +1458,16 @@ mod interpolation_4754 {
         }
     }
 
-    /// Contrôle de fidélité du banc : l'arme « Linéaire » de CE banc doit
-    /// rendre le même signal que la production. Sans ce témoin, les deux
-    /// colonnes pourraient parler d'un chemin que Tune n'emprunte pas.
+    /// Contrôle de fidélité du banc : l'arme de CE banc qui porte le mode de
+    /// la production (`interpolation_sinc`, Cubique ou Linéaire selon le
+    /// rapport depuis #4754) doit rendre le même signal que la production.
+    /// Sans ce témoin, les deux colonnes pourraient parler d'un chemin que
+    /// Tune n'emprunte pas.
     #[test]
     fn le_banc_4754_reproduit_bien_le_chemin_de_production() {
         for r in RAPPORTS {
             let x = sinus(r.de, 1_000.0, 0.2);
-            let mien = piste_interp(SincInterpolationType::Linear, &x, r.de, r.vers);
+            let mien = piste_interp(interpolation_sinc(r.de, r.vers), &x, r.de, r.vers);
             let prod = tune_piste(&x, r.de, r.vers);
             let n = mien.len().min(prod.len());
             assert!(n > 0, "{} : piste vide", r.nom);
@@ -1469,6 +1478,35 @@ mod interpolation_4754 {
                 pire < 1e-6,
                 "{} : le banc #4754 diverge de la production ({pire:.3e})",
                 r.nom
+            );
+        }
+    }
+
+    /// #4754 — là où `interpolation_sinc` garde Linéaire, Cubique rendrait
+    /// EXACTEMENT le même signal : les instants de sortie tombent pile sur les
+    /// phases de la table, il n'y a rien à interpoler. C'est ce qui justifie
+    /// de ne pas y payer ×1,2 de processeur. Si ce témoin rougit, le critère
+    /// « le dénominateur divise le nombre de phases » est faux.
+    #[test]
+    fn cubique_ne_change_rien_quand_les_instants_tombent_sur_la_table() {
+        for (de, vers) in [(96_000, 48_000), (44_100, 88_200), (48_000, 192_000)] {
+            assert!(
+                matches!(interpolation_sinc(de, vers), SincInterpolationType::Linear),
+                "{de} → {vers} : la production devrait rester en Linéaire"
+            );
+            let x = balayage(de, 0.2);
+            let lin = piste_interp(SincInterpolationType::Linear, &x, de, vers);
+            let cub = piste_interp(SincInterpolationType::Cubic, &x, de, vers);
+            assert_eq!(lin.len(), cub.len(), "{de} → {vers} : longueurs");
+            let pire = lin
+                .iter()
+                .zip(&cub)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                pire < 1e-6,
+                "{de} → {vers} : Cubique s'écarte de Linéaire de {pire:.3e} — les \
+                 instants ne tombent donc PAS sur la table"
             );
         }
     }
