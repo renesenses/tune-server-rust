@@ -8,19 +8,21 @@ use tune_core::db::backend::{SqlValue, ToSqlValue};
 use tune_core::db::engine::Engine;
 use tune_core::db::track_repo::folder_like_pattern;
 
-use super::facets::{FacetQuery, build_conditions, hors_executeur};
+use std::collections::HashSet;
+
+use super::facets::{FacetQuery, SocleResolu, build_conditions, hors_executeur};
 use crate::error::AppError;
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct FolderPathQuery {
     /// Absolute directory whose immediate sub-folders to list. Empty/absent →
     /// the configured library roots (top of the drill-down).
-    path: Option<String>,
+    pub(super) path: Option<String>,
     /// Max child folders returned (default 1000; `<= 0` = no limit). Distinct
     /// from `FacetQuery::limit` (that one is per-facet and unused here).
     #[serde(rename = "folder_limit")]
-    limit: Option<i64>,
+    pub(super) limit: Option<i64>,
 }
 
 /// GET /api/v1/library/folder-facet?path=<abs|empty>&<same filters as /library/tracks>
@@ -58,7 +60,31 @@ pub(super) async fn folder_facet(
 }
 
 /// Le corps de `GET /library/folder-facet`, exécuté HORS de l'exécuteur.
-fn lire_les_dossiers(state: &AppState, filters: FacetQuery, p: FolderPathQuery) -> Value {
+pub(super) fn lire_les_dossiers(
+    state: &AppState,
+    filters: FacetQuery,
+    p: FolderPathQuery,
+) -> Value {
+    lire_les_dossiers_avec(state, filters, p, None)
+}
+
+/// [`lire_les_dossiers`], le socle imposé — pour que les témoins de #5993
+/// comparent le calcul sans sonde au socle posé en SQL.
+pub(super) fn lire_les_dossiers_sur(
+    state: &AppState,
+    filters: FacetQuery,
+    p: FolderPathQuery,
+    socle: &SocleResolu,
+) -> Value {
+    lire_les_dossiers_avec(state, filters, p, Some(socle))
+}
+
+fn lire_les_dossiers_avec(
+    state: &AppState,
+    filters: FacetQuery,
+    p: FolderPathQuery,
+    impose: Option<&SocleResolu>,
+) -> Value {
     let engine = state.backend.engine();
     // Cumulative narrowing by the OTHER facets. exclude="folder" so the caller's
     // own folder selection isn't double-applied — this endpoint scopes by the
@@ -70,7 +96,25 @@ fn lire_les_dossiers(state: &AppState, filters: FacetQuery, p: FolderPathQuery) 
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|name| super::facets::resolve_collection(state, name));
-    let (conds, params) = build_conditions(&filters, engine, "folder", coll.as_ref());
+    // #5977 — le socle de la liste. #5993 — sans sonde par piste : on lit sur
+    // le socle réduit aux albums masqués, puis l'on RETRANCHE les pistes
+    // repliées. Un effectif de dossier est un nombre de pistes : la différence
+    // est exacte. `conds_complets` (le socle posé en SQL) ne sert que si le
+    // socle n'a pas pu être résolu.
+    let (conds, params) = build_conditions(
+        &filters,
+        engine,
+        "folder",
+        coll.as_ref(),
+        &SocleResolu::masques_seuls(),
+    );
+    let (conds_complets, _) = build_conditions(
+        &filters,
+        engine,
+        "folder",
+        coll.as_ref(),
+        &SocleResolu::EnSql,
+    );
 
     let path = p
         .path
@@ -86,8 +130,44 @@ fn lire_les_dossiers(state: &AppState, filters: FacetQuery, p: FolderPathQuery) 
     };
 
     match path {
-        None => folder_roots(state, engine, &conds, &params),
-        Some(prefix) => folder_children(state, engine, &prefix, &conds, &params, limit),
+        None => {
+            let global;
+            let socle = match impose {
+                Some(s) => s,
+                None => {
+                    global = SocleResolu::resoudre(state);
+                    &global
+                }
+            };
+            match (socle.ids(), socle.liste_des_ecartees()) {
+                (None, _) => folder_roots(state, engine, &conds_complets, None, &params),
+                (Some(_), None) => folder_roots(state, engine, &conds, None, &params),
+                (Some(_), Some(liste)) => {
+                    let mut retrait = conds.clone();
+                    retrait.push(format!("t.id IN ({liste})"));
+                    folder_roots(state, engine, &conds, Some(&retrait), &params)
+                }
+            }
+        }
+        Some(prefix) => {
+            // Les pistes repliées parmi les albums du dossier, connus une fois
+            // ses pistes lues : pas de seconde lecture du dossier.
+            let ecart = |albums: &[i64]| -> Option<HashSet<i64>> {
+                match impose {
+                    Some(s) => s.ids().map(|ids| ids.iter().copied().collect()),
+                    None => SocleResolu::ecartees_parmi(state, albums),
+                }
+            };
+            folder_children(
+                state,
+                engine,
+                &prefix,
+                (conds.as_slice(), conds_complets.as_slice()),
+                &params,
+                limit,
+                &ecart,
+            )
+        }
     }
 }
 
@@ -145,11 +225,20 @@ fn count_under(
         .unwrap_or(0)
 }
 
-fn folder_roots(state: &AppState, engine: Engine, conds: &[String], params: &[SqlValue]) -> Value {
+fn folder_roots(
+    state: &AppState,
+    engine: Engine,
+    conds: &[String],
+    retrait: Option<&[String]>,
+    params: &[SqlValue],
+) -> Value {
     let children: Vec<Value> = effective_roots(state)
         .into_iter()
         .map(|base| {
-            let count = count_under(state, engine, conds, params, &folder_like_pattern(&base));
+            let motif = folder_like_pattern(&base);
+            // #5993 — moins les pistes repliées du dossier.
+            let count = count_under(state, engine, conds, params, &motif)
+                - retrait.map_or(0, |r| count_under(state, engine, r, params, &motif));
             let name = std::path::Path::new(&base)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -267,27 +356,50 @@ fn folder_children(
     state: &AppState,
     engine: Engine,
     prefix: &str,
-    conds: &[String],
+    (conds, conds_complets): (&[String], &[String]),
     params: &[SqlValue],
     limit: Option<i64>,
+    ecart: &dyn Fn(&[i64]) -> Option<HashSet<i64>>,
 ) -> Value {
     let sep = std::path::MAIN_SEPARATOR;
     let (base, prefix_with_sep, plen) = prefixe_pour_decoupe(prefix, sep);
 
     // Fetch only the file paths in this subtree, narrowed by the active facets.
-    let (where_sql, all) = where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
-    let sql = format!("SELECT t.file_path FROM tracks t WHERE {where_sql}");
-    let refs: Vec<&dyn ToSqlValue> = all.iter().map(|v| v as &dyn ToSqlValue).collect();
-    let rows = state.backend.query_many(&sql, &refs).ou_defaut_journalise();
+    let lire = |conds: &[String]| {
+        let (where_sql, all) =
+            where_with_prefix(engine, conds, params, &folder_like_pattern(&base));
+        let sql = format!("SELECT t.id, t.album_id, t.file_path FROM tracks t WHERE {where_sql}");
+        let refs: Vec<&dyn ToSqlValue> = all.iter().map(|v| v as &dyn ToSqlValue).collect();
+        state.backend.query_many(&sql, &refs).ou_defaut_journalise()
+    };
+    let mut rows = lire(conds);
+    // #5993 — les pistes repliées des albums de CE dossier, retranchées ici.
+    let mut albums: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| r.get(1).and_then(|v| v.as_i64()))
+        .collect();
+    albums.sort_unstable();
+    albums.dedup();
+    let ecartees = match ecart(&albums) {
+        Some(e) => e,
+        None => {
+            rows = lire(conds_complets);
+            HashSet::new()
+        }
+    };
 
-    // Aggregate the immediate child segment (portable: no engine-specific SQL
-    // string surgery, no case/normalization equality traps). A row with no
-    // deeper separator is a file sitting directly in `base` → not a sub-folder.
     use std::collections::HashMap;
     let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut has_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut has_children: HashSet<String> = HashSet::new();
     for row in &rows {
-        let Some(fp) = row.first().and_then(|v| v.as_string()) else {
+        if row
+            .first()
+            .and_then(|v| v.as_i64())
+            .is_some_and(|id| ecartees.contains(&id))
+        {
+            continue;
+        }
+        let Some(fp) = row.get(2).and_then(|v| v.as_string()) else {
             continue;
         };
         let Some((child, deeper)) = split_child(&fp, plen, sep) else {

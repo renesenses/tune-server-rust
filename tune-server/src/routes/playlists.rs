@@ -476,6 +476,38 @@ async fn reorder_tracks(
     }
 }
 
+/// Copier une playlist LOCALE sous un nouveau nom : création et remplissage
+/// dans UNE transaction. Rend l'identifiant de la copie et le nombre de lignes
+/// réellement écrites.
+///
+/// L'appelant a déjà vérifié que la source appartient au profil (#2794). Sert
+/// à `POST /playlists/{id}/duplicate` et au cas « bibliothèque → bibliothèque »
+/// de `POST /playlist-manager/transfer` (#4741), qui n'est pas un transfert
+/// mais une copie : rien n'y est à apparier.
+pub(crate) fn copier_playlist_locale(
+    repo: &PlaylistRepo,
+    source_id: i64,
+    nom: &str,
+    profil: i64,
+) -> Result<(i64, usize), String> {
+    // Reading the source track list used to be `unwrap_or_default()`: a
+    // database error produced an EMPTY copy announced as a success — the same
+    // shape as #2119. A copy whose source we cannot read is a failure.
+    // #4889 — les lignes de service sont recopiées aussi : une copie qui les
+    // perdrait serait une copie plus courte que l'original, sans le dire.
+    let lignes: Vec<EntryContent> = repo
+        .get_entries(source_id)?
+        .into_iter()
+        .map(|e| e.content)
+        .collect();
+    // Create + fill in ONE transaction. A half-copied playlist has no meaning:
+    // either the copy exists complete, or nothing is left behind and the
+    // caller is told so (#2798). The old code created the playlist, then threw
+    // the track-insert error away with `.ok()` and answered 201 anyway.
+    let (new_id, copied) = repo.create_with_entries(nom, None, profil, &lignes)?;
+    Ok((new_id, copied.len()))
+}
+
 async fn duplicate_playlist(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -492,22 +524,8 @@ async fn duplicate_playlist(
         Err(r) => return r,
     };
 
-    // Reading the source track list used to be `unwrap_or_default()`: a
-    // database error produced an EMPTY copy announced as a success — the same
-    // shape as #2119. A copy whose source we cannot read is a failure.
-    // #4889 — les lignes de service sont recopiées aussi : une copie qui les
-    // perdrait serait une copie plus courte que l'original, sans le dire.
-    let lignes: Vec<EntryContent> = match repo.get_entries(id) {
-        Ok(entries) => entries.into_iter().map(|e| e.content).collect(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-
     let new_name = format!("{} (copy)", original.name);
-    // Create + fill in ONE transaction. A half-copied playlist has no meaning:
-    // either the copy exists complete, or nothing is left behind and the
-    // caller is told so (#2798). The old code created the playlist, then threw
-    // the track-insert error away with `.ok()` and answered 201 anyway.
-    match repo.create_with_entries(&new_name, None, profile.id(), &lignes) {
+    match copier_playlist_locale(&repo, id, &new_name, profile.id()) {
         Ok((new_id, copied)) => (
             StatusCode::CREATED,
             Json(json!({
@@ -515,7 +533,7 @@ async fn duplicate_playlist(
                 "name": new_name,
                 "description": Value::Null,
                 // Persisted rows, not "tracks we meant to copy".
-                "track_count": copied.len(),
+                "track_count": copied,
             })),
         )
             .into_response(),

@@ -143,8 +143,8 @@ pub struct ServerConnection {
 /// l'eau. Les distinguer ici evite d'avoir a se demander, plus loin, si un
 /// `Option<String>` vide veut dire « corps vide » ou « corps a venir ».
 pub enum CorpsRelaye {
-    /// Corps complet, deja recu.
-    Entier(Option<String>),
+    /// Corps complet, deja recu — en octets : une pochette n'est pas du texte.
+    Entier(Option<Vec<u8>>),
     /// Morceaux a venir, jusqu'a la fermeture du canal.
     Morceaux(mpsc::Receiver<Vec<u8>>),
 }

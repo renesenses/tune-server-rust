@@ -316,10 +316,23 @@ async fn resolve_pending(state: &RelayState, server_id: &str, resp: protocol::Re
     };
     let attendu = pending.lock().await.remove(&resp.id);
     if let Some(tx) = attendu {
+        // Un corps binaire arrive en base64 (`body_base64`), un corps texte
+        // dans `body`. Un base64 illisible devient un 502 franc : mieux vaut
+        // une image absente qu'une image corrompue.
+        let (status, body) = match resp.body_base64 {
+            Some(encode) => match decoder_base64(&encode) {
+                Some(octets) => (resp.status, Some(octets)),
+                None => {
+                    warn!(server_id = %server_id, id = %resp.id, "corps base64 illisible");
+                    (502, None)
+                }
+            },
+            None => (resp.status, resp.body.map(String::into_bytes)),
+        };
         let _ = tx.send(crate::state::PendingResponse {
-            status: resp.status,
+            status,
             headers: resp.headers,
-            body: CorpsRelaye::Entier(resp.body),
+            body: CorpsRelaye::Entier(body),
         });
     }
 }
@@ -563,7 +576,7 @@ mod relais_de_flux_tests {
 
         let reponse = reponse_attendue(attente).await;
         match reponse.body {
-            CorpsRelaye::Entier(Some(corps)) => assert_eq!(corps, "{\"ok\":true}"),
+            CorpsRelaye::Entier(Some(corps)) => assert_eq!(corps, b"{\"ok\":true}"),
             _ => panic!("une reponse d'API n'est pas un flux"),
         }
     }

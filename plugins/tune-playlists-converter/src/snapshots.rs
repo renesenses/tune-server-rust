@@ -58,8 +58,8 @@ pub const PISTES_PAR_PAGE: usize = 400;
 /// Nombre de plans de restauration gardés (anneau, tous confondus).
 pub const RETENTION_PLANS: u64 = 20;
 
-/// Paquet d'ajout, comme pour le transfert (#4717) : le lot d'ajout de TIDAL.
-const TAILLE_PAQUET: usize = 100;
+// Paquet d'ajout : le MÊME que le transfert (#4717), le lot d'ajout de TIDAL.
+use crate::moteur::TAILLE_PAQUET;
 
 const COMPTEUR_PLAYLISTS: &str = "compteur_playlists_snap";
 const PREFIXE_REGISTRE: &str = "snap_pl:";
