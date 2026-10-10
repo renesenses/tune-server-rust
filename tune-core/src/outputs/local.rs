@@ -3500,7 +3500,20 @@ fn local_dsp_runtime_state(
         return OutputDspState::BypassedDop;
     }
     if pure_bypass.load(Ordering::Relaxed) {
-        return OutputDspState::BypassedPure;
+        // #4176 — dire si PURE contourne quelque chose. Un verrou
+        // empoisonné ne permet pas de l'affirmer : on garde alors le
+        // « contourné » d'avant, qui reste vrai.
+        let rien_d_arme = !mono_downmix.load(Ordering::Relaxed)
+            && eq
+                .lock()
+                .is_ok_and(|g| g.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
+            && convolver.lock().is_ok_and(|g| g.is_none())
+            && crossfeed.lock().is_ok_and(|g| g.is_none());
+        return if rien_d_arme {
+            OutputDspState::PureSansObjet
+        } else {
+            OutputDspState::BypassedPure
+        };
     }
     // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
     // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
@@ -3559,7 +3572,10 @@ fn windows_signal_path_status(
     match dsp {
         OutputDspState::Applied => reasons.push(OutputSignalReason::DspApplied),
         OutputDspState::Unknown => reasons.push(OutputSignalReason::DspStateUnknown),
-        OutputDspState::Inactive | OutputDspState::BypassedPure | OutputDspState::BypassedDop => {}
+        OutputDspState::Inactive
+        | OutputDspState::BypassedPure
+        | OutputDspState::PureSansObjet
+        | OutputDspState::BypassedDop => {}
     }
     if volume == OutputVolumeState::Applied {
         reasons.push(OutputSignalReason::SoftwareVolume);

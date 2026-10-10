@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/community/covers", post(submit_community_cover))
         .route("/community/covers/sync", post(sync_community_covers))
         .route("/bridge/status", get(bridge_status))
+        .route("/bridge/access-link", get(bridge_access_link))
         .route("/bridge/enable", post(bridge_enable))
         .route("/bridge/disable", post(bridge_disable))
         .route("/license/status", get(license_status))
@@ -1008,6 +1009,61 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
             None
         },
     }))
+}
+
+/// Lien d'accès à distance, jeton compris, pour le PROPRIÉTAIRE seulement.
+///
+/// Le client web servi par le relais lit le jeton dans le fragment de
+/// l'adresse (`…/{server_id}/#token=…`) : c'est ce lien que les Réglages
+/// copient et mettent en QR code. `bridge_status` reste public et ne rend que
+/// `has_token` ; ce GET exige l'administrateur dès que l'authentification est
+/// active (`RequireAdmin`), répond 409 tant que le pont est éteint ou sans
+/// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
+async fn bridge_access_link(
+    _admin: crate::auth::RequireAdmin,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let enabled = settings
+        .get("bridge_enabled")
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+        || std::env::var("TUNE_BRIDGE_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+    if !enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "bridge_disabled"})),
+        )
+            .into_response();
+    }
+    let Some(token) = settings
+        .get("bridge_token")
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty())
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "no_bridge_token"})),
+        )
+            .into_response();
+    };
+    let server_id = TelemetryReporter::get_or_create_server_id(&settings);
+    let access_url = format!("https://bridge.mozaiklabs.fr/{server_id}/");
+    let link = format!("{access_url}#token={token}");
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "server_id": server_id,
+            "access_url": access_url,
+            "link": link,
+        })),
+    )
+        .into_response()
 }
 
 async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {

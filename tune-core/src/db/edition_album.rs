@@ -1554,6 +1554,8 @@ fn dossier_stocke(chemin: &str) -> Option<&str> {
 ///   retirés : un scan rend chaque piste à l'album de son dossier. Les
 ///   titres et artistes de piste renommés à la main restent tenus, sur
 ///   l'album où la piste se trouve désormais.
+/// - Le NOM de disque donné dans le coffret ne reste pas (#5644) : chaque
+///   piste reprend celui de sa balise DISCSUBTITLE, ou aucun.
 ///
 /// Refus `pas_un_coffret_manuel` pour tout album sans marqueur `manuel` — un
 /// coffret automatique se défait par sa propre route.
@@ -1637,6 +1639,19 @@ pub fn defaire_coffret_manuel(
         &[&album_id as &dyn ToSqlValue],
     )?;
     repo.update_track_count(album_id)?;
+
+    // #5644 — le NOM de chaque disque redevient celui que porte sa balise
+    // (DISCSUBTITLE), comme « Rétablir les disques » : un nom donné au disque
+    // dans le coffret ne suit pas l'album séparé. Fichier illisible ou
+    // tranche CUE : plus de nom, la relecture suivante le rendra s'il existe.
+    let balises = relire_les_balises(&lignes);
+    for l in &lignes {
+        let nom = balises.get(&l.id).and_then(|b| b.nom_disque.clone());
+        db.execute(
+            &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE id = {p2}"),
+            &[&nom as &dyn ToSqlValue, &l.id],
+        )?;
+    }
 
     // Le titre : rendu seulement s'il est encore celui de la composition.
     if let (Some(compose), Some(origine)) = (&marqueur.titre_compose, marqueur.disques.first())

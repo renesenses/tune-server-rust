@@ -180,6 +180,13 @@ impl PositionPoller {
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_pct)
                         .ok();
+                    // #6008 — l'adoption se dit au journal.
+                    volume_adopte_6008::journaliser_volume_adopte(
+                        zone_id,
+                        &device_id,
+                        db_vol,
+                        status.volume,
+                    );
                 }
                 // Remember what the renderer reported so the next tick can
                 // detect a genuine change.
@@ -1162,6 +1169,13 @@ impl PositionPoller {
                         crate::db::zone_repo::ZoneRepo::with_backend(db)
                             .update_volume(zone_id, vol_pct)
                             .ok();
+                        // #6008 — l'adoption se dit au journal.
+                        volume_adopte_6008::journaliser_volume_adopte(
+                            zone_id,
+                            &device_id,
+                            zone_state.volume,
+                            status.volume,
+                        );
                     }
                     ps.last_device_volume = Some(status.volume);
                 }
@@ -1509,6 +1523,13 @@ impl PositionPoller {
                 crate::db::zone_repo::ZoneRepo::with_backend(db)
                     .update_volume(zone_id, vol_pct)
                     .ok();
+                // #6008 — l'adoption se dit au journal.
+                volume_adopte_6008::journaliser_volume_adopte(
+                    zone_id,
+                    &device_id,
+                    zone_state.volume,
+                    status.volume,
+                );
             }
             // Edge-triggered like the stopped/radio paths: record the reported
             // volume so a renderer stuck at a persistent default (HiFi Rose
