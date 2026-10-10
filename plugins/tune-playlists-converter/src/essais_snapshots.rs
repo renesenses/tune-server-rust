@@ -45,6 +45,7 @@ fn le_transfert_prend_un_snapshot_avant_le_premier_ajout() {
             cible_service: "qobuz".into(),
             playlists: vec!["pl-1".into()],
             suffixe_nom: None,
+            nom_cible: None,
         })
         .unwrap();
     let lot = moteur.transferer(&lot.lot_id, true).unwrap();
@@ -90,6 +91,7 @@ fn sans_snapshot_rien_n_est_verse() {
             cible_service: "qobuz".into(),
             playlists: vec!["pl-1".into()],
             suffixe_nom: None,
+            nom_cible: None,
         })
         .unwrap();
     // Un lot écrit AVANT #4718 : cible déjà créée, aucun snapshot, et la

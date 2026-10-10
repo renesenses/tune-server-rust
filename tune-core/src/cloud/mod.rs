@@ -14,6 +14,7 @@ pub mod recommendations;
 pub mod refusal;
 #[cfg(feature = "cloud-relay")]
 pub mod relay;
+pub mod sauvegarde_config;
 pub mod sso;
 pub mod support;
 pub mod telemetry;

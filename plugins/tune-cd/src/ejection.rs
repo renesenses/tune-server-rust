@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::fournisseur::SOURCE;
 use crate::hote::HoteLecture;
 use crate::lecteur::{LecteurDisque, Presence};
+use crate::memoire::MemoireCd;
 use crate::source::PublicationSource;
 
 /// Zones sur lesquelles le greffon a lancé le disque.
@@ -33,6 +34,8 @@ pub struct Surveillant {
     /// Fil 2135 — l'éjection commandée (`POST /ejecter`) réveille la boucle :
     /// la source passe à `vide` sans attendre la fin de l'intervalle.
     reveil: Arc<Notify>,
+    /// #6043 — le disque chargé en mémoire, libéré quand le disque part.
+    memoire: Option<Arc<MemoireCd>>,
 }
 
 impl Surveillant {
@@ -49,7 +52,13 @@ impl Surveillant {
             derniere_generation: None,
             publication: None,
             reveil: Arc::default(),
+            memoire: None,
         }
+    }
+
+    pub fn avec_memoire(mut self, memoire: Arc<MemoireCd>) -> Self {
+        self.memoire = Some(memoire);
+        self
     }
 
     pub fn avec_reveil(mut self, reveil: Arc<Notify>) -> Self {
@@ -75,6 +84,14 @@ impl Surveillant {
         let generation_avant = self.derniere_generation.replace(generation);
         let lecteur_remplace = generation_avant.is_some_and(|g| g != generation);
         let mut arretees = Vec::new();
+        // #6043 — le disque est parti (ou le lecteur a changé) : rendre la
+        // mémoire du disque chargé, et arrêter un chargement en cours.
+        if avant == Some(Presence::Disque)
+            && (presence != Presence::Disque || lecteur_remplace)
+            && let Some(m) = self.memoire.clone()
+        {
+            let _ = tokio::task::spawn_blocking(move || m.liberer()).await;
+        }
         if avant == Some(Presence::Disque) && (presence != Presence::Disque || lecteur_remplace) {
             let zones: Vec<i64> = self.zones.lock().await.drain().collect();
             for zone_id in zones {

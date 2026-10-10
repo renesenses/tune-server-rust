@@ -6703,6 +6703,7 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
                 track_number: None,
                 disc_number: None,
                 album_ref: Some(PAGE.into()),
+                artist_ref: None,
             }],
         )
         .unwrap();

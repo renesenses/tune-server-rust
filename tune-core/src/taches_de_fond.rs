@@ -268,6 +268,9 @@ pub fn hydrater(backend: &Arc<dyn DbBackend>) {
     // #5169 — le réglage d'ordre est une décision de l'utilisateur, comme la
     // pause : il survit au redémarrage par le même chemin.
     ordre::hydrater(backend);
+    // #4681 — la politique de cession à la lecture, réglable, par le même
+    // chemin.
+    priorite::politique::hydrater(backend);
     if masque != 0 {
         tracing::info!(
             suspendus = ?suspendus().iter().map(|t| t.id()).collect::<Vec<_>>(),

@@ -9,9 +9,11 @@
 //!
 //! This module gives those files a **deterministic** name derived from
 //! everything that affects the encoded bytes, so an identical request finds the
-//! finished file and serves it instantly. Cache files live in a root of their
-//! own **per account** — `racine_de_travail("tune-tcache")`, i.e.
-//! `…/tune-tcache-<uid>/` (#5133) — and use the `tune-tcache-`
+//! finished file and serves it instantly. Cache files live in a folder that
+//! belongs to Tune alone — `<data dir>/cache/transcodage` once the server has
+//! called [`installer_dans_les_donnees`] (#4770), else the per-account root
+//! `racine_de_travail("tune-tcache")`, i.e. `…/tune-tcache-<uid>/` (#5133) —
+//! and use the `tune-tcache-`
 //! prefix, which `streamer::is_temp_transcode_file` does NOT match, so the
 //! per-session and startup cleanups leave them alone — their lifetime is
 //! governed here by [`evict`] (bounded total size, LRU).
@@ -212,17 +214,57 @@ pub fn cache_path_streaming(
     chemin_du_rendu(&name)
 }
 
-/// Étiquette de la racine du cache : `racine_de_travail(ETIQUETTE_RACINE)` rend
-/// `…/tune-tcache-<uid>`, un dossier par compte (#5133).
+/// Étiquette de la racine de REPLI : `racine_de_travail(ETIQUETTE_RACINE)` rend
+/// `…/tune-tcache-<uid>`, un dossier par compte (#5133). Elle ne sert plus que
+/// tant que le serveur n'a pas installé le dossier dédié (tests, outils).
 const ETIQUETTE_RACINE: &str = "tune-tcache";
 
-/// Le chemin du rendu `nom` dans la racine du compte courant.
+/// #4770 (arbitrage du 10/10) — le dossier dédié au cache de transcodage, sous
+/// le dossier de données de Tune : `<données>/cache/transcodage`.
+pub const SOUS_DOSSIER_DES_DONNEES: &str = "cache/transcodage";
+
+/// Le dossier dédié retenu au démarrage par [`installer_dans_les_donnees`].
+static RACINE_DEDIEE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// #4770 — range le cache de transcodage dans `<donnees>/cache/transcodage`,
+/// un dossier qui n'appartient qu'à Tune. Appelée une fois par le démarrage
+/// du serveur. Rend le dossier retenu, ou `None` quand il n'est pas
+/// utilisable (le cache reste alors dans la racine de repli par compte).
+pub fn installer_dans_les_donnees(donnees: &std::path::Path) -> Option<std::path::PathBuf> {
+    let voulu = racine_retenue(Some(donnees));
+    let Some(pret) = racine_preparee(&voulu, crate::chemins_de_travail::uid_courant()) else {
+        tracing::warn!(
+            voulu = %voulu.display(),
+            "transcode_cache_dedicated_dir_unavailable — repli sur le dossier temporaire du compte"
+        );
+        return None;
+    };
+    let retenu = RACINE_DEDIEE.get_or_init(|| pret).clone();
+    info!(dossier = %retenu.display(), "transcode_cache_dir");
+    Some(retenu)
+}
+
+/// La racine du cache : le dossier dédié sous `donnees` quand il est connu,
+/// sinon la racine de travail du compte. Forme pure, testable sans toucher à
+/// l'état global.
+fn racine_retenue(donnees: Option<&std::path::Path>) -> std::path::PathBuf {
+    match donnees {
+        Some(d) => d.join(SOUS_DOSSIER_DES_DONNEES),
+        None => crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE),
+    }
+}
+
+/// La racine en vigueur dans ce processus.
+fn racine() -> std::path::PathBuf {
+    RACINE_DEDIEE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| racine_retenue(None))
+}
+
+/// Le chemin du rendu `nom` dans la racine en vigueur.
 fn chemin_du_rendu(nom: &str) -> Option<String> {
-    chemin_dans(
-        &crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE),
-        crate::chemins_de_travail::uid_courant(),
-        nom,
-    )
+    chemin_dans(&racine(), crate::chemins_de_travail::uid_courant(), nom)
 }
 
 /// Le chemin du rendu `nom` sous `racine`, une fois la racine préparée pour
@@ -302,8 +344,8 @@ fn max_bytes() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|mb| mb.saturating_mul(1024 * 1024));
     max_bytes_dans(
-        // tmp-autorise: on LIT le type du système de fichiers, rien n'y est créé.
-        &std::env::temp_dir(),
+        // #4770 : le plafond suit le système de fichiers du dossier du cache.
+        &racine(),
         reglage,
         crate::chemins_de_travail::memoire_vive_totale(),
     )
@@ -332,48 +374,14 @@ pub fn evict() {
 
 /// Eviction with an explicit byte cap (the testable core of [`evict`]).
 ///
-/// Balaie la racine du compte courant (#5133), puis purge dans son dossier
-/// parent — le dossier temporaire — les rendus posés à plat par les versions
-/// d'avant, **seulement** ceux du compte courant.
+/// #4770 (arbitrage du 10/10) — balaie le dossier du cache, et lui SEUL. Avant,
+/// elle purgeait aussi, dans le dossier parent — le dossier temporaire partagé
+/// —, les `tune-tcache-*` posés à plat par les versions d'avant #5133 : une
+/// éviction qui écrivait hors de son propre dossier.
 fn evict_with_cap(cap: u64) {
-    let uid = crate::chemins_de_travail::uid_courant();
-    let racine = crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE);
-    evict_in(&racine, cap, uid);
-    if let Some(ancien) = racine.parent() {
-        purger_anciens_rendus(ancien, uid);
-    }
+    evict_in(&racine(), cap, crate::chemins_de_travail::uid_courant());
 }
 
-/// Supprime, dans `dossier`, les rendus `tune-tcache-*` posés à plat par les
-/// versions d'avant #5133 : des fichiers ordinaires (ni lien, ni dossier — la
-/// racine `tune-tcache-<uid>` porte le même préfixe) qui appartiennent à `uid`
-/// et assez vieux pour ne plus être servis. Ceux d'un autre compte restent.
-fn purger_anciens_rendus(dossier: &std::path::Path, uid: u32) {
-    let Ok(entrees) = std::fs::read_dir(dossier) else {
-        return;
-    };
-    let maintenant = SystemTime::now();
-    for entree in entrees.flatten() {
-        if !entree
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(CACHE_PREFIX))
-        {
-            continue;
-        }
-        // `DirEntry::metadata` ne suit pas les liens symboliques.
-        let Ok(m) = entree.metadata() else { continue };
-        if !m.is_file() || !appartient_a(&m, uid) {
-            continue;
-        }
-        let age = maintenant
-            .duration_since(m.modified().unwrap_or(maintenant))
-            .unwrap_or(Duration::ZERO);
-        if age >= Duration::from_secs(EVICT_MIN_AGE_SECS) {
-            let _ = std::fs::remove_file(entree.path());
-        }
-    }
-}
 /// Le cœur de l'éviction, avec son dossier et son propriétaire **passés**.
 ///
 /// Les rendus vivent dans la racine du compte (#5133) ; avant, ils vivaient à
@@ -785,42 +793,42 @@ mod tests {
         );
     }
 
-    /// Les anciens rendus posés à plat (avant #5133) ne sont purgés que s'ils
-    /// sont au compte courant et assez vieux ; la racine `tune-tcache-<uid>`,
-    /// qui porte le même préfixe, n'est jamais touchée.
-    #[cfg(unix)]
+    /// #4770 (arbitrage du 10/10) — TÉMOIN : l'éviction ne balaie que le
+    /// dossier du cache. Un `tune-tcache-*` posé à plat dans le dossier
+    /// temporaire partagé, vieux de deux heures et à nous, SURVIT à une
+    /// éviction. Avant le correctif, `evict_with_cap` purgeait aussi le
+    /// dossier parent de sa racine — le dossier temporaire — et le supprimait.
     #[test]
-    fn les_anciens_rendus_a_plat_ne_partent_que_s_ils_sont_a_nous() {
-        let dossier = crate::test_scratch::scratch_dir("tcache-anciens-5133");
-        let vieux = SystemTime::now() - Duration::from_secs(2 * 3600);
-        let ancien = dossier.path().join(format!("{CACHE_PREFIX}ancien.flac"));
-        let recent = dossier.path().join(format!("{CACHE_PREFIX}recent.flac"));
-        std::fs::write(&ancien, vec![0u8; 4096]).unwrap();
-        std::fs::write(&recent, vec![0u8; 4096]).unwrap();
+    fn l_eviction_ne_balaie_que_le_dossier_du_cache_4770() {
+        let plat = crate::test_scratch::scratch_file("tune-tcache-plat-4770", ".flac");
+        std::fs::write(&plat, vec![0u8; 4096]).unwrap();
         std::fs::File::options()
             .write(true)
-            .open(&ancien)
+            .open(&plat)
             .unwrap()
-            .set_modified(vieux)
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 3600))
             .unwrap();
-        let racine = dossier.path().join(format!("{ETIQUETTE_RACINE}-1000"));
-        std::fs::create_dir(&racine).unwrap();
-        std::fs::write(racine.join(format!("{CACHE_PREFIX}garde.flac")), b"x").unwrap();
+        evict_with_cap(u64::MAX);
+        assert!(
+            plat.exists(),
+            "#4770 : l'éviction du cache de transcodage a supprimé un fichier du dossier temporaire partagé, hors de son propre dossier"
+        );
+    }
+
+    /// #4770 — le dossier dédié vit sous le dossier de données de Tune, et
+    /// un rendu y est rangé.
+    #[test]
+    fn le_cache_vit_sous_les_donnees_de_tune_4770() {
+        let donnees = crate::test_scratch::scratch_dir("tcache-donnees-4770");
+        let racine = racine_retenue(Some(donnees.path()));
+        assert_eq!(racine, donnees.path().join("cache").join("transcodage"));
         let moi = crate::chemins_de_travail::uid_courant();
-
-        purger_anciens_rendus(dossier.path(), moi.wrapping_add(1));
+        let chemin =
+            chemin_dans(&racine, moi, "tune-tcache-x.flac").expect("dossier dédié utilisable");
         assert!(
-            ancien.exists(),
-            "l'ancien rendu d'un autre compte a été supprimé"
+            std::path::Path::new(&chemin).starts_with(donnees.path()),
+            "le rendu {chemin} n'est pas sous le dossier de données"
         );
-
-        purger_anciens_rendus(dossier.path(), moi);
-        assert!(
-            !ancien.exists(),
-            "l'ancien rendu du compte n'a pas été purgé"
-        );
-        assert!(recent.exists(), "un rendu récent a été purgé");
-        assert!(racine.join(format!("{CACHE_PREFIX}garde.flac")).exists());
     }
 
     /// Fil 2167 — TÉMOIN : sur un `tmpfs`, le cache de transcodage ne garde

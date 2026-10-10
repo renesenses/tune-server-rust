@@ -77,7 +77,18 @@ pub struct AudioLevels {
     ///
     /// Même échelle et même gain que `rms_*` / `peak_*` (le gain de sortie
     /// compris, #4384), mesuré sur le PCM qu'analyse le forwarder.
+    ///
+    /// Avec une carte de sortie ([`compute_levels_vers_la_sortie`]), ce sont
+    /// les canaux du PÉRIPHÉRIQUE, dans son ordre : la réaffectation (#6044)
+    /// et le routage par la disposition déclarée (#6057) y sont appliqués.
     pub canaux: Vec<NiveauDeCanal>,
+    /// #4969 — le nom de chaque entrée de `canaux`, quand un ordre fait foi
+    /// (3 à 8 canaux). `None` si `canaux` est vide ou sans nom connu.
+    pub noms_des_canaux: Option<&'static [&'static str]>,
+    /// #4969 — `Some(n)` quand `canaux` décrit les `n` voies de SORTIE (une
+    /// carte de sortie était branchée et correspondait au flux) ; `None`
+    /// quand il suit l'ordre de la source.
+    pub canaux_de_sortie: Option<u16>,
 }
 
 /// #4969 — le niveau d'UN canal d'une fenêtre multicanale.
@@ -125,49 +136,92 @@ pub fn noms_des_canaux_par_defaut(channels: u16) -> Option<&'static [&'static st
     }
 }
 
+/// #4969 — les niveaux par canal d'une fenêtre, et ce qu'ils décrivent.
+#[derive(Debug, Default)]
+struct NiveauxParCanal {
+    canaux: Vec<NiveauDeCanal>,
+    noms: Option<&'static [&'static str]>,
+    canaux_de_sortie: Option<u16>,
+}
+
 /// #4969 — une passe par canal, seulement au-delà de la stéréo : la boucle
 /// stéréo de [`compute_levels_avec_gain`] reste intacte, et son coût aussi.
+///
+/// Sans carte (ou avec une carte d'un autre format, posée pour la piste
+/// précédente) : un niveau par canal de la SOURCE, dès trois canaux. Avec une
+/// carte qui part des canaux du flux : un niveau par voie de SORTIE, chaque
+/// échantillon de sortie recomposé par la carte — et rien du tout quand ce
+/// qui sort n'est pas multicanal (repli stéréo), l'écran garde alors ses deux
+/// aiguilles. Une carte identité se mesure sans la matrice.
 fn niveaux_par_canal(
     pcm: &[u8],
     bytes_per_sample: usize,
     channels: usize,
     bit_depth: u16,
     gain: f64,
-) -> Vec<NiveauDeCanal> {
-    if channels <= 2 {
-        return Vec::new();
-    }
+    carte: Option<&super::carte_des_canaux::CarteDesCanaux>,
+) -> NiveauxParCanal {
+    let carte = carte.filter(|c| usize::from(c.entrees()) == channels);
+    let (sorties, coefficients, canaux_de_sortie) = match carte {
+        None if channels <= 2 => return NiveauxParCanal::default(),
+        None => (channels, None, None),
+        Some(c) if !c.est_multicanale() => return NiveauxParCanal::default(),
+        Some(c) if c.est_identite() => (channels, None, Some(c.sorties())),
+        Some(c) => (
+            usize::from(c.sorties()),
+            Some(c.coefficients()),
+            Some(c.sorties()),
+        ),
+    };
     let frame_size = bytes_per_sample * channels;
     let pleine_echelle = pleine_echelle_normalisee(bit_depth);
-    let mut somme_carres = vec![0.0_f64; channels];
-    let mut crete = vec![0.0_f64; channels];
-    let mut suite = vec![0_u32; channels];
-    let mut over = vec![0_u32; channels];
+    let mut entree = vec![0.0_f64; channels];
+    let mut sortie = vec![0.0_f64; sorties];
+    let mut somme_carres = vec![0.0_f64; sorties];
+    let mut crete = vec![0.0_f64; sorties];
+    let mut suite = vec![0_u32; sorties];
+    let mut over = vec![0_u32; sorties];
     let mut trames = 0_usize;
     for frame in pcm.chunks_exact(frame_size) {
         for c in 0..channels {
-            let s = read_sample(frame, c * bytes_per_sample, bytes_per_sample, bit_depth) * gain;
-            somme_carres[c] += s * s;
-            crete[c] = crete[c].max(s.abs());
-            suite[c] = if s.abs() >= pleine_echelle {
-                suite[c] + 1
+            entree[c] =
+                read_sample(frame, c * bytes_per_sample, bytes_per_sample, bit_depth) * gain;
+        }
+        match coefficients {
+            None => sortie.copy_from_slice(&entree),
+            Some(k) => {
+                for (o, ligne) in k.chunks_exact(channels).enumerate() {
+                    sortie[o] = ligne.iter().zip(&entree).map(|(g, x)| g * x).sum();
+                }
+            }
+        }
+        for o in 0..sorties {
+            let s = sortie[o];
+            somme_carres[o] += s * s;
+            crete[o] = crete[o].max(s.abs());
+            suite[o] = if s.abs() >= pleine_echelle {
+                suite[o] + 1
             } else {
                 0
             };
-            over[c] = over[c].max(suite[c]);
+            over[o] = over[o].max(suite[o]);
         }
         trames += 1;
     }
     if trames == 0 {
-        return Vec::new();
+        return NiveauxParCanal::default();
     }
-    (0..channels)
-        .map(|c| NiveauDeCanal {
-            rms: (somme_carres[c] / trames as f64).sqrt(),
-            peak: crete[c],
-            over_run: over[c],
-        })
-        .collect()
+    NiveauxParCanal {
+        canaux: (0..sorties)
+            .map(|o| NiveauDeCanal {
+                rms: (somme_carres[o] / trames as f64).sqrt(),
+                peak: crete[o],
+                over_run: over[o],
+            })
+            .collect(),
+        noms: noms_des_canaux_par_defaut(sorties as u16),
+        canaux_de_sortie,
+    }
 }
 
 /// Nombre d'échantillons consécutifs à pleine échelle à partir duquel on
@@ -559,6 +613,25 @@ pub fn compute_levels_avec_gain(
     sample_rate: u32,
     gain: f64,
 ) -> AudioLevels {
+    compute_levels_vers_la_sortie(pcm, bit_depth, channels, sample_rate, gain, None)
+}
+
+/// #4969 — les mêmes niveaux, dont les niveaux PAR CANAL décrivent les voies
+/// de la sortie selon `carte` : ce qui sort vraiment, réaffectation (#6044)
+/// et disposition déclarée (#6057) comprises. Gauche/droite, crêtes et
+/// spectre restent ceux de la source, comme avant : le contrat des clients
+/// déployés ne bouge pas.
+///
+/// Coût : rien en stéréo ; au-delà, `entrées × sorties` multiplications par
+/// trame quand la carte n'est pas l'identité (36 en 5.1, 64 en 7.1).
+pub fn compute_levels_vers_la_sortie(
+    pcm: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    sample_rate: u32,
+    gain: f64,
+    carte: Option<&super::carte_des_canaux::CarteDesCanaux>,
+) -> AudioLevels {
     let gain = if gain.is_finite() && gain > 0.0 {
         gain
     } else {
@@ -633,6 +706,14 @@ pub fn compute_levels_avec_gain(
         }
     }
 
+    let par_canal = niveaux_par_canal(
+        pcm,
+        bytes_per_sample,
+        channels as usize,
+        bit_depth,
+        gain,
+        carte,
+    );
     AudioLevels {
         rms_left: (sum_sq_l / frames as f64).sqrt(),
         rms_right: (sum_sq_r / frames as f64).sqrt(),
@@ -652,7 +733,9 @@ pub fn compute_levels_avec_gain(
         } else {
             std::time::Duration::ZERO
         },
-        canaux: niveaux_par_canal(pcm, bytes_per_sample, channels as usize, bit_depth, gain),
+        canaux: par_canal.canaux,
+        noms_des_canaux: par_canal.noms,
+        canaux_de_sortie: par_canal.canaux_de_sortie,
     }
 }
 
