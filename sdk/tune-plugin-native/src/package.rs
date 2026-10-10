@@ -127,7 +127,9 @@ fn unpack(bytes: &[u8], target: &str) -> Result<(Package, BTreeMap<String, Vec<u
         .validate()
         .map_err(|e| format!("manifest: {e:?}"))?;
     let expected_kind = match package.manifest.id.as_str() {
-        "equalizer" | "crossfeed" => Some(tune_plugin_sdk::manifest::PluginKind::Dsp),
+        "equalizer" | "crossfeed" | "channel-remap" => {
+            Some(tune_plugin_sdk::manifest::PluginKind::Dsp)
+        }
         "converter" | "declick" => Some(tune_plugin_sdk::manifest::PluginKind::Batch),
         _ => None,
     };

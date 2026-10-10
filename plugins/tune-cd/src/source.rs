@@ -240,6 +240,8 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            memoire: None,
+            backend: None,
             extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
@@ -340,6 +342,8 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            memoire: None,
+            backend: None,
             extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
@@ -406,6 +410,8 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            memoire: None,
+            backend: None,
             extraction: None,
         };
         let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
@@ -453,6 +459,8 @@ mod tests {
             consultation: Arc::new(Fixture),
             zones: Arc::default(),
             reveil: Arc::default(),
+            memoire: None,
+            backend: None,
             extraction: None,
         };
         PublicationSource::new(registre.clone(), &routes).publier_sans_lecteur();

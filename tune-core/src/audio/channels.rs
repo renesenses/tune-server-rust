@@ -163,8 +163,34 @@ impl ChannelLayout {
 
 /// Return a badge string for a given channel count.
 /// Returns `None` for mono/stereo.
+///
+/// Sans disposition déclarée, c'est l'ordre par défaut de FLAC et de
+/// WAVE_FORMAT_EXTENSIBLE qui nomme les canaux (`Disposition::par_defaut`) :
+/// 3 → 3.0, 4 → 4.0 (quad), 5 → 5.0, 7 → 6.1. Ils tombaient avant dans la
+/// disposition nommée supérieure — un FLAC 4.0 s'affichait « 5.1 ».
 pub fn channel_badge(channels: u16) -> Option<&'static str> {
-    ChannelLayout::from_channel_count(channels).badge()
+    match channels {
+        3 => Some("3.0"),
+        4 => Some("4.0"),
+        5 => Some("5.0"),
+        7 => Some("6.1"),
+        _ => ChannelLayout::from_channel_count(channels).badge(),
+    }
+}
+
+/// Le badge d'une piste dont le fichier est `chemin` : la disposition que le
+/// fichier DÉCLARE (masque WAV, tag FLAC, DSF, DFF — `disposition_canaux`)
+/// quand elle existe et compte bien `channels` canaux, sinon le nombre de
+/// canaux. Le fichier n'est ouvert que pour une piste multicanal.
+pub fn channel_badge_declare(chemin: Option<&std::path::Path>, channels: u16) -> Option<String> {
+    if channels <= 2 {
+        return None;
+    }
+    chemin
+        .and_then(super::disposition_canaux::lire_le_fichier)
+        .filter(|d| d.canaux() == channels)
+        .and_then(|d| d.badge())
+        .or_else(|| channel_badge(channels).map(String::from))
 }
 
 // ---------------------------------------------------------------------------
@@ -345,12 +371,24 @@ pub fn build_downmix_matrix(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> 
             matrix[5 * src + 7] = ITU_SURROUND_COEFF; // BR -> SR
         }
 
-        // Conservative fallback for an unknown layout: preserve only channels
-        // which have a destination at the same index. Never fold an unknown
-        // channel into another one (notably LFE/surround into a front channel).
+        // #6057 — up to 8 channels the default FLAC/WAV order names every
+        // channel: route each one by POSITION (`disposition_canaux`). A 4.0
+        // (FL FR BL BR) to stereo now folds its rears into their own side at
+        // −3 dB instead of dropping them; a 3.0 keeps its centre.
+        //
+        // Conservative fallback beyond 8 channels, where no default layout
+        // names the channels: preserve only channels which have a destination
+        // at the same index. Never fold an unknown channel into another one.
         _ => {
-            for i in 0..tgt.min(src) {
-                matrix[i * src + i] = 1.0;
+            match super::disposition_canaux::Disposition::par_defaut(source_ch)
+                .and_then(|d| super::disposition_canaux::matrice_de_routage(&d, target_ch))
+            {
+                Some(routage) => matrix = routage,
+                None => {
+                    for i in 0..tgt.min(src) {
+                        matrix[i * src + i] = 1.0;
+                    }
+                }
             }
         }
     }
@@ -431,6 +469,11 @@ pub fn adapt_channels_f32(
     let mut output = Vec::with_capacity(frames.saturating_mul(tgt));
 
     if source_ch < target_ch {
+        // #6057 — a multichannel source is routed by position: a 4.0 into a
+        // 6-channel device lands its rears on BL/BR, never on FC/LFE.
+        if let Some(matrice) = routage_par_defaut(source_ch, target_ch) {
+            return Ok(appliquer_matrice_f32(samples, src, &matrice));
+        }
         for frame in samples.chunks_exact(src) {
             if source_ch == 1 && target_ch >= 2 {
                 output.push(frame[0]);
@@ -458,6 +501,61 @@ pub fn adapt_channels_f32(
         }
     }
     Ok(output)
+}
+
+/// #6057 — the position routing of an UPMIX from a multichannel source
+/// (3 to 8 channels, default order). `None` for mono or stereo sources, whose
+/// historical behaviour (mono duplicated to the front pair, stereo copied) is
+/// exactly the routing anyway, and beyond 8 channels.
+fn routage_par_defaut(source_ch: u16, target_ch: u16) -> Option<Vec<f32>> {
+    if source_ch < 3 {
+        return None;
+    }
+    let d = super::disposition_canaux::Disposition::par_defaut(source_ch)?;
+    super::disposition_canaux::matrice_de_routage(&d, target_ch)
+}
+
+/// Apply a `target × source` row-major matrix to interleaved f32 frames.
+fn appliquer_matrice_f32(samples: &[f32], src: usize, matrice: &[f32]) -> Vec<f32> {
+    let tgt = matrice.len() / src.max(1);
+    let mut out = Vec::with_capacity(samples.len() / src.max(1) * tgt);
+    for frame in samples.chunks_exact(src) {
+        for ligne in matrice.chunks_exact(src) {
+            out.push(
+                frame
+                    .iter()
+                    .zip(ligne)
+                    .map(|(&x, &c)| f64::from(x) * f64::from(c))
+                    .sum::<f64>() as f32,
+            );
+        }
+    }
+    out
+}
+
+/// #6057 — adapt with the layout the FILE declares (`disposition_canaux`).
+///
+/// Without a declaration, or with one that equals the default order, this is
+/// exactly [`adapt_channels_f32`]. With one, every channel is routed by its
+/// declared position — even at an equal channel count (a DFF that lists
+/// `C LFE SLFT SRGT` is reordered onto a 4-channel device's FL FR …).
+pub fn adapt_channels_f32_disposee(
+    samples: &[f32],
+    source_ch: u16,
+    target_ch: u16,
+    disposition: Option<&super::disposition_canaux::Disposition>,
+) -> Result<Vec<f32>, String> {
+    if let Some(d) = disposition.filter(|d| d.canaux() == source_ch && !d.est_par_defaut())
+        && let Some(matrice) = super::disposition_canaux::matrice_de_routage(d, target_ch)
+    {
+        validate_channel_adaptation(samples.len(), source_ch, target_ch)?;
+        return Ok(appliquer_matrice_f32(
+            samples,
+            usize::from(source_ch),
+            &matrice,
+        ));
+    }
+    adapt_channels_f32(samples, source_ch, target_ch)
 }
 
 fn validate_channel_adaptation(
@@ -499,6 +597,25 @@ pub fn adapt_channels_i32(
     let mut output = Vec::with_capacity(frames.saturating_mul(tgt));
 
     if source_ch < target_ch {
+        // #6057 — même routage par position que `adapt_channels_f32`.
+        if let Some(matrice) = routage_par_defaut(source_ch, target_ch) {
+            let depth = bit_depth.clamp(8, 32);
+            let (min, max) = (-(1i64 << (depth - 1)), (1i64 << (depth - 1)) - 1);
+            return Ok(samples
+                .chunks_exact(src)
+                .flat_map(|frame| {
+                    matrice.chunks_exact(src).map(move |ligne| {
+                        frame
+                            .iter()
+                            .zip(ligne)
+                            .map(|(&x, &c)| x as f64 * c as f64)
+                            .sum::<f64>()
+                            .round()
+                            .clamp(min as f64, max as f64) as i32
+                    })
+                })
+                .collect());
+        }
         for frame in samples.chunks_exact(src) {
             if source_ch == 1 && target_ch >= 2 {
                 output.push(frame[0]);
@@ -873,7 +990,12 @@ mod stereo_i32_tests {
 
     #[test]
     fn trois_a_cinq_canaux_gardent_la_paire_avant() {
-        assert_eq!(to_stereo_i32(&[7, 8, 9], 3), vec![7, 8]);
+        // #6057 — la paire avant reste de son côté ; le centre d'un 3.0 n'est
+        // plus jeté : il arrive des deux côtés à −3 dB, normalisé.
+        let out = to_stereo_i32(&[7_000, 0, 0], 3);
+        assert!(out[0] > 0 && out[1] == 0, "{out:?}");
+        let centre = to_stereo_i32(&[0, 0, 9_000], 3);
+        assert!(centre[0] > 0 && centre[0] == centre[1], "{centre:?}");
     }
 
     #[test]

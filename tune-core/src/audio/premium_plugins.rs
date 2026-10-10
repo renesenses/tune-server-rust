@@ -22,7 +22,19 @@
 //! (désinstallation, désactivation) efface la retenue ([`forget_withheld`]) :
 //! il n'est jamais annulé.
 use crate::db::settings_repo::SettingsRepo;
-pub const IDS: [&str; 4] = ["equalizer", "crossfeed", "converter", "declick"];
+/// #6044 — `channel-remap` (réaffectation des canaux) est GRATUIT et
+/// facultatif, comme l'égaliseur : décision de Bertrand du 10/10/2026.
+pub const IDS: [&str; 5] = [
+    "equalizer",
+    "crossfeed",
+    "converter",
+    "declick",
+    "channel-remap",
+];
+/// Les greffons gratuits : droit `DspEq`, jamais posés par la migration.
+pub fn gratuit(id: &str) -> bool {
+    matches!(id, "equalizer" | "channel-remap")
+}
 pub const MIGRATION: &str = "premium_audio_plugins_migration_v1";
 /// Préfixe de la clé de retenue d'un greffon payant (#4861). Sa valeur liste
 /// les suffixes (`installed`, `enabled`) que la migration a écrits `false`
@@ -35,12 +47,12 @@ pub fn contains(id: &str) -> bool {
     IDS.contains(&id)
 }
 pub fn requires_premium(id: &str) -> bool {
-    contains(id) && id != "equalizer"
+    contains(id) && !gratuit(id)
 }
 /// Les greffons que la migration embarque-active elle-même. L'égaliseur n'en
 /// fait plus partie : il s'installe depuis le catalogue.
 fn installed_by_migration(id: &str) -> bool {
-    contains(id) && id != "equalizer"
+    contains(id) && !gratuit(id)
 }
 fn flag(settings: &SettingsRepo, id: &str, suffix: &str) -> Option<String> {
     settings
@@ -516,7 +528,7 @@ mod tests {
         let s = settings();
         s.set("zone_1_eq_profile", "legacy-profile").unwrap();
         migrate(&s).unwrap();
-        for mask in 0..16 {
+        for mask in 0..(1u32 << IDS.len()) {
             for (i, id) in IDS.iter().enumerate() {
                 let installed = mask & (1 << i) != 0;
                 s.set(
