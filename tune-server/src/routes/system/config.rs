@@ -326,6 +326,11 @@ pub(super) async fn get_config(
         ("tidal_enabled", json!(true)),
         ("qobuz_enabled", json!(true)),
         ("youtube_enabled", json!(true)),
+        // #5247 — pays des tendances YouTube Music ; vide = automatique.
+        (
+            tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES,
+            json!(""),
+        ),
         ("spotify_enabled", json!(false)),
         ("deezer_enabled", json!(true)),
         ("amazon_music_enabled", json!(false)),
@@ -483,6 +488,13 @@ pub(super) async fn get_config(
             }),
         );
     }
+    // #4681 — la politique de cession à la lecture EN VIGUEUR, toujours en
+    // objet : la base la range en texte, l'écran la relit telle qu'elle
+    // s'applique.
+    config.insert(
+        tune_core::taches_de_fond::priorite::politique::CLE_REGLAGE.to_string(),
+        json!(tune_core::taches_de_fond::priorite::politique::politique()),
+    );
     // #5519 — combien de fichiers chaque vitesse décode à la fois SUR CETTE
     // MACHINE : « Rapide » dépend des cœurs, et l'écran doit le dire plutôt
     // que de promettre quatre pistes à un double cœur.
@@ -1180,6 +1192,23 @@ fn normaliser_vitesse_des_analyses(
     Ok(())
 }
 
+/// #4681 — la politique de cession à la lecture : un objet dont chaque champ
+/// est borné (voir `tune_core::taches_de_fond::priorite::politique`). Un champ
+/// absent prend sa valeur par défaut, `null` remet tout par défaut ; un champ
+/// inconnu ou hors bornes est REFUSÉ (400) en nommant le champ. Rend la
+/// politique à appliquer après l'écriture.
+fn normaliser_politique_de_lecture(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<Option<tune_core::taches_de_fond::priorite::politique::Politique>, AppError> {
+    use tune_core::taches_de_fond::priorite::politique::{CLE_REGLAGE, Politique};
+    let Some(brut) = values.get(CLE_REGLAGE) else {
+        return Ok(None);
+    };
+    let politique = Politique::depuis_json(brut)
+        .map_err(|e| AppError::bad_request(format!("{CLE_REGLAGE} : {e}")))?;
+    values.insert(CLE_REGLAGE.to_string(), json!(politique));
+    Ok(Some(politique))
+}
 /// #5593 — le périmètre des analyses de fond : un tableau de chaînes (les
 /// racines exclues), rognées, sans vide ni doublon. `null` vaut le tableau
 /// vide. Toute autre forme est REFUSÉE (400) en nommant la clé : une chaîne
@@ -1220,6 +1249,72 @@ fn normaliser_plafond_aleatoire(
     // autres (`"\"800\""`), pour les lignes déjà écrites.
     values.insert(cle.to_string(), Value::String(borne.to_string()));
     Ok(())
+}
+
+/// #5247 — pays des tendances YouTube Music. Vide, `null` ou `auto` :
+/// automatique (la langue du navigateur, sinon le monde), écrit `""`. Sinon un
+/// code à deux lettres, écrit en MAJUSCULES (`ZZ` = monde). Toute autre valeur
+/// est REFUSÉE en le disant, jamais retenue pour être ignorée à la lecture.
+fn normaliser_pays_tendances_youtube(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    let cle = tune_core::streaming::youtube_decouverte::CLE_PAYS_TENDANCES;
+    let Some(brut) = values.get(cle) else {
+        return Ok(());
+    };
+    let texte = match brut {
+        Value::Null => String::new(),
+        Value::String(s) => s.trim().to_string(),
+        autre => autre.to_string(),
+    };
+    let normalise = if texte.is_empty() || texte.eq_ignore_ascii_case("auto") {
+        String::new()
+    } else {
+        tune_core::streaming::youtube_decouverte::code_pays(&texte).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "{cle} : code pays à deux lettres attendu (FR, DE, ZZ pour le monde) ou vide pour automatique, reçu {texte:?}"
+            ))
+        })?
+    };
+    values.insert(cle.to_string(), Value::String(normalise));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests_pays_tendances_youtube_5247 {
+    use super::*;
+
+    /// `AppError` n'est pas `Debug` : le refus devient `Err(())`.
+    fn normalise(v: Value) -> Result<Value, ()> {
+        let mut m = serde_json::Map::new();
+        m.insert("youtube_charts_country".into(), v);
+        normaliser_pays_tendances_youtube(&mut m).map_err(|_| ())?;
+        Ok(m["youtube_charts_country"].clone())
+    }
+
+    #[test]
+    fn code_ecrit_en_majuscules_et_automatique_ecrit_vide() {
+        assert_eq!(normalise(json!(" de ")).unwrap(), json!("DE"));
+        assert_eq!(normalise(json!("zz")).unwrap(), json!("ZZ"));
+        for auto in [json!(""), json!(null), json!("auto"), json!("AUTO")] {
+            assert_eq!(normalise(auto).unwrap(), json!(""));
+        }
+    }
+
+    #[test]
+    fn valeur_illisible_refusee() {
+        for mauvais in [json!("FRA"), json!("F1"), json!(33), json!(true)] {
+            assert!(normalise(mauvais.clone()).is_err(), "{mauvais}");
+        }
+    }
+
+    #[test]
+    fn autres_cles_intactes() {
+        let mut m = serde_json::Map::new();
+        m.insert("zone_auto_create".into(), json!(true));
+        assert!(normaliser_pays_tendances_youtube(&mut m).is_ok());
+        assert_eq!(m.len(), 1);
+    }
 }
 
 /// « Analyser la bibliothèque au démarrage » : un booléen (ou `"true"` /
@@ -1328,7 +1423,9 @@ pub(super) async fn update_config(
     // valeur hors bornes ou illisible est REFUSÉE en nommant les bornes, au
     // lieu d'être acceptée puis ramenée en silence à la lecture.
     normaliser_plafond_aleatoire(&mut values)?;
+    normaliser_pays_tendances_youtube(&mut values)?;
     normaliser_vitesse_des_analyses(&mut values)?;
+    let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
     let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
@@ -1501,6 +1598,11 @@ pub(super) async fn update_config(
     } else {
         None
     };
+    // #4681 — la politique de cession vaut dès maintenant, pas au prochain
+    // démarrage (`regler` journalise ce qui change).
+    if let Some(p) = politique_de_lecture {
+        tune_core::taches_de_fond::priorite::politique::regler(p);
+    }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en
@@ -5409,6 +5511,101 @@ mod vitesse_des_analyses_5519_tests {
         let mut vide = serde_json::Map::new();
         assert!(normaliser_vitesse_des_analyses(&mut vide).is_ok());
         assert!(vide.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod politique_de_lecture_4681_tests {
+    use super::{get_config, normaliser_politique_de_lecture, update_config};
+    use crate::auth::RequireAdmin;
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::priorite::politique::{self, CLE_REGLAGE, DEFAUT};
+
+    /// #4681 — le PATCH applique la politique TOUT DE SUITE, la range en
+    /// base, et `GET /config` la publie en objet ; le démarrage la relit.
+    #[tokio::test]
+    async fn la_politique_s_ecrit_s_applique_et_se_relit() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_REGLAGE]["enabled"], true, "{c}");
+
+        let mut corps = serde_json::Map::new();
+        corps.insert(
+            CLE_REGLAGE.to_string(),
+            json!({"scan_width": 3, "pause_between_items_ms": 2500}),
+        );
+        update_config(
+            RequireAdmin,
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+            Json(super::ConfigPatch(corps)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update_config a échoué"))
+        .into_response();
+        let p = politique::politique();
+        assert_eq!(p.scan_width, 3);
+        assert_eq!(p.pause_between_items_ms, 2500);
+        assert_eq!(p.sqlite_reserved_readers, DEFAUT.sqlite_reserved_readers);
+
+        // Ce qui est en base se relit au démarrage, par `hydrater`.
+        politique::regler(DEFAUT);
+        assert!(
+            SettingsRepo::with_backend(state.backend.clone())
+                .get(CLE_REGLAGE)
+                .unwrap()
+                .is_some()
+        );
+        tune_core::taches_de_fond::hydrater(&state.backend);
+        assert_eq!(politique::politique().scan_width, 3);
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_REGLAGE]["scan_width"], 3, "{c}");
+        politique::regler(DEFAUT);
+    }
+
+    /// Un champ hors bornes ou inconnu est REFUSÉ en nommant le champ.
+    #[test]
+    fn une_politique_hors_bornes_est_refusee() {
+        for mauvais in [
+            json!({"scan_width": 0}),
+            json!({"sqlite_reserved_readers": 3}),
+            json!({"vitesse": "turbo"}),
+            json!(7),
+        ] {
+            let mut v: serde_json::Map<String, Value> =
+                json!({ CLE_REGLAGE: mauvais }).as_object().unwrap().clone();
+            assert!(
+                normaliser_politique_de_lecture(&mut v).is_err(),
+                "{mauvais}"
+            );
+        }
+        let mut nul: serde_json::Map<String, Value> =
+            json!({ CLE_REGLAGE: null }).as_object().unwrap().clone();
+        assert!(matches!(normaliser_politique_de_lecture(&mut nul), Ok(Some(p)) if p == DEFAUT));
+        let mut vide = serde_json::Map::new();
+        assert!(matches!(
+            normaliser_politique_de_lecture(&mut vide),
+            Ok(None)
+        ));
     }
 }
 
