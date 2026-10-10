@@ -125,6 +125,29 @@ fn dernier(chemin: &str) -> &str {
 
 /// Une image ISO 9660 contenant `contenu`.
 pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
+    session_iso(contenu, noms, 0, &[]).octets
+}
+
+/// Une session ISO 9660 fabriquée : ses octets à partir de son premier
+/// secteur, et où chaque fichier est rangé.
+pub struct Session {
+    /// Octets du secteur `origine` à la fin de la session.
+    pub octets: Vec<u8>,
+    /// Secteur (compté depuis le début du disque) de chaque fichier.
+    pub lba_fichiers: Vec<usize>,
+    /// Premier secteur après la session : sa taille de volume.
+    pub fin: usize,
+}
+
+/// Une session qui commence au secteur `origine` du disque. Le fichier `i`
+/// dont `deja[i]` vaut `Some(lba)` n'est pas réécrit : l'arborescence pointe
+/// son étendue d'une session précédente, comme le fait un graveur.
+pub fn session_iso(
+    contenu: &Contenu,
+    noms: Noms,
+    origine: usize,
+    deja: &[Option<usize>],
+) -> Session {
     let a = arbre(contenu);
     let rr = noms == Noms::RockRidge;
     let joliet = noms == Noms::Joliet;
@@ -185,7 +208,7 @@ pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
         en_secteurs(&recs).len()
     };
 
-    let mut prochain: usize = 16 + 2 + usize::from(joliet);
+    let mut prochain: usize = origine + 16 + 2 + usize::from(joliet);
     let mut lba_primaire: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for d in a.dossiers.keys() {
         let t = taille_dossier(d, false);
@@ -201,12 +224,16 @@ pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
         }
     }
     let mut lba_fichiers = Vec::new();
-    for (_, octets) in contenu {
+    for (i, (_, octets)) in contenu.iter().enumerate() {
+        if let Some(Some(lba)) = deja.get(i) {
+            lba_fichiers.push(*lba);
+            continue;
+        }
         lba_fichiers.push(prochain);
         prochain += octets.len().div_ceil(S).max(1);
     }
     let total = prochain;
-    let mut image = vec![0u8; total * S];
+    let mut image = vec![0u8; (total - origine) * S];
 
     let ecrire_dossiers =
         |image: &mut Vec<u8>, lbas: &BTreeMap<String, (usize, usize)>, jol: bool| {
@@ -251,7 +278,8 @@ pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
                     ));
                 }
                 let bloc = en_secteurs(&recs);
-                image[lba * S..lba * S + bloc.len()].copy_from_slice(&bloc);
+                let ici = (lba - origine) * S;
+                image[ici..ici + bloc.len()].copy_from_slice(&bloc);
             }
         };
     ecrire_dossiers(&mut image, &lba_primaire, false);
@@ -259,7 +287,10 @@ pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
         ecrire_dossiers(&mut image, &lba_joliet, true);
     }
     for (i, (_, octets)) in contenu.iter().enumerate() {
-        let debut = lba_fichiers[i] * S;
+        if matches!(deja.get(i), Some(Some(_))) {
+            continue;
+        }
+        let debut = (lba_fichiers[i] - origine) * S;
         image[debut..debut + octets.len()].copy_from_slice(octets);
     }
 
@@ -292,10 +323,44 @@ pub fn iso(contenu: &Contenu, noms: Noms) -> Vec<u8> {
     term[0] = 255;
     term[1..6].copy_from_slice(b"CD001");
     term[6] = 1;
+    Session {
+        octets: image,
+        lba_fichiers,
+        fin: total,
+    }
+}
+
+/// Une image de disque multisession : `premiere` gravée d'abord, puis une
+/// seconde session, `ecart` secteurs après la fin de la première, qui ajoute
+/// `ajouts` et reprend les fichiers de la première sans les réécrire. Le
+/// secteur 16 de l'image reste celui de la PREMIÈRE session.
+pub fn multisession(premiere: &Contenu, ajouts: &Contenu, noms: Noms, ecart: usize) -> Vec<u8> {
+    let s1 = session_iso(premiere, noms, 0, &[]);
+    let origine = s1.fin + ecart;
+    let tout: Contenu = premiere.iter().chain(ajouts.iter()).cloned().collect();
+    let deja: Vec<Option<usize>> = s1.lba_fichiers.iter().map(|l| Some(*l)).collect();
+    let s2 = session_iso(&tout, noms, origine, &deja);
+    let mut image = s1.octets;
+    image.resize(origine * S, 0);
+    image.extend_from_slice(&s2.octets);
     image
 }
 
 // ─── UDF ────────────────────────────────────────────────────────────────
+
+/// Un identifiant OSTA CS0 : 8 bits (Latin-1) si chaque caractère y tient,
+/// 16 bits (UCS-2 grand-boutiste) sinon.
+fn cs0(nom: &str) -> Vec<u8> {
+    if nom.chars().all(|c| (c as u32) < 256) {
+        let mut v = vec![8u8];
+        v.extend(nom.chars().map(|c| c as u8));
+        v
+    } else {
+        let mut v = vec![16u8];
+        v.extend(nom.encode_utf16().flat_map(|u| u.to_be_bytes()));
+        v
+    }
+}
 
 fn tag(bloc: &mut [u8], id: u16, lieu: u32) {
     bloc[0..2].copy_from_slice(&id.to_le_bytes());
@@ -318,13 +383,7 @@ pub fn udf(contenu: &Contenu) -> Vec<u8> {
     let mut prochain = 1usize;
     let mut entree_dossier: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let fid = |nom: &str, dossier: bool, parent: bool, icb: usize| -> Vec<u8> {
-        let ident: Vec<u8> = if parent {
-            Vec::new()
-        } else {
-            let mut v = vec![8u8];
-            v.extend(nom.bytes());
-            v
-        };
+        let ident: Vec<u8> = if parent { Vec::new() } else { cs0(nom) };
         let longueur = (38 + ident.len()).div_ceil(4) * 4;
         let mut f = vec![0u8; longueur];
         f[16..18].copy_from_slice(&1u16.to_le_bytes());
@@ -444,6 +503,203 @@ pub fn udf(contenu: &Contenu) -> Vec<u8> {
         let lbn = entree_fichier[i];
         entree(&mut image, lbn, false, octets.len());
         let debut = (DEBUT_PARTITION + lbn + 1) * S;
+        image[debut..debut + octets.len()].copy_from_slice(octets);
+    }
+    image
+}
+
+/// Une image UDF 2.50 seule, à partition de MÉTADONNÉES (Blu-ray).
+///
+/// Les entrées de fichier et les répertoires vivent dans le fichier de
+/// métadonnées, rangé sur la partition physique en DEUX étendues séparées
+/// par un trou : un bloc de métadonnées n'est donc pas au bloc physique de
+/// même rang. Les données des fichiers sont sur la partition physique,
+/// désignées par des adresses longues. Avec `principal_abime`, l'entrée du
+/// fichier de métadonnées principal est illisible et seul son miroir sert.
+pub fn udf_250(contenu: &Contenu, principal_abime: bool) -> Vec<u8> {
+    let a = arbre(contenu);
+    const DEBUT_PARTITION: usize = 300;
+    const META_1: usize = 10;
+    const META_1_LONGUEUR: usize = 2;
+    const TROU: usize = 5;
+    const META_2: usize = META_1 + META_1_LONGUEUR + TROU;
+
+    let fid = |nom: &str, dossier: bool, parent: bool, icb: usize| -> Vec<u8> {
+        let ident: Vec<u8> = if parent { Vec::new() } else { cs0(nom) };
+        let longueur = (38 + ident.len()).div_ceil(4) * 4;
+        let mut f = vec![0u8; longueur];
+        f[16..18].copy_from_slice(&1u16.to_le_bytes());
+        f[18] = (if dossier { 2 } else { 0 }) | (if parent { 8 } else { 0 });
+        f[19] = ident.len() as u8;
+        f[20..24].copy_from_slice(&(S as u32).to_le_bytes());
+        f[24..28].copy_from_slice(&(icb as u32).to_le_bytes());
+        // Référence de partition 1 : la carte de métadonnées.
+        f[28..30].copy_from_slice(&1u16.to_le_bytes());
+        f[38..38 + ident.len()].copy_from_slice(&ident);
+        tag(&mut f, 257, 0);
+        f
+    };
+    let taille_dossier = |d: &str| -> usize {
+        let (sous, fichiers) = &a.dossiers[d];
+        let mut t = fid("", true, true, 0).len();
+        for s in sous {
+            t += fid(dernier(s), true, false, 0).len();
+        }
+        for &i in fichiers {
+            t += fid(dernier(&contenu[i].0), false, false, 0).len();
+        }
+        t
+    };
+    // Blocs de la partition de métadonnées : 0 = FSD, puis une entrée et
+    // ses données par dossier, une entrée par fichier.
+    let mut prochain_meta = 1usize;
+    let mut entree_dossier: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for d in a.dossiers.keys() {
+        let t = taille_dossier(d);
+        entree_dossier.insert(d.clone(), (prochain_meta, t));
+        prochain_meta += 1 + t.div_ceil(S);
+    }
+    let mut entree_fichier = Vec::new();
+    for _ in contenu {
+        entree_fichier.push(prochain_meta);
+        prochain_meta += 1;
+    }
+    let longueur_meta = prochain_meta.max(META_1_LONGUEUR + 1);
+    let physique_de = |m: usize| -> usize {
+        if m < META_1_LONGUEUR {
+            META_1 + m
+        } else {
+            META_2 + (m - META_1_LONGUEUR)
+        }
+    };
+    // Données des fichiers, sur la partition physique.
+    let mut prochain = META_2 + (longueur_meta - META_1_LONGUEUR) + 3;
+    let mut donnees_fichier = Vec::new();
+    for (_, octets) in contenu {
+        donnees_fichier.push(prochain);
+        prochain += octets.len().div_ceil(S).max(1);
+    }
+    let longueur_partition = prochain;
+    let total = DEBUT_PARTITION + longueur_partition + 1;
+    let mut image = vec![0u8; total * S];
+    let physique = |lbn: usize| (DEBUT_PARTITION + lbn) * S..(DEBUT_PARTITION + lbn + 1) * S;
+    let meta = |m: usize| physique(physique_de(m));
+
+    for (i, id) in [b"BEA01", b"NSR03", b"TEA01"].iter().enumerate() {
+        let s = &mut image[(16 + i) * S..(17 + i) * S];
+        s[1..6].copy_from_slice(*id);
+        s[6] = 1;
+    }
+    {
+        let s = &mut image[256 * S..257 * S];
+        s[16..20].copy_from_slice(&((16 * S) as u32).to_le_bytes());
+        s[20..24].copy_from_slice(&32u32.to_le_bytes());
+        tag(s, 2, 256);
+    }
+    {
+        let s = &mut image[32 * S..33 * S];
+        s[22..24].copy_from_slice(&0u16.to_le_bytes());
+        s[188..192].copy_from_slice(&(DEBUT_PARTITION as u32).to_le_bytes());
+        s[192..196].copy_from_slice(&(longueur_partition as u32).to_le_bytes());
+        tag(s, 5, 32);
+    }
+    // Volume logique : carte 0 physique, carte 1 de métadonnées ; le FSD est
+    // au bloc 0 de la partition de métadonnées.
+    {
+        let s = &mut image[33 * S..34 * S];
+        s[212..216].copy_from_slice(&(S as u32).to_le_bytes());
+        s[248..252].copy_from_slice(&(S as u32).to_le_bytes());
+        s[252..256].copy_from_slice(&0u32.to_le_bytes());
+        s[256..258].copy_from_slice(&1u16.to_le_bytes());
+        s[264..268].copy_from_slice(&70u32.to_le_bytes());
+        s[268..272].copy_from_slice(&2u32.to_le_bytes());
+        s[440] = 1;
+        s[441] = 6;
+        s[442..444].copy_from_slice(&1u16.to_le_bytes());
+        s[444..446].copy_from_slice(&0u16.to_le_bytes());
+        let c = &mut s[446..446 + 64];
+        c[0] = 2;
+        c[1] = 64;
+        c[5..5 + 23].copy_from_slice(b"*UDF Metadata Partition");
+        c[36..38].copy_from_slice(&1u16.to_le_bytes());
+        c[38..40].copy_from_slice(&0u16.to_le_bytes());
+        c[40..44].copy_from_slice(&0u32.to_le_bytes());
+        c[44..48].copy_from_slice(&1u32.to_le_bytes());
+        c[48..52].copy_from_slice(&u32::MAX.to_le_bytes());
+        c[52..56].copy_from_slice(&32u32.to_le_bytes());
+        c[56..58].copy_from_slice(&1u16.to_le_bytes());
+        tag(s, 6, 33);
+    }
+    tag(&mut image[34 * S..35 * S], 8, 34);
+    // Fichier de métadonnées (bloc physique 0) et son miroir (bloc 1) :
+    // entrées étendues, deux short_ad.
+    for (lbn, type_fichier) in [(0usize, 250u8), (1, 251)] {
+        let s = &mut image[physique(lbn)];
+        s[27] = type_fichier;
+        s[34..36].copy_from_slice(&0u16.to_le_bytes());
+        s[56..64].copy_from_slice(&((longueur_meta * S) as u64).to_le_bytes());
+        s[208..212].copy_from_slice(&0u32.to_le_bytes());
+        s[212..216].copy_from_slice(&16u32.to_le_bytes());
+        s[216..220].copy_from_slice(&((META_1_LONGUEUR * S) as u32).to_le_bytes());
+        s[220..224].copy_from_slice(&(META_1 as u32).to_le_bytes());
+        s[224..228]
+            .copy_from_slice(&(((longueur_meta - META_1_LONGUEUR) * S) as u32).to_le_bytes());
+        s[228..232].copy_from_slice(&(META_2 as u32).to_le_bytes());
+        tag(s, 266, lbn as u32);
+        if principal_abime && lbn == 0 {
+            s[4] ^= 0xFF;
+        }
+    }
+    {
+        let s = &mut image[meta(0)];
+        s[400..404].copy_from_slice(&(S as u32).to_le_bytes());
+        s[404..408].copy_from_slice(&(entree_dossier[""].0 as u32).to_le_bytes());
+        s[408..410].copy_from_slice(&1u16.to_le_bytes());
+        tag(s, 256, 0);
+    }
+    for (d, &(m, t)) in &entree_dossier {
+        assert!(t <= S, "la fabrique range un répertoire dans un seul bloc");
+        {
+            let s = &mut image[meta(m)];
+            s[27] = 4;
+            s[34..36].copy_from_slice(&0u16.to_le_bytes());
+            s[56..64].copy_from_slice(&(t as u64).to_le_bytes());
+            s[168..172].copy_from_slice(&0u32.to_le_bytes());
+            s[172..176].copy_from_slice(&8u32.to_le_bytes());
+            s[176..180].copy_from_slice(&(t as u32).to_le_bytes());
+            s[180..184].copy_from_slice(&((m + 1) as u32).to_le_bytes());
+            tag(s, 261, m as u32);
+        }
+        let parent = d
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let (sous, fichiers) = &a.dossiers[d];
+        let mut donnees = fid("", true, true, entree_dossier[&parent].0);
+        for s in sous {
+            donnees.extend(fid(dernier(s), true, false, entree_dossier[s].0));
+        }
+        for &i in fichiers {
+            donnees.extend(fid(dernier(&contenu[i].0), false, false, entree_fichier[i]));
+        }
+        let debut = meta(m + 1).start;
+        image[debut..debut + donnees.len()].copy_from_slice(&donnees);
+    }
+    for (i, (_, octets)) in contenu.iter().enumerate() {
+        let m = entree_fichier[i];
+        {
+            let s = &mut image[meta(m)];
+            s[27] = 5;
+            s[34..36].copy_from_slice(&1u16.to_le_bytes());
+            s[56..64].copy_from_slice(&(octets.len() as u64).to_le_bytes());
+            s[168..172].copy_from_slice(&0u32.to_le_bytes());
+            s[172..176].copy_from_slice(&16u32.to_le_bytes());
+            s[176..180].copy_from_slice(&(octets.len() as u32).to_le_bytes());
+            s[180..184].copy_from_slice(&(donnees_fichier[i] as u32).to_le_bytes());
+            s[184..186].copy_from_slice(&0u16.to_le_bytes());
+            tag(s, 261, m as u32);
+        }
+        let debut = physique(donnees_fichier[i]).start;
         image[debut..debut + octets.len()].copy_from_slice(octets);
     }
     image

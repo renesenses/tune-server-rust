@@ -313,6 +313,8 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
             json!({ "zones": zones }),
         );
     }
+    // #6043 — l'extraction lit le lecteur : le chargement en mémoire s'arrête.
+    crate::routes::liberer_memoire(&e.routes).await;
     match preparer(&e, d).await {
         Ok((travail, plan, pochette)) => {
             if let Err(autre) = e.ex.inscrire(travail.clone()) {

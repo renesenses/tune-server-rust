@@ -19,7 +19,7 @@ const CLE_REFUS: &str = "premium.required";
 /// `lang` est déjà résolu (`i18n::lang_from_header`). Le nom du droit reste
 /// tel quel : « DSP & EQ », « Cloud Relay » sont des noms de produit, pas des
 /// phrases — c'est la PHRASE qui se traduit, et elle seule.
-fn corps_du_refus(feature: Feature, lang: &str) -> Value {
+pub(crate) fn corps_du_refus(feature: Feature, lang: &str) -> Value {
     json!({
         "error": "premium_required",
         // Le CODE est le terme stable du contrat : un client qui porte ses
