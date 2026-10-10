@@ -749,15 +749,15 @@ const PREFIXE_GREFFONS: &str = "/ext/";
 /// Routes tolérées NOMMÉMENT, jamais par une règle vague. Une entrée se
 /// justifie par sa cause et se retire dès que la dette est payée.
 ///
-/// Ces deux-là sont des chemins que la carte cite et que le routeur assemblé
-/// ne sert pas — c'est MESURÉ, par cette garde et par `curl` sur le .18. Ce
+/// Ce sont des chemins que la carte cite et que le routeur assemblé ne sert
+/// pas (`/streaming/youtube/moods/{}` en est sorti : la route existe depuis
+/// #5247) — c'est MESURÉ, par cette garde et par `curl` sur le .18. Ce
 /// qui suit chaque entrée est le relevé, pas un correctif : la première
 /// rédaction de ce fichier proposait une cause plausible et fausse pour
 /// chacune, et une cause fausse coûte plus cher qu'un simple constat.
-const FANTOMES_TOLERES: &[(&str, &str)] = &[
-    (
-        "/dj/waveform/{}",
-        "#1897 — RELEVÉ. Le serveur de série ne sert RIEN sous `/api/v1/dj/…` : \
+const FANTOMES_TOLERES: &[(&str, &str)] = &[(
+    "/dj/waveform/{}",
+    "#1897 — RELEVÉ. Le serveur de série ne sert RIEN sous `/api/v1/dj/…` : \
          `routes/mod.rs` l'écrit en toutes lettres depuis #917 (« the stock \
          server no longer serves /dj »). Les mêmes chemins existent, declares \
          par la caisse `plugins/tune-dj`, montee sous `/api/v1/ext/dj/…` — \
@@ -766,18 +766,7 @@ const FANTOMES_TOLERES: &[(&str, &str)] = &[
          `/api/v1/ext/dj/status/1` rend 404 lui AUSSI : prefixer l'appel web \
          par `/ext` ne corrigerait rien. Ce qu'il faut trancher d'abord : le \
          greffon DJ doit-il etre livre et installe, ou l'ecran retire ?",
-    ),
-    (
-        "/streaming/youtube/moods/{}",
-        "#1897 — RELEVÉ. Le segment `streaming` est le BON : \
-         `/api/v1/streaming/youtube/moods` rend 200 sur le .18, et cette garde \
-         ne le signale pas. Seule la variante a parametre \
-         `/streaming/youtube/moods/{params}`, qu'appelle \
-         `api.ts:getYoutubeMoodPlaylists`, n'a aucune route. Le gestionnaire de \
-         base est un TALON qui rend une liste vide de categories (#1897) : \
-         c'est un talon serveur a finir, pas un chemin faux cote client.",
-    ),
-];
+)];
 
 /// `/streaming/{}/albums{}` → `/api/v1/streaming/1/albums`.
 ///
