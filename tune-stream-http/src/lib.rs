@@ -355,6 +355,37 @@ impl Drop for SentinelleDuCorps {
     }
 }
 
+/// #6050 — une lecture depuis le DÉBUT d'une conversion dont le canal est FINI
+/// et dont le début a quitté la retenue.
+///
+/// Tidal AAC → WAV chunké sur un WiiM mini (`Lavf/58.76.100`, fil 2198) : la
+/// piste entière part dans une connexion, puis, en fin de piste, le renderer
+/// rouvre `bytes=0-` sur la piste EN COURS. Le début n'existe plus nulle part
+/// et le tuyau n'a plus rien : la réponse était un 200 portant l'en-tête WAV
+/// seul (44 octets), un fichier vide que le renderer redemandait toutes les
+/// 15 s — sans jamais passer à l'URL armée par `SetNextAVTransportURI`, ni
+/// laisser au poller l'arrêt qui déclenche son repli.
+///
+/// La fin n'est notée qu'une fois qu'une connexion a TIRÉ le dernier bloc du
+/// canal (`noter_fin_sous_verrou`) : on ne vide rien ici, une connexion qui
+/// rend encore la fin de piste garde ses octets. Rend `None` tant que le canal
+/// vit — la sonde de #5991 garde l'en-tête puis le direct.
+fn piste_finie_debut_perdu(session: &StreamSession, range_hdr: &str) -> Option<Response> {
+    let fin = session.fin_du_canal()?;
+    let (retenue_debut, retenue_fin) = session.etendue_retenue();
+    warn!(
+        stream_id = %session.id,
+        range = range_hdr,
+        retenue_debut,
+        retenue_fin,
+        fin,
+        "debut_de_piste_perdu_piste_finie — une lecture demande le DÉBUT d'une conversion \
+         déjà rendue en entier, dont le début a quitté la retenue : 404, pas un WAV vide \
+         qui ferait reboucler le renderer sur la piste en cours (#6050)"
+    );
+    Some(StatusCode::NOT_FOUND.into_response())
+}
+
 pub async fn handle_stream(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
@@ -534,6 +565,9 @@ pub async fn handle_stream(
     if let (Some(n), Some(_), true) = (reprise_candidate, wav_length, retenue_possible) {
         let (retenue_debut, retenue_fin) = session.etendue_retenue();
         if n == 0 && n < retenue_fin && n < retenue_debut {
+            if let Some(reponse) = piste_finie_debut_perdu(&session, range_hdr) {
+                return reponse;
+            }
             warn!(
                 stream_id,
                 range = range_hdr,
@@ -612,6 +646,9 @@ pub async fn handle_stream(
                  après qu'une connexion précédente a tiré le tuyau ; servi à l'octet depuis 0"
             );
         } else {
+            if let Some(reponse) = piste_finie_debut_perdu(&session, range_hdr) {
+                return reponse;
+            }
             warn!(
                 stream_id,
                 range = range_hdr,
@@ -5177,6 +5214,9 @@ mod stream_url_distant_tests {
 }
 
 #[cfg(test)]
+mod fin_de_piste_relue_6050;
+
+#[cfg(test)]
 mod long_wav_4016;
 
 #[cfg(test)]
@@ -5793,7 +5833,11 @@ mod reprise_714_sink_strict_de_bout_en_bout {
         let base = format!("http://127.0.0.1:{port_r}");
         let sortie = DlnaOutput::new(
             "Parents".into(),
-            "uuid:28630ca6-cd4f-4a15-80ae-f170dc890b20".into(),
+            // Un UDN PAR TEST : le profil appris (`dlna_repli_set_uri::PROFILS`)
+            // vit pour le processus, clé (UDN, MIME). Partagé, l'essai
+            // `audio/x-flac` appris par le test de la reprise passait en tête
+            // du témoin selon l'ordre d'exécution.
+            format!("uuid:28630ca6-cd4f-4a15-80ae-{id}"),
             "127.0.0.1".into(),
             format!("{base}/AVTransport/control"),
             format!("{base}/RenderingControl/control"),
