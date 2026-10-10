@@ -318,8 +318,8 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT",
-    // #6079 — l'artiste d'une piste de service chez son service (PG 086). Ici
-    // AUSSI, même raison : une base de bascule ne rejouera jamais la 086, alors
+    // #6079 — l'artiste d'une piste de service chez son service (PG 087). Ici
+    // AUSSI, même raison : une base de bascule ne rejouera jamais la 087, alors
     // que l'écriture de la file nomme la colonne.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT",
     // Section « Live » — types secondaires MusicBrainz du disque (PG 081).

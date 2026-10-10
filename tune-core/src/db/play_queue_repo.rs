@@ -434,7 +434,7 @@ pub struct QueueEntry {
     #[serde(default, skip_serializing)]
     pub artist_id: Option<i64>,
     /// L'identifiant de l'ARTISTE chez son service (`StreamTrack.artist_id`),
-    /// pistes de service seulement — migration 122 / PG 086 (#6079). NULL pour
+    /// pistes de service seulement — migration 123 / PG 087 (#6079). NULL pour
     /// les lignes antérieures, les pistes locales, et toute entrée dont ni le
     /// client ni le service ne l'ont donné.
     ///
@@ -469,7 +469,7 @@ impl QueueEntry {
     }
 
     /// L'identifiant de l'artiste CHEZ SON SERVICE, pour une ligne de service
-    /// qui l'a reçu à l'enfilage (`artist_ref`, migration 122, #6079) ; `None`
+    /// qui l'a reçu à l'enfilage (`artist_ref`, migration 123, #6079) ; `None`
     /// pour une ligne locale, et pour une référence absente ou vide.
     ///
     /// C'est le champ `artist_id_service` des lignes de `GET /zones/{id}/queue`.
@@ -1379,7 +1379,7 @@ impl PlayQueueRepo {
 
     /// Comme [`Self::set_streaming_queue_avec_albums`], avec AUSSI l'artiste
     /// de chaque piste chez son service (`StreamTrack.artist_id`, migration
-    /// 122, #6079) : `artist_refs[i]` va à `tracks[i]`, une liste plus courte
+    /// 123, #6079) : `artist_refs[i]` va à `tracks[i]`, une liste plus courte
     /// (ou vide) laisse NULL aux pistes restantes.
     pub fn set_streaming_queue_avec_references(
         &self,
@@ -2110,7 +2110,7 @@ mod tests {
     }
 
     /// #6079 — l'artiste d'une piste de service CHEZ SON SERVICE entre en file
-    /// et en ressort (`artist_ref`, migration 122), par les deux écritures
+    /// et en ressort (`artist_ref`, migration 123), par les deux écritures
     /// (entrées unifiées, liste de pistes d'un album) et les deux lectures
     /// (`get_ordered` et la vue streaming du transfert de zone). Une ligne
     /// locale n'en invente aucun.

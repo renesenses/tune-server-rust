@@ -870,7 +870,7 @@ CREATE TABLE IF NOT EXISTS zones (
 -- COLUMN` de SQLite (« incomplete input »).
 -- `artist_ref` : l'artiste chez le service (`StreamTrack.artist_id`), pour
 -- « Aller à l'artiste » depuis la file (#6079). Jumelle de la migration
--- SQLite 122 et de la PG 086.
+-- SQLite 123 et de la PG 087.
 CREATE TABLE IF NOT EXISTS queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,

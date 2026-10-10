@@ -2390,6 +2390,24 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "true_peak_algo_etiquette",
         up: SQL_ETIQUETTE_CRETES_VRAIES,
     },
+    // #2264 — les index des identifiants d'ENREGISTREMENT : l'ISRC et le MBID
+    // d'enregistrement, sous la forme pliée que comparent le regroupement des
+    // versions et la règle de lecture (`library::groupes_versions`). Index
+    // d'EXPRESSION : la requête compare `UPPER(REPLACE(REPLACE(isrc, '-',
+    // ''), ' ', ''))` et `LOWER(TRIM(musicbrainz_recording_id))`, qu'un index
+    // sur la colonne nue ne servirait pas.
+    //
+    // Numérotée 122 / PG 086 : la 121 / PG 085 est celle de #5959 (crête
+    // vraie), fusionnée dans `batch/feat-rc3-20261002` le 08/10. Le lanceur
+    // ne joue que `version > MAX` : elle vient donc APRÈS la 121.
+    //
+    // Posés dans le bloc de version et dans la passe finale, PAS dans `up` :
+    // même règle qu'à la 119. Jumelle PG : 086.
+    Migration {
+        version: 122,
+        name: "tracks_recording_identifier_indexes",
+        up: "",
+    },
     // #6079 (FabienM, Tune Remote Android) — l'ARTISTE d'une piste de service
     // chez son service (`StreamTrack.artist_id`), gardé avec la ligne de file :
     // `queue_items.artist_ref`. `GET /zones/{id}/queue` le rend sous
@@ -2400,16 +2418,16 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
     // NULL pour toutes les lignes existantes : rien dans la base ne dit quel
     // artiste du service une ligne déjà rangée désignait.
     //
-    // Numérotée 122 / PG 086 : la 121 / PG 085 est la dernière sur
-    // `batch/bugs-rc4-20261008`, `rc/v1.0.0` et `main` le 10/10. ⚠️ #5953
-    // (brouillon, groupes de versions) prend AUSSI 122 / PG 086 : celle des
-    // deux qui fusionne en second se renumérote (123 / PG 087).
+    // Numérotée 123 / PG 087 : la 122 / PG 086 est prise par #5953 (#2264,
+    // index des identifiants d'enregistrement), versée dans
+    // `batch/bugs-rc4-20261008` le 10/10. Le lanceur ne joue que
+    // `version > MAX` : celle-ci vient APRÈS la 122.
     //
     // Colonne posée par `add_column_if_missing` dans le bloc de version et
     // dans la passe finale, PAS dans `up` : même règle qu'à la 114. Jumelle
-    // PG : 086.
+    // PG : 087.
     Migration {
-        version: 122,
+        version: 123,
         name: "queue_items_artist_ref",
         up: "",
     },
@@ -2427,6 +2445,29 @@ SELECT m.track_id, 'rg_album_true_peak_algo', 'catmull-rom-4x' FROM track_metada
 WHERE m.key = 'rg_album_true_peak'
 ON CONFLICT (track_id, key) DO NOTHING;
 ";
+
+/// Les index de la migration 122 (#2264). L'expression est EXACTEMENT celle
+/// des requêtes par identifiant ([`SQL_ISRC_PLIE`], [`SQL_MBID_PLIE`]) :
+/// SQLite et PostgreSQL ne servent un index d'expression qu'à l'identique.
+pub const SQL_INDEX_IDENTIFIANTS_D_ENREGISTREMENT: &str = "\
+    CREATE INDEX IF NOT EXISTS idx_tracks_isrc_norm \
+        ON tracks((UPPER(REPLACE(REPLACE(isrc, '-', ''), ' ', ''))));\
+    CREATE INDEX IF NOT EXISTS idx_tracks_mbid_recording_norm \
+        ON tracks((LOWER(TRIM(musicbrainz_recording_id))));";
+
+/// L'ISRC plié, tel que les requêtes le comparent (alias `t` imposé).
+pub const SQL_ISRC_PLIE: &str = "UPPER(REPLACE(REPLACE(t.isrc, '-', ''), ' ', ''))";
+
+/// Le MBID d'enregistrement plié, tel que les requêtes le comparent.
+pub const SQL_MBID_PLIE: &str = "LOWER(TRIM(t.musicbrainz_recording_id))";
+
+/// Pose les index de la 122. Un échec est JOURNALISÉ, jamais rendu : sans
+/// eux la recherche par identifiant est lente, pas fausse.
+fn index_des_identifiants_d_enregistrement(db: &SqliteDb) {
+    if let Err(e) = db.execute_batch(SQL_INDEX_IDENTIFIANTS_D_ENREGISTREMENT) {
+        warn!(erreur = %e, "migration_122_index_identifiants_d_enregistrement");
+    }
+}
 
 /// La colonne de la migration 120 (#5402). La table d'abord : elle n'est
 /// garantie que par la passe finale, qui tourne APRÈS les blocs de version.
@@ -3555,6 +3596,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             date_de_creation_des_fichiers(db);
         }
         if migration.version == 122 {
+            // Index des identifiants d'enregistrement (#2264).
+            index_des_identifiants_d_enregistrement(db);
+        }
+        if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
             // défaut : NULL = INCONNU pour toute ligne existante.
             add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
@@ -4094,9 +4139,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "queue_items", "album_ref", "TEXT");
     add_column_if_missing(db, "streaming_favorites", "album_ref", "TEXT");
     add_column_if_missing(db, "listen_history", "album_ref", "TEXT");
-    // L'artiste d'une piste de service chez son service (migration 122,
+    // L'artiste d'une piste de service chez son service (migration 123,
     // #6079) — posé ICI aussi : l'écriture de la file le NOMME, et une base
-    // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 086.
+    // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 087.
     add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
@@ -4118,6 +4163,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : le scan l'écrit et le tri « par création » la NOMME. PG :
     // migration 084.
     date_de_creation_des_fichiers(db);
+    // Index des identifiants d'enregistrement (migration 122, #2264) — posés
+    // ICI aussi : le regroupement des versions et la règle de lecture les
+    // interrogent à chaque lancement. PG : migration 086.
+    index_des_identifiants_d_enregistrement(db);
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -4909,12 +4958,19 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "true_peak_algo_etiquette",
         include_str!("../../migrations/postgres/085_true_peak_algo_etiquette.sql"),
     ),
-    // Jumelle de la SQLite 122 (#6079) : `queue_items.artist_ref`, l'artiste
-    // d'une piste de service chez son service, NULL pour l'existant.
+    // Jumelle de la SQLite 122 (#2264) : les index d'expression de l'ISRC et
+    // du MBID d'enregistrement pliés. Vient après la 85 (#5959).
     (
         86,
+        "tracks_recording_identifier_indexes",
+        include_str!("../../migrations/postgres/086_tracks_recording_identifier_indexes.sql"),
+    ),
+    // Jumelle de la SQLite 123 (#6079) : `queue_items.artist_ref`, l'artiste
+    // d'une piste de service chez son service, NULL pour l'existant.
+    (
+        87,
         "queue_items_artist_ref",
-        include_str!("../../migrations/postgres/086_queue_items_artist_ref.sql"),
+        include_str!("../../migrations/postgres/087_queue_items_artist_ref.sql"),
     ),
 ];
 
@@ -6925,14 +6981,14 @@ mod tests {
         );
     }
 
-    /// #6079 — la migration 122 pose `queue_items.artist_ref` (l'artiste d'une
+    /// #6079 — la migration 123 pose `queue_items.artist_ref` (l'artiste d'une
     /// piste de service chez son service), sur une base NEUVE comme sur une
-    /// base MONTÉE en 121 avec une ligne ; la colonne est NULLABLE et
-    /// l'existant reste NULL ; la jumelle PG 086 existe, est enregistrée,
+    /// base MONTÉE en 122 avec une ligne ; la colonne est NULLABLE et
+    /// l'existant reste NULL ; la jumelle PG 087 existe, est enregistrée,
     /// marque le bon numéro, et le schéma de bascule comme `ENSURE_COLUMNS`
     /// la portent.
     #[test]
-    fn la_migration_122_pose_l_artiste_de_service_sur_la_file_6079() {
+    fn la_migration_123_pose_l_artiste_de_service_sur_la_file_6079() {
         let colonne = |db: &SqliteDb| -> Option<bool> {
             let conn = db.connection().lock().unwrap();
             let mut stmt = conn.prepare("PRAGMA table_info(queue_items)").unwrap();
@@ -6959,17 +7015,17 @@ mod tests {
         montee
             .execute_batch(
                 "ALTER TABLE queue_items DROP COLUMN artist_ref;
-                 DELETE FROM _migrations WHERE version >= 122;
+                 DELETE FROM _migrations WHERE version >= 123;
                  INSERT INTO zones (name, output_type) VALUES ('Salon', 'chromecast');
                  INSERT INTO queue_items (zone_id, position, source, source_id, title)
                      VALUES (1, 0, 'qobuz', 'q-1', 'Piste');",
             )
             .unwrap();
         assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
-        assert_eq!(current_version(&montee).unwrap(), 121);
+        assert_eq!(current_version(&montee).unwrap(), 122);
         run_migrations(&montee).unwrap();
         assert_eq!(current_version(&montee).unwrap(), latest_version());
-        assert!(latest_version() >= 122);
+        assert!(latest_version() >= 123);
         assert_eq!(
             colonne(&montee),
             Some(false),
@@ -6992,11 +7048,11 @@ mod tests {
         }
 
         let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let fichier = "086_queue_items_artist_ref.sql";
+        let fichier = "087_queue_items_artist_ref.sql";
         let sql_pg =
             std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
         assert!(
-            sql_pg.contains("VALUES (86, 'queue_items_artist_ref')"),
+            sql_pg.contains("VALUES (87, 'queue_items_artist_ref')"),
             "le script PG marque un autre numéro dans schema_version"
         );
         let alter = "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT";
@@ -8002,9 +8058,11 @@ mod tests {
         // « par création » des ajouts récents NOMME.
         // 85 : `true_peak_algo_etiquette` (#2713), jumelle de la SQLite 121.
         // Étiquette les crêtes vraies Catmull-Rom, que le rattrapage NOMME.
-        // 86 : `queue_items_artist_ref` (#6079), jumelle de la SQLite 122.
+        // 86 : `tracks_recording_identifier_indexes` (#2264), jumelle de la
+        // SQLite 122. Vient après la 85 de #5959.
+        // 87 : `queue_items_artist_ref` (#6079), jumelle de la SQLite 123.
         // Pose `queue_items.artist_ref`, que l'écriture de la file NOMME.
-        assert_eq!(pg_latest_version(), 86, "latest PG migration must be 86");
+        assert_eq!(pg_latest_version(), 87, "latest PG migration must be 87");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

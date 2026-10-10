@@ -9,7 +9,7 @@
 //!   file : la référence d'album (`album_ref`) n'était rangée que pour
 //!   Bandcamp ;
 //! - `artist_id_service` valait `null` en dur : `queue_items` ne gardait pas
-//!   l'artiste du service (migration 122 / PG 086, `artist_ref`).
+//!   l'artiste du service (migration 123 / PG 087, `artist_ref`).
 //!
 //! Ces témoins n'attaquent que les routes publiques, montées par le vrai
 //! routeur, avec des services simulés : ils compilent sur le code d'avant le

@@ -974,9 +974,9 @@ async fn pg_history_round_trip() {
 }
 
 /// #6079 — l'album et l'artiste CHEZ LE SERVICE d'une ligne de file entrent
-/// et ressortent sur PostgreSQL : `queue_items.artist_ref` (PG 086) existe
+/// et ressortent sur PostgreSQL : `queue_items.artist_ref` (PG 087) existe
 /// après `ensure_schema`, les deux écritures de la file la nomment, et la
-/// jumelle 086 se rejoue sans erreur (idempotence).
+/// jumelle 087 se rejoue sans erreur (idempotence).
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_6079_la_file_garde_l_artiste_de_service() {
     use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
@@ -990,11 +990,11 @@ async fn pg_6079_la_file_garde_l_artiste_de_service() {
     let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip l'a vérifié");
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     sqlx::raw_sql(include_str!(
-        "../../migrations/postgres/086_queue_items_artist_ref.sql"
+        "../../migrations/postgres/087_queue_items_artist_ref.sql"
     ))
     .execute(&pool)
     .await
-    .expect("la migration 086 doit se rejouer");
+    .expect("la migration 087 doit se rejouer");
     let zid = ZoneRepo::with_backend(db.clone())
         .create("Salon", Some("dlna"), Some("uuid:6079"))
         .unwrap();

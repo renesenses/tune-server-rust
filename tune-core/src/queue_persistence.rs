@@ -54,7 +54,7 @@ pub struct QueueSnapshotItem {
     /// Bandcamp. Absente des instantanés antérieurs, d'où le défaut.
     #[serde(default)]
     pub album_ref: Option<String>,
-    /// L'artiste chez le service (#6079, migration 122) : sans lui, une file
+    /// L'artiste chez le service (#6079, migration 123) : sans lui, une file
     /// restaurée perdrait « Aller à l'artiste » exact. Absent des instantanés
     /// antérieurs, d'où le défaut.
     #[serde(default)]

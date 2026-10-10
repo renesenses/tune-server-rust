@@ -7,7 +7,7 @@
 //!
 //! - `artist_id` : l'entier de bibliothèque d'une ligne locale ;
 //! - `artist_id_service` : l'artiste chez le service, gardé avec la ligne
-//!   depuis la migration 122 (`artist_ref`, #6079) ; `null` s'il est inconnu.
+//!   depuis la migration 123 (`artist_ref`, #6079) ; `null` s'il est inconnu.
 //!
 //! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
 //! par sa strophe `[[test]]` dans `tune-server/Cargo.toml`.

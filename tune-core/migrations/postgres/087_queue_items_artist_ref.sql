@@ -1,8 +1,8 @@
--- 086_queue_items_artist_ref.sql
+-- 087_queue_items_artist_ref.sql
 --
 -- #6079 (FabienM, Tune Remote Android) : l'ARTISTE d'une piste de service chez
 -- son service (`StreamTrack.artist_id`), gardé avec la ligne de file. Jumelle
--- de la migration SQLite 122.
+-- de la migration SQLite 123.
 --
 -- `GET /zones/{id}/queue` le rend sous `artist_id_service`, qui valait `null`
 -- en dur : « Aller à l'artiste » depuis la file cherchait l'artiste par son
@@ -24,11 +24,11 @@ BEGIN
     IF to_regclass('queue_items') IS NOT NULL THEN
         ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
     ELSE
-        RAISE NOTICE 'migration 086 : queue_items absente';
+        RAISE NOTICE 'migration 087 : queue_items absente';
     END IF;
 END $artiste_de_service$;
 
-INSERT INTO schema_version (version, name) VALUES (86, 'queue_items_artist_ref')
+INSERT INTO schema_version (version, name) VALUES (87, 'queue_items_artist_ref')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;
