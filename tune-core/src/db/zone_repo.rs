@@ -2784,6 +2784,33 @@ impl ZoneRepo {
         self.db.execute(&sql, &params)
     }
 
+    /// #3067 — une zone NAVIGATEUR ne porte plus l'étiquette générique d'une
+    /// zone locale.
+    ///
+    /// `hide_duplicate_generic_local` ne regarde que `output_type = 'local'` :
+    /// une zone navigateur nommée « Cet ordinateur » lui échappe par
+    /// construction, et reste à côté de la zone locale « This Computer ». On ne
+    /// la masque pas (c'est une vraie sortie, l'onglet), on la RENOMME, d'après
+    /// [`crate::config::nom_de_zone_navigateur_heritee`]. Rend les zones
+    /// renommées `(id, nouveau nom)`.
+    pub fn distinguer_zones_navigateur_generiques(&self) -> Result<Vec<(i64, String)>, String> {
+        let mut renommees = Vec::new();
+        for zone in self.list()? {
+            if zone.output_type.as_deref() != Some("browser") {
+                continue;
+            }
+            let (Some(id), Some(nom)) = (
+                zone.id,
+                crate::config::nom_de_zone_navigateur_heritee(&zone.name),
+            ) else {
+                continue;
+            };
+            self.update_name(id, nom)?;
+            renommees.push((id, nom.to_string()));
+        }
+        Ok(renommees)
+    }
+
     /// Hide stale duplicate LOCAL zones stuck on a generic default label
     /// ("This Computer" / "Cet ordinateur"), keeping `keep_id` — the zone bound
     /// to the live default device. The local device_id is derived from the
@@ -3153,6 +3180,10 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         autoplay_enabled: cols.get(16).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }
+
+#[cfg(test)]
+#[path = "zone_navigateur_jumelle_3067_tests.rs"]
+mod zone_navigateur_jumelle_3067_tests;
 
 #[cfg(test)]
 mod tests {

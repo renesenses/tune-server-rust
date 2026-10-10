@@ -54,6 +54,11 @@ pub struct QueueSnapshotItem {
     /// Bandcamp. Absente des instantanés antérieurs, d'où le défaut.
     #[serde(default)]
     pub album_ref: Option<String>,
+    /// L'artiste chez le service (#6079, migration 123) : sans lui, une file
+    /// restaurée perdrait « Aller à l'artiste » exact. Absent des instantanés
+    /// antérieurs, d'où le défaut.
+    #[serde(default)]
+    pub artist_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -173,6 +178,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
             cover_url: e.cover_path.clone(),
             duration_ms: e.duration_ms.unwrap_or(0),
             album_ref: e.album_ref.clone(),
+            artist_ref: e.artist_ref.clone(),
         })
         .collect();
     // Current position from the unified list (a streaming item can be current).
@@ -395,6 +401,7 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
                         track_number: None,
                         disc_number: None,
                         album_ref: it.album_ref.clone(),
+                        artist_ref: it.artist_ref.clone(),
                     });
                 }
             }
@@ -417,6 +424,7 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
                     track_number: None,
                     disc_number: None,
                     album_ref: None,
+                    artist_ref: None,
                 });
             }
         }
@@ -697,6 +705,7 @@ mod tests {
                     track_number: None,
                     disc_number: None,
                     album_ref: None,
+                    artist_ref: None,
                 },
             ],
         )

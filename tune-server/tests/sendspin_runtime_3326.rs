@@ -259,7 +259,15 @@ impl Lecteur {
             .await;
         self.transport = noise.into_transport_mode().unwrap();
         self.condensat = condensat;
-        self.saluer().await;
+        // Spécification 1.0, « Re-handshake » : ni server/hello ni
+        // client/hello ne sont renvoyés ; server/activate est le PREMIER
+        // message sous les nouvelles clés.
+        let v = self.lire().await;
+        assert_eq!(
+            v["type"], "server/activate",
+            "premier message apres re-echange : {v}"
+        );
+        assert_eq!(v["payload"]["activities"], json!([]));
     }
 }
 // Encodeur de fixture RFC4648 (aucun appel au decodeur de production).

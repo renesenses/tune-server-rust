@@ -1545,11 +1545,22 @@ impl PlaybackOrchestrator {
             // quoi une zone qui sort de PURE resterait stéréo jusqu'à la piste
             // suivante alors que le panneau annonce déjà « Mono ».
             local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+            // #6044 — la réaffectation est elle aussi gouvernée par PURE.
+            local_output.set_reaffectation(self.reaffectation_de_la_piste(
+                zone_id,
+                track_id,
+                local_output.current_format().map(|(_, ch)| u32::from(ch)),
+            ));
             // Même raison pour la rampe (#1590) : `zone_soft_mute_ms` rend 0 en
             // PURE, donc une zone qui ENTRE en PURE doit la perdre dans le même
             // geste, et une zone qui en sort doit la retrouver — sans attendre
             // la piste suivante.
             local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+            // #2211 — même raison pour le fondu : une zone qui ENTRE en PURE ne
+            // doit plus fondre à la prochaine frontière.
+            local_output.set_fondu_enchaine_ms(crate::audio::fondu_de_zone::duree_appliquee_ms(
+                &self.db, zone_id,
+            ));
             info!(
                 zone_id,
                 device_id = %device_id,
@@ -2340,6 +2351,175 @@ impl PlaybackOrchestrator {
             );
             true
         }
+    }
+
+    /// #2211 — reposer la durée de fondu enchaîné de la zone sur la sortie
+    /// locale vivante. Elle vaut à la PROCHAINE frontière : jamais au milieu
+    /// d'une piste, où armer une réserve creuserait l'anneau.
+    ///
+    /// `None` : aucune sortie locale vivante pour cette zone (la prochaine
+    /// lecture posera la valeur). `Some(sait_fondre)` : la valeur est posée, et
+    /// `sait_fondre` dit si ce bras de lecture fond (chemin partagé) ou s'il
+    /// enchaîne seulement en gapless (bras exclusifs).
+    /// #2211 — la sortie locale vivante de la zone joue-t-elle par un bras
+    /// EXCLUSIF (WASAPI exclusif, ASIO, CoreAudio exclusif) ? Ces bras
+    /// enchaînent sans blanc mais ne fondent pas : la route refuse alors le
+    /// réglage. `None` : aucune sortie locale vivante pour cette zone.
+    pub async fn zone_locale_exclusive(&self, zone_id: i64) -> Option<bool> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)?;
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            let local_output = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            Some(!local_output.sait_fondre())
+        }
+    }
+
+    pub async fn refresh_zone_fondu_enchaine(&self, zone_id: i64) -> Option<bool> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)?;
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            let local_output = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
+            let ms = crate::audio::fondu_de_zone::duree_appliquee_ms(&self.db, zone_id);
+            local_output.set_fondu_enchaine_ms(ms);
+            let sait_fondre = local_output.sait_fondre();
+            info!(
+                zone_id,
+                device_id = %device_id,
+                fondu_ms = ms,
+                sait_fondre,
+                "zone_fondu_enchaine_refreshed_live"
+            );
+            Some(sait_fondre)
+        }
+    }
+
+    /// #6044 — la matrice de réaffectation des canaux d'une zone pour une
+    /// piste : la règle de l'album prime, puis celle de la zone ; `None` en
+    /// PURE, sans règle armée, ou quand la règle ne part pas du nombre de
+    /// canaux de la source.
+    pub fn reaffectation_de_la_piste(
+        &self,
+        zone_id: i64,
+        track_id: Option<i64>,
+        canaux_du_flux: Option<u32>,
+    ) -> Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>> {
+        use crate::audio::reaffectation_canaux as rc;
+        let (album_id, canaux_en_base) = track_id
+            .map(|tid| rc::album_et_canaux_de_la_piste(&self.db, tid))
+            .unwrap_or((None, None));
+        let canaux = canaux_du_flux
+            .and_then(|c| u16::try_from(c).ok())
+            .filter(|c| *c > 0)
+            .or(canaux_en_base);
+        rc::regle_effective_with(&self.db, zone_id, album_id, canaux).map(|r| r.matrice)
+    }
+
+    /// #6044 — réappliquer la réaffectation des canaux à la sortie locale qui
+    /// joue, sans attendre la piste suivante. Comme le repli mono : aucun état
+    /// à emporter, la nouvelle matrice prend effet au bloc suivant. Rend
+    /// `true` si une sortie locale vivante l'a reçue.
+    pub async fn refresh_zone_reaffectation(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let track_id = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .and_then(|np| np.track_id);
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let matrice = self.reaffectation_de_la_piste(
+                zone_id,
+                track_id,
+                local_output.current_format().map(|(_, ch)| u32::from(ch)),
+            );
+            let armee = matrice.is_some();
+            local_output.set_reaffectation(matrice);
+            info!(
+                zone_id,
+                device_id = %device_id,
+                armee,
+                "zone_reaffectation_refreshed_live"
+            );
+            true
+        }
+    }
+
+    /// #6057 — la disposition des canaux que déclare le fichier de la piste,
+    /// quand elle diffère de l'ordre par défaut ; `None` sinon (le
+    /// comportement par défaut suffit). Le chemin vient du média résolu, à
+    /// défaut de la ligne `tracks`.
+    pub fn disposition_declaree(
+        &self,
+        track_id: Option<i64>,
+        file_path: Option<&str>,
+    ) -> Option<std::sync::Arc<crate::audio::disposition_canaux::Disposition>> {
+        let chemin = file_path.map(str::to_string).or_else(|| {
+            crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .get(track_id?)
+                .ok()
+                .flatten()?
+                .file_path
+        })?;
+        crate::audio::disposition_canaux::declaree_hors_defaut(std::path::Path::new(&chemin))
+            .map(std::sync::Arc::new)
     }
 
     pub async fn set_volume(

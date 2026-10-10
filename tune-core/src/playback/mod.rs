@@ -26,8 +26,9 @@ pub mod radio_artiste;
 // toute lecture du code confirmait ce récit — alors que le seul chemin que
 // l'utilisateur atteint est la route `POST /zones/{id}/crossfade`, fermée par
 // #2689 : elle refuse l'activation par un 501 `crossfade_unavailable` et force
-// la préférence persistée à `false`. Le fondu enchaîné n'existe donc sous
-// AUCUNE forme, pas même la mauvaise.
+// la préférence persistée à `false`. Le fondu enchaîné n'existait donc sous
+// AUCUNE forme, pas même la mauvaise. Depuis, le vrai fondu est branché sur la
+// sortie locale (`audio::fondu_enchaine::PuitsDeFondu`, #2211).
 //
 // L'arbitrage de Bertrand du 02/09/2026 sur #2211 est explicite : le vrai
 // fondu enchaîné mélangera deux flux décodés dans le moteur audio, sur la
@@ -131,6 +132,49 @@ pub struct NowPlaying {
     /// Inconnus pour un ancien client ou une source non mesurée.
     #[serde(default)]
     pub channels: Option<u16>,
+    /// #2264 — quelle VERSION joue, et pourquoi : la règle de choix appliquée
+    /// au lancement (`local`, `quality`, `service:<nom>`), le choix explicite
+    /// fait dans « Autres versions », et le REPLI quand la version préférée
+    /// était indisponible. La source et la qualité de la version jouée sont
+    /// déjà celles des champs ci-dessus ; ce champ dit en plus ce qui a été
+    /// DEMANDÉ et si l'on s'en est écarté.
+    ///
+    /// `None` : aucune règle n'a eu à se prononcer (radio, podcast, piste
+    /// sans autre exemplaire connu, enchaînement d'une ligne de file sans
+    /// substitution). `#[serde(default)]` : un client plus ancien l'ignore.
+    #[serde(default)]
+    pub version: Option<VersionJouee>,
+}
+
+/// La piste DEMANDÉE quand la règle en a fait jouer une autre (#2264).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PisteDemandee {
+    pub track_id: Option<i64>,
+    pub source: String,
+    pub source_id: Option<String>,
+}
+
+/// Ce que la règle de version a décidé pour la piste en cours (#2264).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionJouee {
+    /// `rule` : la règle a choisi. `explicit` : la version a été choisie à la
+    /// main dans « Autres versions », et la règle ne s'est pas appliquée.
+    pub origin: String,
+    /// La règle en vigueur pour le profil de la zone (`local`, `quality`,
+    /// `service:<nom>`), même quand le choix est explicite.
+    pub rule: String,
+    /// D'où vient la règle : `profile`, `setting` (défaut global) ou
+    /// `default`.
+    pub rule_origin: String,
+    /// La piste lancée, quand ce n'est PAS celle qui joue ; `None` sinon.
+    pub requested: Option<PisteDemandee>,
+    /// Vrai quand la version préférée par la règle était indisponible et que
+    /// la suivante disponible joue à sa place. Le client l'affiche
+    /// (« version de repli ») ; le journal porte `version_de_repli`.
+    pub fallback: bool,
+    /// La source de la version préférée indisponible (`qobuz`, `local`…),
+    /// quand `fallback` est vrai.
+    pub unavailable_source: Option<String>,
 }
 
 impl NowPlaying {
@@ -173,6 +217,7 @@ impl NowPlaying {
             // encodage (#2074).
             bitrate_kbps: None,
             channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
+            version: None,
         }
     }
 }
@@ -918,6 +963,10 @@ pub struct PlaybackManager {
     /// #4384 — ce que la sortie locale qui joue la zone demandait avant le
     /// rabot à l'unité. Voir [`GainDemande`]. Absent = pas de sortie locale.
     gains_demandes: std::sync::Mutex<HashMap<i64, GainDemande>>,
+    /// #4969 — la sonde de la carte des canaux de la sortie locale de chaque
+    /// zone. Voir [`Self::carte_des_canaux`].
+    sondes_des_canaux:
+        std::sync::Mutex<HashMap<i64, crate::audio::carte_des_canaux::SondeDesCanaux>>,
 }
 
 impl Default for PlaybackManager {
@@ -940,6 +989,7 @@ impl PlaybackManager {
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
             cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_demandes: std::sync::Mutex::new(HashMap::new()),
+            sondes_des_canaux: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -987,6 +1037,42 @@ impl PlaybackManager {
             .lock()
             .expect("gains_demandes lock")
             .remove(&zone_id);
+        // Et sa carte des canaux (#4969) : un rendu réseau n'a pas la
+        // réaffectation de l'ancien DAC.
+        self.sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .remove(&zone_id);
+    }
+
+    /// #4969 — partage la sonde de la carte des canaux de la sortie locale qui
+    /// va jouer cette zone. Voir [`Self::carte_des_canaux`].
+    pub fn brancher_la_carte_des_canaux(
+        &self,
+        zone_id: i64,
+        sonde: crate::audio::carte_des_canaux::SondeDesCanaux,
+    ) {
+        self.sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .insert(zone_id, sonde);
+    }
+
+    /// #4969 — ce que l'adaptation des canaux de la sortie locale fait de
+    /// chaque canal de la source, relu à chaque appel (une réaffectation
+    /// changée en cours de piste est suivie). `None` sans sortie locale
+    /// branchée, ou hors lecture.
+    pub fn carte_des_canaux(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::carte_des_canaux::CarteDesCanaux> {
+        let sonde = self
+            .sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .get(&zone_id)
+            .cloned()?;
+        sonde()
     }
 
     /// #4384 — partage le registre des crêtes APRÈS DSP de la sortie locale

@@ -911,6 +911,22 @@ pub(super) fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f
     })
 }
 
+/// #6057 — adapter par la disposition DÉCLARÉE du fichier (routage par
+/// position, `audio/disposition_canaux`). Même refus en silence qu'
+/// [`adapt_channels`] pour un PCM mal aligné.
+pub(super) fn adapt_channels_disposee(
+    samples: &[f32],
+    from_ch: u16,
+    to_ch: u16,
+    disposition: &crate::audio::disposition_canaux::Disposition,
+) -> Vec<f32> {
+    crate::audio::channels::adapt_channels_f32_disposee(samples, from_ch, to_ch, Some(disposition))
+        .unwrap_or_else(|error| {
+            warn!(from_ch, to_ch, error = %error, "local_channel_adaptation_rejected");
+            Vec::new()
+        })
+}
+
 // ---------------------------------------------------------------------------
 // #3632 — un FLAC 5.1 vers un ampli HDMI : DEMANDER les canaux au périphérique
 //
