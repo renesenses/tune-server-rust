@@ -66,7 +66,18 @@ pub fn build_track_from_metadata_opts(
         seul.juger().compilation
     });
 
-    let album_artist_name = if is_compilation {
+    // Fil 1881 — un `ALBUMARTIST` générique (« Various », « VA »…) sur un
+    // album que la règle ne juge pas compilation (`COMPILATION=0`, C1) :
+    // l'album prend l'artiste neutre de la convention, et chaque piste garde
+    // son ARTIST. Même décision que le scan par lots
+    // (`scan_import::TrackImporter::import`).
+    let artiste_d_album_neutre = !is_compilation
+        && meta
+            .album_artist
+            .as_deref()
+            .is_some_and(crate::scan_import::is_various_artists);
+
+    let album_artist_name = if is_compilation || artiste_d_album_neutre {
         "Various Artists"
     } else {
         meta.album_artist.as_deref().unwrap_or_else(|| {
@@ -88,7 +99,7 @@ pub fn build_track_from_metadata_opts(
         .as_deref()
         .unwrap_or(tune_core::db::artist_repo::UNKNOWN_ARTIST_NAME);
 
-    let album_artist_mbid = if is_compilation {
+    let album_artist_mbid = if is_compilation || artiste_d_album_neutre {
         None
     } else {
         meta.musicbrainz_album_artist_id
@@ -126,7 +137,9 @@ pub fn build_track_from_metadata_opts(
     };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-    let track_artist = if is_compilation && track_artist_name != album_artist_name {
+    let track_artist = if (is_compilation || artiste_d_album_neutre)
+        && track_artist_name != album_artist_name
+    {
         match artist_repo.get_or_create(
             track_artist_name,
             meta.musicbrainz_artist_id.as_deref(),
@@ -3647,3 +3660,7 @@ mod coffret_auto_relu_tests_2094;
 #[cfg(test)]
 #[path = "scan_au_demarrage_reglage_tests.rs"]
 mod scan_au_demarrage_reglage_tests;
+
+#[cfg(test)]
+#[path = "surveillant_artiste_generique_tests_1881.rs"]
+mod surveillant_artiste_generique_tests_1881;
