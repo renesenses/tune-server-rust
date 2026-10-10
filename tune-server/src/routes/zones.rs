@@ -479,6 +479,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
+        // La commande `SetAVTransportURI` apprise après un refus du renderer :
+        // exposée au diagnostic, oubliable à la main.
+        .route(
+            "/{id}/compatibilite-renderer",
+            get(compatibilite_renderer).delete(reinitialiser_compatibilite_renderer),
+        )
         .route("/{id}/device-presets", get(get_device_presets))
         // #1394 — la photo de l'appareil de cette zone. Locale pour
         // l'instant : rien ne part au catalogue communautaire sans le
@@ -1478,6 +1484,11 @@ pub use ecriture::*;
 
 mod peripheriques;
 mod preconfiguration;
+
+mod compatibilite_renderer;
+use compatibilite_renderer::{compatibilite_renderer, reinitialiser_compatibilite_renderer};
+#[cfg(test)]
+mod compatibilite_renderer_tests;
 
 // La découverte (`discovery_setup.rs`) crée des zones sans passer par le
 // routeur : elle a besoin des deux mêmes gestes que `POST /zones`.
