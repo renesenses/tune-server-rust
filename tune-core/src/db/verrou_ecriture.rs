@@ -43,7 +43,7 @@
 
 use std::backtrace::Backtrace;
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -217,6 +217,9 @@ struct Etat {
     attentes: Mutex<Vec<Prise>>,
     jetons: AtomicU64,
     seuil: Duration,
+    /// #4681 — écrivains de PREMIER PLAN (fils non marqués « de fond ») qui
+    /// attendent la connexion en ce moment.
+    attentes_de_premier_plan: AtomicUsize,
     /// Qui a laissé une transaction ouverte, et qui attend qu'elle se ferme
     /// (voir [`crate::db::transaction_du_lot`]).
     lot: TransactionDuLot,
@@ -301,6 +304,7 @@ impl VerrouEcriture {
                 attentes: Mutex::new(Vec::new()),
                 jetons: AtomicU64::new(1),
                 seuil,
+                attentes_de_premier_plan: AtomicUsize::new(0),
                 lot: TransactionDuLot::default(),
             }),
         }
@@ -436,16 +440,51 @@ impl VerrouEcriture {
         self.etat.lot.fixer_attente_max(d);
     }
 
+    /// #4681 — un écrivain de FOND, pendant qu'une zone joue, laisse d'abord
+    /// passer les écrivains de premier plan qui attendent déjà (file, état
+    /// des zones, historique), au plus `writer_yield_max_ms`. Hors lecture,
+    /// ou sur un fil de premier plan : rien, sans un appel système.
+    fn laisser_passer_le_premier_plan(&self) {
+        use crate::taches_de_fond::priorite::politique;
+        if self.etat.attentes_de_premier_plan.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(max) = politique::cession_de_l_ecrivain() else {
+            return;
+        };
+        let debut = Instant::now();
+        attendre_hors_executeur(|| {
+            while self.etat.attentes_de_premier_plan.load(Ordering::Acquire) > 0
+                && debut.elapsed() < max
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        politique::noter_ecriture_differee(debut.elapsed());
+    }
+
     fn prendre(&self, lieu: &'static Location<'static>) -> LockResult<EcritureTenue<'_>> {
+        self.laisser_passer_le_premier_plan();
         let (garde, empoisonnee) = match self.connexion.try_lock() {
             Ok(g) => (g, false),
             Err(TryLockError::Poisoned(p)) => (p.into_inner(), true),
             Err(TryLockError::WouldBlock) => {
+                let premier_plan = !crate::taches_de_fond::priorite::politique::fil_de_fond();
+                if premier_plan {
+                    self.etat
+                        .attentes_de_premier_plan
+                        .fetch_add(1, Ordering::AcqRel);
+                }
                 let jeton = self.etat.jeton();
                 if let Ok(mut a) = self.etat.attentes.lock() {
                     a.push(Prise::nouvelle(jeton, lieu, false));
                 }
                 let r = attendre_hors_executeur(|| self.connexion.lock());
+                if premier_plan {
+                    self.etat
+                        .attentes_de_premier_plan
+                        .fetch_sub(1, Ordering::AcqRel);
+                }
                 if let Ok(mut a) = self.etat.attentes.lock() {
                     a.retain(|p| p.jeton != jeton);
                 }

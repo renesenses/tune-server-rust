@@ -499,7 +499,7 @@ fn pcm_i32_to_l16_be(samples: &[i32], bit_depth: u16) -> Vec<u8> {
 }
 
 /// Temporary file guard that deletes the file on drop.
-struct TempFileGuard(std::path::PathBuf);
+pub(crate) struct TempFileGuard(std::path::PathBuf);
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
@@ -511,7 +511,9 @@ impl Drop for TempFileGuard {
 /// - Bare paths (`/path/to/file`) are returned as-is.
 /// - `file:///path/to/file` URLs have the scheme stripped.
 /// - HTTP(S) URLs are downloaded to a temporary file (cleaned up on drop).
-async fn url_to_local_path(url: &str) -> Result<(String, Option<TempFileGuard>), String> {
+pub(crate) async fn url_to_local_path(
+    url: &str,
+) -> Result<(String, Option<TempFileGuard>), String> {
     if let Some(path) = url.strip_prefix("file://") {
         return Ok((path.to_string(), None));
     }

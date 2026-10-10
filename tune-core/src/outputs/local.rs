@@ -469,7 +469,20 @@ use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
 mod periode;
+/// #6044 — la réaffectation des canaux (greffon `channel-remap`).
+mod reaffectation;
+
+/// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
+/// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit
+/// l'ordre par défaut.
+pub(crate) type CreneauDisposition =
+    std::sync::Mutex<Option<Arc<crate::audio::disposition_canaux::Disposition>>>;
+
+/// Le créneau vide des étages montés hors d'une `LocalOutput` (témoins).
+#[cfg(test)]
+pub(crate) static SANS_DISPOSITION: CreneauDisposition = std::sync::Mutex::new(None);
 use periode::{avec_periode, config_de_flux, garde_de_prechargement};
+pub(crate) use reaffectation::CreneauReaffectation;
 
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
@@ -485,6 +498,10 @@ struct PendingNextMedia {
     title: Option<String>,
     artist: Option<String>,
     duration_ms: Option<u64>,
+    /// #2211 — ce que l'orchestrateur a dit de la frontière qui mène à cette
+    /// piste (même album, DSD…). `Inconnue` quand rien n'a été dit : pas
+    /// de fondu, l'enchaînement reste gapless.
+    consigne_de_fondu: crate::audio::fondu_enchaine::ConsigneDeJonction,
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +710,12 @@ pub struct LocalOutput {
     /// Ce n'est PAS du bit-perfect, et c'est assumé : le panneau « Chemin du
     /// signal » affiche l'étape « Mono » et le verdict tombe.
     mono_downmix: Arc<AtomicBool>,
+    /// #6044 — la matrice de réaffectation des canaux posée pour la piste
+    /// (`zone_{id}_channel_remap` ou la règle de l'album), appliquée à
+    /// l'adaptation source → périphérique. Vide par défaut et en PURE.
+    reaffectation: Arc<CreneauReaffectation>,
+    /// #6057 — la disposition déclarée par le fichier de la piste en cours.
+    disposition: Arc<CreneauDisposition>,
     /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
     /// pause, à la reprise et à l'arrêt (#1590).
     ///
@@ -758,6 +781,20 @@ pub struct LocalOutput {
     /// `starvation`, il appartient à la sortie et survit aux flux. Voir
     /// [`crate::audio::crete_de_sortie`].
     cretes_de_sortie: Arc<crate::audio::crete_de_sortie::CretesDeSortie>,
+    /// #2211 — durée du fondu enchaîné de la zone qui joue, en millisecondes.
+    /// `0` = désactivé (défaut) : le puits de fondu est alors transparent.
+    /// Posée par piste par l'orchestrateur, qui y met `0` en PURE, en
+    /// bit-perfect strict et pour un flux en direct.
+    fondu_ms: Arc<AtomicU32>,
+    /// #2211 — ce que l'orchestrateur dit de la PROCHAINE frontière, posé
+    /// juste avant `set_next_media` et rangé avec la piste suivante.
+    consigne_de_la_suivante: std::sync::Mutex<crate::audio::fondu_enchaine::ConsigneDeJonction>,
+    /// #2211 — durée retenue dans la réserve du fondu, en millisecondes :
+    /// retranchée de la position publiée, qui sinon courrait devant le son.
+    fondu_retenue_ms: Arc<AtomicU64>,
+    /// #2211 — vrai pendant un recouvrement : le chemin du signal affiche
+    /// alors l'étape « Fondu enchaîné ».
+    fondu_actif: Arc<AtomicBool>,
 }
 
 /// What the render callbacks multiply every sample by, in thousandths.
@@ -1162,6 +1199,8 @@ impl LocalOutput {
             pure_bypass: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
+            reaffectation: Arc::new(CreneauReaffectation::vide()),
+            disposition: Arc::new(std::sync::Mutex::new(None)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
             // exactement comme avant #1590.
@@ -1173,6 +1212,12 @@ impl LocalOutput {
             open_failure: Arc::new(std::sync::Mutex::new(None)),
             starvation: Arc::new(RingStarvation::new()),
             cretes_de_sortie: Arc::new(crate::audio::crete_de_sortie::CretesDeSortie::new()),
+            fondu_ms: Arc::new(AtomicU32::new(0)),
+            consigne_de_la_suivante: std::sync::Mutex::new(
+                crate::audio::fondu_enchaine::ConsigneDeJonction::Inconnue,
+            ),
+            fondu_retenue_ms: Arc::new(AtomicU64::new(0)),
+            fondu_actif: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1470,6 +1515,38 @@ impl LocalOutput {
         self.mono_downmix.store(mono, Ordering::Relaxed);
     }
 
+    /// #6044 — poser (ou retirer) la matrice de réaffectation des canaux de
+    /// la zone qui joue. Comme le repli mono, sans état : un remplacement en
+    /// pleine lecture prend effet au bloc suivant.
+    pub fn set_reaffectation(
+        &self,
+        matrice: Option<Arc<crate::audio::reaffectation_canaux::Matrice>>,
+    ) {
+        self.reaffectation.poser(matrice);
+    }
+
+    /// #6044 — une matrice est-elle posée sur cette sortie ?
+    pub fn has_reaffectation(&self) -> bool {
+        self.reaffectation.posee()
+    }
+
+    /// #6044 — le dernier bloc converti est-il passé par la matrice ?
+    pub fn reaffectation_appliquee(&self) -> bool {
+        self.reaffectation.appliquee()
+    }
+
+    /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
+    /// (`None` : l'ordre par défaut, comme avant). Lue à chaque bloc par
+    /// l'étage de conversion.
+    pub fn set_disposition_source(
+        &self,
+        disposition: Option<Arc<crate::audio::disposition_canaux::Disposition>>,
+    ) {
+        if let Ok(mut d) = self.disposition.lock() {
+            *d = disposition;
+        }
+    }
+
     /// Le repli mono est-il armé sur cette sortie ?
     pub fn has_mono_downmix(&self) -> bool {
         self.mono_downmix.load(Ordering::Relaxed)
@@ -1491,6 +1568,51 @@ impl LocalOutput {
             ms.min(crate::audio::soft_mute::SOFT_MUTE_MAX_MS),
             Ordering::Relaxed,
         );
+    }
+
+    /// #2211 — durée du fondu enchaîné de la zone, en millisecondes (`0` =
+    /// désactivé). Bornée ici à [`crate::audio::fondu_enchaine::DUREE_MAX_S`].
+    ///
+    /// Lue à l'ouverture du flux puis à chaque frontière : un changement en
+    /// cours de piste vaut pour la frontière qui suit la piste suivante, jamais
+    /// au milieu d'une piste — armer une réserve en vol creuserait l'anneau.
+    pub fn set_fondu_enchaine_ms(&self, ms: u32) {
+        let max = (crate::audio::fondu_enchaine::DUREE_MAX_S * 1000.0) as u32;
+        self.fondu_ms.store(ms.min(max), Ordering::Relaxed);
+    }
+
+    /// #2211 — la durée de fondu posée, en millisecondes.
+    pub fn fondu_enchaine_ms(&self) -> u32 {
+        self.fondu_ms.load(Ordering::Relaxed)
+    }
+
+    /// #2211 — ce que l'orchestrateur dit de la frontière vers la piste qu'il
+    /// s'apprête à armer. À poser AVANT `set_next_media`, qui la range avec la
+    /// piste ; une piste armée sans consigne n'est jamais fondue.
+    pub fn consigner_la_jonction_suivante(
+        &self,
+        consigne: crate::audio::fondu_enchaine::ConsigneDeJonction,
+    ) {
+        if let Ok(mut slot) = self.consigne_de_la_suivante.lock() {
+            *slot = consigne;
+        }
+    }
+
+    fn prendre_la_consigne_de_la_suivante(
+        &self,
+    ) -> crate::audio::fondu_enchaine::ConsigneDeJonction {
+        self.consigne_de_la_suivante
+            .lock()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    }
+
+    /// #2211 — ce bras de lecture sait-il fondre ? Seul le chemin CPAL
+    /// partagé porte le puits de fondu ; les bras exclusifs (WASAPI, ASIO,
+    /// CoreAudio) enchaînent en gapless et ne fondent pas.
+    pub fn sait_fondre(&self) -> bool {
+        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::CpalPartage
     }
 
     /// Durée de rampe **réellement applicable** en cet instant, gardes
@@ -2518,6 +2640,10 @@ struct LocalPcmProcessor<'a> {
     crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
     pure_bypass: &'a AtomicBool,
     mono_downmix: &'a AtomicBool,
+    /// #6044 — la réaffectation des canaux, lue par `convertir`.
+    reaffectation: &'a CreneauReaffectation,
+    /// #6057 — la disposition déclarée, lue par `convertir`.
+    disposition: &'a CreneauDisposition,
     dop_active: &'a AtomicBool,
     volume: &'a AtomicU32,
     user_volume: &'a AtomicU32,
@@ -3500,7 +3626,20 @@ fn local_dsp_runtime_state(
         return OutputDspState::BypassedDop;
     }
     if pure_bypass.load(Ordering::Relaxed) {
-        return OutputDspState::BypassedPure;
+        // #4176 — dire si PURE contourne quelque chose. Un verrou
+        // empoisonné ne permet pas de l'affirmer : on garde alors le
+        // « contourné » d'avant, qui reste vrai.
+        let rien_d_arme = !mono_downmix.load(Ordering::Relaxed)
+            && eq
+                .lock()
+                .is_ok_and(|g| g.as_ref().is_none_or(|p| p.est_neutre_au_repos()))
+            && convolver.lock().is_ok_and(|g| g.is_none())
+            && crossfeed.lock().is_ok_and(|g| g.is_none());
+        return if rien_d_arme {
+            OutputDspState::PureSansObjet
+        } else {
+            OutputDspState::BypassedPure
+        };
     }
     // Le repli mono est une vraie transformation : il doit APPARAÎTRE dans le
     // verdict, sans quoi le panneau annoncerait un chemin intouché pendant que
@@ -3559,7 +3698,10 @@ fn windows_signal_path_status(
     match dsp {
         OutputDspState::Applied => reasons.push(OutputSignalReason::DspApplied),
         OutputDspState::Unknown => reasons.push(OutputSignalReason::DspStateUnknown),
-        OutputDspState::Inactive | OutputDspState::BypassedPure | OutputDspState::BypassedDop => {}
+        OutputDspState::Inactive
+        | OutputDspState::BypassedPure
+        | OutputDspState::PureSansObjet
+        | OutputDspState::BypassedDop => {}
     }
     if volume == OutputVolumeState::Applied {
         reasons.push(OutputSignalReason::SoftwareVolume);
@@ -3904,7 +4046,32 @@ impl EtageDeConversion<'_> {
 
     /// Adaptation de canaux puis rééchantillonnage, dans cet ordre et lui seul.
     fn convertir(&mut self, mut mots: Vec<f32>) -> Vec<f32> {
-        if self.needs_channel_adapt() {
+        // #6044 — la matrice de réaffectation, quand elle va de la source à la
+        // sortie, REMPLACE l'adaptation par défaut. Jamais sur un porteur DoP
+        // ni en PURE : ce sont des octets à livrer tels quels.
+        let intouchable = self.pcm.dop_active.load(Ordering::Relaxed)
+            || self.pcm.pure_bypass.load(Ordering::Relaxed);
+        let matrice = if intouchable {
+            None
+        } else {
+            self.pcm
+                .reaffectation
+                .pour(self.spec.canaux(), self.sortie.canaux)
+        };
+        self.pcm.reaffectation.noter(matrice.is_some());
+        // #6057 — sans matrice, la disposition que le fichier DÉCLARE route
+        // chaque voie par sa position, même à nombre de canaux égal. Jamais sur
+        // un porteur DoP : ce sont des octets à livrer tels quels.
+        let declaree = if matrice.is_some() || self.pcm.dop_active.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.pcm.disposition.lock().ok().and_then(|d| d.clone())
+        };
+        if let Some(m) = matrice {
+            mots = m.appliquer_f32(&mots);
+        } else if let Some(d) = declaree.filter(|d| d.canaux() == self.spec.canaux()) {
+            mots = adapt_channels_disposee(&mots, self.spec.canaux(), self.sortie.canaux, &d);
+        } else if self.needs_channel_adapt() {
             mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
         if self.needs_resample {
@@ -3932,7 +4099,13 @@ impl EtageDeConversion<'_> {
             self.pcm.convolver,
             self.pcm.crossfeed,
             self.pcm.mono_downmix,
-        )
+        ) || (!self.pcm.dop_active.load(Ordering::Relaxed)
+            && !self.pcm.pure_bypass.load(Ordering::Relaxed)
+            && self
+                .pcm
+                .reaffectation
+                .pour(self.spec.canaux(), self.sortie.canaux)
+                .is_some())
     }
 
     /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
@@ -4529,6 +4702,33 @@ impl BoucleProducteur<'_> {
     }
 }
 
+/// #2211 — **la frontière du fondu enchaîné**, sortie de `play_url` pour être
+/// éprouvée sur un puits factice : décider (règle pure,
+/// [`crate::audio::fondu_enchaine::decider_le_fondu`]), puis fondre ou
+/// renoncer. Rend `false` seulement quand le puits réel a cessé de consommer.
+pub(super) fn jonction_du_fondu(
+    puits: &mut crate::audio::fondu_enchaine::PuitsDeFondu<'_>,
+    jonction: crate::audio::fondu_enchaine::Jonction,
+    device_name: &str,
+) -> bool {
+    match crate::audio::fondu_enchaine::decider_le_fondu(jonction) {
+        Ok(()) => {
+            info!(device = %device_name, "fondu_enchaine_commence");
+            puits.commencer_le_fondu()
+        }
+        Err(motif) => {
+            if jonction.fondu_arme {
+                info!(
+                    device = %device_name,
+                    motif = motif.code(),
+                    "fondu_enchaine_renonce"
+                );
+            }
+            puits.renoncer_au_fondu()
+        }
+    }
+}
+
 /// #4176 — après une attente bloquante (première lecture HTTP), le fil doit-il
 /// encore ouvrir le périphérique ? Non dès que `stop()` est passé : par le
 /// drapeau de silence forcé ou par le canal d'arrêt.
@@ -4613,6 +4813,7 @@ impl OutputTarget for LocalOutput {
             title: title.map(String::from),
             artist: artist.map(String::from),
             duration_ms: None,
+            consigne_de_fondu: self.prendre_la_consigne_de_la_suivante(),
         });
         debug!("local_audio_gapless_next_url_set");
         Ok(())
@@ -4624,6 +4825,7 @@ impl OutputTarget for LocalOutput {
             title: media.title.map(String::from),
             artist: media.artist.map(String::from),
             duration_ms: media.duration_ms,
+            consigne_de_fondu: self.prendre_la_consigne_de_la_suivante(),
         });
         info!(
             title = ?media.title,
@@ -4679,6 +4881,9 @@ impl OutputTarget for LocalOutput {
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
+        // #2211 — un flux neuf n'a rien en réserve et ne fond pas encore.
+        self.fondu_retenue_ms.store(0, Ordering::Relaxed);
+        self.fondu_actif.store(false, Ordering::Relaxed);
         // (`chain_exhausted` est remis à zéro plus bas, APRÈS l'incrément de
         // `play_generation` — voir le commentaire là-bas : le faire ici
         // laisserait une fenêtre où l'ancien fil peut relever le drapeau.)
@@ -4841,6 +5046,8 @@ impl OutputTarget for LocalOutput {
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
+        let reaffectation = self.reaffectation.clone();
+        let disposition = self.disposition.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
@@ -4856,6 +5063,11 @@ impl OutputTarget for LocalOutput {
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let chain_exhausted_ref = self.chain_exhausted.clone();
+        // #2211 — le fondu enchaîné : sa durée (relue à chaque frontière),
+        // la retenue que la position retranche, le drapeau du recouvrement.
+        let fondu_ms = self.fondu_ms.clone();
+        let fondu_retenue_ms = self.fondu_retenue_ms.clone();
+        let fondu_actif = self.fondu_actif.clone();
         let uri_ref = self.current_uri.clone();
         let title_ref = self.track_title.clone();
         let artist_ref = self.track_artist.clone();
@@ -5525,6 +5737,8 @@ impl OutputTarget for LocalOutput {
                     dec_sr,
                     dec_ch,
                     FormatOuvert::new(output_sr, output_ch),
+                    Some((&reaffectation, pure_bypass.load(Ordering::Relaxed))),
+                    disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
 
                 // Pre-fill the ring buffer before starting the cpal stream.
@@ -5773,6 +5987,8 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    reaffectation: reaffectation.clone(),
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5451 — le bras consomme la réserve et enchaîne à
                     // format égal, sans rouvrir le périphérique.
@@ -5826,6 +6042,8 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    reaffectation: reaffectation.clone(),
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5204 — la route native consomme la réserve et enchaîne
                     // à format égal, sans refermer le pilote.
@@ -6045,6 +6263,8 @@ impl OutputTarget for LocalOutput {
                     crossfeed: &crossfeed,
                     pure_bypass: &pure_bypass,
                     mono_downmix: &mono_downmix,
+                    reaffectation: &reaffectation,
+                    disposition: &disposition,
                     dop_active: &dop_active,
                     volume: &volume,
                     user_volume: &user_volume_ref,
@@ -6067,8 +6287,23 @@ impl OutputTarget for LocalOutput {
             // qu'un, flottant — c'est le chemin DSP, le mot y est `f32` par
             // construction ; un puits natif ici n'est pas une erreur à
             // rapporter mais une impossibilité de type.
+            //
+            // #2211 — le fondu enchaîné se branche ICI, entre l'étage et
+            // l'anneau : il voit les mots au format OUVERT, après
+            // rééchantillonnage, donc deux pistes de cadences différentes se
+            // mélangent sans précaution. Durée nulle (défaut, PURE, flux en
+            // direct) : le puits est transparent, un `ecrire` et rien d'autre.
             let mut puits = match backend.puits() {
-                Puits::Flottant(puits) => puits,
+                Puits::Flottant(puits) => {
+                    Box::new(crate::audio::fondu_enchaine::PuitsDeFondu::nouveau(
+                        puits,
+                        FormatOuvert::new(output_sr, output_ch),
+                        crate::audio::fondu_enchaine::CourbeDeFondu::default(),
+                        fondu_ms.clone(),
+                        fondu_retenue_ms.clone(),
+                        fondu_actif.clone(),
+                    ))
+                }
                 Puits::Natif(_) => unreachable!("BackendCpal ne fournit qu'un puits flottant"),
             };
 
@@ -6267,6 +6502,10 @@ impl OutputTarget for LocalOutput {
             // If the stream was never started (very short track or error),
             // start it now with whatever data we have.
             if !stream_started {
+                // #2211 — une piste plus courte que la réserve du fondu a tout
+                // laissé dans la réserve : démarrer sur un anneau vide ferait
+                // une famine. Elle part intacte ; cette frontière ne fondra pas.
+                puits.renoncer_au_fondu();
                 // Empty stream: the source delivered zero audio bytes (a
                 // superseded/aborted start — e.g. a rapid re-trigger of the same
                 // track, seen in Philippe Vella's log as two orchestrator_play
@@ -6379,6 +6618,21 @@ impl OutputTarget for LocalOutput {
                 else {
                     break;
                 };
+
+                // #2211 — la frontière est acquise (même format ouvert, ou
+                // conversion déjà réglée par l'étage) : fondre, ou renoncer et
+                // laisser partir la réserve intacte — le gapless au mot près.
+                let jonction = crate::audio::fondu_enchaine::Jonction {
+                    fondu_arme: puits.fondu_arme(),
+                    pure: pure_bypass.load(Ordering::Relaxed),
+                    bitperfect_strict: strict_bitperfect,
+                    dop: dop_active.load(Ordering::Relaxed),
+                    reserve_vide: puits.reserve_vide(),
+                    consigne: next.consigne_de_fondu,
+                };
+                if !jonction_du_fondu(&mut puits, jonction, &device_name) {
+                    break;
+                }
 
                 // REF-6b : la piste enchaînée a son propre format d'entrée.
                 publier_les_transformations(&transformations_reelles, &etage);
@@ -6578,6 +6832,17 @@ impl OutputTarget for LocalOutput {
                 && !device_gone.load(Ordering::Relaxed)
             {
                 etage.vider(&mut *puits);
+            }
+
+            // #2211 — fin de chaîne : la réserve du fondu part au DAC, intacte
+            // (ou la sortante finit son extinction), APRÈS la queue du DSP et
+            // le vidage du rééchantillonneur, qui en font partie. Après un
+            // Stop, rien ne part : la réserve ne ressuscite pas une lecture.
+            if http_eof
+                && !force_silent.load(Ordering::Relaxed)
+                && !device_gone.load(Ordering::Relaxed)
+            {
+                puits.terminer();
             }
 
             // Wait for the ring buffer to drain (real playback) before signalling
@@ -6818,6 +7083,9 @@ impl OutputTarget for LocalOutput {
             *slot = None;
         }
         *self.next_media.lock().unwrap() = None;
+        // #2211 — un arrêt jette la réserve du fondu : rien n'est plus retenu.
+        self.fondu_retenue_ms.store(0, Ordering::Relaxed);
+        self.fondu_actif.store(false, Ordering::Relaxed);
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
         *self.track_artist.lock().unwrap() = None;
@@ -6924,7 +7192,12 @@ impl OutputTarget for LocalOutput {
 
         Ok(OutputStatus {
             state,
-            position_ms: self.position_ms.load(Ordering::Relaxed),
+            // #2211 — la réserve du fondu n'est pas encore partie au DAC : la
+            // position alimentée la compte, la position entendue non.
+            position_ms: self
+                .position_ms
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.fondu_retenue_ms.load(Ordering::Relaxed)),
             duration_ms,
             volume: self.user_volume.load(Ordering::Relaxed) as f64 / 1000.0,
             muted: self.muted.load(Ordering::Relaxed),
@@ -6956,7 +7229,10 @@ impl OutputTarget for LocalOutput {
     /// `publier_les_transformations` — à l'ouverture, puis à chaque
     /// frontière gapless. `None` hors lecture.
     fn transformations_reelles(&self) -> Option<TransformationsReelles> {
-        self.transformations_reelles.lock().ok().and_then(|t| *t)
+        // #2211 — le fondu se déclare pendant le recouvrement, et lui seul.
+        let fondu = self.fondu_actif.load(Ordering::Relaxed);
+        let mesure = self.transformations_reelles.lock().ok().and_then(|t| *t);
+        mesure.map(|t| t.avec_fondu_enchaine(fondu))
     }
 
     fn ring_starvation(&self) -> Option<OutputRingStarvation> {
@@ -7296,6 +7572,11 @@ mod bitperfect_strict_3973;
 #[cfg(test)]
 mod gapless_changement_de_cadence_4953;
 
+// #2211 — le fondu enchaîné branché sur la boucle gapless : l'étage réel, le
+// puits de fondu, la frontière, et le branchement dans `play_url`.
+#[cfg(test)]
+mod fondu_enchaine_2211;
+
 // #5416 — PURE sur une sortie qui convertit déjà : même cadence source,
 // l'enchaînement sans blanc est gardé.
 #[cfg(test)]
@@ -7579,3 +7860,7 @@ mod empreinte_asio_f70496;
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
 mod transformations_reelles_de_l_etage_ref6b;
+
+/// #6057 — l'étage route par la disposition déclarée par le fichier.
+#[cfg(test)]
+mod disposition_declaree_tests;

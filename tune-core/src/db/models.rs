@@ -383,7 +383,13 @@ impl Track {
     pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(obj) = v.as_object_mut() {
-            let badge = crate::audio::channels::channel_badge(self.channels as u16);
+            // La disposition DÉCLARÉE par le fichier fait foi (un FLAC 4.0
+            // n'est pas un « 5.1 ») ; une piste CUE la lit dans son image.
+            let chemin = self.file_path.as_deref().or(self.cue_media_path.as_deref());
+            let badge = crate::audio::channels::channel_badge_declare(
+                chemin.map(std::path::Path::new),
+                self.channels.clamp(0, i32::from(u16::MAX)) as u16,
+            );
             obj.insert("channel_badge".into(), serde_json::json!(badge));
         }
         v

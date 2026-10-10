@@ -1388,6 +1388,18 @@ fn fichier_tague(dossier: &std::path::Path, nom: &str, gabarit: &str, album: &st
     chemin.to_string_lossy().into_owned()
 }
 
+/// #5644 — pose la balise DISCSUBTITLE (le NOM du disque) sur un fichier.
+fn baliser_nom_de_disque(chemin: &str, nom: &str) {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::tag::ItemKey;
+    let mut f = lofty::read_from_path(chemin).unwrap();
+    f.primary_tag_mut()
+        .unwrap()
+        .insert_text(ItemKey::SetSubtitle, nom.to_string());
+    f.save_to_path(chemin, WriteOptions::default()).unwrap();
+}
+
 /// Fil 2094 (décision de Bertrand du 05/10/2026) — un coffret dont le
 /// marqueur ne retient AUCUN titre d'origine : le rattrapage relit la balise
 /// ALBUM de la PREMIÈRE piste de chaque disque, sur de vrais FLAC et MP3, et
@@ -1441,11 +1453,10 @@ pub(crate) fn scenario_rattrapage_par_les_balises_2094(db: &Arc<dyn DbBackend>) 
     );
     // Disque 5 : porte DÉJÀ un nom — jamais remplacé.
     let dossier5 = r.join("Yes Box/CD5");
-    let b5 = un_disque(
-        "Yes Box",
-        &dossier5,
-        &[(1, fichier_tague(&dossier5, "01.flac", "test.flac", "90125"))],
-    );
+    // #5644 — le nom vient de sa balise DISCSUBTITLE : le défaire le garde.
+    let f5 = fichier_tague(&dossier5, "01.flac", "test.flac", "90125");
+    baliser_nom_de_disque(&f5, "Bonus");
+    let b5 = un_disque("Yes Box", &dossier5, &[(1, f5)]);
     let (p1, p2) = placeholders(db);
     db.execute(
         &format!("UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2}"),
@@ -1522,6 +1533,79 @@ pub(crate) fn scenario_rattrapage_par_les_balises_2094(db: &Arc<dyn DbBackend>) 
 #[test]
 fn rattrapage_par_les_balises_2094_sur_sqlite() {
     scenario_rattrapage_par_les_balises_2094(&sqlite());
+}
+
+/// #5644 (Marco Polo, fil 2009) — DÉFAIRE un coffret composé à la main ne
+/// laisse pas sur l'album séparé le NOM donné au disque dans le coffret.
+/// Chaque piste reprend le nom de sa balise DISCSUBTITLE, ou aucun.
+pub(crate) fn scenario_defaire_rend_le_nom_de_la_balise_5644(db: &Arc<dyn DbBackend>) {
+    let _ = db.execute("DELETE FROM album_metadata", &[]);
+    let _ = db.execute("DELETE FROM album_distinct_pairs", &[]);
+    let _ = SettingsRepo::with_backend(db.clone()).delete(CLE_REFUS);
+    let racine = tempfile::tempdir().unwrap();
+    let r = racine.path();
+    let a = artiste(db, "Marco Polo");
+    let un_disque = |titre: &str, dossier: &std::path::Path, chemin: String| {
+        let id = album(db, titre, a, &dossier.to_string_lossy());
+        piste(db, id, a, 1, 1, &chemin);
+        id
+    };
+    let d1 = r.join("Box/CD1");
+    let b1 = un_disque(
+        "Premier",
+        &d1,
+        fichier_tague(&d1, "01.flac", "test.flac", "Premier"),
+    );
+    let d2 = r.join("Box/CD2");
+    let b2 = un_disque(
+        "Second",
+        &d2,
+        fichier_tague(&d2, "01.flac", "test.flac", "Second"),
+    );
+    let d3 = r.join("Box/CD3");
+    let f3 = fichier_tague(&d3, "01.flac", "test.flac", "Troisieme");
+    baliser_nom_de_disque(&f3, "Live");
+    let b3 = un_disque("Troisieme", &d3, f3);
+    coffret_manuel_d_avant_2094(db, "Box", &[b1, b2, b3], vec![]);
+    // Renommage des disques dans le coffret, comme l'écrit l'édition.
+    let (p1, p2) = placeholders(db);
+    for (nom, n) in [("Disque A", 1i64), ("Disque B", 2), ("Disque C", 3)] {
+        db.execute(
+            &format!(
+                "UPDATE tracks SET disc_subtitle = {p1} WHERE album_id = {p2} AND disc_number = {n}"
+            ),
+            &[&nom as &dyn ToSqlValue, &b1],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        sous_titres_de(db, b1),
+        vec![
+            (1, Some("Disque A".into())),
+            (2, Some("Disque B".into())),
+            (3, Some("Disque C".into())),
+        ]
+    );
+
+    let recrees = crate::db::edition_album::defaire_coffret_manuel(db, b1).unwrap();
+    assert_eq!(recrees.len(), 2);
+    let mut noms: Vec<Option<String>> = std::iter::once(b1)
+        .chain(recrees.iter().copied())
+        .flat_map(|id| sous_titres_de(db, id))
+        .map(|(_, s)| s)
+        .collect();
+    noms.sort();
+    assert_eq!(
+        noms,
+        vec![None, None, Some("Live".to_string())],
+        "#5644 : le nom donné dans le coffret ne reste pas sur les albums séparés ; \
+         seule la balise DISCSUBTITLE (« Live ») est rendue"
+    );
+}
+
+#[test]
+fn defaire_rend_le_nom_de_la_balise_5644_sur_sqlite() {
+    scenario_defaire_rend_le_nom_de_la_balise_5644(&sqlite());
 }
 
 /// Fil 2094, suite de #5812 — la RELECTURE des fichiers d'un coffret

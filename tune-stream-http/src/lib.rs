@@ -2554,6 +2554,7 @@ fn resumable_proxy_body(
     reresolve: Option<ReresolveFn>,
     compteur: std::sync::Arc<StreamSession>,
     bilan: BilanDeConnexion,
+    limite: Option<u64>,
 ) -> Body {
     let flux = async_stream::stream! {
         use futures_util::StreamExt;
@@ -2638,7 +2639,9 @@ fn resumable_proxy_body(
             }
         }
     };
-    corps_compte(flux, compteur)
+    // `limite` : la tranche d'un `Range: bytes=N-M` s'arrête à M — l'amont
+    // est lâché dès le dernier octet dû (sonde `bytes=0-1` d'AVPlayer).
+    corps_compte(borner_le_corps(flux, limite), compteur)
 }
 
 /// #5050 — la longueur TOTALE du flux amont, d'après la réponse du CDN.
@@ -2660,6 +2663,18 @@ fn longueur_totale_amont(
             .filter(|&n| n > 0),
         _ => None,
     }
+}
+
+/// Premier octet d'un `Content-Range: bytes a-b/total` amont : `a`.
+fn debut_de_tranche_amont(content_range: &str) -> Option<u64> {
+    content_range
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// #5050 — faut-il écrire la ligne `proxy_get_amont` du `n`-ième `GET`
@@ -2774,9 +2789,25 @@ async fn proxy_stream(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.to_ascii_lowercase().contains("lavf"));
     let resume_threshold = if is_lavf { RESUME_RANGE_THRESHOLD } else { 1 };
+    // Un suffixe `bytes=-n` se transmet au CDN comme `bytes=(total-n)-` quand
+    // une requête précédente de la session a appris la longueur ; sinon
+    // l'amont part de 0 et la tranche est atteinte par saut local.
+    let debut_du_suffixe = || {
+        let n = range_value
+            .as_deref()?
+            .strip_prefix("bytes=-")?
+            .split(',')
+            .next()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let total = session.longueur_amont()?;
+        (n > 0).then(|| total.saturating_sub(n))
+    };
     let resume_start = range_value
         .as_deref()
         .and_then(parse_range_start)
+        .or_else(debut_du_suffixe)
         .filter(|&n| n >= resume_threshold);
 
     if let Some(start) = resume_start {
@@ -2876,6 +2907,106 @@ async fn proxy_stream(
         HeaderValue::from_static("Streaming"),
     );
 
+    // ── La plage EXACTE (écoute à distance iPhone, 10/10/2026) ──
+    //
+    // AVPlayer sonde avec `Range: bytes=0-1`. Le mandataire ne lisait que le
+    // DÉBUT de la plage : il répondait `206 bytes 0-41008206/41008207` et
+    // envoyait le fichier entier (1.0.0-rc3, zone « Ce téléphone » via le
+    // relais). AVPlayer rejette une réponse qui n'est pas la tranche demandée,
+    // et la zone restait muette. Le suffixe `bytes=-n` rendait un 200 depuis
+    // 0, et une plage hors fichier un 200 aussi.
+    //
+    // Dès que la longueur totale est connue (CDN qui dit `Content-Length` en
+    // 200 ou `Content-Range` en 206), la demande est lue par la même
+    // [`interpreter_range`] que `serve_file` : tranche bornée, ouverte ou
+    // suffixe → 206 aux bornes exactes ; hors fichier → 416 `bytes */total`.
+    // Ce que l'amont a commencé à rendre AVANT l'octet dû est sauté, ce qu'il
+    // rendrait APRÈS le dernier est coupé (l'amont est alors lâché).
+    // Longueur inconnue : rien ne change, les branches ci-dessous gardent
+    // leur contrat (un `Range` ignoré, RFC 9110 §14.2).
+    if !is_radio {
+        if upstream_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            // Reprise transmise au CDN au-delà de la fin : il a dit 416, on le
+            // redit — avec la taille quand il l'a donnée.
+            let total = upstream_content_range
+                .as_deref()
+                .and_then(|cr| cr.rsplit('/').next())
+                .and_then(|t| t.trim().parse::<u64>().ok());
+            warn!(
+                stream_id = %session.id,
+                range = range_value.as_deref().unwrap_or("-"),
+                total = ?total,
+                "proxy_range_insatisfiable — le CDN a répondu 416, transmis tel quel"
+            );
+            let rep = match total {
+                Some(t) => reponse_416(t),
+                None => StatusCode::RANGE_NOT_SATISFIABLE.into_response(),
+            };
+            diag.journaliser(&session, StatusCode::RANGE_NOT_SATISFIABLE, rep.headers());
+            return rep;
+        }
+        let total_amont = longueur_totale_amont(
+            upstream_resp.status().as_u16(),
+            content_length,
+            upstream_content_range.as_deref(),
+        );
+        if let (Some(r), Some(total)) = (range_value.as_deref(), total_amont) {
+            match interpreter_range(r, total) {
+                DemandeDeRange::Insatisfiable => {
+                    warn!(
+                        stream_id = %session.id,
+                        range = r,
+                        total,
+                        "proxy_range_insatisfiable — 416, la plage ne désigne aucun octet du flux"
+                    );
+                    let rep = reponse_416(total);
+                    diag.journaliser(&session, StatusCode::RANGE_NOT_SATISFIABLE, rep.headers());
+                    return rep;
+                }
+                DemandeDeRange::Tranche { debut, fin } => {
+                    let amont_debut = match upstream_resp.status() {
+                        reqwest::StatusCode::OK => Some(0),
+                        reqwest::StatusCode::PARTIAL_CONTENT => upstream_content_range
+                            .as_deref()
+                            .and_then(debut_de_tranche_amont),
+                        _ => None,
+                    };
+                    if let Some(amont_debut) = amont_debut.filter(|&a| a <= debut) {
+                        let longueur = fin - debut + 1;
+                        headers.insert("Content-Length", HeaderValue::from(longueur));
+                        headers.insert(
+                            "Content-Range",
+                            HeaderValue::from_str(&format!("bytes {debut}-{fin}/{total}")).unwrap(),
+                        );
+                        info!(
+                            stream_id = %session.id,
+                            range = r,
+                            debut,
+                            fin,
+                            total,
+                            amont_debut,
+                            "proxy_206_tranche_exacte"
+                        );
+                        let body = resumable_proxy_body(
+                            client,
+                            upstream_url.to_string(),
+                            upstream_resp,
+                            amont_debut,
+                            debut - amont_debut,
+                            reresolve.clone(),
+                            session.clone(),
+                            BilanDeConnexion::mandataire(&session.id, req_headers),
+                            (fin + 1 < total).then_some(longueur),
+                        );
+                        diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
+                        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+                    }
+                }
+                DemandeDeRange::Totalite => {}
+            }
+        }
+    }
+
     // DLNA renderers (e.g. Eversolo DMP-A8 with Lavf) send Range: bytes=0-
     // and expect 206 Partial Content with Content-Range header.
     // Returning 200 OK causes them to abort after ~31 seconds.
@@ -2904,6 +3035,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
             BilanDeConnexion::mandataire(&session.id, req_headers),
+            None,
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -2948,6 +3080,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
             BilanDeConnexion::mandataire(&session.id, req_headers),
+            None,
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -3000,6 +3133,7 @@ async fn proxy_stream(
             reresolve.clone(),
             session.clone(),
             BilanDeConnexion::mandataire(&session.id, req_headers),
+            None,
         );
         diag.journaliser(&session, StatusCode::PARTIAL_CONTENT, &headers);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
@@ -3018,6 +3152,7 @@ async fn proxy_stream(
         reresolve.clone(),
         session.clone(),
         BilanDeConnexion::mandataire(&session.id, req_headers),
+        None,
     );
     diag.journaliser(&session, StatusCode::OK, &headers);
     (StatusCode::OK, headers, body).into_response()
@@ -5224,6 +5359,9 @@ mod reprise_navigateur_5426;
 
 #[cfg(test)]
 mod relais_wav24_b209bf;
+
+#[cfg(test)]
+mod plages_avplayer_b209;
 
 /// #4645 — la mesure du terrain perdu pendant le service d'un fichier.
 ///
