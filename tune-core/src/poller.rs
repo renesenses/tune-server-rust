@@ -1025,6 +1025,11 @@ mod volume_pure_5695_tests;
 
 /// #5662 — un renderer à 100 % ignoré par l'adoption est signalé au journal.
 mod volume_100_ignore_5662;
+/// #6008 — l'adoption du volume du renderer est dite au journal.
+mod volume_adopte_6008;
+/// #6008 — son banc, sur le vrai sondeur.
+#[cfg(test)]
+mod volume_adopte_6008_tests;
 
 #[cfg(test)]
 mod tests;

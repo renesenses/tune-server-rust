@@ -75,17 +75,11 @@ pub fn rss_mb() -> Option<u64> {
 /// Rend au noyau les pages libres que l'allocateur garde. `true` quand
 /// l'allocateur dit en avoir rendu ; `false` s'il n'y avait rien à rendre, ou
 /// hors glibc, où rien n'est fait.
+///
+/// Le geste vit dans `tune_core::memoire_rendue`, pour que la passe acoustique
+/// puisse aussi le jouer juste après avoir relâché sa session ONNX.
 pub fn rendre_la_memoire_liberee() -> bool {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // SAFETY : `malloc_trim` n'a pas de précondition ; il prend lui-même
-        // le verrou de chaque arène et ne déplace aucune allocation vivante.
-        unsafe { libc::malloc_trim(0) != 0 }
-    }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    {
-        false
-    }
+    tune_core::memoire_rendue::rendre_la_memoire_liberee()
 }
 
 /// La purge n'a lieu qu'à froid : aucune sortie LOCALE ne joue (fil 2167).
