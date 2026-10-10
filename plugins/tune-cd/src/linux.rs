@@ -1,6 +1,8 @@
 //! Le lecteur Linux : ioctl `CDROMREADTOCHDR`, `CDROMREADTOCENTRY`,
 //! `CDROMREADAUDIO` et `CDROM_DRIVE_STATUS` sur `/dev/sr*` (`linux/cdrom.h`),
-//! et `CDROMEJECT` pour éjecter (fil 2135).
+//! et `CDROMEJECT` pour éjecter (fil 2135). Un Apple SuperDrive reçoit
+//! en plus sa commande d'éveil par `SG_IO` (#5729, voir
+//! [`CDB_EVEIL_SUPERDRIVE`]).
 //!
 //! Aucun outil externe pour lire : ni `cdparanoia`, ni `cdda2wav`, ni ffmpeg.
 //! L'éjection seule se replie sur la commande `eject` si l'ioctl est refusé
@@ -11,6 +13,7 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::lecteur::{ErreurCd, ErreurEjection, LecteurDisque, Presence};
@@ -28,6 +31,125 @@ const CDROM_LEADOUT: u8 = 0xAA;
 const CDROM_DATA_TRACK: u8 = 0x04;
 const CDSL_CURRENT: libc::c_int = i32::MAX;
 const CDS_DISC_OK: libc::c_int = 4;
+
+// scsi/sg.h
+const SG_IO: u64 = 0x2285;
+const SG_DXFER_NONE: libc::c_int = -1;
+/// Délai de la commande d'éveil, en millisecondes.
+const DELAI_EVEIL_MS: u32 = 5_000;
+
+/// #5729 — la commande vendeur qui « éveille » un Apple SuperDrive.
+///
+/// Hors d'un Mac, le SuperDrive refuse ou recrache tout disque tant qu'il
+/// n'a pas reçu cette commande : c'est l'équivalent de
+/// `sg_raw /dev/srN EA 00 00 00 00 00 01`, que la règle udev connue des
+/// distributions envoie au branchement. Aucun transfert de données.
+pub const CDB_EVEIL_SUPERDRIVE: [u8; 7] = [0xEA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+/// `struct sg_io_hdr` (`scsi/sg.h`).
+#[repr(C)]
+struct SgIoHdr {
+    interface_id: libc::c_int,
+    dxfer_direction: libc::c_int,
+    cmd_len: u8,
+    mx_sb_len: u8,
+    iovec_count: u16,
+    dxfer_len: u32,
+    dxferp: *mut libc::c_void,
+    cmdp: *const u8,
+    sbp: *mut u8,
+    timeout: u32,
+    flags: u32,
+    pack_id: libc::c_int,
+    usr_ptr: *mut libc::c_void,
+    status: u8,
+    masked_status: u8,
+    msg_status: u8,
+    sb_len_wr: u8,
+    host_status: u16,
+    driver_status: u16,
+    resid: libc::c_int,
+    duration: u32,
+    info: u32,
+}
+
+/// Ce qui envoie la commande d'éveil au périphérique `chemin`. Injecté dans
+/// les tests ; [`eveiller_par_sg_io`] sinon.
+pub type Eveil = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// #5729 — les lecteurs déjà éveillés, par chemin. Un [`LecteurLinux`]
+/// neuf est créé à chaque recherche de lecteur (toutes les 2 s tant que le
+/// lecteur est vide) : l'éveil se compte donc pour le PÉRIPHÉRIQUE, pas pour
+/// l'objet. Un lecteur qui disparaît (débranché) en sort, et sera éveillé
+/// de nouveau à son retour.
+static LECTEURS_EVEILLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// #5729 — `vendor` et `model` (sysfs) désignent-ils un Apple SuperDrive ?
+/// Le noyau les complète d'espaces (`"Apple   "`, `"SuperDrive      "`).
+pub fn est_un_superdrive(fabricant: &str, modele: &str) -> bool {
+    fabricant.trim().eq_ignore_ascii_case("apple")
+        && modele.to_ascii_lowercase().contains("superdrive")
+}
+
+/// #5729 — `vendor` et `model` du lecteur `chemin` (`/dev/sr0`), lus dans
+/// `<racine_sys>/block/sr0/device/`. `None` si l'un manque.
+pub fn identite_scsi(racine_sys: &Path, chemin: &str) -> Option<(String, String)> {
+    let nom = Path::new(chemin).file_name()?.to_str()?;
+    let dossier = racine_sys.join("block").join(nom).join("device");
+    let lire = |f: &str| std::fs::read_to_string(dossier.join(f)).ok();
+    Some((lire("vendor")?, lire("model")?))
+}
+
+/// Envoie [`CDB_EVEIL_SUPERDRIVE`] à `chemin` par `SG_IO`.
+///
+/// Le noyau ne laisse passer une commande vendeur qu'avec `CAP_SYS_RAWIO` :
+/// c'est le cas du service Tune OS (`User=root`), pas du paquet `.deb`
+/// (`User=tune`), où l'appel rend `EPERM` — l'erreur le dit.
+pub fn eveiller_par_sg_io(chemin: &str) -> Result<(), String> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(chemin)
+        .map_err(|e| format!("{chemin} ne s'ouvre pas : {e}"))?;
+    let mut sense = [0u8; 32];
+    let mut hdr = SgIoHdr {
+        interface_id: b'S' as libc::c_int,
+        dxfer_direction: SG_DXFER_NONE,
+        cmd_len: CDB_EVEIL_SUPERDRIVE.len() as u8,
+        mx_sb_len: sense.len() as u8,
+        iovec_count: 0,
+        dxfer_len: 0,
+        dxferp: std::ptr::null_mut(),
+        cmdp: CDB_EVEIL_SUPERDRIVE.as_ptr(),
+        sbp: sense.as_mut_ptr(),
+        timeout: DELAI_EVEIL_MS,
+        flags: 0,
+        pack_id: 0,
+        usr_ptr: std::ptr::null_mut(),
+        status: 0,
+        masked_status: 0,
+        msg_status: 0,
+        sb_len_wr: 0,
+        host_status: 0,
+        driver_status: 0,
+        resid: 0,
+        duration: 0,
+        info: 0,
+    };
+    // SAFETY: `hdr` est une `sg_io_hdr` valide ; `cmdp` pointe sur une
+    // constante de 7 octets, `sbp` sur `sense` (32 octets), tous deux
+    // vivants le temps de l'appel ; aucun transfert (`SG_DXFER_NONE`).
+    if unsafe { libc::ioctl(f.as_raw_fd(), SG_IO as _, &mut hdr as *mut SgIoHdr) } < 0 {
+        return Err(format!("SG_IO : {}", derniere_erreur()));
+    }
+    if hdr.status != 0 || hdr.host_status != 0 || hdr.driver_status != 0 {
+        return Err(format!(
+            "SG_IO : statut {:#04x}, hôte {:#06x}, pilote {:#06x}",
+            hdr.status, hdr.host_status, hdr.driver_status
+        ));
+    }
+    Ok(())
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -65,14 +187,62 @@ pub struct LecteurLinux {
     /// de secteurs coûterait un `open` 3 fois par seconde). Rouvert après
     /// toute erreur.
     fichier: Mutex<Option<File>>,
+    /// #5729 — où lire `vendor` et `model` (`/sys`).
+    racine_sys: PathBuf,
+    /// #5729 — l'envoi de la commande d'éveil d'un SuperDrive.
+    eveil: Eveil,
 }
 
 impl LecteurLinux {
     pub fn new(chemin: String) -> Self {
+        Self::avec_eveil(chemin, PathBuf::from("/sys"), Box::new(eveiller_par_sg_io))
+    }
+
+    /// Comme [`LecteurLinux::new`], avec la racine sysfs et l'envoi de
+    /// l'éveil fournis (tests, #5729).
+    pub fn avec_eveil(chemin: String, racine_sys: PathBuf, eveil: Eveil) -> Self {
         Self {
             chemin,
             fichier: Mutex::new(None),
+            racine_sys,
+            eveil,
         }
+    }
+
+    /// #5729 — un Apple SuperDrive reçoit sa commande d'éveil, une fois par
+    /// branchement. Un échec est journalisé et n'empêche rien : le lecteur
+    /// reste sondé comme les autres.
+    fn eveiller_si_superdrive(&self) {
+        {
+            let mut faits = LECTEURS_EVEILLES.lock().unwrap_or_else(|e| e.into_inner());
+            if faits.contains(&self.chemin) {
+                return;
+            }
+            faits.push(self.chemin.clone());
+        }
+        let Some((fabricant, modele)) = identite_scsi(&self.racine_sys, &self.chemin) else {
+            return;
+        };
+        if !est_un_superdrive(&fabricant, &modele) {
+            return;
+        }
+        match (self.eveil)(&self.chemin) {
+            Ok(()) => tracing::info!(lecteur = %self.chemin, "cd_superdrive_eveille"),
+            Err(raison) => tracing::warn!(
+                lecteur = %self.chemin,
+                %raison,
+                "cd_superdrive_eveil_refuse : il faut envoyer EA 00 00 00 00 00 01 \
+                 en root (sg_raw, ou règle udev) pour qu'il accepte un disque"
+            ),
+        }
+    }
+
+    /// #5729 — le lecteur a disparu : il sera éveillé de nouveau à son retour.
+    fn oublier_l_eveil(&self) {
+        LECTEURS_EVEILLES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c != &self.chemin);
     }
 
     fn ouvrir(&self) -> std::io::Result<File> {
@@ -142,8 +312,10 @@ impl LecteurDisque for LecteurLinux {
 
     fn presence(&self) -> Presence {
         let Ok(f) = self.ouvrir() else {
+            self.oublier_l_eveil();
             return Presence::AucunLecteur;
         };
+        self.eveiller_si_superdrive();
         // SAFETY: ioctl sans pointeur ; l'argument est un entier.
         let etat = unsafe { libc::ioctl(f.as_raw_fd(), CDROM_DRIVE_STATUS as _, CDSL_CURRENT) };
         if etat == CDS_DISC_OK {
@@ -297,7 +469,116 @@ mod tests {
         {
             assert_eq!(std::mem::offset_of!(CdromReadAudio, buf), 16);
             assert_eq!(std::mem::size_of::<CdromReadAudio>(), 24);
+            // `struct sg_io_hdr` (#5729).
+            assert_eq!(std::mem::offset_of!(SgIoHdr, dxfer_len), 12);
+            assert_eq!(std::mem::offset_of!(SgIoHdr, cmdp), 24);
+            assert_eq!(std::mem::offset_of!(SgIoHdr, timeout), 40);
+            assert_eq!(std::mem::offset_of!(SgIoHdr, usr_ptr), 56);
+            assert_eq!(std::mem::offset_of!(SgIoHdr, status), 64);
+            assert_eq!(std::mem::offset_of!(SgIoHdr, resid), 72);
+            assert_eq!(std::mem::size_of::<SgIoHdr>(), 88);
         }
+    }
+
+    /// #5729 — la commande d'éveil est exactement celle de la règle udev
+    /// (`sg_raw /dev/srN EA 00 00 00 00 00 01`).
+    #[test]
+    fn la_commande_d_eveil_est_celle_de_sg_raw_5729() {
+        assert_eq!(CDB_EVEIL_SUPERDRIVE, [0xEA, 0, 0, 0, 0, 0, 0x01]);
+    }
+
+    /// #5729 — `vendor`/`model` tels que le noyau les écrit (complétés
+    /// d'espaces) ; un autre lecteur Apple ou un Samsung ne sont pas visés.
+    #[test]
+    fn un_superdrive_se_reconnait_a_vendor_et_model_5729() {
+        assert!(est_un_superdrive("Apple   \n", "SuperDrive      \n"));
+        assert!(est_un_superdrive("APPLE", "superdrive"));
+        assert!(!est_un_superdrive("TSSTcorp", "CDDVDW SE-208GB \n"));
+        assert!(!est_un_superdrive("Apple   ", "iPod            "));
+        assert!(!est_un_superdrive("Applet", "SuperDrive"));
+    }
+
+    /// Un faux `/dev/srN` (fichier ordinaire, il s'ouvre) et son sysfs.
+    fn faux_lecteur_5729(
+        nom: &str,
+        fabricant: &str,
+        modele: &str,
+    ) -> (tune_core::test_scratch::ScratchDir, PathBuf, String) {
+        let dossier = tune_core::test_scratch::scratch_dir(nom);
+        let dev = dossier.join("dev").join("sr0");
+        std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        std::fs::write(&dev, b"").unwrap();
+        let device = dossier.join("sys/block/sr0/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), fabricant).unwrap();
+        std::fs::write(device.join("model"), modele).unwrap();
+        let sys = dossier.join("sys");
+        (dossier, sys, dev.to_string_lossy().into_owned())
+    }
+
+    fn compteur_5729() -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, Eveil) {
+        let appels = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let a = appels.clone();
+        (
+            appels,
+            Box::new(move |c: &str| {
+                a.lock().unwrap().push(c.to_string());
+                Ok(())
+            }),
+        )
+    }
+
+    /// #5729 — sonder un SuperDrive lui envoie la commande d'éveil, UNE
+    /// fois, même si la recherche recrée l'objet à chaque sondage.
+    #[test]
+    fn sonder_un_superdrive_l_eveille_une_fois_5729() {
+        let (_d, sys, dev) =
+            faux_lecteur_5729("cd-5729-superdrive", "Apple   \n", "SuperDrive      \n");
+        let (appels, eveil) = compteur_5729();
+        let l = LecteurLinux::avec_eveil(dev.clone(), sys.clone(), eveil);
+        l.presence();
+        l.presence();
+        // La recherche du lecteur branchable crée un objet neuf.
+        let (appels2, eveil2) = compteur_5729();
+        LecteurLinux::avec_eveil(dev.clone(), sys, eveil2).presence();
+        assert_eq!(
+            *appels.lock().unwrap(),
+            [dev.clone()],
+            "#5729 : le SuperDrive doit recevoir sa commande d'éveil au premier sondage, une seule fois"
+        );
+        assert!(
+            appels2.lock().unwrap().is_empty(),
+            "#5729 : éveil renvoyé au même lecteur"
+        );
+        // Débranché puis rebranché : il est éveillé de nouveau.
+        std::fs::remove_file(&dev).unwrap();
+        assert_eq!(l.presence(), Presence::AucunLecteur);
+        std::fs::write(&dev, b"").unwrap();
+        l.presence();
+        assert_eq!(
+            appels.lock().unwrap().len(),
+            2,
+            "#5729 : un SuperDrive rebranché n'est pas éveillé"
+        );
+    }
+
+    /// #5729 — un autre lecteur ne reçoit aucune commande vendeur, et un
+    /// éveil refusé n'empêche pas de sonder.
+    #[test]
+    fn un_autre_lecteur_n_est_pas_eveille_5729() {
+        let (_d2, sys, dev) = faux_lecteur_5729("cd-5729-samsung", "TSSTcorp", "CDDVDW SE-208GB ");
+        let (appels, eveil) = compteur_5729();
+        let l = LecteurLinux::avec_eveil(dev, sys, eveil);
+        assert_eq!(l.presence(), Presence::Vide);
+        assert!(appels.lock().unwrap().is_empty());
+
+        let (_d3, sys, dev) = faux_lecteur_5729("cd-5729-refus", "Apple", "SuperDrive");
+        let l = LecteurLinux::avec_eveil(dev, sys, Box::new(|_| Err("EPERM".into())));
+        assert_eq!(
+            l.presence(),
+            Presence::Vide,
+            "#5729 : un éveil refusé ne doit rien bloquer"
+        );
     }
 
     /// Fil 2135 : TOUS les `srN`, au-delà de `sr3`, dans l'ordre numérique,

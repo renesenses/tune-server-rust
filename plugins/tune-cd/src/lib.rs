@@ -47,6 +47,7 @@ pub mod lecteur;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod memoire;
 pub mod musicbrainz;
 pub mod routes;
 pub mod simule;
@@ -87,6 +88,8 @@ pub struct CdPlugin {
     surveillance: Option<tokio::task::JoinHandle<()>>,
     /// #2466 — pour annuler une extraction en cours au retrait du greffon.
     extractions: Option<Arc<extraction::Extractions>>,
+    /// #6043 — pour rendre la mémoire du disque chargé au retrait.
+    memoire: Option<Arc<memoire::MemoireCd>>,
 }
 
 impl CdPlugin {
@@ -95,6 +98,7 @@ impl CdPlugin {
             services,
             surveillance: None,
             extractions: None,
+            memoire: None,
         }
     }
 }
@@ -137,6 +141,17 @@ impl TunePlugin for CdPlugin {
             self.services.scan.clone(),
         ));
         self.extractions = Some(extractions.clone());
+        // #6043 — « Charger le CD en mémoire » : les réglages rangés, à
+        // défaut ceux que la RAM disponible permet.
+        let reglages =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(self.services.backend.clone());
+        let lu = |cle| reglages.get(cle).ok().flatten();
+        let memoire = Arc::new(memoire::MemoireCd::depuis_reglages_ranges(
+            lu(memoire::CLE_ACTIF).as_deref(),
+            lu(memoire::CLE_PLAFOND_MIO).as_deref(),
+        ));
+        tracing::info!(reglages = ?memoire.reglages(), ram_disponible = ?memoire.ram_disponible(), "cd_memoire_reglages");
+        self.memoire = Some(memoire.clone());
         let etat_routes = routes::EtatRoutes {
             lecteur: lecteur.clone(),
             hote: hote.clone(),
@@ -144,6 +159,8 @@ impl TunePlugin for CdPlugin {
             zones: zones.clone(),
             reveil: reveil.clone(),
             extraction: Some(extractions.clone()),
+            memoire: Some(memoire.clone()),
+            backend: Some(self.services.backend.clone()),
         };
         // #5065 — la source `cd` du registre commun des sources physiques.
         let publication = Arc::new(source::PublicationSource::new(
@@ -157,12 +174,16 @@ impl TunePlugin for CdPlugin {
         match &lecteur {
             Some(l) => {
                 tracing::info!(lecteur = %l.chemin(), "cd_lecteur_surveille");
-                self.services
-                    .orchestrator
-                    .sources_pcm()
-                    .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur: l.clone() }));
+                self.services.orchestrator.sources_pcm().inscrire(
+                    SOURCE,
+                    Arc::new(FournisseurCd {
+                        lecteur: l.clone(),
+                        memoire: Some(memoire.clone()),
+                    }),
+                );
                 let s = Surveillant::new(l.clone(), hote.clone(), zones.clone())
                     .avec_publication(publication)
+                    .avec_memoire(memoire)
                     .avec_reveil(reveil);
                 self.surveillance = Some(tokio::spawn(s.tourner()));
             }
@@ -187,6 +208,10 @@ impl TunePlugin for CdPlugin {
             // Attendue : un tour en vol ne republie pas la source après son
             // retrait.
             let _ = h.await;
+        }
+        // #6043 — le disque chargé rend sa mémoire avec le greffon.
+        if let Some(m) = self.memoire.take() {
+            let _ = tokio::task::spawn_blocking(move || m.liberer()).await;
         }
         self.services
             .orchestrator
@@ -285,7 +310,7 @@ mod bout_en_bout {
         let orch = orchestrateur();
         let lecteur = Arc::new(LecteurSimule::new(toc_du_vecteur()));
         orch.sources_pcm()
-            .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur }));
+            .inscrire(SOURCE, Arc::new(FournisseurCd::direct(lecteur)));
         let zone = zone_avec_la_file(&orch);
         let toc = toc_du_vecteur();
 
@@ -334,7 +359,7 @@ mod bout_en_bout {
         let lecteur = Arc::new(LecteurSimule::new(toc_du_vecteur()));
         lecteur.ejecter_apres(3);
         orch.sources_pcm()
-            .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur }));
+            .inscrire(SOURCE, Arc::new(FournisseurCd::direct(lecteur)));
         let zone = zone_avec_la_file(&orch);
         let r = orch.resolve_queue_item_url(zone, 0).await.unwrap();
         let v = servi(&orch, r.stream_id.as_deref().unwrap()).await;
