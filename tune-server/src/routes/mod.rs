@@ -18,6 +18,8 @@ pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
 mod premium_audio_host;
+/// #6044 — le greffon « Réaffectation des canaux » (`/channel-remap`).
+pub mod reaffectation_canaux;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
@@ -63,7 +65,6 @@ pub mod party;
 pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
-pub mod playlist_transfer;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -463,7 +464,6 @@ pub fn router_with_plugins(
         // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
-        .nest("/playlist-transfer", playlist_transfer::router())
         .nest("/zone-manager", zone_manager::router())
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())
@@ -497,6 +497,8 @@ pub fn router_with_plugins(
         .nest("/eq", eq_pro::router())
         // #4684 — préréglages nommés du crossfeed, sur le modèle de `/eq/presets`.
         .nest("/crossfeed", crossfeed::router())
+        // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
+        .nest("/channel-remap", reaffectation_canaux::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())

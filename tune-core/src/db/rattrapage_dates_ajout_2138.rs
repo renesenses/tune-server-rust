@@ -17,10 +17,11 @@
 //! la retient côté serveur : elle est relue à chaque requête.
 //!
 //! 1. **Détection prudente** ([`mesurer_le_bloc`], [`est_figee`]) : les dates des
-//!    pistes locales sont triées ; le BLOC du premier scan part de la plus
-//!    ancienne et s'étend tant que deux dates successives sont à moins de
-//!    [`ECART_MAX_DANS_LE_BLOC_S`] l'une de l'autre (un scan pose une date par
-//!    lot, sans trou), sans dépasser [`DUREE_MAX_DU_BLOC_S`]. La base est dite
+//!    pistes locales sont triées ; le BLOC du premier scan est la fenêtre de
+//!    [`DUREE_MAX_DU_BLOC_S`] qui porte le PLUS de pistes (fil 2203 : un
+//!    premier scan fait en plusieurs fois, ou quelques pistes datées avant
+//!    lui, coupaient l'ancien bloc, ancré sur la date la plus ancienne et
+//!    fermé au premier trou de dix minutes). La base est dite
 //!    figée si ce bloc porte au moins [`PROPORTION_FIGEE_MIN`] des pistes
 //!    locales (pistes sans ligne `file_first_seen` comprises, au
 //!    dénominateur), et qu'elle en a au moins [`PISTES_MIN`].
@@ -35,6 +36,9 @@
 //!
 //! Le marqueur [`CLE_RATTRAPAGE_DATES_AJOUT_2138`] (`settings`) est posé
 //! dans la même transaction que les corrections : la passe ne se rejoue pas.
+//! Une exception, une seule fois : une base que la passe de la rc3 a dite
+//! « non figée » ([`MARQUEUR_NON_FIGEE_RC3`]) est réexaminée par la détection
+//! du fil 2203, puis marquée [`MARQUEUR_NON_FIGEE`].
 //! Le poser aussi quand la base n'est pas figée est sûr : depuis #5748, un
 //! premier scan ne fige plus rien, une base saine ne peut pas le devenir.
 
@@ -57,15 +61,19 @@ pub const CLE_RATTRAPAGE_DATES_AJOUT_2138: &str = "rattrapage_dates_ajout_premie
 /// l'utilisateur serait un pari.
 pub const PROPORTION_FIGEE_MIN: f64 = 0.80;
 
-/// Écart maximal entre deux dates successives d'un même bloc : « quelques
-/// minutes ». L'ancien scan posait UNE date par lot (`create_batch`), et un
-/// lot se lit en secondes, parfois en minutes sur un partage lent : un trou de
-/// dix minutes signe une autre passe.
-pub const ECART_MAX_DANS_LE_BLOC_S: f64 = 600.0;
-
-/// Durée maximale du bloc : le premier scan d'une très grosse bibliothèque
-/// sur un Raspberry Pi peut durer des heures, jamais des jours.
+/// Largeur de la fenêtre du bloc : le premier scan d'une très grosse
+/// bibliothèque sur un Raspberry Pi peut durer des heures, être interrompu
+/// puis repris, jamais s'étaler sur des jours. Plus de borne sur l'écart
+/// entre deux lots (fil 2203) : un scan arrêté puis relancé trois heures plus
+/// tard reste le premier scan.
 pub const DUREE_MAX_DU_BLOC_S: f64 = 72.0 * 3600.0;
+
+/// Marqueur posé par la passe de la rc3 sur une base dite non figée : sa
+/// détection était trop étroite (fil 2203), la base est réexaminée une fois.
+pub const MARQUEUR_NON_FIGEE_RC3: &str = "non_figee";
+
+/// Marqueur d'une base non figée selon la détection du fil 2203 : définitif.
+pub const MARQUEUR_NON_FIGEE: &str = "non_figee_2203";
 
 /// En dessous, une proportion ne dit rien : la passe ne conclut pas.
 pub const PISTES_MIN: usize = 20;
@@ -102,6 +110,11 @@ pub enum Issue {
 
 /// Le bloc du premier scan : `(debut, fin, nombre)`, mesuré sur `dates`, la
 /// date d'ajout de chaque piste locale qui en a une. `None` sans date valable.
+///
+/// C'est la fenêtre d'au plus [`DUREE_MAX_DU_BLOC_S`] qui porte le plus de
+/// dates (la plus ancienne à égalité) ; `debut` et `fin` sont ses dates
+/// extrêmes. Ni une piste datée bien avant le scan, ni un scan repris après
+/// une pause ne la coupent (fil 2203).
 pub fn mesurer_le_bloc(dates: &[f64]) -> Option<(f64, f64, usize)> {
     let mut triees: Vec<f64> = dates
         .iter()
@@ -109,17 +122,18 @@ pub fn mesurer_le_bloc(dates: &[f64]) -> Option<(f64, f64, usize)> {
         .filter(|d| d.is_finite() && *d > 0.0)
         .collect();
     triees.sort_by(|a, b| a.total_cmp(b));
-    let debut = *triees.first()?;
-    let mut fin = debut;
-    let mut nombre = 0usize;
-    for d in triees {
-        if d - fin > ECART_MAX_DANS_LE_BLOC_S || d - debut > DUREE_MAX_DU_BLOC_S {
-            break;
+    let mut meilleur = (*triees.first()?, *triees.first()?, 0usize);
+    let mut gauche = 0usize;
+    for (droite, &d) in triees.iter().enumerate() {
+        while d - triees[gauche] > DUREE_MAX_DU_BLOC_S {
+            gauche += 1;
         }
-        fin = d;
-        nombre += 1;
+        let nombre = droite + 1 - gauche;
+        if nombre > meilleur.2 {
+            meilleur = (triees[gauche], d, nombre);
+        }
     }
-    Some((debut, fin, nombre))
+    Some(meilleur)
 }
 
 /// La base est-elle figée au premier scan ? `dans_le_bloc` pistes sur
@@ -178,11 +192,18 @@ struct Piste {
     mtime: Option<f64>,
 }
 
+/// La passe est-elle faite ? Oui dès qu'un marqueur est posé, sauf le
+/// « non figée » de la rc3 ([`MARQUEUR_NON_FIGEE_RC3`]), réexaminé une fois.
 fn lire_le_marqueur(db: &Arc<dyn DbBackend>) -> Result<bool, String> {
     let (p1, _, _) = placeholders(db.engine());
     let sql = format!("SELECT value FROM settings WHERE key = {p1}");
     let params: [&dyn ToSqlValue; 1] = [&CLE_RATTRAPAGE_DATES_AJOUT_2138];
-    Ok(db.query_one_strong(&sql, &params)?.is_some())
+    Ok(match db.query_one_strong(&sql, &params)? {
+        None => false,
+        Some(ligne) => {
+            ligne.first().and_then(SqlValue::as_string).as_deref() != Some(MARQUEUR_NON_FIGEE_RC3)
+        }
+    })
 }
 
 /// La passe : détection, corrections et marqueur. Voir la note de module.
@@ -259,7 +280,7 @@ pub fn rattraper_les_dates_d_ajout(db: &Arc<dyn DbBackend>) -> Result<Issue, Str
                 b.laissees + corrections.len().saturating_sub(ecrites),
                 b.absentes
             ),
-            _ => "non_figee".to_string(),
+            _ => MARQUEUR_NON_FIGEE.to_string(),
         };
         let params: [&dyn ToSqlValue; 3] = [&CLE_RATTRAPAGE_DATES_AJOUT_2138, &valeur, &maintenant];
         tx.execute(&marqueur, &params)?;
