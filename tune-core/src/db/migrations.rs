@@ -3398,6 +3398,26 @@ pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_me
      ON track_metadata(key, track_id, value) WHERE key IN ('dr_album', 'dr_track');
      CREATE INDEX IF NOT EXISTS idx_tracks_id_album ON tracks(id, album_id);";
 
+/// #2149 (Sevy Tabroc, 1.0.0-rc3) — une collection intelligente dont la
+/// règle porte sur le GENRE met plus d'une minute à s'ouvrir ; les autres,
+/// presque rien.
+///
+/// Le genre est une colonne de la PISTE (`t.genre`). Les requêtes d'une
+/// collection (`build_album_query` : liste d'albums, comptes d'albums et de
+/// pistes) joignent `tracks` par `idx_tracks_album_id`, qui ne porte pas le
+/// genre : chaque piste de chaque album est relue dans la TABLE, dans le
+/// désordre. Une règle sur l'artiste ou l'album, elle, se contente des index.
+/// Cet index porte le genre à côté de l'album : la jointure devient couvrante
+/// et ne lit plus aucune ligne de piste. Mesuré sur une base de 95 925
+/// pistes (Shrek, cache chaud) : 161 → 42 ms pour la liste, 152 → 24 ms pour
+/// le compte. Sur un disque froid ou une table lourde, l'écart est celui des
+/// lectures de table supprimées.
+///
+/// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
+/// [`DR_ALBUM_INDEX`], pour ne pas prendre de numéro de migration.
+pub(crate) const TRACKS_ALBUM_GENRE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_album_genre ON tracks(album_id, genre)";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -4232,6 +4252,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Table « un album, son DR » (ticket 190) : même passe — voir la constante.
     if let Err(e) = db.execute_batch(DR_ALBUM_INDEX) {
         warn!(error = %e, "sqlite_dr_album_index_failed");
+    }
+    // #2149 — collections à règle de genre : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
+        warn!(error = %e, "sqlite_tracks_album_genre_index_failed");
     }
     // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
     if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {

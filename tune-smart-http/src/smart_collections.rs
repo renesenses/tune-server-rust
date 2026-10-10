@@ -342,11 +342,7 @@ fn calculer_les_comptes(
     let (where_clause, _order, _limit) =
         build_album_query(rules_str, match_mode, sort_by, sort_order, None, ctx);
 
-    let album_count_sql = format!(
-        "SELECT COUNT(DISTINCT al.id) FROM albums al \
-         LEFT JOIN artists ar ON al.artist_id = ar.id \
-         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-    );
+    let album_count_sql = sql_compte_de_collection("al.id", &where_clause);
     let (albums_en_base, albums_de_service) = compte_albums_ventile(
         &*state.backend,
         &album_count_sql,
@@ -369,11 +365,7 @@ fn calculer_les_comptes(
     // disparaît, le nombre d'albums reste.
     let compte_complet = albums_de_service == 0;
     let track_count = if compte_complet {
-        let track_count_sql = format!(
-            "SELECT COUNT(DISTINCT t.id) FROM albums al \
-             LEFT JOIN artists ar ON al.artist_id = ar.id \
-             LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-        );
+        let track_count_sql = sql_compte_de_collection("t.id", &where_clause);
         state
             .backend
             .query_many(&track_count_sql, &[])
@@ -1073,14 +1065,26 @@ pub fn build_album_query(
     (where_clause, order, limit_clause)
 }
 
-/// Execute a smart album query and return album rows as JSON values.
-fn execute_album_query(
-    state: &SmartHttpState,
+/// Le compte `COUNT(DISTINCT {objet})` d'une collection — `al.id` pour ses
+/// albums, `t.id` pour ses pistes — sur la même jointure que
+/// [`sql_albums_de_collection`]. Une seule écriture, pour que l'épreuve du plan
+/// (#2149) lise le SQL que la liste des collections joue.
+pub(crate) fn sql_compte_de_collection(objet: &str, where_clause: &str) -> String {
+    format!(
+        "SELECT COUNT(DISTINCT {objet}) FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    )
+}
+
+/// La liste des albums d'une collection, telle que [`execute_album_query`] la
+/// joue.
+pub(crate) fn sql_albums_de_collection(
     where_clause: &str,
     order: &str,
     limit_clause: &str,
-) -> Result<Vec<Value>, AppError> {
-    let sql = format!(
+) -> String {
+    format!(
         // `al.is_compilation` (#1957) est dans le GROUP BY comme les autres
         // colonnes d'album : PostgreSQL refuse une colonne ni groupée ni
         // agrégée, SQLite l'accepterait. Écrire pour les deux.
@@ -1093,7 +1097,17 @@ fn execute_album_query(
          GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation \
          {} {}",
         where_clause, order, limit_clause
-    );
+    )
+}
+
+/// Execute a smart album query and return album rows as JSON values.
+fn execute_album_query(
+    state: &SmartHttpState,
+    where_clause: &str,
+    order: &str,
+    limit_clause: &str,
+) -> Result<Vec<Value>, AppError> {
+    let sql = sql_albums_de_collection(where_clause, order, limit_clause);
     tracing::debug!(sql = %sql, "smart_collection_album_query");
 
     let rows = state
@@ -2651,5 +2665,107 @@ mod apercu_note_5547 {
         // Le profil 2 n'a noté que Giant Steps.
         let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
         assert_eq!(v["total"], 1, "{v}");
+    }
+}
+
+/// #2149 (Sevy Tabroc, 1.0.0-rc3, 109 152 pistes) — les collections à règle
+/// de GENRE mettent plus d'une minute à s'ouvrir ; les autres s'ouvrent tout
+/// de suite. Le genre est une colonne de piste : sans index qui le porte, la
+/// jointure `tracks` relit chaque ligne de piste dans la table. L'épreuve lit
+/// le plan des TROIS requêtes que joue une collection (liste d'albums, compte
+/// d'albums, compte de pistes), écrites par les mêmes fonctions que la
+/// production, sur une base migrée et analysée.
+///
+/// Contre-épreuve : retirer `TRACKS_ALBUM_GENRE_INDEX` de la passe de
+/// démarrage de `run_migrations` fait tomber
+/// `une_regle_de_genre_ne_lit_que_des_index_2149`.
+#[cfg(test)]
+mod genre_couvrant_2149 {
+    use super::{build_album_query, sql_albums_de_collection, sql_compte_de_collection};
+    use crate::smart_refs::{DbRefResolver, RefCtx};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        let genres = [
+            "Jazz",
+            "Pop-Rock",
+            "Classique",
+            "Électro",
+            "Chanson française",
+        ];
+        let mut sql = String::from("BEGIN;\n");
+        for a in 1..=40 {
+            sql.push_str(&format!(
+                "INSERT INTO artists (id, name) VALUES ({a}, 'Artiste {a}');\n"
+            ));
+        }
+        let mut tid = 0;
+        for al in 1..=400 {
+            sql.push_str(&format!(
+                "INSERT INTO albums (id, title, artist_id) VALUES ({al}, 'Album {al}', {});\n",
+                al % 40 + 1
+            ));
+            for n in 1..=9 {
+                tid += 1;
+                sql.push_str(&format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, \
+                     track_number, file_path, format, genre) VALUES ({tid}, 'Piste {n}', \
+                     {al}, {}, 1, {n}, '/m/{al}/{n}.flac', 'flac', '{}');\n",
+                    al % 40 + 1,
+                    genres[al as usize % genres.len()]
+                ));
+            }
+        }
+        sql.push_str("COMMIT;\nANALYZE;\n");
+        db.execute_batch(&sql).expect("remplissage");
+        Arc::new(db)
+    }
+
+    fn plan(db: &Arc<dyn DbBackend>, sql: &str) -> String {
+        db.query_many(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
+            .expect("plan")
+            .iter()
+            .map(|r| r.last().and_then(|v| v.as_string()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn une_regle_de_genre_ne_lit_que_des_index_2149() {
+        let db = base();
+        let resolver = DbRefResolver::new(&db);
+        let ctx = RefCtx::root(&resolver, Some(1));
+        for regle in [
+            r#"[{"field":"genre","op":"=","value":"Jazz"}]"#,
+            r#"[{"field":"genre","op":"contains","value":"jazz"}]"#,
+        ] {
+            let (where_clause, order, limit) =
+                build_album_query(regle, "all", "title", "asc", None, &ctx);
+            for (quoi, sql) in [
+                (
+                    "liste",
+                    sql_albums_de_collection(&where_clause, &order, &limit),
+                ),
+                ("albums", sql_compte_de_collection("al.id", &where_clause)),
+                ("pistes", sql_compte_de_collection("t.id", &where_clause)),
+            ] {
+                let p = plan(&db, &sql);
+                assert!(
+                    p.contains("COVERING INDEX idx_tracks_album_genre"),
+                    "#2149 : {quoi} de la collection {regle} relit les pistes dans la \
+                     table au lieu de l'index (album, genre) : {p}"
+                );
+            }
+            let n = db
+                .query_many(&sql_compte_de_collection("al.id", &where_clause), &[])
+                .expect("compte")[0][0]
+                .as_i64();
+            assert_eq!(n, Some(80), "le compte ne change pas : {regle}");
+        }
     }
 }
