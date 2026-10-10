@@ -3035,6 +3035,11 @@ impl StreamingService for QobuzService {
         ))
     }
 
+    /// #5997 — favoris en miroir : la vérité est chez le service.
+    fn favoris_miroir(&self) -> bool {
+        true
+    }
+
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         if fav_type == TYPE_FAVORI_PLAYLISTS {
             return self

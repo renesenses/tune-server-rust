@@ -23,6 +23,9 @@ pub mod decode;
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
 pub mod dff;
+/// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
+/// DFF) et le routage par position vers la sortie.
+pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;
@@ -57,6 +60,9 @@ pub mod faststart;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
 pub mod flac_vendeur;
+/// #2211 — le réglage de fondu d'une zone et la consigne de chaque frontière
+/// (même album, live, DSD) que l'orchestrateur remet à la sortie locale.
+pub mod fondu_de_zone;
 /// Le fondu enchaîné qui superpose vraiment deux pistes (#2211) — deux flux
 /// `f32` décodés, une enveloppe par échantillon, un seul puits. Aucun volume
 /// de sortie n'est touché : c'est tout le sujet du ticket.
@@ -94,6 +100,9 @@ pub mod pcm_teneur;
 /// `test` de la CI, qui ne compile pas `local-audio`.
 pub mod periode_alsa;
 pub mod pipeline;
+/// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
+/// album, résolution de la règle qui s'applique à une piste.
+pub mod reaffectation_canaux;
 pub mod replaygain;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).

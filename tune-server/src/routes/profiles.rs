@@ -94,6 +94,10 @@ struct StreamingFavoriteAdd {
     /// rien n'est posé.
     #[serde(default, alias = "album_ai_generated")]
     ai_generated: Option<bool>,
+    /// #5997 — l'ISRC d'une piste, quand le client le connaît : il resserre
+    /// le rapprochement avec la bibliothèque locale (forum #2127).
+    #[serde(default)]
+    isrc: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +193,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{id}/favorites/streaming/reorder",
             post(reorder_streaming_favorites),
+        )
+        // État du miroir des favoris de service (#5997).
+        .route(
+            "/{id}/favorites/streaming/miroir",
+            get(etat_miroir_streaming_favorites),
         )
         // Favoris de facette (label, et demain genre/format/année) — #2442.
         .route("/{id}/favorites/facets", get(list_facet_favorites))
@@ -482,13 +491,164 @@ async fn list_streaming_favorites(
     if let Err(r) = profil_du_chemin_ou_404(id, profil) {
         return r;
     }
+    // #5997 — l'ouverture des Favoris rafraîchit les services en miroir dont
+    // le cache court est périmé, puis donne à ce profil les favoris communs
+    // qu'il n'a pas encore. La réponse reste un TABLEAU : un ancien client
+    // obtient le miroir sans rien changer.
+    let miroirs = services_en_miroir(&state).await;
+    rafraichir_les_miroirs(&state, &miroirs, id, false, ATTENTE_RAFRAICHISSEMENT_LISTE).await;
+    let noms: Vec<String> = miroirs.iter().map(|(n, _)| n.clone()).collect();
+    if let Err(e) =
+        tune_core::streaming::favorites_mirror::aligner_profil(&state.backend, id, &noms)
+    {
+        tracing::warn!(profile_id = id, erreur = %e, "favoris_miroir_alignement_impossible");
+    }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     let items = match TriFavoris::depuis(q.sort.as_deref(), q.order.as_deref()) {
         Some(tri) => repo.list_sorted(id, q.item_type.as_deref(), tri),
         None => repo.list(id, q.item_type.as_deref()),
     }
     .unwrap_or_default();
-    Json(json!(items)).into_response()
+    let mut reponse = Json(json!(items)).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(statut_des_miroirs(&noms)) {
+        reponse.headers_mut().insert("x-tune-favoris-miroir", v);
+    }
+    reponse
+}
+
+/// Ce que l'ouverture des Favoris attend du rafraîchissement, au plus. Au-delà
+/// la liste part avec ce qu'elle a ; le rafraîchissement continue en fond et
+/// la lecture suivante le verra.
+const ATTENTE_RAFRAICHISSEMENT_LISTE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Les services du registre dont les favoris sont tenus en miroir (#5997),
+/// connectés ou non : un service déconnecté peut porter des écritures en
+/// attente, et ses favoris restent communs à tous les profils.
+pub(crate) async fn services_en_miroir(
+    state: &AppState,
+) -> Vec<(String, tune_core::streaming::favorites_mirror::ServiceArc)> {
+    let arcs: Vec<(String, tune_core::streaming::favorites_mirror::ServiceArc)> = {
+        let registre = state.services.lock().await;
+        registre
+            .list()
+            .into_iter()
+            .filter_map(|nom| registre.get(&nom).map(|arc| (nom, arc)))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (nom, arc) in arcs {
+        if arc.read().await.favoris_miroir() {
+            out.push((nom, arc));
+        }
+    }
+    out
+}
+
+/// Le service nommé, s'il est en miroir ET connecté.
+///
+/// Un service en miroir mais DÉCONNECTÉ (jamais configuré, session fermée)
+/// garde le chemin d'avant : favori propre au profil, `201 {"ok":true}`. Rien
+/// ne se perd pour autant : la ligne naît `miroir_etat` NULL, et le premier
+/// rafraîchissement après la connexion l'adopte et la pousse au service.
+/// Une PANNE d'un service connecté, elle, passe par le miroir et rend 202.
+async fn service_en_miroir(
+    state: &AppState,
+    service: &str,
+) -> Option<tune_core::streaming::favorites_mirror::ServiceArc> {
+    let arc = state.services.lock().await.get(service)?;
+    let pret = {
+        let svc = arc.read().await;
+        svc.favoris_miroir() && svc.utilisable().await
+    };
+    pret.then_some(arc)
+}
+
+/// Rafraîchit les miroirs (périmés, ou tous si `forcer`) dans une tâche à
+/// part, attendue au plus `attente`. Rend les bilans des passages faits.
+pub(crate) async fn rafraichir_les_miroirs(
+    state: &AppState,
+    miroirs: &[(String, tune_core::streaming::favorites_mirror::ServiceArc)],
+    profile_id: i64,
+    forcer: bool,
+    attente: std::time::Duration,
+) -> serde_json::Map<String, Value> {
+    if miroirs.is_empty() {
+        return serde_json::Map::new();
+    }
+    let miroirs = miroirs.to_vec();
+    let backend = state.backend.clone();
+    let tache = tokio::spawn(async move {
+        let mut bilans = serde_json::Map::new();
+        for (nom, arc) in miroirs {
+            if let Some(b) = tune_core::streaming::favorites_mirror::rafraichir_si_perime(
+                &arc, &backend, profile_id, forcer,
+            )
+            .await
+            {
+                tune_streaming_http::purge_contenu_utilisateur(&nom);
+                bilans.insert(nom, json!(b));
+            }
+        }
+        bilans
+    });
+    match tokio::time::timeout(attente, tache).await {
+        Ok(Ok(bilans)) => bilans,
+        Ok(Err(e)) => {
+            tracing::warn!(erreur = %e, "favoris_miroir_tache_interrompue");
+            serde_json::Map::new()
+        }
+        Err(_) => {
+            tracing::info!(
+                profile_id,
+                "favoris_miroir_rafraichissement_continue_en_fond"
+            );
+            serde_json::Map::new()
+        }
+    }
+}
+
+/// L'en-tête `X-Tune-Favoris-Miroir` : `aucun`, `echec`, `en_attente` ou `ok`.
+fn statut_des_miroirs(noms: &[String]) -> &'static str {
+    if noms.is_empty() {
+        return "aucun";
+    }
+    let etats: Vec<_> = noms
+        .iter()
+        .map(|n| tune_core::streaming::favorites_mirror::etat(n))
+        .collect();
+    if etats.iter().any(|e| e.statut == "echec") {
+        "echec"
+    } else if etats.iter().any(|e| e.en_attente > 0) {
+        "en_attente"
+    } else {
+        "ok"
+    }
+}
+
+/// `GET /profiles/{id}/favorites/streaming/miroir` — l'état du miroir de
+/// chaque service (#5997) : dernier rafraîchissement, statut, motif, nombre
+/// d'écritures en attente. De quoi dire « Qobuz n'a pas suivi ».
+async fn etat_miroir_streaming_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    profil: ActiveProfile,
+) -> Response {
+    if let Err(r) = profil_du_chemin_ou_404(id, profil) {
+        return r;
+    }
+    use tune_core::streaming::favorites_mirror as miroir;
+    let mut services = serde_json::Map::new();
+    for (nom, _) in services_en_miroir(&state).await {
+        let mut etat = miroir::etat(&nom);
+        etat.en_attente = miroir::compter_en_attente(&state.backend, &nom);
+        services.insert(nom, json!(etat));
+    }
+    Json(json!({
+        "ttl_s": miroir::ttl().as_secs(),
+        "periode_s": miroir::periode().map(|p| p.as_secs()).unwrap_or(0),
+        "services": services,
+    }))
+    .into_response()
 }
 
 async fn add_streaming_favorite(
@@ -499,6 +659,43 @@ async fn add_streaming_favorite(
 ) -> impl IntoResponse {
     if let Err(r) = profil_du_chemin_ou_404(id, profil) {
         return r;
+    }
+    // #5997 — service en miroir : le serveur ajoute CHEZ le service, puis
+    // pose le favori pour tous les profils. Un échec chez le service ne perd
+    // rien (ligne en attente, retentée) et le dit (202 + motif).
+    if let Some(arc) = service_en_miroir(&state, &body.service).await {
+        let fav = tune_core::streaming::favorites_mirror::FavoriMiroir {
+            item_type: body.item_type.clone(),
+            service_id: body.service_id.clone(),
+            title: body.title.clone(),
+            artist: body.artist.clone(),
+            album: body.album.clone(),
+            cover_url: body.cover_url.clone(),
+            ai_generated: body.ai_generated,
+            isrc: body.isrc.clone(),
+            created_at: None,
+        };
+        return match tune_core::streaming::favorites_mirror::ajouter(&arc, &state.backend, id, &fav)
+            .await
+        {
+            Ok(p) => {
+                tune_streaming_http::purge_contenu_utilisateur(&body.service);
+                let statut = match p {
+                    tune_core::streaming::favorites_mirror::Propagation::Propage => {
+                        StatusCode::CREATED
+                    }
+                    _ => StatusCode::ACCEPTED,
+                };
+                (
+                    statut,
+                    Json(json!({"ok": true, "miroir": p.en_json(&body.service)})),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            }
+        };
     }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.add(
@@ -533,6 +730,34 @@ async fn remove_streaming_favorite(
 ) -> impl IntoResponse {
     if let Err(r) = profil_du_chemin_ou_404(id, profil) {
         return r;
+    }
+    // #5997 — service en miroir : retrait CHEZ le service, puis de tous les
+    // profils ; si le service ne suit pas, le favori est masqué et retenté.
+    if let Some(arc) = service_en_miroir(&state, &body.service).await {
+        return match tune_core::streaming::favorites_mirror::retirer(
+            &arc,
+            &state.backend,
+            &body.item_type,
+            &body.service_id,
+        )
+        .await
+        {
+            Ok(p) => {
+                tune_streaming_http::purge_contenu_utilisateur(&body.service);
+                let statut = match p {
+                    tune_core::streaming::favorites_mirror::Propagation::Propage => StatusCode::OK,
+                    _ => StatusCode::ACCEPTED,
+                };
+                (
+                    statut,
+                    Json(json!({"ok": true, "miroir": p.en_json(&body.service)})),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            }
+        };
     }
     let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
     match repo.remove(id, &body.item_type, &body.service, &body.service_id) {
@@ -602,9 +827,17 @@ pub(crate) async fn reprendre_les_favoris(
     };
 
     let mut comptes = serde_json::Map::new();
+    let mut miroirs = Vec::new();
     for (nom, arc) in arcs {
         let svc = arc.read().await;
         if !svc.utilisable().await {
+            continue;
+        }
+        // #5997 — un service en miroir fait le rafraîchissement complet
+        // (ajouts ET retraits, écritures en attente poussées), plus bas.
+        if svc.favoris_miroir() {
+            drop(svc);
+            miroirs.push((nom, arc));
             continue;
         }
         let stats = tune_core::streaming::favorites_import::reprendre_les_favoris_du_service(
@@ -615,6 +848,18 @@ pub(crate) async fn reprendre_les_favoris(
         .await;
         comptes.insert(nom, json!(stats));
     }
+    // Forcé, et attendu sans borne courte : c'est une demande explicite (route
+    // `sync`) ou le passage de démarrage, pas l'ouverture d'un écran.
+    comptes.extend(
+        rafraichir_les_miroirs(
+            state,
+            &miroirs,
+            profile_id,
+            true,
+            std::time::Duration::from_secs(120),
+        )
+        .await,
+    );
     Value::Object(comptes)
 }
 

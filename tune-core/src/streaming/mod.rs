@@ -5,6 +5,7 @@ pub mod deezer_decrypt;
 pub mod favorites_date;
 pub mod favorites_identity;
 pub mod favorites_import;
+pub mod favorites_mirror;
 pub mod matching;
 pub mod podcasts;
 pub mod qobuz;
@@ -20,6 +21,7 @@ pub mod traits;
 /// La vignette d'un podcast mise en cache à l'abonnement (#5214).
 pub mod vignette_podcast;
 pub mod youtube;
+pub mod youtube_decouverte;
 
 pub use registry::ServiceRegistry;
 pub use traits::*;
