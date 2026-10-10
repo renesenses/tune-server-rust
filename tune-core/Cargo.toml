@@ -11,6 +11,7 @@ tune-plugin-sdk = { path = "../sdk/tune-plugin-sdk" }
 tune-plugin-audio-support = { path = "../sdk/tune-plugin-audio-support" }
 tune-plugin-equalizer = { path = "../sdk/tune-plugin-equalizer" }
 tune-plugin-crossfeed = { path = "../sdk/tune-plugin-crossfeed" }
+tune-plugin-channel-remap = { path = "../sdk/tune-plugin-channel-remap" }
 # Temporary streaming downloads must be removed on cancellation (#4234).
 tempfile = "3"
 tune-output-api = { path = "../tune-output-api" }
@@ -617,6 +618,12 @@ path = "tests/journal_perte_flac_2218.rs"
 [[test]]
 name = "fondu_enchaine_superpose_deux_pistes_2211"
 path = "tests/fondu_enchaine_superpose_deux_pistes_2211.rs"
+# #2211 — le raccordement du fondu à la sortie locale : le puits de fondu,
+# la règle de frontière (PURE, strict, DoP, live, sans blanc) et le banc de
+# l'enveloppe sur des échantillons. Sans cible `[[test]]`, jamais compilé.
+[[test]]
+name = "fondu_enchaine_sortie_locale_2211"
+path = "tests/fondu_enchaine_sortie_locale_2211.rs"
 # #4023 — HQPlayer natif : le `Play` qui suivait le `PlaylistAdd` n'arrivait
 # jamais. Le témoin monte un faux HQPlayer sur une socket locale et lit les
 # octets réellement écrits par un `play_media` : une SEULE déclaration XML par
@@ -724,3 +731,10 @@ required-features = ["audio-embedding"]
 [[test]]
 name = "wav24_chaine_progressive_b209bf"
 path = "tests/wav24_chaine_progressive_b209bf.rs"
+
+# #4770 — le dossier de travail des scripts d'image (témoin shell joué depuis
+# Rust). `autotests = false` : sans cette cible, le fichier ne serait jamais
+# compilé.
+[[test]]
+name = "scripts_image_dossier_de_travail_4770"
+path = "tests/scripts_image_dossier_de_travail_4770.rs"

@@ -225,6 +225,7 @@ async fn un_titre_deja_en_file_ne_relit_pas_son_album() {
                 track_number: None,
                 disc_number: None,
                 album_ref: None,
+                artist_ref: None,
             }],
         )
         .unwrap();

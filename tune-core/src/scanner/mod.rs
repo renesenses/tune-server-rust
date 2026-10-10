@@ -10,6 +10,38 @@ pub mod quality;
 pub mod walker;
 pub mod watcher;
 
+/// Corbeilles et dossiers système que pose un NAS, Windows ou macOS, en
+/// minuscules : la comparaison ignore la casse (le vrai nom Windows est
+/// `$Recycle.Bin`, Samba écrit `.recycle`, Synology `#recycle`).
+const DOSSIERS_SYSTEME: &[&str] = &[
+    ".recycle",
+    "#recycle",
+    "@eadir",
+    "$recycle.bin",
+    "system volume information",
+    ".spotlight-v100",
+    ".ds_store",
+];
+
+/// Fil forum 2207 — un dossier de ce nom est une corbeille ou un dossier
+/// système, jamais de la musique : le scan, le surveillant et l'estimation
+/// n'y entrent pas. Tout nom commençant par `.Trash` (`.Trash`, `.Trashes`,
+/// `.Trash-1000`) en est aussi. Casse ignorée.
+///
+/// Seule liste de ces noms : le parcours du scan, le surveillant, la sonde
+/// réseau, l'estimation et l'explorateur de dossiers l'appellent tous.
+pub fn dossier_systeme_ignore(nom: &str) -> bool {
+    let nom = nom.to_lowercase();
+    nom.starts_with(".trash") || DOSSIERS_SYSTEME.contains(&nom.as_str())
+}
+
+/// Un des dossiers de `chemin` (lui compris) est-il un
+/// [`dossier_systeme_ignore`] ? Les deux séparateurs sont reconnus : un
+/// chemin Windows stocké en base se lit aussi sous Linux.
+pub fn chemin_sous_un_dossier_systeme(chemin: &str) -> bool {
+    chemin.split(['/', '\\']).any(dossier_systeme_ignore)
+}
+
 /// Tune's own streaming/prefetch temp files (written to the system temp dir
 /// during transcodes) must never be indexed as library tracks, even when the
 /// configured music folder is a parent of the temp dir (e.g. the whole user
@@ -20,6 +52,13 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
         None => return false,
     };
     if name.starts_with("tune-stream-") || name.starts_with("tune-prefetch-") {
+        return true;
+    }
+    // #4770 : le cache de transcodage vit désormais sous le dossier de
+    // données, hors du dossier temporaire. Une bibliothèque qui englobe ce
+    // dossier (tout un profil utilisateur sous Windows) ne doit pas en faire
+    // des pistes fantômes : on le reconnaît à son préfixe, où qu'il soit.
+    if name.starts_with("tune-tcache-") {
         return true;
     }
     // La copie de travail de « Écrire dans les fichiers » (édition d'album,
@@ -33,9 +72,52 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
 }
 
 #[cfg(test)]
+mod dossiers_systeme_tests_2207 {
+    use super::{chemin_sous_un_dossier_systeme, dossier_systeme_ignore};
+
+    #[test]
+    fn les_corbeilles_se_reconnaissent_sans_tenir_compte_de_la_casse_2207() {
+        for nom in [
+            ".recycle",
+            ".Recycle",
+            "#recycle",
+            "@eaDir",
+            "@EADIR",
+            ".Trash",
+            ".Trashes",
+            ".Trash-1000",
+            "$RECYCLE.BIN",
+            "$Recycle.Bin",
+            "System Volume Information",
+        ] {
+            assert!(dossier_systeme_ignore(nom), "{nom}");
+        }
+        for nom in ["Recycle", "Trash Metal", "recycled", "Album", "duplicates"] {
+            assert!(!dossier_systeme_ignore(nom), "{nom}");
+        }
+        assert!(chemin_sous_un_dossier_systeme(
+            "/mnt/nas/Musique/.recycle/Album/01.flac"
+        ));
+        assert!(chemin_sous_un_dossier_systeme(
+            r"D:\Musique\$Recycle.Bin\S-1-5\01.flac"
+        ));
+        assert!(!chemin_sous_un_dossier_systeme(
+            "/mnt/nas/Musique/Recycle/01.flac"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tune_temp_file_tests {
     use super::is_tune_temp_file;
     use std::path::Path;
+
+    #[test]
+    fn un_rendu_du_cache_de_transcodage_n_est_jamais_une_piste_4770() {
+        assert!(is_tune_temp_file(Path::new(
+            "/home/moi/Tune/cache/transcodage/tune-tcache-0123abcd.flac"
+        )));
+    }
 
     #[test]
     fn matches_stream_and_prefetch_names_anywhere() {

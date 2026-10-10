@@ -912,6 +912,14 @@ path = "tests/album_de_la_file_fil2143.rs"
 name = "artiste_de_la_file_fil2143"
 path = "tests/artiste_de_la_file_fil2143.rs"
 
+# #6079 (FabienM) — les identifiants de SERVICE d'un titre de la file :
+# `album_id_service` et `artist_id_service` sur `GET /zones/{id}/queue` pour un
+# titre Qobuz ou Tidal mis seul en file, en lot, ou lu dans son album.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "identifiants_de_service_en_file_6079"
+path = "tests/identifiants_de_service_en_file_6079.rs"
+
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
 # des services simulés. `autotests = false` plus haut : sans cette cible, le
@@ -1536,6 +1544,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# #5997 — les routes de favoris de service passent par le miroir du service.
+[[test]]
+name = "favoris_miroir_routes_5997"
+path = "tests/favoris_miroir_routes_5997.rs"
 
 # #4805 — les crédits MusicBrainz lus juste après l'identification d'un album
 # (doublure MusicBrainz locale). `autotests = false` : sans cette cible, jamais

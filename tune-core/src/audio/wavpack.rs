@@ -20,9 +20,14 @@ use super::decode::DecodedAudio;
 
 const WAVPACK_MAGIC: [u8; 4] = *b"wvpk";
 
-const SAMPLE_RATES: [u32; 16] = [
+// 🔴 QUINZE cadences, pas seize (`sample_rates[]` de WavPack 5.6.0) :
+// l'indice 14 vaut 192 000 et l'indice 15 signale une cadence hors table,
+// portée par le sous-bloc `ID_SAMPLE_RATE`. La table d'origine glissait
+// 176 400 en 14 : tout WavPack 192 kHz était annoncé et joué à 176,4 kHz
+// (#6060, fil 2171).
+const SAMPLE_RATES: [u32; 15] = [
     6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
-    176400, 192000,
+    192000,
 ];
 
 // Flag bit masks
@@ -44,6 +49,10 @@ const FLAG_DSD: u32 = 0x8000_0000;
 const FLAG_INITIAL_BLOCK: u32 = 1 << 11;
 const FLAG_FINAL_BLOCK: u32 = 1 << 12;
 const _FLAG_EXTENDED_INT: u32 = 1 << 8;
+// `FLOAT_DATA` (bit 7) : échantillons IEEE 754 32 bits, décrits par le
+// sous-bloc `ID_FLOAT_INFO`. Sans lui, les mantisses sortaient comme des
+// entiers lus sur 2^31 — un signal vers −140 dB (#6060).
+const FLAG_FLOAT_DATA: u32 = 0x80;
 // 🔴 SHIFT_MASK vaut `0x1f << 13` dans le format (cinq bits, décalage de 0 à
 // 31). Le masque de DEUX bits utilisé jusqu'ici tronquait tout décalage ≥ 4 :
 // un 24 bits stocké en 20 bits + shift 4 sortait 16 fois trop bas.
@@ -58,6 +67,13 @@ const SUB_ENTROPY_VARS: u8 = 0x05;
 const SUB_BITSTREAM: u8 = 0x0A;
 const SUB_WVX_BITSTREAM: u8 = 0x0C;
 const SUB_INT32_INFO: u8 = 0x09;
+const SUB_FLOAT_INFO: u8 = 0x08;
+// Drapeaux de `ID_FLOAT_INFO` (octet 0), `include/wavpack.h` 5.6.0.
+const FLOAT_SHIFT_ONES: u8 = 1;
+const FLOAT_SHIFT_SAME: u8 = 2;
+const FLOAT_SHIFT_SENT: u8 = 4;
+const FLOAT_ZEROS_SENT: u8 = 8;
+const FLOAT_NEG_ZEROS: u8 = 0x10;
 const SUB_CHANNEL_INFO: u8 = 0x0D;
 const SUB_SAMPLE_RATE: u8 = 0x27; // non-standard rate (ID with ODD flag = 0x07 | 0x20)
 
@@ -138,13 +154,14 @@ impl BlockHeader {
     }
 
     fn sample_rate(&self) -> u32 {
-        let idx = self.sample_rate_index();
-        if idx == 15 {
-            // 15 = unknown / stored in metadata sub-block
-            0
-        } else {
-            SAMPLE_RATES[idx]
-        }
+        // 15 = cadence hors table, portée par le sous-bloc `ID_SAMPLE_RATE`.
+        SAMPLE_RATES
+            .get(self.sample_rate_index())
+            .copied()
+            .unwrap_or(0)
+    }
+    fn is_float(&self) -> bool {
+        self.flags & FLAG_FLOAT_DATA != 0
     }
 
     #[cfg(test)]
@@ -1054,6 +1071,7 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
     let mut bitstream_data: &[u8] = &[];
     let mut wvx_data: Option<&[u8]> = None;
     let mut int32_info: Option<(u8, u8, u8, u8)> = None;
+    let mut float_info: Option<FloatInfo> = None;
 
     let is_mono = header.is_mono_data();
 
@@ -1099,6 +1117,16 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
             SUB_INT32_INFO => {
                 if sub.data.len() >= 4 {
                     int32_info = Some((sub.data[0], sub.data[1], sub.data[2], sub.data[3]));
+                }
+            }
+            SUB_FLOAT_INFO => {
+                if sub.data.len() >= 4 {
+                    float_info = Some(FloatInfo {
+                        flags: sub.data[0],
+                        shift: sub.data[1] as u32,
+                        max_exp: sub.data[2] as i32,
+                        norm_exp: sub.data[3] as i32,
+                    });
                 }
             }
             id if id == SUB_BITSTREAM => {
@@ -1186,6 +1214,28 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
         return Err(format!("bitstream overrun at block {}", header.block_index));
     }
 
+    // `fixup_samples` : un bloc flottant ne passe NI par `INT32_INFO` NI par
+    // le décalage de l'en-tête — `float_values` reconstruit chaque IEEE 754.
+    if header.is_float() {
+        let info = float_info.ok_or_else(|| {
+            format!(
+                "float block without ID_FLOAT_INFO at index {}",
+                header.block_index
+            )
+        })?;
+        let mut xbs = wvx_data.map(BitstreamReader::new);
+        for s in buffer.iter_mut() {
+            let f = float_value(*s, &info, xbs.as_mut());
+            *s = float_to_i32(normaliser_flottant(f, info.norm_exp));
+        }
+        if xbs.is_some_and(|x| x.overrun) {
+            return Err(format!(
+                "wvx bitstream overrun at block {}",
+                header.block_index
+            ));
+        }
+        return Ok(desentrelacer(header, buffer, num_samples, is_mono));
+    }
     // `fixup_samples` : bits supplémentaires, puis décalage final.
     let mut shift = header.left_shift();
 
@@ -1234,7 +1284,15 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
         }
     }
 
-    // Désentrelacement.
+    Ok(desentrelacer(header, buffer, num_samples, is_mono))
+}
+/// Désentrelacement d'un bloc décodé.
+fn desentrelacer(
+    header: &BlockHeader,
+    buffer: Vec<i32>,
+    num_samples: usize,
+    is_mono: bool,
+) -> DecodedBlock {
     let (left, right) = if is_mono {
         // `FALSE_STEREO` : bloc mono à restituer en stéréo identique.
         let right = if header.is_false_stereo() {
@@ -1252,8 +1310,123 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
         }
         (left, right)
     };
-
-    Ok(DecodedBlock { left, right })
+    DecodedBlock { left, right }
+}
+/// Contenu de `ID_FLOAT_INFO`.
+#[derive(Debug, Clone, Copy)]
+struct FloatInfo {
+    flags: u8,
+    shift: u32,
+    max_exp: i32,
+    norm_exp: i32,
+}
+/// Assemble un IEEE 754 simple précision à partir de ses trois champs.
+#[inline]
+fn assembler_f32(signe: bool, exposant: i32, mantisse: u32) -> f32 {
+    f32::from_bits(
+        ((signe as u32) << 31) | (((exposant as u32) & 0xff) << 23) | (mantisse & 0x7f_ffff),
+    )
+}
+/// `float_values` / `float_values_nowvx` de `float.c` (WavPack 5.6.0) pour
+/// UN échantillon : l'entier décodé porte une mantisse sur 24 bits alignée
+/// sur `max_exp` ; le flux WVX, s'il existe, rend les bits que l'encodeur a
+/// sortis du flux principal (bits de mantisse, zéros signés, exposants).
+fn float_value(valeur: i32, info: &FloatInfo, wvx: Option<&mut BitstreamReader>) -> f32 {
+    let mut exp = info.max_exp;
+    let Some(x) = wvx else {
+        if valeur == 0 {
+            return 0.0;
+        }
+        let mut v = valeur.wrapping_shl(info.shift);
+        let signe = v < 0;
+        if signe {
+            v = v.wrapping_neg();
+        }
+        if v >= 0x100_0000 {
+            while v & 0xf00_0000 != 0 {
+                v >>= 1;
+                exp += 1;
+            }
+        } else if exp != 0 {
+            let mut decalage = 0u32;
+            while v & 0x80_0000 == 0 {
+                exp -= 1;
+                if exp == 0 {
+                    break;
+                }
+                decalage += 1;
+                v <<= 1;
+            }
+            if decalage != 0 && info.flags & FLOAT_SHIFT_ONES != 0 {
+                v |= ((1u32 << decalage.min(31)) - 1) as i32;
+            }
+        }
+        return assembler_f32(signe, exp, v as u32);
+    };
+    if valeur == 0 {
+        if info.flags & FLOAT_ZEROS_SENT != 0 {
+            if x.getbit() != 0 {
+                let mantisse = x.getbits(23);
+                let exposant = if exp >= 25 { x.getbits(8) as i32 } else { 0 };
+                let signe = x.getbit() != 0;
+                return assembler_f32(signe, exposant, mantisse);
+            } else if info.flags & FLOAT_NEG_ZEROS != 0 {
+                return assembler_f32(x.getbit() != 0, 0, 0);
+            }
+        }
+        return 0.0;
+    }
+    let mut v = valeur.wrapping_shl(info.shift);
+    let signe = v < 0;
+    if signe {
+        v = v.wrapping_neg();
+    }
+    if v == 0x100_0000 {
+        let mantisse = if x.getbit() != 0 { x.getbits(23) } else { 0 };
+        return assembler_f32(signe, 255, mantisse);
+    }
+    let mut decalage = 0u32;
+    if exp != 0 {
+        while v & 0x80_0000 == 0 {
+            exp -= 1;
+            if exp == 0 {
+                break;
+            }
+            decalage += 1;
+            v <<= 1;
+        }
+    }
+    if decalage != 0 {
+        let masque = (1u32 << decalage.min(31)) - 1;
+        if info.flags & FLOAT_SHIFT_ONES != 0
+            || (info.flags & FLOAT_SHIFT_SAME != 0 && x.getbit() != 0)
+        {
+            v |= masque as i32;
+        } else if info.flags & FLOAT_SHIFT_SENT != 0 {
+            v |= (x.getbits(decalage) & masque) as i32;
+        }
+    }
+    assembler_f32(signe, exp, v as u32)
+}
+/// `float_norm_exp` vaut 127 pour un flottant normalisé à ±1,0 (cas d'un WAV
+/// IEEE). Un autre exposant de normalisation (±32 768, par exemple) se
+/// ramène à ±1,0 avant la conversion entière.
+fn normaliser_flottant(f: f32, norm_exp: i32) -> f64 {
+    let f = f as f64;
+    if norm_exp == 127 || norm_exp == 0 {
+        f
+    } else {
+        f * 2f64.powi(127 - norm_exp)
+    }
+}
+/// Même règle que l'AIFF flottant : ±1,0 ↦ ±2^31, arrondi au plus proche.
+fn float_to_i32(sample: f64) -> i32 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    (sample.clamp(-1.0, 1.0) * 2_147_483_648.0)
+        .round()
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
 /// Bits de poids faible reconstitués (`zeros` / `ones` / `dups`).
@@ -1471,10 +1644,10 @@ pub fn decode_wavpack_to_pcm(
         return Err("hybrid (lossy) WavPack not supported".into());
     }
 
-    let source_rate = {
-        let r = first_header.sample_rate();
-        if r == 0 { 44100 } else { r }
-    };
+    // La cadence vient de `parse_wavpack`, qui lit aussi le sous-bloc
+    // `ID_SAMPLE_RATE` : une cadence hors table (176,4 kHz, indice 15)
+    // passait ici pour du 44,1 kHz.
+    let source_rate = parse_wavpack(path)?.sample_rate;
 
     let source_channels = if first_header.is_mono() && !first_header.is_false_stereo() {
         1u32
@@ -2284,6 +2457,44 @@ mod tests {
             24,
             17640,
             "fde7ae70718c6bf728921f45133fc60c",
+        ),
+        // #6060 (fil 2171) : WavPack 32 bits FLOTTANT (`FLOAT_DATA`,
+        // sous-bloc `ID_FLOAT_INFO`). Les mantisses sortaient comme des
+        // entiers lus sur 2^31 : un signal vers -140 dB, « son tres tenu ».
+        // Source : WAV IEEE float 32 bits fabrique par script, encode par
+        // `wavpack -y -q` 5.6.0 ; empreinte = sortie flottante de `wvunpack`
+        // 5.6.0 convertie en i32 par la meme regle que l'AIFF flottant
+        // (`clamp(-1, 1) * 2^31`, arrondi au plus proche).
+        //   * stereo 192 kHz, sinus + bruit : mantisses completees par le
+        //     flux WVX (`FLOAT_SHIFT_SENT`), plus 100 trames de zeros exacts ;
+        (
+            "float32_192000_stereo.wv",
+            2,
+            192000,
+            32,
+            38400,
+            "6699c04793e8fa420323a977a979183f",
+        ),
+        //   * mono 44,1 kHz, valeurs representables sur 24 bits : aucun bit
+        //     WVX, chemin `float_values_nowvx`.
+        (
+            "float32_44100_mono.wv",
+            1,
+            44100,
+            32,
+            4410,
+            "0633131d3391dddaca7b5424fc06e78c",
+        ),
+        //   * stereo 176,4 kHz : cadence HORS table (indice 15), portee par le
+        //     sous-bloc `ID_SAMPLE_RATE`. Le decodeur complet l'ignorait et
+        //     rendait 44,1 kHz ; l'ancienne table placait 176 400 en 14.
+        (
+            "float32_176400_stereo.wv",
+            2,
+            176400,
+            32,
+            35280,
+            "3068279ff7647c568607d324b944bac5",
         ),
     ];
 

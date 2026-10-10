@@ -51,6 +51,7 @@ fn requete_de_lecture(
             track_number,
             disc_number,
             album_ref,
+            ..
         } => PlayRequest {
             zone_id,
             output_device_id,

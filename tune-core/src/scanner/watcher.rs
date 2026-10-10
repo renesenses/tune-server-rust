@@ -274,7 +274,10 @@ fn lister(
                 continue;
             };
             if meta.is_dir() {
-                if genre.is_symlink() {
+                // Fil 2207 — une corbeille de NAS n'est ni relevée ni relue.
+                if genre.is_symlink()
+                    || super::dossier_systeme_ignore(&entree.file_name().to_string_lossy())
+                {
                     continue;
                 }
                 trouves.insert(
@@ -739,8 +742,15 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                     if (is_audio_file(path) || est_une_feuille_cue(path) || est_une_image_iso(path))
                         && !super::is_tune_temp_file(path)
                     {
+                        let change_type = genre_d_un_fichier(&event.kind, path, &ct);
+                        // Fil 2207 — un fichier qui ARRIVE dans une corbeille
+                        // du NAS n'est pas une piste ; sa disparition, elle,
+                        // passe : elle nettoie ce qu'un ancien scan y a indexé.
+                        if change_type != ChangeType::Deleted && sous_une_corbeille(path) {
+                            continue;
+                        }
                         let _ = event_tx.send(FileChange {
-                            change_type: genre_d_un_fichier(&event.kind, path, &ct),
+                            change_type,
                             path: path.to_string_lossy().to_string(),
                         });
                     }
@@ -782,6 +792,9 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                 // Windows, sa suppression (`Remove(Any)`) passerait sinon pour
                 // un dossier disparu.
                 if crate::library::pochette_disque::est_une_image_de_pochette(path) {
+                    if sous_une_corbeille(path) {
+                        continue;
+                    }
                     let _ = event_tx.send(FileChange {
                         change_type: ChangeType::ImageDePochette,
                         path: path.to_string_lossy().to_string(),
@@ -789,6 +802,9 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                     continue;
                 }
                 if let Some(genre) = evenement_de_dossier(&event.kind, path) {
+                    if genre != ChangeType::DossierDisparu && sous_une_corbeille(path) {
+                        continue;
+                    }
                     let _ = event_tx.send(FileChange {
                         change_type: genre,
                         path: path.to_string_lossy().to_string(),
@@ -800,6 +816,12 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
             warn!(error = %e, "watcher_error");
         }
     }
+}
+
+/// Fil 2207 — `chemin` passe-t-il par une corbeille ou un dossier système
+/// ([`super::dossier_systeme_ignore`]) ?
+fn sous_une_corbeille(chemin: &Path) -> bool {
+    super::chemin_sous_un_dossier_systeme(&chemin.to_string_lossy())
 }
 
 /// #4896 — le genre d'un événement portant sur un fichier audio (ou une
@@ -883,7 +905,9 @@ pub fn fichiers_audio_sous(dossier: &Path) -> Vec<String> {
             };
             let chemin = entree.path();
             if genre.is_dir() {
-                a_lire.push(chemin);
+                if !super::dossier_systeme_ignore(&entree.file_name().to_string_lossy()) {
+                    a_lire.push(chemin);
+                }
             } else if (is_audio_file(&chemin) || est_une_image_iso(&chemin))
                 && !super::is_tune_temp_file(&chemin)
             {
@@ -1507,6 +1531,99 @@ mod tests {
                     .to_string_lossy()
                     .to_string(),
             ]
+        );
+    }
+
+    /// Fil forum 2207 — les corbeilles et dossiers système d'un NAS
+    /// (`.recycle` de Samba vfs_recycle, `#recycle` Synology, `@eaDir`,
+    /// `.Trash-1000`, `$Recycle.Bin`, quelle que soit la casse) ne sont pas de
+    /// la musique : rien de ce qui s'y trouve ne doit remonter du surveillant.
+    const CORBEILLES_2207: &[&str] = &[
+        ".recycle",
+        "#Recycle",
+        "@EADIR",
+        ".Trash-1000",
+        "$Recycle.Bin",
+        "System Volume Information",
+    ];
+
+    #[test]
+    fn un_fichier_arrive_dans_une_corbeille_du_nas_ne_remonte_pas_2207() {
+        use notify::event::{CreateKind, RenameMode};
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-corbeilles-2207",
+        );
+        for corbeille in CORBEILLES_2207 {
+            let dossier = racine.join(corbeille).join("Album");
+            fs::create_dir_all(&dossier).unwrap();
+            let fichier = dossier.join("01 - Piste.flac");
+            fs::write(&fichier, b"x").unwrap();
+            let vus = genres(&rejouer_evenements_notify(vec![
+                evp(EventKind::Create(CreateKind::File), &fichier),
+                evp(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                    &fichier,
+                ),
+                evp(EventKind::Create(CreateKind::Folder), &dossier),
+            ]));
+            assert!(
+                vus.is_empty(),
+                "🔴 fil 2207 — un fichier arrivé dans {corbeille} remonte du surveillant : {vus:?}"
+            );
+        }
+        // La disparition du fichier d'origine, elle, doit toujours passer.
+        let parti = racine.join("Artiste").join("01 - Piste.flac");
+        let vus = genres(&rejouer_evenements_notify(vec![evp(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            &parti,
+        )]));
+        assert_eq!(
+            vus.get(&*parti.to_string_lossy()),
+            Some(&ChangeType::Deleted)
+        );
+    }
+
+    #[test]
+    fn un_dossier_apparu_ne_liste_pas_ses_corbeilles_2207() {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-corbeilles-apparu-2207",
+        );
+        let album = racine.join("Album");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01.flac"), b"x").unwrap();
+        for corbeille in CORBEILLES_2207 {
+            let d = album.join(corbeille);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("02.flac"), b"x").unwrap();
+        }
+        assert_eq!(
+            fichiers_audio_sous(&album),
+            vec![album.join("01.flac").to_string_lossy().to_string()],
+            "🔴 fil 2207 — fichiers_audio_sous descend dans les corbeilles"
+        );
+    }
+
+    #[test]
+    fn la_sonde_reseau_ignore_les_corbeilles_du_nas_2207() {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            "watcher-corbeilles-sonde-2207",
+        );
+        fs::create_dir_all(racine.join("Album")).unwrap();
+        fs::write(racine.join("Album").join("01.flac"), b"x").unwrap();
+        let (mut releve, _) = Releve::initial(&racine).expect("relevé initial");
+        laisser_passer_une_seconde();
+        for corbeille in CORBEILLES_2207 {
+            let d = racine.join(corbeille).join("Album");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("01.flac"), b"x").unwrap();
+        }
+        let (_, vus) = passage(&mut releve, true);
+        assert!(
+            vus.is_empty(),
+            "🔴 fil 2207 — la sonde réseau remonte le contenu des corbeilles : {vus:?}"
         );
     }
 

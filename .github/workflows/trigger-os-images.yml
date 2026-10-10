@@ -124,7 +124,7 @@ jobs:
             echo "brouillon OS cree pour $OS_TAG"
           fi
 
-      - name: Dispatcher et attendre les trois builds OS
+      - name: Dispatcher et attendre les builds OS
         env:
           TOKEN: ${{ secrets.TUNE_OS_DISPATCH_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
@@ -206,9 +206,13 @@ jobs:
           # ou l'ISO echouait (#2151, confirme par deux testeurs). On cesse de
           # l'attendre : la construire prenait du temps de train pour un
           # artefact que plus personne ne doit telecharger.
+          # Image VM ARM64 en UEFI (qcow2, #5529) : UTM/Parallels sur Mac
+          # Apple Silicon, QEMU `-machine virt`, serveurs ARM. Elle n'est
+          # deposee qu'apres un demarrage reel dans qemu-system-aarch64.
           wait_workflow build-rpi-image.yml & P2=$!
           wait_workflow build-x86-image.yml & P3=$!
-          wait "$P2"; wait "$P3"
+          wait_workflow build-arm64-vm-image.yml & P4=$!
+          wait "$P2"; wait "$P3"; wait "$P4"
 
       - name: Verifier la matrice OS staged
         env:
@@ -237,4 +241,13 @@ jobs:
           fi
           grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image x86_64 absente"; exit 1; }
           grep -Eq 'aarch64.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image aarch64 absente"; exit 1; }
-          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 2 ] || { echo "::error::checksums OS incomplets"; exit 1; }
+          # Image VM ARM64 (#5529), nom EXACT produit par tune-os
+          # scripts/build-arm64-vm-image.sh et deposee par
+          # build-arm64-vm-image.yml sur ce meme brouillon :
+          #   tune-os-fedora<N>-aarch64-vm-<version>-<AAAAMMJJ>.qcow2 (+ .sha256)
+          # La date est celle du build : seule partie que le train ne connait pas.
+          OS_V="${OS_TAG#tune-os-rpi-v}"
+          VM_RE="tune-os-fedora[0-9]+-aarch64-vm-${OS_V//./\\.}-[0-9]{8}\\.qcow2"
+          grep -Eq "^${VM_RE}\$" <<<"$ASSETS" || { echo "::error::image VM ARM64 absente (attendu : ${VM_RE})"; exit 1; }
+          grep -Eq "^${VM_RE}\\.sha256\$" <<<"$ASSETS" || { echo "::error::checksum de l'image VM ARM64 absent"; exit 1; }
+          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 3 ] || { echo "::error::checksums OS incomplets"; exit 1; }

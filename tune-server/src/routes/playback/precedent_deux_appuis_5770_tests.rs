@@ -62,6 +62,7 @@ async fn banc(type_de_sortie: &str) -> Banc {
             track_number: None,
             disc_number: None,
             album_ref: None,
+            artist_ref: None,
         })
         .collect();
     PlayQueueRepo::with_backend(state.backend.clone())

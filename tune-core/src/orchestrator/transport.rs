@@ -1825,6 +1825,10 @@ impl PlaybackOrchestrator {
                     // 0 dB » au lieu d'un préampli qui ne fait rien.
                     self.playback
                         .brancher_le_gain_demande(zone_id, local_output.gain_demande());
+                    // #4969 — et sa carte des canaux : les niveaux par canal
+                    // décrivent les voies qui sortent, après réaffectation.
+                    self.playback
+                        .brancher_la_carte_des_canaux(zone_id, local_output.sonde_des_canaux());
                     return;
                 }
             }
@@ -2084,10 +2088,37 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #6044 — la réaffectation des canaux : la règle de l'album
+                    // prime sur celle de la zone, et aucune ne s'applique en
+                    // PURE (`regle_effective_with` le vérifie). Les canaux de
+                    // la source sont ceux du flux résolu, sinon ceux de la
+                    // piste en base.
+                    local_output.set_reaffectation(self.reaffectation_de_la_piste(
+                        zone_id,
+                        track_id,
+                        media.channels,
+                    ));
+                    // #6057 — la disposition des canaux que le FICHIER déclare
+                    // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
+                    // voie par sa position. Rien en PURE : chemin intouché.
+                    local_output.set_disposition_source(if zone_audiophile {
+                        None
+                    } else {
+                        self.disposition_declaree(track_id, media.file_path)
+                    });
                     // Rampe anti-« ploc » à la pause / reprise / arrêt (#1590),
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.
                     local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+                    // #2211 — fondu enchaîné, sortie LOCALE uniquement : `0` en
+                    // PURE et en bit-perfect strict (`duree_appliquee_ms`), et
+                    // pour un flux en direct, qui n'a pas de piste suivante et
+                    // dont la réserve retarderait le démarrage.
+                    local_output.set_fondu_enchaine_ms(if media.live_stream {
+                        0
+                    } else {
+                        crate::audio::fondu_de_zone::duree_appliquee_ms(&self.db, zone_id)
+                    });
                 }
                 drop(output);
             }
