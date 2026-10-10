@@ -2785,6 +2785,24 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        self.reprendre(zone_id, device_id, &session_message, false)
+            .await
+    }
+
+    /// Corps de [`Self::resume_with_session_error_message`].
+    ///
+    /// `apres_refus_de_la_sortie` (#6062) : second et dernier passage, quand
+    /// la sortie a refusé la reprise « sur place » en disant qu'elle a perdu
+    /// sa session pendant la pause (`device_released_on_pause()` devenu
+    /// vrai). La décision est alors prise comme pour un périphérique rendu :
+    /// rétablir à la position, ou l'expliquer — jamais un second `resume()`.
+    async fn reprendre(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: &MessageDeSessionPerdue<'_>,
+        apres_refus_de_la_sortie: bool,
+    ) -> OutputCommandResult<()> {
         // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
         // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
         let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
@@ -2880,13 +2898,14 @@ impl PlaybackOrchestrator {
             // de la sortie : sans elles, le garde vivrait tout le `match`
             // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
             #[allow(clippy::blocks_in_conditions)]
-            let peripherique_rendu = match device_id {
-                Some(did) => match { self.outputs.lock().await.get(did) } {
-                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+            let peripherique_rendu = apres_refus_de_la_sortie
+                || match device_id {
+                    Some(did) => match { self.outputs.lock().await.get(did) } {
+                        Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                        None => false,
+                    },
                     None => false,
-                },
-                None => false,
-            };
+                };
             if peripherique_rendu {
                 info!(
                     zone_id,
@@ -3023,7 +3042,25 @@ impl PlaybackOrchestrator {
             })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            out.checked_resume().await?;
+            if let Err(refus) = out.checked_resume().await {
+                // #6062 — la sortie dit avoir perdu sa session pendant la
+                // pause (Chromecast dont l'application s'est refermée) : la
+                // reprise sur place ne relancera rien, on rétablit à la
+                // position. Une seule fois : le second passage ne revient
+                // jamais ici.
+                if !apres_refus_de_la_sortie && out.device_released_on_pause() {
+                    drop(out);
+                    info!(
+                        zone_id,
+                        position_ms,
+                        error = %refus,
+                        "resume_session_perdue_par_la_sortie_retablissement"
+                    );
+                    return Box::pin(self.reprendre(zone_id, device_id, session_message, true))
+                        .await;
+                }
+                return Err(refus);
+            }
             Some(t)
         } else {
             None
@@ -3565,6 +3602,11 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// #6062 — la traduction, fournie par l'appelant, du message d'une session
+/// perdue (#4193) : `(titre, position mesurée, erreur)`.
+type MessageDeSessionPerdue<'a> =
+    dyn Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync + 'a;
 
 /// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
 /// sortie basculée sur la sienne.

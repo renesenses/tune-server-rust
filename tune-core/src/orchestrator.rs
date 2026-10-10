@@ -2053,6 +2053,10 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6062 — fil 2199 : une sortie qui a perdu sa session pendant la pause
+/// (Chromecast) refuse la reprise ; la lecture est rétablie à la position.
+#[cfg(test)]
+mod reprise_session_perdue_par_la_sortie_6062;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]

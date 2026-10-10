@@ -84,6 +84,12 @@ pub struct MockOutput {
     /// #3967 — armé, `set_next_media` REFUSE avec ce motif (faute SOAP 401
     /// d'un renderer qui n'implémente pas l'action). L'appel est compté.
     refus_de_set_next: Arc<std::sync::Mutex<Option<String>>>,
+    /// #6062 — armé, `resume` REFUSE comme un Chromecast dont l'application
+    /// s'est refermée pendant la pause, et la sortie répond ensuite `true` à
+    /// `device_released_on_pause()`.
+    session_perdue_a_la_reprise: Arc<AtomicBool>,
+    /// #6062 — posé par un `resume` refusé : la session a été perdue.
+    session_perdue: Arc<AtomicBool>,
 }
 
 impl MockOutput {
@@ -118,7 +124,16 @@ impl MockOutput {
             refus_de_seek: Arc::new(std::sync::Mutex::new(None)),
             annonce_suivante: Arc::new(std::sync::Mutex::new(AnnonceSuivante::Inconnue)),
             refus_de_set_next: Arc::new(std::sync::Mutex::new(None)),
+            session_perdue_a_la_reprise: Arc::new(AtomicBool::new(false)),
+            session_perdue: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// #6062 — la prochaine reprise trouvera l'appareil sans session (voir
+    /// `session_perdue_a_la_reprise`).
+    pub fn perdre_la_session_a_la_reprise(&self) {
+        self.session_perdue_a_la_reprise
+            .store(true, Ordering::Relaxed);
     }
 
     /// #3967 — ce que l'appareil annoncera de `SetNextAVTransportURI`.
@@ -393,8 +408,16 @@ impl OutputTarget for MockOutput {
 
     async fn resume(&self) -> Result<(), String> {
         self.resume_calls.fetch_add(1, Ordering::Relaxed);
+        if self.session_perdue_a_la_reprise.load(Ordering::Relaxed) {
+            self.session_perdue.store(true, Ordering::Relaxed);
+            return Err("mock: plus de session média à reprendre".into());
+        }
         *self.state.lock().await = TransportState::Playing;
         Ok(())
+    }
+
+    fn device_released_on_pause(&self) -> bool {
+        self.session_perdue.load(Ordering::Relaxed)
     }
 
     async fn stop(&self) -> Result<(), String> {
