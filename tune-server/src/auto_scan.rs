@@ -3658,6 +3658,9 @@ mod surveillant_annonces_tests_2134;
 mod coffret_auto_relu_tests_2094;
 
 #[cfg(test)]
+#[path = "album_renomme_relu_tests_5919.rs"]
+mod album_renomme_relu_tests_5919;
+#[cfg(test)]
 #[path = "scan_au_demarrage_reglage_tests.rs"]
 mod scan_au_demarrage_reglage_tests;
 
