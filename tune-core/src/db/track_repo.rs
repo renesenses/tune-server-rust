@@ -4449,6 +4449,35 @@ mod tests {
         assert_eq!((tires, total), (vec![par_dossier], 1));
     }
 
+    /// Fil 1684 — le texte libre d'Oxygen (`GET /library/tracks?q=`) et le
+    /// tirage par répertoire trouvent une piste par son COMPOSITEUR, casse et
+    /// accents repliés ; un compositeur absent ne rend rien.
+    #[test]
+    fn le_texte_libre_compare_le_compositeur_fil_1684() {
+        let db = test_db();
+        let (par_dossier, _, cigare) = jeu_5192(&db);
+        let repo = TrackRepo::new(db.clone());
+        let mut bolero = Track::new("Boléro".into());
+        bolero.composer = Some("Maurice Ravel".into());
+        bolero.file_path = Some("/music/Classique/Orchestre/01-Bolero.flac".into());
+        let bolero = repo.create(&bolero).unwrap();
+        let liste = |q: &str| -> (Vec<i64>, i64) {
+            let f = TrackFilter {
+                q: Some(q.into()),
+                ..Default::default()
+            };
+            let (pistes, total) = repo.list_filtered(&f, 50, 0).unwrap();
+            (pistes.into_iter().filter_map(|t| t.id).collect(), total)
+        };
+        assert_eq!(liste("ravel"), (vec![bolero], 1));
+        assert_eq!(liste("RAVÉL"), (vec![bolero], 1), "casse et accent");
+        assert_eq!(liste("stravinsky"), (vec![], 0), "témoin");
+        let _ = (par_dossier, cigare);
+        let (tires, total) = repo
+            .random_ids_in_folder(1, "/music/Classique", Some("ravel"), 10)
+            .unwrap();
+        assert_eq!((tires, total), (vec![bolero], 1));
+    }
     /// #4367, moitié PostgreSQL — Shrek n'a aucun PostgreSQL, la porte PG est
     /// celle de la CI. Ce qui se vérifie ici est donc la FORME du prédicat :
     /// le vecteur recalculé porte les quatre colonnes d'identité, pas le

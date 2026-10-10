@@ -597,4 +597,84 @@ mod tests {
         let sql = "SELECT COUNT(DISTINCT t.album_id) FROM tracks t";
         assert!(sql.contains("COUNT(DISTINCT t.album_id)"));
     }
+    /// Fil 1684 — la recherche de la Bibliothèque (`albums-detailed?q=`)
+    /// trouve un album par le COMPOSITEUR de ses pistes : « Ravel » rend le
+    /// Boléro joué par un orchestre, alors qu'aucun titre, artiste, album,
+    /// label ni chemin ne porte « Ravel ». Une SEULE piste de l'album le
+    /// porte. Témoin : un album sans ce compositeur ne sort pas. La casse et
+    /// les accents sont repliés, comme pour les autres champs.
+    #[tokio::test]
+    async fn la_recherche_trouve_un_album_par_le_compositeur_d_une_piste() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Orchestre de Paris'), (2, 'Quatuor Ebène')",
+            &[],
+        )
+        .expect("artistes");
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Boléro', 1), (2, 'Quatuors', 2)",
+            &[],
+        )
+        .expect("albums");
+        for (titre, artiste, album, compositeur, chemin) in [
+            ("Boléro", 1, 1, Some("Maurice Ravel"), "/m/OP/01.flac"),
+            ("Pavane", 1, 1, None, "/m/OP/02.flac"),
+            ("Quatuor n°1", 2, 2, Some("Claude Debussy"), "/m/QE/01.flac"),
+        ] {
+            b.execute(
+                "INSERT INTO tracks (title, artist_id, album_id, composer, source, file_path) \
+                 VALUES (?1, ?2, ?3, ?4, 'local', ?5)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &(artiste as i64),
+                    &(album as i64),
+                    &compositeur,
+                    &chemin,
+                ],
+            )
+            .expect("piste");
+        }
+        let albums = |q: &'static str| {
+            let state = state.clone();
+            async move {
+                let reponse = super::super::router()
+                    .with_state(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/albums-detailed?limit=10&q={q}"))
+                            .body(Body::empty())
+                            .expect("requête"),
+                    )
+                    .await
+                    .expect("réponse");
+                let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                    .await
+                    .expect("corps");
+                let v: Value = serde_json::from_slice(&octets).expect("json");
+                let mut ids: Vec<i64> = v["items"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("items absents : {v}"))
+                    .iter()
+                    .filter_map(|c| c["album_id"].as_i64())
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        assert_eq!(albums("ravel").await, vec![1], "par le compositeur");
+        assert_eq!(albums("RAVEL").await, vec![1], "casse repliée");
+        assert_eq!(albums("rav%C3%A9l").await, vec![1], "accent replié");
+        assert_eq!(albums("debussy").await, vec![2]);
+        assert_eq!(
+            albums("stravinsky").await,
+            Vec::<i64>::new(),
+            "témoin : aucun compositeur ne correspond"
+        );
+    }
 }

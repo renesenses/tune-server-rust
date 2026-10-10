@@ -40,14 +40,21 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 /// Les champs que compare le TEXTE LIBRE d'Oxygen (#5192), dans l'ordre du
 /// prédicat de [`condition_texte_libre`] — et, mot pour mot, ceux que le
 /// client web compare dans sa fenêtre chargée (`OxygenView.svelte`) : le
-/// titre, l'artiste, l'album, le label, et les termes de chemin
+/// titre, l'artiste, l'album, le label, les termes de chemin
 /// (`path_terms`, que `/library/tracks` rend calculés, voir
-/// [`crate::library::full_text_search::termes_de_chemin`]).
+/// [`crate::library::full_text_search::termes_de_chemin`]) et le compositeur
+/// de la piste (fil 1684 : « Ravel » trouve le Boléro joué par un orchestre).
 ///
 /// Avant #5192, le serveur ne comparait que le titre et l'artiste, le
 /// navigateur les quatre premiers : les deux ne rendaient pas la même liste.
-pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 5] =
-    ["title", "artist_name", "album_title", "label", "path_terms"];
+pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 6] = [
+    "title",
+    "artist_name",
+    "album_title",
+    "label",
+    "path_terms",
+    "composer",
+];
 
 /// Le prédicat du texte libre d'Oxygen, pour la piste d'alias `t` : sous-
 /// chaîne, insensible à la casse et aux accents, de l'un des
@@ -77,6 +84,7 @@ pub fn condition_texte_libre(
     let album = like(ph);
     let label = like(ph);
     let chemin = like(ph);
+    let compositeur = like(ph);
     // Jamais l'expression pure ici : ~60 µs par piste, et ce prédicat
     // parcourt la bibliothèque entière. SQLite : la fonction Rust enregistrée.
     let termes = match ph.engine() {
@@ -91,7 +99,8 @@ pub fn condition_texte_libre(
          OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
          OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {album}) \
          OR LOWER(unaccent(t.label)) {label} \
-         OR LOWER(unaccent({termes})) {chemin})"
+         OR LOWER(unaccent({termes})) {chemin} \
+         OR LOWER(unaccent(t.composer)) {compositeur})"
     );
     let valeurs = (0..CHAMPS_DU_TEXTE_LIBRE.len())
         .map(|_| super::backend::SqlValue::Text(motif.clone()))
@@ -1258,5 +1267,50 @@ mod tests {
         assert_eq!(normalize(&v), vec!["flac".to_string(), "aiff".to_string()]);
         assert!(normalize(&[]).is_empty());
         assert_eq!(normalize_ints(&[44100, 96000, 44100]), vec![44100, 96000]);
+    }
+    /// Fil 1684 — le prédicat du texte libre compare le compositeur, en
+    /// SIXIÈME position, avec le même repli de casse et d'accents et le même
+    /// échappement que les cinq autres ; et il demande exactement autant de
+    /// marqueurs qu'il rend de valeurs, sur les DEUX moteurs (piège n°2).
+    #[test]
+    fn le_texte_libre_compare_le_compositeur_sur_les_deux_moteurs() {
+        assert_eq!(CHAMPS_DU_TEXTE_LIBRE.len(), 6);
+        assert_eq!(CHAMPS_DU_TEXTE_LIBRE[5], "composer");
+        let esc = super::super::track_repo::like_escape_clause();
+        for engine in [Engine::Sqlite, Engine::Postgres] {
+            let mut ph = Placeholders::resuming_at(engine, 3);
+            let (sql, valeurs) = condition_texte_libre(&mut ph, "Ravél 50%");
+            assert_eq!(valeurs.len(), CHAMPS_DU_TEXTE_LIBRE.len(), "{engine:?}");
+            assert_eq!(
+                ph.next_index(),
+                3 + CHAMPS_DU_TEXTE_LIBRE.len(),
+                "{engine:?} : un marqueur par champ"
+            );
+            assert_eq!(
+                sql.matches("LIKE LOWER(unaccent(").count(),
+                CHAMPS_DU_TEXTE_LIBRE.len(),
+                "{engine:?} : {sql}"
+            );
+            let sixieme = match engine {
+                Engine::Sqlite => "?",
+                Engine::Postgres => "$8",
+            };
+            assert!(
+                sql.contains(&format!(
+                    "OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({sixieme})){esc})"
+                )),
+                "{engine:?} : le compositeur, sixième et dernier : {sql}"
+            );
+            let motif = format!(
+                "%{}%",
+                super::super::track_repo::echapper_jokers_like("Ravél 50%")
+            );
+            for v in &valeurs {
+                assert!(
+                    matches!(v, super::super::backend::SqlValue::Text(t) if *t == motif),
+                    "{engine:?} : même motif échappé pour chaque champ : {v:?}"
+                );
+            }
+        }
     }
 }
