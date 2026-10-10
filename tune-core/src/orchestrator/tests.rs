@@ -1961,7 +1961,10 @@ fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
         &apres[..fin]
     };
     for (nom, sig) in [
-        ("resume", "pub async fn resume_with_session_error_message("),
+        // #6062 — le corps de `resume_with_session_error_message` vit
+        // désormais dans `reprendre` (second passage après un refus de la
+        // sortie) : c'est lui que la garde lit.
+        ("resume", "    async fn reprendre(\n"),
         (
             "seek_output_after_replay",
             "pub(super) async fn seek_output_after_replay(",
