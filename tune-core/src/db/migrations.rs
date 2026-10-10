@@ -4158,6 +4158,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if let Err(e) = crate::library::full_text_search::assurer_termes_de_chemin(&conn) {
             warn!(error = %e, "tracks_fts_termes_de_chemin_echec");
         }
+        // #5919 — `albums_fts` et `artists_fts` retirent par `rowid` : un
+        // artiste renommé ne fait plus échouer l'écriture de ses albums.
+        if let Err(e) = crate::library::full_text_search::assurer_retrait_par_rowid(&conn) {
+            warn!(error = %e, "fts_retrait_par_rowid_echec");
+        }
     }
 
     db.execute_batch("ANALYZE;").ok();
