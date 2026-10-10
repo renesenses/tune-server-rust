@@ -228,7 +228,11 @@ fn long_wav_4016_switches_only_above_the_signed_ceiling() {
     for size in [0, 1, i32::MAX as u64 - 36, i32::MAX as u64 - 35, u64::MAX] {
         let h = build_wav_header(1, 1000, 8, Some(size));
         let data = u32::from_le_bytes(h[40..44].try_into().unwrap());
-        if size <= i32::MAX as u64 - 36 {
+        if size == 0 {
+            // Forum #2189 — une durée nulle est une durée inconnue : le plafond
+            // signé, jamais un chunk `data` vide que le renderer refermerait.
+            assert_eq!(u64::from(data), i32::MAX as u64 - 36);
+        } else if size <= i32::MAX as u64 - 36 {
             assert_eq!(u64::from(data), size);
         } else {
             assert_eq!(data, u32::MAX, "aucune fausse fin au plafond signé");

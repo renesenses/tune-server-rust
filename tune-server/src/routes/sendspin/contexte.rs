@@ -10,6 +10,7 @@ use tune_core::sendspin::{ErreurSendspin, Identite};
 struct Interieur {
     dossier: PathBuf,
     sessions: super::sessions::Sessions,
+    zones: Option<super::zones::RaccordZones>,
     magasin: OnceLock<Result<Mutex<MagasinAppairage>, String>>,
 }
 
@@ -21,8 +22,25 @@ impl ContexteSendspin {
         Self(Arc::new(Interieur {
             dossier,
             sessions: super::sessions::Sessions::default(),
+            zones: None,
             magasin: OnceLock::new(),
         }))
+    }
+
+    /// Branche les sorties et les zones : une enceinte appairee qui active le
+    /// role `player@v1` devient une zone. Sans cet appel (temoins du seul
+    /// protocole), aucune sortie n'est enregistree.
+    #[must_use]
+    pub fn avec_zones(mut self, zones: super::zones::RaccordZones) -> Self {
+        match Arc::get_mut(&mut self.0) {
+            Some(interieur) => interieur.zones = Some(zones),
+            None => tracing::warn!("sendspin_zones_non_branchees_contexte_partage"),
+        }
+        self
+    }
+
+    pub(super) fn zones(&self) -> Option<&super::zones::RaccordZones> {
+        self.0.zones.as_ref()
     }
 
     /// Suit le chemin de donnees deja resolu par TuneConfig, y compris quand

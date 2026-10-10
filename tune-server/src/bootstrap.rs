@@ -240,6 +240,9 @@ pub async fn run_with(opts: RunOptions) {
         );
         tracing::info!(dossier = %dossier.display(), "gel_executeur_releves");
         std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
+        // #4770 (arbitrage du 10/10) : le cache de transcodage quitte le
+        // dossier temporaire pour un dossier dédié sous les données.
+        let _ = tune_core::transcode_cache::installer_dans_les_donnees(&donnees);
     }
 
     // Image builders alone cannot protect appliances already in the field:
@@ -501,6 +504,11 @@ pub async fn run_with(opts: RunOptions) {
     // Create shared OpenHome event listener
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
+
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716) survivent au redémarrage : la mémoire est
+    // branchée sur la base AVANT la découverte, qui les relit.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
 
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);

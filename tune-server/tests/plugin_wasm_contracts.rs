@@ -28,3 +28,7 @@ mod plugin_uninstall_4194;
 mod plugin_wasm_restart_required_5112;
 #[path = "plugin_wasm_routes.rs"]
 mod plugin_wasm_routes;
+// #4741 — un seul moteur de transfert de playlists, celui du greffon : les
+// routes historiques passent par lui, les deux autres moteurs ont disparu.
+#[path = "transfert_moteur_unique_4741.rs"]
+mod transfert_moteur_unique_4741;

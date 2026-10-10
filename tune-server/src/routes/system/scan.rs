@@ -582,7 +582,13 @@ pub(crate) fn sous_arbres_vides(
     // Pistes perdues par dossier, tous niveaux confondus.
     let mut perdues: HashMap<&str, usize> = HashMap::new();
     for p in existants {
-        if decouverts.contains(*p) || !dans_le_perimetre(p) {
+        // Fil 2207 — une piste indexée depuis une corbeille de NAS n'est plus
+        // listée parce que le parcours l'écarte, pas parce qu'un montage est
+        // tombé : elle ne compte pas pour protéger son sous-arbre.
+        if decouverts.contains(*p)
+            || !dans_le_perimetre(p)
+            || tune_core::scanner::chemin_sous_un_dossier_systeme(p)
+        {
             continue;
         }
         let mut cur = *p;
@@ -4414,6 +4420,25 @@ mod roots_gone_empty_tests {
 
     fn perdues(prefixe: &str, n: usize) -> Vec<String> {
         (0..n).map(|i| format!("{prefixe}/{i:04}.flac")).collect()
+    }
+
+    /// Fil forum 2207 — les pistes déjà indexées depuis une corbeille de NAS
+    /// (`.recycle`, `#recycle`…) disparaissent du parcours une fois celle-ci
+    /// écartée. Au-delà du seuil, le garde du montage imbriqué les aurait
+    /// prises pour un montage tombé et CONSERVÉES à jamais : la purge doit
+    /// pouvoir les retirer.
+    #[test]
+    fn les_pistes_d_une_corbeille_de_nas_ne_sont_pas_protegees_2207() {
+        let mut chemins = perdues("/mnt/nas/Musique/.recycle/Album", 150);
+        chemins.extend(perdues("/mnt/nas/Musique/#Recycle/Album", 150));
+        chemins.push("/mnt/nas/Musique/Artiste/ok.flac".to_string());
+        let refs: Vec<&str> = chemins.iter().map(|s| s.as_str()).collect();
+        let decouverts = set(&["/mnt/nas/Musique/Artiste/ok.flac"]);
+        let v = sous_arbres_vides(&["/mnt/nas/Musique".to_string()], &refs, &decouverts);
+        assert!(
+            v.is_empty(),
+            "🔴 fil 2207 — une corbeille de NAS est protégée comme un montage tombé : {v:?}"
+        );
     }
 
     #[test]

@@ -200,6 +200,12 @@ path = "tests/memoire_a_froid.rs"
 name = "sendspin_point_d_acces_s2a"
 path = "tests/sendspin_point_d_acces_s2a.rs"
 
+# Le lien d'accès à distance (pont), servi à l'administrateur seul.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "pont_lien_d_acces"
+path = "tests/pont_lien_d_acces.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -467,6 +473,15 @@ required-features = ["postgres"]
 [[test]]
 name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
+# #2264 : `GET /library/tracks/{id}/versions/groups` ajoute une requete par
+# ISRC plie / MBID d enregistrement. Meme reponse sur PostgreSQL et SQLite,
+# et une mesure ignoree sur 100 000 pistes. `autotests = false` : sans cette
+# entree, le fichier ne serait jamais compile.
+[[test]]
+name = "pg_2264_groupes_versions"
+path = "tests/pg_2264_groupes_versions.rs"
 required-features = ["postgres"]
 
 # SQL propre a SQLite dans des routes jouees sur PostgreSQL (chasse PG du
@@ -896,6 +911,14 @@ path = "tests/album_de_la_file_fil2143.rs"
 [[test]]
 name = "artiste_de_la_file_fil2143"
 path = "tests/artiste_de_la_file_fil2143.rs"
+
+# #6079 (FabienM) — les identifiants de SERVICE d'un titre de la file :
+# `album_id_service` et `artist_id_service` sur `GET /zones/{id}/queue` pour un
+# titre Qobuz ou Tidal mis seul en file, en lot, ou lu dans son album.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "identifiants_de_service_en_file_6079"
+path = "tests/identifiants_de_service_en_file_6079.rs"
 
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
@@ -1521,6 +1544,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# #5997 — les routes de favoris de service passent par le miroir du service.
+[[test]]
+name = "favoris_miroir_routes_5997"
+path = "tests/favoris_miroir_routes_5997.rs"
 
 # #4805 — les crédits MusicBrainz lus juste après l'identification d'un album
 # (doublure MusicBrainz locale). `autotests = false` : sans cette cible, jamais

@@ -156,6 +156,7 @@ mod tests {
             track_number: None,
             disc_number: None,
             album_ref: album_ref.map(String::from),
+            artist_ref: None,
         }
     }
 
