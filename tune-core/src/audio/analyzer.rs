@@ -618,6 +618,8 @@ pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEm
     }
     let path = file_path.to_string();
     let tete = tokio::task::spawn_blocking(move || {
+        // #4681 — E/S basses si une zone joue (segment déjà parti).
+        let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
         let natif = super::decode::decode_natif(
             &path,
             Some(super::empreinte::TAUX),
@@ -825,6 +827,8 @@ async fn parcourir_les_segments(
         let path = file_path.to_string();
         let deja_decode = premier.take();
         let (rendue, segment) = tokio::task::spawn_blocking(move || {
+            // #4681 — E/S basses si une zone joue (segment déjà parti).
+            let _basse = crate::taches_de_fond::priorite::politique::baisser_pendant_la_lecture();
             let decoded = match deja_decode {
                 Some(d) => d,
                 None => match super::decode::decode_to_pcm(&path, None, Some(2), seek, SEG_SECONDS)

@@ -113,6 +113,7 @@ async fn file_qobuz(state: &AppState, zone_id: i64) {
         track_number: None,
         disc_number: None,
         album_ref: None,
+        artist_ref: None,
     })
     .collect();
     PlayQueueRepo::with_backend(state.backend.clone())
@@ -287,6 +288,7 @@ async fn une_file_de_stations_annonce_son_suivant_et_avance() {
         track_number: None,
         disc_number: None,
         album_ref: None,
+        artist_ref: None,
     })
     .collect();
     PlayQueueRepo::with_backend(state.backend.clone())

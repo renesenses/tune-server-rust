@@ -782,6 +782,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
 -- Marquage IA d'un favori de service (#5530, PG 082 / SQLite 118). En ALTER
 -- pour la même raison qu'au-dessus.
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
+-- Miroir des favoris de service (#5997) : état, motif d'échec, ISRC. Sans
+-- numéro de migration, comme côté SQLite (`favoris_miroir_colonnes`).
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT;
 -- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :
 -- l'adresse de la page Bandcamp qui permet de resigner une URL de flux
 -- expirée. En ALTER pour la même raison que juste au-dessus : les trois tables
@@ -789,6 +794,9 @@ ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
+-- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
+-- 122). En ALTER pour la même raison que juste au-dessus.
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue

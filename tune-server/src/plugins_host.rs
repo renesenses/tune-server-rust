@@ -80,6 +80,35 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Handle::current().block_on(fut)
 }
 
+thread_local! {
+    /// Le profil de l'appel en cours (#4741), posé par
+    /// [`avec_profil_de_l_appel`] autour d'UN appel wasm.
+    ///
+    /// Un appel wasm — et toutes les fonctions hôte qu'il déclenche — se joue
+    /// en entier sur le même fil bloquant (`spawn_blocking`) : une variable de
+    /// fil suffit à porter le profil sans le confier au greffon, qui ne choisit
+    /// jamais au nom de qui il agit.
+    static PROFIL_DE_L_APPEL: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Jouer `f` au nom de `profil`, puis rendre le fil tel qu'il était.
+///
+/// Une route qui sait QUI agit (l'en-tête `X-Profile-Id`, via `ActiveProfile`)
+/// le transmet ainsi au greffon : une playlist locale lue ou créée pendant
+/// l'appel l'est sous ce profil, et non sous le réglage global
+/// `active_profile_id`. `None` laisse la règle d'avant.
+pub fn avec_profil_de_l_appel<R>(profil: Option<i64>, f: impl FnOnce() -> R) -> R {
+    struct Retablir(Option<i64>);
+    impl Drop for Retablir {
+        fn drop(&mut self) {
+            PROFIL_DE_L_APPEL.with(|p| p.set(self.0));
+        }
+    }
+    let _retablir = Retablir(PROFIL_DE_L_APPEL.with(|p| p.replace(profil)));
+    f()
+}
+
 /// The concrete [`HostContext`]: the plugin capability surface backed by the
 /// live server. Holds `Arc`-clones of exactly the pieces of [`AppState`] the
 /// P1 capabilities need — no reference back to `AppState` itself, so it is
@@ -194,6 +223,9 @@ impl AppStateHost {
     /// `active_profile_id`, puis le profil par défaut — pour qu'une playlist
     /// créée par un greffon atterrisse là où l'utilisateur la cherchera.
     fn profil_actif(&self) -> i64 {
+        if let Some(profil) = PROFIL_DE_L_APPEL.with(std::cell::Cell::get) {
+            return profil;
+        }
         SettingsRepo::with_backend(self.backend.clone())
             .get("active_profile_id")
             .ok()
@@ -332,6 +364,10 @@ impl HostContext for AppStateHost {
                     track_number: t.get("track_number").and_then(Value::as_i64),
                     disc_number: t.get("disc_number").and_then(Value::as_i64),
                     album_ref: t.get("album_ref").and_then(Value::as_str).map(String::from),
+                    artist_ref: t
+                        .get("artist_ref")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 });
             }
         }
@@ -636,7 +672,7 @@ impl HostContext for AppStateHost {
         }
         let arc = self.service(service)?;
         // L'appariement N'EST PAS réécrit ici : `apparier_chez_le_service_classe`
-        // dépouille la MÊME recherche que `transfer_playlist`, avec le même
+        // dépouille la MÊME recherche que l'ancien `transfer_playlist`, avec le même
         // scoring, et sa tête est le verdict de la route. Un seul verdict pour
         // l'écran et pour le greffon — avec, en plus, les candidats suivants.
         let apparies = block_on(async {

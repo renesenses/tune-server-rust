@@ -1,7 +1,9 @@
 //! Resolve a *known* track (title/artist, optionally ISRC + duration) onto a
 //! streaming service's search results.
 //!
-//! Historically the playlist-transfer and playlist-manager paths matched with
+//! Historically the playlist-transfer and playlist-manager paths (both gone
+//! since #4741: the « Playlists converter » plugin is the only transfer engine,
+//! and reaches this matcher through `host_streaming_match_track`) matched with
 //! naive string equality ("title == title") then fell back to "take the first
 //! result", which happily attached live versions, covers or unrelated songs.
 //! This routes both through the shared normalized+fuzzy matcher in
@@ -151,7 +153,7 @@ pub const LIMITE_RECHERCHE_APPARIEMENT: usize = 10;
 /// Chercher un titre connu chez un service, puis l'apparier — les DEUX gestes
 /// que tout transfert de playlist enchaîne.
 ///
-/// Extrait de `transfer_playlist` (`tune-server/src/routes/playlist_manager.rs`)
+/// Extrait de l'ancien `transfer_playlist` (`playlist_manager.rs`, moteur retiré par #4741)
 /// pour l'ouverture de l'interface hôte WASM (#4716, épique #4715) : la capacité
 /// `host_streaming_match_track` doit apparier EXACTEMENT comme la route, sans
 /// quoi le greffon « Playlists converter » et l'écran de fusion donneraient deux
