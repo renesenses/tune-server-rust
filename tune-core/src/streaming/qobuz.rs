@@ -6643,6 +6643,119 @@ mod tests_rubriques_par_genre {
         assert_eq!(vus.lock().expect("verrou d'essai").len(), 2);
     }
 }
+/// #5313 — les playlists éditoriales d'un genre.
+///
+/// Serveur simulé sur `127.0.0.1:0` : il NOTE les paramètres de chaque
+/// `/playlist/getFeatured` reçu et rend une playlist dont le nom dit ce qu'il
+/// a reçu (`type` et `genre_ids`). Aucun appel à l'API Qobuz. Mesuré sur le
+/// .18 le 09/10/2026 : Qobuz honore `genre_ids` sur cette route (Classique :
+/// Reich, Trifonov, Savall ; Pop/Rock : Johnny Marr…).
+#[cfg(test)]
+mod tests_playlists_par_genre_5313 {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::{Arc, Mutex};
+
+    type Vus = Arc<Mutex<Vec<Carte<String, String>>>>;
+
+    async fn qobuz_playlists_simule() -> (String, Vus) {
+        let vus: Vus = Arc::default();
+        let note = vus.clone();
+        let app = Router::new().route(
+            "/playlist/getFeatured",
+            get(move |Query(q): Query<Carte<String, String>>| {
+                let note = note.clone();
+                async move {
+                    let nom = format!(
+                        "{}|{}",
+                        q.get("type").cloned().unwrap_or_default(),
+                        q.get("genre_ids").cloned().unwrap_or_else(|| "-".into())
+                    );
+                    note.lock().expect("verrou d'essai").push(q);
+                    Json(json!({"playlists": {"items": [
+                        {"id": 1, "name": nom, "tracks_count": 12}
+                    ], "total": 1}}))
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), vus)
+    }
+
+    /// LE besoin de #5313 : le genre part chez Qobuz en `genre_ids`, avec les
+    /// playlists éditoriales (`editor-picks`).
+    #[tokio::test]
+    async fn le_genre_part_chez_qobuz_en_genre_ids_5313() {
+        let (base, vus) = qobuz_playlists_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let playlists = svc
+            .get_featured_playlists(None, Some("10"))
+            .await
+            .expect("serveur simulé");
+
+        let vus = vus.lock().expect("verrou d'essai").clone();
+        assert_eq!(vus.len(), 1, "un seul appel amont (total = 1)");
+        assert_eq!(
+            vus[0].get("genre_ids").map(String::as_str),
+            Some("10"),
+            "le genre doit accompagner la demande de playlists (#5313)"
+        );
+        assert_eq!(vus[0].get("type").map(String::as_str), Some("editor-picks"));
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].name, "editor-picks|10");
+    }
+
+    /// Deux genres ne se confondent pas dans le cache éditorial : sans quoi la
+    /// vue du second genre resservirait les playlists du premier.
+    #[tokio::test]
+    async fn deux_genres_ne_se_confondent_pas_en_cache_5313() {
+        let (base, vus) = qobuz_playlists_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let classique = svc
+            .get_featured_playlists(None, Some("10"))
+            .await
+            .expect("serveur simulé");
+        let chanson = svc
+            .get_featured_playlists(None, Some("6"))
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(classique[0].name, "editor-picks|10");
+        assert_eq!(chanson[0].name, "editor-picks|6");
+        assert_eq!(vus.lock().expect("verrou d'essai").len(), 2);
+    }
+
+    /// Non-régression : sans genre, aucun `genre_ids` n'est envoyé.
+    #[tokio::test]
+    async fn sans_genre_aucun_genre_ids_5313() {
+        let (base, vus) = qobuz_playlists_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let playlists = svc
+            .get_featured_playlists(None, None)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(playlists[0].name, "editor-picks|-");
+        assert!(
+            vus.lock().expect("verrou d'essai")[0]
+                .get("genre_ids")
+                .is_none()
+        );
+    }
+}
 
 /// Le repli sur la dernière liste éditoriale connue (signalement Levente,
 /// 20/09/2026).
