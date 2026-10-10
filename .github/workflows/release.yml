@@ -935,35 +935,76 @@ jobs:
           mkdir -p "$APP/Contents/Resources/plugins/playlists-converter"
           cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm "$APP/Contents/Resources/plugins/playlists-converter/"
           cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json "$APP/Contents/Resources/plugins/playlists-converter/"
-          # Lanceur AppleScript. #5141 — il RESTE VIVANT, parent du serveur :
-          # `exec` sans `&`, l'applet attend. L'ancien lanceur lançait le
-          # serveur en arrière-plan puis se terminait ; orphelin, le serveur
-          # n'était plus rattaché à Tune Server.app, et macOS lui refusait le
-          # réseau local (os error 65) même avec la clé de #4949 — alors que le
-          # même binaire, lancé depuis un Terminal resté ouvert, voyait tout.
+          # Lanceur AppleScript. #5141 — il RESTE VIVANT, parent du serveur.
+          # L'ancien lanceur lançait le serveur en arrière-plan puis se
+          # terminait ; orphelin, le serveur n'était plus rattaché à
+          # Tune Server.app, et macOS lui refusait le réseau local (os error 65)
+          # même avec la clé de #4949.
+          # #6076 — mais un applet bloqué dans `do shell script "exec …"` ne
+          # traite plus AUCUN évènement : le double-clic suivant (Tune déjà
+          # lancé) envoyait un « reopen » qui restait en file, et rien ne
+          # s'ouvrait. Le serveur est donc lancé par NSTask : enfant DIRECT de
+          # l'applet (ppid = applet), sans bloquer sa boucle d'évènements.
+          # L'applet est « stay-open » (`osacompile -s`, clé OSAAppletStayOpen
+          # de l'Info.plist plus bas) : `on reopen` rouvre l'onglet, `on idle`
+          # quitte quand le serveur s'arrête, `on quit` l'arrête proprement.
+          # L'onglet ne s'ouvre plus après un `sleep 2` fixe : il attend que le
+          # port réponde (un essai par seconde, 60 s au plus).
           # TUNE_PORT se surcharge par l'environnement (`open --env`), et
           # TUNE_RELANCE_APRES_MAJ=1 (relance après mise à jour) n'ouvre pas
           # d'onglet de plus (#1236). L'Info.plist porte
           # OSAAppletShowStartupScreen=false : sans la clé, un applet recompilé
           # a été vu bloqué sur son écran de démarrage modal, serveur jamais lancé.
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
+          use framework "Foundation"
+          use scripting additions
+
+          property serveur : missing value
+          property tunePort : "8888"
+
           on run
-            set appPath to (path to me as text)
-            set posixApp to POSIX path of appPath
+            set posixApp to POSIX path of (path to me)
             set resDir to posixApp & "Contents/Resources/"
-            set serverBin to quoted form of (resDir & "tune-server")
-            set webDir to quoted form of (resDir & "web")
             set tunePort to system attribute "TUNE_PORT"
             if tunePort is "" then set tunePort to "8888"
-            if (system attribute "TUNE_RELANCE_APRES_MAJ") is not "1" then
-              do shell script "(sleep 2; /usr/bin/open " & quoted form of ("http://localhost:" & tunePort) & ") > /dev/null 2>&1 &"
-            end if
-            try
-              do shell script "mkdir -p \"$HOME/Library/Logs\"; export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=" & quoted form of tunePort & "; exec " & serverBin & " >> \"$HOME/Library/Logs/tune-server.log\" 2>&1"
-            end try
+            set journal to do shell script "mkdir -p \"$HOME/Library/Logs\"; touch \"$HOME/Library/Logs/tune-server.log\"; echo \"$HOME/Library/Logs/tune-server.log\""
+            set sortie to current application's NSFileHandle's fileHandleForWritingAtPath:journal
+            sortie's seekToEndOfFile()
+            set env to (current application's NSProcessInfo's processInfo()'s environment())'s mutableCopy()
+            env's setObject:(resDir & "web") forKey:"TUNE_WEB_DIR"
+            env's setObject:tunePort forKey:"TUNE_PORT"
+            set serveur to current application's NSTask's alloc()'s init()
+            serveur's setLaunchPath:(resDir & "tune-server")
+            serveur's setEnvironment:env
+            serveur's setStandardOutput:sortie
+            serveur's setStandardError:sortie
+            serveur's |launch|()
+            if (system attribute "TUNE_RELANCE_APRES_MAJ") is not "1" then ouvrirTune()
           end run
+
+          on reopen
+            ouvrirTune()
+          end reopen
+
+          on idle
+            if serveur is missing value then quit
+            if not ((serveur's isRunning()) as boolean) then quit
+            return 5
+          end idle
+
+          on quit
+            if serveur is not missing value then
+              if ((serveur's isRunning()) as boolean) then serveur's terminate()
+            end if
+            continue quit
+          end quit
+
+          on ouvrirTune()
+            set adresse to quoted form of ("http://localhost:" & tunePort)
+            do shell script "(i=0; while [ $i -lt 60 ] && ! /usr/bin/curl -s -o /dev/null --max-time 1 " & adresse & "; do sleep 1; i=$((i+1)); done; /usr/bin/open " & adresse & ") > /dev/null 2>&1 &"
+          end ouvrirTune
           ASCRIPT
-          osacompile -o "$APP/Contents/MacOS/Tune Server.app" /tmp/tune-launcher.applescript
+          osacompile -s -o "$APP/Contents/MacOS/Tune Server.app" /tmp/tune-launcher.applescript
           # Move the compiled applet contents into our app structure
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/MacOS/applet" "$APP/Contents/MacOS/Tune Server"
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/Resources/Scripts" "$APP/Contents/Resources/Scripts"
@@ -990,6 +1031,7 @@ jobs:
             <key>NSAppleScriptEnabled</key><true/>
             <key>NSMicrophoneUsageDescription</key><string>Tune capte une entrée audio (platine, S/PDIF, optique) pour la diffuser vers vos zones ; macOS traite toute entrée audio comme un micro. Tune captures an audio input (turntable, S/PDIF, optical) to stream it to your zones; macOS treats every audio input as a microphone.</string>
             <key>OSAAppletShowStartupScreen</key><false/>
+            <key>OSAAppletStayOpen</key><true/>
             <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
             <key>NSBonjourServices</key>
             <array>
