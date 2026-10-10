@@ -789,6 +789,9 @@ ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
+-- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
+-- 122). En ALTER pour la même raison que juste au-dessus.
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
