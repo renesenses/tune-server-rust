@@ -16,6 +16,7 @@ fn demande(playlists: &[&str]) -> Demande {
         cible_service: "qobuz".into(),
         playlists: playlists.iter().map(|s| s.to_string()).collect(),
         suffixe_nom: None,
+        nom_cible: None,
     }
 }
 
@@ -201,16 +202,8 @@ fn un_lot_inconnu_n_ecrit_rien_meme_avec_accord() {
     assert!(hote.creations().is_empty());
 }
 
-/// La bibliothèque locale comme CIBLE est refusée explicitement, et la raison
-/// nomme la capacité qui manque.
-#[test]
-fn la_bibliotheque_comme_cible_est_refusee_explicitement() {
-    let hote = banc_trois_titres();
-    let mut d = demande(&["pl-1"]);
-    d.cible_service = "local".into();
-    let erreur = Convertisseur::new(&hote).apercu(&d).unwrap_err();
-    assert!(erreur.starts_with("cible_locale_non_supportee"), "{erreur}");
-}
+// La bibliothèque comme CIBLE n'est plus refusée (#4741) : voir
+// `essais_moteur_unique::la_bibliotheque_est_une_cible`.
 
 // ---------------------------------------------------------------------------
 // Transfert

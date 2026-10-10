@@ -669,6 +669,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2372_versions_par_piste -- --nocapture --test-threads=1
+      # #2264 -- les groupes de versions et les index d'expression ISRC/MBID
+      # sur une VRAIE base. Sans cette etape, les deux epreuves de
+      # `pg_2264_groupes_versions` sautaient partout (garde #2816).
+      - name: Groupes de versions sur PostgreSQL (#2264)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2264_groupes_versions -- --nocapture --test-threads=1
 
       # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
       # VRAIE base.

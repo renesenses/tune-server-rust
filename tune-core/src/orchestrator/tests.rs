@@ -3521,7 +3521,13 @@ async fn pcm_retenu_passthrough(
         tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
 
     let (sink_tx, decode_tx) = if freine {
-        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx)
+        // Personne ne draine la file : rien n'est consommé (#3818).
+        super::spawn_braked_levels_sink(
+            orch.playback.clone(),
+            zone_id,
+            levels_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        )
     } else {
         // Forme d'origine : le puits draine sans condition, et le décodeur
         // écrit DIRECTEMENT dans la file du forwarder.
@@ -3679,10 +3685,15 @@ async fn un_passthrough_bride_fait_toujours_monter_des_niveaux_sur_le_bus() {
 
     // Génération épinglée AVANT le spawn, comme dans la branche (#1110).
     let play_seq = orch.playback.current_play_seq(zone_id).await;
-    let levels_tx =
-        super::spawn_paced_levels_forwarder(bus, orch.playback.clone(), zone_id, play_seq, 0);
+    let (levels_tx, consomme_ms) = super::spawn_paced_levels_forwarder_mesure(
+        bus,
+        orch.playback.clone(),
+        zone_id,
+        play_seq,
+        0,
+    );
     let (sink_tx, relais_tx) =
-        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx);
+        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx, consomme_ms);
     let ready = std::sync::Arc::new(tokio::sync::Notify::new());
     tokio::task::spawn_blocking(move || {
         crate::audio::decode::decode_to_pcm_streaming_with_levels(

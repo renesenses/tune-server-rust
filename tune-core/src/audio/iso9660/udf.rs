@@ -1,17 +1,26 @@
-//! UDF (ECMA-167 / OSTA UDF 1.02 à 2.01), en lecture, sur partition physique.
+//! UDF (ECMA-167 / OSTA UDF 1.02 à 2.60), en lecture.
 //!
 //! Lu seulement quand l'image n'a pas d'arborescence ISO 9660 exploitable : la
 //! plupart des DVD de données sont des images « pont », et leur ISO 9660 suffit.
 //!
 //! Chemin suivi : ancre (`AVDP`, secteur 256) → séquence de descripteurs de
 //! volume → descripteur de partition (début de partition) et de volume logique
-//! (taille de bloc, emplacement du `FSD`) → descripteur d'ensemble de fichiers
-//! → ICB de la racine → entrées de fichier et identifiants de fichier.
+//! (taille de bloc, cartes de partition, emplacement du `FSD`) → descripteur
+//! d'ensemble de fichiers → ICB de la racine → entrées de fichier et
+//! identifiants de fichier.
 //!
-//! Hors périmètre, rendu comme « pas d'UDF lisible » : les partitions de
-//! métadonnées (UDF 2.50, Blu-ray) et les partitions virtuelles (disques
-//! multisessions en écriture incrémentale). Une partition « sparable »
-//! (DVD-RW) est lue comme une partition physique, sans table de réaffectation.
+//! Partitions lues : physique (type 1), « sparable » (DVD-RW, lue comme une
+//! partition physique, sans table de réaffectation) et, depuis UDF 2.50, la
+//! partition de MÉTADONNÉES (Blu-ray, DVD gravés en UDF 2.50 ou 2.60). Celle-ci
+//! range les entrées de fichier et les répertoires dans un « fichier de
+//! métadonnées » posé sur la partition physique : un bloc de la partition de
+//! métadonnées est le bloc de même rang DANS ce fichier, dont les étendues
+//! disent où il se trouve. Si le fichier principal est illisible, son miroir
+//! est essayé.
+//!
+//! Hors périmètre, rendu comme « pas d'UDF lisible » : les partitions
+//! virtuelles (`VAT`, disques gravés en écriture incrémentale), les étendues
+//! non enregistrées et les descripteurs d'allocation chaînés.
 
 use std::fs::File;
 use std::io;
@@ -46,29 +55,136 @@ fn tag_valide(b: &[u8], attendu: u16) -> bool {
     somme == b[4]
 }
 
+/// Une carte de partition du volume logique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carte {
+    /// Type 1, ou type 2 « sparable » : la partition elle-même.
+    Physique { numero: u16 },
+    /// Type 2 « métadonnées » (UDF 2.50+) : emplacements, dans la partition
+    /// physique, du fichier de métadonnées et de son miroir.
+    Metadonnees {
+        numero: u16,
+        fichier: u32,
+        miroir: u32,
+    },
+    /// Toute autre carte (partition virtuelle…) : non suivie.
+    Autre,
+}
+
+const IDENTIFIANT_SPARABLE: &[u8] = b"*UDF Sparable Part";
+const IDENTIFIANT_METADONNEES: &[u8] = b"*UDF Metadata Partition";
+
+/// Les cartes de partition, dans l'ordre : leur rang est la « référence de
+/// partition » des adresses longues.
+fn cartes(table: &[u8]) -> Vec<Carte> {
+    let mut sortie = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= table.len() {
+        let type_carte = table[i];
+        let longueur = table[i + 1] as usize;
+        if longueur < 2 || i + longueur > table.len() {
+            break;
+        }
+        let c = &table[i..i + longueur];
+        sortie.push(match type_carte {
+            1 if longueur >= 6 => Carte::Physique {
+                numero: u16_le(c, 4),
+            },
+            2 if longueur >= 64
+                && c[5..5 + IDENTIFIANT_SPARABLE.len()] == *IDENTIFIANT_SPARABLE =>
+            {
+                Carte::Physique {
+                    numero: u16_le(c, 38),
+                }
+            }
+            2 if longueur >= 64
+                && c[5..5 + IDENTIFIANT_METADONNEES.len()] == *IDENTIFIANT_METADONNEES =>
+            {
+                Carte::Metadonnees {
+                    numero: u16_le(c, 38),
+                    fichier: u32_le(c, 40),
+                    miroir: u32_le(c, 44),
+                }
+            }
+            _ => Carte::Autre,
+        });
+        i += longueur;
+    }
+    sortie
+}
+
 struct Volume {
     taille_bloc: u64,
+    numero_partition: u16,
     debut_partition: u64,
     longueur_partition: u64,
     taille_image: u64,
+    cartes: Vec<Carte>,
+    /// Les étendues PHYSIQUES du fichier de métadonnées, dans l'ordre ; vide
+    /// tant qu'il n'est pas lu, ou sans partition de métadonnées.
+    metadonnees: Vec<Etendue>,
 }
 
 impl Volume {
-    fn octet(&self, lbn: u32) -> u64 {
-        (self.debut_partition + lbn as u64) * self.taille_bloc
+    /// Les étendues, en octets dans l'image, de `longueur` octets à partir du
+    /// bloc `lbn` de la partition de référence `reference`.
+    fn etendues(&self, reference: u16, lbn: u32, longueur: u64) -> io::Result<Vec<Etendue>> {
+        match self.cartes.get(reference as usize) {
+            Some(Carte::Physique { numero }) if *numero == self.numero_partition => {
+                let fin_partition = self.longueur_partition * self.taille_bloc;
+                let dans = lbn as u64 * self.taille_bloc;
+                if dans + longueur > fin_partition {
+                    return Err(invalide("UDF : bloc hors de la partition"));
+                }
+                let debut = self.debut_partition * self.taille_bloc + dans;
+                if debut + longueur > self.taille_image {
+                    return Err(invalide("UDF : bloc hors de l'image"));
+                }
+                Ok(vec![Etendue { debut, longueur }])
+            }
+            Some(Carte::Metadonnees { numero, .. }) if *numero == self.numero_partition => {
+                // Le bloc `lbn` est l'octet `lbn × taille de bloc` du fichier
+                // de métadonnées : on suit ses étendues jusque-là.
+                let mut cherche = lbn as u64 * self.taille_bloc;
+                let mut restant = longueur;
+                let mut sortie = Vec::new();
+                for e in &self.metadonnees {
+                    if restant == 0 {
+                        break;
+                    }
+                    if cherche >= e.longueur {
+                        cherche -= e.longueur;
+                        continue;
+                    }
+                    let utile = (e.longueur - cherche).min(restant);
+                    sortie.push(Etendue {
+                        debut: e.debut + cherche,
+                        longueur: utile,
+                    });
+                    restant -= utile;
+                    cherche = 0;
+                }
+                if restant != 0 {
+                    return Err(invalide("UDF : bloc hors du fichier de métadonnées"));
+                }
+                Ok(sortie)
+            }
+            _ => Err(invalide(format!(
+                "UDF : référence de partition {reference} non suivie"
+            ))),
+        }
     }
 
-    fn lire_bloc(&self, fichier: &mut File, lbn: u32) -> io::Result<Vec<u8>> {
-        if lbn as u64 >= self.longueur_partition {
-            return Err(invalide("UDF : bloc hors de la partition"));
-        }
-        let position = self.octet(lbn);
-        if position + self.taille_bloc > self.taille_image {
-            return Err(invalide("UDF : bloc hors de l'image"));
-        }
-        let mut b = vec![0u8; self.taille_bloc as usize];
-        lire_a(fichier, position, &mut b)?;
-        Ok(b)
+    /// Un bloc logique, et sa position dans l'image.
+    fn lire_bloc(
+        &self,
+        fichier: &mut File,
+        reference: u16,
+        lbn: u32,
+    ) -> io::Result<(Vec<u8>, u64)> {
+        let etendues = self.etendues(reference, lbn, self.taille_bloc)?;
+        let position = etendues.first().map_or(0, |e| e.debut);
+        Ok((lire_etendues(fichier, &etendues)?, position))
     }
 }
 
@@ -115,7 +231,7 @@ pub(super) fn lire(fichier: &mut File, taille_image: u64) -> io::Result<Option<I
     }
     let (
         Some((numero_partition, debut_partition, longueur_partition)),
-        Some((taille_bloc, fsd_lbn, fsd_ref, cartes)),
+        Some((taille_bloc, fsd_lbn, fsd_ref, table_cartes)),
     ) = (partition, volume_logique)
     else {
         return Ok(None);
@@ -123,23 +239,38 @@ pub(super) fn lire(fichier: &mut File, taille_image: u64) -> io::Result<Option<I
     if taille_bloc != SECTEUR {
         return Ok(None);
     }
-    // Seule une carte de type 1 (physique) vers NOTRE partition est suivie ;
-    // les cartes de type 2 ne sont admises que « sparables ».
-    if !carte_physique_ou_sparable(&cartes, fsd_ref, numero_partition) {
-        return Ok(None);
-    }
-    let volume = Volume {
+    let mut volume = Volume {
         taille_bloc,
+        numero_partition,
         debut_partition,
         longueur_partition,
         taille_image,
+        cartes: cartes(&table_cartes),
+        metadonnees: Vec::new(),
     };
+    // Le FSD doit être sur NOTRE partition, par une carte suivie.
+    match volume.cartes.get(fsd_ref as usize) {
+        Some(Carte::Physique { numero }) if *numero == numero_partition => {}
+        Some(&Carte::Metadonnees {
+            numero,
+            fichier: principal,
+            miroir,
+        }) if numero == numero_partition => {
+            let Some(etendues) = fichier_de_metadonnees(fichier, &volume, principal)
+                .or_else(|| fichier_de_metadonnees(fichier, &volume, miroir))
+            else {
+                return Ok(None);
+            };
+            volume.metadonnees = etendues;
+        }
+        _ => return Ok(None),
+    }
 
-    let fsd = volume.lire_bloc(fichier, fsd_lbn)?;
+    let (fsd, _) = volume.lire_bloc(fichier, fsd_ref, fsd_lbn)?;
     if !tag_valide(&fsd, TAG_ENSEMBLE_DE_FICHIERS) {
         return Err(invalide("UDF : descripteur d'ensemble de fichiers absent"));
     }
-    let racine = u32_le(&fsd, 404);
+    let racine = (u16_le(&fsd, 408), u32_le(&fsd, 404));
 
     let mut sortie = Vec::new();
     let mut vus = std::collections::HashSet::new();
@@ -150,39 +281,59 @@ pub(super) fn lire(fichier: &mut File, taille_image: u64) -> io::Result<Option<I
     }))
 }
 
-fn carte_physique_ou_sparable(cartes: &[u8], reference: u16, numero: u16) -> bool {
-    let mut i = 0usize;
-    let mut indice = 0u16;
-    while i + 2 <= cartes.len() {
-        let type_carte = cartes[i];
-        let longueur = cartes[i + 1] as usize;
-        if longueur < 2 || i + longueur > cartes.len() {
-            return false;
-        }
-        if indice == reference {
-            return match type_carte {
-                1 if longueur >= 6 => u16_le(cartes, i + 4) == numero,
-                2 if longueur >= 64 => {
-                    &cartes[i + 5..i + 5 + 18] == b"*UDF Sparable Part"
-                        && u16_le(cartes, i + 38) == numero
-                }
-                _ => false,
+/// Les étendues physiques du fichier de métadonnées dont l'entrée est au bloc
+/// `lbn` de la partition PHYSIQUE, ou `None` s'il est illisible.
+fn fichier_de_metadonnees(fichier: &mut File, volume: &Volume, lbn: u32) -> Option<Vec<Etendue>> {
+    let reference = volume.cartes.iter().position(
+        |c| matches!(c, Carte::Physique { numero } if *numero == volume.numero_partition),
+    );
+    // Sans carte physique explicite (cas d'UDF 2.50 sur une seule carte), la
+    // partition physique est lue directement.
+    let physique;
+    let (volume, reference) = match reference {
+        Some(r) => (volume, r as u16),
+        None => {
+            physique = Volume {
+                cartes: vec![Carte::Physique {
+                    numero: volume.numero_partition,
+                }],
+                metadonnees: Vec::new(),
+                ..*volume
             };
+            (&physique, 0)
         }
-        indice += 1;
-        i += longueur;
-    }
-    false
+    };
+    let entree = lire_entree(fichier, volume, reference, lbn).ok()?;
+    matches!(
+        entree.type_fichier,
+        TYPE_FICHIER_METADONNEES | TYPE_FICHIER_METADONNEES_MIROIR
+    )
+    .then_some(entree.etendues)
 }
 
-/// Une entrée de fichier décodée : type, taille, étendues.
+const TYPE_FICHIER_DOSSIER: u8 = 4;
+const TYPE_FICHIER_METADONNEES: u8 = 250;
+const TYPE_FICHIER_METADONNEES_MIROIR: u8 = 251;
+
+/// Une entrée de fichier décodée : type, étendues dans l'image.
 struct Entree {
-    dossier: bool,
+    type_fichier: u8,
     etendues: Vec<Etendue>,
 }
 
-fn lire_entree(fichier: &mut File, volume: &Volume, lbn: u32) -> io::Result<Entree> {
-    let b = volume.lire_bloc(fichier, lbn)?;
+impl Entree {
+    fn dossier(&self) -> bool {
+        self.type_fichier == TYPE_FICHIER_DOSSIER
+    }
+}
+
+fn lire_entree(
+    fichier: &mut File,
+    volume: &Volume,
+    reference: u16,
+    lbn: u32,
+) -> io::Result<Entree> {
+    let (b, position) = volume.lire_bloc(fichier, reference, lbn)?;
     let id = u16_le(&b, 0);
     let (debut_ad, l_ea, l_ad) = if tag_valide(&b, TAG_ENTREE_DE_FICHIER) {
         (176usize, u32_le(&b, 168) as usize, u32_le(&b, 172) as usize)
@@ -203,7 +354,7 @@ fn lire_entree(fichier: &mut File, volume: &Volume, lbn: u32) -> io::Result<Entr
     let mut etendues = Vec::new();
     let mut restant = taille;
     match drapeaux & 0x07 {
-        // short_ad
+        // short_ad : même partition que l'entrée elle-même.
         0 => {
             for c in b[ad..ad + l_ad].chunks_exact(8) {
                 let brut = u32_le(c, 0);
@@ -214,10 +365,17 @@ fn lire_entree(fichier: &mut File, volume: &Volume, lbn: u32) -> io::Result<Entr
                 if genre != 0 {
                     return Err(invalide("UDF : étendue non enregistrée ou chaînée"));
                 }
-                pousser(&mut etendues, &mut restant, volume, u32_le(c, 4), longueur)?;
+                pousser(
+                    &mut etendues,
+                    &mut restant,
+                    volume,
+                    reference,
+                    u32_le(c, 4),
+                    longueur,
+                )?;
             }
         }
-        // long_ad
+        // long_ad : la partition est nommée par l'adresse.
         1 => {
             for c in b[ad..ad + l_ad].chunks_exact(16) {
                 let brut = u32_le(c, 0);
@@ -228,14 +386,21 @@ fn lire_entree(fichier: &mut File, volume: &Volume, lbn: u32) -> io::Result<Entr
                 if genre != 0 {
                     return Err(invalide("UDF : étendue non enregistrée ou chaînée"));
                 }
-                pousser(&mut etendues, &mut restant, volume, u32_le(c, 4), longueur)?;
+                pousser(
+                    &mut etendues,
+                    &mut restant,
+                    volume,
+                    u16_le(c, 8),
+                    u32_le(c, 4),
+                    longueur,
+                )?;
             }
         }
         // Données incorporées dans l'entrée elle-même.
         3 => {
             let longueur = (l_ad as u64).min(taille);
             etendues.push(Etendue {
-                debut: volume.octet(lbn) + ad as u64,
+                debut: position + ad as u64,
                 longueur,
             });
             restant -= longueur;
@@ -246,7 +411,7 @@ fn lire_entree(fichier: &mut File, volume: &Volume, lbn: u32) -> io::Result<Entr
         return Err(invalide("UDF : fichier plus court que sa taille annoncée"));
     }
     Ok(Entree {
-        dossier: type_fichier == 4,
+        type_fichier,
         etendues,
     })
 }
@@ -255,6 +420,7 @@ fn pousser(
     etendues: &mut Vec<Etendue>,
     restant: &mut u64,
     volume: &Volume,
+    reference: u16,
     lbn: u32,
     longueur: u64,
 ) -> io::Result<()> {
@@ -262,14 +428,13 @@ fn pousser(
     if utile == 0 {
         return Ok(());
     }
-    let debut = volume.octet(lbn);
-    if debut + utile > volume.taille_image {
-        return Err(invalide("UDF : étendue hors de l'image"));
+    for e in volume.etendues(reference, lbn, utile)? {
+        // Deux étendues contiguës n'en font qu'une.
+        match etendues.last_mut() {
+            Some(d) if d.debut + d.longueur == e.debut => d.longueur += e.longueur,
+            _ => etendues.push(e),
+        }
     }
-    etendues.push(Etendue {
-        debut,
-        longueur: utile,
-    });
     *restant -= utile;
     Ok(())
 }
@@ -309,17 +474,17 @@ fn nom_cs0(b: &[u8]) -> String {
 fn descendre(
     fichier: &mut File,
     volume: &Volume,
-    lbn: u32,
+    (reference, lbn): (u16, u32),
     prefixe: &str,
     profondeur: usize,
-    vus: &mut std::collections::HashSet<u32>,
+    vus: &mut std::collections::HashSet<(u16, u32)>,
     sortie: &mut Vec<FichierInterne>,
 ) -> io::Result<()> {
-    if profondeur > PROFONDEUR_MAX || !vus.insert(lbn) {
+    if profondeur > PROFONDEUR_MAX || !vus.insert((reference, lbn)) {
         return Ok(());
     }
-    let entree = lire_entree(fichier, volume, lbn)?;
-    if !entree.dossier {
+    let entree = lire_entree(fichier, volume, reference, lbn)?;
+    if !entree.dossier() {
         return Err(invalide("UDF : la racine n'est pas un dossier"));
     }
     let donnees = lire_etendues(fichier, &entree.etendues)?;
@@ -331,7 +496,8 @@ fn descendre(
         }
         let caracteristiques = d[18];
         let l_fi = d[19] as usize;
-        let icb_lbn = u32_le(d, 24);
+        // L'ICB est une adresse longue : bloc, puis référence de partition.
+        let icb = (u16_le(d, 28), u32_le(d, 24));
         let l_iu = u16_le(d, 36) as usize;
         let longueur = (38 + l_iu + l_fi).div_ceil(4) * 4;
         if 38 + l_iu + l_fi > d.len() {
@@ -352,21 +518,13 @@ fn descendre(
             format!("{prefixe}/{nom}")
         };
         if caracteristiques & 0x02 != 0 {
-            let _ = descendre(
-                fichier,
-                volume,
-                icb_lbn,
-                &chemin,
-                profondeur + 1,
-                vus,
-                sortie,
-            );
+            let _ = descendre(fichier, volume, icb, &chemin, profondeur + 1, vus, sortie);
             continue;
         }
-        let Ok(e) = lire_entree(fichier, volume, icb_lbn) else {
+        let Ok(e) = lire_entree(fichier, volume, icb.0, icb.1) else {
             continue;
         };
-        if e.dossier {
+        if e.dossier() || e.type_fichier >= TYPE_FICHIER_METADONNEES {
             continue;
         }
         if sortie.len() >= ENTREES_MAX {

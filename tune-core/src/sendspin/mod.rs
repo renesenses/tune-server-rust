@@ -21,13 +21,11 @@
 //! Les trois parcours d'appairage et leur interaction operateur restent a
 //! brancher. La Sentinelle publique n'authentifie pas un pair.
 //!
-//! Non livre :
-//! - l'appairage complet (PSK provisoire, CPace, codes) — S2-b ;
-//! - le **son** : horloge, cadrage, encodeur Opus, `stream/start` — S2-c ;
-//! - la **synchronisation** à plusieurs enceintes — S2-d ;
-//! - le branchement d'`OutputTarget` : deux décisions de produit ne sont pas
-//!   tranchées (voir la note de fin de ce document) et appartiennent à
-//!   Bertrand. Aucune zone Sendspin ne peut naître de ce module.
+//! S2-c, premiere version (`lecteur`, `horloge`, `outputs::sendspin`) : le
+//! role `player@v1` sur une session appairee (PSK longue duree), PCM seul,
+//! une zone par enceinte connectee. Non livre : FLAC et Opus, connexions
+//! initiees par le serveur, groupes multipieces synchronises (S2-d). Voir
+//! `docs/sendspin.md`.
 //!
 //! ## D'où vient le contrat de fil
 //!
@@ -61,8 +59,10 @@
 //! l'emprunte est nommée comme telle dans le journal et au registre.
 
 pub mod appairage;
+pub mod horloge;
 pub mod identite;
 pub mod jeton;
+pub mod lecteur;
 pub mod magasin;
 pub mod messages;
 pub mod pake;

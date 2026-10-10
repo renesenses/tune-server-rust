@@ -29,6 +29,8 @@ pub struct Piste {
     pub titre: String,
     pub artiste: String,
     pub duree_ms: u64,
+    /// Vide par défaut, comme chez la plupart des sources (#4741).
+    pub isrc: String,
 }
 
 impl Piste {
@@ -38,7 +40,13 @@ impl Piste {
             titre: titre.into(),
             artiste: artiste.into(),
             duree_ms,
+            isrc: String::new(),
         }
+    }
+
+    pub fn avec_isrc(mut self, isrc: &str) -> Self {
+        self.isrc = isrc.into();
+        self
     }
     fn json(&self) -> Value {
         json!({
@@ -46,7 +54,7 @@ impl Piste {
             "title": self.titre,
             "artist_name": self.artiste,
             "duration_ms": self.duree_ms,
-            "isrc": "",
+            "isrc": self.isrc,
         })
     }
 }
@@ -60,6 +68,10 @@ pub enum Verdict {
         score: f64,
         approximatif: bool,
     },
+    /// Plusieurs candidats CLASSÉS, verdict en tête : `(piste, score,
+    /// approximate)`. La forme `candidates` de l'hôte réel (#4716), que le
+    /// greffon parcourt depuis #4741.
+    Classement(Vec<(Piste, f64, bool)>),
     /// Le service n'a rien.
     Rien,
     /// L'appel échoue.
@@ -168,6 +180,35 @@ impl HoteDeBanc {
         match self.verdict(service, titre) {
             None | Some(Verdict::Rien) => Ok(json!({ "service": service, "matched": Value::Null })),
             Some(Verdict::Erreur(e)) => Err(e.clone()),
+            Some(Verdict::Classement(liste)) => {
+                let fiche = |piste: &Piste| {
+                    let mut v = piste.json();
+                    if service == "local"
+                        && let Ok(n) = piste.id.parse::<i64>()
+                    {
+                        v["track_id"] = json!(n);
+                        v["source_id"] = json!(format!("origine-{n}"));
+                    }
+                    v
+                };
+                let candidats: Vec<Value> = liste
+                    .iter()
+                    .map(|(p, score, approximatif)| {
+                        json!({ "track": fiche(p), "score": score, "approximate": approximatif })
+                    })
+                    .collect();
+                Ok(match liste.first() {
+                    Some((p, score, approximatif)) => json!({
+                        "service": service,
+                        "matched": fiche(p),
+                        "score": score,
+                        "approximate": approximatif,
+                        "count": candidats.len(),
+                        "candidates": candidats,
+                    }),
+                    None => json!({ "service": service, "matched": Value::Null, "candidates": [] }),
+                })
+            }
             Some(Verdict::Candidat {
                 piste,
                 score,
@@ -247,10 +288,14 @@ impl HoteDeBanc {
     /// connue du banc — pour qu'un ajout fasse apparaître une vraie piste.
     fn piste_par_id(&self, id: &str) -> Piste {
         for v in self.cible.values().chain(self.cible_chez.values()) {
-            if let Verdict::Candidat { piste, .. } = v
-                && piste.id == id
-            {
-                return piste.clone();
+            match v {
+                Verdict::Candidat { piste, .. } if piste.id == id => return piste.clone(),
+                Verdict::Classement(liste) => {
+                    if let Some((p, _, _)) = liste.iter().find(|(p, _, _)| p.id == id) {
+                        return p.clone();
+                    }
+                }
+                _ => {}
             }
         }
         for (_, pistes) in self.source.values() {

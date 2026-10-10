@@ -14,6 +14,11 @@ pub struct DeviceDescription {
     pub model_description: String,
     pub udn: String,
     pub device_type: String,
+    /// Version logicielle publiée par l'appareil, quand sa description en
+    /// porte une (`softwareVersion`, `firmwareVersion`… : aucune balise n'est
+    /// normalisée par UPnP). Vide sinon. Sert à oublier les profils de
+    /// commande appris sous une autre version.
+    pub version_logicielle: String,
     pub services: Vec<ServiceDescription>,
 }
 
@@ -397,6 +402,12 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
                         "modelDescription" => device.model_description = text,
                         "UDN" => device.udn = text,
                         "deviceType" => device.device_type = text,
+                        "softwareVersion" | "firmwareVersion" | "firmware_version"
+                        | "swVersion" | "displayVersion"
+                            if device.version_logicielle.is_empty() =>
+                        {
+                            device.version_logicielle = text
+                        }
                         _ => {}
                     }
                 }
@@ -450,6 +461,9 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
             }
             if desc.model_description.is_empty() {
                 desc.model_description = renderer.model_description.clone();
+            }
+            if desc.version_logicielle.is_empty() {
+                desc.version_logicielle = renderer.version_logicielle.clone();
             }
             // Append so a renderer service wins over a same-named root service
             // in service_urls/event_sub_urls, while retaining root-only vendor
@@ -1434,6 +1448,54 @@ mod descriptif_illisible {
             !err.contains(NOM_DE_RESEAU),
             "aucun morceau du corps ne doit remonter dans une chaîne d'erreur \
              qui finit dans une réponse HTTP : {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod version_logicielle_tests {
+    use super::parse_device_description;
+
+    /// La version publiée sert à oublier les profils de commande appris sous
+    /// une autre : elle est lue quelle que soit la balise du constructeur, et
+    /// la première trouvée gagne.
+    #[test]
+    fn la_version_logicielle_est_lue_si_l_appareil_la_publie() {
+        let xml = r#"<root><device>
+            <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+            <friendlyName>Salon</friendlyName><UDN>uuid:1</UDN>
+            <softwareVersion> 1.4.2 </softwareVersion>
+            <firmwareVersion>autre</firmwareVersion>
+        </device></root>"#;
+        let desc = parse_device_description(xml).unwrap();
+        assert_eq!(desc.version_logicielle, "1.4.2");
+
+        let sans = r#"<root><device>
+            <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+            <friendlyName>Salon</friendlyName><UDN>uuid:1</UDN>
+        </device></root>"#;
+        assert_eq!(
+            parse_device_description(sans).unwrap().version_logicielle,
+            ""
+        );
+    }
+
+    /// Composite : la version du renderer embarqué remonte quand la racine
+    /// n'en porte pas.
+    #[test]
+    fn la_version_du_renderer_embarque_remonte() {
+        let xml = r#"<root><device>
+            <deviceType>urn:schemas-upnp-org:device:Basic:1</deviceType>
+            <UDN>uuid:racine</UDN>
+            <deviceList><device>
+                <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+                <UDN>uuid:renderer</UDN>
+                <firmwareVersion>2.0</firmwareVersion>
+            </device></deviceList>
+        </device></root>"#;
+        assert_eq!(
+            parse_device_description(xml).unwrap().version_logicielle,
+            "2.0"
         );
     }
 }
