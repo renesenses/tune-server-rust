@@ -65,6 +65,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_radio_logo_refresh(state);
     spawn_rattrapage_vignettes_podcasts(state);
     spawn_cloud_library_sync(state);
+    // Sauvegarde cloud automatique des personnalisations (#5654). Un test de
+    // câblage garde la ligne.
+    crate::routes::system::sauvegarde_cloud::spawn(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -3423,6 +3426,21 @@ mod tests_licence_proprietaire_battement {
                  serveur serait refixe toutes les heures sur le dernier compte lie"
             );
         }
+    }
+
+    /// #5654 — sans cet appel, la sauvegarde automatique serait du code mort :
+    /// l'écran dirait « active » et rien ne partirait jamais.
+    #[test]
+    fn la_sauvegarde_cloud_automatique_est_lancee() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
+            "la passe de sauvegarde cloud n'est plus lancee au demarrage"
+        );
     }
 
     /// Meme garde d'ordre que dans `cloud.rs` : l'adoption doit lire le compte
