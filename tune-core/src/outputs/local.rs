@@ -4020,7 +4020,7 @@ impl EtageDeConversion<'_> {
             self.pcm.pure_bypass,
         );
         self.pcm.reaffectation.noter(matrice.is_some());
-        if matrice.is_some() || declaree.is_some() || self.needs_channel_adapt() {
+        if matrice.is_some() || declaree.is_some() {
             // #4969 — la fonction même dont la carte des canaux mesure la
             // réponse (`LocalOutput::sonde_des_canaux`).
             mots = crate::audio::carte_des_canaux::adapter_vers_la_sortie(
@@ -4034,6 +4034,11 @@ impl EtageDeConversion<'_> {
                 warn!(from_ch = source, to_ch = sortie, error = %error, "local_channel_adaptation_rejected");
                 Vec::new()
             });
+        } else if self.needs_channel_adapt() {
+            // Sans matrice ni disposition déclarée, `adapter_vers_la_sortie`
+            // se réduit à `adapt_channels_f32` : c'est l'appel en ligne que les
+            // gardes #3233 et REF-7 lisent ici, même refus en silence.
+            mots = adapt_channels(&mots, self.spec.canaux(), self.sortie.canaux);
         }
         if self.needs_resample {
             mots = rubato_resample_chunk(
