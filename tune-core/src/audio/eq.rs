@@ -14,13 +14,14 @@ use tune_plugin_native::stage::Stage;
 /// une marche de 12 dB (Levente Toth, fil 1974). Le mutex relu à chaque
 /// paquet rendait le remplacement instantané, donc la marche aussi.
 ///
-/// 200 ms, parce que c'est l'ordre de la constante d'intégration de la
-/// sonie : en deçà, l'oreille entend encore une MARCHE (20 ms suffisent
-/// contre le clic, pas contre le sursaut) ; au-delà, le geste « couper l'EQ
-/// pour comparer » paraît retardé. La rampe ne sert QUE les bascules d'un
+/// 300 ms, décision de Bertrand du 10/10 (d'abord 200 ms) : au-delà de la
+/// constante d'intégration de la sonie, donc sans marche audible, sans que
+/// le geste « couper l'EQ pour comparer » paraisse retardé. Depuis la même
+/// décision, une coupure GARDE le préampli (voir [`EqProcessor::neutre`]) :
+/// la rampe n'efface plus que la courbe. Elle ne sert QUE les bascules d'un
 /// réglage en cours de lecture ([`EqProcessor::prendre_la_releve`]) : un
 /// début de piste passe par `LocalOutput::set_eq`, sans rampe.
-pub const RAMPE_DE_BASCULE_MS: u32 = 200;
+pub const RAMPE_DE_BASCULE_MS: u32 = 300;
 
 /// #5215 — écart de niveau (préampli ou niveau moyen, en dB) au-delà duquel
 /// un remplacement d'égaliseur est fondu plutôt qu'instantané.
@@ -50,6 +51,11 @@ pub struct EqProcessor {
     /// #4685 — niveau moyen du filtre, réserve comprise, calculé UNE fois à
     /// la construction (voir [`Self::gain_moyen_db`]).
     gain_moyen_db: f64,
+    /// #5215 (décision du 10/10) — gain linéaire par canal que porte un
+    /// égaliseur COUPÉ en vol : le préampli (et la compensation portée) de
+    /// celui qu'on quitte, pour que le niveau perçu ne bouge pas. `None` :
+    /// identité, le neutre se retire une fois son fondu fini.
+    gain_garde: Option<Vec<f32>>,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -102,19 +108,39 @@ impl EqProcessor {
             fondu: None,
             compensation: 1.0,
             gain_moyen_db,
+            gain_garde: None,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
     }
 
-    fn neutre(sample_rate: u32, channels: u16) -> Self {
+    /// #5215 — l'égaliseur COUPÉ qui prend la relève de `precedent`.
+    ///
+    /// Décision de Bertrand du 10/10 : il GARDE le préampli courant (et la
+    /// compensation que portait `precedent`), canal par canal. Couper l'EQ
+    /// retirait jusqu'ici une réserve de −12,56 dB : +12 dB d'un coup au
+    /// casque (Levente Toth, fil 1974), puis en 200 ms. Désormais le niveau
+    /// perçu reste celui de l'instant ; seule la courbe s'efface, par le fondu.
+    fn neutre(precedent: &Self) -> Self {
+        let canaux = precedent.channels.max(1);
+        let gains: Vec<f32> = (0..canaux)
+            .map(|c| {
+                let db = precedent
+                    .preamp_db(c)
+                    .filter(|d| d.is_finite())
+                    .unwrap_or(0.0);
+                (10.0_f64.powf(db / 20.0) * precedent.compensation_portee()) as f32
+            })
+            .collect();
+        let identite = gains.iter().all(|g| (g - 1.0).abs() < 1e-6);
         Self {
             engine: Engine::Neutre,
-            sample_rate,
-            channels,
+            sample_rate: precedent.sample_rate,
+            channels: precedent.channels,
             fondu: None,
             compensation: 1.0,
             gain_moyen_db: 0.0,
+            gain_garde: (!identite).then_some(gains),
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
@@ -146,7 +172,7 @@ impl EqProcessor {
                     // Déjà en train de descendre vers le sec : on le laisse finir.
                     return Some(precedent);
                 }
-                let mut neutre = Self::neutre(precedent.sample_rate, precedent.channels);
+                let mut neutre = Self::neutre(&precedent);
                 neutre.armer_le_fondu(Some(precedent));
                 Some(neutre)
             }
@@ -157,7 +183,10 @@ impl EqProcessor {
                 if !compatible {
                     return Some(neuf);
                 }
-                if neuf.ecart_de_niveau_db(&precedent) > SEUIL_DE_RAMPE_DB {
+                // Réactiver après une coupure : la courbe revient par un
+                // fondu, même si le préampli gardé égale le nouveau.
+                if precedent.est_neutre() || neuf.ecart_de_niveau_db(&precedent) > SEUIL_DE_RAMPE_DB
+                {
                     neuf.armer_le_fondu(Some(precedent));
                 } else if let Some(fondu) = precedent.fondu.take() {
                     // Petit cran pendant un fondu : le nouveau reprend le fondu
@@ -223,10 +252,50 @@ impl EqProcessor {
         matches!(self.engine, Engine::Neutre)
     }
 
-    /// #5215 — égaliseur coupé dont le fondu est fini : identité exacte, à
-    /// retirer de la chaîne.
+    /// #5215 (décision de Bertrand du 10/10, seconde partie) — tant que
+    /// l'égaliseur reste COUPÉ, le préampli gardé vaut pour TOUTES les pistes
+    /// suivantes, sans saut. Rend, pour la piste qui commence, un neutre qui
+    /// porte le même gain, sans fondu (début de piste : rien à fondre). `None`
+    /// quand `self` n'est pas un neutre qui garde un préampli.
+    ///
+    /// Un gain identique sur tous les canaux (le cas d'un préampli) est rangé
+    /// en un seul coefficient : il vaut alors quel que soit le nombre de
+    /// canaux de la piste suivante. Le neutre ne filtre rien : son taux ne
+    /// sert à rien, celui de la piste coupée est repris tel quel.
+    pub fn reporter_le_preampli_garde(&self) -> Option<Self> {
+        let (sample_rate, channels) = (self.sample_rate, self.channels);
+        if !self.est_neutre() {
+            return None;
+        }
+        let gains = self.gain_garde.as_ref()?;
+        let premier = *gains.first()?;
+        let gains = if gains.iter().all(|g| (g - premier).abs() < 1e-7) {
+            vec![premier]
+        } else if usize::from(channels.max(1)) == gains.len() {
+            gains.clone()
+        } else {
+            // Canaux différents et gains inégaux : on garde la moyenne plutôt
+            // que de décaler les canaux.
+            vec![gains.iter().sum::<f32>() / gains.len() as f32]
+        };
+        Some(Self {
+            engine: Engine::Neutre,
+            sample_rate,
+            channels,
+            fondu: None,
+            compensation: 1.0,
+            gain_moyen_db: 0.0,
+            gain_garde: Some(gains),
+            clipping: Default::default(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// #5215 — égaliseur coupé dont le fondu est fini ET qui ne garde aucun
+    /// préampli : identité exacte, à retirer de la chaîne. Un neutre qui
+    /// garde un préampli reste monté : il porte le niveau (décision du 10/10).
     pub fn est_neutre_au_repos(&self) -> bool {
-        self.est_neutre() && self.fondu.is_none()
+        self.est_neutre() && self.fondu.is_none() && self.gain_garde.is_none()
     }
 
     /// #4685 — ce que cet égaliseur, réserve automatique comprise, fait
@@ -239,9 +308,9 @@ impl EqProcessor {
     pub fn process_pcm(&mut self, pcm: &mut [u8], depth: u16) -> EqProcessStats {
         // #4407 — une relève en vol sur un porteur d'OCTETS (relais DSP
         // progressif d'un flux réseau) : le fondu de `prendre_la_releve` ne
-        // vit que dans le chemin flottant. Le temps du fondu (200 ms), le
+        // vit que dans le chemin flottant. Le temps du fondu (300 ms), le
         // bloc y passe ; ensuite, retour au chemin entier habituel.
-        if self.fondu.is_some() {
+        if self.fondu.is_some() || self.gain_garde.is_some() {
             return self.process_pcm_en_fondu(pcm, depth);
         }
         match &mut self.engine {
@@ -259,6 +328,10 @@ impl EqProcessor {
         let trame = octets * usize::from(self.channels.max(1));
         if !(2..=4).contains(&octets) || pcm.is_empty() || !pcm.len().is_multiple_of(trame) {
             self.fondu = None;
+            if self.gain_garde.is_some() {
+                // Bloc illisible : le rendre tel quel plutôt que boucler.
+                return EqProcessStats::default();
+            }
             return self.process_pcm(pcm, depth);
         }
         let echelle = (1i64 << (depth - 1)) as f64;
@@ -312,7 +385,17 @@ impl EqProcessor {
         let stats = match &mut self.engine {
             Engine::Bundled(p) => p.process_interleaved(samples),
             Engine::Native(p) => record_native(&mut self.clipping, p.process_f32(samples)),
-            Engine::Unavailable | Engine::Neutre => EqProcessStats::default(),
+            Engine::Unavailable => EqProcessStats::default(),
+            Engine::Neutre => {
+                if let Some(gains) = self.gain_garde.as_deref() {
+                    for trame in samples.chunks_mut(gains.len().max(1)) {
+                        for (s, g) in trame.iter_mut().zip(gains) {
+                            *s *= g;
+                        }
+                    }
+                }
+                EqProcessStats::default()
+            }
         };
         // #5227 — après le filtre, donc après ses compteurs d'écrêtage : le
         // rendu flottant dépasse l'unité ici, le volume le ramène au rappel.
@@ -467,6 +550,23 @@ mod rampe_de_bascule_5215 {
             neuf.en_fondu(),
             "la rampe d'activation ne doit pas sauter à sa fin"
         );
+    }
+
+    /// Décision du 10/10 : la rampe de bascule dure ~300 ms.
+    #[test]
+    fn la_rampe_de_bascule_dure_300_ms() {
+        let neuf = EqProcessor::prendre_la_releve(None, Some(egaliseur(12.0))).unwrap();
+        let total = neuf.fondu.as_ref().map(|f| f.total);
+        assert_eq!(total, Some(14_400), "300 ms à 48 kHz");
+    }
+
+    /// Couper puis réactiver : la courbe revient par un fondu, pas d'un coup.
+    #[test]
+    fn reactiver_apres_une_coupure_fond_la_courbe() {
+        let mut coupe = EqProcessor::prendre_la_releve(None, Some(egaliseur(12.0))).unwrap();
+        coupe.fondu = None;
+        let neuf = EqProcessor::prendre_la_releve(Some(egaliseur(12.0)), Some(coupe)).unwrap();
+        assert!(neuf.en_fondu());
     }
 
     /// Couper rend un neutre qui ne compte pas comme un égaliseur actif.

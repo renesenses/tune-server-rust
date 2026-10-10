@@ -899,7 +899,7 @@ impl PlaybackOrchestrator {
                 // #4407 — le flux que Tune fabrique au fil de l'eau (radio
                 // décodée, relais progressif) relève le nouvel égaliseur au
                 // bloc suivant : même session, aucun `SetAVTransportURI`,
-                // aucun blanc. Fondu de 200 ms (#5215) si le niveau bouge.
+                // aucun blanc. Fondu de 300 ms (#5215) si le niveau bouge.
                 "eq_en_vol"
             };
         }

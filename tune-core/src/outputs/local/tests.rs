@@ -4131,8 +4131,12 @@ fn crete_5215(signal: &[f32]) -> f32 {
     signal.iter().map(|s| s.abs()).fold(0.0, f32::max)
 }
 
+/// Décision de Bertrand du 10/10 : couper l'égaliseur GARDE le préampli
+/// courant. Le niveau perçu ne bouge pas ; seule la courbe s'efface, en
+/// `RAMPE_DE_BASCULE_MS` (~300 ms). Avant, la coupure fondait vers le signal
+/// SEC : +12 dB en 200 ms, le sursaut de Levente seulement adouci.
 #[test]
-fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
+fn couper_l_egaliseur_en_vol_garde_le_niveau_du_preampli_5215() {
     let sortie = LocalOutput::new("Casque".to_string());
     // Le fondu du filtre seul : la compensation (#5227) a son témoin à part.
     sortie.set_compensation_de_niveau(false);
@@ -4143,6 +4147,7 @@ fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
         "le témoin veut une grosse réserve : {preampli} dB"
     );
     sortie.set_eq(Some(eq));
+    let attendu = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32;
 
     let mut trame = 0;
     // 51 paquets : 20,4 périodes, la bascule tombe en pleine alternance.
@@ -4154,29 +4159,117 @@ fn couper_l_egaliseur_en_vol_rejoint_le_niveau_sec_par_une_rampe_5215() {
     assert!(
         marche <= MARCHE_MAX_5215,
         "couper l'EQ fait une marche de {marche} entre deux échantillons \
-         (seuil {MARCHE_MAX_5215}) : le préampli de {preampli:.2} dB saute d'un coup"
+         (seuil {MARCHE_MAX_5215})"
     );
-    // PROGRESSIF, pas seulement sans clic : 50 à 100 ms après la bascule, le
-    // niveau est encore en chemin (une rampe de 1 ms passerait le seuil de
-    // marche mais laisserait le sursaut entier).
+    // À 40 Hz seul le préampli agit : pendant ET après la rampe, le niveau
+    // reste celui du préampli, à 0,1 dB près.
     let bascule = 51 * TRAMES_PAR_PAQUET_5215;
-    let en_chemin = crete_5215(&signal[bascule + 2400..bascule + 4800]);
-    assert!(
-        en_chemin < 0.9 * AMPLITUDE_5215 as f32,
-        "50 à 100 ms après la coupure, le niveau est déjà plein ({en_chemin}) : pas de rampe"
-    );
-    // Niveau final : le signal SEC, exactement.
-    let fin = &signal[signal.len() - 1200..];
-    let crete = crete_5215(fin);
-    assert!(
-        (crete - AMPLITUDE_5215 as f32).abs() < 0.01,
-        "après la rampe, le niveau doit être celui sans EQ : crête {crete}"
-    );
-    // Et la chaîne redevient celle d'un EQ absent.
+    for (debut, fin, quand) in [
+        (bascule, bascule + 4800, "pendant la rampe"),
+        (signal.len() - 1200, signal.len(), "après la rampe"),
+    ] {
+        let crete = crete_5215(&signal[debut..fin]);
+        assert!(
+            (crete / attendu - 1.0).abs() < 0.012,
+            "{quand}, couper l'EQ change le niveau : crête {crete}, attendu {attendu} \
+             (préampli {preampli:.2} dB gardé, décision du 10/10)"
+        );
+    }
+    // L'égaliseur ne compte plus comme monté, mais le préampli reste porté.
     assert!(!sortie.has_eq());
     assert!(
+        sortie.eq.lock().unwrap().is_some(),
+        "le préampli gardé doit rester dans la chaîne"
+    );
+}
+
+/// Décision de Bertrand du 10/10, seconde partie : tant que l'égaliseur reste
+/// COUPÉ, le préampli gardé vaut pour TOUTES les pistes suivantes, sans saut.
+/// Le début de piste passe par `set_eq(None)` (l'EQ de la zone est coupé) :
+/// avant, il retirait le neutre et le niveau remontait d'un coup à 0 dB.
+#[test]
+fn le_preampli_garde_vaut_pour_les_pistes_suivantes_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    let eq = egaliseur_a_preampli_negatif_5215();
+    let preampli = eq.preamp_db(0).expect("préampli chiffré");
+    assert!(
+        preampli < -10.0,
+        "prémisse : grosse réserve ({preampli} dB)"
+    );
+    sortie.set_eq(Some(eq));
+    let attendu = (AMPLITUDE_5215 * 10f64.powf(preampli / 20.0)) as f32;
+
+    let mut trame = 0;
+    let mut signal = jouer_5215(&sortie, &mut trame, 20);
+    sortie.replace_eq_live(None);
+    signal.extend(jouer_5215(&sortie, &mut trame, 60));
+    // Deux pistes suivantes, l'égaliseur toujours coupé.
+    for piste in 1..=2 {
+        sortie.set_eq(None);
+        let debut = signal.len();
+        signal.extend(jouer_5215(&sortie, &mut trame, 30));
+        let crete = crete_5215(&signal[debut..]);
+        assert!(
+            (crete / attendu - 1.0).abs() < 0.012,
+            "piste suivante n°{piste}, égaliseur coupé : crête {crete}, attendu {attendu} \
+             (le préampli {preampli:.2} dB gardé doit valoir pour les pistes suivantes, \
+             décision du 10/10)"
+        );
+    }
+    let marche = plus_grande_marche_5215(&signal);
+    assert!(
+        marche <= MARCHE_MAX_5215,
+        "un saut de {marche} entre deux échantillons au changement de piste (seuil {MARCHE_MAX_5215})"
+    );
+    assert!(!sortie.has_eq(), "l'égaliseur ne compte pas comme actif");
+}
+
+/// Sous PURE, rien ne reste monté : le préampli gardé n'est pas reporté.
+#[test]
+fn sous_pure_le_preampli_garde_n_est_pas_reporte_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    sortie.set_eq(Some(egaliseur_a_preampli_negatif_5215()));
+    let mut trame = 0;
+    jouer_5215(&sortie, &mut trame, 5);
+    sortie.replace_eq_live(None);
+    jouer_5215(&sortie, &mut trame, 60);
+    sortie.pure_bypass.store(true, Ordering::Relaxed);
+    sortie.set_eq(None);
+    assert!(
         sortie.eq.lock().unwrap().is_none(),
-        "la rampe finie, plus rien ne doit rester monté"
+        "PURE : le neutre qui garde le préampli a été reporté sur la piste suivante"
+    );
+}
+
+/// Un égaliseur sans préampli (aucune bande qui pousse) : la coupure finie,
+/// rien ne reste monté — la chaîne redevient celle d'un EQ absent.
+#[test]
+fn couper_un_egaliseur_sans_preampli_ne_laisse_rien_de_monte_5215() {
+    let sortie = LocalOutput::new("Casque".to_string());
+    sortie.set_compensation_de_niveau(false);
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 8000.0,
+            gain: -6.0,
+            q: 1.0,
+            band_type: "peak".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let eq = crate::audio::eq::EqProcessor::new(&profil, TAUX_5215, 2);
+    assert!(eq.preamp_db(0).unwrap_or(0.0).abs() < 1e-9);
+    sortie.set_eq(Some(eq));
+    let mut trame = 0;
+    jouer_5215(&sortie, &mut trame, 10);
+    sortie.replace_eq_live(None);
+    jouer_5215(&sortie, &mut trame, 60);
+    assert!(
+        sortie.eq.lock().unwrap().is_none(),
+        "sans préampli à garder, la rampe finie ne laisse rien de monté"
     );
 }
 
@@ -4356,6 +4449,7 @@ async fn l_interrupteur_de_compensation_ne_fait_aucune_bouffee_5227() {
 // remontait à 1 AU RAPPEL, d'un coup, pendant que l'anneau jouait encore les
 // échantillons de l'égaliseur (qui portaient la compensation) : une marche de
 // toute la compensation (~+12 dB, Levente +10,4 dB), AVANT le fondu de 200 ms
+// (300 ms depuis le 10/10, et la coupure garde désormais le préampli)
 // — qui, lui, fondait entre deux signaux de même niveau. Les témoins de #5227
 // ne la voyaient pas : ils jouent à −20 dB, où la compensation passe en
 // entier. Ceux-ci rejouent la géométrie anneau + volume à 100 % et à 50 %.
@@ -4402,13 +4496,21 @@ async fn verifier_la_bascule_sans_marche_5215(volume: f64, activer: bool) {
          entre deux échantillons au DAC (seuil {MARCHE_MAX_5215}) — le volume saute au \
          rappel au lieu de laisser la bascule au fondu (régimes {avant} → {fin})"
     );
-    // La bascule a bien changé le niveau : le témoin n'est pas un fondu
-    // entre deux régimes égaux.
-    let (bas, haut) = if activer { (fin, avant) } else { (avant, fin) };
-    assert!(
-        haut > 2.0 * bas,
-        "le banc veut une vraie différence de niveau : {avant} → {fin}"
-    );
+    if activer {
+        // L'activation a bien changé le niveau : le témoin n'est pas un fondu
+        // entre deux régimes égaux.
+        assert!(
+            avant > 2.0 * fin,
+            "le banc veut une vraie différence de niveau : {avant} → {fin}"
+        );
+    } else {
+        // Décision du 10/10 : couper garde le préampli, le niveau ne bouge
+        // pas (il remontait de toute la réserve rabotée, ici ×9).
+        assert!(
+            (fin / avant - 1.0).abs() < 0.012,
+            "couper l'égaliseur au volume {volume} change le niveau : {avant} → {fin}"
+        );
+    }
 }
 
 #[tokio::test]
