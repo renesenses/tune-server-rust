@@ -47,6 +47,7 @@ pub mod journal_de_test;
 pub mod library;
 pub mod license;
 pub mod lyrics;
+pub mod memoire_rendue;
 pub mod metadata;
 pub mod notifications;
 pub mod orchestrator;

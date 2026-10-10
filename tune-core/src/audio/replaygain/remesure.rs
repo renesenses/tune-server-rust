@@ -71,18 +71,19 @@ pub const SEUIL_DE_RELANCE: i64 = 50;
 /// candidates parcourt `tracks` : une fois par minute, pas plus.
 const ATTENTE: Duration = Duration::from_secs(60);
 
-/// Les clés de piste effacées : la mesure, sa provenance, sa version et le
-/// témoin qui ferait sauter la piste à la passe.
+/// Les clés de piste effacées : la mesure, sa provenance, ses versions (celle
+/// de la crête vraie et sa marque d'échec, #2713, comprises) et le témoin qui
+/// ferait sauter la piste à la passe.
 const CLES_DE_PISTE: &str = "'rg_track_gain', 'rg_track_peak', 'rg_track_true_peak', \
-     'rg_track_source', 'rg_algo', 'rg_analyzed'";
+     'rg_track_source', 'rg_algo', 'rg_true_peak_algo', 'rg_true_peak_echec', 'rg_analyzed'";
 
 /// Les clés d'album effacées, sur les seules pistes où l'album est de Tune
 /// (`rg_album_source = analysis`). Le gain d'album se calcule sur les gains de
 /// piste : sans cela, il garderait la valeur faite des anciennes mesures. La
 /// passe d'albums le refait quand toutes les pistes de l'album ont de nouveau
 /// leur gain.
-const CLES_D_ALBUM: &str =
-    "'rg_album_gain', 'rg_album_peak', 'rg_album_true_peak', 'rg_album_source'";
+const CLES_D_ALBUM: &str = "'rg_album_gain', 'rg_album_peak', 'rg_album_true_peak', \
+     'rg_album_true_peak_algo', 'rg_album_source'";
 
 /// Une campagne tourne dans ce processus.
 static EN_COURS: AtomicBool = AtomicBool::new(false);

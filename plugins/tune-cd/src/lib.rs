@@ -1,4 +1,5 @@
-//! Greffon natif « cd » (#4863) : lire un CD audio SANS l'extraire.
+//! Greffon natif « cd » (#4863) : lire un CD audio vers une zone, et
+//! l'extraire vers la bibliothèque (#2466, module [`extraction`]).
 //!
 //! Le disque tourne dans le lecteur de la machine qui fait tourner Tune ; le
 //! greffon en lit les secteurs audio en temps réel et les remet au chemin de
@@ -27,13 +28,17 @@
 //! précédente, le pré-armement gapless et l'avance dans la piste passent par
 //! l'orchestrateur sans rien lui apprendre du CD.
 //!
-//! ## Hors de ce greffon
+//! ## L'extraction (#2466)
 //!
-//! L'extraction vers la bibliothèque (#2466).
+//! Le module [`extraction`] lit le même lecteur, piste par piste, en FLAC
+//! ou en WAV, balise, range dans un emplacement de la bibliothèque et
+//! demande un scan ciblé. Il vit ICI, pas dans un greffon voisin : voir
+//! l'en-tête du module.
 
 pub mod cddafs;
 pub mod discid;
 pub mod ejection;
+pub mod extraction;
 pub mod flux;
 pub mod fournisseur;
 pub mod hote;
@@ -72,11 +77,16 @@ pub struct HostServices {
     pub orchestrator: Arc<PlaybackOrchestrator>,
     /// Pour la longueur de file et l'état de lecture des zones.
     pub playback: Arc<PlaybackManager>,
+    /// #2466 — le scan ciblé d'un dossier après une extraction. `None` :
+    /// les fichiers attendent le prochain scan.
+    pub scan: Option<Arc<dyn extraction::ScanCible>>,
 }
 
 pub struct CdPlugin {
     services: HostServices,
     surveillance: Option<tokio::task::JoinHandle<()>>,
+    /// #2466 — pour annuler une extraction en cours au retrait du greffon.
+    extractions: Option<Arc<extraction::Extractions>>,
 }
 
 impl CdPlugin {
@@ -84,6 +94,7 @@ impl CdPlugin {
         Self {
             services,
             surveillance: None,
+            extractions: None,
         }
     }
 }
@@ -97,7 +108,7 @@ impl TunePlugin for CdPlugin {
         tune_core::version()
     }
     fn description(&self) -> &str {
-        "Lecture directe d'un CD audio vers une zone, sans extraction (Linux, macOS et Windows)"
+        "Lecture directe d'un CD audio vers une zone, et extraction en FLAC ou WAV vers la bibliothèque (Linux, macOS et Windows)"
     }
     /// Opt-in : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -120,12 +131,19 @@ impl TunePlugin for CdPlugin {
         });
         let zones: ZonesDuDisque = Arc::default();
         let reveil = Arc::new(tokio::sync::Notify::new());
+        let extractions = Arc::new(extraction::Extractions::new(
+            self.services.backend.clone(),
+            ctx.event_bus.clone(),
+            self.services.scan.clone(),
+        ));
+        self.extractions = Some(extractions.clone());
         let etat_routes = routes::EtatRoutes {
             lecteur: lecteur.clone(),
             hote: hote.clone(),
             consultation: musicbrainz::MusicBrainz::new(),
             zones: zones.clone(),
             reveil: reveil.clone(),
+            extraction: Some(extractions.clone()),
         };
         // #5065 — la source `cd` du registre commun des sources physiques.
         let publication = Arc::new(source::PublicationSource::new(
@@ -158,6 +176,11 @@ impl TunePlugin for CdPlugin {
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
+        // #2466 — une extraction en cours s'arrête au prochain bloc et retire
+        // son fichier provisoire.
+        if let Some(t) = self.extractions.take().and_then(|e| e.en_cours()) {
+            t.annuler();
+        }
         self.services.orchestrator.sources_pcm().retirer(SOURCE);
         if let Some(h) = self.surveillance.take() {
             h.abort();
