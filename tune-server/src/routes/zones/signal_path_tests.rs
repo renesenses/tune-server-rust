@@ -488,6 +488,25 @@ fn local_signal_path_uses_the_runtime_backend_contract_and_its_reason() {
     );
 }
 
+/// #4176 — PURE allumé, rien d'armé : l'étape DSP le dit en clair au lieu
+/// d'annoncer « DSP contourné par PURE » sur un chemin déjà intact.
+#[test]
+fn pure_sans_objet_est_dit_dans_l_etape_dsp() {
+    let (zone, mut ps, backend) = local_runtime_zone(100.0, OutputVolumeState::Unity, Vec::new());
+    if let Some(runtime) = ps.output_signal_path.as_mut() {
+        runtime.bit_perfect = true;
+        runtime.dsp = OutputDspState::PureSansObjet;
+    }
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DAC"), "WASAPI", None).unwrap();
+
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("PURE actif : aucun traitement armé, rien à contourner")
+    );
+}
+
 /// Monte une zone locale Windows dont la sonde a publié `reasons`.
 fn local_runtime_zone(
     volume_percent: f64,
@@ -4635,4 +4654,52 @@ fn source_inconnue_n_est_plus_annoncee_flac_16_44_2119() {
         !tout.contains("0Hz/0bit") && !tout.contains("0kHz/0bit"),
         "pas de chiffres nuls affichés : {tout}"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #2211 — l'étape « Fondu enchaîné », déclarée par la sortie pendant le
+// recouvrement, et lui seul.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn un_fondu_enchaine_declare_s_annonce_et_fait_tomber_le_verdict() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles =
+        Some(transformations_mesurees(96_000, 2, false).avec_fondu_enchaine(true));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "Fondu enchaîné").as_deref(),
+        Some("Deux pistes superposées le temps du fondu enchaîné"),
+        "le chemin du signal annonce l'étape pendant le recouvrement"
+    );
+    assert_eq!(
+        sp.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(false),
+        "deux pistes additionnées : plus rien n'est bit-perfect"
+    );
+
+    // Contre-épreuve : la même mesure, hors recouvrement.
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 2, false));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(step_desc(&sp, "Fondu enchaîné"), None);
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
 }

@@ -13,6 +13,7 @@
 //! | Reprise sans recréer | [`modele::PlaylistDuLot::restant_a_verser`] |
 //! | Snapshot daté avant tout transfert, retour en arrière SANS suppression (#4718) | [`snapshots`] |
 //! | Liens auto-sync : ajouts seulement, disparitions signalées, journal, aperçu avant la première synchro (#4719) | [`liens`] |
+//! | Seul moteur de transfert du serveur, bibliothèque locale comprise des deux côtés ; ISRC d'abord, puis le classement (#4741) | [`appariement::apparier_chez`] |
 //!
 //! # L'appariement (Bertrand, 22/09/2026)
 //!
@@ -49,5 +50,7 @@ mod banc;
 mod essais;
 #[cfg(test)]
 mod essais_liens;
+#[cfg(test)]
+mod essais_moteur_unique;
 #[cfg(test)]
 mod essais_snapshots;

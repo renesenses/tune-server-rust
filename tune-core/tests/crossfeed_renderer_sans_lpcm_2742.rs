@@ -353,6 +353,7 @@ async fn un_renderer_sans_lpcm_entend_le_crossfeed_sur_un_flux_de_service_2742()
                 track_number: None,
                 disc_number: None,
                 album_ref: None,
+                artist_ref: None,
             }],
         )
         .unwrap();

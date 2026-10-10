@@ -109,6 +109,7 @@ async fn file_qobuz(state: &AppState, zone_id: i64) {
         track_number: None,
         disc_number: None,
         album_ref: None,
+        artist_ref: None,
     })
     .collect();
     repo.append(zone_id, &items).expect("mise en file");
@@ -262,6 +263,7 @@ async fn une_file_de_stations_garde_son_suivant() {
         track_number: None,
         disc_number: None,
         album_ref: None,
+        artist_ref: None,
     })
     .collect();
     repo.append(zid, &items).expect("mise en file");

@@ -49,11 +49,47 @@ pub struct StreamingFavorite {
     /// Absent du JSON dans ce cas, pour que la forme rendue ne change pas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_generated: Option<bool>,
+    /// #5997 — l'état du favori dans le MIROIR du service : `synchro` (le
+    /// service l'a confirmé) ou `ajout_en_attente` (posé dans Tune, pas encore
+    /// confirmé chez le service). Absent hors miroir et sur une ligne d'avant
+    /// la rc4 : la forme rendue ne change pas pour elles. Une ligne
+    /// `retrait_en_attente` n'est jamais rendue par la liste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miroir_etat: Option<String>,
+    /// #5997 — le dernier motif d'échec chez le service, absent après un
+    /// succès.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miroir_erreur: Option<String>,
 }
 
 /// Engine-agnostic SQL builders.
 pub mod sql {
     use super::SqlDialect;
+    use crate::db::engine::Engine;
+
+    /// `col` comparé au profil lié en `idx`-ième position (#5997).
+    ///
+    /// Sur PostgreSQL, `streaming_favorites.profile_id` n'est pas toujours
+    /// BIGINT : une table posée par `PG_FULL_SCHEMA` (bascule SQLite → PG) le
+    /// déclare TEXT, et seule la migration 060 le convertit. Le dépôt lie un
+    /// `i64` : `text = bigint` n'existe pas, et la lecture tombait (CI
+    /// `pg_5997`, répétition rc4). La comparaison se fait donc en texte des
+    /// deux côtés, juste quel que soit le type de la colonne. SQLite compare
+    /// directement, comme avant.
+    pub fn profil_egal<D: SqlDialect>(d: &D, col: &str, idx: usize) -> String {
+        match d.engine() {
+            Engine::Postgres => format!("{col}::text = ({})::text", d.placeholder(idx)),
+            Engine::Sqlite => format!("{col} = {}", d.placeholder(idx)),
+        }
+    }
+
+    /// La négation de [`profil_egal`].
+    pub fn profil_different<D: SqlDialect>(d: &D, col: &str, idx: usize) -> String {
+        match d.engine() {
+            Engine::Postgres => format!("{col}::text <> ({})::text", d.placeholder(idx)),
+            Engine::Sqlite => format!("{col} <> {}", d.placeholder(idx)),
+        }
+    }
 
     pub fn add<D: SqlDialect>(d: &D) -> String {
         // created_at is filled with the engine's own "now" SQL expression
@@ -118,10 +154,10 @@ pub mod sql {
         // positionnels, un `?1` répété n'y est pas un placeholder numéroté.
         format!(
             "UPDATE streaming_favorites SET created_at = {} \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {} \
                AND (created_at IS NULL OR created_at != {})",
             d.placeholder(1),
-            d.placeholder(2),
+            profil_egal(d, "profile_id", 2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
@@ -140,10 +176,10 @@ pub mod sql {
     pub fn premiere_vue_si_absente<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE streaming_favorites SET first_seen_at = {} \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {} \
                AND first_seen_at IS NULL",
             d.now_iso8601(),
-            d.placeholder(1),
+            profil_egal(d, "profile_id", 1),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
@@ -156,10 +192,10 @@ pub mod sql {
     pub fn completer_album_ref<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE streaming_favorites SET album_ref = {} \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {} \
                AND album_ref IS NULL",
             d.placeholder(1),
-            d.placeholder(2),
+            profil_egal(d, "profile_id", 2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
@@ -171,9 +207,9 @@ pub mod sql {
     pub fn poser_ia<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE streaming_favorites SET ai_generated = {} \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
             d.placeholder(1),
-            d.placeholder(2),
+            profil_egal(d, "profile_id", 2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
@@ -201,8 +237,8 @@ pub mod sql {
     pub fn album_ref<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT album_ref FROM streaming_favorites \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
-            d.placeholder(1),
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
+            profil_egal(d, "profile_id", 1),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
@@ -212,8 +248,8 @@ pub mod sql {
     pub fn remove<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM streaming_favorites \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
-            d.placeholder(1),
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
+            profil_egal(d, "profile_id", 1),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
@@ -223,8 +259,8 @@ pub mod sql {
     pub fn count_one<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM streaming_favorites \
-             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
-            d.placeholder(1),
+             WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
+            profil_egal(d, "profile_id", 1),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
@@ -236,21 +272,30 @@ pub mod sql {
     // l'insérer ailleurs décalerait silencieusement le rang manuel.
     // `ai_generated` (#5530) suit `first_seen_at`, à l'indice 11 dans les
     // DEUX listes ; `position` passe donc en 12.
-    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated \
+    //
+    // #5997 — `miroir_etat` et `miroir_erreur` suivent `ai_generated`, aux
+    // indices 12 et 13 dans les DEUX listes ; `position` passe donc en 14.
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur \
          FROM streaming_favorites";
+
+    /// #5997 — un retrait demandé dans Tune et pas encore confirmé par le
+    /// service est MASQUÉ : l'auditeur a retiré son cœur, il ne doit pas le
+    /// voir revenir pendant que le serveur retente.
+    const HORS_RETRAIT_EN_ATTENTE: &str =
+        "(miroir_etat IS NULL OR miroir_etat <> 'retrait_en_attente')";
 
     pub fn list_all<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS} WHERE profile_id = {} ORDER BY created_at DESC",
-            d.placeholder(1)
+            "{SELECT_COLS} WHERE {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
+            profil_egal(d, "profile_id", 1),
         )
     }
 
     pub fn list_by_type<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS} WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
-            d.placeholder(1),
-            d.placeholder(2)
+            "{SELECT_COLS} WHERE {} AND item_type = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
+            profil_egal(d, "profile_id", 1),
+            d.placeholder(2),
         )
     }
 
@@ -259,41 +304,41 @@ pub mod sql {
     /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
     /// n'est lue que par le tri manuel et n'entre JAMAIS dans
     /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
-    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, position \
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position \
          FROM streaming_favorites";
 
     pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} ORDER BY created_at DESC",
-            d.placeholder(1)
+            "{SELECT_COLS_POUR_RANG} WHERE {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
+            profil_egal(d, "profile_id", 1),
         )
     }
 
     pub fn list_by_type_pour_rang<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{SELECT_COLS_POUR_RANG} WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
-            d.placeholder(1),
-            d.placeholder(2)
+            "{SELECT_COLS_POUR_RANG} WHERE {} AND item_type = {} AND {HORS_RETRAIT_EN_ATTENTE} ORDER BY created_at DESC",
+            profil_egal(d, "profile_id", 1),
+            d.placeholder(2),
         )
     }
 
     /// Efface le rang manuel de tout un onglet avant d'en reposer un.
     pub fn raz_ordre_manuel<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE streaming_favorites SET position = NULL WHERE profile_id = {} AND item_type = {}",
-            d.placeholder(1),
-            d.placeholder(2)
+            "UPDATE streaming_favorites SET position = NULL WHERE {} AND item_type = {}",
+            profil_egal(d, "profile_id", 1),
+            d.placeholder(2),
         )
     }
 
     pub fn poser_rang_manuel<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE streaming_favorites SET position = {} WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {}",
+            "UPDATE streaming_favorites SET position = {} WHERE {} AND item_type = {} AND service = {} AND service_id = {}",
             d.placeholder(1),
-            d.placeholder(2),
+            profil_egal(d, "profile_id", 2),
             d.placeholder(3),
             d.placeholder(4),
-            d.placeholder(5)
+            d.placeholder(5),
         )
     }
 }
@@ -619,10 +664,10 @@ impl StreamingFavoritesRepo {
                 self.db.query_many(&sql, &params)?
             };
             favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
-                // 12 et non 10 : `first_seen_at` puis `ai_generated` (#5530)
-                // se sont glissés entre `created_at` et `position` dans
-                // SELECT_COLS_POUR_RANG.
-                r.get(12).and_then(|v| v.as_i64())
+                // 14 et non 10 : `first_seen_at`, `ai_generated` (#5530) puis
+                // `miroir_etat` et `miroir_erreur` (#5997) se sont glissés
+                // entre `created_at` et `position` dans SELECT_COLS_POUR_RANG.
+                r.get(14).and_then(|v| v.as_i64())
             });
             return Ok(rows.iter().map(row_to_streaming_favorite).collect());
         }
@@ -707,6 +752,8 @@ fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
             .get(11)
             .and_then(|v| v.as_string())
             .and_then(|v| marquage_ia_lu(&v)),
+        miroir_etat: cols.get(12).and_then(|v| v.as_string()),
+        miroir_erreur: cols.get(13).and_then(|v| v.as_string()),
     }
 }
 
@@ -1003,14 +1050,13 @@ mod tests {
             "WHERE profile_id = ? AND item_type = ? AND service = ? AND service_id = ?"
         ));
         assert!(sql::poser_rang_manuel(&PostgresDialect).ends_with(
-            "WHERE profile_id = $2 AND item_type = $3 AND service = $4 AND service_id = $5"
+            "WHERE profile_id::text = ($2)::text AND item_type = $3 AND service = $4 AND service_id = $5"
         ));
         // Le rang doit etre LU, et seulement par la requete dediee : la
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
-        assert!(
-            sql::list_by_type_pour_rang(&SqliteDialect)
-                .contains("created_at, first_seen_at, ai_generated, position")
-        );
+        assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains(
+            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position"
+        ));
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }
 

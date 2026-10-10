@@ -155,8 +155,8 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// désigner un autre enregistrement. Une piste locale étiquetée
 /// `FR-Z12-88-00001` ne pouvait donc pas se rattacher à sa jumelle Qobuz
 /// `FRZ128800001` — et c'est ce chemin que suivent le transfert de playlist
-/// (`routes/playlist_manager.rs:318`), les radios (`routes/radios.rs:1876`)
-/// et `playlist_transfer.rs:96`.
+/// (le greffon « Playlists converter », par `host_streaming_match_track`,
+/// seul moteur depuis #4741) et les radios (`routes/radios.rs:1876`).
 ///
 /// L'arbitrage du 01/09/2026 sur #2264 retient l'ISRC comme clé d'identité du
 /// groupe de versions. Une clé ne peut pas se comparer de deux façons : c'est
