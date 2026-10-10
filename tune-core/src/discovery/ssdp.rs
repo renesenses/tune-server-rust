@@ -1151,6 +1151,14 @@ fn build_renderer_device(
         "scpd_urls".into(),
         serde_json::to_value(desc.scpd_urls()).unwrap_or_default(),
     );
+    // Même clé que la découverte mDNS. Absente quand la description ne porte
+    // aucune version : l'absence ne vaut pas « version changée ».
+    if !desc.version_logicielle.is_empty() {
+        device.capabilities.insert(
+            "firmware".into(),
+            serde_json::Value::String(desc.version_logicielle.clone()),
+        );
+    }
     // We just fetched the description over TCP, so the ARP cache has this host:
     // recover the MAC (stable identity + brand display) while it is warm.
     super::mac::enrich_identity(&mut device);

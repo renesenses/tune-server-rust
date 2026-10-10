@@ -691,6 +691,87 @@ pub fn copie_de_moindre_qualite_exclue() -> String {
     )
 }
 
+/// Le SOCLE de la vue des pistes — alias `t` : les trois prédicats que
+/// `GET /library/tracks` pose TOUJOURS, hors de toute facette (#5977).
+///
+/// - albums masqués ([`hidden_tracks_excluded`], #1391) ;
+/// - pistes d'un album distant doublé par un local
+///   ([`pistes_album_distant_double_exclu`], #4146) ;
+/// - copie de moindre qualité ([`copie_de_moindre_qualite_exclue`], #4101).
+///
+/// Une SEULE définition pour la liste (`TrackRepo::conditions_du_filtre`) et
+/// pour le rail (`routes/library/facets.rs`, `build_conditions`, qui sert aussi
+/// `albums-detailed`, la facette Dossiers et les collections). Les deux
+/// derniers prédicats avaient été ajoutés à la liste seule (14/09 et 17/09) :
+/// chez Dominique Pamingle (fil 2180), chaque effectif du rail était le DOUBLE
+/// du total du bandeau. Un prédicat ajouté ici l'est aux deux à la fois.
+pub fn socle_de_la_vue_des_pistes(engine: Engine) -> [String; 3] {
+    [
+        hidden_tracks_excluded().to_string(),
+        pistes_album_distant_double_exclu(engine),
+        copie_de_moindre_qualite_exclue(),
+    ]
+}
+
+/// Les identifiants des pistes que les deux replis COÛTEUX du socle écartent
+/// — double distant (#4146) et copie de moindre qualité (#4101) —, alias `t`,
+/// bâtis sur les MÊMES fragments que [`socle_de_la_vue_des_pistes`] : une
+/// piste est dans ce jeu si et seulement si la liste la replie pour l'une de
+/// ces deux raisons. Les deux prédicats rendent vrai ou faux, jamais NULL :
+/// la négation est exacte.
+///
+/// #5977 — le rail évalue une vingtaine de requêtes sur le même socle.
+/// Chacune rejouait les deux sous-requêtes corrélées sur toute la
+/// bibliothèque : mesuré sur 104 317 pistes, le rail passait de 0,8 à 1,8 s.
+/// Résolu UNE fois par requête HTTP, le socle se pose ensuite en
+/// `t.id NOT IN (…)`.
+///
+/// Deux branches, chacune EXACTE et bornée à ses candidates :
+///
+/// - double distant : `NOT pistes_album_distant_double_exclu(t)` vaut
+///   « l'album de `t` est un album distant doublé par un local » — le même
+///   [`double_par_un_local`], évalué sur les albums (quelques milliers) et
+///   non sur chaque piste ;
+/// - copie de moindre qualité : une piste écartée a, dans son album, une
+///   sœur de même clé (disque, numéro, titre) ; seuls les albums où une clé
+///   se répète sont donc candidats (lecture de `idx_tracks_cle_de_copie`),
+///   et [`copie_de_moindre_qualite_exclue`] tranche parmi leurs pistes.
+pub fn sql_pistes_ecartees_par_le_socle(engine: Engine) -> String {
+    sql_pistes_ecartees(engine, None)
+}
+
+/// [`sql_pistes_ecartees_par_le_socle`], limité aux albums `albums` (liste
+/// SQL d'entiers, `12,57,…`) — #5993 : la facette Dossiers n'a besoin que
+/// des pistes repliées de SON dossier. La restriction porte sur l'ALBUM, pas
+/// sur le chemin : une copie se départage contre toutes les pistes de son
+/// album, même rangées ailleurs, exactement comme dans la liste.
+pub fn sql_pistes_ecartees_parmi_les_albums(engine: Engine, albums: &str) -> String {
+    sql_pistes_ecartees(engine, Some(albums))
+}
+
+fn sql_pistes_ecartees(engine: Engine, albums: Option<&str>) -> String {
+    let (parmi_dist, parmi_pistes) = match albums {
+        Some(a) => (
+            format!(" AND dist.id IN ({a})"),
+            format!(" AND album_id IN ({a})"),
+        ),
+        None => (String::new(), String::new()),
+    };
+    format!(
+        "SELECT t.id FROM tracks t WHERE t.album_id IN \
+           (SELECT dist.id FROM albums dist WHERE {double}{parmi_dist}) \
+         UNION \
+         SELECT t.id FROM tracks t WHERE t.album_id IN \
+           (SELECT album_id FROM tracks WHERE album_id IS NOT NULL{parmi_pistes} \
+            GROUP BY album_id, COALESCE(disc_number, 1), COALESCE(track_number, 0), \
+                     LOWER(TRIM(COALESCE(title, ''))) \
+            HAVING COUNT(*) > 1) \
+         AND NOT ({copie})",
+        double = double_par_un_local(engine, "dist"),
+        copie = copie_de_moindre_qualite_exclue(),
+    )
+}
+
 /// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
 /// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
 ///

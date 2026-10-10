@@ -395,7 +395,8 @@ pub fn router_with_plugins(
     state: AppState,
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
-    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path);
+    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()

@@ -1349,6 +1349,12 @@ fn assembler_les_etapes(
                 false,
             )),
             OutputDspState::BypassedPure => Some(("DSP contourné par PURE", true)),
+            // #4176 — PURE allumé sur un chemin déjà intact : le dire, plutôt
+            // que d'annoncer un contournement qui ne change rien.
+            OutputDspState::PureSansObjet => Some((
+                "PURE actif : aucun traitement armé, rien à contourner",
+                true,
+            )),
             OutputDspState::BypassedDop => Some(("DSP contourné pour DoP", true)),
             OutputDspState::Unknown => Some(("État DSP indéterminé", false)),
             OutputDspState::Inactive => None,
