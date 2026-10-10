@@ -918,6 +918,10 @@ pub struct PlaybackManager {
     /// #4384 — ce que la sortie locale qui joue la zone demandait avant le
     /// rabot à l'unité. Voir [`GainDemande`]. Absent = pas de sortie locale.
     gains_demandes: std::sync::Mutex<HashMap<i64, GainDemande>>,
+    /// #4969 — la sonde de la carte des canaux de la sortie locale de chaque
+    /// zone. Voir [`Self::carte_des_canaux`].
+    sondes_des_canaux:
+        std::sync::Mutex<HashMap<i64, crate::audio::carte_des_canaux::SondeDesCanaux>>,
 }
 
 impl Default for PlaybackManager {
@@ -940,6 +944,7 @@ impl PlaybackManager {
             horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
             cretes_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_demandes: std::sync::Mutex::new(HashMap::new()),
+            sondes_des_canaux: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -987,6 +992,42 @@ impl PlaybackManager {
             .lock()
             .expect("gains_demandes lock")
             .remove(&zone_id);
+        // Et sa carte des canaux (#4969) : un rendu réseau n'a pas la
+        // réaffectation de l'ancien DAC.
+        self.sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .remove(&zone_id);
+    }
+
+    /// #4969 — partage la sonde de la carte des canaux de la sortie locale qui
+    /// va jouer cette zone. Voir [`Self::carte_des_canaux`].
+    pub fn brancher_la_carte_des_canaux(
+        &self,
+        zone_id: i64,
+        sonde: crate::audio::carte_des_canaux::SondeDesCanaux,
+    ) {
+        self.sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .insert(zone_id, sonde);
+    }
+
+    /// #4969 — ce que l'adaptation des canaux de la sortie locale fait de
+    /// chaque canal de la source, relu à chaque appel (une réaffectation
+    /// changée en cours de piste est suivie). `None` sans sortie locale
+    /// branchée, ou hors lecture.
+    pub fn carte_des_canaux(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::carte_des_canaux::CarteDesCanaux> {
+        let sonde = self
+            .sondes_des_canaux
+            .lock()
+            .expect("sondes_des_canaux lock")
+            .get(&zone_id)
+            .cloned()?;
+        sonde()
     }
 
     /// #4384 — partage le registre des crêtes APRÈS DSP de la sortie locale

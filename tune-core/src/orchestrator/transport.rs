@@ -1814,6 +1814,10 @@ impl PlaybackOrchestrator {
                     // 0 dB » au lieu d'un préampli qui ne fait rien.
                     self.playback
                         .brancher_le_gain_demande(zone_id, local_output.gain_demande());
+                    // #4969 — et sa carte des canaux : les niveaux par canal
+                    // décrivent les voies qui sortent, après réaffectation.
+                    self.playback
+                        .brancher_la_carte_des_canaux(zone_id, local_output.sonde_des_canaux());
                     return;
                 }
             }

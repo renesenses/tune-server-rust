@@ -425,12 +425,17 @@ fn spawn_paced_levels_forwarder_mesure(
             // sortie locale et en DoP : rien n'y est raboté.
             let gain_demande_units = playback.gain_demande_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
-            let mut lvl = crate::audio::levels::compute_levels_avec_gain(
+            // #4969 — la carte des canaux de la sortie locale : les niveaux
+            // par canal décrivent alors les voies qui SORTENT (réaffectation
+            // #6044, disposition déclarée #6057), pas l'ordre du fichier.
+            let carte = playback.carte_des_canaux(zone_id);
+            let mut lvl = crate::audio::levels::compute_levels_vers_la_sortie(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
                 gain,
+                carte.as_ref(),
             );
             // #4384 — la CRÊTE, elle, se lit sur les échantillons tels qu'ils
             // partent vers le DAC quand la sortie locale les a relevés : après
@@ -455,8 +460,7 @@ fn spawn_paced_levels_forwarder_mesure(
             bus.emit(
                 "playback.audio_levels",
                 avec_les_niveaux_par_canal(
-                    &lvl.canaux,
-                    raw.channels,
+                    &lvl,
                     avec_le_gain_demande(
                         gain_demande_units,
                         serde_json::json!({
@@ -592,10 +596,14 @@ fn avec_le_gain_demande(
 }
 
 /// #4969 — champs ADDITIFS de `playback.audio_levels`, posés seulement à partir
-/// de trois canaux : `channel_levels`, le niveau de chaque canal dans l'ordre
-/// du flux (`rms_db`, `peak_db`, `over`), et `channel_names`, le nom de chaque
-/// canal dans l'ordre par défaut FLAC/WAV quand il en existe un (voir
-/// [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+/// de trois canaux : `channel_levels`, le niveau de chaque canal (`rms_db`,
+/// `peak_db`, `over`), et `channel_names`, le nom de chaque canal quand il en
+/// existe un (voir [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+///
+/// Sur une sortie locale branchée, ces canaux sont ceux du PÉRIPHÉRIQUE,
+/// après réaffectation (#6044) et routage par la disposition déclarée
+/// (#6057), et `output_channels` en donne le nombre ; un repli vers la
+/// stéréo n'en pose aucun. Ailleurs, ils suivent l'ordre de la source.
 ///
 /// En stéréo rien ne change : un client ancien, application iOS comprise, ne
 /// voit aucun champ de plus, et un client neuf se garde de leur absence.
@@ -603,15 +611,14 @@ fn avec_le_gain_demande(
 /// rendu réseau qui replie la piste en stéréo (#4573), il n'a plus que deux
 /// canaux, et ces champs restent absents.
 fn avec_les_niveaux_par_canal(
-    canaux: &[crate::audio::levels::NiveauDeCanal],
-    channels: u16,
+    lvl: &crate::audio::levels::AudioLevels,
     mut niveaux: serde_json::Value,
 ) -> serde_json::Value {
-    if canaux.is_empty() {
+    if lvl.canaux.is_empty() {
         return niveaux;
     }
     niveaux["channel_levels"] = serde_json::Value::Array(
-        canaux
+        lvl.canaux
             .iter()
             .map(|c| {
                 serde_json::json!({
@@ -622,8 +629,11 @@ fn avec_les_niveaux_par_canal(
             })
             .collect(),
     );
-    if let Some(noms) = crate::audio::levels::noms_des_canaux_par_defaut(channels) {
+    if let Some(noms) = lvl.noms_des_canaux {
         niveaux["channel_names"] = serde_json::json!(noms);
+    }
+    if let Some(sorties) = lvl.canaux_de_sortie {
+        niveaux["output_channels"] = serde_json::json!(sorties);
     }
     niveaux
 }
@@ -1952,6 +1962,10 @@ mod niveaux_frein_3818;
 /// #4969 — un flux multicanal publie le niveau de chaque canal.
 #[cfg(test)]
 mod niveaux_par_canal_4969;
+/// #4969 — les niveaux par canal suivent les voies qui SORTENT : un vrai WAV
+/// 5.1, un canal à la fois, à travers réaffectation et disposition.
+#[cfg(test)]
+mod niveaux_par_canal_de_sortie_4969;
 #[cfg(test)]
 mod niveaux_relais_unique_5078_5051;
 #[cfg(test)]
