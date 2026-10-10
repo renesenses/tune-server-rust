@@ -202,28 +202,99 @@ const COLONNES_TRACKS_FTS: &str = "title, artist_name, album_title, genre, compo
 /// (`upgrade_fts5_tables`) et du schéma de base : `CORE_SCHEMA` les pose en
 /// `IF NOT EXISTS` à chaque démarrage, un autre nom en aurait ajouté une
 /// seconde série.
+///
+/// # #5919 — `contentless_delete=1`, et l'on retire une ligne par son `rowid`
+///
+/// Les déclencheurs retiraient l'ancienne ligne par la commande
+/// `('delete', old.id, <anciennes valeurs>)`, qui exige les valeurs EXACTES
+/// indexées. Or l'artiste et le titre d'album y étaient RECALCULÉS au moment
+/// du retrait (`SELECT title FROM albums WHERE id = old.album_id`) : un album
+/// renommé entre-temps — reclassement en compilation pendant le scan,
+/// composition d'un coffret, édition — rendait le NOUVEAU titre, qui n'avait
+/// jamais été indexé pour cette piste. SQLite répond alors « database disk
+/// image is malformed », et c'est l'`UPDATE` de la piste qui échoue.
+///
+/// Conséquence mesurée (rapport du 06/10, 1.0.0-rc2) : les 2 217 pistes d'un
+/// coffret reclassé en compilation ne voyaient jamais leur `file_mtime` écrit,
+/// et le scan de démarrage les relisait toutes, à chaque démarrage.
+///
+/// Avec `contentless_delete=1` (SQLite ≥ 3.43, embarqué), une ligne se retire
+/// par `DELETE … WHERE rowid = old.id`, sans valeurs : le retrait ne peut plus
+/// dépendre de ce que sont devenus l'album ou l'artiste.
 pub fn sql_tracks_fts_avec_termes_de_chemin() -> String {
     let nouvelles = valeurs_tracks_fts_declencheur("new");
-    let anciennes = valeurs_tracks_fts_declencheur("old");
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(\
              {COLONNES_TRACKS_FTS}, \
              tokenize='unicode61 remove_diacritics 2', \
-             content='', content_rowid='id');\n\
+             content='', contentless_delete=1, content_rowid='id');\n\
          CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN \
              INSERT INTO tracks_fts(rowid, {COLONNES_TRACKS_FTS}) VALUES (new.id, {nouvelles}); \
          END;\n\
          CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN \
-             INSERT INTO tracks_fts(tracks_fts, rowid, {COLONNES_TRACKS_FTS}) \
-                 VALUES ('delete', old.id, {anciennes}); \
+             DELETE FROM tracks_fts WHERE rowid = old.id; \
              INSERT INTO tracks_fts(rowid, {COLONNES_TRACKS_FTS}) VALUES (new.id, {nouvelles}); \
          END;\n\
          CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN \
-             INSERT INTO tracks_fts(tracks_fts, rowid, {COLONNES_TRACKS_FTS}) \
-                 VALUES ('delete', old.id, {anciennes}); \
+             DELETE FROM tracks_fts WHERE rowid = old.id; \
          END;"
     )
 }
+
+/// Marque, dans le SQL d'une table FTS5, qu'elle accepte le retrait par
+/// `rowid` (#5919).
+const SUPPRESSION_PAR_ROWID: &str = "contentless_delete=1";
+
+/// `albums_fts` et ses trois déclencheurs (#5919, même règle que
+/// [`sql_tracks_fts_avec_termes_de_chemin`]) : l'artiste d'un album renommé
+/// ne fait plus échouer l'`UPDATE` de l'album.
+pub fn sql_albums_fts() -> String {
+    "CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(\
+         title, artist_name, genre, \
+         tokenize='unicode61 remove_diacritics 2', \
+         content='', contentless_delete=1, content_rowid='id');\n\
+     CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN \
+         INSERT INTO albums_fts(rowid, title, artist_name, genre) \
+         VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), new.genre); \
+     END;\n\
+     CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN \
+         DELETE FROM albums_fts WHERE rowid = old.id; \
+         INSERT INTO albums_fts(rowid, title, artist_name, genre) \
+         VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), new.genre); \
+     END;\n\
+     CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN \
+         DELETE FROM albums_fts WHERE rowid = old.id; \
+     END;"
+        .to_string()
+}
+
+/// `artists_fts` et ses trois déclencheurs (#5919).
+pub fn sql_artists_fts() -> String {
+    "CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(\
+         name, sort_name, \
+         tokenize='unicode61 remove_diacritics 2', \
+         content='', contentless_delete=1, content_rowid='id');\n\
+     CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN \
+         INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); \
+     END;\n\
+     CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN \
+         DELETE FROM artists_fts WHERE rowid = old.id; \
+         INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); \
+     END;\n\
+     CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN \
+         DELETE FROM artists_fts WHERE rowid = old.id; \
+     END;"
+        .to_string()
+}
+
+/// Remplir `albums_fts` depuis `albums` (table vide).
+pub const SQL_REMPLIR_ALBUMS_FTS: &str = "INSERT INTO albums_fts(rowid, title, artist_name, genre) \
+     SELECT a.id, a.title, (SELECT name FROM artists WHERE id = a.artist_id), a.genre \
+     FROM albums a";
+
+/// Remplir `artists_fts` depuis `artists` (table vide).
+pub const SQL_REMPLIR_ARTISTS_FTS: &str =
+    "INSERT INTO artists_fts(rowid, name, sort_name) SELECT id, name, sort_name FROM artists";
 
 /// Remplir `tracks_fts` depuis `tracks` (la table doit être vide : après un
 /// `delete-all`, ou juste créée). Partagé par la reconstruction manuelle, la
@@ -257,15 +328,76 @@ fn tracks_fts_a_les_termes_de_chemin(conn: &Connection) -> bool {
     let table = sql_de("table", "tracks_fts");
     // `content=''` : une table héritée du schéma de base (`content='tracks'`)
     // n'est pas celle que les déclencheurs alimentent.
+    // #5919 — et `contentless_delete=1` : sans lui, les déclencheurs
+    // retiraient par valeurs, et un album renommé faisait échouer l'`UPDATE`.
     table.contains(COLONNE_TERMES_DE_CHEMIN)
         && table.contains("content=''")
-        && [
-            "tracks_fts_insert",
-            "tracks_fts_update",
-            "tracks_fts_delete",
-        ]
-        .iter()
-        .all(|t| sql_de("trigger", t).contains("cue_media_path"))
+        && table.contains(SUPPRESSION_PAR_ROWID)
+        && ["tracks_fts_insert", "tracks_fts_update"]
+            .iter()
+            .all(|t| sql_de("trigger", t).contains("cue_media_path"))
+        && ["tracks_fts_update", "tracks_fts_delete"]
+            .iter()
+            .all(|t| sql_de("trigger", t).contains("rowid = old.id"))
+}
+
+/// #5919 — mise à niveau IDEMPOTENTE de `albums_fts` et `artists_fts` vers
+/// le retrait par `rowid`, même forme que [`assurer_termes_de_chemin`] :
+/// rejouée à chaque démarrage, elle lit `sqlite_master` et ne recrée une
+/// table qu'une fois. La recréation REPART des tables sources : un index
+/// déjà abîmé par un retrait aux valeurs fausses en sort réparé.
+///
+/// Rend le nombre de tables recréées. UNE transaction par table : un échec
+/// laisse l'ancien index en place.
+pub fn assurer_retrait_par_rowid(conn: &Connection) -> Result<usize, String> {
+    let mut recreees = 0usize;
+    for (table, creation, remplissage) in [
+        ("albums", sql_albums_fts(), SQL_REMPLIR_ALBUMS_FTS),
+        ("artists", sql_artists_fts(), SQL_REMPLIR_ARTISTS_FTS),
+    ] {
+        let fts = format!("{table}_fts");
+        let sql_de = |kind: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![kind, name],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default()
+        };
+        let a_jour = sql_de("table", &fts).contains(SUPPRESSION_PAR_ROWID)
+            && ["update", "delete"]
+                .iter()
+                .all(|q| sql_de("trigger", &format!("{fts}_{q}")).contains("rowid = old.id"));
+        if a_jour {
+            continue;
+        }
+        let debut = std::time::Instant::now();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("transaction : {e}"))?;
+        tx.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {fts}_insert;\
+             DROP TRIGGER IF EXISTS {fts}_update;\
+             DROP TRIGGER IF EXISTS {fts}_delete;\
+             DROP TABLE IF EXISTS {fts};"
+        ))
+        .map_err(|e| format!("{fts} : suppression de l'ancien index : {e}"))?;
+        tx.execute_batch(&creation)
+            .map_err(|e| format!("{fts} : création de l'index : {e}"))?;
+        let n = tx
+            .execute(remplissage, [])
+            .map_err(|e| format!("{fts} : remplissage de l'index : {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("{fts} : validation : {e}"))?;
+        info!(
+            table = %fts,
+            lignes = n,
+            ms = debut.elapsed().as_millis() as u64,
+            "fts_retrait_par_rowid_pose"
+        );
+        recreees += 1;
+    }
+    Ok(recreees)
 }
 
 /// Mise à niveau IDEMPOTENTE de `tracks_fts` vers les termes de chemin
@@ -466,14 +598,7 @@ pub fn rebuild_fts_contentless(conn: &Connection) -> Result<i64, String> {
         Ok(_) => {}
         Err(e) => warn!(error = %e, "fts_rebuild_delete_albums_fts"),
     }
-    match conn.execute(
-        "INSERT INTO albums_fts(rowid, title, artist_name, genre) \
-         SELECT a.id, a.title, \
-                (SELECT name FROM artists WHERE id = a.artist_id), \
-                a.genre \
-         FROM albums a",
-        [],
-    ) {
+    match conn.execute(SQL_REMPLIR_ALBUMS_FTS, []) {
         Ok(n) => {
             total_rows += n as i64;
             info!(rows = n, "fts_rebuild_albums_fts");
@@ -486,11 +611,7 @@ pub fn rebuild_fts_contentless(conn: &Connection) -> Result<i64, String> {
         Ok(_) => {}
         Err(e) => warn!(error = %e, "fts_rebuild_delete_artists_fts"),
     }
-    match conn.execute(
-        "INSERT INTO artists_fts(rowid, name, sort_name) \
-         SELECT id, name, sort_name FROM artists",
-        [],
-    ) {
+    match conn.execute(SQL_REMPLIR_ARTISTS_FTS, []) {
         Ok(n) => {
             total_rows += n as i64;
             info!(rows = n, "fts_rebuild_artists_fts");
@@ -874,6 +995,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fts_search(&conn, "tracks", "Karajan", 10), vec![8]);
+    }
+
+    /// Une piste, son album et son artiste, indexés par les déclencheurs.
+    fn bibliotheque_5919(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'Haydn');\
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Disc 13', 1);\
+             INSERT INTO tracks (id, title, album_id, artist_id, file_path) VALUES \
+               (1, 'Symphony no. 104', 1, 1, '/m/Disc 77/01.flac');",
+        )
+        .unwrap();
+    }
+
+    /// #5919 — un album renommé (reclassement en compilation pendant le scan,
+    /// composition d'un coffret, édition) ne doit pas faire échouer
+    /// l'écriture de ses pistes. Avant : « database disk image is
+    /// malformed », et le `file_mtime` de la piste n'était jamais écrit.
+    #[test]
+    fn un_album_renomme_n_empeche_plus_d_ecrire_ses_pistes_5919() {
+        let db = test_db();
+        let conn = db.connection().lock().unwrap();
+        bibliotheque_5919(&conn);
+        conn.execute(
+            "UPDATE albums SET title = 'The History Of Classical Music' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tracks SET file_mtime = 1750000000.25 WHERE id = 1",
+            [],
+        )
+        .expect("#5919 : l'écriture d'une piste dont l'album a été renommé");
+        // L'index suit : la piste réécrite porte le nouveau titre d'album.
+        assert_eq!(fts_search(&conn, "tracks", "History", 10), vec![1]);
+        assert_eq!(fts_search(&conn, "tracks", "Symphony", 10), vec![1]);
+        // Un artiste renommé : ni l'album ni la piste ne se bloquent.
+        conn.execute("UPDATE artists SET name = 'Joseph Haydn' WHERE id = 1", [])
+            .unwrap();
+        conn.execute("UPDATE albums SET genre = 'Classique' WHERE id = 1", [])
+            .expect("#5919 : l'écriture d'un album dont l'artiste a été renommé");
+        conn.execute("UPDATE tracks SET title = 'Symphonie 104' WHERE id = 1", [])
+            .expect("#5919 : l'écriture d'une piste dont l'artiste a été renommé");
+        assert_eq!(fts_search(&conn, "albums", "Joseph", 10), vec![1]);
+        // Et la suppression, qui retirait elle aussi par valeurs.
+        conn.execute("DELETE FROM tracks WHERE id = 1", [])
+            .expect("#5919 : suppression d'une piste après renommages");
+        conn.execute("DELETE FROM albums WHERE id = 1", [])
+            .expect("#5919 : suppression d'un album après renommage de l'artiste");
+        assert_eq!(
+            fts_search(&conn, "tracks", "Symphonie", 10),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            fts_search(&conn, "albums", "History", 10),
+            Vec::<i64>::new()
+        );
+    }
+
+    /// #5919 — la mise à niveau du démarrage : une base à l'index d'avant
+    /// (retrait par valeurs), déjà ABÎMÉE par un renommage, est recréée et
+    /// réparée une fois ; le second passage ne fait rien.
+    #[test]
+    fn une_base_d_avant_5919_est_reparee_au_demarrage_une_seule_fois() {
+        let db = test_db();
+        let conn = db.connection().lock().unwrap();
+        // Les trois index tels que la migration 12 et #5192 les laissaient.
+        let anciennes = valeurs_tracks_fts_declencheur("old");
+        let nouvelles = valeurs_tracks_fts_declencheur("new");
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS tracks_fts_insert; DROP TRIGGER IF EXISTS tracks_fts_update;\
+             DROP TRIGGER IF EXISTS tracks_fts_delete; DROP TABLE IF EXISTS tracks_fts;\
+             DROP TRIGGER IF EXISTS albums_fts_insert; DROP TRIGGER IF EXISTS albums_fts_update;\
+             DROP TRIGGER IF EXISTS albums_fts_delete; DROP TABLE IF EXISTS albums_fts;\
+             DROP TRIGGER IF EXISTS artists_fts_insert; DROP TRIGGER IF EXISTS artists_fts_update;\
+             DROP TRIGGER IF EXISTS artists_fts_delete; DROP TABLE IF EXISTS artists_fts;\
+             CREATE VIRTUAL TABLE tracks_fts USING fts5({COLONNES_TRACKS_FTS},\
+               tokenize='unicode61 remove_diacritics 2', content='', content_rowid='id');\
+             CREATE TRIGGER tracks_fts_insert AFTER INSERT ON tracks BEGIN \
+               INSERT INTO tracks_fts(rowid, {COLONNES_TRACKS_FTS}) VALUES (new.id, {nouvelles}); END;\
+             CREATE TRIGGER tracks_fts_update AFTER UPDATE ON tracks BEGIN \
+               INSERT INTO tracks_fts(tracks_fts, rowid, {COLONNES_TRACKS_FTS}) VALUES ('delete', old.id, {anciennes}); \
+               INSERT INTO tracks_fts(rowid, {COLONNES_TRACKS_FTS}) VALUES (new.id, {nouvelles}); END;\
+             CREATE TRIGGER tracks_fts_delete AFTER DELETE ON tracks BEGIN \
+               INSERT INTO tracks_fts(tracks_fts, rowid, {COLONNES_TRACKS_FTS}) VALUES ('delete', old.id, {anciennes}); END;\
+             CREATE VIRTUAL TABLE albums_fts USING fts5(title, artist_name, genre,\
+               tokenize='unicode61 remove_diacritics 2', content='', content_rowid='id');\
+             CREATE TRIGGER albums_fts_insert AFTER INSERT ON albums BEGIN \
+               INSERT INTO albums_fts(rowid, title, artist_name, genre) VALUES (new.id, new.title, \
+               (SELECT name FROM artists WHERE id = new.artist_id), new.genre); END;\
+             CREATE TRIGGER albums_fts_update AFTER UPDATE ON albums BEGIN \
+               INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre) VALUES ('delete', old.id, old.title, \
+               (SELECT name FROM artists WHERE id = old.artist_id), old.genre); \
+               INSERT INTO albums_fts(rowid, title, artist_name, genre) VALUES (new.id, new.title, \
+               (SELECT name FROM artists WHERE id = new.artist_id), new.genre); END;\
+             CREATE VIRTUAL TABLE artists_fts USING fts5(name, sort_name,\
+               tokenize='unicode61 remove_diacritics 2', content='', content_rowid='id');\
+             CREATE TRIGGER artists_fts_insert AFTER INSERT ON artists BEGIN \
+               INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); END;\
+             CREATE TRIGGER artists_fts_update AFTER UPDATE ON artists BEGIN \
+               INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name); \
+               INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); END;"
+        ))
+        .unwrap();
+        bibliotheque_5919(&conn);
+        conn.execute(
+            "UPDATE albums SET title = 'The History Of Classical Music' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        // Le défaut, tel que la base d'un testeur le porte.
+        let avant = conn.execute("UPDATE tracks SET file_mtime = 1.5 WHERE id = 1", []);
+        assert!(
+            avant.is_err(),
+            "témoin : l'ancien index refuse l'écriture ({avant:?})"
+        );
+
+        assert_eq!(assurer_termes_de_chemin(&conn).unwrap(), Some(1));
+        assert_eq!(assurer_retrait_par_rowid(&conn).unwrap(), 2);
+        conn.execute("UPDATE tracks SET file_mtime = 1.5 WHERE id = 1", [])
+            .expect("#5919 : réparée au démarrage");
+        assert_eq!(fts_search(&conn, "tracks", "History", 10), vec![1]);
+        assert_eq!(fts_search(&conn, "albums", "History", 10), vec![1]);
+        assert_eq!(fts_search(&conn, "artists", "Haydn", 10), vec![1]);
+        assert_eq!(assurer_termes_de_chemin(&conn).unwrap(), None);
+        assert_eq!(assurer_retrait_par_rowid(&conn).unwrap(), 0, "déjà fait");
     }
 
     /// Mesure (#5192) : taille de l'index et temps de reconstruction, sur une
