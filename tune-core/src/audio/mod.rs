@@ -23,6 +23,9 @@ pub mod decode;
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
 pub mod dff;
+/// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
+/// DFF) et le routage par position vers la sortie.
+pub mod disposition_canaux;
 /// Dither TPDF — UNE implémentation, partagée par tous les étages qui
 /// repassent du flottant à l'entier (#4075, #4076).
 pub mod dither;

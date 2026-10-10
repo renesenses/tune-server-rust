@@ -90,6 +90,7 @@ impl DspAuRepos {
             crossfeed: &self.crossfeed,
             pure_bypass: &self.pure_bypass,
             mono_downmix: &self.mono_downmix,
+            disposition: &crate::outputs::local::SANS_DISPOSITION,
             dop_active: &self.dop_active,
             volume: &self.volume,
             user_volume: &self.user_volume,
