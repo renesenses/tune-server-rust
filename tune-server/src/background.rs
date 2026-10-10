@@ -51,6 +51,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_reprise_favoris_streaming(state);
+    spawn_veille_favoris_miroir(state);
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
@@ -2480,6 +2481,50 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 comptes = %comptes,
                 "reprise_favoris_streaming_au_demarrage"
             );
+        }
+    });
+}
+
+/// La veille du miroir des favoris de service (#5997) : toutes les
+/// `TUNE_FAVORIS_MIROIR_PERIODE_S` (300 s par défaut, `0` la coupe), chaque
+/// service en miroir connecté est relu, réconcilié, et ses écritures en
+/// attente poussées. Un favori posé ou retiré dans l'application du service
+/// arrive ainsi dans Tune sans redémarrage, même écran fermé.
+///
+/// Le premier passage reste celui de [`spawn_reprise_favoris_streaming`], 90 s
+/// après le démarrage ; la veille commence une période plus tard.
+fn spawn_veille_favoris_miroir(state: &AppState) {
+    let Some(periode) = tune_core::streaming::favorites_mirror::periode() else {
+        info!("veille_favoris_miroir_coupee");
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REPRISE_FAVORIS_DELAI_SECS)).await;
+        loop {
+            tokio::time::sleep(periode).await;
+            let profil =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                    .get("active_profile_id")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|&id| id > 0)
+                    .unwrap_or(1);
+            let mut connectes = Vec::new();
+            for (nom, arc) in crate::routes::profiles::services_en_miroir(&state).await {
+                if arc.read().await.utilisable().await {
+                    connectes.push((nom, arc));
+                }
+            }
+            crate::routes::profiles::rafraichir_les_miroirs(
+                &state,
+                &connectes,
+                profil,
+                false,
+                std::time::Duration::from_secs(120),
+            )
+            .await;
         }
     });
 }

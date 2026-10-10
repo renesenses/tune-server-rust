@@ -2446,6 +2446,18 @@ WHERE m.key = 'rg_album_true_peak'
 ON CONFLICT (track_id, key) DO NOTHING;
 ";
 
+/// Les colonnes du miroir des favoris de service (#5997) : `miroir_etat`
+/// (`synchro`, `ajout_en_attente`, `retrait_en_attente`, NULL hors miroir),
+/// `miroir_erreur` (dernier motif d'échec chez le service) et `isrc` (le code
+/// d'enregistrement que le service donne, pour le rapprochement local #2127).
+/// TEXT des trois côtés, comme `album_ref` et `ai_generated`. Jumelles PG :
+/// `ENSURE_TABLES` / `ENSURE_COLUMNS` (postgres.rs) et `PG_FULL_SCHEMA`.
+pub(crate) fn favoris_miroir_colonnes(db: &SqliteDb) {
+    for col in ["miroir_etat", "miroir_erreur", "isrc"] {
+        add_column_if_missing(db, "streaming_favorites", col, "TEXT");
+    }
+}
+
 /// Les index de la migration 122 (#2264). L'expression est EXACTEMENT celle
 /// des requêtes par identifiant ([`SQL_ISRC_PLIE`], [`SQL_MBID_PLIE`]) :
 /// SQLite et PostgreSQL ne servent un index d'expression qu'à l'identique.
@@ -4155,6 +4167,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // aussi : l'écriture et la lecture des favoris de service la NOMMENT.
     // PG : migration 082.
     add_column_if_missing(db, "streaming_favorites", "ai_generated", "TEXT");
+    // Favoris de service en MIROIR (#5997, rc4) — colonnes SANS numéro de
+    // migration, sur le modèle de #5192 : la 122 / PG 086 est prise par #5953
+    // dans un autre lot, et un numéro sauté ne se rejoue jamais. Idempotent,
+    // NULL pour l'existant ; le premier rafraîchissement du miroir adopte les
+    // lignes d'avant (`tune_core::streaming::favorites_mirror`).
+    favoris_miroir_colonnes(db);
     // Clé du signal PCM et son témoin (migration 119, #5594) — posés ICI
     // aussi : la passe `taches_de_fond::cle_pcm` les NOMME, et une base
     // arrivée sans eux ne pourrait plus la faire tourner. PG : migration 083.

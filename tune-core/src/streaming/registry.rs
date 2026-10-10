@@ -80,6 +80,9 @@ impl ServiceRegistry {
                 // #4577 — annoncer ce que le service refuse, pour que l'écran
                 // n'offre pas un cœur qui rendra 501.
                 "favoris_ecrivables": svc.favoris_ecrivables(),
+                // #5997 — le serveur propage lui-même les cœurs de ce service
+                // et en tient le miroir : le client ne recopie plus.
+                "favoris_miroir": svc.favoris_miroir(),
             }));
         }
         results

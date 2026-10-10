@@ -37,6 +37,11 @@
 //! aujourd'hui les deux origines. Trancher cela demande une colonne d'origine
 //! et un arbitrage produit ; ajouter n'en demande aucun.
 //!
+//! **Arbitrage rendu le 08/10/2026 (#5997)** : pour les services en MIROIR
+//! (Qobuz, Tidal), c'est `favorites_mirror` qui tient la table — ajouts ET
+//! retraits, colonne d'origine `miroir_etat`. Cette reprise-ci ne sert plus
+//! qu'aux services hors miroir ; elle continue de ne rien retirer.
+//!
 //! # Deux dates, et une seule qui ne bouge pas
 //!
 //! Depuis renesenses/tune-web-client#1060, chaque ligne porte DEUX dates :
@@ -103,20 +108,27 @@ impl RepriseFavoris {
 }
 
 /// Un favori du service, réduit à ce que la table de Tune mémorise.
-struct Entree {
-    item_type: &'static str,
-    service_id: String,
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    cover_url: Option<String>,
+///
+/// `pub(crate)` depuis #5997 : le miroir (`favorites_mirror`) relit le
+/// service par la même projection que la reprise, pour qu'il n'y ait qu'une
+/// lecture des favoris d'un service.
+pub(crate) struct Entree {
+    pub(crate) item_type: &'static str,
+    pub(crate) service_id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) album: Option<String>,
+    pub(crate) cover_url: Option<String>,
     /// La date de mise en favori CHEZ LE SERVICE (ISO 8601), quand il la
     /// donne. `None` = la reprise datera au « maintenant » du moteur.
-    created_at: Option<String>,
+    pub(crate) created_at: Option<String>,
     /// Le marquage « généré par IA » de l'album (#5530) : celui de l'album
     /// pour un favori album, celui de son album pour une piste. `None` : le
     /// service ne dit rien.
-    ai_generated: Option<bool>,
+    pub(crate) ai_generated: Option<bool>,
+    /// L'ISRC d'une piste quand le service le donne (#5997, rapprochement
+    /// local #2127). `None` pour les albums et les artistes.
+    pub(crate) isrc: Option<String>,
 }
 
 /// Les entrées DATÉES d'un type, par `get_user_favorites_dated` (#3489) —
@@ -180,6 +192,7 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     // Greffé par le connecteur depuis l'album imbriqué
                     // (`QobuzService::favori_date`).
                     ai_generated: v.get("album_ai_generated").and_then(|x| x.as_bool()),
+                    isrc: texte(v, &["isrc"]).filter(|i| !i.trim().is_empty()),
                 },
                 "album" => Entree {
                     item_type,
@@ -190,6 +203,7 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     cover_url: texte(v, &["cover_path"]),
                     created_at: texte(v, &["created_at"]),
                     ai_generated: v.get("ai_generated").and_then(|x| x.as_bool()),
+                    isrc: None,
                 },
                 _ => Entree {
                     item_type,
@@ -200,10 +214,82 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                     cover_url: texte(v, &["image_path"]),
                     created_at: texte(v, &["created_at"]),
                     ai_generated: None,
+                    isrc: None,
                 },
             })
             .collect(),
     )
+}
+
+/// Les favoris d'UN type chez le service : la lecture datée d'abord (#3489),
+/// la lecture typée à défaut. `Err` quand le service n'a pas su rendre ce
+/// type — jeton expiré, panne réseau : l'appelant ne doit alors RIEN conclure
+/// de l'absence d'un favori (le miroir, #5997, n'en retire aucun).
+pub(crate) async fn lire_les_favoris(
+    svc: &dyn StreamingService,
+    fav_type: &str,
+) -> Result<Vec<Entree>, String> {
+    if let Some(datees) = entrees_datees(svc, fav_type).await {
+        return Ok(datees);
+    }
+    let entrees = match fav_type {
+        "tracks" => svc
+            .get_user_tracks()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|t| Entree {
+                item_type: "track",
+                service_id: t.id,
+                title: Some(t.title),
+                artist: Some(t.artist),
+                album: t.album,
+                cover_url: t.cover_path,
+                created_at: None,
+                ai_generated: None,
+                isrc: t.isrc.filter(|i| !i.trim().is_empty()),
+            })
+            .collect(),
+        "albums" => svc
+            .get_user_albums()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| Entree {
+                item_type: "album",
+                service_id: a.id,
+                // `title` porte le titre de l'album, `album` reste vide :
+                // c'est la forme qu'écrit déjà le cœur cliqué dans Tune, et la
+                // liste des favoris affiche `title`.
+                title: Some(a.title),
+                artist: Some(a.artist),
+                album: None,
+                cover_url: a.cover_path,
+                created_at: None,
+                ai_generated: a.ai_generated,
+                isrc: None,
+            })
+            .collect(),
+        "artists" => svc
+            .get_user_artists()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| Entree {
+                item_type: "artist",
+                service_id: a.id,
+                title: Some(a.name),
+                artist: None,
+                album: None,
+                cover_url: a.image_path,
+                created_at: None,
+                ai_generated: None,
+                isrc: None,
+            })
+            .collect(),
+        autre => return Err(format!("type de favori non relu : {autre}")),
+    };
+    Ok(entrees)
 }
 
 /// Reprend les favoris d'UN service dans le profil `profile_id`.
@@ -221,86 +307,15 @@ pub async fn reprendre_les_favoris_du_service(
     let repo = StreamingFavoritesRepo::with_backend(backend.clone());
     let mut total = RepriseFavoris::default();
 
-    let pistes = if let Some(datees) = entrees_datees(svc, "tracks").await {
-        datees
-    } else {
-        match svc.get_user_tracks().await {
-            Ok(items) => items
-                .into_iter()
-                .map(|t| Entree {
-                    item_type: "track",
-                    service_id: t.id,
-                    title: Some(t.title),
-                    artist: Some(t.artist),
-                    album: t.album,
-                    cover_url: t.cover_path,
-                    created_at: None,
-                    ai_generated: None,
-                })
-                .collect(),
+    for fav_type in ["tracks", "albums", "artists"] {
+        match lire_les_favoris(svc, fav_type).await {
+            Ok(entrees) => total.cumuler(enregistrer(&repo, profile_id, &service, entrees)),
             Err(e) => {
-                warn!(service = %service, r#type = "tracks", erreur = %e, "reprise_favoris_service_illisible");
+                warn!(service = %service, r#type = fav_type, erreur = %e, "reprise_favoris_service_illisible");
                 total.echecs += 1;
-                Vec::new()
             }
         }
-    };
-    total.cumuler(enregistrer(&repo, profile_id, &service, pistes));
-
-    let albums = if let Some(datees) = entrees_datees(svc, "albums").await {
-        datees
-    } else {
-        match svc.get_user_albums().await {
-            Ok(items) => items
-                .into_iter()
-                .map(|a| Entree {
-                    item_type: "album",
-                    service_id: a.id,
-                    // `title` porte le titre de l'album, `album` reste vide :
-                    // c'est la forme qu'écrit déjà le cœur cliqué dans Tune, et la
-                    // liste des favoris affiche `title`.
-                    title: Some(a.title),
-                    artist: Some(a.artist),
-                    album: None,
-                    cover_url: a.cover_path,
-                    created_at: None,
-                    ai_generated: a.ai_generated,
-                })
-                .collect(),
-            Err(e) => {
-                warn!(service = %service, r#type = "albums", erreur = %e, "reprise_favoris_service_illisible");
-                total.echecs += 1;
-                Vec::new()
-            }
-        }
-    };
-    total.cumuler(enregistrer(&repo, profile_id, &service, albums));
-
-    let artistes = if let Some(datees) = entrees_datees(svc, "artists").await {
-        datees
-    } else {
-        match svc.get_user_artists().await {
-            Ok(items) => items
-                .into_iter()
-                .map(|a| Entree {
-                    item_type: "artist",
-                    service_id: a.id,
-                    title: Some(a.name),
-                    artist: None,
-                    album: None,
-                    cover_url: a.image_path,
-                    created_at: None,
-                    ai_generated: None,
-                })
-                .collect(),
-            Err(e) => {
-                warn!(service = %service, r#type = "artists", erreur = %e, "reprise_favoris_service_illisible");
-                total.echecs += 1;
-                Vec::new()
-            }
-        }
-    };
-    total.cumuler(enregistrer(&repo, profile_id, &service, artistes));
+    }
 
     if total.ajoutes > 0 || total.echecs > 0 {
         info!(
@@ -632,6 +647,7 @@ mod tests_dates {
             cover_url: None,
             created_at: None,
             ai_generated: ia,
+            isrc: None,
         };
         enregistrer(
             &repo,
