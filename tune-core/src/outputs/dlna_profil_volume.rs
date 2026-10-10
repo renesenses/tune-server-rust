@@ -87,6 +87,35 @@ impl ProfilVolume {
         self.min + (v * etendue).round() as u32
     }
 
+    /// #2147 — la consigne dans l'unité de l'appareil, quand on sait le niveau
+    /// qu'il tient déjà (`precedent`).
+    ///
+    /// Sur une plage étroite (0–31, 0–60), un cran de 1 % — celui d'une
+    /// flèche du clavier sur le curseur — retombe, à l'arrondi, sur le niveau
+    /// déjà tenu : l'ordre part, rien ne change, et la relecture du volume
+    /// ramène le curseur en arrière. Les flèches semblaient mortes alors que
+    /// la souris, qui saute plusieurs crans, marchait (Sevy Tabroc, fil 2147).
+    /// Une consigne qui demande un AUTRE volume que celui tenu bouge donc
+    /// l'appareil d'au moins un cran, dans le sens demandé.
+    pub fn niveau_depuis(&self, volume: f64, precedent: Option<u32>) -> u32 {
+        let niveau = self.niveau(volume);
+        let Some(tenu) = precedent.filter(|p| (self.min..=self.max).contains(p)) else {
+            return niveau;
+        };
+        if niveau != tenu || !volume.is_finite() {
+            return niveau;
+        }
+        let actuel = self.fraction(f64::from(tenu));
+        let v = volume.clamp(0.0, 1.0);
+        if v > actuel + 1e-6 && tenu < self.max {
+            tenu + 1
+        } else if v + 1e-6 < actuel && tenu > self.min {
+            tenu - 1
+        } else {
+            niveau
+        }
+    }
+
     /// Un niveau rapporté par l'appareil, ramené à 0,0–1,0.
     pub fn fraction(&self, niveau: f64) -> f64 {
         let etendue = f64::from(self.max.saturating_sub(self.min));
@@ -184,6 +213,49 @@ mod tests {
       <stateVariable sendEvents="no"><name>A_ARG_TYPE_Channel</name><dataType>string</dataType>
         <allowedValueList><allowedValue>LF</allowedValue><allowedValue>RF</allowedValue></allowedValueList></stateVariable>
     </serviceStateTable></scpd>"#;
+
+    /// #2147 — sur une plage 0–31, une flèche (±1 %) doit bouger l'appareil
+    /// d'un cran ; sans le niveau tenu, la conversion reste celle d'avant.
+    #[test]
+    fn une_fleche_bouge_d_au_moins_un_cran_sur_une_plage_etroite() {
+        let p = ProfilVolume {
+            min: 0,
+            max: 31,
+            canaux: Vec::new(),
+        };
+        // L'appareil tient 16, que le curseur affiche 16/31 ≈ 0,516. Une flèche
+        // vers le haut demande 0,526, vers le bas 0,506 : à l'arrondi, 16 tous
+        // les deux.
+        let tenu = p.fraction(16.0);
+        assert_eq!(
+            p.niveau(tenu + 0.01),
+            16,
+            "prémisse : l'arrondi seul ne bouge pas"
+        );
+        assert_eq!(
+            p.niveau(tenu - 0.01),
+            16,
+            "prémisse : l'arrondi seul ne bouge pas"
+        );
+        assert_eq!(
+            p.niveau_depuis(tenu + 0.01, Some(16)),
+            17,
+            "flèche haut : un cran de plus"
+        );
+        assert_eq!(
+            p.niveau_depuis(tenu - 0.01, Some(16)),
+            15,
+            "flèche bas : un cran de moins"
+        );
+        // Le même volume renvoyé ne bouge rien, et les bornes tiennent.
+        assert_eq!(p.niveau_depuis(tenu, Some(16)), 16);
+        assert_eq!(p.niveau_depuis(1.0, Some(31)), 31);
+        assert_eq!(p.niveau_depuis(0.0, Some(0)), 0);
+        // Un saut de plusieurs crans (la souris) garde sa conversion.
+        assert_eq!(p.niveau_depuis(0.8, Some(16)), p.niveau(0.8));
+        // Sans niveau connu : la conduite d'avant.
+        assert_eq!(p.niveau_depuis(tenu + 0.01, None), 16);
+    }
 
     #[test]
     fn un_scpd_standard_garde_la_conduite_d_avant() {
