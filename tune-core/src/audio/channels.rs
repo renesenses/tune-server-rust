@@ -163,8 +163,34 @@ impl ChannelLayout {
 
 /// Return a badge string for a given channel count.
 /// Returns `None` for mono/stereo.
+///
+/// Sans disposition déclarée, c'est l'ordre par défaut de FLAC et de
+/// WAVE_FORMAT_EXTENSIBLE qui nomme les canaux (`Disposition::par_defaut`) :
+/// 3 → 3.0, 4 → 4.0 (quad), 5 → 5.0, 7 → 6.1. Ils tombaient avant dans la
+/// disposition nommée supérieure — un FLAC 4.0 s'affichait « 5.1 ».
 pub fn channel_badge(channels: u16) -> Option<&'static str> {
-    ChannelLayout::from_channel_count(channels).badge()
+    match channels {
+        3 => Some("3.0"),
+        4 => Some("4.0"),
+        5 => Some("5.0"),
+        7 => Some("6.1"),
+        _ => ChannelLayout::from_channel_count(channels).badge(),
+    }
+}
+
+/// Le badge d'une piste dont le fichier est `chemin` : la disposition que le
+/// fichier DÉCLARE (masque WAV, tag FLAC, DSF, DFF — `disposition_canaux`)
+/// quand elle existe et compte bien `channels` canaux, sinon le nombre de
+/// canaux. Le fichier n'est ouvert que pour une piste multicanal.
+pub fn channel_badge_declare(chemin: Option<&std::path::Path>, channels: u16) -> Option<String> {
+    if channels <= 2 {
+        return None;
+    }
+    chemin
+        .and_then(super::disposition_canaux::lire_le_fichier)
+        .filter(|d| d.canaux() == channels)
+        .and_then(|d| d.badge())
+        .or_else(|| channel_badge(channels).map(String::from))
 }
 
 // ---------------------------------------------------------------------------

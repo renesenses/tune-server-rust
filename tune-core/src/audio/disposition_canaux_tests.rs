@@ -278,3 +278,90 @@ fn l_adaptation_commune_ne_perd_plus_l_arriere_d_un_4_0() {
         "4.0 vers 6 voies, en entiers aussi"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Le badge sous la pochette suit la disposition DÉCLARÉE (« Catherine of
+// Aragon », Rick Wakeman : FLAC 4.0, masque 0x0033, affiché « 5.1 »).
+// ---------------------------------------------------------------------------
+
+fn piste(chemin: &std::path::Path, canaux: i32) -> crate::db::models::Track {
+    let mut t = crate::db::models::Track::new("Catherine of Aragon".into());
+    t.file_path = Some(chemin.to_string_lossy().into_owned());
+    t.channels = canaux;
+    t
+}
+
+fn badge_json(t: &crate::db::models::Track) -> serde_json::Value {
+    t.to_json()["channel_badge"].clone()
+}
+
+#[test]
+fn badge_flac_quad_masque_0x33_est_4_0() {
+    let (_d, c) = ecrire(&flac(4, Some("0x0033")), "flac");
+    assert_eq!(badge_json(&piste(&c, 4)), serde_json::json!("4.0"));
+}
+
+#[test]
+fn badge_flac_masque_0x3f_est_5_1() {
+    let (_d, c) = ecrire(&flac(6, Some("0x003F")), "flac");
+    assert_eq!(badge_json(&piste(&c, 6)), serde_json::json!("5.1"));
+}
+
+#[test]
+fn badge_flac_masque_0x63f_est_7_1() {
+    let (_d, c) = ecrire(&flac(8, Some("0x063F")), "flac");
+    assert_eq!(badge_json(&piste(&c, 8)), serde_json::json!("7.1"));
+}
+
+#[test]
+fn badge_suit_le_masque_et_non_le_compte() {
+    // 6 canaux sans LFE (FL FR FC BL BR BC) : un 6.0, pas un 5.1.
+    let (_d, c) = ecrire(&flac(6, Some("0x0137")), "flac");
+    assert_eq!(badge_json(&piste(&c, 6)), serde_json::json!("6.0"));
+    // 5.0 (FL FR FC BL BR) et 5.1.2 (hauteurs avant).
+    let (_d2, c2) = ecrire(&flac(5, Some("0x0037")), "flac");
+    assert_eq!(badge_json(&piste(&c2, 5)), serde_json::json!("5.0"));
+    let (_d3, c3) = ecrire(&flac(8, Some("0x503F")), "flac");
+    assert_eq!(badge_json(&piste(&c3, 8)), serde_json::json!("5.1.2"));
+    // WAV extensible quadriphonique.
+    let (_d4, c4) = ecrire(&wav(4, 0x33), "wav");
+    assert_eq!(badge_json(&piste(&c4, 4)), serde_json::json!("4.0"));
+}
+
+#[test]
+fn badge_sans_declaration_suit_le_nombre_de_canaux() {
+    let (_d, c) = ecrire(&flac(4, None), "flac");
+    assert_eq!(badge_json(&piste(&c, 4)), serde_json::json!("4.0"));
+    let mut sans_fichier = crate::db::models::Track::new("x".into());
+    for (n, attendu) in [
+        (3, "3.0"),
+        (4, "4.0"),
+        (5, "5.0"),
+        (6, "5.1"),
+        (7, "6.1"),
+        (8, "7.1"),
+    ] {
+        sans_fichier.channels = n;
+        assert_eq!(
+            badge_json(&sans_fichier),
+            serde_json::json!(attendu),
+            "{n} canaux"
+        );
+    }
+    sans_fichier.channels = 2;
+    assert_eq!(badge_json(&sans_fichier), serde_json::Value::Null);
+    // Un masque qui ne compte pas les canaux du fichier ne fait pas foi.
+    let (_d5, c5) = ecrire(&flac(4, Some("0x003F")), "flac");
+    assert_eq!(badge_json(&piste(&c5, 4)), serde_json::json!("4.0"));
+}
+
+#[test]
+fn badge_de_disposition_direct() {
+    let d = |m: u32, n: u16| Disposition::depuis_masque(m, n).unwrap().badge();
+    assert_eq!(d(0x33, 4).as_deref(), Some("4.0"));
+    assert_eq!(d(0x3F, 6).as_deref(), Some("5.1"));
+    assert_eq!(d(0x60F, 6).as_deref(), Some("5.1"));
+    assert_eq!(d(0x63F, 8).as_deref(), Some("7.1"));
+    assert_eq!(d(0x3, 2), None);
+    assert_eq!(d(0x4, 1), None);
+}
