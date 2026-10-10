@@ -798,3 +798,7 @@ mod routage_tests {
         assert_eq!(noms.into_iter().collect::<Vec<_>>(), ["m::a"]);
     }
 }
+
+#[cfg(test)]
+#[path = "banc_rail_5993.rs"]
+mod banc_rail_5993;
