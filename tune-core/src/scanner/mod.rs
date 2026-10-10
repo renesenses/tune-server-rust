@@ -22,6 +22,13 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
     if name.starts_with("tune-stream-") || name.starts_with("tune-prefetch-") {
         return true;
     }
+    // #4770 : le cache de transcodage vit désormais sous le dossier de
+    // données, hors du dossier temporaire. Une bibliothèque qui englobe ce
+    // dossier (tout un profil utilisateur sous Windows) ne doit pas en faire
+    // des pistes fantômes : on le reconnaît à son préfixe, où qu'il soit.
+    if name.starts_with("tune-tcache-") {
+        return true;
+    }
     // La copie de travail de « Écrire dans les fichiers » (édition d'album,
     // tranche 4) : posée à CÔTÉ du fichier, le temps d'y écrire les balises,
     // puis renommée sur lui. Le surveillant ne doit jamais en faire une piste.
@@ -36,6 +43,13 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
 mod tune_temp_file_tests {
     use super::is_tune_temp_file;
     use std::path::Path;
+
+    #[test]
+    fn un_rendu_du_cache_de_transcodage_n_est_jamais_une_piste_4770() {
+        assert!(is_tune_temp_file(Path::new(
+            "/home/moi/Tune/cache/transcodage/tune-tcache-0123abcd.flac"
+        )));
+    }
 
     #[test]
     fn matches_stream_and_prefetch_names_anywhere() {

@@ -240,6 +240,9 @@ pub async fn run_with(opts: RunOptions) {
         );
         tracing::info!(dossier = %dossier.display(), "gel_executeur_releves");
         std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
+        // #4770 (arbitrage du 10/10) : le cache de transcodage quitte le
+        // dossier temporaire pour un dossier dédié sous les données.
+        let _ = tune_core::transcode_cache::installer_dans_les_donnees(&donnees);
     }
 
     // Image builders alone cannot protect appliances already in the field:
