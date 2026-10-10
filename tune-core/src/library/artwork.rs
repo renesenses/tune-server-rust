@@ -258,10 +258,54 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
 /// d'un coffret rangé un dossier par disque la cherche aussi dans le dossier
 /// qui les réunit (#5685, `library::pochette_disque`).
 pub fn image_de_pochette_dans(dossier: &Path) -> Option<PathBuf> {
-    FOLDER_COVER_NAMES
-        .iter()
-        .map(|name| dossier.join(name))
-        .find(|candidate| extended_path(candidate).exists())
+    // #6077 — on LISTE le dossier et on compare les noms sans casse : la liste
+    // fixe de `FOLDER_COVER_NAMES` ne voyait ni `Cover.JPG` sur un volume
+    // sensible à la casse, ni `AlbumArt_{…}_Large.jpg`, ni `cover.webp`.
+    match std::fs::read_dir(&*extended_path(dossier)) {
+        Ok(entrees) => entrees
+            .flatten()
+            .filter_map(|e| {
+                let nom = e.file_name().into_string().ok()?;
+                let rang = rang_de_pochette(&nom)?;
+                let chemin = dossier.join(&nom);
+                extended_path(&chemin)
+                    .is_file()
+                    .then_some((rang, nom, chemin))
+            })
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, _, chemin)| chemin),
+        // Dossier qu'on ne sait pas lister : l'ancienne sonde par noms fixes.
+        Err(_) => FOLDER_COVER_NAMES
+            .iter()
+            .map(|name| dossier.join(name))
+            .find(|candidate| extended_path(candidate).exists()),
+    }
+}
+
+/// Extensions d'image acceptées pour une pochette de dossier, dans l'ordre de
+/// préférence (#6077). Toutes sont servables par le cache
+/// ([`FORMATS_IMAGE_SERVABLES`]) : `jpeg` y est écrit `jpg`.
+const EXTENSIONS_DE_POCHETTE: &[&str] = &["jpg", "jpeg", "png", "webp"];
+
+/// Le rang d'un nom de fichier comme pochette de dossier, `None` s'il n'en est
+/// pas une (#6077). Comparaison SANS casse. Plus le rang est petit, plus le nom
+/// est prioritaire : `cover` < `folder` < `front` < `album` < `AlbumArt*`
+/// (Windows Media Player : `AlbumArt_{GUID}_Large.jpg` avant `…_Small.jpg` et
+/// `AlbumArtSmall.jpg`), puis, à nom égal, `jpg` < `jpeg` < `png` < `webp`.
+pub(crate) fn rang_de_pochette(nom: &str) -> Option<(u8, u8)> {
+    let bas = nom.to_ascii_lowercase();
+    let (radical, ext) = bas.rsplit_once('.')?;
+    let rang_ext = EXTENSIONS_DE_POCHETTE.iter().position(|e| *e == ext)? as u8;
+    let rang_nom = match radical {
+        "cover" => 0,
+        "folder" => 1,
+        "front" => 2,
+        "album" => 3,
+        r if r.starts_with("albumart") && r.ends_with("large") => 4,
+        r if r.starts_with("albumart") => 5,
+        _ => return None,
+    };
+    Some((rang_nom, rang_ext))
 }
 
 /// Extensions sous lesquelles une entrée de cache de pochette peut exister,
@@ -2513,6 +2557,10 @@ pub fn backfill_embedded_covers(
     }
     filled
 }
+
+#[cfg(test)]
+#[path = "noms_de_pochette_tests_6077.rs"]
+mod noms_de_pochette_tests_6077;
 
 #[cfg(test)]
 #[path = "image_rejetee_tests_4837.rs"]
