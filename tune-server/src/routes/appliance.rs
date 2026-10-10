@@ -92,11 +92,12 @@ async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppE
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(500)).await;
         tracing::info!("appliance_shutdown_requested");
-        // L'image Tune OS tourne son service en root — ailleurs, la route
-        // n'est de toute façon pas montée. Si l'ordre échoue quand même
-        // (droits, polkit), la réponse HTTP est déjà partie : le journal est
-        // le SEUL endroit où l'échec apparaît. C'est pourquoi les trois
-        // images appliance doivent lancer le service en root, garde ci-dessous.
+        // Les images Debian historiques tournent leur service en root ;
+        // Tune OS le tourne sous `tune`, et une règle polkit lui accorde
+        // `org.freedesktop.login1.power-off` (#3206). Si l'ordre échoue quand
+        // même (droits, polkit), la réponse HTTP est déjà partie : le journal
+        // est le SEUL endroit où l'échec apparaît. D'où la garde ci-dessous
+        // sur les trois images Debian, qui n'ont pas cette règle.
         if let Err(err) = issue_poweroff(&systemctl_bin()).await {
             tracing::warn!(error = %err, "appliance_shutdown_failed");
         }

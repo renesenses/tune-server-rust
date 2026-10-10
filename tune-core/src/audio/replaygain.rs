@@ -35,9 +35,13 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// #2713 — la crête vraie versionnée, et le rattrapage des crêtes mesurées
+/// par l'ancien algorithme.
+pub mod rattrapage_crete;
 /// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
 /// (#5882) : la campagne qui les rend à la passe, par lots.
 pub mod remesure;
+pub use rattrapage_crete::{ALBUM_TRUE_PEAK_ALGO_KEY, TRUE_PEAK_ALGO, TRUE_PEAK_ALGO_KEY};
 
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
@@ -89,6 +93,12 @@ pub const RG_ALGO_KEY: &str = "rg_algo";
 /// lisait ce saut comme un over (0,507 au lieu de 0,456 sur le même signal).
 /// `v1` a pu être écrite sans ce correctif : la branche de #5594 ne le
 /// contenait pas. Voir [`remesure`].
+///
+/// #2713 — la crête vraie a désormais SA version, [`TRUE_PEAK_ALGO_KEY`] :
+/// le passage de Catmull-Rom 4× à l'annexe 2 de BS.1770 ne change ni le gain
+/// ni le pic d'échantillon, et monter `RG_ALGO` aurait rendu à la remesure
+/// (qui efface les GAINS) des mesures dont seul le pic est à refaire. Le nom
+/// `tp4x` reste celui de la version `v2`, figé avec elle.
 pub const RG_ALGO: &str = "bs1770-tp4x-v2";
 
 /// #5594 (lot 2) — la clé de `track_metadata` qui dit quel algorithme a
@@ -225,6 +235,8 @@ fn appliquer_les_ecritures(tx: &dyn DbTxHandle, e: &EcrituresDePiste) -> Result<
         // `prevent_clipping` PRÉFÈRE celle-ci quand elle existe. Peut dépasser
         // 1.0 — c'est l'information.
         poser("rg_track_true_peak", &format_peak(true_peak))?;
+        // #2713 — la version de la crête vraie, écrite avec elle.
+        poser(TRUE_PEAK_ALGO_KEY, TRUE_PEAK_ALGO)?;
         // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en base un
         // gain MESURÉ ici d'un gain lu dans les tags du fichier : les deux
         // s'écrivent sous `rg_track_gain`, et c'est voulu (interchangeables à
@@ -944,6 +956,24 @@ pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
             return TourDeCascade::Suspendue(tache);
         }
     }
+    // #2713 — DERNIER rang, hors de l'ordre réglable : refaire les crêtes
+    // vraies mesurées par l'ancien algorithme. C'est du ReplayGain : coupé et
+    // suspendu avec lui. Il ne passe qu'après tout le reste — les gains, les
+    // empreintes et la plage dynamique manquent davantage qu'un pic plus
+    // juste de quelques dixièmes de dB.
+    if rg_armee && !est_en_pause(Tache::ReplayGain) {
+        noter_rang_au_travail(Some(Rang::ReplayGain));
+        let n = rattrapage_crete::rattraper_un_lot(backend).await;
+        if n > 0 {
+            return TourDeCascade::Travail(n);
+        }
+        // Même raison qu'au-dessus (#5469) : un 0 après une pause tombée en
+        // plein lot n'est pas un repos.
+        if est_en_pause(Tache::ReplayGain) {
+            noter_rang_au_travail(None);
+            return TourDeCascade::Suspendue(Tache::ReplayGain);
+        }
+    }
     noter_rang_au_travail(None);
     // Une plage dynamique suspendue n'est pas au repos : le travail est
     // toujours devant elle, la campagne ne doit pas se clore.
@@ -1204,7 +1234,12 @@ pub async fn passe_d_album(backend: &Arc<dyn DbBackend>, en_lecture: bool) -> us
     }
     let backend_album = backend.clone();
     priorite::hors_du_fil_async(Tache::ReplayGain.id(), move || {
-        analyze_album_batch(&backend_album)
+        match analyze_album_batch(&backend_album) {
+            // #2713 — plus aucun gain d'album à faire : les crêtes d'album
+            // dont toutes les pistes ont leur crête à jour.
+            0 => rattrapage_crete::rafraichir_une_crete_d_album(&backend_album),
+            n => n,
+        }
     })
     .await
     .unwrap_or(0)
@@ -2495,7 +2530,8 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_peak'), \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_track_true_peak'), \
                 (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_gain'), \
-                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_source') \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_album_source'), \
+                (SELECT value FROM track_metadata WHERE track_id = t.id AND key = 'rg_true_peak_algo') \
          FROM tracks t WHERE t.album_id = ?",
         &[&album_id as &dyn ToSqlValue],
     ) {
@@ -2514,6 +2550,11 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // rater la piste la plus chaude, et `prevent_clipping` s'y fierait.
     let mut true_peak_max = 0.0f64;
     let mut true_peak_complete = true;
+    // #2713 — la crête d'album n'est de la version courante que si TOUTES les
+    // crêtes de piste le sont. Sinon elle s'écrit quand même (elle protège
+    // mieux que rien), sans version : le rattrapage la refera
+    // (`rattrapage_crete::rafraichir_une_crete_d_album`).
+    let mut true_peak_a_jour = true;
     let mut n = 0usize;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut track_ids: Vec<i64> = Vec::new();
@@ -2557,6 +2598,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
             // reçoit pas non plus tant qu'elle n'est pas ré-analysée.
             None => true_peak_complete = false,
         }
+        if r.get(7).and_then(|v| v.as_string()).as_deref() != Some(TRUE_PEAK_ALGO) {
+            true_peak_a_jour = false;
+        }
     }
 
     if n == 0 || dur_sum <= 0.0 {
@@ -2586,6 +2630,9 @@ pub fn analyze_album_batch(backend: &Arc<dyn DbBackend>) -> usize {
         let _ = repo.set(*tid, "rg_album_peak", &peak_str);
         if let Some(tp) = &true_peak_str {
             let _ = repo.set(*tid, "rg_album_true_peak", tp);
+            if true_peak_a_jour {
+                let _ = repo.set(*tid, ALBUM_TRUE_PEAK_ALGO_KEY, TRUE_PEAK_ALGO);
+            }
         }
         // Provenance (#1627) : ce gain d'album n'est dans AUCUN fichier. Il
         // vient d'être calculé ici, à partir des gains de piste — que ceux-ci
@@ -3894,6 +3941,13 @@ mod tests {
             t.get("rg_algo").map(String::as_str),
             Some("bs1770-tp4x-v2"),
             "la mesure ReplayGain doit porter la version de son algorithme : {t:?}"
+        );
+        // #2713 — la crête vraie porte SA version, écrite avec elle.
+        assert!(t.contains_key("rg_track_true_peak"), "{t:?}");
+        assert_eq!(
+            t.get("rg_true_peak_algo").map(String::as_str),
+            Some("bs1770-a2-fir-v1"),
+            "la crête vraie doit porter la version de son algorithme : {t:?}"
         );
         assert_eq!(t.get("dr_track").map(String::as_str), Some("10"));
         assert_eq!(t.get("dr_source").map(String::as_str), Some("analysis"));

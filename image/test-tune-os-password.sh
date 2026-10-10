@@ -74,6 +74,30 @@ premier_acces
     || fail "avis de console resté après le changement"
 PREMIER_ACCES
 
+# --reinitialiser (#3206): forgotten password, from the console helper. A new
+# temporary password, expired at once, published for the console screens; the
+# account commands are stubbed and recorded, the password never reaches
+# stdout or stderr.
+bash -s -- "$work" <<'REINITIALISER'
+set -euo pipefail
+work="$1"
+fail() { echo "reinitialiser: $*" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "${work}/policy.sh"
+rm -rf "${work}/state" "${work}/run" "${work}/issue.d"
+chpasswd() { cat > "${work}/chpasswd.in"; }
+chage() { printf '%s\n' "$*" > "${work}/chage.args"; }
+sortie="$(reinitialiser 2>&1)"
+[[ -s "${work}/run/premier-mot-de-passe" ]] || fail "aucun mot de passe temporaire publié"
+pw="$(cat "${work}/run/premier-mot-de-passe")"
+[[ "$pw" =~ ^[0-9a-f]{24}$ ]] || fail "copie publiée hors forme"
+[[ "$(cat "${work}/chpasswd.in")" == "tune:${pw}" ]] || fail "chpasswd n'a pas reçu le mot de passe publié"
+[[ "$(cat "${work}/chage.args")" == "-d 0 tune" ]] || fail "mot de passe non expiré (chage -d 0)"
+[[ "$(cat "${work}/state/ssh-password-v2")" == "reset-from-console" ]] || fail "marqueur absent"
+[[ "$sortie" != *"$pw"* ]] || fail "mot de passe écrit sur la sortie (journal)"
+grep -q "$pw" "${work}/issue.d/90-tune-initial-password.issue" || fail "avis de console absent"
+REINITIALISER
+
 # main must be reached exactly as in production (#5617): the server pipes
 # this file into `/bin/bash -s -- <mode>`; images call it by path. A probe
 # mode stops at main's first check (root) or at its usage line: both prove

@@ -95,7 +95,16 @@ CARGO="$RUST_DIR/Cargo.toml"
 WEB="$DEV/tune-web-client/package.json"
 FLUTTER_DIR="$DEV/tune-server-flutter"
 FLUTTER="$FLUTTER_DIR/pubspec.yaml"
-IPAD="$DEV/tune-server-ipados/Tune/project.yml"
+# tune-server-universal (ex-tune-server-ipados, renommé sur GitHub). Un vieux
+# clone local peut encore s'appeler tune-server-ipados et traîner sur une
+# ancienne branche : on vise le dépôt sous son nom actuel, et on ne retombe
+# sur l'ancien dossier que s'il est le seul présent (avec un avertissement).
+UNIVERSAL_DIR="$DEV/tune-server-universal"
+if [ ! -d "$UNIVERSAL_DIR" ] && [ -d "$DEV/tune-server-ipados" ]; then
+    echo "Warning: $UNIVERSAL_DIR absent, repli sur l'ancien clone $DEV/tune-server-ipados." >&2
+    UNIVERSAL_DIR="$DEV/tune-server-ipados"
+fi
+IPAD="$UNIVERSAL_DIR/Tune/project.yml"
 
 # The Android engine lives in the Flutter repo as three checked-in
 # `libtuneserver.so`, one per ABI. `check-native-libs.sh` is their guard;
@@ -270,7 +279,7 @@ echo "  - $WEB"
 # branches. Always read a version from the branch that ships:
 #
 #   git -C "$DEV/tune-server-flutter" show origin/main:pubspec.yaml
-#   git -C "$DEV/tune-server-ipados"  show origin/main:Tune/project.yml
+#   git -C "$DEV/tune-server-universal" show origin/main:Tune/project.yml
 #
 # The same trap applies to tune-web-client's package.json.
 if [ "$WITH_CLIENTS" -eq 1 ]; then

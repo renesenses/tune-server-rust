@@ -54,6 +54,8 @@ pub mod plugins;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins_host;
 pub mod premium_guard;
+/// Actions root d'un service qui ne tourne pas en root (Tune OS, #3206).
+pub mod privilege;
 /// Détail du RSS (`RssAnon`, `RssFile`, `RssShmem`) pour `memory_diagnostics`.
 pub mod releve_memoire;
 pub mod reprise_des_passes;

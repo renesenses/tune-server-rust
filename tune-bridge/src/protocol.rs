@@ -22,6 +22,10 @@ pub struct RelayResponse {
     #[serde(default)]
     pub headers: serde_json::Map<String, serde_json::Value>,
     pub body: Option<String>,
+    /// Corps BINAIRE (pochette, archive…), encode en base64. Un corps texte
+    /// voyage dans `body` ; un serveur anterieur n'envoie jamais ce champ.
+    #[serde(default)]
+    pub body_base64: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

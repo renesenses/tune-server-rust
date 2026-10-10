@@ -24,11 +24,11 @@ use tokio::sync::Mutex;
 const APPAREIL: &str = "dlna-my-devialet";
 const DUREE_MS: u64 = 600_000;
 
-struct Banc {
+pub(super) struct Banc {
     poller: PositionPoller,
     db: Arc<dyn crate::db::backend::DbBackend>,
     outputs: Arc<Mutex<OutputRegistry>>,
-    zone_id: i64,
+    pub(super) zone_id: i64,
     poll_states: HashMap<i64, ZonePollState>,
     idle: HashMap<i64, IdlePollBackoff>,
     position_ms: u64,
@@ -38,7 +38,7 @@ struct Banc {
 impl Banc {
     /// Une zone DLNA qui joue, volume 100 % en base et en mémoire, PURE
     /// verrouillé ou non.
-    async fn monter(pure_verrouille: bool) -> Self {
+    pub(super) async fn monter(pure_verrouille: bool) -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
@@ -123,7 +123,7 @@ impl Banc {
     /// Le volume de l'appareil, changé hors de Tune (télécommande,
     /// application du fabricant). Rend le nombre de commandes déjà comptées,
     /// pour que ce geste-ci ne soit pas pris pour une commande de Tune.
-    async fn appareil_a(&self, volume: f64) -> usize {
+    pub(super) async fn appareil_a(&self, volume: f64) -> usize {
         self.avec_mock(async |m| {
             m.set_volume(volume).await.unwrap();
             m.volume_call_count().await
@@ -137,7 +137,7 @@ impl Banc {
     }
 
     /// Un tour de la vraie boucle, l'appareil en lecture qui avance.
-    async fn tic(&mut self) {
+    pub(super) async fn tic(&mut self) {
         self.position_ms += 1_000;
         let position = self.position_ms;
         self.avec_mock(async |m| {
@@ -152,7 +152,7 @@ impl Banc {
     }
 
     /// La zone à `pour_cent` en base ET en mémoire, sans grâce de volume.
-    async fn zone_a(&self, pour_cent: f64) {
+    pub(super) async fn zone_a(&self, pour_cent: f64) {
         ZoneRepo::with_backend(self.db.clone())
             .update_volume(self.zone_id, pour_cent)
             .unwrap();
@@ -162,7 +162,7 @@ impl Banc {
             .await;
     }
 
-    fn volume_en_base(&self) -> f64 {
+    pub(super) fn volume_en_base(&self) -> f64 {
         ZoneRepo::with_backend(self.db.clone())
             .get(self.zone_id)
             .unwrap()
@@ -312,4 +312,56 @@ async fn le_verrou_global_arme_apres_coup_ramene_la_zone_a_100_5695() {
     banc.tic().await;
     assert_eq!(banc.volume_en_base(), 100.0);
     assert_eq!(banc.commandes_depuis(deja).await, vec![1.0]);
+}
+
+/// #5662 — sur le VRAI tick, hors PURE : l'appareil passe de lui-même à
+/// 100 %. Tune ne l'adopte pas (la règle reste), n'envoie aucune commande
+/// (il n'impose rien), et le SIGNALE : un `zone.volume_externe` à
+/// l'ouverture, aucun pendant l'épisode, un à la fin.
+#[tokio::test]
+async fn un_renderer_a_100_est_signale_sans_etre_adopte_ni_corrige_5662() {
+    let mut banc = Banc::monter(false).await;
+    banc.zone_a(42.0).await;
+    banc.appareil_a(0.42).await;
+    banc.tic().await;
+    let deja = banc.appareil_a(1.0).await;
+    for _ in 0..5 {
+        banc.tic().await;
+    }
+    let mut externes = Vec::new();
+    while let Ok(e) = banc.recu.try_recv() {
+        if e.event_type == "zone.volume_externe" {
+            externes.push(e.data);
+        }
+    }
+    assert_eq!(
+        externes.len(),
+        1,
+        "un seul signal pour cinq tours à 100 % : {externes:?}"
+    );
+    assert_eq!(externes[0]["zone_id"], banc.zone_id);
+    assert_eq!(externes[0]["actif"], true);
+    assert_eq!(externes[0]["renderer_volume"], 1.0);
+    assert_eq!(externes[0]["tune_volume"], 0.42);
+    assert_eq!(
+        banc.volume_en_base(),
+        42.0,
+        "le 100 % de l'appareil ne doit pas être adopté"
+    );
+    assert!(
+        banc.commandes_depuis(deja).await.is_empty(),
+        "Tune signale et n'impose rien : aucune commande de volume"
+    );
+
+    banc.appareil_a(0.42).await;
+    banc.tic().await;
+    banc.tic().await;
+    let mut fins = Vec::new();
+    while let Ok(e) = banc.recu.try_recv() {
+        if e.event_type == "zone.volume_externe" {
+            fins.push(e.data);
+        }
+    }
+    assert_eq!(fins.len(), 1, "une seule fin d'épisode : {fins:?}");
+    assert_eq!(fins[0]["actif"], false);
 }

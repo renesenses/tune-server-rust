@@ -133,7 +133,10 @@ impl StreamInfo {
         if let Some(taille) = self.file_size.filter(|_| self.format == "wav") {
             return Some(taille);
         }
-        let dur = self.duration_ms?;
+        // Forum #2189 — une durée NULLE est une durée inconnue (base qui n'a
+        // pas su la lire), jamais une piste vide : sans ce filtre, le renderer
+        // recevait `Content-Length: 44`, l'en-tête seul, et restait à 0:00.
+        let dur = self.duration_ms.filter(|d| *d > 0)?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
@@ -210,10 +213,16 @@ impl StreamInfo {
     }
 }
 
+/// #5716 — ce que l'on fait du codec reconnu par la sonde d'une radio.
+pub type ObservateurDeCodec = Box<dyn FnOnce(&'static str) + Send>;
+
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
     detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
+    /// #5716 — appelé UNE fois, au premier codec de station que la sonde
+    /// reconnaît (voir [`Self::au_premier_codec_radio`]).
+    au_premier_codec: std::sync::Mutex<Option<ObservateurDeCodec>>,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Keeps the channel open until the session is removed, even after the
     /// decoder drops its tx. Without this, the HTTP stream ends as soon as
@@ -486,6 +495,29 @@ impl StreamSession {
             .detected_radio_source
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(source);
+        // #5716 — le premier codec CONNU part à l'observateur, une seule fois
+        // (une reconnexion republie la même sonde). Un format inconnu ne le
+        // consomme pas : la sonde suivante peut encore le donner.
+        if let Some(codec) = source.format {
+            let observateur = self
+                .au_premier_codec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(observateur) = observateur {
+                observateur(codec);
+            }
+        }
+    }
+
+    /// #5716 — `observateur` reçoit le codec de la station (`mp3`, `aac`,
+    /// `flac`…) dès que la sonde de décodage l'a reconnu. Il sert à retenir ce
+    /// codec dans `radio_stations`, où les stations livrées ont `codec = NULL`.
+    pub fn au_premier_codec_radio(&self, observateur: ObservateurDeCodec) {
+        *self
+            .au_premier_codec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(observateur);
     }
 
     fn effective_output_info(&self) -> StreamInfo {
@@ -531,6 +563,7 @@ impl StreamSession {
             id,
             info,
             detected_radio_source: std::sync::Mutex::new(None),
+            au_premier_codec: std::sync::Mutex::new(None),
             tx: Mutex::new(Some(tx)),
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),
@@ -2597,6 +2630,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.wav_content_length(), None);
+    }
+
+    /// Forum #2189 (DMP-A6, 1.0.0-rc3) : une piste dont la base ignore la
+    /// durée (`duration_ms = 0`, DSD128 converti en WAV 176,4/24) annonçait
+    /// `Content-Length: 44` — l'en-tête seul, zéro octet d'audio. Le renderer
+    /// lisait l'en-tête, refermait, réessayait, puis restait à 0:00, la piste
+    /// affichée. Une durée nulle est une durée INCONNUE, pas une piste vide.
+    #[test]
+    fn une_duree_nulle_n_annonce_pas_un_wav_vide_2189() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 176_400,
+            bit_depth: 24,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            info.wav_content_length(),
+            None,
+            "durée 0 : la longueur doit rester inconnue (flux chunké), jamais 44 octets"
+        );
     }
 
     #[test]
