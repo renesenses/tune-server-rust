@@ -393,3 +393,159 @@ async fn une_faute_hors_format_n_appelle_aucun_repli() {
     assert_eq!(etat.get_protocol_info.load(Ordering::Relaxed), 0);
     vie.abort();
 }
+
+// ── Persistance d'un démarrage à l'autre ────────────────────────────────────
+//
+// La mémoire est rangée en base sous `settings[dlna_compat_set_uri:<udn>]`.
+// Un « redémarrage » se simule en vidant la mémoire process de l'appareil
+// (`oublier_en_memoire_seulement`) : seule la base reste.
+
+fn profil_x_flac() -> repli::ProfilSetUri {
+    repli::ProfilSetUri {
+        mime_annonce: "audio/x-flac".into(),
+        niveau_didl_min: 1,
+        servi_sous_ce_mime: true,
+    }
+}
+
+/// Attend qu'une écriture partie hors de la pose (tâche bloquante) ait
+/// atteint la base. Borné : deux secondes.
+async fn attendre_base(udn: &str, presente: bool) -> Option<String> {
+    for _ in 0..100 {
+        let v = repli::valeur_en_base(udn);
+        if v.is_some() == presente {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    repli::valeur_en_base(udn)
+}
+
+/// Hors exécuteur, l'écriture en base est synchrone.
+#[test]
+fn le_profil_appris_survit_a_un_redemarrage() {
+    let _ = repli::base_de_test();
+    let udn = "uuid:banc-persistance-redemarrage";
+    repli::oublier_en_memoire_seulement(udn);
+    repli::memoriser_profil(udn, "audio/FLAC", profil_x_flac());
+    let brut = repli::valeur_en_base(udn).expect("le profil est rangé en base");
+    assert!(brut.contains("audio/x-flac"), "{brut}");
+
+    repli::oublier_en_memoire_seulement(udn);
+    assert_eq!(
+        repli::profil_memorise(udn, "audio/flac"),
+        Some(profil_x_flac()),
+        "après redémarrage, le profil est relu en base"
+    );
+    let diag = repli::compatibilite_de(udn);
+    assert_eq!(diag.profils.len(), 1);
+    assert_eq!(diag.profils[0].mime_source, "audio/flac");
+    assert!(diag.profils[0].appris_le.is_some());
+
+    // « Réinitialiser la compatibilité » : mémoire ET base.
+    assert_eq!(repli::reinitialiser_compatibilite(udn), Ok(1));
+    assert_eq!(repli::valeur_en_base(udn), None);
+    repli::oublier_en_memoire_seulement(udn);
+    assert_eq!(repli::profil_memorise(udn, "audio/flac"), None);
+}
+
+/// Un changement de version logicielle publiée oublie les profils ; la même
+/// version, ou une description sans version, les garde.
+#[test]
+fn un_changement_de_firmware_oublie_le_profil() {
+    let _ = repli::base_de_test();
+    let udn = "uuid:banc-persistance-firmware";
+    repli::oublier_en_memoire_seulement(udn);
+    repli::charger_pour_appareil(udn, Some("1.4.2"));
+    repli::memoriser_profil(udn, "audio/flac", profil_x_flac());
+    assert!(
+        repli::valeur_en_base(udn).is_some_and(|v| v.contains("1.4.2")),
+        "la version sous laquelle le profil a été appris est rangée avec lui"
+    );
+
+    // Redémarrage, même version : gardé.
+    repli::oublier_en_memoire_seulement(udn);
+    repli::charger_pour_appareil(udn, Some("1.4.2"));
+    assert_eq!(
+        repli::profil_memorise(udn, "audio/flac"),
+        Some(profil_x_flac())
+    );
+
+    // Redémarrage, description sans version : gardé (l'absence ne prouve rien).
+    repli::oublier_en_memoire_seulement(udn);
+    repli::charger_pour_appareil(udn, None);
+    assert_eq!(
+        repli::profil_memorise(udn, "audio/flac"),
+        Some(profil_x_flac())
+    );
+
+    // Redémarrage après mise à jour : oublié, en mémoire et en base.
+    repli::oublier_en_memoire_seulement(udn);
+    repli::charger_pour_appareil(udn, Some("1.5.0"));
+    assert_eq!(repli::profil_memorise(udn, "audio/flac"), None);
+    assert_eq!(repli::valeur_en_base(udn), None);
+    repli::oublier_en_memoire_seulement(udn);
+    repli::charger_pour_appareil(udn, Some("1.5.0"));
+    assert_eq!(repli::profil_memorise(udn, "audio/flac"), None);
+
+    // Un nouveau profil appris sous 1.5.0 porte la nouvelle version.
+    repli::memoriser_profil(udn, "audio/flac", profil_x_flac());
+    assert!(repli::valeur_en_base(udn).is_some_and(|v| v.contains("1.5.0")));
+    let _ = repli::reinitialiser_compatibilite(udn);
+}
+
+/// Bout à bout : le repli appris sur le renderer est rangé en base, relu
+/// après un redémarrage (une seule pose), puis OUBLIÉ en base quand le
+/// renderer, mis à jour, le refuse à son tour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_profil_relu_apres_redemarrage_puis_refuse_est_oublie_en_base() {
+    let _ = repli::base_de_test();
+    let udn = "uuid:banc-persistance-refus";
+    repli::oublier_en_memoire_seulement(udn);
+    let _ = repli::reinitialiser_compatibilite(udn);
+    let etat = Strict::new(&["audio/x-flac"], &["http-get:*:audio/x-flac:*"], 501);
+    let (sortie, vie) = demarrer(etat.clone(), udn).await;
+
+    sortie
+        .play_media(&piste("http://127.0.0.1:9/stream/persiste-a.flac"))
+        .await
+        .expect("repli sur audio/x-flac");
+    let brut = attendre_base(udn, true)
+        .await
+        .expect("profil rangé en base");
+    assert!(brut.contains("audio/x-flac"), "{brut}");
+
+    // Redémarrage de Tune : la mémoire process est vide, la sortie neuve.
+    repli::oublier_en_memoire_seulement(udn);
+    drop(sortie);
+    let (sortie, vie2) = demarrer(etat.clone(), udn).await;
+    etat.set_uri.lock().await.clear();
+    sortie
+        .play_media(&piste("http://127.0.0.1:9/stream/persiste-b.flac"))
+        .await
+        .expect("profil relu");
+    {
+        let poses = etat.set_uri.lock().await;
+        assert_eq!(
+            poses.len(),
+            1,
+            "le refus n'est pas repayé après redémarrage"
+        );
+        assert_eq!(mime_annonce(&poses[0]).as_deref(), Some("audio/x-flac"));
+    }
+
+    // Mise à jour du renderer : il n'accepte plus que audio/flac.
+    *etat.acceptes.lock().await = vec!["audio/flac".into()];
+    let _ = sortie
+        .play_media(&piste("http://127.0.0.1:9/stream/persiste-c.flac"))
+        .await;
+    assert_eq!(
+        attendre_base(udn, false).await,
+        None,
+        "le profil refusé à son tour est oublié en base"
+    );
+    repli::oublier_en_memoire_seulement(udn);
+    assert_eq!(repli::profil_memorise(udn, "audio/flac"), None);
+    vie.abort();
+    vie2.abort();
+}

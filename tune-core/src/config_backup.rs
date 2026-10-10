@@ -8,22 +8,21 @@
 //! # Streaming tokens
 //!
 //! Streaming credentials are OAuth refresh tokens for paid accounts, and a
-//! snapshot leaves the machine: `cloud-push` PUTs it to mozaiklabs.fr. They
+//! snapshot leaves the machine as a downloaded file. They
 //! used to be XOR'd with a fixed key compiled into every binary, which is not
 //! encryption — anyone holding a Tune build could read every token in every
 //! snapshot they could reach (audit item 7).
 //!
 //! They are now sealed in a [`Envelope`]: a random data key encrypts them, and
 //! that data key is wrapped under both the user's passphrase and a recovery key
-//! shown once. Without one of those two secrets the tokens are unreadable, so
-//! the cloud store holds an opaque blob.
+//! shown once. Without one of those two secrets the tokens are unreadable.
 //!
 //! Two consequences worth knowing:
 //!
 //! - [`export_config`] produces a snapshot with **no tokens at all**. Sealing
 //!   requires the passphrase, so it is [`export_config_sealed`] that carries
 //!   them. Everything else — zones, playlists, favourites — restores without
-//!   any secret, so an unattended `cloud-pull` onto a fresh machine still
+//!   any secret, so a restore onto a fresh machine still
 //!   rebuilds the install and only asks for a passphrase to re-attach the
 //!   streaming services.
 //! - Snapshots written before this change are still readable on import
@@ -34,7 +33,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
@@ -400,7 +398,10 @@ fn export_settings(
     let mut room_profiles = Vec::new();
 
     for (key, value) in all {
-        if is_sensitive(&key) {
+        // La liste fixe ci-dessus ne nommait ni les jetons de service ni ceux
+        // du compte : le filtre COMMUN des secrets (`crate::secrets`, celui de
+        // l'export gratuit) s'applique aussi ici (#5654).
+        if is_sensitive(&key) || crate::secrets::est_secret(&key) {
             debug!(key = %key, "config_export_skip_sensitive");
             continue;
         }
@@ -416,7 +417,7 @@ fn export_settings(
     Ok((general, eq_presets, room_profiles))
 }
 
-fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+pub(crate) fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let playlist_rows = backend.query_many(
         "SELECT id, name, description FROM playlists ORDER BY id",
         &[],
@@ -519,7 +520,7 @@ fn export_favorites(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> 
     Ok(rows_to_json(rows, cols))
 }
 
-fn export_radios(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
+pub(crate) fn export_radios(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> {
     let cols = &[
         "id",
         "name",
@@ -900,119 +901,136 @@ fn import_playlists(
         )?;
 
         if let Some(tracks) = pl["tracks"].as_array() {
-            for t in tracks {
-                let title = t["title"].as_str().unwrap_or_default();
-                let artist = t["artist_name"].as_str().unwrap_or_default();
-                let album = t["album_title"].as_str().unwrap_or_default();
-                let source = t["source"].as_str().unwrap_or("local");
-                let source_id = t["source_id"].as_str().unwrap_or_default();
-                let position = t["position"].as_i64().unwrap_or(0);
-
-                // #5066 — un titre de service (#4922) ne se cherche pas dans
-                // `tracks` : il se RECREE tel quel, `track_id` NUL, avec ses
-                // colonnes d'affichage. Le CHECK de la table exige `source` et
-                // `source_id` ; une ligne qui ne les a pas est signalee.
-                if t["kind"].as_str() == Some("service") {
-                    let texte = |cle: &str| {
-                        t[cle]
-                            .as_str()
-                            .filter(|s| !s.trim().is_empty())
-                            .map(str::to_string)
-                    };
-                    let (Some(source), Some(source_id)) = (texte("source"), texte("source_id"))
-                    else {
-                        warnings.push(format!(
-                            "playlist '{name}': service track at position {position} \
-                             has no source/source_id, skipped"
-                        ));
-                        continue;
-                    };
-                    backend.execute(
-                        "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
-                         title, artist, album, album_source_id, duration_ms, cover_url) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        &[
-                            &pl_id as &dyn ToSqlValue,
-                            &position as &dyn ToSqlValue,
-                            &source as &dyn ToSqlValue,
-                            &source_id as &dyn ToSqlValue,
-                            &texte("title") as &dyn ToSqlValue,
-                            &texte("artist_name") as &dyn ToSqlValue,
-                            &texte("album_title") as &dyn ToSqlValue,
-                            &texte("album_source_id") as &dyn ToSqlValue,
-                            &t["duration_ms"].as_i64() as &dyn ToSqlValue,
-                            &texte("cover_url") as &dyn ToSqlValue,
-                        ],
-                    )?;
-                    continue;
-                }
-
-                let track_row = if !source_id.is_empty() {
-                    backend.query_one(
-                        "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
-                        &[
-                            &source.to_string() as &dyn ToSqlValue,
-                            &source_id.to_string() as &dyn ToSqlValue,
-                        ],
-                    )?
-                } else {
-                    // #4927 — `tracks` n'a ni `artist_name` ni `album_title` :
-                    // l'artiste et l'album sont des cles etrangeres. Une piste
-                    // locale se retrouve par titre + nom d'artiste, et l'album
-                    // departage deux homonymes (une sauvegarde sans
-                    // `album_title` prend la premiere, comme avant).
-                    backend.query_one(
-                        "SELECT t.id FROM tracks t \
-                         LEFT JOIN artists ar ON ar.id = t.artist_id \
-                         LEFT JOIN albums al ON al.id = t.album_id \
-                         WHERE t.title = ? AND COALESCE(ar.name, '') = ? \
-                         ORDER BY CASE WHEN COALESCE(al.title, '') = ? THEN 0 ELSE 1 END, t.id \
-                         LIMIT 1",
-                        &[
-                            &title.to_string() as &dyn ToSqlValue,
-                            &artist.to_string() as &dyn ToSqlValue,
-                            &album.to_string() as &dyn ToSqlValue,
-                        ],
-                    )?
-                };
-
-                // #5113 — titre et artiste ne la retrouvent pas : son
-                // empreinte, si la sauvegarde la porte et qu'elle designe UNE
-                // seule piste de la cible.
-                let track_row = match track_row {
-                    Some(row) => Some(row),
-                    None => piste_par_empreinte(backend, t)?,
-                };
-
-                let Some(row) = track_row else {
-                    // #5113 — elle etait abandonnee sans un mot : la playlist
-                    // revenait plus courte et rien ne le disait.
-                    let chemin = t["file_path"]
-                        .as_str()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or("unknown path: backup predates it");
-                    warnings.push(format!(
-                        "playlist '{name}': track at position {position} not found in the \
-                         library, skipped: '{title}' by '{artist}' ({chemin})"
-                    ));
-                    continue;
-                };
-                let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
-                backend.execute(
-                    "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
-                     VALUES (?, ?, ?)",
-                    &[
-                        &pl_id as &dyn ToSqlValue,
-                        &track_id as &dyn ToSqlValue,
-                        &position as &dyn ToSqlValue,
-                    ],
-                )?;
-            }
+            inserer_les_pistes(backend, pl_id, name, tracks, warnings)?;
         }
 
         count += 1;
     }
     Ok(count)
+}
+
+/// Insère les pistes d'une playlist sauvegardée dans la playlist `pl_id`.
+///
+/// Extrait d'[`import_playlists`] pour la restauration depuis le cloud
+/// (#5654), qui REMPLACE le contenu d'une playlist homonyme : mêmes règles de
+/// rapprochement (service, `source_id`, titre + artiste, empreinte), mêmes
+/// avertissements. N'écrit que `playlist_tracks` : la bibliothèque n'est
+/// jamais touchée.
+pub(crate) fn inserer_les_pistes(
+    backend: &Arc<dyn DbBackend>,
+    pl_id: i64,
+    name: &str,
+    tracks: &[Value],
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    for t in tracks {
+        let title = t["title"].as_str().unwrap_or_default();
+        let artist = t["artist_name"].as_str().unwrap_or_default();
+        let album = t["album_title"].as_str().unwrap_or_default();
+        let source = t["source"].as_str().unwrap_or("local");
+        let source_id = t["source_id"].as_str().unwrap_or_default();
+        let position = t["position"].as_i64().unwrap_or(0);
+
+        // #5066 — un titre de service (#4922) ne se cherche pas dans
+        // `tracks` : il se RECREE tel quel, `track_id` NUL, avec ses
+        // colonnes d'affichage. Le CHECK de la table exige `source` et
+        // `source_id` ; une ligne qui ne les a pas est signalee.
+        if t["kind"].as_str() == Some("service") {
+            let texte = |cle: &str| {
+                t[cle]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            };
+            let (Some(source), Some(source_id)) = (texte("source"), texte("source_id")) else {
+                warnings.push(format!(
+                    "playlist '{name}': service track at position {position} \
+                     has no source/source_id, skipped"
+                ));
+                continue;
+            };
+            backend.execute(
+                "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
+                 title, artist, album, album_source_id, duration_ms, cover_url) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    &pl_id as &dyn ToSqlValue,
+                    &position as &dyn ToSqlValue,
+                    &source as &dyn ToSqlValue,
+                    &source_id as &dyn ToSqlValue,
+                    &texte("title") as &dyn ToSqlValue,
+                    &texte("artist_name") as &dyn ToSqlValue,
+                    &texte("album_title") as &dyn ToSqlValue,
+                    &texte("album_source_id") as &dyn ToSqlValue,
+                    &t["duration_ms"].as_i64() as &dyn ToSqlValue,
+                    &texte("cover_url") as &dyn ToSqlValue,
+                ],
+            )?;
+            continue;
+        }
+
+        let track_row = if !source_id.is_empty() {
+            backend.query_one(
+                "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
+                &[
+                    &source.to_string() as &dyn ToSqlValue,
+                    &source_id.to_string() as &dyn ToSqlValue,
+                ],
+            )?
+        } else {
+            // #4927 — `tracks` n'a ni `artist_name` ni `album_title` :
+            // l'artiste et l'album sont des cles etrangeres. Une piste
+            // locale se retrouve par titre + nom d'artiste, et l'album
+            // departage deux homonymes (une sauvegarde sans
+            // `album_title` prend la premiere, comme avant).
+            backend.query_one(
+                "SELECT t.id FROM tracks t \
+                 LEFT JOIN artists ar ON ar.id = t.artist_id \
+                 LEFT JOIN albums al ON al.id = t.album_id \
+                 WHERE t.title = ? AND COALESCE(ar.name, '') = ? \
+                 ORDER BY CASE WHEN COALESCE(al.title, '') = ? THEN 0 ELSE 1 END, t.id \
+                 LIMIT 1",
+                &[
+                    &title.to_string() as &dyn ToSqlValue,
+                    &artist.to_string() as &dyn ToSqlValue,
+                    &album.to_string() as &dyn ToSqlValue,
+                ],
+            )?
+        };
+
+        // #5113 — titre et artiste ne la retrouvent pas : son
+        // empreinte, si la sauvegarde la porte et qu'elle designe UNE
+        // seule piste de la cible.
+        let track_row = match track_row {
+            Some(row) => Some(row),
+            None => piste_par_empreinte(backend, t)?,
+        };
+
+        let Some(row) = track_row else {
+            // #5113 — elle etait abandonnee sans un mot : la playlist
+            // revenait plus courte et rien ne le disait.
+            let chemin = t["file_path"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("unknown path: backup predates it");
+            warnings.push(format!(
+                "playlist '{name}': track at position {position} not found in the \
+                 library, skipped: '{title}' by '{artist}' ({chemin})"
+            ));
+            continue;
+        };
+        let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        backend.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
+             VALUES (?, ?, ?)",
+            &[
+                &pl_id as &dyn ToSqlValue,
+                &track_id as &dyn ToSqlValue,
+                &position as &dyn ToSqlValue,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// #5113 — retrouver une piste de la sauvegarde par son empreinte
@@ -1079,7 +1097,7 @@ fn import_favorites(
     Ok(count)
 }
 
-fn import_radios(
+pub(crate) fn import_radios(
     backend: &Arc<dyn DbBackend>,
     radios: &[Value],
     _warnings: &mut Vec<String>,
@@ -1295,23 +1313,6 @@ fn import_legacy_tokens(
     Ok(count)
 }
 
-// ── Snapshot fingerprint ────────────────────────────────────────────
-
-impl ConfigSnapshot {
-    /// SHA-256 digest of the snapshot content (for cloud deduplication).
-    pub fn fingerprint(&self) -> String {
-        let json = serde_json::to_vec(self).unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(&json);
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Approximate size in bytes when serialised as JSON.
-    pub fn size_bytes(&self) -> usize {
-        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,28 +1350,6 @@ mod tests {
         assert!(is_room_profile_key("room_profile_1"));
         assert!(is_room_profile_key("room_profile_index"));
         assert!(!is_room_profile_key("theme"));
-    }
-
-    #[test]
-    fn snapshot_fingerprint_deterministic() {
-        let snap = ConfigSnapshot {
-            version: "0.8.0".into(),
-            created_at: "2026-06-25T00:00:00Z".into(),
-            zones: vec![],
-            settings: vec![],
-            playlists: vec![],
-            favorites: vec![],
-            radio_stations: vec![],
-            alarms: vec![],
-            eq_presets: vec![],
-            room_profiles: vec![],
-            streaming_tokens: vec![],
-            sealed_tokens: None,
-        };
-        let fp1 = snap.fingerprint();
-        let fp2 = snap.fingerprint();
-        assert_eq!(fp1, fp2);
-        assert_eq!(fp1.len(), 64);
     }
 
     #[test]
@@ -1420,6 +1399,38 @@ mod tests {
             )
             .unwrap();
         assert!(row.is_some());
+    }
+
+    /// #5654 — l'export Premium ne laisse sortir AUCUN jeton : ni de service,
+    /// ni du compte, ni de liaison. Témoin : la liste fixe seule les laissait
+    /// passer.
+    #[test]
+    fn l_export_premium_ne_porte_aucun_jeton() {
+        let backend = fresh_backend();
+        let settings = SettingsRepo::with_backend(backend.clone());
+        for (k, v) in [
+            ("discogs_token", "jeton-discogs"),
+            ("auth_tokens_qobuz", "{\"user_auth_token\":\"jeton-qobuz\"}"),
+            ("mozaik_refresh_token", "jeton-compte"),
+            ("cloud_server_link_token", "jeton-liaison"),
+            ("theme", "dark"),
+        ] {
+            settings.set(k, v).unwrap();
+        }
+        let snapshot = export_config(&backend).unwrap();
+        let texte = serde_json::to_string(&snapshot).unwrap();
+        for jeton in [
+            "jeton-discogs",
+            "jeton-qobuz",
+            "jeton-compte",
+            "jeton-liaison",
+        ] {
+            assert!(
+                !texte.contains(jeton),
+                "l'export Premium porte un secret en clair : {jeton}"
+            );
+        }
+        assert!(snapshot.settings.iter().any(|(k, _)| k == "theme"));
     }
 
     // ── Alarms round trip (#5669) ───────────────────────────────────
@@ -1546,8 +1557,8 @@ mod tests {
     }
 
     /// The heart of audit item 7: a snapshot that leaves the machine must not
-    /// carry a recoverable token. Previously `cloud-push` PUT them to
-    /// mozaiklabs.fr XOR'd with a key compiled into every binary.
+    /// carry a recoverable token. Previously they left XOR'd with a key
+    /// compiled into every binary.
     #[test]
     fn a_sealed_snapshot_leaks_no_token() {
         let backend = seeded_backend();
@@ -1562,8 +1573,8 @@ mod tests {
         assert!(snapshot.streaming_tokens.is_empty());
     }
 
-    /// The plain export must never carry tokens: it is what an unattended
-    /// cloud-push sends, with no passphrase to seal them.
+    /// The plain export must never carry tokens: nothing seals them without
+    /// a passphrase.
     #[test]
     fn the_plain_export_carries_no_tokens() {
         let backend = seeded_backend();
@@ -1610,7 +1621,7 @@ mod tests {
     }
 
     /// Everything except the tokens must restore with no secret at all —
-    /// otherwise a cloud-pull onto a new machine is useless without a
+    /// otherwise a restore onto a new machine is useless without a
     /// passphrase.
     #[test]
     fn a_restore_without_the_secret_still_rebuilds_the_install() {

@@ -41,6 +41,14 @@ pub trait DbBackend: Send + Sync {
     /// The engine type for SQL dialect dispatch.
     fn engine(&self) -> Engine;
 
+    /// #5993 — un jeton qui change à chaque écriture validée dans la base,
+    /// quelle que soit la connexion qui l'a faite. Sert à garder en mémoire
+    /// un résultat de lecture coûteux tant que rien n'a été écrit. `None` :
+    /// le moteur ne sait pas le dire, et l'appelant ne garde rien.
+    fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        None
+    }
+
     /// Execute a statement that doesn't return rows (INSERT/UPDATE/
     /// DELETE/DDL). Returns the number of affected rows.
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String>;
@@ -607,6 +615,10 @@ fn sqlite_lire_frais(
 impl DbBackend for crate::db::sqlite::SqliteDb {
     fn engine(&self) -> Engine {
         Engine::Sqlite
+    }
+
+    fn jeton_des_donnees(&self) -> Option<(u64, i64)> {
+        crate::db::sqlite::SqliteDb::jeton_des_donnees(self)
     }
 
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {

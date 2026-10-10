@@ -42,8 +42,11 @@
 //! - Rock Ridge (entrées `NM` du SUSP, zones de continuation `CE` comprises),
 //!   préféré à Joliet quand les deux existent : ses noms ne sont pas bornés à
 //!   64 caractères ;
-//! - UDF 1.02 à 2.01 sur partition physique, quand l'image n'a PAS
-//!   d'arborescence ISO 9660 exploitable (voir [`udf`]).
+//! - les images multisession : la dernière session porte la vue complète du
+//!   disque (voir `sessions`) ;
+//! - UDF 1.02 à 2.60 sur partition physique ou « sparable », avec la
+//!   partition de métadonnées d'UDF 2.50 et suivants (Blu-ray), quand l'image
+//!   n'a PAS d'arborescence ISO 9660 exploitable (voir [`udf`]).
 //!
 //! Tout est borné : profondeur, nombre d'entrées, étendues contenues dans
 //! l'image. Une image forgée ou abîmée rend une erreur, jamais une boucle.
@@ -355,20 +358,32 @@ fn saut_susp_racine(racine_point: &Enregistrement) -> Option<usize> {
     (su.len() >= 7 && &su[0..2] == b"SP" && su[4] == 0xBE && su[5] == 0xEF).then(|| su[6] as usize)
 }
 
-/// Les deux arborescences candidates : primaire et Joliet.
+/// Les deux arborescences candidates d'UNE session : primaire et Joliet.
 struct Descripteurs {
     primaire: Option<[u8; 34]>,
     joliet: Option<[u8; 34]>,
+    /// Taille du volume déclarée par le descripteur primaire, en secteurs,
+    /// comptée depuis le début du DISQUE : une session suivante la porte à
+    /// la fin de ses propres données.
+    taille_volume: u64,
 }
 
-fn lire_descripteurs(fichier: &mut File) -> io::Result<Descripteurs> {
+/// Les descripteurs de la session qui commence au secteur `debut`.
+fn lire_descripteurs(fichier: &mut File, debut: u64) -> io::Result<Descripteurs> {
     let mut d = Descripteurs {
         primaire: None,
         joliet: None,
+        taille_volume: 0,
     };
     let mut secteur = [0u8; SECTEUR as usize];
     for n in 0..MAX_DESCRIPTEURS {
-        if lire_a(fichier, (PREMIER_DESCRIPTEUR + n) * SECTEUR, &mut secteur).is_err() {
+        if lire_a(
+            fichier,
+            (debut + PREMIER_DESCRIPTEUR + n) * SECTEUR,
+            &mut secteur,
+        )
+        .is_err()
+        {
             break;
         }
         if &secteur[1..6] != b"CD001" {
@@ -377,7 +392,10 @@ fn lire_descripteurs(fichier: &mut File) -> io::Result<Descripteurs> {
         let mut racine = [0u8; 34];
         racine.copy_from_slice(&secteur[156..190]);
         match secteur[0] {
-            1 if d.primaire.is_none() => d.primaire = Some(racine),
+            1 if d.primaire.is_none() => {
+                d.primaire = Some(racine);
+                d.taille_volume = u32_le(&secteur, 80) as u64;
+            }
             2 => {
                 // Séquences d'échappement Joliet : %/@, %/C, %/E (niveaux 1-3).
                 let esc = &secteur[88..91];
@@ -390,6 +408,91 @@ fn lire_descripteurs(fichier: &mut File) -> io::Result<Descripteurs> {
         }
     }
     Ok(d)
+}
+
+/// Au-delà de la fin d'une session, la zone où sa suivante est cherchée, en
+/// secteurs (64 Mio) : elle couvre l'écart d'entrée et de sortie de session
+/// d'un CD (11 400 secteurs pour la première, 6 900 ensuite) et le bourrage
+/// des graveurs.
+const FENETRE_SESSION: u64 = 32_768;
+
+/// Au plus autant de sessions suivies.
+const SESSIONS_MAX: usize = 64;
+
+/// Les signatures d'un descripteur primaire : type 1, `CD001`, version 1.
+const SIGNATURE_PRIMAIRE: &[u8; 7] = b"\x01CD001\x01";
+
+/// Les sessions de l'image, de la première à la dernière : (secteur de
+/// début, descripteurs).
+///
+/// Un disque multisession (CD-R ou DVD-R gravé en plusieurs fois) porte une
+/// session par gravure. Chacune commence par sa propre zone système de seize
+/// secteurs, suivie de ses descripteurs ; sa taille de volume est comptée
+/// depuis le début du disque, et son arborescence reprend celle des sessions
+/// précédentes en pointant leurs étendues. La DERNIÈRE session est donc la
+/// vue complète du disque, mais le secteur 16 de l'image n'en dit rien : il
+/// porte la première. (Une image de support réinscriptible, ou une image
+/// prolongée par `xorriso`, recopie au contraire la dernière session au
+/// secteur 16 : elle n'a qu'une session visible, et c'est la bonne.)
+///
+/// Sans table des matières dans un `.iso`, la session suivante est cherchée
+/// après la fin déclarée de la précédente : le premier secteur qui porte la
+/// signature d'un descripteur primaire, dont la taille de volume dépasse la
+/// précédente, ouvre une session seize secteurs plus tôt.
+fn sessions(fichier: &mut File, taille_image: u64) -> io::Result<Vec<(u64, Descripteurs)>> {
+    let premiere = lire_descripteurs(fichier, 0)?;
+    let mut sessions = vec![(0u64, premiere)];
+    let secteurs_image = taille_image / SECTEUR;
+    while sessions.len() < SESSIONS_MAX {
+        let (_, derniere) = sessions.last().expect("au moins une session");
+        let fin = derniere.taille_volume;
+        if derniere.primaire.is_none() || fin == 0 || fin + PREMIER_DESCRIPTEUR >= secteurs_image {
+            break;
+        }
+        let Some(suivante) = chercher_session(fichier, fin, secteurs_image)? else {
+            break;
+        };
+        sessions.push(suivante);
+    }
+    Ok(sessions)
+}
+
+/// La première session qui commence à partir du secteur `depuis`, dans la
+/// fenêtre [`FENETRE_SESSION`].
+fn chercher_session(
+    fichier: &mut File,
+    depuis: u64,
+    secteurs_image: u64,
+) -> io::Result<Option<(u64, Descripteurs)>> {
+    const PAR_LECTURE: u64 = 512;
+    let premier = depuis + PREMIER_DESCRIPTEUR;
+    let dernier = (depuis + FENETRE_SESSION).min(secteurs_image);
+    let mut secteur = premier;
+    while secteur < dernier {
+        let n = PAR_LECTURE.min(dernier - secteur);
+        let mut tampon = vec![0u8; (n * SECTEUR) as usize];
+        lire_a(fichier, secteur * SECTEUR, &mut tampon)?;
+        for (i, s) in tampon.chunks_exact(SECTEUR as usize).enumerate() {
+            if &s[..7] != SIGNATURE_PRIMAIRE {
+                continue;
+            }
+            let pvd = secteur + i as u64;
+            let debut = pvd - PREMIER_DESCRIPTEUR;
+            let taille_volume = u32_le(s, 80) as u64;
+            // Une session déclare un volume qui va au-delà de son descripteur
+            // et de la session précédente ; sinon, ce n'est qu'un octet de
+            // données qui ressemble à un descripteur.
+            if taille_volume <= pvd || taille_volume <= depuis {
+                continue;
+            }
+            let d = lire_descripteurs(fichier, debut)?;
+            if d.primaire.is_some() {
+                return Ok(Some((debut, d)));
+            }
+        }
+        secteur += n;
+    }
+    Ok(None)
 }
 
 struct Parcours<'a> {
@@ -487,9 +590,42 @@ impl Parcours<'_> {
     }
 }
 
-/// Lit l'arborescence ISO 9660 (Rock Ridge, sinon Joliet, sinon noms nus).
+/// Lit l'arborescence ISO 9660 de la dernière session lisible.
+///
+/// Les sessions sont essayées de la dernière à la première (voir
+/// [`sessions`]) : la première qui rend des fichiers l'emporte. Si aucune
+/// n'en rend, c'est le verdict de la dernière qui est rendu — pour une image
+/// d'une seule session, exactement celui d'avant la lecture multisession.
 fn index_iso9660(fichier: &mut File, taille_image: u64) -> io::Result<Option<IndexImage>> {
-    let d = lire_descripteurs(fichier)?;
+    let sessions = sessions(fichier, taille_image)?;
+    let mut verdict_de_la_derniere = None;
+    for (debut, d) in sessions.iter().rev() {
+        let verdict = index_session(fichier, taille_image, d);
+        if let Ok(Some(index)) = &verdict
+            && !index.fichiers.is_empty()
+        {
+            if *debut > 0 {
+                tracing::debug!(
+                    session = debut,
+                    sessions = sessions.len(),
+                    "iso_multisession_derniere_session_lue"
+                );
+            }
+            return verdict;
+        }
+        if verdict_de_la_derniere.is_none() {
+            verdict_de_la_derniere = Some(verdict);
+        }
+    }
+    verdict_de_la_derniere.unwrap_or(Ok(None))
+}
+
+/// Lit l'arborescence d'une session (Rock Ridge, sinon Joliet, sinon noms nus).
+fn index_session(
+    fichier: &mut File,
+    taille_image: u64,
+    d: &Descripteurs,
+) -> io::Result<Option<IndexImage>> {
     let Some(primaire) = d.primaire else {
         return Ok(None);
     };
@@ -991,3 +1127,6 @@ mod epreuves_5299;
 
 #[cfg(test)]
 mod epreuves_formats_5299;
+
+#[cfg(test)]
+mod epreuves_sessions_udf250_5299;
